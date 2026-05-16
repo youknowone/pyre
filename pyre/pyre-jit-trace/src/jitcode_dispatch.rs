@@ -8541,7 +8541,7 @@ mod tests {
         // resume data — better than a wrong-layout snapshot the
         // optimizer would consume as truth.
         assert_eq!(
-            guard_op.rd_resume_position, -1,
+            guard_op.rd_resume_position.get(), -1,
             "walker guards stay at rd_resume_position=-1 by design (shadow validator; trait-leg captures resumedata)",
         );
     }

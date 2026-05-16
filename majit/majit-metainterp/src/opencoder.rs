@@ -940,7 +940,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
             None => majit_ir::Op::new(opcode, &args),
         };
-        op.rd_resume_position = rd_resume_position;
+        op.rd_resume_position.set(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
         // the ResOp class is intrinsically typed via the IntOp/FloatOp/
         // RefOp mixin (resoperation.py:564-638) or the AbstractResOp
@@ -3502,7 +3502,7 @@ mod tests {
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GuardTrue);
         assert!(op.descr.is_none()); // guards do NOT carry a resolved descr
-        assert_eq!(op.rd_resume_position, 7); // opencoder.py:423 parity
+        assert_eq!(op.rd_resume_position.get(), 7); // opencoder.py:423 parity
     }
 
     /// M4 step 3: non-guard descr-bearing opcode routes through the
@@ -3535,7 +3535,7 @@ mod tests {
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
         let resolved = op.descr.expect("descr must resolve");
         assert_eq!(resolved.index(), 99);
-        assert_eq!(op.rd_resume_position, -1); // non-guard sentinel
+        assert_eq!(op.rd_resume_position.get(), -1); // non-guard sentinel
     }
 
     /// M4 step 3: non-guard descr-bearing opcode with `descr_index == 0`
@@ -3552,7 +3552,7 @@ mod tests {
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
         assert!(op.descr.is_none());
-        assert_eq!(op.rd_resume_position, -1);
+        assert_eq!(op.rd_resume_position.get(), -1);
     }
 
     // ── SnapshotIterator::get / unpack_array parity tests ──

@@ -7474,7 +7474,7 @@ mod tests {
                 .expect("branch guard should be recorded")
                 .clone();
             assert_eq!(guard.opcode, OpCode::GuardTrue);
-            let snapshot_id = guard.rd_resume_position;
+            let snapshot_id = guard.rd_resume_position.get();
             assert!(
                 snapshot_id >= 0,
                 "branch guard must carry rd_resume_position pointing at its captured snapshot",
@@ -7612,7 +7612,7 @@ mod tests {
             .expect("guard op should be present")
             .clone();
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        let snapshot_id = guard.rd_resume_position;
+        let snapshot_id = guard.rd_resume_position.get();
         assert!(
             snapshot_id >= 0,
             "guard must carry rd_resume_position pointing at its captured snapshot",

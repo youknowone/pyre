@@ -1013,8 +1013,10 @@ pub struct Op {
     /// resoperation.py: GuardResOp.rd_resume_position — index of the
     /// guard in the trace for resume data lookup. Set by unroll when
     /// creating extra guards from short preamble / virtual state.
-    /// -1 means unset.
-    pub rd_resume_position: i32,
+    /// -1 means unset. `Cell` so that mutators reachable via `&Op` (the
+    /// shared-trace identity model from `Vec<Rc<Op>>`) can update the
+    /// slot without requiring `&mut Op`.
+    pub rd_resume_position: std::cell::Cell<i32>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,
@@ -1040,7 +1042,7 @@ impl Clone for Op {
             type_: self.type_,
             fail_args: self.fail_args.clone(),
             fail_arg_types: self.fail_arg_types.clone(),
-            rd_resume_position: self.rd_resume_position,
+            rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
             vecinfo: self.vecinfo.clone(),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
@@ -1123,7 +1125,7 @@ impl Op {
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: None,
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
@@ -1138,7 +1140,7 @@ impl Op {
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: None,
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
@@ -1190,7 +1192,7 @@ impl Op {
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
             // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
             // copy datatype/bytesize/signed/count from the source.  pyre
             // collapses VectorOp/VectorGuardOp into Op, so the same copy
@@ -1211,7 +1213,7 @@ impl Op {
         if opcode.is_guard() || self.opcode.is_guard() {
             newop.fail_args = self.fail_args.clone();
             newop.fail_arg_types = self.fail_arg_types.clone();
-            newop.rd_resume_position = self.rd_resume_position;
+            newop.rd_resume_position.set(self.rd_resume_position.get());
         }
         newop
     }
@@ -4211,7 +4213,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4221,7 +4223,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4232,7 +4234,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4253,7 +4255,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -4269,7 +4271,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -4286,7 +4288,7 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0) [v0, v1]");
@@ -4302,7 +4304,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -4318,7 +4320,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -4338,7 +4340,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4348,7 +4350,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Finish,
@@ -4359,7 +4361,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4379,7 +4381,7 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 99);
@@ -4410,7 +4412,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4420,7 +4422,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4430,7 +4432,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4441,7 +4443,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4473,7 +4475,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntGt,
@@ -4483,7 +4485,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4493,7 +4495,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Finish,
@@ -4504,7 +4506,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4533,7 +4535,7 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_resume_position: -1,
+            rd_resume_position: std::cell::Cell::new(-1),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -4564,7 +4566,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntAdd,
@@ -4574,7 +4576,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntLt,
@@ -4584,7 +4586,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardTrue,
@@ -4594,7 +4596,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(2)]),
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::IntSub,
@@ -4604,7 +4606,7 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::Jump,
@@ -4615,7 +4617,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4647,7 +4649,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0)]),
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
                 opcode: OpCode::GuardFalse,
@@ -4658,7 +4660,7 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_resume_position: -1,
+                rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();

@@ -5029,7 +5029,7 @@ impl OptContext {
         // capture_resumedata (tracer guards) or patchguardop copy
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
-        let resume_pos = op.rd_resume_position;
+        let resume_pos = op.rd_resume_position.get();
         let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
         // resume.py:396-397: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
@@ -5052,10 +5052,10 @@ impl OptContext {
             let fallback_pos = self
                 .patchguardop
                 .as_ref()
-                .map(|p| p.rd_resume_position)
+                .map(|p| p.rd_resume_position.get())
                 .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
-                op.rd_resume_position = fb_pos;
+                op.rd_resume_position.set(fb_pos);
                 // resume.py:570 _add_optimizer_sections: forward knowledge
                 // to the patchguardop snapshot so heap/class/loopinvariant
                 // sections are serialized into rd_numb. RPython's finish()
@@ -5075,7 +5075,7 @@ impl OptContext {
                  resume_pos={}) has no snapshot and no patchguardop \
                  ancestor — RPython resume.py:397 \
                  `assert resume_position >= 0` parity",
-                op.opcode, op.pos, op.rd_resume_position
+                op.opcode, op.pos, op.rd_resume_position.get()
             );
         }
 
@@ -5083,16 +5083,16 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position)
+        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position)
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position)
+        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
-        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position)
+        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position.get())
             .cloned()
             .unwrap_or_default();
 
@@ -5100,7 +5100,7 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position);
+        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get());
         let mut snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
             // Multi-frame: split snapshot_boxes into per-frame chunks.
             let mut frames = Vec::new();
@@ -7199,10 +7199,10 @@ where
     let mut next_resume_pos = 0i32;
     for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
         let snapshot_boxes = snapshot_for_guard(op);
-        let resume_pos = if op.rd_resume_position >= 0
-            && !snapshot_contains(&snapshots, op.rd_resume_position)
+        let resume_pos = if op.rd_resume_position.get() >= 0
+            && !snapshot_contains(&snapshots, op.rd_resume_position.get())
         {
-            op.rd_resume_position
+            op.rd_resume_position.get()
         } else {
             while snapshot_contains(&snapshots, next_resume_pos) {
                 next_resume_pos += 1;
@@ -7211,7 +7211,7 @@ where
             next_resume_pos += 1;
             resume_pos
         };
-        op.rd_resume_position = resume_pos;
+        op.rd_resume_position.set(resume_pos);
         snapshot_insert(
             &mut snapshots,
             resume_pos,

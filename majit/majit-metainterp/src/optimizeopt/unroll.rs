@@ -582,7 +582,7 @@ impl UnrollOptimizer {
                 exported_state.end_args.len(),
                 p1_patchguardop
                     .as_ref()
-                    .map(|p| p.rd_resume_position)
+                    .map(|p| p.rd_resume_position.get())
                     .unwrap_or(-99),
             );
         }
@@ -842,14 +842,14 @@ impl UnrollOptimizer {
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=[{}]",
                             op.opcode,
                             op.pos,
-                            op.rd_resume_position,
+                            op.rd_resume_position.get(),
                             rd_numb_len,
                             fa_raw.join(", ")
                         );
                     } else {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
-                            op.opcode, op.pos, op.rd_resume_position, rd_numb_len,
+                            op.opcode, op.pos, op.rd_resume_position.get(), rd_numb_len,
                         );
                     }
                 }
@@ -2971,7 +2971,7 @@ impl OptUnroll {
                         force_boxes,
                     )
                 });
-                let rd_resume_position = patch.rd_resume_position;
+                let rd_resume_position = patch.rd_resume_position.get();
                 for mut guard_op in emitted {
                     if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                         let arg_values: Vec<_> = guard_op
@@ -2996,7 +2996,7 @@ impl OptUnroll {
                     // GUARD_TRUE/GUARD_VALUE pairs; only the latter inherit
                     // resume metadata. Mirror the type filter via `is_guard()`.
                     if guard_op.opcode.is_guard() {
-                        guard_op.rd_resume_position = rd_resume_position;
+                        guard_op.rd_resume_position.set(rd_resume_position);
                         guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
                     }
                     optimizer.send_extra_operation(&guard_op, ctx);
@@ -3368,7 +3368,7 @@ impl OptUnroll {
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
                     if let Some(ref patch) = ctx.patchguardop {
-                        new_op.rd_resume_position = patch.rd_resume_position;
+                        new_op.rd_resume_position.set(patch.rd_resume_position.get());
                     }
                     // Re-register guard constant args from preamble's constant pool.
                     for &arg in &new_op.args {
@@ -4784,7 +4784,7 @@ fn clone_guard_snapshot_remapped(
     guard: &mut Op,
     ref_map: &HashMap<OpRef, OpRef>,
 ) {
-    let old_pos = guard.rd_resume_position;
+    let old_pos = guard.rd_resume_position.get();
     if old_pos < 0 {
         return;
     }
@@ -4822,7 +4822,7 @@ fn clone_guard_snapshot_remapped(
     if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
         snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
     }
-    guard.rd_resume_position = new_pos;
+    guard.rd_resume_position.set(new_pos);
 }
 
 impl Default for OptUnroll {

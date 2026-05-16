@@ -3569,8 +3569,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position >= 0
-                            && op.rd_resume_position < 0),
+                            && current_op.rd_resume_position.get() >= 0
+                            && op.rd_resume_position.get() < 0),
                         "Replace dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -3597,8 +3597,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position >= 0
-                            && op.rd_resume_position < 0),
+                            && current_op.rd_resume_position.get() >= 0
+                            && op.rd_resume_position.get() < 0),
                         "Restart dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -4093,7 +4093,7 @@ impl Optimizer {
             }
         });
         op.fail_args = last.fail_args.clone();
-        op.rd_resume_position = last.rd_resume_position;
+        op.rd_resume_position.set(last.rd_resume_position.get());
         // bridgeopt.py parity: the class-knowledge bitfield baked into
         // rd_numb is indexed by the donor's per-livebox type layout.
         // `deserialize_optimizer_knowledge` reads that bitfield using the
@@ -4294,7 +4294,7 @@ impl Optimizer {
         // compile.py:855 _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
-        newop.rd_resume_position = op.rd_resume_position;
+        newop.rd_resume_position.set(op.rd_resume_position.get());
         newop
     }
 }

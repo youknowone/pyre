@@ -297,7 +297,7 @@ impl Trace {
     /// Called after record_guard* to associate a snapshot.
     pub fn set_last_op_resume_position(&mut self, snapshot_id: i32) {
         if let Some(op) = self.ops.last_mut() {
-            op.rd_resume_position = snapshot_id;
+            op.rd_resume_position.set(snapshot_id);
         }
     }
 
