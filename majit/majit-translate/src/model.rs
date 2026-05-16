@@ -757,23 +757,23 @@ pub enum OpKind {
     /// If condition is true, call the function. Always produces void.
     /// RPython: `COND_CALL(condition, funcptr, calldescr, args...)`
     ConditionalCall {
-        condition: ValueId,
+        condition: crate::flowspace::model::Variable,
         funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
     },
     /// jtransform.py:1687 — `conditional_call_value_{ir}_{reskind}`.
     /// If value is falsy (0/NULL/None), call the function and return its result.
     /// RPython: `COND_CALL_VALUE(value, funcptr, calldescr, args...)`
     ConditionalCallValue {
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         result_kind: char,
     },
 

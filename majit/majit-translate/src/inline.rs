@@ -963,14 +963,22 @@ fn remap_op_kind(
             args_i,
             args_r,
             args_f,
-        } => OpKind::ConditionalCall {
-            condition: remap(condition),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("ConditionalCall arg/condition must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::ConditionalCall {
+                condition: remap_var(condition),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+            }
+        }
         OpKind::ConditionalCallValue {
             value,
             funcptr,
@@ -979,15 +987,23 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::ConditionalCallValue {
-            value: remap(value),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("ConditionalCallValue arg/value must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::ConditionalCallValue {
+                value: remap_var(value),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::Abort { kind } => OpKind::Abort { kind: kind.clone() },
     }
 }
@@ -1288,10 +1304,16 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let mut refs = vec![*condition];
-            refs.extend(args_i);
-            refs.extend(args_r);
-            refs.extend(args_f);
+            let g = graph
+                .expect("ConditionalCall requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("ConditionalCall arg/condition must be a known Variable on graph")
+            };
+            let mut refs = vec![project(condition)];
+            refs.extend(args_i.iter().map(project));
+            refs.extend(args_r.iter().map(project));
+            refs.extend(args_f.iter().map(project));
             refs
         }
         OpKind::ConditionalCallValue {
@@ -1301,10 +1323,16 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let mut refs = vec![*value];
-            refs.extend(args_i);
-            refs.extend(args_r);
-            refs.extend(args_f);
+            let g = graph
+                .expect("ConditionalCallValue requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("ConditionalCallValue arg/value must be a known Variable on graph")
+            };
+            let mut refs = vec![project(value)];
+            refs.extend(args_i.iter().map(project));
+            refs.extend(args_r.iter().map(project));
+            refs.extend(args_f.iter().map(project));
             refs
         }
         OpKind::RecordKnownResult {

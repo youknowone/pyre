@@ -2942,6 +2942,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn _rewrite_op_cond_call(
         &mut self,
+        graph: &FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -2984,7 +2985,7 @@ impl<'a> Transformer<'a> {
             "conditional_call target must not force virtualizable"
         );
         // jtransform.py:1678-1680: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists(func_args);
+        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, func_args);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
@@ -3001,9 +3002,10 @@ impl<'a> Transformer<'a> {
             detail: format!("{rewritten_opname} → {rewritten_opname}_ir_{result_kind}"),
         });
         self.calls_classified += 1;
+        let condition_or_value_var = graph.must_variable(condition_or_value);
         let call_kind = if is_value {
             OpKind::ConditionalCallValue {
-                value: condition_or_value,
+                value: condition_or_value_var,
                 funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
@@ -3013,7 +3015,7 @@ impl<'a> Transformer<'a> {
             }
         } else {
             OpKind::ConditionalCall {
-                condition: condition_or_value,
+                condition: condition_or_value_var,
                 funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
@@ -3041,13 +3043,14 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_conditional_call(
         &mut self,
+        graph: &FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        self._rewrite_op_cond_call(op, target, args, result_ty, graph_name, false)
+        self._rewrite_op_cond_call(graph, op, target, args, result_ty, graph_name, false)
     }
 
     /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`
@@ -3056,13 +3059,14 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_conditional_call_value(
         &mut self,
+        graph: &FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        self._rewrite_op_cond_call(op, target, args, result_ty, graph_name, true)
+        self._rewrite_op_cond_call(graph, op, target, args, result_ty, graph_name, true)
     }
 
     /// RPython: `Transformer.rewrite_op_jit_marker(op)` (jtransform.py:1658-1663)
@@ -4354,14 +4358,22 @@ fn remap_op(
             args_i,
             args_r,
             args_f,
-        } => OpKind::ConditionalCall {
-            condition: remap_value(*condition, aliases),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: remap_list(args_i, aliases),
-            args_r: remap_list(args_r, aliases),
-            args_f: remap_list(args_f, aliases),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("ConditionalCall arg/condition must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::ConditionalCall {
+                condition: remap_var(condition),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+            }
+        }
         OpKind::ConditionalCallValue {
             value,
             funcptr,
@@ -4370,15 +4382,23 @@ fn remap_op(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::ConditionalCallValue {
-            value: remap_value(*value, aliases),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: remap_list(args_i, aliases),
-            args_r: remap_list(args_r, aliases),
-            args_f: remap_list(args_f, aliases),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("ConditionalCallValue arg/value must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::ConditionalCallValue {
+                value: remap_var(value),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
     };
     SpaceOperation {
         result: op.result,
