@@ -1720,8 +1720,8 @@ impl AbstractShortPreambleBuilderState {
         &mut self,
         preamble_op: &Op,
         already_in_short: &HashSet<OpRef>,
-        all_produced: &HashMap<OpRef, ProducedShortOp>,
-        pos_to_key: &HashMap<OpRef, OpRef>,
+        all_produced: &VecAssoc<OpRef, ProducedShortOp>,
+        pos_to_key: &VecAssoc<OpRef, OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) -> Op {
@@ -1904,18 +1904,21 @@ fn build_short_preamble_struct_from_ops(
 /// Build reverse index: preamble_op.pos → key for entries where they differ.
 /// In RPython, Box identity makes this unnecessary. In majit, produce_arg
 /// returns preamble_op.pos which may differ from the key in produced_short_boxes.
-fn build_pos_to_key(produced: &HashMap<OpRef, ProducedShortOp>) -> HashMap<OpRef, OpRef> {
-    produced
-        .iter()
-        .filter(|(key, prod)| **key != prod.preamble_op.pos.get())
-        .map(|(key, prod)| (prod.preamble_op.pos.get(), *key))
-        .collect()
+fn build_pos_to_key(produced: &VecAssoc<OpRef, ProducedShortOp>) -> VecAssoc<OpRef, OpRef> {
+    let mut out = VecAssoc::new();
+    for (key, prod) in produced.iter() {
+        let pos = prod.preamble_op.pos.get();
+        if *key != pos {
+            out.insert(pos, *key);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
 pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
-    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+    produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
 }
 
 impl ShortPreambleBuilder {
@@ -1924,7 +1927,10 @@ impl ShortPreambleBuilder {
         short_boxes: &[(OpRef, ProducedShortOp)],
         short_inputargs: &[OpRef],
     ) -> Self {
-        let produced_short_boxes = short_boxes.iter().cloned().collect();
+        let mut produced_short_boxes = VecAssoc::new();
+        for (k, v) in short_boxes {
+            produced_short_boxes.insert(*k, v.clone());
+        }
         ShortPreambleBuilder {
             state: AbstractShortPreambleBuilderState {
                 short_inputargs: if short_inputargs.is_empty() {
@@ -2109,7 +2115,7 @@ impl ShortPreambleBuilder {
 /// `use_box()` pops JUMP, appends deps/guards/op, re-appends JUMP.
 #[derive(Clone, Debug)]
 pub struct ExtendedShortPreambleBuilder {
-    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
+    produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
@@ -2253,7 +2259,7 @@ impl ExtendedShortPreambleBuilder {
         arg: OpRef,
         inputargs_set: &HashSet<OpRef>,
         constants_set: &HashSet<u32>,
-        pos_to_key: &HashMap<OpRef, OpRef>,
+        pos_to_key: &VecAssoc<OpRef, OpRef>,
     ) -> bool {
         if self.short_results.contains(&arg)
             || inputargs_set.contains(&arg)
