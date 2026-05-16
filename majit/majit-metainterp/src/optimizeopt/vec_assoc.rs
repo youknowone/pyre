@@ -94,4 +94,12 @@ impl<K: Eq, V> VecAssoc<K, V> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
         self.entries.iter_mut().map(|(k, v)| (&*k, v))
     }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, v)| v)
+    }
 }

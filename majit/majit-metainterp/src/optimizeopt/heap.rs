@@ -661,7 +661,7 @@ impl ArrayCachedItem {
 /// 1:1.
 struct ArrayCacheSubMap {
     /// heap.py:302: const_indexes = {} (int -> ArrayCachedItem)
-    const_indexes: HashMap<i64, ArrayCachedItem>,
+    const_indexes: crate::optimizeopt::vec_assoc::VecAssoc<i64, ArrayCachedItem>,
     /// heap.py:305-306: cached_varindex_triples = None
     /// List of (arrayinfo, indexbox, resbox). RPython uses Python object
     /// identity for arrayinfo; majit uses the canonical array OpRef.
@@ -671,7 +671,7 @@ struct ArrayCacheSubMap {
 impl ArrayCacheSubMap {
     fn new() -> Self {
         ArrayCacheSubMap {
-            const_indexes: HashMap::new(),
+            const_indexes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cached_varindex_triples: None,
         }
     }
@@ -749,7 +749,7 @@ pub struct OptHeap {
     cached_fields: Vec<(u32, DescrRef, CachedField)>,
     /// Immutable (pure) field cache — separate to survive all invalidation.
     /// RPython heap.py: is_always_pure() fields are never invalidated.
-    immutable_cached_fields: HashMap<FieldKey, OpRef>,
+    immutable_cached_fields: crate::optimizeopt::vec_assoc::VecAssoc<FieldKey, OpRef>,
     /// heap.py:332: cached_arrayitems OrderedDict keyed by array descr.
     cached_arrayitems: Vec<(u32, DescrRef, ArrayCacheSubMap)>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
@@ -774,7 +774,7 @@ pub struct OptHeap {
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: HashMap<OpRef, Vec<OpRef>>,
+    heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<OpRef>>,
 
     /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
@@ -784,7 +784,10 @@ pub struct OptHeap {
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py:100 args_dict / args_eq via history.py:204 same_box).
-    cached_dict_reads: HashMap<usize, HashMap<[DictArgKey; 2], OpRef>>,
+    cached_dict_reads: crate::optimizeopt::vec_assoc::VecAssoc<
+        usize,
+        crate::optimizeopt::vec_assoc::VecAssoc<[DictArgKey; 2], OpRef>,
+    >,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
     /// array descr) → extradescrs[0] dict identity.
     ///
@@ -797,18 +800,18 @@ pub struct OptHeap {
     /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
     /// (the registration is gated by a `cached_dict_reads` first-encounter
     /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
-    corresponding_array_descrs: HashMap<u32, (DescrRef, usize)>,
+    corresponding_array_descrs: crate::optimizeopt::vec_assoc::VecAssoc<u32, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: HashMap<FieldKey, OpRef>,
+    quasi_immut_cache: crate::optimizeopt::vec_assoc::VecAssoc<FieldKey, OpRef>,
 }
 
 impl OptHeap {
     pub fn new() -> Self {
         OptHeap {
             cached_fields: Vec::new(),
-            immutable_cached_fields: HashMap::new(),
+            immutable_cached_fields: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cached_arrayitems: Vec::new(),
             seen_guard_not_invalidated: false,
             postponed_op: None,
@@ -816,11 +819,11 @@ impl OptHeap {
             seen_allocation: Vec::new(),
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
-            heapc_deps: HashMap::new(),
+            heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_emitted_removed: false,
-            cached_dict_reads: HashMap::new(),
-            corresponding_array_descrs: HashMap::new(),
-            quasi_immut_cache: HashMap::new(),
+            cached_dict_reads: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            corresponding_array_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            quasi_immut_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -909,7 +912,9 @@ impl OptHeap {
     /// unescaped; otherwise escape the value immediately.
     fn escape_from_write(&mut self, container: OpRef, value: OpRef) {
         if vb_get(&self.unescaped, container.raw()) && vb_get(&self.unescaped, value.raw()) {
-            self.heapc_deps.entry(container).or_default().push(value);
+            self.heapc_deps
+                .entry_or_insert_with(container, Vec::new)
+                .push(value);
         } else if !value.is_none() {
             self.escape_box(value);
         }
@@ -1009,8 +1014,7 @@ impl OptHeap {
     fn arrayitem_cache(&mut self, descr: &DescrRef, index: i64) -> &mut ArrayCachedItem {
         self.arrayitem_submap(&descr)
             .const_indexes
-            .entry(index)
-            .or_insert_with(|| ArrayCachedItem::new(index))
+            .entry_or_insert_with(index, || ArrayCachedItem::new(index))
     }
 
     fn get_cached_array_submap(&self, descr_idx: u32) -> Option<&ArrayCacheSubMap> {
@@ -1047,8 +1051,7 @@ impl OptHeap {
             if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
                 submap
                     .const_indexes
-                    .entry(index)
-                    .or_insert_with(|| ArrayCachedItem::new(index))
+                    .entry_or_insert_with(index, || ArrayCachedItem::new(index))
                     .register_info(array);
             }
             return;
@@ -1560,7 +1563,8 @@ impl OptHeap {
         // skip it. Mirror this — `or_default()` would unconditionally
         // re-register and diverge from RPython.
         if !self.cached_dict_reads.contains_key(&descr1_id) {
-            self.cached_dict_reads.insert(descr1_id, HashMap::new());
+            self.cached_dict_reads
+                .insert(descr1_id, crate::optimizeopt::vec_assoc::VecAssoc::new());
             self.corresponding_array_descrs
                 .insert(descr2.index(), (descr2, descr1_id));
         }
@@ -3510,7 +3514,7 @@ impl Optimization for OptHeap {
             if descr.get_descr_index() == -1 {
                 continue;
             }
-            for (&index, cai) in &submap.const_indexes {
+            for (&index, cai) in submap.const_indexes.iter() {
                 // heap.py:852: if cf._lazy_set: continue
                 if cai.lazy_set.is_some() {
                     continue;
