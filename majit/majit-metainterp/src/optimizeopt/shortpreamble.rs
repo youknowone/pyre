@@ -86,7 +86,7 @@ pub struct ShortPreamble {
     /// survive across compilations. In pyre, OpRef indices reference the
     /// loop's constant pool. This map captures (value, type) for each
     /// constant OpRef so bridges can re-register them in their own pool.
-    pub constants: HashMap<u32, (i64, majit_ir::Type)>,
+    pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
     /// Used by inline_short_preamble to propagate PtrInfo to jump_args
@@ -111,7 +111,7 @@ impl ShortPreamble {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
-            constants: HashMap::new(),
+            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -298,7 +298,7 @@ impl CollectedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: HashMap::new(),
+            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -996,7 +996,7 @@ impl CollectedExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: HashMap::new(),
+            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -1832,7 +1832,7 @@ fn build_short_preamble_struct_from_ops(
     // In RPython, Const objects are stored in op args and are GC-tracked. Here,
     // we snapshot the loop's constant pool entries for any OpRef referenced by
     // short preamble ops that isn't defined by the ops themselves.
-    let mut constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
+    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)> = crate::optimizeopt::vec_assoc::VecAssoc::new();
     // RPython parity: typed `OpRef::Const{Int,Float,Ptr}` carry the type
     // tag intrinsically (history.py:220/261/307). Only `OpRef::Untyped`
     // (legacy `from_raw` producers) needs the lockstep side-table; missing
@@ -2123,7 +2123,7 @@ pub struct ExtendedShortPreambleBuilder {
     short_jump_args: Vec<OpRef>,
     pub target_token: u64,
     /// RPython parity: remap Phase 1 preamble OpRefs → current inputarg OpRefs.
-    phase1_to_inputarg: HashMap<OpRef, OpRef>,
+    phase1_to_inputarg: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     /// B.6.4 canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
     /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
     /// `produced_short_boxes` carries dual entries (source-key plus
@@ -2148,7 +2148,7 @@ impl ExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             short_jump_args: Vec::new(),
             target_token,
-            phase1_to_inputarg: HashMap::new(),
+            phase1_to_inputarg: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             recorded_canonical_results: HashSet::new(),
         }
     }
@@ -2680,7 +2680,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         used_boxes: Vec::new(),
         jump_args: Vec::new(),
         exported_state: None,
-        constants: HashMap::new(),
+        constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         phase1_inputargs: None,
         inputarg_infos: Vec::new(),
     }
