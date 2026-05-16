@@ -3,6 +3,7 @@ pub mod descr;
 pub mod descr_registry;
 pub mod effectinfo;
 pub mod forwarded;
+pub mod op_descr;
 pub mod op_type_index;
 pub mod resoperation;
 pub mod resumecode;

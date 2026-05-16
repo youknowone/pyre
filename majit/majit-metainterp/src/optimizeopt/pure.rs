@@ -39,7 +39,7 @@ impl PureOpKey {
         PureOpKey {
             opcode: op.opcode,
             args: op.args.to_vec(),
-            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+            descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
 
@@ -50,7 +50,7 @@ impl PureOpKey {
         PureOpKey {
             opcode: OpCode::call_pure_for_type(op.result_type()),
             args: op.args[start_index..].to_vec(),
-            descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+            descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
 }
@@ -546,7 +546,7 @@ impl OptPure {
     ///   `self._same_args(known_result_op, op, 1, start_index)` → args check
     /// No opcode comparison.
     fn lookup_known_result(&self, op: &Op, start_index: usize, ctx: &OptContext) -> Option<OpRef> {
-        let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+        let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
         for entry in &self.known_result_call_pure {
             if entry.descr_identity != op_descr_identity {
                 continue;
@@ -567,10 +567,7 @@ impl OptPure {
     }
 
     fn call_pure_can_raise(op: &Op) -> bool {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.get_extra_info().check_can_raise(true))
+        op.with_call_descr(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 
@@ -578,7 +575,7 @@ impl OptPure {
     /// Searches preamble entries with forwarding-aware arg matching.
     /// On match, forces PreambleOp (in-place replacement) and returns result.
     fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
-        let descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+        let descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
         for entry in &mut self.preamble_pure_ops {
             if entry.opcode != op.opcode {
                 continue;
@@ -881,7 +878,7 @@ fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
 }
 
 fn try_constant_fold_pure_getfield(op: &Op, ctx: &OptContext) -> Option<Value> {
-    let descr = op.descr.as_ref()?;
+    let descr = op.getdescr()?;
     let field_descr = descr.as_field_descr()?;
     let addr = constant_ptr_value(op.arg(0), ctx)? + field_descr.offset();
 
@@ -1098,7 +1095,7 @@ impl Optimization for OptPure {
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
                 self.known_result_call_pure.push(KnownResultEntry {
-                    descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
+                    descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
                     args: op.args[1..].to_vec(),
                     result: op.arg(0),
                 });
@@ -1140,7 +1137,7 @@ impl Optimization for OptPure {
         // pure.py:236-238: optimize_COND_CALL_VALUE_I/R → start_index=1
         if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
             let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
-            let op_descr_identity = op.descr.as_ref().map(majit_ir::descr::descr_identity);
+            let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
@@ -1154,7 +1151,7 @@ impl Optimization for OptPure {
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
                     let old_descr_identity =
-                        old_op.descr.as_ref().map(majit_ir::descr::descr_identity);
+                        old_op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
@@ -2473,7 +2470,7 @@ mod tests {
 
         let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef::int_op(0)]);
         op.pos.set(OpRef::int_op(2));
-        op.descr = Some(call_descr);
+        op.setdescr(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(1));
@@ -2516,7 +2513,7 @@ mod tests {
             &[OpRef::int_op(100), OpRef::int_op(0), OpRef::int_op(1)],
         );
         op.pos.set(OpRef::int_op(2));
-        op.descr = Some(majit_ir::descr::make_call_descr(
+        op.setdescr(majit_ir::descr::make_call_descr(
             vec![
                 majit_ir::Type::Int,
                 majit_ir::Type::Int,
@@ -2565,7 +2562,7 @@ mod tests {
             &[OpRef::int_op(100), OpRef::int_op(0)],
         );
         op.pos.set(OpRef::int_op(2));
-        op.descr = Some(majit_ir::descr::make_call_descr(
+        op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
             majit_ir::EffectInfo::new(

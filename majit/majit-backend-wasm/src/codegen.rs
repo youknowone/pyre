@@ -1249,7 +1249,8 @@ fn emit_resolve(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, o
 
 /// Extract field offset from op's descr (FieldDescr).
 fn field_offset_from_descr(op: &Op) -> u64 {
-    if let Some(ref descr) = op.descr {
+    let __descr_arc_descr = op.getdescr();
+    if let Some(ref descr) = __descr_arc_descr.as_ref() {
         if let Some(fd) = descr.as_field_descr() {
             return fd.offset() as u64;
         }
@@ -1267,15 +1268,9 @@ fn array_len_offset_from_descr(_op: &Op) -> u64 {
 /// Compute array element address: base + base_size + index * item_size.
 /// Leaves i32 address on the wasm stack.
 fn emit_array_addr(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, op: &Op) {
-    let (base_size, item_size) = if let Some(ref descr) = op.descr {
-        if let Some(ad) = descr.as_array_descr() {
-            (ad.base_size() as u64, ad.item_size() as u64)
-        } else {
-            (16, 8) // default
-        }
-    } else {
-        (16, 8)
-    };
+    let (base_size, item_size) = op
+        .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
+        .unwrap_or((16, 8));
     emit_resolve(sink, constants, op.arg(0)); // array ptr
     sink.i32_wrap_i64();
     // base + base_size + index * item_size

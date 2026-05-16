@@ -1334,7 +1334,8 @@ impl Optimization for OptString {
             | OpCode::CallPureR
             | OpCode::CallPureF
             | OpCode::CallPureN => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         if ei.has_oopspec() {

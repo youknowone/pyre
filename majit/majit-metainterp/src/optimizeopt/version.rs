@@ -152,8 +152,8 @@ impl LoopVersion {
                 continue;
             }
             // version.py:104-105
-            let old_descr = match &op.descr {
-                Some(d) => d.clone(),
+            let old_descr = match op.getdescr() {
+                Some(d) => d,
                 None => continue,
             };
             // version.py:107: descr = olddescr.clone()
@@ -163,7 +163,7 @@ impl LoopVersion {
                 continue;
             };
             // version.py:108: op.setdescr(descr)
-            op.descr = Some(new_descr.clone());
+            op.setdescr(new_descr.clone());
             // version.py:109-114: if descr.loop_version()
             let Some(new_fd) = new_descr.as_fail_descr() else {
                 continue;

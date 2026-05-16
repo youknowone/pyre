@@ -291,7 +291,7 @@ impl Guard {
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
         let mut guard_op = Op::new(self.op.opcode, &[compare.pos.get()]);
-        guard_op.descr = Some(fresh_descr);
+        guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.fail_args = Some(label_args.into());
         // copy_all_attributes_from parity: compile.py:861-872 copies
@@ -342,17 +342,15 @@ impl Guard {
         // ResumeGuardCopiedDescr.prev via get_resumestorage()).
         let my_descr = self
             .op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("guard.py:120 myop.getdescr() must exist");
         let donor_descr = other
             .op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("guard.py:121 otherop.getdescr() must exist");
         // compile.py:861-872 / 840-842: in-place copy preserving
         // myop.descr identity (`fail_index` / status / subtype tag).
-        crate::compile::copy_all_attributes_from(my_descr, donor_descr);
+        crate::compile::copy_all_attributes_from(&my_descr, &donor_descr);
         self.op.rd_resume_position.set(other.op.rd_resume_position.get());
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
         self.op.fail_args = other.op.fail_args.clone();
@@ -392,7 +390,7 @@ impl Guard {
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
         let mut guard = Op::new(self.op.opcode, &[cmp_op.pos.get()]);
-        guard.descr = self.op.descr.clone();
+        guard.descr = self.op.getdescr();
         guard.fail_args = self.op.fail_args.clone();
         guard.fail_arg_types = self.op.fail_arg_types.clone();
         guard.rd_resume_position.set(self.op.rd_resume_position.get());
@@ -607,7 +605,8 @@ impl GuardStrengthenOpt {
             if !op.opcode.is_guard() {
                 continue;
             }
-            if let Some(ref descr) = op.descr {
+            let __descr_arc_descr = op.getdescr();
+            if let Some(ref descr) = __descr_arc_descr.as_ref() {
                 if let Some(fd) = descr.as_fail_descr() {
                     if fd.loop_version() {
                         // `version.py:32-36 leads_to[descr]` keys by descr
@@ -718,8 +717,7 @@ impl GuardStrengthenOpt {
                     // `version_info` (stale `leads_to` entry).
                     let other_descr = other
                         .op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("guard.py:295 other.op.getdescr() must exist");
                     assert!(
                         other_descr.as_fail_descr().is_some(),
@@ -730,8 +728,7 @@ impl GuardStrengthenOpt {
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
                     let tg_descr = tg
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("guard.py:297 transitive_guard.descr must exist");
                     assert!(
                         tg_descr.as_fail_descr().is_some(),
@@ -934,9 +931,9 @@ impl OptGuard {
     /// If the current guard has no descriptor and the previous guard had
     /// one, reuse it.
     fn try_fuse_descr(&self, op: &mut Op) {
-        if op.descr.is_none() {
+        if !op.has_descr() {
             if let Some(ref descr) = self.last_guard_descr {
-                op.descr = Some(descr.clone());
+                op.setdescr(descr.clone());
             }
         }
     }
@@ -999,7 +996,7 @@ impl Optimization for OptGuard {
         self.try_fuse_descr(&mut fused_op);
 
         // Track this guard's descriptor for the next consecutive guard.
-        self.last_guard_descr = fused_op.descr.clone();
+        self.last_guard_descr = fused_op.getdescr();
 
         OptimizationResult::Emit(fused_op)
     }
@@ -1033,8 +1030,8 @@ mod tests {
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
-            if op.opcode.is_guard() && op.descr.is_none() {
-                op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+            if op.opcode.is_guard() && !op.has_descr() {
+                op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
         }
     }

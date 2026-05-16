@@ -440,10 +440,10 @@ pub(crate) fn build_guard_metadata(
             // lookups can resolve through the descr Arc directly.
             // Skip non-resume FailDescrs (whose
             // `set_fail_index_per_trace` panics by default).
-            if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            let __descr_arc = op.getdescr();
+            if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
                 if op
-                    .descr
-                    .as_ref()
+                    .getdescr()
                     .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
                 {
                     fd.set_fail_index_per_trace(fail_index);
@@ -462,11 +462,7 @@ pub(crate) fn build_guard_metadata(
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
         // and finally the incremental guard-point `value_types` map.
-        let descr_types = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_fail_descr())
-            .map(|fd| fd.fail_arg_types());
+        let descr_types = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec());
         let exit_types: Vec<Type> = if is_finish {
             // FINISH ops are always emitted with one of the
             // `_DoneWithThisFrameDescr` family (compile.py:623-672) or
@@ -585,7 +581,7 @@ pub(crate) fn build_guard_metadata(
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let (_num_failargs, vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &exit_types, fvc_ref);
+                    rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &exit_types, fvc_ref);
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -655,12 +651,15 @@ pub(crate) fn build_guard_metadata(
                 Some(crate::resume::ResumeStorage::new(
                     numb.to_vec(),
                     op.resolved_rd_consts()
+                        .as_deref()
                         .map(<[Const]>::to_vec)
                         .unwrap_or_default(),
                     op.resolved_rd_virtuals()
+                        .as_deref()
                         .map(<[std::rc::Rc<majit_ir::RdVirtualInfo>]>::to_vec)
                         .unwrap_or_default(),
                     op.resolved_rd_pendingfields()
+                        .as_deref()
                         .map(<[majit_ir::GuardPendingFieldEntry]>::to_vec)
                         .unwrap_or_default(),
                 ))
@@ -694,7 +693,7 @@ pub(crate) fn build_guard_metadata(
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                     let (num_failargs, vable_values, vref_values, frames) =
-                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &exit_types, fvc_ref);
+                        rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &exit_types, fvc_ref);
                     debug_assert!(
                         vref_values.len() & 1 == 0,
                         "vref_values length must be even, got {}",
@@ -741,7 +740,8 @@ pub(crate) fn build_guard_metadata(
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             // Follow `descr.prev` so sharing-path guards see the donor's
             // const pool (compile.py:849 get_resumestorage).
-            let rd_consts_ref = op.resolved_rd_consts().unwrap_or(&[]);
+            let rd_consts_arc = op.resolved_rd_consts();
+            let rd_consts_ref: &[Const] = rd_consts_arc.as_deref().unwrap_or(&[]);
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = majit_ir::resumedata::untag(tagged);
                 match tagbits {
@@ -1005,7 +1005,7 @@ pub(crate) fn build_guard_metadata(
                             // pf_op is always a descr-bearing setfield op.
                             let descr = pf
                                 .descr
-                                .as_ref()
+                                .clone()
                                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
                             // resume.py:1003-1007: itemindex >= 0 → setarrayitem.
                             let item_index = if descr.as_array_descr().is_some() {
@@ -1083,7 +1083,7 @@ pub(crate) fn build_guard_metadata(
                 recovery_layout,
                 resume_layout,
                 storage,
-                descr: op.descr.clone(),
+                descr: op.getdescr(),
                 op_arg_types_for_jump: None,
             },
         );
@@ -1132,7 +1132,7 @@ pub(crate) fn merge_backend_exit_layouts(
         let descr_from_op = layout
             .source_op_index
             .and_then(|idx| ops.get(idx))
-            .and_then(|op| op.descr.clone())
+            .and_then(|op| op.getdescr())
             .or_else(|| {
                 Some(if layout.is_finish {
                     make_finish_fail_descr_typed(
@@ -1421,7 +1421,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             Some(op) => op.opcode == OpCode::Jump,
             None => !layout.is_finish,
         };
-        let descr_from_op = source_op.and_then(|op| op.descr.clone()).or_else(|| {
+        let descr_from_op = source_op.and_then(|op| op.getdescr()).or_else(|| {
             Some(if layout.is_finish {
                 make_finish_fail_descr_typed(layout.exit_types.clone(), layout.is_exception_exit)
             } else {
@@ -1624,7 +1624,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     recovery_layout: None,
                     resume_layout: None,
                     storage: None,
-                    descr: op.descr.clone(),
+                    descr: op.getdescr(),
                     op_arg_types_for_jump,
                 },
             );
@@ -1960,7 +1960,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         next_opref += 1;
         let mut op = Op::new(opcode, &[vable_box]);
         op.pos.set(new_opref);
-        op.descr = Some(descr);
+        op.setdescr(descr);
         extra_ops.push(op);
         set_local_forwarded(&mut forwarding, old_opref, new_opref);
         i += 1;
@@ -1980,7 +1980,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box]);
         arr_load.pos.set(array_opref);
-        arr_load.descr = Some(array_field_descr.clone());
+        arr_load.setdescr(array_field_descr.clone());
         extra_ops.push(arr_load);
 
         let array_descr = vinfo
@@ -2018,7 +2018,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_opref]);
                 ptr_load.pos.set(ptr_opref);
-                ptr_load.descr = Some(majit_ir::descr::make_field_descr(
+                ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
                     std::mem::size_of::<usize>(),
                     Type::Int,
@@ -2052,7 +2052,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             next_opref += 1;
             let mut elem_op = Op::new(item_opcode, &[item_base, const_opref]);
             elem_op.pos.set(new_opref);
-            elem_op.descr = Some(item_descr.clone());
+            elem_op.setdescr(item_descr.clone());
             extra_ops.push(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, new_opref);
             i += 1;
@@ -2585,7 +2585,7 @@ mod tests {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
-        guard.descr = Some(descr);
+        guard.setdescr(descr);
         guard.fail_args = Some(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_int(1)
@@ -2634,7 +2634,7 @@ mod tests {
             .as_fail_descr()
             .unwrap()
             .set_fail_arg_types(fail_arg_types.clone());
-        guard.descr = Some(descr);
+        guard.setdescr(descr);
         guard.fail_args = Some(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_ref(1),
@@ -2669,7 +2669,7 @@ mod tests {
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)]);
                 op.pos.set(OpRef::int_op(11));
-                op.descr = Some(majit_ir::descr::make_field_descr(
+                op.setdescr(majit_ir::descr::make_field_descr(
                     16,
                     8,
                     Type::Int,
@@ -4936,8 +4936,7 @@ impl FailDescr for CompileLoopVersionDescr {
 /// ResumeGuardDescr)`).
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
     let src_descr = source_op
-        .descr
-        .as_ref()
+        .getdescr()
         .expect("guard.py:90: self.op.getdescr() must exist");
     // compile.py:862 `other = other.get_resumestorage()`: if the source
     // is a `ResumeGuardCopiedDescr`, resolve to its `prev` so we read

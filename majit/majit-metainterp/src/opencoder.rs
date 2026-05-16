@@ -3501,7 +3501,7 @@ mod tests {
         let mut it = buf.get_byte_iter();
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GuardTrue);
-        assert!(op.descr.is_none()); // guards do NOT carry a resolved descr
+        assert!(!op.has_descr()); // guards do NOT carry a resolved descr
         assert_eq!(op.rd_resume_position.get(), 7); // opencoder.py:423 parity
     }
 
@@ -3533,7 +3533,7 @@ mod tests {
         let mut it = buf.get_byte_iter();
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
-        let resolved = op.descr.expect("descr must resolve");
+        let resolved = op.getdescr().expect("descr must resolve");
         assert_eq!(resolved.index(), 99);
         assert_eq!(op.rd_resume_position.get(), -1); // non-guard sentinel
     }
@@ -3551,7 +3551,7 @@ mod tests {
         let mut it = buf.get_byte_iter();
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
-        assert!(op.descr.is_none());
+        assert!(!op.has_descr());
         assert_eq!(op.rd_resume_position.get(), -1);
     }
 

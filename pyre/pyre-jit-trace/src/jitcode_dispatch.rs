@@ -5871,11 +5871,10 @@ mod tests {
             "FINISH args must carry the bubbled exc OpRef",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr_exc),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
             "FINISH descr must be exit_frame_with_exception_descr_ref",
         );
     }
@@ -6046,11 +6045,10 @@ mod tests {
             "Finish args must select registers_r[3], not registers_r[0]",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("Finish must carry done_with_this_frame_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "Finish descr must be the exact instance the dispatcher was handed",
         );
     }
@@ -6135,11 +6133,10 @@ mod tests {
         assert_eq!(last.opcode, majit_ir::OpCode::Finish);
         assert_eq!(last.args.as_slice(), &[expected_arg]);
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("Finish must carry done_with_this_frame_descr_int");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr_int),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr_int),
             "int_return/i must use done_with_this_frame_descr_int, not _ref",
         );
     }
@@ -6238,11 +6235,10 @@ mod tests {
             "void_return/ FINISH must carry zero args (RPython exits = [])",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("Finish must carry done_with_this_frame_descr_void");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr_void),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr_void),
             "void_return/ must use done_with_this_frame_descr_void, not _ref",
         );
     }
@@ -6597,11 +6593,10 @@ mod tests {
             "FINISH args must carry the exception OpRef from registers_r[src]",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr_exc),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
             "FINISH descr must be the caller-supplied \
              `exit_frame_with_exception_descr_ref`, not \
              `done_with_this_frame_descr_ref`",
@@ -6743,11 +6738,10 @@ mod tests {
             "FINISH args must carry the standing last_exc_value OpRef",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("FINISH must carry exit_frame_with_exception_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr_exc),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr_exc),
             "reraise/ at top-level must use exit_frame_with_exception_descr_ref",
         );
     }
@@ -8517,11 +8511,10 @@ mod tests {
             "CallR args must be [funcptr, ...args] from registers_i+registers_r",
         );
         let recorded_descr = call_op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("CallR must carry the calldescr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &call_descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallR descr must be descr_refs[1] (not decoy at index 0)",
         );
         // GuardNoException follows immediately after.
@@ -9212,11 +9205,10 @@ mod tests {
             "CallI args must be [funcptr, ...args] from registers_i+registers_r",
         );
         let recorded_descr = call_op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("CallI must carry the calldescr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &call_descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallI descr must be descr_refs[1] (not decoy at index 0)",
         );
         // dst writeback into the int bank (NOT the r bank).
@@ -9385,11 +9377,10 @@ mod tests {
              permutation when descr.arg_types=[Int, Int, Ref, Ref]",
         );
         let recorded_descr = call_op
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("CallR must carry the calldescr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &call_descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallR descr must be descr_refs[1] (not decoy at index 0)",
         );
         // dst writeback into registers_r[0].
@@ -9654,19 +9645,17 @@ mod tests {
             .iter()
             .find(|o| {
                 o.opcode == majit_ir::OpCode::Finish
-                    && o.descr
-                        .as_ref()
-                        .map(|d| std::sync::Arc::ptr_eq(d, &descr))
+                    && o.getdescr()
+                        .map(|d| std::sync::Arc::ptr_eq(&d, &descr))
                         .unwrap_or(false)
             })
             .expect("outermost Finish with done-with-this-frame descr must exist");
         assert_eq!(outermost_finish.args.len(), 1);
         let recorded_descr = outermost_finish
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("Finish must carry done_with_this_frame_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "Finish descr must be the exact instance the dispatcher was handed",
         );
     }
@@ -10320,11 +10309,10 @@ mod tests {
             "GetfieldGcI args must be [obj] (the r-reg source)",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("GetfieldGcI must carry the field descr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "GetfieldGcI descr must be descr_refs[d] (the field descr)",
         );
         assert_eq!(dst_post, last.pos.get());
@@ -10721,7 +10709,7 @@ mod tests {
             "SetfieldGc args must be [obj, valuebox] in that order",
         );
         assert!(std::sync::Arc::ptr_eq(
-            last.descr.as_ref().expect("SetfieldGc must carry descr"),
+            &last.getdescr().expect("SetfieldGc must carry descr"),
             &descr,
         ),);
         // Cache must now know the new field value.
@@ -10837,7 +10825,7 @@ mod tests {
             "GetarrayitemGcR args must be [array, index]",
         );
         assert!(std::sync::Arc::ptr_eq(
-            last.descr.as_ref().expect("must carry array descr"),
+            &last.getdescr().expect("must carry array descr"),
             &descr,
         ));
         assert_eq!(dst_post, last.pos.get());
@@ -11014,7 +11002,7 @@ mod tests {
             "SetarrayitemGc args must be [array, index, value]",
         );
         assert!(std::sync::Arc::ptr_eq(
-            last.descr.as_ref().expect("must carry array descr"),
+            &last.getdescr().expect("must carry array descr"),
             &descr,
         ));
         // Heapcache must reflect the write.
@@ -11091,11 +11079,10 @@ mod tests {
             "FINISH args must be sym.registers_r[2] threaded through the MIFrame bridge",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("FINISH must carry done_with_this_frame_descr_ref");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "FINISH descr must be the descr passed through dispatch_via_miframe",
         );
     }

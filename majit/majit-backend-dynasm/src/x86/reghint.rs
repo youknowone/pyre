@@ -260,7 +260,7 @@ impl RegisterHints {
 
     /// reghint.py:138 `_consider_real_call`.
     fn _consider_real_call(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let Some(descr) = op.descr.as_ref() else {
+        let Some(descr) = op.getdescr() else {
             return;
         };
         let Some(calldescr) = descr.as_call_descr() else {
@@ -282,7 +282,7 @@ impl RegisterHints {
         guard_not_forced: bool,
         first_arg_index: usize,
     ) {
-        let Some(descr) = op.descr.as_ref() else {
+        let Some(descr) = op.getdescr() else {
             return;
         };
         let Some(calldescr) = descr.as_call_descr() else {

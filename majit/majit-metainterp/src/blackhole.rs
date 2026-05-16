@@ -267,10 +267,7 @@ pub fn blackhole_execute_full(
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
                     .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {
@@ -389,39 +386,23 @@ fn execute_one_with_memory(
         // ── Field access via descr offset ──
         OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
             let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
             let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
             let base = values.resolve(op.args[0]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
             let base = values.resolve(op.args[0]);
             let value = values.resolve(op.args[1]);
-            let offset = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map_or(0, |f| f.offset() as i64);
+            let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
@@ -430,30 +411,24 @@ fn execute_one_with_memory(
             let base = values.resolve(op.args[0]);
             let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
             let base = values.resolve(op.args[0]);
             let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
             let base = values.resolve(op.args[0]);
             let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
         }
         OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
@@ -461,10 +436,8 @@ fn execute_one_with_memory(
             let index = values.resolve(op.args[1]);
             let value = values.resolve(op.args[2]);
             let (item_size, base_ofs) = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_array_descr())
-                .map_or((1, 0), |a| (a.item_size() as i64, a.base_size() as i64));
+                .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
+                .unwrap_or((1, 0));
             memory.gc_store_indexed(base, index, item_size, base_ofs, value);
             OpResult::Void
         }
@@ -674,10 +647,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .with_fail_descr(|fd| fd.fail_arg_types().to_vec())
                     .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {

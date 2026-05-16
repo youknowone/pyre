@@ -2215,7 +2215,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, 
         ) {
             continue;
         }
-        let descr = op.descr.as_ref().ok_or_else(|| {
+        let descr = op.getdescr().ok_or_else(|| {
             unsupported_semantics(opcode, "call-assembler op must have a descriptor")
         })?;
         let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -4377,7 +4377,7 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
             continue;
         }
         if op.opcode == OpCode::CallAssemblerR {
-            let descr = op.descr.as_ref().ok_or_else(|| {
+            let descr = op.getdescr().ok_or_else(|| {
                 unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
             })?;
             let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -4456,11 +4456,13 @@ fn build_type_overrides(
     let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
-            if let Some(ref d) = op.descr {
+            let __descr_arc_d = op.getdescr();
+            if let Some(ref d) = __descr_arc_d.as_ref() {
                 label_by_descr.insert(d.index(), op_idx);
             }
         } else if op.opcode == OpCode::Jump {
-            if let Some(ref d) = op.descr {
+            let __descr_arc_d = op.getdescr();
+            if let Some(ref d) = __descr_arc_d.as_ref() {
                 jumps_by_descr.push((d.index(), op_idx));
             }
         }
@@ -4680,13 +4682,13 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_some() {
+        if op.has_descr() {
             continue;
         }
         if let Some(descr) = builtin_string_array_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         }
     }
 }
@@ -7901,8 +7903,7 @@ impl CraneliftBackend {
             .iter()
             .filter_map(|&li| {
                 ops[li]
-                    .descr
-                    .as_ref()
+                    .getdescr()
                     .map(|d| (d.index(), ops[li].args.len()))
             })
             .collect();
@@ -8154,7 +8155,7 @@ impl CraneliftBackend {
             for _ in 0..ops[label_idx].args.len() {
                 builder.append_block_param(block, cl_types::I64);
             }
-            if let Some(descr_index) = ops[label_idx].descr.as_ref().map(|descr| descr.index()) {
+            if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
                 label_blocks_by_descr.insert(descr_index, block);
             }
             label_blocks.push((label_idx, block));
@@ -9650,7 +9651,7 @@ impl CraneliftBackend {
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN => {
-                    let descr = op.descr.as_ref().expect("call op must have a descriptor");
+                    let descr = op.getdescr().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
@@ -9694,7 +9695,7 @@ impl CraneliftBackend {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    let descr = op.descr.as_ref().ok_or_else(|| {
+                    let descr = op.getdescr().ok_or_else(|| {
                         unsupported_semantics(op.opcode, "call-assembler op must have a descriptor")
                     })?;
                     let call_descr = descr.as_call_descr().ok_or_else(|| {
@@ -10273,7 +10274,7 @@ impl CraneliftBackend {
                     }
 
                     // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
-                    let descr = op.descr.as_ref().expect("call op must have a descriptor");
+                    let descr = op.getdescr().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
@@ -10341,8 +10342,7 @@ impl CraneliftBackend {
                     }
 
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("call_release_gil op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
@@ -10475,7 +10475,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
 
-                    if let Some(descr) = op.descr.as_ref() {
+                    if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
                             let _ = emit_indirect_call_from_parts(
                                 &mut builder,
@@ -10530,7 +10530,7 @@ impl CraneliftBackend {
                     builder.seal_block(call_block);
 
                     let mut call_result = cond; // fallback
-                    if let Some(descr) = op.descr.as_ref() {
+                    if let Some(descr) = op.getdescr() {
                         if let Some(call_descr) = descr.as_call_descr() {
                             if let Some(result) = emit_indirect_call_from_parts(
                                 &mut builder,
@@ -10718,8 +10718,7 @@ impl CraneliftBackend {
                         return Err(missing_gc_runtime(op.opcode));
                     }
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("CallMallocNurseryVarsize must have an ArrayDescr");
                     let ad = descr
                         .as_array_descr()
@@ -11117,8 +11116,7 @@ impl CraneliftBackend {
                 }
                 OpCode::RawLoadI | OpCode::RawLoadF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("raw load op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11278,8 +11276,7 @@ impl CraneliftBackend {
                 | OpCode::GetfieldGcPureR
                 | OpCode::GetfieldGcPureF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("getfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
@@ -11302,8 +11299,7 @@ impl CraneliftBackend {
                 // args[0] = base, args[1] = value
                 OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("setfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
@@ -11334,8 +11330,7 @@ impl CraneliftBackend {
                 | OpCode::GetarrayitemGcPureR
                 | OpCode::GetarrayitemGcPureF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("getarrayitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11365,8 +11360,7 @@ impl CraneliftBackend {
                 // args[0] = base, args[1] = index, args[2] = value
                 OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("setarrayitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11396,8 +11390,7 @@ impl CraneliftBackend {
                 | OpCode::GetinteriorfieldGcR
                 | OpCode::GetinteriorfieldGcF => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("getinteriorfield op must have a descriptor");
                     let id = descr
                         .as_interior_field_descr()
@@ -11426,8 +11419,7 @@ impl CraneliftBackend {
 
                 OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("setinteriorfield op must have a descriptor");
                     let id = descr
                         .as_interior_field_descr()
@@ -11456,8 +11448,7 @@ impl CraneliftBackend {
 
                 OpCode::RawStore => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("raw store op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11485,8 +11476,7 @@ impl CraneliftBackend {
                 // the array descriptor's len_descr.
                 OpCode::ArraylenGc => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("arraylen op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11515,8 +11505,7 @@ impl CraneliftBackend {
                     // These use the array descriptor attached to the op.
                     // The length is at len_descr().offset() from the base pointer.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strlen/unicodelen op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11546,8 +11535,7 @@ impl CraneliftBackend {
                     // `builtin_string_hash_field_descr` above.  The assert
                     // `size == WORD` at rewrite.py:286,292 mirrors here.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strhash/unicodehash op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
@@ -11576,8 +11564,7 @@ impl CraneliftBackend {
                     // rewrite.py:299/311 subtracts it before emitting the
                     // address arithmetic.  UNICODE has no extra item.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("str/unicodegetitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11613,8 +11600,7 @@ impl CraneliftBackend {
                     // rewrite.py:307-318 parity.  See STRGETITEM note above
                     // for the `basesize -= 1` rationale.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("str/unicodesetitem op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11650,8 +11636,7 @@ impl CraneliftBackend {
                     // addresses skip the extra null character for STR, just
                     // like STR{GET,SET}ITEM.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("copystr/unicodecontent op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11705,8 +11690,7 @@ impl CraneliftBackend {
                 //  base + descr.base_size + start*scale_start + size*scale_size)
                 OpCode::ZeroArray => {
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("zero_array op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
@@ -11777,17 +11761,16 @@ impl CraneliftBackend {
                     // into block params, so the runtime num_block_params is
                     // unreliable — compare against the arity captured before
                     // codegen).
-                    let local_target_arity_matches = op.descr.as_ref().is_some_and(|d| {
+                    let local_target_arity_matches = op.getdescr().is_some_and(|d| {
                         label_arity_by_descr
                             .get(&d.index())
                             .copied()
                             .is_some_and(|arity| arity == op.args.len())
                     });
                     let target_block = if local_target_arity_matches {
-                        op.descr
-                            .as_ref()
+                        op.getdescr()
                             .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
-                    } else if op.descr.is_some() {
+                    } else if op.has_descr() {
                         // Descr present but either points outside this function
                         // (bridge → main loop) or to a local label with
                         // mismatched arity — compile as external jump.
@@ -12499,7 +12482,8 @@ impl CraneliftBackend {
                 // or rewritten by the GC rewriter. If they reach the backend,
                 // we call out to a runtime helper.
                 OpCode::New | OpCode::NewWithVtable => {
-                    let sd = op.descr.as_ref().and_then(|d| d.as_size_descr());
+                    let __descr_arc_sd = op.getdescr();
+                    let sd = __descr_arc_sd.as_ref().and_then(|d| d.as_size_descr());
                     let (size, type_id, vtable) = sd.map_or((16, 0, 0usize), |sd| {
                         (sd.size() as i64, sd.type_id() as i64, sd.vtable())
                     });
@@ -12601,8 +12585,9 @@ impl CraneliftBackend {
                     }
                     let length =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+                    let __descr_arc = op.getdescr();
                     let (base_size, item_size) =
-                        if let Some(ad) = op.descr.as_ref().and_then(|d| d.as_array_descr()) {
+                        if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
                             (
                                 builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
                                 builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
@@ -12771,8 +12756,7 @@ impl CraneliftBackend {
                     // UNICODE basesize = 16. Allocated bytes per rstr.malloc
                     // are `basesize + n * itemsize`.
                     let descr = op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("newstr/newunicode op must have an ArrayDescr");
                     let ad = descr
                         .as_array_descr()
@@ -12989,11 +12973,11 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            if let Some(descr_ref) = op.descr.as_ref() {
+            if let Some(descr_ref) = op.getdescr() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
                     target.set_dispatch_target(body_ptr as usize, label_block_id);
                 }
-                register_loop_target(descr_ref, entry.clone());
+                register_loop_target(&descr_ref, entry.clone());
             }
             label_block_id += 1;
         }
@@ -13130,7 +13114,7 @@ fn collect_guards(
     let label_arity_by_descr: HashMap<u32, usize> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.descr.as_ref().map(|d| (d.index(), op.args.len())))
+        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.args.len())))
         .collect();
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -13140,8 +13124,7 @@ fn collect_guards(
         // target with mismatched arity (treated as external for parity).
         let is_external_jump = op.opcode == OpCode::Jump
             && op
-                .descr
-                .as_ref()
+                .getdescr()
                 .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
                     None => true,
                     Some(&arity) => arity != op.args.len(),
@@ -13159,10 +13142,9 @@ fn collect_guards(
             // set by the tracer and represent the caller's view of the return
             // type, which may differ from the op's inferred type (e.g. New
             // produces Ref but the value is treated as Int by the caller).
-            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                let dt = fd.fail_arg_types();
+            let types = if let Some(dt) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
                 if dt.len() == refs.len() {
-                    dt.to_vec()
+                    dt
                 } else {
                     infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
                 }
@@ -13172,7 +13154,8 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            let descr_fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
+            let __descr_arc_descr_fd = op.getdescr();
+            let descr_fd = __descr_arc_descr_fd.as_ref().and_then(|d| d.as_fail_descr());
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404)
             // sets op.descr to a fresh ResumeGuardDescr whose
             // fail_arg_types match the reduced liveboxes — prefer the
@@ -13211,9 +13194,10 @@ fn collect_guards(
                 .iter()
                 .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
                 .collect();
+            let fb_descr_arc = op.getdescr();
             let types = resolve_fail_arg_types(
                 &refs,
-                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                fb_descr_arc.as_ref().and_then(|d| d.as_fail_descr()),
                 &type_index,
                 &type_overrides,
                 &op_def_positions,
@@ -13248,7 +13232,7 @@ fn collect_guards(
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let (_nfa, _vable, _vref, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
+                    rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &fail_arg_types, fvc_ref);
                 frames.last().map(|f| f.pc as u64)
             } else {
                 None
@@ -13281,12 +13265,12 @@ fn collect_guards(
         {
             let rd_vi = op.resolved_rd_virtuals();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
-            let rd_consts_ref: &[majit_ir::Const] = rd_consts_data;
+            let rd_consts_ref: &[majit_ir::Const] = &rd_consts_data;
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
             let (_num_failargs, _vable_values, _vref_values, frames) =
-                rebuild_from_numbering(rd_numb_bytes, rd_consts_data, &fail_arg_types, fvc_ref);
+                rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &fail_arg_types, fvc_ref);
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.

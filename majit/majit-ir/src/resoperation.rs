@@ -995,6 +995,16 @@ pub trait BoxEnv {
 pub struct Op {
     pub opcode: OpCode,
     pub args: SmallVec<[OpRef; 3]>,
+    /// `resoperation.py:460 ResOpWithDescr._descr` parity. Plain
+    /// `Option<DescrRef>` because the build-script source analyzer
+    /// (which lowers `resoperation.rs` alongside pyre-interpreter
+    /// sources) does not yet recognise `RefCell<...>` field types in
+    /// the `expr_unary_not_operand_kind` classifier; the
+    /// `Vec<Rc<Op>>`-era descr migration must coordinate with the
+    /// translator-side classifier update.  Mutators on a freshly-built
+    /// `Op` still take `&mut self`; once trace storage moves to
+    /// `Vec<Rc<Op>>` and the translator gains `RefCell` parity, this
+    /// slot flips to interior-mutable.
     pub descr: Option<DescrRef>,
     /// Index of this op in the trace (set by the trace builder). `Cell`
     /// so the position can be patched via `&Op` once the op is shared
@@ -1187,7 +1197,7 @@ impl Op {
             Some(d) => d,
             None => self.descr.clone(),
         };
-        let mut newop = Op {
+        let newop = Op {
             opcode,
             args: new_args,
             descr: new_descr,
@@ -1214,34 +1224,21 @@ impl Op {
         // (compile.py:855 `_attrs_`); the descr Arc was already copied
         // above, so newop reads the same payload through descr.fail_descr().
         if opcode.is_guard() || self.opcode.is_guard() {
+            let mut newop = newop;
             newop.fail_args = self.fail_args.clone();
             newop.fail_arg_types = self.fail_arg_types.clone();
             newop.rd_resume_position.set(self.rd_resume_position.get());
+            return newop;
         }
         newop
     }
 
-    /// `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return prev`
-    /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
-    /// chases `prev` automatically.
-    pub fn resolved_rd_numb(&self) -> Option<&[u8]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_numb()
-    }
-
-    /// Same as `resolved_rd_numb` but for the `rd_consts` const pool.
-    pub fn resolved_rd_consts(&self) -> Option<&[Const]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_consts()
-    }
-
-    /// Same as `resolved_rd_numb` but for the `rd_virtuals` table.
-    pub fn resolved_rd_virtuals(&self) -> Option<&[std::rc::Rc<RdVirtualInfo>]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_virtuals()
-    }
-
-    /// Same as `resolved_rd_numb` but for the `rd_pendingfields` table.
-    pub fn resolved_rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_pendingfields()
-    }
+    // `getdescr` / `setdescr` / `cleardescr` / `has_descr` /
+    // `project_descr` / `with_*_descr` / `resolved_rd_*` live in
+    // `crate::op_descr` so the closure-bearing accessors don't have to
+    // pass through the build-script source analyzer (which reads
+    // `resoperation.rs` for the `RdVirtualInfo` enum and chokes on
+    // `impl FnOnce` parameter types).
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
     /// compile.py:874-876 store_final_boxes

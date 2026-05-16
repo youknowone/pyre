@@ -1436,7 +1436,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     };
     let mut vecop =
         state.create_vec_op(vec_opcode, &args, datatype, bytesize as i32, signed, count);
-    vecop.descr = first_op.descr.clone();
+    vecop.descr = first_op.getdescr();
 
     let vecop_pos = vecop.pos.get();
     // schedule.py:340-346: map scalar ops to vector positions

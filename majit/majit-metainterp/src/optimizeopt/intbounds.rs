@@ -1797,7 +1797,7 @@ impl OptIntBounds {
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntAdd, &op.args);
-            new_op.descr = op.descr.clone();
+            new_op.descr = op.getdescr();
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1832,7 +1832,7 @@ impl OptIntBounds {
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntSub, &op.args);
-            new_op.descr = op.descr.clone();
+            new_op.descr = op.getdescr();
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1854,7 +1854,7 @@ impl OptIntBounds {
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntMul, &op.args);
-            new_op.descr = op.descr.clone();
+            new_op.descr = op.getdescr();
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -2908,7 +2908,8 @@ impl Optimization for OptIntBounds {
             | OpCode::GetfieldRawF
             | OpCode::GetfieldGcF
             | OpCode::GetinteriorfieldGcF => {
-                if let Some(ref d) = op.descr {
+                let __descr_arc_d = op.getdescr();
+                if let Some(ref d) = __descr_arc_d.as_ref() {
                     let (field_size, signed) = d.field_size_and_sign();
                     if field_size > 0 && field_size < 8 {
                         let (lo, hi) = if signed {
@@ -2924,7 +2925,8 @@ impl Optimization for OptIntBounds {
 
             // ── Array item accesses ──
             OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcI => {
-                if let Some(ref d) = op.descr {
+                let __descr_arc_d = op.getdescr();
+                if let Some(ref d) = __descr_arc_d.as_ref() {
                     if let Some(ad) = d.as_array_descr() {
                         let item_size = ad.item_size();
                         if item_size > 0 && item_size < 8 {
@@ -2943,7 +2945,8 @@ impl Optimization for OptIntBounds {
 
             // ── Call postprocess ──
             OpCode::CallPureI | OpCode::CallI => {
-                if let Some(ref d) = op.descr {
+                let __descr_arc_d = op.getdescr();
+                if let Some(ref d) = __descr_arc_d.as_ref() {
                     if let Some(cd) = d.as_call_descr() {
                         let ei = cd.get_extra_info();
                         match ei.oopspecindex {
@@ -3196,7 +3199,7 @@ mod tests {
             opcode.is_guard(),
             "make_guard_with_descr requires a guard opcode"
         );
-        op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+        op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
         op
     }
 
@@ -3801,7 +3804,7 @@ mod tests {
     #[test]
     fn test_arraylen_nonneg() {
         let mut op = make_op(OpCode::ArraylenGc, &[OpRef::int_op(0)], 1);
-        op.descr = Some(descr(1));
+        op.setdescr(descr(1));
         let ops = vec![op];
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
@@ -4154,7 +4157,7 @@ mod tests {
             &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
             2,
         );
-        call.descr = Some(call_descr(12, majit_ir::OopSpecIndex::IntPyDiv));
+        call.setdescr(call_descr(12, majit_ir::OopSpecIndex::IntPyDiv));
         let initial_bounds = vec![
             (OpRef::int_op(0), IntBound::bounded(-100, -10)),
             (OpRef::int_op(1), IntBound::bounded(2, 4)),
@@ -4175,7 +4178,7 @@ mod tests {
             &[OpRef::int_op(10), OpRef::int_op(0), OpRef::int_op(1)],
             2,
         );
-        call.descr = Some(call_descr(14, majit_ir::OopSpecIndex::IntPyMod));
+        call.setdescr(call_descr(14, majit_ir::OopSpecIndex::IntPyMod));
         let initial_bounds = vec![
             (OpRef::int_op(0), IntBound::bounded(-100, 100)),
             (OpRef::int_op(1), IntBound::bounded(-4, -2)),

@@ -204,7 +204,7 @@ impl UnrollOptimizer {
         );
         let mut result = body_ops.to_vec();
         if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
-            jump.descr = Some(preamble_target.as_jump_target_descr());
+            jump.setdescr(preamble_target.as_jump_target_descr());
         }
         result
     }
@@ -1379,7 +1379,7 @@ impl UnrollOptimizer {
                 let redirected_jump_descr_idx = redirected_tail_ops
                     .iter()
                     .rfind(|o| o.opcode == OpCode::Jump)
-                    .and_then(|o| o.descr.as_ref())
+                    .and_then(|o| o.getdescr())
                     .map(|d| d.index());
                 if redirected_jump_descr_idx != current_body_descr_idx {
                     // RPython parity: the Cranelift backend can't jump to
@@ -1441,7 +1441,7 @@ impl UnrollOptimizer {
                 );
             }
             if let Some(mut end_jump) = body_terminal_op {
-                end_jump.descr = Some(preamble_target.as_jump_target_descr());
+                end_jump.setdescr(preamble_target.as_jump_target_descr());
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                     // unroll.py:238-242 parity: jump_to_preamble retargets
                     // the live end_jump and routes it through
@@ -2997,7 +2997,7 @@ impl OptUnroll {
                     // resume metadata. Mirror the type filter via `is_guard()`.
                     if guard_op.opcode.is_guard() {
                         guard_op.rd_resume_position.set(rd_resume_position);
-                        guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                        guard_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     }
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }
@@ -3150,7 +3150,7 @@ impl OptUnroll {
             let mut jump_args = target_args;
             jump_args.extend(extra);
             let mut jump = Op::new(OpCode::Jump, &jump_args);
-            jump.descr = Some(target_token.as_jump_target_descr());
+            jump.setdescr(target_token.as_jump_target_descr());
             optimizer.send_extra_operation(&jump, ctx);
             return None; // successfully jumped
         }
@@ -3362,7 +3362,7 @@ impl OptUnroll {
                     // the new guard reads None for every rd_* until
                     // store_final_boxes_in_guard repopulates them from the live
                     // snapshot.
-                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                    new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.fail_args = None;
                     new_op.fail_arg_types = None;
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
@@ -4055,7 +4055,7 @@ fn assemble_peeled_trace_with_jump_args(
     if let Some(start_label_descr) = start_label_descr {
         let mut start_label = Op::new(OpCode::Label, start_label_args);
         start_label.pos.set(OpRef::NONE);
-        start_label.descr = Some(start_label_descr);
+        start_label.setdescr(start_label_descr);
         result.push(start_label);
     }
 
@@ -4713,7 +4713,7 @@ impl OptUnroll {
                 // opencoder.py:391-401 parity: trace iteration strips guard
                 // descrs, keeping only rd_resume_position. optimizer.py then
                 // invents a fresh opcode-appropriate descr at emission time.
-                peeled.descr = None;
+                peeled.cleardescr();
             }
             ctx.emit(peeled);
         }
@@ -4757,7 +4757,7 @@ impl OptUnroll {
                 // Same opencoder.py guard-descr stripping as the peeled copy.
                 // ResumeAtPositionDescr is inline_short_preamble-only
                 // (unroll.py:406-409), not normal peeled body guard state.
-                body_op.descr = None;
+                body_op.cleardescr();
             }
             ctx.emit(body_op);
         }
@@ -5017,7 +5017,7 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
-            result[1].descr.as_ref().map(|descr| descr.repr()),
+            result[1].getdescr().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
         );
     }
@@ -5044,7 +5044,7 @@ mod tests {
             op
         }];
         let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(2)]);
-        jump.descr = Some(TargetToken::new_preamble(7).as_jump_target_descr());
+        jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
         let result = replace_terminal_jump(&body_ops, jump);
 
@@ -5053,7 +5053,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(result[1].args.as_slice(), &[OpRef::int_op(2)]);
         assert_eq!(
-            result[1].descr.as_ref().map(|descr| descr.repr()),
+            result[1].getdescr().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
         );
     }
@@ -5438,22 +5438,22 @@ mod tests {
             .collect();
         assert_eq!(guards.len(), 2);
         for guard in &guards {
-            assert!(guard.descr.is_some(), "guard should have a descriptor");
+            assert!(guard.has_descr(), "guard should have a descriptor");
             assert!(
-                guard.descr.as_ref().unwrap().is_resume_guard(),
+                guard.getdescr().unwrap().is_resume_guard(),
                 "optimizer.py:723: descr must be a ResumeGuardDescr subtype"
             );
         }
-        let peel_index = guards[0].descr.as_ref().unwrap().index();
-        let body_index = guards[1].descr.as_ref().unwrap().index();
+        let peel_index = guards[0].getdescr().unwrap().index();
+        let body_index = guards[1].getdescr().unwrap().index();
         assert_ne!(peel_index, original_index);
         assert_ne!(body_index, original_index);
         assert_ne!(
             peel_index, body_index,
             "peeled and body guards must own distinct freshly invented descrs"
         );
-        assert!(!guards[0].descr.as_ref().unwrap().is_resume_at_position());
-        assert!(!guards[1].descr.as_ref().unwrap().is_resume_at_position());
+        assert!(!guards[0].getdescr().unwrap().is_resume_at_position());
+        assert!(!guards[1].getdescr().unwrap().is_resume_at_position());
     }
 
     // ── Chain of references ───────────────────────────────────────────
@@ -6133,7 +6133,7 @@ mod tests {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::GetfieldGcR, &[OpRef::int_op(3)]);
             op.pos.set(OpRef::int_op(19));
-            op.descr = Some(majit_ir::descr::make_field_descr_full(
+            op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
                 0,
                 8,
@@ -6145,7 +6145,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::SetfieldGc, &[OpRef::int_op(25), OpRef::int_op(19)]);
-                op.descr = Some(majit_ir::descr::make_field_descr_full(
+                op.setdescr(majit_ir::descr::make_field_descr_full(
                     57,
                     8,
                     8,
@@ -6325,7 +6325,7 @@ mod tests {
             {
                 let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::int_op(50)]);
                 op.pos.set(OpRef::int_op(1));
-                op.descr = Some(majit_ir::make_field_descr(
+                op.setdescr(majit_ir::make_field_descr(
                     0,
                     8,
                     majit_ir::Type::Int,
@@ -6436,7 +6436,7 @@ mod tests {
                     OpRef::int_op(4),
                 ],
             );
-            jump.descr = Some(start_descr.clone());
+            jump.setdescr(start_descr.clone());
             jump
         }];
 
@@ -6491,7 +6491,7 @@ mod tests {
             },
             {
                 let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]);
-                jump.descr = Some(start_descr.clone());
+                jump.setdescr(start_descr.clone());
                 jump
             },
         ];
@@ -6533,7 +6533,7 @@ mod tests {
                     OpCode::Jump,
                     &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)],
                 );
-                jump.descr = Some(start_descr.clone());
+                jump.setdescr(start_descr.clone());
                 jump
             },
         ];
@@ -6558,7 +6558,7 @@ mod tests {
             .iter()
             .find(|op| {
                 op.opcode == OpCode::Label
-                    && op.descr.as_ref().map(|descr| descr.repr())
+                    && op.getdescr().map(|descr| descr.repr())
                         == Some("LoopTargetDescr(1)".to_string())
             })
             .expect("body label");

@@ -811,8 +811,7 @@ impl ShortBoxes {
                 getfield_op.opcode,
                 &new_args,
                 getfield_op
-                    .descr
-                    .clone()
+                    .getdescr()
                     .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
             );
             new_op.pos.set(getfield_op.pos.get());
@@ -1358,7 +1357,7 @@ impl ProducedShortOp {
         ctx.imported_short_pure_ops
             .push(crate::optimizeopt::ImportedShortPureOp::new(
                 opcode,
-                self.preamble_op.descr.clone(),
+                self.preamble_op.getdescr(),
                 args,
                 result_opref,
                 source,
@@ -1398,7 +1397,7 @@ impl ProducedShortOp {
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
-        let descr = self.preamble_op.descr.clone()?;
+        let descr = self.preamble_op.getdescr()?;
         // Object arg classification — Slot or Const only (RPython
         // shortpreamble.py:91-95 add_op_to_short uses `produce_arg`,
         // which admits Slot/Const).  We accept Produced too for completeness.
@@ -1435,7 +1434,7 @@ impl ProducedShortOp {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let mut getfield_op = Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
-        getfield_op.descr = Some(descr.clone());
+        getfield_op.setdescr(descr.clone());
         // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
         // result_opref because `replace_op(source, result_opref)` installed
         // below clobbers source's slot. Seed info at result_opref's slot
@@ -1451,10 +1450,8 @@ impl ProducedShortOp {
             preamble_op: getfield_op.clone(),
         };
         let parent_descr = getfield_op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .and_then(|fd| fd.get_parent_descr());
+            .with_field_descr(|fd| fd.get_parent_descr())
+            .flatten();
         if let Some(info) = ctx.get_const_info_mut(obj_resolved, parent_descr) {
             info.set_preamble_field(descr_idx, pop.clone());
         }
@@ -1492,7 +1489,7 @@ impl ProducedShortOp {
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
-        let descr = self.preamble_op.descr.clone()?;
+        let descr = self.preamble_op.getdescr()?;
         let object_arg = self.preamble_op.arg(0);
         let obj_class = classify_short_arg(
             ctx,
@@ -1545,7 +1542,7 @@ impl ProducedShortOp {
             OpCode::getarrayitem_for_type(result_type),
             &[obj_resolved, index_const],
         );
-        getarrayitem_op.descr = Some(descr.clone());
+        getarrayitem_op.setdescr(descr.clone());
         // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
         // result_opref. See produce_heap_field for the Box-identity-vs-flat-OpRef
         // adaptation rationale.

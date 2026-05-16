@@ -31,8 +31,7 @@ fn round_up(size: usize) -> usize {
 /// for STR (the extra_item_after_alloc null).
 fn strgetsetitem_token(op: &Op, is_str: bool) -> (i64, i64) {
     let descr = op
-        .descr
-        .as_ref()
+        .getdescr()
         .expect("STR/UNICODE getitem/setitem op must carry an ArrayDescr");
     let ad = descr
         .as_array_descr()
@@ -883,10 +882,8 @@ impl GcRewriterImpl {
     // ────────────────────────────────────────────────────────
 
     fn handle_new(&self, op: &Op, st: &mut RewriteState) {
-        let descr = op
-            .descr
-            .as_ref()
-            .expect("NEW must have a SizeDescr")
+        let descr_arc = op.getdescr().expect("NEW must have a SizeDescr");
+        let descr = descr_arc
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
 
@@ -1215,7 +1212,7 @@ impl GcRewriterImpl {
             OpCode::ZeroArray,
             &[v_arr, c_zero, v_length_scaled, c_scale_a, c_scale_b],
         );
-        zero_op.descr = Some(arraydescr);
+        zero_op.setdescr(arraydescr);
         let out_index = st.out.len();
         st.emit(zero_op);
         // rewrite.py:610-611 — register in last_zero_arrays only for
@@ -1276,7 +1273,7 @@ impl GcRewriterImpl {
             OpCode::CallMallocNurseryVarsize,
             &[kind_ref, itemsize_ref, v_length],
         );
-        varsize_op.descr = Some(arraydescr);
+        varsize_op.setdescr(arraydescr);
         Some(st.emit_result(varsize_op, result_pos))
     }
 
@@ -1290,7 +1287,7 @@ impl GcRewriterImpl {
     ) -> OpRef {
         st.emitting_an_operation_that_can_collect();
         let mut call_op = Op::new(OpCode::CallR, args);
-        call_op.descr = Some(calldescr);
+        call_op.setdescr(calldescr);
         let result = st.emit_result(call_op, result_pos);
         st.emit(Op::new(OpCode::CheckMemoryError, &[result]));
         result
@@ -1528,7 +1525,7 @@ impl GcRewriterImpl {
         // rewrite.py:1079-1080 — CALL_N(memcpy_fn, i2, i1, arg, descr=memcpy_descr).
         let memcpy_fn_const = st.const_int(memcpy_fn);
         let mut call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
-        call_op.descr = Some(memcpy_descr);
+        call_op.setdescr(memcpy_descr);
         st.emit(call_op);
     }
 
@@ -1604,10 +1601,8 @@ impl GcRewriterImpl {
         // here ForceToken (Ref) stores to an Int-typed field (offset 128),
         // a pyre-specific divergence.
         let field_is_ptr = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .map(|fd| fd.is_pointer_field())
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
             .unwrap_or(false);
         let val = st.resolve(op.arg(1));
         let val_is_ref = if field_is_ptr {
@@ -1645,9 +1640,8 @@ impl GcRewriterImpl {
     /// activates the delayed-zero tracking without further callsite
     /// changes.
     fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
-        let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) else {
-            return;
-        };
+        let Some(descr) = op.getdescr() else { return };
+        let Some(fd) = descr.as_field_descr() else { return };
         let offset = fd.offset() as i64;
         let base = st.resolve(op.arg(0));
         if let Some(entries) = st._delayed_zero_setfields.get_mut(&base) {
@@ -1693,10 +1687,8 @@ impl GcRewriterImpl {
             let val_is_ref = match st.result_type_of(v) {
                 Some(tp) => tp == Type::Ref,
                 None => op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| ad.is_array_of_pointers())
+                    .getdescr()
+                    .and_then(|d| d.as_array_descr().map(|ad| ad.is_array_of_pointers()))
                     .unwrap_or(false),
             };
             if val_is_ref && !st.is_null_constant(v) {
@@ -1712,7 +1704,7 @@ impl GcRewriterImpl {
     /// in the main loop via `emit_maybe_forwarded` for RAW and via the
     /// SETARRAYITEM_GC write-barrier arm for GC).
     fn handle_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let descr = op.descr.as_ref().expect("SETARRAYITEM needs ArrayDescr");
+        let descr = op.getdescr().expect("SETARRAYITEM needs ArrayDescr");
         let ad = descr
             .as_array_descr()
             .expect("SETARRAYITEM descr must be ArrayDescr");
@@ -1861,7 +1853,7 @@ impl GcRewriterImpl {
     /// per rewrite.py:216-219) into GC_LOAD / GC_LOAD_INDEXED by
     /// forwarding the op through `emit_gc_load_or_indexed`.
     fn handle_getarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let descr = op.descr.as_ref().expect("GETARRAYITEM needs ArrayDescr");
+        let descr = op.getdescr().expect("GETARRAYITEM needs ArrayDescr");
         let ad = descr
             .as_array_descr()
             .expect("GETARRAYITEM descr must be ArrayDescr");
@@ -2008,7 +2000,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:222-227 RAW_STORE
         if matches!(opnum, OpCode::RawStore) {
-            let descr = op.descr.as_ref().expect("RAW_STORE needs ArrayDescr");
+            let descr = op.getdescr().expect("RAW_STORE needs ArrayDescr");
             let ad = descr
                 .as_array_descr()
                 .expect("RAW_STORE descr must be ArrayDescr");
@@ -2022,7 +2014,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:228-232 RAW_LOAD_{I,F}
         if matches!(opnum, OpCode::RawLoadI | OpCode::RawLoadF) {
-            let descr = op.descr.as_ref().expect("RAW_LOAD needs ArrayDescr");
+            let descr = op.getdescr().expect("RAW_LOAD needs ArrayDescr");
             let ad = descr
                 .as_array_descr()
                 .expect("RAW_LOAD descr must be ArrayDescr");
@@ -2040,8 +2032,7 @@ impl GcRewriterImpl {
             OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR | OpCode::GetinteriorfieldGcF
         ) {
             let descr = op
-                .descr
-                .as_ref()
+                .getdescr()
                 .expect("GETINTERIORFIELD needs InteriorFieldDescr");
             let ifd = descr
                 .as_interior_field_descr()
@@ -2063,8 +2054,7 @@ impl GcRewriterImpl {
             OpCode::SetinteriorfieldRaw | OpCode::SetinteriorfieldGc
         ) {
             let descr = op
-                .descr
-                .as_ref()
+                .getdescr()
                 .expect("SETINTERIORFIELD needs InteriorFieldDescr");
             let ifd = descr
                 .as_interior_field_descr()
@@ -2106,7 +2096,7 @@ impl GcRewriterImpl {
                 | OpCode::GetfieldRawR
                 | OpCode::GetfieldRawF
         ) {
-            let descr = op.descr.as_ref().expect("GETFIELD needs FieldDescr");
+            let descr = op.getdescr().expect("GETFIELD needs FieldDescr");
             let fd = descr
                 .as_field_descr()
                 .expect("GETFIELD descr must be FieldDescr");
@@ -2133,7 +2123,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:262-266 SETFIELD_{GC,RAW}
         if matches!(opnum, OpCode::SetfieldGc | OpCode::SetfieldRaw) {
-            let descr = op.descr.as_ref().expect("SETFIELD needs FieldDescr");
+            let descr = op.getdescr().expect("SETFIELD needs FieldDescr");
             let fd = descr
                 .as_field_descr()
                 .expect("SETFIELD descr must be FieldDescr");
@@ -2147,7 +2137,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:267-272 ARRAYLEN_GC
         if matches!(opnum, OpCode::ArraylenGc) {
-            let descr = op.descr.as_ref().expect("ARRAYLEN_GC needs ArrayDescr");
+            let descr = op.getdescr().expect("ARRAYLEN_GC needs ArrayDescr");
             let ad = descr
                 .as_array_descr()
                 .expect("ARRAYLEN_GC descr must be ArrayDescr");
@@ -2169,8 +2159,7 @@ impl GcRewriterImpl {
         if matches!(opnum, OpCode::Strlen | OpCode::Unicodelen) {
             let word = std::mem::size_of::<usize>() as i64;
             let descr = op
-                .descr
-                .as_ref()
+                .getdescr()
                 .expect("STRLEN/UNICODELEN op must carry an ArrayDescr");
             let ad = descr
                 .as_array_descr()
@@ -2191,8 +2180,7 @@ impl GcRewriterImpl {
         if matches!(opnum, OpCode::Strhash | OpCode::Unicodehash) {
             let word = std::mem::size_of::<usize>() as i64;
             let descr = op
-                .descr
-                .as_ref()
+                .getdescr()
                 .expect("STRHASH/UNICODEHASH op must carry a FieldDescr");
             let fd = descr
                 .as_field_descr()
@@ -2503,10 +2491,11 @@ impl GcRewriterImpl {
         let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
 
         // rewrite.py:667-668 — loop_token = op.getdescr(); JitCellToken
-        let loop_token_descr = op
-            .descr
-            .as_ref()
-            .and_then(|d| d.as_loop_token_descr())
+        let descr_arc = op
+            .getdescr()
+            .expect("CallAssembler op must carry a loop-token descriptor");
+        let loop_token_descr = descr_arc
+            .as_loop_token_descr()
             .expect("CallAssembler op must carry a loop-token descriptor");
         let token = loop_token_descr.loop_token_number();
 
@@ -2636,7 +2625,7 @@ impl GcRewriterImpl {
             vec![frame]
         };
         let mut call_asm = Op::new(op.opcode, &new_args);
-        call_asm.descr = op.descr.clone();
+        call_asm.descr = op.getdescr();
         call_asm.fail_args = op
             .fail_args
             .as_ref()
@@ -2753,8 +2742,7 @@ impl GcRewriter for GcRewriterImpl {
                 // NEWUNICODE thread self.gc_ll_descr.{str,unicode}_descr.
                 OpCode::NewArray | OpCode::NewArrayClear => {
                     let descr_ref = op
-                        .descr
-                        .clone()
+                        .getdescr()
                         .expect("NEW_ARRAY must carry an ArrayDescr");
                     self.handle_new_array(descr_ref, op, &mut st, 0); // FLAG_ARRAY
                 }
@@ -4402,7 +4390,7 @@ mod tests {
         assert_eq!(result[2].arg(1), result[1].pos.get()); // dst
         assert_eq!(result[2].arg(2), result[0].pos.get()); // src
         assert_eq!(result[2].arg(3), i_len);
-        assert!(result[2].descr.is_some(), "CALL_N must carry memcpy_descr");
+        assert!(result[2].has_descr(), "CALL_N must carry memcpy_descr");
     }
 
     // ── COPYUNICODECONTENT with non-constant length → LEA × 2 + LSHIFT + CALL_N ──
@@ -4480,7 +4468,7 @@ mod tests {
         assert_eq!(result[4].arg(1), result[3].pos.get()); // dst
         assert_eq!(result[4].arg(2), result[1].pos.get()); // src
         assert_eq!(result[4].arg(3), i_len);
-        assert!(result[4].descr.is_some(), "CALL_N must carry memcpy_descr");
+        assert!(result[4].has_descr(), "CALL_N must carry memcpy_descr");
     }
 
     // ── COPYUNICODECONTENT without LEA → LSHIFT + INT_ADD + INT_ADD per side + LSHIFT(len) + CALL_N ──

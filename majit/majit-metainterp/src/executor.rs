@@ -684,7 +684,8 @@ pub(crate) fn execute_one(
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
             let resolved_args: Vec<i64> = op.args.iter().map(|&r| values.resolve(r)).collect();
             if let (Some(&obj_ptr), Some(&value)) = (resolved_args.first(), resolved_args.get(1)) {
-                if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
+                let __descr_arc = op.getdescr();
+                if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_field_descr()) {
                     let offset = fd.offset();
                     if obj_ptr != 0 {
                         unsafe {
@@ -719,10 +720,8 @@ pub(crate) fn execute_one(
         // contains unoptimized allocation (e.g. result_type=Ref finish).
         OpCode::New | OpCode::NewWithVtable => {
             let size = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_size_descr())
-                .map_or(16, |sd| sd.size());
+                .with_size_descr(|sd| sd.size())
+                .unwrap_or(16);
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<[u8; 16]>());
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };

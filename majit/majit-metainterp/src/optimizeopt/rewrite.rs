@@ -1686,10 +1686,9 @@ impl OptRewrite {
                         old_guard.fail_arg_types.clone().unwrap_or_default(),
                     );
                     let old_descr = old_guard
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .expect("strengthened GUARD_CLASS donor must carry a descr");
-                    crate::compile::copy_all_attributes_from(&new_descr, old_descr);
+                    crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                     let combined = old_guard.copy_and_change(
                         OpCode::GuardNonnullClass,
                         Some(&[old_guard.arg(0), op.arg(1)]),
@@ -2016,8 +2015,8 @@ impl OptRewrite {
         }
 
         // rewrite.py:612,617: extrainfo.single_write_descr_array sanity check
-        let call_descr = match &op.descr {
-            Some(d) => d.clone(),
+        let call_descr = match op.getdescr() {
+            Some(d) => d,
             None => return false,
         };
         let cd = match call_descr.as_call_descr() {
@@ -2144,7 +2143,7 @@ impl OptRewrite {
                 let opcode = OpCode::getarrayitem_for_type(item_type);
                 let idx_const = ctx.make_constant_int(index + source_start);
                 let mut getop = Op::new(opcode, &[source_box, idx_const]);
-                getop.descr = Some(arraydescr.clone());
+                getop.setdescr(arraydescr.clone());
                 let pos = ctx.emit_extra(pass_idx, getop);
                 Some(pos)
             };
@@ -2165,7 +2164,7 @@ impl OptRewrite {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC
                 let idx_const = ctx.make_constant_int(index + dest_start);
                 let mut setop = Op::new(OpCode::SetarrayitemGc, &[dest_box, idx_const, val]);
-                setop.descr = Some(arraydescr.clone());
+                setop.setdescr(arraydescr.clone());
                 ctx.emit_extra(pass_idx, setop);
             }
         }
@@ -2701,7 +2700,7 @@ impl Optimization for OptRewrite {
                     if c != 0 {
                         let mut call_op = Op::new(OpCode::CallN, &op.args[1..]);
                         call_op.pos.set(op.pos.get());
-                        call_op.descr = op.descr.clone();
+                        call_op.descr = op.getdescr();
                         ctx.last_op_removed = false;
                         return OptimizationResult::Replace(call_op);
                     }
@@ -2728,7 +2727,7 @@ impl Optimization for OptRewrite {
                     };
                     let mut call_op = Op::new(call_opcode, &op.args[1..]);
                     call_op.pos.set(op.pos.get());
-                    call_op.descr = op.descr.clone();
+                    call_op.descr = op.getdescr();
                     ctx.last_op_removed = false;
                     return OptimizationResult::Replace(call_op);
                 }
@@ -2838,7 +2837,8 @@ impl Optimization for OptRewrite {
             // Constant-fold and CSE are handled by pure.rs; here we
             // only do oopspec-specific simplifications.
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         match ei.oopspecindex {
@@ -2930,13 +2930,13 @@ impl Optimization for OptRewrite {
                     let call_opcode = OpCode::call_for_type(op.result_type());
                     let mut producer = Op::new(call_opcode, &op.args);
                     producer.pos.set(op.pos.get());
-                    producer.descr = op.descr.clone();
+                    producer.descr = op.getdescr();
                     self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let mut new_op = Op::new(call_opcode, &op.args);
                 new_op.pos.set(op.pos.get());
-                new_op.descr = op.descr.clone();
+                new_op.descr = op.getdescr();
                 ctx.last_op_removed = false;
                 OptimizationResult::Emit(new_op)
             }
@@ -3021,7 +3021,8 @@ impl Optimization for OptRewrite {
 
             // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         match ei.oopspecindex {

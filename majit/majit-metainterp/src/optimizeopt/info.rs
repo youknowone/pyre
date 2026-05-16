@@ -1565,7 +1565,7 @@ impl PtrInfo {
                 // OpRef, so later passes (earlyforce → heap → call) all talk
                 // about the same concrete allocation.
                 new_op.pos.set(opref);
-                new_op.descr = Some(vinfo.descr.clone());
+                new_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // info.py:152 `newop.set_forwarded(self)` — unconditional.
                 // Route through `ensure_box` so the just-emitted alloc op
@@ -1595,7 +1595,7 @@ impl PtrInfo {
                         "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                     );
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = Some(descr);
+                    set_op.setdescr(descr);
                     emit_op(ctx, set_op);
                 }
                 alloc_ref
@@ -1617,7 +1617,7 @@ impl PtrInfo {
                 // OpRef, so later passes (earlyforce → heap → call) all talk
                 // about the same concrete allocation.
                 new_op.pos.set(opref);
-                new_op.descr = Some(vinfo.descr.clone());
+                new_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // info.py:152 `newop.set_forwarded(self)` — unconditional.
                 if let Some(b) = ctx.ensure_box(alloc_ref) {
@@ -1639,7 +1639,7 @@ impl PtrInfo {
                         "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                     );
                     let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = Some(descr);
+                    set_op.setdescr(descr);
                     emit_op(ctx, set_op);
                 }
                 alloc_ref
@@ -1661,7 +1661,7 @@ impl PtrInfo {
                 };
                 let mut alloc_op = Op::new(alloc_opcode, &[len_ref]);
                 alloc_op.pos.set(opref);
-                alloc_op.descr = Some(vinfo.descr.clone());
+                alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
@@ -1694,7 +1694,7 @@ impl PtrInfo {
                     let subbox = force_child(item_ref, ctx);
                     let idx_ref = ctx.emit_constant_int(i as i64);
                     let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, subbox]);
-                    set_op.descr = Some(descr.clone());
+                    set_op.setdescr(descr.clone());
                     emit_op(ctx, set_op);
                 }
                 // info.py:557: optforce.pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
@@ -1715,7 +1715,7 @@ impl PtrInfo {
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
                 alloc_op.pos.set(opref);
-                alloc_op.descr = Some(vinfo.descr.clone());
+                alloc_op.setdescr(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
@@ -1788,7 +1788,7 @@ impl PtrInfo {
                     let offset_ref = ctx.emit_constant_int(offset);
                     let mut store_op =
                         Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-                    store_op.descr = Some(descr);
+                    store_op.setdescr(descr);
                     emit_op(ctx, store_op);
                 }
 

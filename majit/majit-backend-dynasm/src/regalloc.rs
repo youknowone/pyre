@@ -1815,10 +1815,10 @@ impl<'a> RegAlloc<'a> {
         if op.opcode != OpCode::Jump {
             return;
         }
-        let descr_id = op.descr.as_ref().map(descr_identity);
+        let descr_id = op.getdescr().as_ref().map(descr_identity);
         self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
         self.final_jump_op_position = (operations.len() - 1) as i32;
-        let Some(descr) = op.descr.as_ref() else {
+        let Some(descr) = op.getdescr() else {
             return;
         };
         // x86/regalloc.py:1274 descr._ll_loop_code != 0:
@@ -4377,21 +4377,20 @@ impl<'a> RegAlloc<'a> {
         if let Some(size) = size {
             return self.const_value(size);
         }
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_field_descr())
-            .map(|fd| {
-                let s = fd.field_size() as i64;
-                if fd.is_field_signed() { -s } else { s }
+        op.getdescr()
+            .and_then(|d| {
+                d.as_field_descr().map(|fd| {
+                    let s = fd.field_size() as i64;
+                    if fd.is_field_signed() { -s } else { s }
+                })
             })
             .or_else(|| {
-                op.descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| {
+                op.getdescr().and_then(|d| {
+                    d.as_array_descr().map(|ad| {
                         let s = ad.item_size() as i64;
                         if ad.is_item_signed() { -s } else { s }
                     })
+                })
             })
             .unwrap_or(8)
     }
@@ -4537,21 +4536,20 @@ impl<'a> RegAlloc<'a> {
         let nsize = if op.args.len() > 2 {
             self.const_value(op.args[2])
         } else {
-            op.descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .map(|fd| {
-                    let s = fd.field_size() as i64;
-                    if fd.is_field_signed() { -s } else { s }
+            op.getdescr()
+                .and_then(|d| {
+                    d.as_field_descr().map(|fd| {
+                        let s = fd.field_size() as i64;
+                        if fd.is_field_signed() { -s } else { s }
+                    })
                 })
                 .or_else(|| {
-                    op.descr
-                        .as_ref()
-                        .and_then(|d| d.as_array_descr())
-                        .map(|ad| {
+                    op.getdescr().and_then(|d| {
+                        d.as_array_descr().map(|ad| {
                             let s = ad.item_size() as i64;
                             if ad.is_item_signed() { -s } else { s }
                         })
+                    })
                 })
                 .unwrap_or(8)
         };
@@ -4974,10 +4972,9 @@ impl<'a> RegAlloc<'a> {
         save_all_regs: bool,
         first_arg_index: usize,
     ) {
-        let calldescr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        let descr_arc = op.getdescr().expect("call op without CallDescr");
+        let calldescr = descr_arc
+            .as_call_descr()
             .expect("call op without CallDescr");
         assert_eq!(calldescr.arg_types().len(), op.num_args() - first_arg_index);
 
@@ -5067,10 +5064,9 @@ impl<'a> RegAlloc<'a> {
         save_all_regs: bool,
         first_arg_index: usize,
     ) {
-        let calldescr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        let descr_arc = op.getdescr().expect("call op without CallDescr");
+        let calldescr = descr_arc
+            .as_call_descr()
             .expect("call op without CallDescr");
         assert_eq!(calldescr.arg_types().len(), args.len() - first_arg_index);
 
@@ -5658,7 +5654,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:1303 consider_jump
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
-        let descr_id = op.descr.as_ref().map(descr_identity);
+        let descr_id = op.getdescr().as_ref().map(descr_identity);
         self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
@@ -5676,7 +5672,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let descr_id = op.descr.as_ref().map(descr_identity);
+        let descr_id = op.getdescr().as_ref().map(descr_identity);
         self.final_jump_args = descr_id.map(|id| (id, args.to_vec()));
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
@@ -5730,7 +5726,7 @@ impl<'a> RegAlloc<'a> {
         //     intentionally not emitted on aarch64
         //
         // Mirror the per-arch difference exactly via #[cfg].
-        if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
+        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity) {
             if self
                 .final_jump_args
                 .as_ref()
@@ -5795,7 +5791,7 @@ impl<'a> RegAlloc<'a> {
             locs.push(loc);
         }
 
-        if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
+        if let Some(label_id) = op.getdescr().as_ref().map(descr_identity) {
             if self
                 .final_jump_args
                 .as_ref()

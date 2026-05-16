@@ -571,10 +571,10 @@ fn normalize_root_loop_entry_contract(
         .find(|op| op.opcode == OpCode::Label);
     let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
     let label_descr_index = label_op
-        .and_then(|op| op.descr.as_ref())
+        .and_then(|op| op.getdescr())
         .map(|descr| descr.index());
     let jump_targets_current_loop = last_jump.is_some_and(|op| {
-        let jump_descr_index = op.descr.as_ref().map(|descr| descr.index());
+        let jump_descr_index = op.getdescr().map(|descr| descr.index());
         match (jump_descr_index, label_descr_index) {
             (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
             (None, None) => true,
@@ -1472,19 +1472,14 @@ impl<M: Clone> MetaInterp<M> {
         // at `descr.rs:1065`). The HashMap was keyed on the per-trace
         // counter, so descr-side identity must read the per-trace slot.
         let op_index = trace.ops.iter().position(|op| {
-            op.descr
-                .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .is_some_and(|descr| descr.fail_index_per_trace() == fail_index)
+            op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
+                .unwrap_or(false)
         })?;
         let op = trace.ops.get(op_index)?;
         if let Some(types) = &op.fail_arg_types {
             return Some(types.clone());
         }
-        op.descr
-            .as_ref()
-            .and_then(|descr| descr.as_fail_descr())
-            .map(|descr| descr.fail_arg_types().to_vec())
+        op.with_fail_descr(|descr| descr.fail_arg_types().to_vec())
             .filter(|types| !types.is_empty())
     }
 
@@ -4474,20 +4469,20 @@ impl<M: Clone> MetaInterp<M> {
                 .last_mut()
                 .filter(|op| op.opcode == OpCode::Jump)
             {
-                jump_op.descr = Some(target_token.as_jump_target_descr());
+                jump_op.setdescr(target_token.as_jump_target_descr());
             }
             if let Some(label_op) = compiled_ops
                 .iter_mut()
                 .find(|op| op.opcode == OpCode::Label)
             {
-                label_op.descr = Some(target_token.as_jump_target_descr());
+                label_op.setdescr(target_token.as_jump_target_descr());
             } else {
                 let mut label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
                     &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
-                label_op.descr = Some(target_token.as_jump_target_descr());
+                label_op.setdescr(target_token.as_jump_target_descr());
                 compiled_ops.insert(0, label_op);
             }
             vec![target_token]
@@ -5893,12 +5888,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(first_guard_types) = optimized_ops
             .iter()
             .find(|op| op.opcode.is_guard())
-            .and_then(|op| {
-                op.descr
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
-            })
+            .and_then(|op| op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()))
         {
             for (i, ia) in inputargs.iter_mut().enumerate() {
                 if let Some(&tp) = first_guard_types.get(i) {
@@ -6270,14 +6260,14 @@ impl<M: Clone> MetaInterp<M> {
             .last_mut()
             .filter(|op| op.opcode == OpCode::Jump)
         {
-            jump_op.descr = Some(target_token.as_jump_target_descr());
+            jump_op.setdescr(target_token.as_jump_target_descr());
         }
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
             &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
-        label_op.descr = Some(target_token.as_jump_target_descr());
+        label_op.setdescr(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
         // compile.py:504-511 send_loop_to_backend virtualizable hook —
@@ -7227,8 +7217,7 @@ impl<M: Clone> MetaInterp<M> {
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op
-                        .descr
-                        .as_ref()
+                        .getdescr()
                         .is_some_and(|descr| descr.index() == target_descr.index())
             }) {
                 return Some(
@@ -7342,7 +7331,7 @@ impl<M: Clone> MetaInterp<M> {
             // can hold the descr value while still freely mutating
             // `op.descr` to land the `compile.py:191/202 cleardescr()`
             // calls on the JitCellToken/TargetToken branches below.
-            let Some(descr) = op.descr.clone() else {
+            let Some(descr) = op.getdescr() else {
                 // `compile.py:184` returns `None` for ops without a
                 // descr; the subsequent `isinstance` checks all fail.
                 continue;
@@ -7465,7 +7454,7 @@ impl<M: Clone> MetaInterp<M> {
                     // no longer needed and is released to break any
                     // loop ↔ JitCellToken cycle a downstream consumer
                     // (e.g., debug/tests) might form.
-                    op.descr = None;
+                    op.cleardescr();
                     continue;
                 }
             }
@@ -7521,7 +7510,7 @@ impl<M: Clone> MetaInterp<M> {
                     // `if not we_are_translated()` (test-only debug
                     // aid); pyre has no consumer of that weakref so
                     // the cleardescr stands alone.
-                    op.descr = None;
+                    op.cleardescr();
                 }
             }
         }
@@ -7890,7 +7879,7 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(descr) = trace
                 .exit_layouts
                 .get(&fail_index)
-                .and_then(|layout| layout.descr.as_ref())
+                .and_then(|layout| layout.descr.clone())
                 .filter(|d| d.is_resume_guard() || d.is_resume_guard_copied())
             {
                 return Some(descr.clone());
@@ -9653,10 +9642,8 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.rs:301`), like RPython's `compile.py:184
         // op.getdescr()` predicate.
         let guard_op_index = trace.ops.iter().position(|op| {
-            op.descr
-                .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .is_some_and(|descr| descr.fail_index_per_trace() == fail_index)
+            op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
+                .unwrap_or(false)
         })?;
         let guard_op = trace.ops.get(guard_op_index)?;
         let fail_args = guard_op.fail_args.as_ref()?;
@@ -9859,10 +9846,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
-                        .unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -9943,10 +9927,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
-                        .unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -10161,10 +10142,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
-                        .unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -10245,10 +10223,7 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.descr.as_ref())
-                        .and_then(|descr| descr.as_fail_descr())
-                        .map(|fd| fd.fail_index_per_trace())
-                        .unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -18989,12 +18964,10 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_descr = call
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call descr");
-        assert_eq!(call_descr.call_target_token(), Some(4242));
+        let call_token = call
+            .with_call_descr(|cd| cd.call_target_token())
+            .flatten();
+        assert_eq!(call_token, Some(4242));
     }
 
     #[test]
@@ -19070,12 +19043,10 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_descr = call
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call descr");
-        assert_eq!(call_descr.call_target_token(), Some(token_number));
+        let call_token2 = call
+            .with_call_descr(|cd| cd.call_target_token())
+            .flatten();
+        assert_eq!(call_token2, Some(token_number));
     }
 
     #[test]

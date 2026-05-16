@@ -3489,27 +3489,27 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[2].descr.as_ref().map(|d| d.index()),
+            ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[3].descr.as_ref().map(|d| d.index()),
+            ops[3].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[4].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[4].descr.as_ref().map(|d| d.index()),
+            ops[4].getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
     }
@@ -3592,22 +3592,22 @@ mod tests {
         assert_eq!(ops.len(), 4, "no trailing token-NULL setfield");
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[2].descr.as_ref().map(|d| d.index()),
+            ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
         assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
-            ops[3].descr.as_ref().map(|d| d.index()),
+            ops[3].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
     }
@@ -3718,18 +3718,18 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
         assert_eq!(
-            ops[0].descr.as_ref().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.static_field_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
-            ops[1].descr.as_ref().map(|d| d.index()),
+            ops[1].getdescr().map(|d| d.index()),
             Some(info.array_pointer_field_descr(0).index())
         );
         for k in 0..3 {
             assert_eq!(ops[2 + k].opcode, OpCode::GetarrayitemGcI);
             assert_eq!(
-                ops[2 + k].descr.as_ref().map(|d| d.index()),
+                ops[2 + k].getdescr().map(|d| d.index()),
                 Some(info.array_item_descr(0).index())
             );
         }

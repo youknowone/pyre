@@ -236,7 +236,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                     .getvector_of_box(*arg)
                     .map(|(_, vec_ref)| vec_ref)
                     .unwrap_or(*arg);
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumInfo {
                             // resume.py:31 prev — attach_vector_info links this
@@ -346,7 +347,8 @@ impl VectorizingOptimizer {
         let mut smallest = 0usize;
         for op in ops {
             if op.opcode.is_getarrayitem() || op.opcode.is_setarrayitem() {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(ad) = descr.as_array_descr() {
                         let item_size = ad.item_size();
                         if smallest == 0 || item_size < smallest {

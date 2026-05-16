@@ -2473,7 +2473,7 @@ impl OptContext {
                         &resolved_args,
                     );
                     op.pos.set(replay_pos(*source, produced_op));
-                    op.descr = produced_op.preamble_op.descr.clone();
+                    op.descr = produced_op.preamble_op.getdescr();
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         preamble_op: op,
@@ -2488,7 +2488,7 @@ impl OptContext {
                 }
                 PreambleOpKind::Heap => {
                     let result_type = produced_op.preamble_op.result_type();
-                    let descr = match produced_op.preamble_op.descr.clone() {
+                    let descr = match produced_op.preamble_op.getdescr() {
                         Some(d) => d,
                         None => continue,
                     };
@@ -2508,7 +2508,7 @@ impl OptContext {
                             };
                             let mut op = Op::new(opcode, &[obj]);
                             op.pos.set(replay_pos(*source, produced_op));
-                            op.descr = Some(descr);
+                            op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
@@ -2544,7 +2544,7 @@ impl OptContext {
                             };
                             let mut op = Op::new(opcode, &[obj, index_opref]);
                             op.pos.set(replay_pos(*source, produced_op));
-                            op.descr = Some(descr);
+                            op.setdescr(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 preamble_op: op,
@@ -4764,7 +4764,7 @@ impl OptContext {
         if !op.opcode.is_call_pure() {
             return false;
         }
-        let Some(ref descr) = op.descr else {
+        let Some(descr) = op.getdescr() else {
             return false;
         };
         let Some(cd) = descr.as_call_descr() else {
@@ -4807,7 +4807,7 @@ impl OptContext {
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
-            && op.descr.is_none()
+            && !op.has_descr()
             && op.rd_resume_position.get() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
@@ -4828,7 +4828,7 @@ impl OptContext {
             // matched the production Optimizer in name only and used to
             // silently leave `op.descr = None` when the donor lacked a
             // descr.  Tighten to RPython parity.
-            let donor_descr = self.new_operations[idx].descr.clone().expect(
+            let donor_descr = self.new_operations[idx].getdescr().expect(
                 "optimizer.py:691 assert isinstance(last_descr, \
                      ResumeGuardDescr): donor guard has no descr",
             );
@@ -4839,7 +4839,7 @@ impl OptContext {
                  ResumeGuardDescr subclass",
                 donor_descr.index()
             );
-            op.descr = Some(match opnum {
+            op.setdescr(match opnum {
                 OpCode::GuardException | OpCode::GuardNoException => {
                     crate::compile::make_resume_guard_copied_exc_descr(donor_descr)
                 }
@@ -5000,12 +5000,11 @@ impl OptContext {
         // limited to the standalone test entry.  Either way only fresh
         // descrs reach this function.
         assert!(
-            op.descr.as_ref().map_or(true, |d| d.is_resume_guard()),
+            op.getdescr().map_or(true, |d| d.is_resume_guard()),
             "optimizer.py:723 store_final_boxes_in_guard expects \
              ResumeGuardDescr, got non-resume descr (kind={:?}, copied={})",
-            op.descr.as_ref().map(|d| d.index()),
-            op.descr
-                .as_ref()
+            op.getdescr().map(|d| d.index()),
+            op.getdescr()
                 .map_or(false, |d| d.is_resume_guard_copied())
         );
 
@@ -5015,11 +5014,7 @@ impl OptContext {
         // livebox set and break bridge attachment.  Promoted from
         // debug_assert! so release builds catch double-finish too.
         assert!(
-            op.descr
-                .as_ref()
-                .and_then(|d| d.as_fail_descr())
-                .and_then(|fd| fd.rd_numb())
-                .is_none(),
+            op.resolved_rd_numb().is_none(),
             "resume.py:397 finish() invoked twice on the same ResumeGuardDescr"
         );
 
@@ -5222,7 +5217,7 @@ impl OptContext {
         // (`is_resume_at_position()`, `loop_version()`) survive
         // `store_final_boxes_in_guard` (compile.py:1035-1043, mirrored
         // at pyjitpl/mod.rs:6799 `is_resume_at_position()`).
-        match op.descr.as_ref() {
+        match op.getdescr() {
             Some(existing) => {
                 if let Some(fd) = existing.as_fail_descr() {
                     fd.set_fail_arg_types(new_types);
@@ -5241,7 +5236,7 @@ impl OptContext {
                 // dispatch via `is_guard_exc()` / `is_guard_forced()`
                 // without reshaping this match arm.
                 use majit_ir::OpCode;
-                op.descr = Some(match op.opcode {
+                op.setdescr(match op.opcode {
                     OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                         crate::compile::make_resume_guard_forced_descr_typed(new_types)
                     }
@@ -5269,7 +5264,8 @@ impl OptContext {
         } else {
             Some(pending_setfields)
         };
-        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+        let __descr_arc = op.getdescr();
+        if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
@@ -5472,7 +5468,7 @@ impl OptContext {
         if gcref.is_null() {
             return None;
         }
-        let descr = op.descr.as_ref()?;
+        let descr = op.getdescr()?;
         let fd = descr.as_field_descr()?;
         let addr = gcref.0 + fd.offset();
         // llmodel.py:467-478 read_int_at_mem / read_ref_at_mem dispatch.
@@ -6510,10 +6506,8 @@ impl OptContext {
         if arg0.is_constant() || self.get_constant(arg0).is_some() {
             // info.py:750-752 ConstPtrInfo.setfield → _get_info(parent_descr, optheap)
             let parent_descr = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
-                .and_then(|fd| fd.get_parent_descr());
+                .with_field_descr(|fd| fd.get_parent_descr())
+                .flatten();
             if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
                 info.setfield(field_idx, value);
             }
@@ -6538,7 +6532,7 @@ impl OptContext {
         let arg0 = self.get_box_replacement(op.arg(0));
         if arg0.is_constant() || self.get_constant(arg0).is_some() {
             // info.py:746-748 ConstPtrInfo.setitem → _get_array_info.
-            if let Some(descr) = op.descr.clone() {
+            if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut(arg0, descr) {
                     info.setitem(index, value);
                 }
@@ -6773,10 +6767,11 @@ impl OptContext {
             //     else:
             //         opinfo = info.StructPtrInfo(parent_descr)
             //     opinfo.init_fields(parent_descr, descr.get_index())
-            let field_descr = op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_field_descr())
+            let ensure_field_descr_arc = op
+                .getdescr()
+                .expect("ensure_ptr_info_arg0: field op without FieldDescr");
+            let field_descr = ensure_field_descr_arc
+                .as_field_descr()
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
             // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
             let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {
@@ -6786,7 +6781,7 @@ impl OptContext {
                      offset={} field_type={:?}; the FieldDescr implementation must \
                      override get_parent_descr() for parity with optimizer.py:478",
                     op.opcode,
-                    op.descr,
+                    op.getdescr(),
                     field_descr.field_name(),
                     field_descr.index_in_parent(),
                     field_descr.offset(),
@@ -6816,8 +6811,7 @@ impl OptContext {
             // optimizer.py:485-487: getarrayitem / setarrayitem_gc / arraylen_gc
             // → ArrayPtrInfo(op.getdescr())
             let descr = op
-                .descr
-                .clone()
+                .getdescr()
                 .expect("ensure_ptr_info_arg0: array op without descr");
             PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative())
         } else if op.opcode == OpCode::GuardClass || op.opcode == OpCode::GuardNonnullClass {
@@ -6914,7 +6908,7 @@ impl OptContext {
         }
         self.new_operations
             .get(guard_pos as usize)
-            .and_then(|op| op.descr.as_ref())
+            .and_then(|op| op.getdescr())
             .map_or(false, |descr| descr.is_resume_at_position())
     }
 

@@ -254,7 +254,7 @@ impl TreeLoop {
             }
             // history.py:582-593: guard checks
             if op.opcode.is_guard() {
-                if check_descr && op.descr.is_none() {
+                if check_descr && !op.has_descr() {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
@@ -305,7 +305,7 @@ impl TreeLoop {
         }
         // history.py:605-608: if a JUMP has a target, it must be TargetToken.
         if last.opcode == OpCode::Jump {
-            if let Some(descr) = last.descr.as_ref() {
+            if let Some(descr) = last.getdescr() {
                 if descr.as_loop_target_descr().is_none() {
                     return false;
                 }
@@ -911,13 +911,13 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         // Call op has descr
-        assert!(trace.ops[0].descr.is_some());
-        assert_eq!(trace.ops[0].descr.as_ref().unwrap().index(), 42);
+        assert!(trace.ops[0].has_descr());
+        assert_eq!(trace.ops[0].getdescr().unwrap().index(), 42);
         // Guard op has descr
-        assert!(trace.ops[1].descr.is_some());
-        assert_eq!(trace.ops[1].descr.as_ref().unwrap().index(), 42);
+        assert!(trace.ops[1].has_descr());
+        assert_eq!(trace.ops[1].getdescr().unwrap().index(), 42);
         // Jump op has no descr
-        assert!(trace.ops[2].descr.is_none());
+        assert!(!trace.ops[2].has_descr());
     }
 
     #[test]
@@ -1201,7 +1201,7 @@ mod tests {
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
         op0.pos.set(iop(2));
         let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![op0, guard, Op::new(OpCode::Finish, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1229,7 +1229,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
         guard.fail_args = Some(smallvec::smallvec![OpRef::const_int(0)]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1241,7 +1241,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
         guard.fail_args = Some(smallvec::smallvec![iop(99)]);
-        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1288,7 +1288,7 @@ mod tests {
     fn test_check_consistency_jump_descr_must_be_target_token() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut jump = Op::new(OpCode::Jump, &[iarg(0)]);
-        jump.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        jump.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let trace = TreeLoop::new(inputargs, vec![jump]);
         assert!(!trace.check_consistency());
     }
@@ -4286,12 +4286,8 @@ mod history_record_tests {
         let trace = recorder.get_trace();
         let call_op = &trace.ops[0];
         let arg_types = call_op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
-            .expect("call op should carry CallDescr")
-            .arg_types()
-            .to_vec();
+            .with_call_descr(|cd| cd.arg_types().to_vec())
+            .expect("call op should carry CallDescr");
         (arg_types, call_op.opcode)
     }
 
@@ -4368,15 +4364,12 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(op.args.as_slice(), &args);
-        let call_descr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        let descr_arc = op.getdescr().expect("call op must carry descr");
+        let call_descr = descr_arc
+            .as_call_descr()
             .expect("call op should carry CallDescr");
-        let loop_token = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_loop_token_descr())
+        let loop_token = descr_arc
+            .as_loop_token_descr()
             .expect("call op should carry loop-token metadata");
         assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
         assert_eq!(call_descr.call_target_token(), Some(777));
@@ -4400,10 +4393,9 @@ mod history_record_tests {
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
         assert_eq!(op.args.as_slice(), &[frame]);
-        let call_descr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        let cd_arc = op.getdescr().expect("op must have descr");
+        let call_descr = cd_arc
+            .as_call_descr()
             .expect("red-only CA should still carry a CallDescr");
         assert_eq!(call_descr.arg_types(), &[Type::Ref]);
         assert_eq!(call_descr.call_target_token(), Some(999));

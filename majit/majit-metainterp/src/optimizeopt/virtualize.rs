@@ -240,7 +240,7 @@ impl VirtualizableTracker {
         if !self.is_standard_ref(frame_ref, ctx) {
             return None;
         }
-        let field_idx = descr_index(&producer.descr);
+        let field_idx = descr_index_of_op(&producer);
         let offset = extract_field_offset(field_idx)?;
         let array_idx = self.array_idx_for_offset(offset)?;
         Some((frame_ref, array_idx))
@@ -373,7 +373,7 @@ impl OptVirtualize {
         let opinfo = crate::optimizeopt::info::VirtualRawBufferInfo::new(
             func,
             size,
-            source_op.descr.clone(),
+            source_op.getdescr(),
         );
         let b = ctx
             .ensure_box(source_op.pos.get())
@@ -408,7 +408,7 @@ impl OptVirtualize {
     // ── Per-opcode handlers ──
 
     fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let descr = op.descr.clone().expect("NEW_WITH_VTABLE needs descr");
+        let descr = op.getdescr().expect("NEW_WITH_VTABLE needs descr");
         // virtualize.py:208 `known_class = ConstInt(op.getdescr().get_vtable())`
         // — no null filter; ConstInt(0) flows downstream as the
         // known_class. info.py:763-772 ConstPtrInfo.get_known_class
@@ -432,7 +432,7 @@ impl OptVirtualize {
     }
 
     fn optimize_new(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let descr = op.descr.clone().expect("NEW needs descr");
+        let descr = op.getdescr().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
             fields: Vec::new(),
@@ -452,7 +452,7 @@ impl OptVirtualize {
             // virtualize.py:28-29 `if not info.reasonable_array_index(size):`
             // — defined at info.py:487-492 with upper bound 150000.
             if crate::optimizeopt::info::reasonable_array_index(size) {
-                let descr = op.descr.clone().expect("NEW_ARRAY needs descr");
+                let descr = op.getdescr().expect("NEW_ARRAY needs descr");
                 // virtualize.py:30-32: arraydescr.is_array_of_structs()
                 let is_struct = descr
                     .as_array_descr()
@@ -525,11 +525,12 @@ impl OptVirtualize {
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));
-        let field_idx = descr_index(&op.descr);
-        let field_descr = op
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_field_descr())
+        let field_idx = descr_index_of_op(op);
+        let setfield_descr_arc = op
+            .getdescr()
+            .expect("optimize_setfield_gc: field op without FieldDescr");
+        let field_descr = setfield_descr_arc
+            .as_field_descr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
         let offset = extract_field_offset(field_idx);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
@@ -553,7 +554,7 @@ impl OptVirtualize {
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        let descr_for_vstate = op.descr.clone();
+        let descr_for_vstate = op.getdescr();
         let struct_box = ctx.ensure_box(struct_ref);
         let early = struct_box
             .as_ref()
@@ -646,7 +647,7 @@ impl OptVirtualize {
 
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
-        let field_idx = descr_index(&op.descr);
+        let field_idx = descr_index_of_op(op);
         let is_raw_op = matches!(
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
@@ -696,10 +697,7 @@ impl OptVirtualize {
                 )
             {
                 let is_typeptr = op
-                    .descr
-                    .as_ref()
-                    .and_then(|d| d.as_field_descr())
-                    .map(|fd| fd.is_typeptr())
+                    .with_field_descr(|fd| fd.is_typeptr())
                     .unwrap_or(false);
                 if is_typeptr {
                     let vtable = match &info {
@@ -851,7 +849,7 @@ impl OptVirtualize {
     ) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        let field_idx = descr_index(&op.descr);
+        let field_idx = descr_index_of_op(op);
 
         if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx
             .get_box_replacement_box(array_ref)
@@ -895,7 +893,7 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
-        let field_idx = descr_index(&op.descr);
+        let field_idx = descr_index_of_op(op);
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             let elem_idx = index as usize;
@@ -1005,14 +1003,14 @@ impl OptVirtualize {
                 let Some(lookup_offset) = base_offset.checked_add(offset) else {
                     return OptimizationResult::PassOn;
                 };
-                let Some(descr) = op.descr.as_ref() else {
+                let Some(descr) = op.getdescr() else {
                     return OptimizationResult::PassOn;
                 };
                 let Some(ad) = descr.as_array_descr() else {
                     return OptimizationResult::PassOn;
                 };
                 // rawbuffer.py:120: read_value(offset, length, descr)
-                if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), descr) {
+                if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
                     ctx.replace_op(op.pos.get(), val_ref);
                     return OptimizationResult::Remove;
                 }
@@ -1047,7 +1045,7 @@ impl OptVirtualize {
             let Some(store_offset) = base_offset.checked_add(offset) else {
                 return OptimizationResult::PassOn;
             };
-            let Some(descr) = op.descr.clone() else {
+            let Some(descr) = op.getdescr() else {
                 return OptimizationResult::PassOn;
             };
             let Some(ad) = descr.as_array_descr() else {
@@ -1109,7 +1107,7 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(descr) = op.descr.as_ref() {
+            if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {
                     // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
                     // `assert not descr.is_array_of_pointers()` at
@@ -1191,7 +1189,7 @@ impl OptVirtualize {
                             // the upstream `except InvalidRawOperation:
                             // pass` arm — fall through to
                             // make_nonnull + emit.
-                            if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, descr)
+                            if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
                             {
                                 ctx.replace_op(op.pos.get(), val_ref);
                                 return OptimizationResult::Remove;
@@ -1235,7 +1233,7 @@ impl OptVirtualize {
         let value_ref = ctx.get_box_replacement(op.arg(2));
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(descr) = op.descr.clone() {
+            if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {
                     // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
                     // `assert not descr.is_array_of_pointers()`. A
@@ -1480,14 +1478,14 @@ impl OptVirtualize {
         // virtualize.py:150-153: set 'forced' to the real object.
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
-            set_forced.descr = Some(make_vref_field_descr(VREF_FORCED_FIELD_INDEX));
+            set_forced.setdescr(make_vref_field_descr(VREF_FORCED_FIELD_INDEX));
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
-        set_token.descr = Some(make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
+        set_token.setdescr(make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
         ctx.emit_extra(ctx.current_pass_idx, set_token);
 
         OptimizationResult::Remove
@@ -1725,7 +1723,8 @@ impl Optimization for OptVirtualize {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
@@ -1778,7 +1777,8 @@ impl Optimization for OptVirtualize {
             // virtualize.py: optimize_COND_CALL — if the call is
             // OS_JIT_FORCE_VIRTUALIZABLE and the target is virtual, remove.
             OpCode::CondCallN => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
@@ -1820,7 +1820,8 @@ impl Optimization for OptVirtualize {
             // base Optimization.emit and only get virtual-arg forcing in the
             // standard force_box path.
             OpCode::CallN | OpCode::CallR | OpCode::CallI => {
-                if let Some(ref descr) = op.descr {
+                let __descr_arc_descr = op.getdescr();
+                if let Some(ref descr) = __descr_arc_descr.as_ref() {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.get_extra_info();
                         // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
@@ -2003,11 +2004,8 @@ fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
 }
 
 /// Extract the descriptor index used as a field identifier.
-fn descr_index(descr: &Option<DescrRef>) -> u32 {
-    descr
-        .as_ref()
-        .and_then(|descr| descr.as_field_descr())
-        .map(|field_descr| field_descr.index_in_parent() as u32)
+fn descr_index_of_op(op: &majit_ir::Op) -> u32 {
+    op.with_field_descr(|field_descr| field_descr.index_in_parent() as u32)
         .expect("descr_index: field operations must carry a FieldDescr with parent-local index")
 }
 
@@ -2779,7 +2777,7 @@ mod tests {
                 OpRef::input_arg_int(1),
             ],
         );
-        call.descr = Some(majit_ir::descr::make_call_descr(
+        call.setdescr(majit_ir::descr::make_call_descr(
             vec![Type::Int, Type::Int, Type::Int],
             Type::Int,
             majit_ir::EffectInfo::default(),
@@ -2820,7 +2818,7 @@ mod tests {
         pass.setup();
 
         let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
+        get.setdescr(make_field_index_descr(virtualizable_field_index(8)));
         get.pos.set(OpRef::int_op(10));
 
         let result = pass.propagate_forward(&get, &mut ctx);
@@ -2847,7 +2845,7 @@ mod tests {
             OpCode::SetfieldRaw,
             &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
         );
-        set.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
+        set.setdescr(make_field_index_descr(virtualizable_field_index(8)));
 
         let result = pass.propagate_forward(&set, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2919,7 +2917,8 @@ mod tests {
             )
             .with_parent_descr(parent.clone(), 3),
         );
-        assert_eq!(descr_index(&Some(descr as DescrRef)), 3);
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.index_in_parent() as u32, 3);
         drop(parent);
     }
 
@@ -2940,7 +2939,7 @@ mod tests {
         pass.setup();
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
+        get_field.setdescr(make_field_index_descr(virtualizable_field_index(24)));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
@@ -2952,7 +2951,7 @@ mod tests {
             OpCode::GetarrayitemRawI,
             &[OpRef::int_op(10), OpRef::input_arg_int(1)],
         );
-        get_item.descr = Some(array_descr(24));
+        get_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&get_item, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
@@ -2974,7 +2973,7 @@ mod tests {
         pass.setup();
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
+        get_field.setdescr(make_field_index_descr(virtualizable_field_index(24)));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
@@ -2986,7 +2985,7 @@ mod tests {
             OpCode::SetarrayitemRaw,
             &[OpRef::int_op(10), OpRef::input_arg_int(1), OpRef::int_op(2)],
         );
-        set_item.descr = Some(array_descr(24));
+        set_item.setdescr(array_descr(24));
         let result = pass.propagate_forward(&set_item, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }

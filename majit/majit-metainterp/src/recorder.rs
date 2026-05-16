@@ -670,7 +670,7 @@ mod tests {
         let trace = rec.get_trace();
         assert_eq!(trace.num_ops(), 3); // GuardTrue + IntAdd + Jump
         assert!(trace.ops[0].opcode.is_guard());
-        assert!(trace.ops[0].descr.is_some());
+        assert!(trace.ops[0].has_descr());
     }
 
     #[test]
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(i1, iop(1));
 
         // Verify the op has a descriptor
-        assert!(rec.ops[0].descr.is_some());
+        assert!(rec.ops[0].has_descr());
     }
 
     #[test]
@@ -967,7 +967,7 @@ mod tests {
         assert_eq!(finish_op.opcode, OpCode::Finish);
         assert_eq!(finish_op.args.len(), 1);
         assert_eq!(finish_op.args[0], add);
-        assert!(finish_op.descr.is_some());
+        assert!(finish_op.has_descr());
     }
 
     #[test]
@@ -1046,8 +1046,8 @@ mod tests {
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
         let guard = &trace.ops[0];
-        assert!(guard.descr.is_some());
-        let d = guard.descr.as_ref().unwrap();
+        assert!(guard.has_descr());
+        let d = guard.getdescr().unwrap();
         assert_eq!(d.index(), 77);
     }
 
@@ -1064,8 +1064,8 @@ mod tests {
         let trace = rec.get_trace();
         let call_op = &trace.ops[0];
         assert_eq!(call_op.opcode, OpCode::CallI);
-        assert!(call_op.descr.is_some());
-        assert_eq!(call_op.descr.as_ref().unwrap().index(), 55);
+        assert!(call_op.has_descr());
+        assert_eq!(call_op.getdescr().unwrap().index(), 55);
     }
 
     #[test]
@@ -1161,8 +1161,8 @@ mod tests {
         rec.close_loop(&[call1, call2]);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].descr.as_ref().unwrap().index(), 10);
-        assert_eq!(trace.ops[1].descr.as_ref().unwrap().index(), 20);
+        assert_eq!(trace.ops[0].getdescr().unwrap().index(), 10);
+        assert_eq!(trace.ops[1].getdescr().unwrap().index(), 20);
     }
 
     #[test]
@@ -1272,9 +1272,9 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
-        assert_eq!(guards[0].descr.as_ref().unwrap().index(), 100);
-        assert_eq!(guards[1].descr.as_ref().unwrap().index(), 200);
-        assert_eq!(guards[2].descr.as_ref().unwrap().index(), 300);
+        assert_eq!(guards[0].getdescr().unwrap().index(), 100);
+        assert_eq!(guards[1].getdescr().unwrap().index(), 200);
+        assert_eq!(guards[2].getdescr().unwrap().index(), 300);
     }
 
     #[test]
@@ -1322,7 +1322,7 @@ mod tests {
 
         let finish = trace.ops.last().unwrap();
         assert_eq!(finish.opcode, OpCode::Finish);
-        assert_eq!(finish.descr.as_ref().unwrap().index(), 999);
+        assert_eq!(finish.getdescr().unwrap().index(), 999);
     }
 
     #[test]

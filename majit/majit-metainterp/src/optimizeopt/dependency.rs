@@ -177,10 +177,8 @@ impl Node {
         if self.op.opcode.is_guard() {
             // dependency.py:203: descr = self.op.getdescr(); return descr.exits_early()
             self.op
-                .descr
-                .as_ref()
-                .and_then(|d| d.as_fail_descr())
-                .is_some_and(|fd| fd.exits_early())
+                .with_fail_descr(|fd| fd.exits_early())
+                .unwrap_or(false)
         } else {
             false
         }
@@ -1195,7 +1193,7 @@ impl<'a> IntegralForwardModification<'a> {
         let array = op.args[0];
         let index = op.args[1];
         let idx_var = self.get_or_create(index);
-        if let Some(ref descr) = op.descr {
+        if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()
             let is_prim = descr
                 .as_array_descr()
@@ -1206,7 +1204,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             let mref = MemoryRef {
                 array,
-                descr: descr.clone(),
+                descr,
                 index_var: idx_var,
                 raw_access,
             };

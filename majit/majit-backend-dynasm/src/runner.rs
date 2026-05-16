@@ -3751,7 +3751,7 @@ mod tests {
         assert_eq!(backend.get_ref_value(&direct, 0), payload);
 
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::input_arg_ref(0)], 1);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -3804,7 +3804,7 @@ mod tests {
             ),
             {
                 let mut call = mk_op(OpCode::CallAssemblerI, &[OpRef::int_op(2)], 3);
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Int],
                     Type::Int,
@@ -3899,7 +3899,7 @@ mod tests {
                     &[OpRef::int_op(3), OpRef::input_arg_ref(1)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Int, Type::Ref],
                     Type::Ref,
@@ -3999,7 +3999,7 @@ mod tests {
                     &[OpRef::input_arg_ref(0), OpRef::int_op(3)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Ref, Type::Int],
                     Type::Ref,
@@ -4068,7 +4068,7 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        entry_getfield.descr = Some(field_descr);
+        entry_getfield.setdescr(field_descr);
         let callee_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4102,7 +4102,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
             2,
         );
-        call.descr = Some(make_call_assembler_descr_with_expansion(
+        call.setdescr(make_call_assembler_descr_with_expansion(
             &callee_token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4184,7 +4184,7 @@ mod tests {
                     &[OpRef::input_arg_ref(0), OpRef::int_op(3)],
                     4,
                 );
-                call.descr = Some(make_call_assembler_descr(
+                call.setdescr(make_call_assembler_descr(
                     &token,
                     vec![Type::Ref, Type::Int],
                     Type::Ref,
@@ -4203,7 +4203,7 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
-        getfield.descr = Some(field_descr);
+        getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             getfield,
@@ -4266,7 +4266,7 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        entry_getfield.descr = Some(field_descr.clone());
+        entry_getfield.setdescr(field_descr.clone());
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
         guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
@@ -4276,7 +4276,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(4)],
             6,
         );
-        call1.descr = Some(make_call_assembler_descr(
+        call1.setdescr(make_call_assembler_descr(
             &token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4286,7 +4286,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(5)],
             7,
         );
-        call2.descr = Some(make_call_assembler_descr(
+        call2.setdescr(make_call_assembler_descr(
             &token,
             vec![Type::Ref, Type::Int],
             Type::Int,
@@ -4328,7 +4328,7 @@ mod tests {
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
         backend.set_constants(HashMap::new());
         let mut bridge_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
-        bridge_getfield.descr = Some(field_descr);
+        bridge_getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_getfield,
@@ -4415,7 +4415,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
             1,
         );
-        bridge_value.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        bridge_value.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             bridge_value,
@@ -4508,7 +4508,7 @@ mod tests {
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
-        getfield.descr = Some(field_descr);
+        getfield.setdescr(field_descr);
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4572,7 +4572,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
             1,
         );
-        passthrough.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        passthrough.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             passthrough,
@@ -4626,9 +4626,9 @@ mod tests {
             &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
             1,
         );
-        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
         let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef::ref_op(1)], 2);
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -4691,13 +4691,13 @@ mod tests {
             &[OpRef::int_op(201), OpRef::input_arg_ref(0)],
             2,
         );
-        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
             &[OpRef::ref_op(2), OpRef::input_arg_ref(1)],
             3,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4762,13 +4762,13 @@ mod tests {
             .unwrap();
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(203)], 1);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let mut call_asm = mk_op(
             OpCode::CallAssemblerR,
             &[OpRef::input_arg_ref(1), OpRef::input_arg_ref(0)],
             2,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4847,7 +4847,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
             2,
         );
-        call_asm.descr = Some(make_call_assembler_descr(
+        call_asm.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref, Type::Ref],
             Type::Ref,
@@ -4912,7 +4912,7 @@ mod tests {
         assert_eq!(backend.get_ref_value(&direct, 0), payload);
 
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::input_arg_ref(0)], 1);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -4971,9 +4971,9 @@ mod tests {
         backend.set_constants(consts);
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(203)], 1);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef::ref_op(1)], 2);
-        call.descr = Some(make_call_assembler_descr(
+        call.setdescr(make_call_assembler_descr(
             &callee_token,
             vec![Type::Ref],
             Type::Ref,
@@ -5021,7 +5021,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(205)], 0);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
@@ -5065,7 +5065,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let mut plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(206)], 0);
-        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
@@ -5255,13 +5255,13 @@ fn builtin_string_hash_field_descr(opcode: majit_ir::OpCode) -> Option<majit_ir:
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_some() {
+        if op.has_descr() {
             continue;
         }
         if let Some(descr) = builtin_string_array_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
-            op.descr = Some(descr);
+            op.setdescr(descr);
         }
     }
 }

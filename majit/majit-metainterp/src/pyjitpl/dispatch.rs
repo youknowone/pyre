@@ -5737,7 +5737,7 @@ mod tests {
         let set_token = recorder.get_op_by_pos(OpRef::void_op(1)).unwrap();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
-            set_token.descr.as_ref().map(|d| d.index()),
+            set_token.getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
         assert_eq!(

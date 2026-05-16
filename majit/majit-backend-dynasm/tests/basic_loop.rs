@@ -189,11 +189,11 @@ fn test_setarrayitem_raw_float_roundtrip() {
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, const_index, value]);
     set_op.pos.set(OpRef::void_op(2));
-    set_op.descr = Some(array_descr.clone());
+    set_op.setdescr(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, const_index]);
     get_op.pos.set(OpRef::float_op(3));
-    get_op.descr = Some(array_descr);
+    get_op.setdescr(array_descr);
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(3)]);
     finish_op.pos.set(OpRef::void_op(4));
@@ -233,11 +233,11 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, index, value]);
     set_op.pos.set(OpRef::void_op(3));
-    set_op.descr = Some(array_descr.clone());
+    set_op.setdescr(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, index]);
     get_op.pos.set(OpRef::float_op(4));
-    get_op.descr = Some(array_descr);
+    get_op.setdescr(array_descr);
 
     let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(4)]);
     finish_op.pos.set(OpRef::void_op(5));
@@ -284,7 +284,7 @@ fn test_guard_and_loop() {
 
     let mut label_op = Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]);
     label_op.pos.set(OpRef::void_op(100));
-    label_op.descr = Some(loop_descr.clone());
+    label_op.setdescr(loop_descr.clone());
 
     let mut add_op = Op::new(
         OpCode::IntAdd,
@@ -302,7 +302,7 @@ fn test_guard_and_loop() {
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef::int_op(1)]);
     jump_op.pos.set(OpRef::void_op(4));
-    jump_op.descr = Some(loop_descr);
+    jump_op.setdescr(loop_descr);
 
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
 
@@ -344,7 +344,7 @@ fn test_float_loop_carried_across_jump() {
         &[OpRef::input_arg_float(0), OpRef::input_arg_int(1)],
     );
     label_op.pos.set(OpRef::void_op(100));
-    label_op.descr = Some(loop_descr.clone());
+    label_op.setdescr(loop_descr.clone());
 
     let mut lt_op = Op::new(
         OpCode::IntLt,
@@ -380,7 +380,7 @@ fn test_float_loop_carried_across_jump() {
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef::float_op(6), OpRef::int_op(7)]);
     jump_op.pos.set(OpRef::void_op(8));
-    jump_op.descr = Some(loop_descr);
+    jump_op.setdescr(loop_descr);
 
     let ops = vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,

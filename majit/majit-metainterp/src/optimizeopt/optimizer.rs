@@ -1861,10 +1861,7 @@ impl Optimizer {
     /// Mirrors PyPy exactly: ignore `MemoryError`-only effects when deciding
     /// whether a CALL_PURE breaks guard resume-data sharing.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
-        op.descr
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .map(|cd| cd.get_extra_info().check_can_raise(true))
+        op.with_call_descr(|cd| cd.get_extra_info().check_can_raise(true))
             .unwrap_or(true)
     }
 
@@ -2700,7 +2697,7 @@ impl Optimizer {
                         entry.op.pos.get(),
                         entry.op.opcode,
                         entry.op.args,
-                        entry.op.descr.as_ref().map(|d| d.index()),
+                        entry.op.getdescr().map(|d| d.index()),
                         entry.invented_name,
                         entry.same_as_source,
                     );
@@ -3244,7 +3241,7 @@ impl Optimizer {
                 // unroll.py:240-242: jump_to_preamble → send_extra_operation
                 let mut jump_op = terminal_jump.clone();
                 jump_op.args = pre_opt_jump_args.clone().into();
-                jump_op.descr = Some(preamble_token.as_jump_target_descr());
+                jump_op.setdescr(preamble_token.as_jump_target_descr());
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
@@ -3313,7 +3310,7 @@ impl Optimizer {
                     ctx.clear_newoperations();
                     let mut jump_op = terminal_jump.clone();
                     jump_op.args = pre_opt_jump_args.clone().into();
-                    jump_op.descr = Some(preamble_token.as_jump_target_descr());
+                    jump_op.setdescr(preamble_token.as_jump_target_descr());
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
@@ -3389,7 +3386,7 @@ impl Optimizer {
             ctx.clear_newoperations();
             let mut jump_op = terminal_jump.clone();
             jump_op.args = pre_opt_jump_args.into();
-            jump_op.descr = Some(preamble_token.as_jump_target_descr());
+            jump_op.setdescr(preamble_token.as_jump_target_descr());
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
@@ -3731,15 +3728,15 @@ impl Optimizer {
                         // replacement guard without resume payload, which
                         // would silently overwrite the slot.  Match RPython
                         // by panicking instead of skipping.
-                        let old_descr = ctx.new_operations[target_pos].descr.as_ref().expect(
+                        let old_descr = ctx.new_operations[target_pos].getdescr().expect(
                             "optimizer.py:716 old_descr = old_op.getdescr(): \
                                  replaced guard slot has no descr",
                         );
-                        let new_descr = op.descr.as_ref().expect(
+                        let new_descr = op.getdescr().expect(
                             "optimizer.py:717 new_descr = new_op.getdescr(): \
                              replacement guard has no descr",
                         );
-                        crate::compile::copy_all_attributes_from(new_descr, old_descr);
+                        crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                         ctx.new_operations[target_pos] = op.clone();
                         ctx.in_final_emission = saved_in_final_emission;
                         return;
@@ -3912,7 +3909,7 @@ impl Optimizer {
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path at
         // optimizeopt/mod.rs:3061-3066.
-        let shared = op.descr.is_none()
+        let shared = !op.has_descr()
             && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
@@ -3975,7 +3972,7 @@ impl Optimizer {
                             (pf_op.arg(0), pf_op.arg(1), -1i32)
                         };
                         majit_ir::GuardPendingFieldEntry {
-                            descr: pf_op.descr.clone(),
+                            descr: pf_op.getdescr(),
                             item_index,
                             target: ctx.get_box_replacement(target),
                             value: ctx.get_box_replacement(value),
@@ -4075,15 +4072,14 @@ impl Optimizer {
         // would make `op.descr.fail_descr().rd_*()` reads fall back
         // to empty slices) or a two-hop prev.
         let last_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("optimizer.py:691 last_guard_op.getdescr() must exist");
         assert!(
             !last_descr.is_resume_guard_copied(),
             "optimizer.py:691 assert isinstance(last_descr, ResumeGuardDescr): \
              ResumeGuardCopiedDescr forbidden as sharing donor"
         );
-        op.descr = Some({
+        op.setdescr({
             use majit_ir::OpCode;
             match op.opcode {
                 OpCode::GuardException | OpCode::GuardNoException => {
@@ -4288,7 +4284,7 @@ impl Optimizer {
         // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
         newop.pos.set(op.pos.get());
-        newop.descr = op.descr.clone();
+        newop.descr = op.getdescr();
         newop.fail_args = op.fail_args.clone();
         newop.fail_arg_types = op.fail_arg_types.clone();
         // compile.py:855 _attrs_ live on the descr; Arc-clone of
@@ -4607,7 +4603,7 @@ mod tests {
 
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef::int_op(0)]);
-                set.descr = Some(self.field_descr.clone());
+                set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
             }
             OptimizationResult::PassOn
@@ -5093,7 +5089,7 @@ mod tests {
         // descrless GuardNonnull below — give it a real descr so
         // OptContext::emit_guard_operation finds a valid donor.
         let mut guard_true = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
-        guard_true.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+        guard_true.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
         let mut ops = vec![
             guard_true,
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
@@ -5206,12 +5202,12 @@ mod tests {
 
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef::int_op(0)]);
-                set_a.descr = Some(self.field_descr.clone());
+                set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef::int_op(1)]);
-                set_b.descr = Some(self.field_descr.clone());
+                set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
             OptimizationResult::PassOn
@@ -5523,7 +5519,7 @@ mod tests {
     #[test]
     fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.descr = Some(Arc::new(TestCallDescr {
+        op.setdescr(Arc::new(TestCallDescr {
             idx: 400,
             effect: EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
             result_type: majit_ir::Type::Int,
@@ -5537,7 +5533,7 @@ mod tests {
     #[test]
     fn test_is_call_pure_pure_canraise_true_for_other_raising_effects() {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.descr = Some(Arc::new(TestCallDescr {
+        op.setdescr(Arc::new(TestCallDescr {
             idx: 401,
             effect: EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
             result_type: majit_ir::Type::Int,
@@ -5704,7 +5700,7 @@ mod tests {
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
         assert!(ctx.new_operations.iter().any(|op| {
-            op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.descr.is_some()
+            op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef::int_op(11) && op.has_descr()
         }));
         // info.py:146-151: force_box emits the ORIGINAL box op, so the
         // forced GuardNonnull keeps arg(0) = OpRef::ref_op(10) (matches the virtual's
