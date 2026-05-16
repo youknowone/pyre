@@ -4212,6 +4212,117 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "T3 audit probe — dumps runtime opnames + walker-handled set + \
+                per-opname JitCode hit count. Run with \
+                `cargo test -p pyre-jit-trace --features dynasm --lib \
+                t3_audit_opname_gap_inventory -- --ignored --nocapture` to \
+                produce a project memory entry; not a permanent test."]
+    fn t3_audit_opname_gap_inventory() {
+        use crate::jitcode_runtime::{all_jitcodes, insns_byte_to_opname, insns_opname_to_byte};
+
+        // 1) Runtime opnames (pyre's actual codewriter emission set).
+        let runtime_names: std::collections::BTreeSet<String> =
+            insns_opname_to_byte().keys().cloned().collect();
+
+        // 2) Walker-handled opnames — parsed from the embedded `handle`
+        // function's string literals.  Source-of-truth scan against
+        // the file itself so this probe stays accurate as handlers
+        // land/leave.
+        let source = include_str!("jitcode_dispatch.rs");
+        let mut handled: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Heuristic: scan the literal patterns that appear ONLY in
+        // dispatch arms of `handle()` — they look like
+        // `"<opname>/[argcodes]" => ...`.  Filter to entries that are
+        // also in the runtime table to drop test-fixture literals.
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('"') {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end_quote_idx) = rest.find('"') else {
+                continue;
+            };
+            let key = &rest[..end_quote_idx];
+            // Must contain '/' (separates opname from argcodes); skip
+            // anything that doesn't look like an opname/argcodes literal.
+            if !key.contains('/') {
+                continue;
+            }
+            if runtime_names.contains(key) {
+                handled.insert(key.to_string());
+            }
+        }
+
+        let unhandled: Vec<&String> = runtime_names.difference(&handled).collect();
+
+        // 3) Per-opname JitCode hit count — for each unhandled opname,
+        // count how many JitCodes contain its opcode byte.  Higher
+        // counts = higher likelihood of blocking the next opcode
+        // entering the shadow allow-list.
+        let opname_to_byte = insns_opname_to_byte();
+        let byte_to_opname = insns_byte_to_opname();
+        let all_jcs = all_jitcodes();
+
+        // For accurate counts the byte must be at a true OP position,
+        // not an operand position.  We need to walk each JitCode using
+        // `decoded_ops` to enumerate true op bytes.
+        let mut hit_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for jc in all_jcs {
+            for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+                let key = op.key;
+                if handled.contains(key) {
+                    continue;
+                }
+                *hit_counts.entry(key.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        eprintln!();
+        eprintln!("=== T3 AUDIT: runtime opnames ===");
+        eprintln!("total runtime opnames: {}", runtime_names.len());
+        eprintln!("walker-handled opnames: {}", handled.len());
+        eprintln!("unhandled opnames: {}", unhandled.len());
+
+        eprintln!();
+        eprintln!("=== T3 AUDIT: unhandled opnames ranked by JitCode hit count ===");
+        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, count) in &ranked {
+            let byte = opname_to_byte
+                .get(name)
+                .map(|b| format!("0x{b:02x}"))
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!("  {count:>5}  {byte}  {name}");
+        }
+
+        eprintln!();
+        eprintln!("=== T3 AUDIT: unhandled opnames with ZERO JitCode hits ===");
+        for name in &unhandled {
+            if !ranked.iter().any(|(n, _)| n == *name) {
+                let byte = opname_to_byte
+                    .get(*name)
+                    .map(|b| format!("0x{b:02x}"))
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("  {byte}  {name}");
+            }
+        }
+
+        eprintln!();
+        eprintln!("=== T3 AUDIT: walker-handled opnames (for cross-check) ===");
+        for name in &handled {
+            eprintln!("  {name}");
+        }
+
+        // Sanity: byte_to_opname must invert opname_to_byte.
+        assert_eq!(byte_to_opname.len(), opname_to_byte.len());
+    }
+
+    #[test]
     fn switch_id_hit_jumps_to_matching_target() {
         let switch_byte = *insns_opname_to_byte()
             .get("switch/id")
