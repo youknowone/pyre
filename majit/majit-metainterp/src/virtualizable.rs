@@ -158,10 +158,10 @@ pub struct VirtualizableInfo {
     _array_field_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
-    pub static_field_by_descrs: HashMap<usize, usize>,
+    pub static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
-    pub array_field_by_descrs: HashMap<usize, usize>,
+    pub array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
     /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
     /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
     /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
@@ -230,8 +230,8 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
-            static_field_by_descrs: HashMap::new(),
-            array_field_by_descrs: HashMap::new(),
+            static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             clear_vable_ptr: None,
             clear_vable_descr: None,
         }

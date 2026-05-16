@@ -340,14 +340,15 @@ impl TreeLoop {
         original_box_types: &[majit_ir::Type],
         inputarg_consts: &[OpRef],
     ) -> TreeLoop {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use std::collections::{HashSet, VecDeque};
 
         let num_original_inputargs = self.inputargs.len() as u32;
         let cut_ops = &self.ops[start.op_index..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         // Each new inputarg carries the type recorded in `original_box_types[i]`.
-        let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         let original_set: HashSet<OpRef> = original_boxes.iter().copied().collect();
         for (i, &old_ref) in original_boxes.iter().enumerate() {
             remap.insert(

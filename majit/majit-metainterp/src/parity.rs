@@ -1,9 +1,8 @@
 //! Test-only trace comparison utilities — no RPython equivalent.
 //! Used by integration tests for structural trace parity validation.
 
-use std::collections::HashMap;
-
 use crate::history::TreeLoop;
+use crate::optimizeopt::vec_assoc::VecAssoc;
 use majit_ir::{Op, OpRef, Type};
 
 /// A small, stable parity case format for comparing majit traces against
@@ -22,16 +21,18 @@ pub struct TraceParityCase<'a> {
 #[derive(Default)]
 struct VarRenumbering {
     next_id: u32,
-    ids: HashMap<OpRef, u32>,
+    ids: VecAssoc<OpRef, u32>,
 }
 
 impl VarRenumbering {
     fn id_for(&mut self, opref: OpRef) -> u32 {
-        *self.ids.entry(opref).or_insert_with(|| {
-            let id = self.next_id;
-            self.next_id += 1;
-            id
-        })
+        if let Some(&id) = self.ids.get(&opref) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.ids.insert(opref, id);
+        id
     }
 }
 
