@@ -504,11 +504,16 @@ fn remap_op_kind(
             receiver,
             trait_root,
             method_name,
-        } => OpKind::VtableMethodPtr {
-            receiver: remap(receiver),
-            trait_root: trait_root.clone(),
-            method_name: method_name.clone(),
-        },
+        } => {
+            let receiver_vid = source_graph
+                .value_id_of(receiver)
+                .expect("VtableMethodPtr.receiver must have a backing ValueId in source");
+            OpKind::VtableMethodPtr {
+                receiver: target_graph.must_variable(remap(&receiver_vid)),
+                trait_root: trait_root.clone(),
+                method_name: method_name.clone(),
+            }
+        }
         OpKind::IndirectCall {
             funcptr,
             args,
@@ -881,7 +886,12 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .value_id_of(value)
                 .expect("AssertGreen/IsConstant/IsVirtual.value must be a known Variable on graph"),
         ],
-        OpKind::VtableMethodPtr { receiver, .. } => vec![*receiver],
+        OpKind::VtableMethodPtr { receiver, .. } => vec![
+            graph
+                .expect("VtableMethodPtr requires a graph to project Variable to ValueId")
+                .value_id_of(receiver)
+                .expect("VtableMethodPtr.receiver must be a known Variable on graph"),
+        ],
         OpKind::IndirectCall { funcptr, args, .. } => {
             let mut v = vec![*funcptr];
             v.extend(args.iter().copied());

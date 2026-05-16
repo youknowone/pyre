@@ -82,10 +82,11 @@ pub fn class_get_method_ptr(
     method_name: String,
 ) -> ValueId {
     let funcptr = graph.alloc_value();
+    let receiver_var = graph.must_variable(receiver);
     let op = SpaceOperation {
         result: Some(funcptr),
         kind: OpKind::VtableMethodPtr {
-            receiver,
+            receiver: receiver_var,
             trait_root,
             method_name,
         },

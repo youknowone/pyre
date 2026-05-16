@@ -1337,7 +1337,11 @@ impl Assembler {
                 trait_root,
                 method_name,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*receiver, regallocs);
+                let receiver_vid = graph
+                    .expect("encode_op for VtableMethodPtr requires a graph")
+                    .value_id_of(receiver)
+                    .expect("VtableMethodPtr.receiver must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(receiver_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VtableMethod {

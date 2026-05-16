@@ -542,7 +542,7 @@ pub enum OpKind {
     /// in for the chain and must be emitted by the rtyper-equivalent layer
     /// (`translator/rtyper/rclass.rs`), never by `jtransform`.
     VtableMethodPtr {
-        receiver: ValueId,
+        receiver: crate::flowspace::model::Variable,
         trait_root: String,
         method_name: String,
     },
