@@ -429,13 +429,21 @@ fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
-        } => OpKind::ArrayRead {
-            base: remap(base),
-            index: remap(index),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-            nolength: *nolength,
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("ArrayRead.base must have a backing ValueId in source");
+            let index_vid = source_graph
+                .value_id_of(index)
+                .expect("ArrayRead.index must have a backing ValueId in source");
+            OpKind::ArrayRead {
+                base: target_graph.must_variable(remap(&base_vid)),
+                index: target_graph.must_variable(remap(&index_vid)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+                nolength: *nolength,
+            }
+        }
         OpKind::ArrayWrite {
             base,
             index,
@@ -443,14 +451,25 @@ fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
-        } => OpKind::ArrayWrite {
-            base: remap(base),
-            index: remap(index),
-            value: remap(value),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-            nolength: *nolength,
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("ArrayWrite.base must have a backing ValueId in source");
+            let index_vid = source_graph
+                .value_id_of(index)
+                .expect("ArrayWrite.index must have a backing ValueId in source");
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("ArrayWrite.value must have a backing ValueId in source");
+            OpKind::ArrayWrite {
+                base: target_graph.must_variable(remap(&base_vid)),
+                index: target_graph.must_variable(remap(&index_vid)),
+                value: target_graph.must_variable(remap(&value_vid)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+                nolength: *nolength,
+            }
+        }
         OpKind::InteriorFieldRead {
             base,
             index,
@@ -916,10 +935,30 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                     .expect("FieldWrite.value must be a known Variable on graph"),
             ]
         }
-        OpKind::ArrayRead { base, index, .. } => vec![*base, *index],
+        OpKind::ArrayRead { base, index, .. } => {
+            let g = graph
+                .expect("ArrayRead requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("ArrayRead.base must be a known Variable on graph"),
+                g.value_id_of(index)
+                    .expect("ArrayRead.index must be a known Variable on graph"),
+            ]
+        }
         OpKind::ArrayWrite {
             base, index, value, ..
-        } => vec![*base, *index, *value],
+        } => {
+            let g = graph
+                .expect("ArrayWrite requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("ArrayWrite.base must be a known Variable on graph"),
+                g.value_id_of(index)
+                    .expect("ArrayWrite.index must be a known Variable on graph"),
+                g.value_id_of(value)
+                    .expect("ArrayWrite.value must be a known Variable on graph"),
+            ]
+        }
         OpKind::InteriorFieldRead { base, index, .. } => vec![*base, *index],
         OpKind::InteriorFieldWrite {
             base, index, value, ..
@@ -1521,11 +1560,13 @@ mod tests {
             true,
         );
         let idx = g.push_op(entry, OpKind::ConstInt(0), true);
+        let base_var = g.must_variable(base.unwrap());
+        let idx_var = g.must_variable(idx.unwrap());
         let result = g.push_op(
             entry,
             OpKind::ArrayRead {
-                base: base.unwrap(),
-                index: idx.unwrap(),
+                base: base_var,
+                index: idx_var,
                 item_ty: ValueType::Ref,
                 array_type_id: None,
                 nolength: false,

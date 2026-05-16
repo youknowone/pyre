@@ -448,8 +448,8 @@ pub enum OpKind {
         ty: ValueType,
     },
     ArrayRead {
-        base: ValueId,
-        index: ValueId,
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
         item_ty: ValueType,
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         /// Distinguishes arrays with the same item_ty but different
@@ -463,9 +463,9 @@ pub enum OpKind {
         nolength: bool,
     },
     ArrayWrite {
-        base: ValueId,
-        index: ValueId,
-        value: ValueId,
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
         item_ty: ValueType,
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,

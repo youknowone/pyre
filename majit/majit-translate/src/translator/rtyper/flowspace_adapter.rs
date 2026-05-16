@@ -714,8 +714,14 @@ pub fn translate_op(
         // resolved type, lowering to `getarrayitem_gc_*` /
         // `setarrayitem_gc_*` bytecodes.
         OpKind::ArrayRead { base, index, .. } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("ArrayRead.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("ArrayRead.index must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getitem",
@@ -726,9 +732,18 @@ pub fn translate_op(
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("ArrayWrite.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("ArrayWrite.index must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("ArrayWrite.value must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setitem",
@@ -2714,17 +2729,17 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::ArrayRead {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayRead arm must lower");
         assert_eq!(translated.len(), 1);
@@ -2739,18 +2754,18 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::ArrayWrite {
-                base: ValueId(1),
-                index: ValueId(2),
-                value: ValueId(3),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
+                value: graph.must_variable(ValueId(3)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayWrite arm must lower");
         assert_eq!(translated.len(), 1);

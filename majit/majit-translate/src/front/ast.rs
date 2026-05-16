@@ -3636,14 +3636,16 @@ fn lower_expr(
         syn::Expr::Index(idx) => {
             let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
             let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+            let base_var = graph.must_variable(base);
+            let index_var = graph.must_variable(index);
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
                 .unwrap_or(ValueType::Unknown);
             let result = graph.push_op(
                 *block,
                 OpKind::ArrayRead {
-                    base,
-                    index,
+                    base: base_var,
+                    index: index_var,
                     item_ty,
                     nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                     array_type_id,
@@ -3719,6 +3721,9 @@ fn lower_expr(
                 syn::Expr::Index(idx) => {
                     let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                     let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                    let base_var = graph.must_variable(base);
+                    let index_var = graph.must_variable(index);
+                    let value_var = graph.must_variable(value);
                     let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                     let item_ty =
                         array_item_value_type_from_array_type_id(array_type_id.as_deref())
@@ -3726,9 +3731,9 @@ fn lower_expr(
                     graph.push_op(
                         *block,
                         OpKind::ArrayWrite {
-                            base,
-                            index,
-                            value,
+                            base: base_var,
+                            index: index_var,
+                            value: value_var,
                             item_ty,
                             nolength: nolength_from_array_type_id(array_type_id.as_deref()),
                             array_type_id,

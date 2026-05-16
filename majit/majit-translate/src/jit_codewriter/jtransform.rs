@@ -676,7 +676,13 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_getarrayitem(op, *base, *index, item_ty, graph_name, graph)
+                let base_vid = graph
+                    .value_id_of(base)
+                    .expect("ArrayRead.base must have a backing ValueId");
+                let index_vid = graph
+                    .value_id_of(index)
+                    .expect("ArrayRead.index must have a backing ValueId");
+                self.rewrite_op_getarrayitem(op, base_vid, index_vid, item_ty, graph_name, graph)
             }
             // ── rewrite_op_setarrayitem ──
             OpKind::ArrayWrite {
@@ -686,8 +692,17 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
+                let base_vid = graph
+                    .value_id_of(base)
+                    .expect("ArrayWrite.base must have a backing ValueId");
+                let index_vid = graph
+                    .value_id_of(index)
+                    .expect("ArrayWrite.index must have a backing ValueId");
+                let value_vid = graph
+                    .value_id_of(value)
+                    .expect("ArrayWrite.value must have a backing ValueId");
                 self.rewrite_op_setarrayitem(
-                    op, *base, *index, *value, item_ty, graph_name, graph,
+                    op, base_vid, index_vid, value_vid, item_ty, graph_name, graph,
                 )
             }
             // ── rewrite_op_direct_call ──
@@ -2063,8 +2078,8 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::ArrayRead {
-                    base,
-                    index,
+                    base: graph.must_variable(base),
+                    index: graph.must_variable(index),
                     item_ty: typed_item_ty,
                     array_type_id: match &op.kind {
                         OpKind::ArrayRead { array_type_id, .. } => array_type_id.clone(),
@@ -2118,9 +2133,9 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::ArrayWrite {
-                    base,
-                    index,
-                    value,
+                    base: graph.must_variable(base),
+                    index: graph.must_variable(index),
+                    value: graph.must_variable(value),
                     item_ty: typed_item_ty,
                     array_type_id: match &op.kind {
                         OpKind::ArrayWrite { array_type_id, .. } => array_type_id.clone(),
@@ -3777,13 +3792,21 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
-        } => OpKind::ArrayRead {
-            base: remap_value(*base, aliases),
-            index: remap_value(*index, aliases),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-            nolength: *nolength,
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("ArrayRead.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("ArrayRead.index must have a backing ValueId");
+            OpKind::ArrayRead {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                index: graph.must_variable(remap_value(index_vid, aliases)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+                nolength: *nolength,
+            }
+        }
         OpKind::ArrayWrite {
             base,
             index,
@@ -3791,14 +3814,25 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
-        } => OpKind::ArrayWrite {
-            base: remap_value(*base, aliases),
-            index: remap_value(*index, aliases),
-            value: remap_value(*value, aliases),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-            nolength: *nolength,
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("ArrayWrite.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("ArrayWrite.index must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("ArrayWrite.value must have a backing ValueId");
+            OpKind::ArrayWrite {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                index: graph.must_variable(remap_value(index_vid, aliases)),
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+                nolength: *nolength,
+            }
+        }
         OpKind::InteriorFieldRead {
             base,
             index,
@@ -4627,11 +4661,13 @@ mod tests {
                 true,
             )
             .unwrap();
+        let array_var = graph.must_variable(array);
+        let index_var = graph.must_variable(index);
         graph.push_op(
             graph.startblock,
             OpKind::ArrayRead {
-                base: array,
-                index,
+                base: array_var,
+                index: index_var,
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
@@ -4743,12 +4779,15 @@ mod tests {
         let base = graph.alloc_value();
         let index = graph.alloc_value();
         let value = graph.alloc_value();
+        let base_var = graph.must_variable(base);
+        let index_var = graph.must_variable(index);
+        let value_var = graph.must_variable(value);
         graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
-                base,
-                index,
-                value,
+                base: base_var,
+                index: index_var,
+                value: value_var,
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
@@ -4815,12 +4854,14 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         let index = graph.alloc_value();
+        let base_var = graph.must_variable(base);
+        let index_var = graph.must_variable(index);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::ArrayRead {
-                    base,
-                    index,
+                    base: base_var,
+                    index: index_var,
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,

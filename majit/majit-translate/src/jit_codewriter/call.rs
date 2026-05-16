@@ -4750,9 +4750,12 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
+                    let base_vid = graph
+                        .value_id_of(base)
+                        .expect("ArrayRead.base must have a backing ValueId");
                     let resolved_id = resolve_array_identity(
                         graph,
-                        base,
+                        &base_vid,
                         array_type_id,
                         &value_producers,
                         &phi_sources,
@@ -4798,9 +4801,12 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
+                    let base_vid = graph
+                        .value_id_of(base)
+                        .expect("ArrayWrite.base must have a backing ValueId");
                     let resolved_id = resolve_array_identity(
                         graph,
-                        base,
+                        &base_vid,
                         array_type_id,
                         &value_producers,
                         &phi_sources,

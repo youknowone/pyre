@@ -1450,10 +1450,17 @@ impl Assembler {
                 array_type_id,
                 nolength,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for ArrayRead requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("ArrayRead.base must be a known Variable on graph");
+                let index_vid = g
+                    .value_id_of(index)
+                    .expect("ArrayRead.index must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
+                let (reg, kc) = self.lookup_reg_with_kind(index_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 // descr.py:359-362 + ARRAY_INSIDE._hints.get('nolength',
@@ -1495,13 +1502,23 @@ impl Assembler {
                 array_type_id,
                 nolength,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for ArrayWrite requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("ArrayWrite.base must be a known Variable on graph");
+                let index_vid = g
+                    .value_id_of(index)
+                    .expect("ArrayWrite.index must be a known Variable on graph");
+                let value_vid = g
+                    .value_id_of(value)
+                    .expect("ArrayWrite.value must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
+                let (reg, kc) = self.lookup_reg_with_kind(index_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(value_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
                 // pyre source-level array operations are emitted from
@@ -4184,12 +4201,13 @@ mod tests {
             },
             false,
         );
+        let index_var = graph.must_variable(index);
         graph.push_op(
             graph.startblock,
             OpKind::ArrayWrite {
-                base,
-                index,
-                value,
+                base: base_var,
+                index: index_var,
+                value: graph.must_variable(value),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
@@ -4299,12 +4317,14 @@ mod tests {
                 true,
             )
             .unwrap();
+        let index_var = graph.must_variable(index);
+        let base_var2 = graph.must_variable(base);
         let array_result = graph
             .push_op(
                 graph.startblock,
                 OpKind::ArrayRead {
-                    base,
-                    index,
+                    base: base_var2,
+                    index: index_var,
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
