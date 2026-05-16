@@ -7012,8 +7012,22 @@ impl CodeWriter {
         // descent + `seen_blocks` (`flatten.py:110-113`); convergence
         // arrives when production flips to post-walk `flatten_graph`.
         {
+            // Reviewer R5: drain must skip dead/superseded blocks per
+            // RPython `flowspace/flowcontext.py:455` (the supersede
+            // step sets `block.dead = True; block.operations = ()`
+            // and reroutes incoming edges to the newblock; the dead
+            // block is no longer enumerated for flattening).  Pyre's
+            // per-block SSA accumulator collected insns into the
+            // dead block before supersede fired; without this filter
+            // those insns reach the drained stream and the runtime's
+            // first-wins PC dispatch (`pc_anchor_positions`) lands
+            // on the dead block's PcAnchor instead of the supersede
+            // newblock's re-walked emission — a NEW-DEVIATION from
+            // PyPy where dead blocks contribute nothing to the
+            // final code.
             let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
                 .iter()
+                .filter(|block| !block.dead())
                 .map(|block| block.per_block_ssarepr())
                 .collect();
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
