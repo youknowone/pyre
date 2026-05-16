@@ -1316,8 +1316,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph
-                .expect("ConditionalCall requires a graph to project Variable to ValueId");
+            let g = graph.expect("ConditionalCall requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("ConditionalCall arg/condition must be a known Variable on graph")

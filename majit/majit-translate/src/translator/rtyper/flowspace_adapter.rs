@@ -2592,7 +2592,10 @@ mod tests {
             result: Some(ValueId(3)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::method("push", Some("Vec".into())),
-                args: vec![graph.must_variable(ValueId(1)), graph.must_variable(ValueId(2))],
+                args: vec![
+                    graph.must_variable(ValueId(1)),
+                    graph.must_variable(ValueId(2)),
+                ],
                 result_ty: ValueType::Int,
             },
         };

@@ -1189,8 +1189,7 @@ impl Assembler {
                 // leading `i` operand.
                 match funcptr {
                     crate::model::CallFuncPtr::Value(var) => {
-                        let g = graph
-                            .expect("encode_op for Call funcptr requires a graph");
+                        let g = graph.expect("encode_op for Call funcptr requires a graph");
                         let vid = g
                             .value_id_of(var)
                             .expect("Call funcptr must be a known Variable on graph");

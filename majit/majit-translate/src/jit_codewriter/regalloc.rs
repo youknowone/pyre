@@ -241,7 +241,11 @@ impl RegAllocator {
 
     /// RPython: `RegAllocator.make_dependencies()` — regalloc.py:26-77.
     /// Per-block die_at analysis.
-    fn make_dependencies(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
+    fn make_dependencies(
+        &mut self,
+        graph: &FunctionGraph,
+        consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
+    ) {
         for block in &graph.blocks {
             self.process_block(block, graph, consider);
         }
@@ -252,7 +256,7 @@ impl RegAllocator {
         &mut self,
         block: &Block,
         graph: &FunctionGraph,
-        consider: &dyn Fn(ValueId) -> bool,
+        consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
         // die_at: last usage index of each variable in this block.
         // Keyed on the backing Variable so the coalesce / coloring
@@ -292,13 +296,10 @@ impl RegAllocator {
         die_list.sort_by_key(|(t, _)| *t);
 
         // inputargs all interfere with each other
-        let inputarg_vids = block.inputarg_value_ids(graph);
-        let livevars: Vec<crate::flowspace::model::Variable> = inputarg_vids
-            .iter()
-            .copied()
-            .zip(block.input_variables(graph))
-            .filter(|(v, _)| consider(*v))
-            .map(|(_, var)| var.clone())
+        let livevars: Vec<crate::flowspace::model::Variable> = block
+            .input_variables(graph)
+            .filter(|var| consider(var))
+            .cloned()
             .collect();
         for (i, v) in livevars.iter().enumerate() {
             self.depgraph.add_node(v.clone());
@@ -316,8 +317,8 @@ impl RegAllocator {
                 die_index += 1;
             }
             if let Some(result) = op.result {
-                if consider(result) {
-                    let result_var = Self::var(graph, result);
+                let result_var = Self::var(graph, result);
+                if consider(&result_var) {
                     self.depgraph.add_node(result_var.clone());
                     for v in &alive {
                         self.depgraph.add_edge(v.clone(), result_var.clone());
@@ -334,7 +335,11 @@ impl RegAllocator {
     /// Upstream also pre-seeds the depgraph with nodes for
     /// `link.last_exception` / `link.last_exc_value` so any downstream
     /// `getcolor(v)` against those extravars finds a colored node.
-    fn coalesce_variables(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
+    fn coalesce_variables(
+        &mut self,
+        graph: &FunctionGraph,
+        consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
+    ) {
         for block in &graph.blocks {
             for link in &block.exits {
                 // RPython `regalloc.py:92-95`: add `link.last_exception` and
@@ -347,20 +352,16 @@ impl RegAllocator {
                 // it (`color.py:25-27 getnodes()` filters
                 // `all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception {
-                    if let Some(v) = arg.as_value(graph) {
-                        if consider(v) {
-                            if let Some(var) = arg.as_variable() {
-                                self.depgraph.add_node(var.clone());
-                            }
+                    if let Some(var) = arg.as_variable() {
+                        if consider(var) {
+                            self.depgraph.add_node(var.clone());
                         }
                     }
                 }
                 if let Some(arg) = &link.last_exc_value {
-                    if let Some(v) = arg.as_value(graph) {
-                        if consider(v) {
-                            if let Some(var) = arg.as_variable() {
-                                self.depgraph.add_node(var.clone());
-                            }
+                    if let Some(var) = arg.as_variable() {
+                        if consider(var) {
+                            self.depgraph.add_node(var.clone());
                         }
                     }
                 }
@@ -369,14 +370,7 @@ impl RegAllocator {
                     target_block.input_variables(graph).cloned().collect();
                 for (arg, target_var) in link.args.iter().zip(target_input_vars.iter()) {
                     if let Some(arg_var) = arg.as_variable() {
-                        // `consider` is still ValueId-keyed (it reads
-                        // `graph.concretetype(v)` for the kind dispatch);
-                        // project the Variable back via `graph.value_id_of`
-                        // for the predicate call.
-                        let arg_vid = graph
-                            .value_id_of(arg_var)
-                            .expect("LinkArg variable must have a backing ValueId");
-                        if consider(arg_vid) {
+                        if consider(arg_var) {
                             self.depgraph.add_node(arg_var.clone());
                         }
                         self.try_coalesce(graph, arg_var, target_var, consider);
@@ -387,24 +381,17 @@ impl RegAllocator {
     }
 
     /// `regalloc.py:_try_coalesce` direct port — operands are
-    /// `Variable` instances now (matching upstream's
-    /// `for v, w in zip(link.args, target.inputargs)`), and the
-    /// `consider` predicate's `ValueId` argument is recovered via
-    /// `graph.value_id_of`.
+    /// `Variable` instances (matching upstream's `for v, w in
+    /// zip(link.args, target.inputargs)`), and the `consider`
+    /// predicate reads off the same Variable handle.
     fn try_coalesce(
         &mut self,
-        graph: &FunctionGraph,
+        _graph: &FunctionGraph,
         v: &crate::flowspace::model::Variable,
         w: &crate::flowspace::model::Variable,
-        consider: &dyn Fn(ValueId) -> bool,
+        consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
-        let v_vid = graph
-            .value_id_of(v)
-            .expect("try_coalesce.v must have a backing ValueId");
-        let w_vid = graph
-            .value_id_of(w)
-            .expect("try_coalesce.w must have a backing ValueId");
-        if !consider(v_vid) || !consider(w_vid) {
+        if !consider(v) || !consider(w) {
             return;
         }
         let v0 = self.unionfind.find_rep(v.clone());
@@ -432,9 +419,8 @@ impl RegAllocator {
         self.coloring = self.depgraph.find_node_coloring();
     }
 
-    fn getcolor(&mut self, graph: &FunctionGraph, v: ValueId) -> Option<usize> {
-        let var = graph.variable(v)?.clone();
-        let rep = self.unionfind.find_rep(var);
+    fn getcolor(&mut self, var: &crate::flowspace::model::Variable) -> Option<usize> {
+        let rep = self.unionfind.find_rep(var.clone());
         self.coloring.get(&rep).copied()
     }
 }
@@ -547,7 +533,7 @@ pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKin
 /// reads `getkind(v.concretetype)`.
 pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocResult {
     let consider =
-        |v: ValueId| -> bool { concretetype_to_regkind(&graph.concretetype(v)) == Some(kind) };
+        |var: &crate::flowspace::model::Variable| -> bool { variable_regkind(var) == Some(kind) };
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, &consider);
     allocator.coalesce_variables(graph, &consider);
@@ -556,13 +542,12 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
     let mut max_reg = 0usize;
     // Walk every Variable minted on the graph and pick those whose
-    // graph-side concretetype lands in `kind`.  `getcolor` projects
-    // through the unionfind rep to recover the chordal coloring
-    // entry — matches upstream `regalloc.py:118
-    // self.coloring[self.unionfind.find_rep(v)]`.
-    for (vid, var) in graph.iter_variables() {
-        if concretetype_to_regkind(&graph.concretetype(vid)) == Some(kind) {
-            if let Some(color) = allocator.getcolor(graph, vid) {
+    // concretetype lands in `kind`.  `getcolor` projects through the
+    // unionfind rep to recover the chordal coloring entry — matches
+    // upstream `regalloc.py:118 self.coloring[self.unionfind.find_rep(v)]`.
+    for (_vid, var) in graph.iter_variables() {
+        if variable_regkind(var) == Some(kind) {
+            if let Some(color) = allocator.getcolor(var) {
                 coloring.insert(var.clone(), color);
                 if color + 1 > max_reg {
                     max_reg = color + 1;
@@ -574,6 +559,17 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
         coloring,
         num_regs: max_reg,
     }
+}
+
+/// [`crate::flowspace::model::Variable`] → [`RegKind`] projection,
+/// reading the Variable's inline `concretetype` cell directly.  Mirrors
+/// upstream RPython's `getkind(v.concretetype)` (`history.py:46-71`).
+fn variable_regkind(var: &crate::flowspace::model::Variable) -> Option<RegKind> {
+    let ct = match var.concretetype.borrow().as_ref() {
+        Some(lltype) => crate::model::getkind(lltype),
+        None => ConcreteType::Unknown,
+    };
+    concretetype_to_regkind(&ct)
 }
 
 /// `getkind`'s [`ConcreteType`] → [`RegKind`] projection:
