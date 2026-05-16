@@ -2557,7 +2557,11 @@ impl FunctionGraph {
     /// Slice Z2.5.A — get-or-mint the `ValueId` bridge for an upstream
     /// `Variable` cell (key = `Variable.id`).  Idempotent: repeated calls
     /// with the same Variable return the same ValueId; distinct
-    /// Variables get distinct ValueIds via `alloc_value()`.
+    /// Variables get distinct ValueIds via [`Self::alloc_value_with_variable`]
+    /// so the slot's backing [`crate::flowspace::model::Variable`] is
+    /// the supplied `v` itself (RPython parity: `Variable.concretetype`
+    /// — set by the rtyper before the bridge is observed — is the
+    /// authoritative kind source via [`Self::concretetype`]).
     ///
     /// Consumers populate the bridge at the moment a `Variable`
     /// originating from `FrameState.stack` or `last_exception` needs
@@ -2569,9 +2573,7 @@ impl FunctionGraph {
         if let Some(&vid) = self.variable_to_vid.get(&v.id()) {
             return vid;
         }
-        let vid = self.alloc_value();
-        self.variable_to_vid.insert(v.id(), vid);
-        vid
+        self.alloc_value_with_variable(v.clone())
     }
 
     /// `Variable.concretetype` getter — RPython's
