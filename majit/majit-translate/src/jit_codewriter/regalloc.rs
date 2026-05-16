@@ -365,33 +365,52 @@ impl RegAllocator {
                     }
                 }
                 let target_block = graph.block(link.target);
-                let target_vids = target_block.inputarg_value_ids(graph);
-                for (v, &w) in link.args.iter().zip(target_vids.iter()) {
-                    if let Some(v) = v.as_value(graph) {
-                        if consider(v) {
-                            self.depgraph.add_node(Self::var(graph, v));
+                let target_input_vars: Vec<crate::flowspace::model::Variable> = target_block
+                    .input_variables(graph)
+                    .cloned()
+                    .collect();
+                for (arg, target_var) in link.args.iter().zip(target_input_vars.iter()) {
+                    if let Some(arg_var) = arg.as_variable() {
+                        // `consider` is still ValueId-keyed (it reads
+                        // `graph.concretetype(v)` for the kind dispatch);
+                        // project the Variable back via `graph.value_id_of`
+                        // for the predicate call.
+                        let arg_vid = graph
+                            .value_id_of(arg_var)
+                            .expect("LinkArg variable must have a backing ValueId");
+                        if consider(arg_vid) {
+                            self.depgraph.add_node(arg_var.clone());
                         }
-                        self.try_coalesce(graph, v, w, consider);
+                        self.try_coalesce(graph, arg_var, target_var, consider);
                     }
                 }
             }
         }
     }
 
+    /// `regalloc.py:_try_coalesce` direct port — operands are
+    /// `Variable` instances now (matching upstream's
+    /// `for v, w in zip(link.args, target.inputargs)`), and the
+    /// `consider` predicate's `ValueId` argument is recovered via
+    /// `graph.value_id_of`.
     fn try_coalesce(
         &mut self,
         graph: &FunctionGraph,
-        v: ValueId,
-        w: ValueId,
+        v: &crate::flowspace::model::Variable,
+        w: &crate::flowspace::model::Variable,
         consider: &dyn Fn(ValueId) -> bool,
     ) {
-        if !consider(v) || !consider(w) {
+        let v_vid = graph
+            .value_id_of(v)
+            .expect("try_coalesce.v must have a backing ValueId");
+        let w_vid = graph
+            .value_id_of(w)
+            .expect("try_coalesce.w must have a backing ValueId");
+        if !consider(v_vid) || !consider(w_vid) {
             return;
         }
-        let v_var = Self::var(graph, v);
-        let w_var = Self::var(graph, w);
-        let v0 = self.unionfind.find_rep(v_var);
-        let w0 = self.unionfind.find_rep(w_var);
+        let v0 = self.unionfind.find_rep(v.clone());
+        let w0 = self.unionfind.find_rep(w.clone());
         if v0 == w0 {
             return;
         }
