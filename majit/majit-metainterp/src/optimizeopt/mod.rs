@@ -7109,7 +7109,7 @@ pub trait Optimization {
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        _available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -7127,7 +7127,7 @@ pub trait Optimization {
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        _available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }

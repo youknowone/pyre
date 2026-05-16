@@ -3374,7 +3374,7 @@ impl Optimization for OptHeap {
     fn export_cached_fields(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, DescrRef, OpRef)> {
         let mut result = Vec::new();
         // heap.py:827-846: for descr, cf in cached_fields.iteritems():
@@ -3405,7 +3405,7 @@ impl Optimization for OptHeap {
                 }
                 // heap.py:836: if not box1.is_constant() and box1 not in available_boxes: continue
                 if let Some(ab) = available_boxes {
-                    if !obj.is_constant() && !ab.contains_key(&obj) {
+                    if !obj.is_constant() && !ab.contains(&obj) {
                         continue;
                     }
                 }
@@ -3433,7 +3433,7 @@ impl Optimization for OptHeap {
                     continue;
                 }
                 let val_ok = available_boxes.map_or(true, |ab| {
-                    val.is_constant() || ctx.is_constant(val) || ab.contains_key(&val)
+                    val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
                 });
                 if val_ok {
                     result.push((obj, descr.clone(), val));
@@ -3502,7 +3502,7 @@ impl Optimization for OptHeap {
     fn export_cached_arrayitems(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
+        available_boxes: Option<&[OpRef]>,
     ) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
         let mut result = Vec::new();
         for (_, descr, submap) in &self.cached_arrayitems {
@@ -3521,7 +3521,7 @@ impl Optimization for OptHeap {
                     }
                     // heap.py:855: if not box1.is_constant() and box1 not in available_boxes: continue
                     if let Some(ab) = available_boxes {
-                        if !obj.is_constant() && !ab.contains_key(&obj) {
+                        if !obj.is_constant() && !ab.contains(&obj) {
                             continue;
                         }
                     }
@@ -3552,7 +3552,7 @@ impl Optimization for OptHeap {
                         continue;
                     }
                     let val_ok = available_boxes.map_or(true, |ab| {
-                        val.is_constant() || ctx.is_constant(val) || ab.contains_key(&val)
+                        val.is_constant() || ctx.is_constant(val) || ab.contains(&val)
                     });
                     if val_ok {
                         result.push((obj, index, descr.clone(), val));
