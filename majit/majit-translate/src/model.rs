@@ -567,7 +567,7 @@ pub enum OpKind {
     /// Virtualizable field read → reads from boxes, no heap op.
     /// RPython: `getfield_vable_i/r/f`
     VableFieldRead {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         field_index: usize,
         ty: ValueType,
     },

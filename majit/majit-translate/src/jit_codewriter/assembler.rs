@@ -1511,7 +1511,11 @@ impl Assembler {
             OpKind::VableFieldRead {
                 base, field_index, ..
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let base_vid = graph
+                    .expect("encode_op for VableFieldRead requires a graph")
+                    .value_id_of(base)
+                    .expect("VableFieldRead.base must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: vable field → VableField descriptor (index, not byte offset).

@@ -543,11 +543,16 @@ fn remap_op_kind(
             base,
             field_index,
             ty,
-        } => OpKind::VableFieldRead {
-            base: remap(base),
-            field_index: *field_index,
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("VableFieldRead.base must have a backing ValueId in source");
+            OpKind::VableFieldRead {
+                base: target_graph.must_variable(remap(&base_vid)),
+                field_index: *field_index,
+                ty: ty.clone(),
+            }
+        }
         OpKind::VableFieldWrite {
             base,
             field_index,
@@ -904,7 +909,12 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .expect("RecordQuasiImmutField.base must be a known Variable on graph"),
         ],
         OpKind::JitDebug { args, .. } => args.clone(),
-        OpKind::VableFieldRead { base, .. } => vec![*base],
+        OpKind::VableFieldRead { base, .. } => vec![
+            graph
+                .expect("VableFieldRead requires a graph to project Variable to ValueId")
+                .value_id_of(base)
+                .expect("VableFieldRead.base must be a known Variable on graph"),
+        ],
         OpKind::VableFieldWrite { base, value, .. } => vec![*base, *value],
         OpKind::VableArrayRead {
             base, elem_index, ..

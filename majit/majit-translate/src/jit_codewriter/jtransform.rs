@@ -1850,13 +1850,14 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
+            let base_vid = match &op.kind {
+                OpKind::FieldRead { base, .. } => *base,
+                _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
+            };
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldRead {
-                    base: match &op.kind {
-                        OpKind::FieldRead { base, .. } => *base,
-                        _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
-                    },
+                    base: graph.must_variable(base_vid),
                     field_index: vable_field.index,
                     ty: typed_ty.clone(),
                 },
@@ -3832,11 +3833,16 @@ fn remap_op(
             base,
             field_index,
             ty,
-        } => OpKind::VableFieldRead {
-            base: remap_value(*base, aliases),
-            field_index: *field_index,
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("VableFieldRead.base must have a backing ValueId");
+            OpKind::VableFieldRead {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                field_index: *field_index,
+                ty: ty.clone(),
+            }
+        }
         OpKind::VableFieldWrite {
             base,
             field_index,
@@ -4533,18 +4539,16 @@ mod tests {
         assert_eq!(result.vable_rewrites, 1);
         // Should be rewritten to VableFieldRead
         let rewritten_op = &result.graph.block(graph.startblock).operations[0];
-        assert!(
-            matches!(
-                &rewritten_op.kind,
-                OpKind::VableFieldRead {
-                    base: rewritten_base,
-                    field_index: 0,
-                    ..
-                } if *rewritten_base == base
-            ),
-            "expected VableFieldRead, got {:?}",
-            rewritten_op.kind
-        );
+        let OpKind::VableFieldRead {
+            base: rewritten_base,
+            field_index,
+            ..
+        } = &rewritten_op.kind
+        else {
+            panic!("expected VableFieldRead, got {:?}", rewritten_op.kind);
+        };
+        assert_eq!(*field_index, 0);
+        assert_eq!(result.graph.value_id_of(rewritten_base), Some(base));
     }
 
     #[test]
