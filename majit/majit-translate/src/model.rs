@@ -407,7 +407,7 @@ impl FieldDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpKind {
     Input {
         name: String,
@@ -439,7 +439,6 @@ pub enum OpKind {
         /// chosen opcode flavour through flatten/assembly so the
         /// runtime sees the `_pure` bytecode variant instead of having
         /// to rediscover purity from the descriptor later.
-        #[serde(default)]
         pure: bool,
     },
     FieldWrite {
@@ -858,7 +857,7 @@ pub enum OpKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceOperation {
     pub result: Option<ValueId>,
     pub kind: OpKind,
