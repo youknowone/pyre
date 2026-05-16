@@ -324,6 +324,12 @@ impl CodeWriter {
         );
         #[cfg(debug_assertions)]
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
+        // PyPy parity: before jtransform runs, hydrate every Variable's
+        // `concretetype` cell from the rtyper-produced `type_state` so
+        // jtransform reads kinds via `graph.concretetype(v)` — the same
+        // `getkind(v.concretetype)` path as upstream — rather than a
+        // separate `TypeResolutionState` side-table fallback.
+        crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut graph_owned);
         let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =

@@ -63,19 +63,21 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         &legacy_callcontrol,
     );
 
+    // PyPy parity: hydrate every Variable's `concretetype` cell from the
+    // rtyper-produced `types` table BEFORE jtransform runs, so jtransform
+    // reads kinds via `graph.concretetype(v)` directly (the same
+    // `getkind(v.concretetype)` path as upstream).  `with_type_state` is
+    // still threaded as a belt-and-suspenders fallback for any slot that
+    // the rtyper left Unknown — without it the legacy snapshot path
+    // defaulted those slots to `'r'`, forcing `jtransform`'s
+    // kind-coercion arms to manufacture `cast_ptr_to_int` ops.
+    crate::jit_codewriter::type_state::apply_to_graph(&types, &mut graph_owned);
+
     // Pass 3: JIT transform (RPython jtransform) — thread the same empty
     // CallControl so `lower_indirect_call_op` has access to `getcalldescr`
     // / `guess_call_kind` / `graphs_from`. With no registered candidates
     // the op resolves to `CallKind::Residual`, matching upstream's
     // conservative fallback for `indirect_call` with unknown family.
-    // Also thread `types` so jtransform's `get_value_kind` sees each
-    // operand's `concretetype` — RPython's rtyper resolves
-    // `Variable.concretetype` once at typing time and every later pass
-    // (including jtransform) reads it directly.  Without `with_type_state`
-    // the legacy snapshot path defaulted every operand to `'r'`, which
-    // forced the kind-coercion arms in `jtransform` to manufacture
-    // `cast_ptr_to_int` ops on graphs that the canonical pipeline
-    // already processed correctly.
     let transform_result = {
         let mut transformer = crate::jtransform::Transformer::new(&config.transform)
             .with_callcontrol(&mut legacy_callcontrol)
