@@ -1727,19 +1727,15 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        // Load-bearing identity invariant for runtime dispatch: pyre's
-        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
-        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
-        // fast path + assembler-emitted store of `fail_index` into
-        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
-        // build catches the position/fail_index mismatch eagerly rather
-        // than dispatching to the wrong descr at runtime.
-        assert!(
-            self.fail_descrs.iter().enumerate().all(|(i, d)| d
-                .as_fail_descr()
-                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
-            "fail_descrs position must equal fail_index"
-        );
+        // Position is the canonical fail_index identity (matching
+        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
+        // carry per-emission `fail_index` on the descr itself).  Codegen
+        // increments the `fail_index` counter in lockstep with
+        // `fail_descrs.push`, so the contract is structural rather than
+        // descr-internal.  The earlier per-descr assertion was a pyre
+        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // descrs (`compile.py:623-662`) answer the trait-default `0`
+        // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
@@ -1849,19 +1845,15 @@ impl<'a> Assembler386<'a> {
             eprintln!();
         }
 
-        // Load-bearing identity invariant for runtime dispatch: pyre's
-        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
-        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
-        // fast path + assembler-emitted store of `fail_index` into
-        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
-        // build catches the position/fail_index mismatch eagerly rather
-        // than dispatching to the wrong descr at runtime.
-        assert!(
-            self.fail_descrs.iter().enumerate().all(|(i, d)| d
-                .as_fail_descr()
-                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
-            "fail_descrs position must equal fail_index"
-        );
+        // Position is the canonical fail_index identity (matching
+        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
+        // carry per-emission `fail_index` on the descr itself).  Codegen
+        // increments the `fail_index` counter in lockstep with
+        // `fail_descrs.push`, so the contract is structural rather than
+        // descr-internal.  The earlier per-descr assertion was a pyre
+        // NEW DEVIATION removed in Session 7-Tα4: singleton FINISH
+        // descrs (`compile.py:623-662`) answer the trait-default `0`
+        // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
