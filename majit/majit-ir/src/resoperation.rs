@@ -1032,7 +1032,11 @@ pub struct Op {
     pub rd_resume_position: std::cell::Cell<i32>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
-    pub vecinfo: Option<Box<VectorizationInfo>>,
+    /// `RefCell` so the vectorizer can stamp metadata onto a shared `Op`
+    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython's
+    /// `forwarded_vecinfo(op)` (schedule.py:479-486) writes through the
+    /// same `_vector_info` slot every observer sees.
+    pub vecinfo: std::cell::RefCell<Option<Box<VectorizationInfo>>>,
     /// resoperation.py:234 `_forwarded` slot from
     /// `AbstractResOpOrInputArg`. Carries forwarding targets and
     /// analysis info during optimization. See
@@ -1056,7 +1060,7 @@ impl Clone for Op {
             fail_args: self.fail_args.clone(),
             fail_arg_types: self.fail_arg_types.clone(),
             rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
-            vecinfo: self.vecinfo.clone(),
+            vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
@@ -1139,7 +1143,7 @@ impl Op {
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: std::cell::Cell::new(-1),
-            vecinfo: None,
+            vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
@@ -1154,7 +1158,7 @@ impl Op {
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: std::cell::Cell::new(-1),
-            vecinfo: None,
+            vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
@@ -1211,7 +1215,7 @@ impl Op {
             // collapses VectorOp/VectorGuardOp into Op, so the same copy
             // happens unconditionally — None for scalar ops, Some(_) for
             // vector ops which is what RPython's Vector* subclasses do.
-            vecinfo: self.vecinfo.clone(),
+            vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             // resoperation.py:323 `ResOperation(opnum, args[:], descr)` —
             // a freshly constructed op starts with `_forwarded = None`.
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
@@ -3155,7 +3159,7 @@ mod tests {
             let mut __op = Op {
                 $($field)*
                 type_: Type::Void,
-                vecinfo: None,
+                vecinfo: std::cell::RefCell::new(None),
                 forwarded: std::cell::RefCell::new(
                     crate::forwarded::Forwarded::None,
                 ),

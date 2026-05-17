@@ -630,7 +630,7 @@ impl VectorizingOptimizer {
                 .body_ops
                 .iter()
                 .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.vecinfo.as_ref())
+                .and_then(|op| op.get_vecinfo())
                 .map(|vi| vi.getbytesize() as i32)
                 .unwrap_or(8);
             // vector.py:827,840: vec_reg_size // bytesize
