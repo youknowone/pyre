@@ -33,6 +33,41 @@ use majit_ir::{
     Op, OpCode, OpRef, OpTypeIndex, Type, Value,
 };
 
+mod slice_x2_probe {
+    //! Slice X2 instrumentation: count how often the host-loop
+    //! `execute_with_inputs` falls back to the dispatch-loop branch for
+    //! cross-loop JUMP exits.  In-code `closing_jump` work will keep
+    //! shrinking this counter until the branch can be deleted.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static EXECUTE_WITH_INPUTS_HITS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn record_execute_with_inputs_hit() {
+        EXECUTE_WITH_INPUTS_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    struct ReporterGuard;
+
+    impl Drop for ReporterGuard {
+        fn drop(&mut self) {
+            if std::env::var_os("MAJIT_X2_PROBE").is_some() {
+                eprintln!(
+                    "[X2-PROBE] execute_with_inputs.external_jump={}",
+                    EXECUTE_WITH_INPUTS_HITS.load(Ordering::Relaxed),
+                );
+            }
+        }
+    }
+
+    thread_local! {
+        static REPORTER: ReporterGuard = const { ReporterGuard };
+    }
+
+    pub fn arm_reporter() {
+        REPORTER.with(|_| {});
+    }
+}
+
 /// Whether `MAJIT_LOG` is set, cached at first access.
 ///
 /// `std::env::var_os` acquires a global env lock and walks the env table on
@@ -7233,6 +7268,7 @@ impl CraneliftBackend {
     /// When a bridge FINISH with loop_reentry fires, switch back to the
     /// main loop.
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        slice_x2_probe::arm_reporter();
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
         let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
@@ -7304,6 +7340,7 @@ impl CraneliftBackend {
             // `target_token._ll_loop_code`. Cranelift can't emit inter-
             // function JMPs, so we return and re-enter the target loop here.
             if fail_descr_fd.is_external_jump() {
+                slice_x2_probe::record_execute_with_inputs_hit();
                 let target_entry = fail_descr_fd
                     .target_descr()
                     .as_ref()
@@ -14261,36 +14298,31 @@ impl majit_backend::Backend for CraneliftBackend {
         )));
         let _registry_guard = FailDescrRegistryGuard;
 
-        // PRE-EXISTING-ADAPTATION (parity exception): RPython
-        // `llgraph/runner.py:1120-1201` has only one `LLFrame.execute`
-        // path that produces an `LLDeadFrame`; the deadframe is
-        // decoded via the recovery layout (resume.py:1042
-        // `rebuild_state_after_failure`) on every read, materialising
-        // virtuals into concrete objects.  pyre's
-        // `execute_with_inputs` mirrors that path and feeds
-        // `MetaInterp.handle_*` callers that expect virtual rebuild.
-        //
-        // `RawExecResult` is the lightweight raw-output cousin used
-        // by [`crate::pyre`] entry points that need the encoded
-        // exit-slot bytes BEFORE virtual reconstruction (the
-        // resume-trace builder rebuilds virtuals from the
-        // `recovery_layout` itself).  Routing these consumers through
-        // `execute_with_inputs` collapses the two semantics and
-        // breaks fannkuch on cranelift (the recovery-layout decoder
-        // allocates fresh per-iteration virtual lists, defeating the
-        // raw resumetrace shortcut).  The dispatch loop below is kept
-        // structurally aligned with `execute_with_inputs` (same
-        // closing-jump / bridge-follow / FINISH branches) so a parity
-        // edit to one stays mechanically applicable to the other.
-        let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
-        let mut cur_num_ref_roots = compiled.num_ref_roots;
-        let mut cur_max_output_slots = compiled.max_output_slots;
-        let mut cur_inputs = args.to_vec();
+        // llmodel.py:290-329 `execute_token` parity (raw-output variant).
+        // PyPy's `execute_token` performs exactly one `func(ll_frame, ...)`
+        // call and returns the resulting deadframe; cross-trace transitions
+        // (bridge attach, `closing_jump`) happen entirely inside the
+        // generated machine code via `emit_attached_bridge_dispatch`
+        // (compiler.rs:5464) and the JMP-target overlay.  The raw consumer
+        // surface (resume-trace builder via `[`crate::pyre`]`) needs the
+        // exit-slot bytes BEFORE virtual reconstruction, so this entry
+        // point preserves the raw-output assembly but does not introduce
+        // any host-side dispatch loop — there is no orthodox equivalent
+        // in RPython.  Slice X2-step2: probe (compiler.rs:slice_x2_probe)
+        // confirmed both `execute_with_inputs` and `execute_token_ints_raw`
+        // already have in-code coverage for bridges (X1-delete) and that
+        // `execute_token_ints_raw` never observes a cross-loop JUMP exit
+        // in any production benchmark — every JUMP exit terminates raw
+        // dispatch with its `is_external_jump` descr.
+        let cur_code_ptr = compiled.code_ptr;
+        let cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
+        let cur_num_ref_roots = compiled.num_ref_roots;
+        let cur_max_output_slots = compiled.max_output_slots;
+        let cur_inputs = args.to_vec();
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
         let attachments: &CpuDescrAttachments = &*attachments_guard;
 
-        loop {
+        {
             let exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
@@ -14388,22 +14420,21 @@ impl majit_backend::Backend for CraneliftBackend {
 
             let fail_descr_fd = as_fd(fail_descr);
 
-            // llgraph/runner.py:1130-1140 closing_jump: cross-loop JUMP
-            // re-enters the target loop trace identified by the
-            // TargetToken on the fail descriptor.
-            if fail_descr_fd.is_external_jump() {
-                let target_entry = fail_descr_fd
-                    .target_descr()
-                    .as_ref()
-                    .and_then(lookup_loop_target)
-                    .expect("external JUMP target must be a registered LoopTargetDescr");
-                cur_code_ptr = target_entry.code_ptr;
-                cur_fail_descrs = target_entry.fail_descrs;
-                cur_num_ref_roots = target_entry.num_ref_roots;
-                cur_max_output_slots = target_entry.max_output_slots;
-                cur_inputs = outputs;
-                continue;
-            }
+            // Cross-loop JUMP must not surface here in raw dispatch: the raw
+            // consumer terminates each call after a single
+            // `run_compiled_code` invocation per `execute_token` parity.
+            // Slice X2-step2 measurement showed zero fires across the full
+            // production bench suite; a non-zero observation indicates the
+            // raw entry has acquired a new caller that re-enters across a
+            // closing_jump exit, which would need its own orthodox port.
+            assert!(
+                !fail_descr_fd.is_external_jump(),
+                "execute_token_ints_raw observed a cross-loop JUMP exit \
+                 (trace_id={}, fail_index={}); raw dispatch is single-call \
+                 per llmodel.py:execute_token parity",
+                fail_descr_fd.trace_id(),
+                fail_index,
+            );
 
             // llgraph/runner.py:1200-1201 execute_finish.  Finish exits
             // the dispatch loop with the trace's payload — the raw path
@@ -14453,17 +14484,23 @@ impl majit_backend::Backend for CraneliftBackend {
 
             fail_descr_fd.increment_fail_count();
 
-            // llgraph/runner.py:1184-1191 fail_guard with bridge.
-            if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
-                let n = bridge.num_inputs.min(outputs.len());
-                let bridge_inputs = outputs[..n].to_vec();
-                cur_code_ptr = bridge.code_ptr;
-                cur_fail_descrs = bridge.fail_descrs.clone();
-                cur_num_ref_roots = bridge.num_ref_roots;
-                cur_max_output_slots = bridge.max_output_slots;
-                cur_inputs = bridge_inputs;
-                continue;
-            }
+            // X1-delete proved the host-loop bridge fallback is dead for
+            // `execute_with_inputs`: every attached bridge is dispatched
+            // inside the generated code via `emit_attached_bridge_dispatch`
+            // (compiler.rs:5464) once `fail_descr_attach_bridge`
+            // (compiler.rs:5879) publishes the cache before the
+            // BridgeData Arc swap.  The same in-code path runs here, so a
+            // bridge observation in raw dispatch would mean a guard exit
+            // returned to the host without consulting the cache — flag it
+            // loudly.
+            assert!(
+                fail_descr_bridge_ref(fail_descr_fd).is_none(),
+                "execute_token_ints_raw observed a bridge attached to a \
+                 guard exit (trace_id={}, fail_index={}); in-code bridge \
+                 dispatch should have intercepted it",
+                fail_descr_fd.trace_id(),
+                fail_index,
+            );
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge —
             // exit with the raw outputs.
