@@ -5076,6 +5076,16 @@ impl CodeWriter {
 
         // flowcontext.py:402-405 `while self.pendingblocks: block =
         // self.pendingblocks.popleft(); if not block.dead: self.record_block(block)`.
+        //
+        // Phase 4 slice 4: outer loop wraps main drain + catch landings
+        // emit so handler-entry blocks queued by
+        // `emit_goto!(handler_py_pc)` in catch landings get drained by
+        // a second main-drain pass.  Without this, handler-entry blocks
+        // would be orphans with 0 ops + 0 exits + framestate-wide
+        // inputargs, tripping `make_return`'s 1-or-2-arg invariant in
+        // canonical `flatten_graph` (`flatten.py:107-109`).
+        let mut catch_landings_processed = false;
+        loop {
         while let Some(pending_block) = pendingblocks.pop_front() {
             if pending_block.dead() {
                 continue;
@@ -5114,6 +5124,17 @@ impl CodeWriter {
                 // handler's specified depth and arrives only from
                 // `catch_exception` edges, not from sequential fallthrough.
                 if handler_depth_at.contains_key(&py_pc) {
+                    // Phase 4 slice 4: when reached sequentially from
+                    // a prior PC (start_pc != py_pc), break.  Handler
+                    // PCs are reached only via exception edges in
+                    // upstream RPython (`flowcontext.py:130-156
+                    // guessexception`); pyre's analogous catch landings
+                    // `emit_goto!(handler_py_pc)` creates the
+                    // handler-entry block, which the outer-loop second
+                    // drain pass walks when start_pc == handler_py_pc.
+                    if start_pc != py_pc {
+                        break;
+                    }
                     if let Some(handler_state) = handler_entry_state_from_catch_sites(
                         code,
                         &mut graph,
@@ -7808,29 +7829,21 @@ impl CodeWriter {
                     }
                 }
             }
-        } // end while-let pendingblocks
+        } // end inner while-let pendingblocks
 
-        // RPython flatten.py parity: every code path ends with an explicit
-        // return/raise/goto/unreachable. No end-of-code sentinel needed —
-        // falling off the end is unreachable if all bytecodes are covered.
+        // Phase 4 slice 4 outer loop logic.  After main drain
+        // exhausts pendingblocks, catch landings emit (below) runs
+        // ONCE (gated on `catch_landings_processed`).  `emit_goto!`
+        // in catch landings queues handler-entry blocks onto
+        // pendingblocks; the next outer-loop iteration's inner
+        // while-let drains them so they don't end up as orphan
+        // empty-exits blocks with framestate-wide inputargs.
+        if catch_landings_processed {
+            break;
+        }
+        catch_landings_processed = true;
 
-        // pyre-only PyJitCode.has_abort: a "this jitcode cannot be
-        // blackhole-dispatched, pipe straight to the interpreter" flag.
-        // RPython has no such flag (rpython/jit/codewriter/jitcode.py:14
-        // — no abort tracking on JitCode). Upstream's `Assembler.abort()`
-        // (assembler.py:177-181, bhimpl_abort) emits BC_ABORT so the
-        // blackhole raises SwitchToBlackhole(ABORT_ESCAPE) at runtime;
-        // `abort_permanent()` is a different pyre-only bytecode we emit
-        // for genuinely unsupported Python opcodes, and its execution
-        // path already raises/aborts correctly from the blackhole. We
-        // keep has_abort narrowly scoped to `abort()` emissions (matches
-        // the JitCodeBuilder flag shape) so the flag's meaning doesn't
-        // drift into "assembler overflow" or "abort_permanent present"
-        // — both of which the assembler/blackhole already handle without
-        // a front-end gate.
-        let has_abort = assembler.has_abort_flag();
-
-        for site in catch_sites {
+        for site in &catch_sites {
             emit_mark_label_catch_landing!(site.landing_label);
             // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
             // reassigns `current_block` to the pre-allocated catch
@@ -8063,6 +8076,27 @@ impl CodeWriter {
             emit_vsd!(depth);
             emit_goto!(site.handler_py_pc);
         }
+        } // end outer drain loop (Phase 4 slice 4)
+
+        // RPython flatten.py parity: every code path ends with an explicit
+        // return/raise/goto/unreachable. No end-of-code sentinel needed —
+        // falling off the end is unreachable if all bytecodes are covered.
+
+        // pyre-only PyJitCode.has_abort: a "this jitcode cannot be
+        // blackhole-dispatched, pipe straight to the interpreter" flag.
+        // RPython has no such flag (rpython/jit/codewriter/jitcode.py:14
+        // — no abort tracking on JitCode). Upstream's `Assembler.abort()`
+        // (assembler.py:177-181, bhimpl_abort) emits BC_ABORT so the
+        // blackhole raises SwitchToBlackhole(ABORT_ESCAPE) at runtime;
+        // `abort_permanent()` is a different pyre-only bytecode we emit
+        // for genuinely unsupported Python opcodes, and its execution
+        // path already raises/aborts correctly from the blackhole. We
+        // keep has_abort narrowly scoped to `abort()` emissions (matches
+        // the JitCodeBuilder flag shape) so the flag's meaning doesn't
+        // drift into "assembler overflow" or "abort_permanent present"
+        // — both of which the assembler/blackhole already handle without
+        // a front-end gate.
+        let has_abort = assembler.has_abort_flag();
 
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53
