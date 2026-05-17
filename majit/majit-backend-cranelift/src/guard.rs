@@ -15,8 +15,6 @@ use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Mutex;
 
 // BRIDGE_CACHES_TABLE removed (Slice JJ → Slice 7-Tβ11): the
 // `Box<AtomicUsize>` cells for bridge code_ptr / frame_depth now live
@@ -293,21 +291,13 @@ pub struct CraneliftFailDescr {
     /// those exits route through dedicated metainterp Done* descrs
     /// owned by `MetaInterpStaticData`, not via `op.descr`.
     pub meta_descr: Option<DescrRef>,
-    /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
-    /// parity — descr-local atomic cell holding the published
-    /// `Arc<BridgeData>` raw pointer.  Equivalent to PyPy's
-    /// `adr_jump_offset` (`history.py:132 _attrs_`): a stable raw
-    /// memory cell whose contents are patched in-place at
-    /// `attach_bridge` time and read lock-free by the guard-failure
-    /// dispatch (PyPy: JMP rel32; pyre: `bridge_ref` atomic load +
-    /// `Arc::increment_strong_count`).  `Box` gives the cell a
-    /// heap-pinned address (descr is wrapped in `Arc::new` after
-    /// construction; without Box the cell address would change).
-    ///
-    /// Null on construction (no bridge attached).  Holds a raw pointer
-    /// from `Arc::into_raw(Arc::new(bridge_data))` after
-    /// `attach_bridge`; `Drop` reclaims the Arc.
-    pub bridge_dispatch_cell: Box<std::sync::atomic::AtomicPtr<BridgeData>>,
+    // bridge_dispatch_cell moved to ResumeGuardDescr (Slice 7-Tβ12):
+    // type-erased as `AtomicPtr<()>` on the meta side with a backend-
+    // registered cleanup function.  Cranelift's `bridge_ref` /
+    // `attach_bridge` forward through the meta Arc; the cleanup
+    // (`drop_bridge_payload` below) reconstructs and drops the
+    // owning `Arc<BridgeData>` so the cross-crate type is reclaimed
+    // by the owning crate.
     // fail_count moved to ResumeGuardDescr (Slice 7-Tβ9): the meta
     // Arc is the canonical home, reached via `as_any` downcast on
     // `meta_descr` (precedent: Slice 7-Tβ6 source_op_index, Slice 7-Tβ7
@@ -374,20 +364,23 @@ impl Drop for CraneliftFailDescr {
         // (Slice 7-Tβ6); no backend-local cell to reclaim.
         // force_token_slots moved to ResumeGuardDescr meta-side slot
         // (Slice 7-Tβ7); no backend-local cell to reclaim.
-        // bridge_code_ptr_cache / bridge_frame_depth_cache are descr-
-        // local Box<AtomicUsize> (Slice JJ): drop naturally with self.
-        // Reclaim the published `Arc<BridgeData>` (if any) from the
-        // descr-local dispatch cell.  Swap-to-null first so any
-        // concurrent `bridge_ref` reader either sees the still-live
-        // Arc (after `increment_strong_count`) or the null and skips.
-        let bridge_ptr = self
-            .bridge_dispatch_cell
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !bridge_ptr.is_null() {
-            // Safety: produced by `Arc::into_raw(Arc::new(bridge))` in
-            // `attach_bridge`; reconstruct the owning Arc and drop it.
-            unsafe { drop(Arc::from_raw(bridge_ptr as *const BridgeData)) };
-        }
+        // bridge_dispatch_cell moved to ResumeGuardDescr meta-side
+        // slot (Slice 7-Tβ12); reclaim is owned by
+        // ResumeGuardDescr::drop via the cleanup function registered
+        // in `attach_bridge`.
+    }
+}
+
+/// Backend-registered cleanup for the type-erased
+/// `ResumeGuardDescr::bridge_dispatch_cell` (Slice 7-Tβ12).  Invoked
+/// by `ResumeGuardDescr::drop` on any payload still in the cell at
+/// descr teardown; reconstructs the owning `Arc<BridgeData>` so its
+/// `Drop` runs.
+fn drop_bridge_payload(ptr: *mut ()) {
+    if !ptr.is_null() {
+        // Safety: produced by `Arc::into_raw(Arc::new(bridge))` in
+        // `attach_bridge`; reclaim ownership and drop.
+        unsafe { drop(Arc::from_raw(ptr as *const BridgeData)) };
     }
 }
 
@@ -411,10 +404,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("trace_info", &self.trace_info_ref())
             .field("recovery_layout", &self.recovery_layout_ref())
             .field("fail_count", &self.get_fail_count())
-            .field(
-                "has_bridge",
-                &(!self.bridge_dispatch_cell.load(Ordering::Acquire).is_null()),
-            )
+            .field("has_bridge", &self.has_bridge())
             .finish()
     }
 }
@@ -461,7 +451,6 @@ impl CraneliftFailDescr {
             trace_id,
             fail_arg_types,
             meta_descr: None,
-            bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
         }
     }
 
@@ -482,7 +471,6 @@ impl CraneliftFailDescr {
             trace_id,
             fail_arg_types,
             meta_descr: None,
-            bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
         }
     }
 
@@ -490,15 +478,19 @@ impl CraneliftFailDescr {
     // RPython ResumeGuardDescr fields are plain attributes (GIL-protected).
 
     /// `assembler.py:987 patch_jump_for_descr` parity — read the
-    /// descr-local atomic dispatch cell.  PyPy's dispatch is a JMP
-    /// rel32 whose target is patched in-place by `attach_bridge`; pyre
-    /// reads the `Arc<BridgeData>` raw pointer the JIT thread wrote
-    /// there with `Arc::into_raw(Arc::new(...))`, then bumps the
-    /// strong count and reconstructs the `Arc`.  Lock-free and
-    /// HashMap-free (mirrors `adr_jump_offset` semantics).
+    /// meta-side type-erased dispatch cell (Slice 7-Tβ12).  PyPy's
+    /// dispatch is a JMP rel32 whose target is patched in-place by
+    /// `attach_bridge`; pyre reads the `Arc<BridgeData>` raw pointer
+    /// the JIT thread wrote there with `Arc::into_raw(Arc::new(...))`,
+    /// then bumps the strong count and reconstructs the `Arc`.  Lock-
+    /// free and HashMap-free (mirrors `adr_jump_offset` semantics).
+    /// Returns `None` when no `ResumeGuardDescr` meta is present
+    /// (singletons / non-Resume meta) — those guards never carry
+    /// bridges.
     #[inline]
     pub fn bridge_ref(&self) -> Option<Arc<BridgeData>> {
-        let ptr = self.bridge_dispatch_cell.load(Ordering::Acquire);
+        let rgd = self.meta_resume_guard_descr()?;
+        let ptr = rgd.bridge_dispatch_load();
         if ptr.is_null() {
             None
         } else {
@@ -618,9 +610,12 @@ impl CraneliftFailDescr {
 
     /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
     /// parity — atomic-store the bridge `Arc` raw pointer into the
-    /// descr-local dispatch cell, and publish `(code_ptr, frame_depth)`
-    /// into the meta-side cache cells (Slice 7-Tβ11) that
-    /// `emit_attached_bridge_dispatch` baked addresses for.
+    /// meta-side dispatch cell (Slice 7-Tβ12), and publish
+    /// `(code_ptr, frame_depth)` into the meta-side cache cells
+    /// (Slice 7-Tβ11) that `emit_attached_bridge_dispatch` baked
+    /// addresses for.  Registers the backend-side cleanup function
+    /// (idempotent) so `ResumeGuardDescr::drop` can reclaim the
+    /// published `Arc<BridgeData>` without knowing its concrete type.
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
         let frame_depth = bridge
@@ -628,22 +623,22 @@ impl CraneliftFailDescr {
             .max(bridge.num_inputs)
             .max(1)
             .saturating_add(bridge.num_ref_roots);
-        // `Arc::into_raw(Arc::new(bridge))` publishes the bridge data
-        // as a raw pointer the dispatch path can re-Arc via
-        // `increment_strong_count + Arc::from_raw`.  Swap atomically so
-        // a re-attach (unusual) reclaims the previous Arc.
-        let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut BridgeData;
-        let old_ptr = self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            // Safety: prior `attach_bridge` published this pointer;
-            // reclaim ownership and drop.
-            unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
-        }
         let rgd = self.meta_resume_guard_descr().expect(
             "attach_bridge requires a ResumeGuardDescr meta_descr; \
              all bridgeable guards carry one (op.descr or synthesised at \
              compiler.rs:12884)",
         );
+        // `Arc::into_raw(Arc::new(bridge))` publishes the bridge data
+        // as a raw pointer the dispatch path can re-Arc via
+        // `increment_strong_count + Arc::from_raw`.  Swap atomically so
+        // a re-attach (unusual) reclaims the previous Arc.
+        let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut () as *mut ();
+        let old_ptr = rgd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
+        if !old_ptr.is_null() {
+            // Safety: prior `attach_bridge` published this pointer;
+            // reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
+        }
         rgd.store_bridge_caches(code_ptr, frame_depth);
     }
 

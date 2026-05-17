@@ -207,6 +207,32 @@ pub struct ResumeGuardDescr {
     /// runtime can verify the JIT frame can fit the bridge inputs
     /// before re-entering.
     pub bridge_frame_depth_cache: Box<AtomicUsize>,
+    /// Bridge dispatch cell (Slice 7-Tβ12 / cranelift-only NEW
+    /// DEVIATION).  PyPy's `assembler.py:987 patch_jump_for_descr`
+    /// rewrites the guard JMP target in place; cranelift cannot patch
+    /// finalised code, so the runtime guard-failure dispatch loads
+    /// the published `Arc<BridgeData>` raw pointer from this cell
+    /// (via `bridge_dispatch_load` below) and reconstructs the Arc
+    /// via `Arc::increment_strong_count + Arc::from_raw`.
+    ///
+    /// Type-erased to `*mut ()` because `BridgeData` lives in
+    /// `majit-backend-cranelift` (downstream crate) and majit-backend
+    /// must not depend on it.  The matching cleanup is registered by
+    /// the backend on first `bridge_dispatch_swap` so `Drop` can
+    /// reclaim the published Arc without knowing its concrete type.
+    ///
+    /// The cell's address is not JIT-baked (runtime reads only), so a
+    /// plain `AtomicPtr<()>` suffices — `Arc::new(self)` pins the
+    /// surrounding `ResumeGuardDescr`, and the field address is then
+    /// stable across `Arc::clone` calls.  Null on construction (no
+    /// bridge attached).
+    pub bridge_dispatch_cell: AtomicPtr<()>,
+    /// Type-aware cleanup function the backend registers on first
+    /// `bridge_dispatch_swap`.  `Drop` invokes this with the cell's
+    /// final non-null payload so the published `Arc<BridgeData>` is
+    /// reclaimed by the owning crate.  `OnceLock` so the registration
+    /// is idempotent across re-attach.
+    pub bridge_dispatch_drop_fn: OnceLock<fn(*mut ())>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -251,6 +277,8 @@ impl Descr for ResumeGuardDescr {
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
         }))
     }
 }
@@ -410,6 +438,8 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+        bridge_dispatch_drop_fn: OnceLock::new(),
     })
 }
 
@@ -562,6 +592,30 @@ impl ResumeGuardDescr {
     pub fn bridge_code_ptr(&self) -> usize {
         self.bridge_code_ptr_cache.load(Ordering::Acquire)
     }
+
+    /// Read the type-erased bridge dispatch cell (Slice 7-Tβ12).
+    /// Returns the published raw pointer for the backend to
+    /// reconstruct its concrete `Arc<BridgeData>` via
+    /// `Arc::increment_strong_count + Arc::from_raw`.  Null when no
+    /// bridge has been attached.
+    pub fn bridge_dispatch_load(&self) -> *mut () {
+        self.bridge_dispatch_cell.load(Ordering::Acquire)
+    }
+
+    /// Atomic-swap a new bridge dispatch payload into the cell and
+    /// register the backend-supplied cleanup function (Slice 7-Tβ12).
+    /// Returns the previous payload so the backend can reclaim its
+    /// owned `Arc`.  The cleanup function is registered once
+    /// (idempotent) and invoked by `Drop` on any payload still in the
+    /// cell at descr teardown.
+    pub fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: fn(*mut ()),
+    ) -> *mut () {
+        let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+    }
 }
 
 impl Drop for ResumeGuardDescr {
@@ -574,6 +628,21 @@ impl Drop for ResumeGuardDescr {
             // Safety: produced by `Arc::into_raw(Arc::new(info))` in
             // `set_trace_info`.
             unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
+        }
+        // Slice 7-Tβ12: reclaim any published bridge dispatch payload
+        // via the backend-registered cleanup function.  Swap-to-null
+        // first so a concurrent reader either sees the still-live
+        // pointer (and bumps the strong count) or null (and skips).
+        let bridge_ptr = self
+            .bridge_dispatch_cell
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !bridge_ptr.is_null() {
+            if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
+                drop_fn(bridge_ptr);
+            }
+            // else: payload published with no cleanup registered — a
+            // backend bug.  Leaks rather than risks reading the wrong
+            // concrete type.
         }
     }
 }

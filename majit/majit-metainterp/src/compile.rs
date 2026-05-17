@@ -2905,6 +2905,8 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+        bridge_dispatch_drop_fn: OnceLock::new(),
     })
 }
 
@@ -2995,6 +2997,8 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+        bridge_dispatch_drop_fn: OnceLock::new(),
     })
 }
 
@@ -3206,6 +3210,8 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
         },
     })
 }
@@ -3423,6 +3429,8 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
         },
     })
 }
@@ -3624,6 +3632,8 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
         },
     })
 }
