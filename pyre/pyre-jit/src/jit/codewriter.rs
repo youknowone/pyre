@@ -6205,14 +6205,19 @@ impl CodeWriter {
                         } else {
                             let graph_call_args: Vec<_> =
                                 graph_arg_values_rev.iter().rev().cloned().collect();
-                            emit_frontend_simple_call(
+                            let result = emit_frontend_simple_call(
                                 &mut graph,
                                 &current_block.block(),
                                 callable_value.clone(),
                                 graph_call_args,
                                 py_pc as i64,
-                            )
-                            .into()
+                            );
+                            pair_walker_slot(
+                                &mut walker_slot_for_variable,
+                                Some(result),
+                                stack_base + current_depth,
+                            );
+                            result.into()
                         };
                         if nargs > 8 {
                             emit_abort_permanent!();
@@ -6359,6 +6364,16 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            zero_graph_var,
+                            scratch_zero,
+                        );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(negated),
+                            stack_base + current_depth,
+                        );
                         if let Some(zero_var) = &zero_graph_var {
                             let binary_result = record_residual_call_graph_op(
                                 &mut graph,
@@ -6372,7 +6387,11 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            let _ = &binary_result;
+                            pair_walker_slot(
+                                &mut walker_slot_for_variable,
+                                binary_result,
+                                stack_base + current_depth,
+                            );
                         }
                         current_state.stack.push(negated.into());
                         current_depth += 1;
@@ -6442,6 +6461,11 @@ impl CodeWriter {
                             &current_block.block(),
                             item_values_rev.into_iter().rev().collect(),
                             py_pc as i64,
+                        );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(result_value),
+                            stack_base + current_depth,
                         );
                         // Task #48 micro-slice 13: BuildList factor
                         // refactor.  The prior `emit_residual_call(
@@ -6514,6 +6538,11 @@ impl CodeWriter {
                             stop_value,
                             step_info.map(|(_, value)| value),
                             py_pc as i64,
+                        );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(result_value),
+                            stack_base + current_depth,
                         );
                         push_walker_emit(
                             &current_block,
