@@ -3419,23 +3419,12 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
 /// prologue (`_check_frame_depth`, aarch64/assembler.py:927) calls this
 /// when `jf_frame.length < expected_size`: it allocates a wider
 /// JITFRAME, copies the live slots, threads `jf_forward = new_frame`,
-/// and returns the new pointer.  Mirrors dynasm's
-/// `runner::dynasm_realloc_frame`, but works against cranelift's
-/// frame-info-less allocation pattern (`run_compiled_code_inner` sets
-/// `jf_frame_info = std::ptr::null()` since cranelift does not
-/// pre-allocate `JitFrameInfo` per CompiledLoop yet).
-///
-/// Allocates a fresh libc-backed `JitFrame` with capacity `new_depth`,
-/// copies header + items, sets `jf_forward` so `jitframe_resolve` follows
-/// the forwarding chain (`jitframe.py:54`), and registers the new payload
-/// with the shadow-stack tracer so GC scans interior Ref slots.
-///
-/// Currently registered but unwired — the cranelift bridge dispatch
-/// path (`emit_attached_bridge_dispatch`) still falls through to the
-/// host-loop bridge fallback when the frame is too small.  A future
-/// slice (#103/#111) replaces the host fallback by routing the
-/// frame-fits-false branch through this helper, mirroring PyPy's
-/// `_check_frame_depth` → `_frame_realloc_slowpath` flow.
+/// and returns the new pointer.  llmodel.py:127-154 `realloc_frame`
+/// line-by-line — uses the same nursery allocator as the initial
+/// `JITFRAME.allocate(frame_info)`, so reclamation flows through the
+/// regular GC cycle (PyPy: `jitframe.JITFRAME.allocate(jf_frame_info)`;
+/// pyre: `alloc_nursery_no_collect_typed(JITFRAME_TID, ...)` matching
+/// `run_compiled_code_inner` at compiler.rs:6235).
 ///
 /// # Safety
 /// - `old_jf` must be a live, currently-running `JitFrame` whose
@@ -3443,6 +3432,8 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
 /// - The caller (the JIT-emitted dispatch path) has already published
 ///   all live fail-args into `old_jf->jf_frame[...]` via `emit_guard_exit`
 ///   spills; this helper only needs to copy those words verbatim.
+/// - Must run on the JIT thread that owns `CRANELIFT_ACTIVE_GC` /
+///   `CRANELIFT_JITFRAME_TYPE_ID` thread-locals.
 #[inline(never)]
 pub unsafe extern "C" fn cranelift_realloc_frame(
     old_jf: *mut i64,
@@ -3452,16 +3443,37 @@ pub unsafe extern "C" fn cranelift_realloc_frame(
     let new_total = header_words + new_depth;
     let new_bytes = new_total * 8;
 
-    // `libc::calloc` parity using `std::alloc::alloc_zeroed`; matches
-    // the dynasm runner's `register_libc_jitframe`-tracked allocation
-    // strategy in `runner::dynasm_realloc_frame`.
-    let layout = std::alloc::Layout::from_size_align(new_bytes, 8)
-        .expect("cranelift_realloc_frame: invalid layout");
-    let new_jf = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-    assert!(
-        !new_jf.is_null(),
-        "cranelift_realloc_frame: alloc_zeroed failed"
-    );
+    // llmodel.py:140 `new_frame = jitframe.JITFRAME.allocate(...)` —
+    // allocate from the GC nursery so the new frame is reclaimed once
+    // it falls out of the shadow-stack roots (matches the initial
+    // allocation strategy at compiler.rs:6235).  Without a JITFRAME
+    // type id (host-test path that runs without a configured GC),
+    // fall back to libc-zeroed to keep behaviour defined.
+    let new_jf = match cranelift_jitframe_type_id() {
+        Some(type_id) => {
+            let gcref = with_cranelift_gc_required(|gc| {
+                gc.alloc_nursery_no_collect_typed(type_id, new_bytes)
+            });
+            assert_ne!(gcref.0, 0, "cranelift_realloc_frame: nursery alloc failed");
+            unsafe {
+                // jitframe.py:48 parity (compiler.rs:6242): zero the
+                // header so jf_descr / jf_forward / jf_gcmap start at
+                // NULL; nursery alloc may not zero.
+                std::ptr::write_bytes(gcref.0 as *mut u8, 0, JF_FRAME_ITEM0_OFS as usize);
+            }
+            gcref.0 as *mut i64
+        }
+        None => {
+            let layout = std::alloc::Layout::from_size_align(new_bytes, 8)
+                .expect("cranelift_realloc_frame: invalid layout");
+            let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
+            assert!(!p.is_null(), "cranelift_realloc_frame: alloc_zeroed failed");
+            // Host-test fallback only — register with the libc-jitframe
+            // tracer so any interior Ref scan still works.
+            majit_gc::shadow_stack::register_libc_jitframe(p as usize);
+            p
+        }
+    };
 
     let old_base = old_jf as usize;
     let new_base = new_jf as usize;
@@ -3491,11 +3503,6 @@ pub unsafe extern "C" fn cranelift_realloc_frame(
         // llmodel.py:141 — frame.jf_forward = new_frame.
         *((old_base + JF_FORWARD_OFS as usize) as *mut *mut i64) = new_jf;
     }
-
-    // Mirror dynasm's `register_libc_jitframe` so the GC visitor sees
-    // the new payload's interior Ref slots through the registered
-    // libc-jitframe tracer.
-    majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
 
     if majit_log_enabled() {
         eprintln!(
