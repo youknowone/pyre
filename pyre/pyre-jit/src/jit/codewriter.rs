@@ -5918,6 +5918,13 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {
+                            pair_walker_slot(
+                                &mut walker_slot_for_variable,
+                                Some(*v),
+                                cond_reg,
+                            );
+                        }
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -6009,6 +6016,13 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {
+                            pair_walker_slot(
+                                &mut walker_slot_for_variable,
+                                Some(*v),
+                                cond_reg,
+                            );
+                        }
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
