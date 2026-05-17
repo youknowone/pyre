@@ -4832,7 +4832,6 @@ impl CodeWriter {
                     "emit_pushvalue_ref_const: only PY_NULL is supported today; \
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
-                emit_ref_const_copy!(stack_base + $depth, value);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
@@ -4854,6 +4853,11 @@ impl CodeWriter {
                         depth_value,
                         value
                     );
+                } else {
+                    // Non-portal frames have no vable mirror; the runtime
+                    // expects the pushed PY_NULL to be visible in the
+                    // stack slot register for any downstream consumer.
+                    emit_ref_const_copy!(stack_base + $depth, value);
                 }
                 $depth += 1;
                 emit_vsd!($depth);
