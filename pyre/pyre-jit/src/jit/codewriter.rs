@@ -6604,7 +6604,7 @@ impl CodeWriter {
                             // canonical `flatten_graph` driver sees the same
                             // op via passthrough.  `normalize_raise_varargs_fn`
                             // takes `(exc:Ref, cause:Ref) → Ref` MayForce.
-                            let normalized_exc_fv = record_residual_call_graph_op(
+                            let normalized_var = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 normalize_raise_varargs_fn_idx,
@@ -6615,9 +6615,11 @@ impl CodeWriter {
                                 vec![Kind::Ref, Kind::Ref],
                                 ResKind::Ref,
                                 py_pc as i64,
-                            )
-                            .map(super::flow::FlowValue::from)
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            );
+                            pair_walker_slot(&mut walker_slot_for_variable, normalized_var, exc_reg);
+                            let normalized_exc_fv = normalized_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64);
                         } else {
                             // reraise: re-raise exception_last_value
@@ -6690,7 +6692,7 @@ impl CodeWriter {
                         // for the analyzer-equivalent `EF_CANNOT_RAISE
                         // + empty raw frozensets + can_collect=false`
                         // shape (`effectinfo.py:281-283`).
-                        let _ = record_residual_call_graph_op(
+                        let prev_var = record_residual_call_graph_op(
                             &mut graph,
                             &current_block.block(),
                             get_current_exception_fn_idx,
@@ -6702,6 +6704,7 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
+                        pair_walker_slot(&mut walker_slot_for_variable, prev_var, scratch_prev);
                         let _ = record_residual_call_graph_op(
                             &mut graph,
                             &current_block.block(),
@@ -7782,6 +7785,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         -1,
                     );
+                    pair_walker_slot(&mut walker_slot_for_variable, boxed_lasti, exc_slot);
                     if let Some(boxed_var) = boxed_lasti {
                         let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
                         let v_lasti_idx: super::flow::FlowValue =
