@@ -14,7 +14,7 @@ use crate::optimizeopt::dependency::DependencyGraph;
 /// if present, otherwise the default for the op's result type.
 /// INT_WORD = 8, FLOAT_WORD = 8 on 64-bit; void → 0.
 fn get_op_bytesize(op: &Op) -> i32 {
-    if let Some(ref vi) = op.vecinfo {
+    if let Some(vi) = op.get_vecinfo() {
         return vi.getbytesize() as i32;
     }
     match op.opcode.result_type() {
@@ -956,7 +956,7 @@ pub fn check_if_pack_supported(pack: &Pack, ops: &[Op]) -> Result<(), NotAProfit
     let first_op = &ops[pack.members[0]];
     // schedule.py:471-474: INT_MUL with bytesize 8 or 1 is not profitable
     if first_op.opcode == OpCode::IntMul {
-        if let Some(ref vi) = first_op.vecinfo {
+        if let Some(vi) = first_op.get_vecinfo() {
             let insize = vi.getbytesize();
             if insize == 8 || insize == 1 {
                 return Err(NotAProfitableLoop);
@@ -1126,8 +1126,8 @@ fn gather(state: &mut VecScheduleState, vectors: &[(usize, OpRef)], count: usize
 fn find_vecinfo(state: &VecScheduleState, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
     for op in state.oplist.iter().chain(state.invariant_oplist.iter()) {
         if op.pos.get() == opref {
-            if let Some(ref vi) = op.vecinfo {
-                return Some((**vi).clone());
+            if let Some(vi) = op.get_vecinfo() {
+                return Some(vi.clone());
             }
         }
     }
@@ -1428,7 +1428,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
 
     // schedule.py:337-338: VecOperation(left.vector, args, left, pack.numops())
     // resoperation.py:100-104: copy datatype/bytesize/signed from baseop's vecinfo
-    let (datatype, bytesize, signed) = if let Some(ref vi) = first_op.vecinfo {
+    let (datatype, bytesize, signed) = if let Some(vi) = first_op.get_vecinfo() {
         (vi.datatype, vi.bytesize, vi.signed)
     } else {
         // Default from result type when vecinfo absent
