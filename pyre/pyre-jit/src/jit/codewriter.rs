@@ -6114,6 +6114,7 @@ impl CodeWriter {
                         } else {
                             None
                         };
+                        pair_walker_slot(&mut walker_slot_for_variable, loaded, scratch_ns);
                         let result_value = loaded
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
