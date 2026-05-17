@@ -2556,6 +2556,22 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
+    flatten_graph_with_walker_slots(graph, regallocs, &[], include_all_exc_links, cpu)
+}
+
+/// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
+/// graph regalloc color so production can splice canonical Insns into
+/// the walker's SSARepr without Register-index mismatch.  Synthetic
+/// graph-only Variables (e.g. `last_exception` from
+/// `attach_catch_exception_edge`) have no entry and fall back to
+/// `regallocs[kind].getcolor(v)` per `flatten.py:382-391`.
+pub fn flatten_graph_with_walker_slots<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    walker_slot_for_variable: &'a [Option<u16>],
+    include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+) -> SSARepr {
     // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
     // `regallocs` on `self.regallocs` and the method mutates it
     // in place; pyre's `get_register` closure (constructed below)
@@ -2565,10 +2581,17 @@ pub fn flatten_graph<'a>(
     // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)` — read
-    // `regallocs[kind].coloring[variable.id]` through the closure.
+    // `flatten.py:382-391 getcolor(v)`, prepended with the Phase 4
+    // bridge lookup documented on `flatten_graph_with_walker_slots`.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
+        let walker_slot = walker_slot_for_variable
+            .get(variable.id.0 as usize)
+            .copied()
+            .flatten();
+        if let Some(slot) = walker_slot {
+            return Register::new(kind, slot);
+        }
         let color = regallocs[kind.index()]
             .coloring
             .get(&variable.id)
