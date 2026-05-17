@@ -4430,14 +4430,16 @@ impl CodeWriter {
                 // dual-writes can thread the same Variable; non-portal
                 // callees skip the graph emit and return `None`.
                 if is_portal {
-                    Some(emit_graph_op_with_result(
+                    let result = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
                         "getfield_vable_r",
                         vable_getfield_ref_graph_args(frame_var.into(), field_idx),
                         Kind::Ref,
                         -1,
-                    ))
+                    );
+                    pair_walker_slot(&mut walker_slot_for_variable, Some(result), dst);
+                    Some(result)
                 } else {
                     None
                 }
@@ -4933,6 +4935,11 @@ impl CodeWriter {
                         vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
                         Kind::Ref,
                         -1,
+                    );
+                    pair_walker_slot(
+                        &mut walker_slot_for_variable,
+                        Some(v_loaded),
+                        stack_base + $depth,
                     );
                     let loaded: super::flow::FlowValue = v_loaded.into();
                     let v_stack_idx: super::flow::FlowValue =
@@ -5631,6 +5638,11 @@ impl CodeWriter {
                                 ),
                                 Kind::Ref,
                                 -1,
+                            );
+                            pair_walker_slot(
+                                &mut walker_slot_for_variable,
+                                Some(v_loaded),
+                                stack_base + current_depth,
                             );
                             let loaded: super::flow::FlowValue = v_loaded.into();
                             let v_stack_idx: super::flow::FlowValue =
