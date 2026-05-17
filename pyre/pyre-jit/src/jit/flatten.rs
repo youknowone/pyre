@@ -2556,7 +2556,7 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    flatten_graph_with_walker_slots(graph, regallocs, &[], &[], include_all_exc_links, cpu)
+    flatten_graph_with_walker_slots(graph, regallocs, &[], &[], &[], include_all_exc_links, cpu)
 }
 
 /// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
@@ -2584,6 +2584,7 @@ pub fn flatten_graph_with_walker_slots<'a>(
     regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
     walker_slot_for_variable: &'a [Option<u16>],
     block_name_overrides: &[(super::flow::BlockRef, String)],
+    link_name_overrides: &[(super::flow::LinkRef, String)],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2645,6 +2646,24 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // for blocks not in the override list keep their fallback names.
     for (block, name) in block_name_overrides {
         flattener.block_names.push((block.clone(), name.clone()));
+    }
+    // Task #50 T6 epic slice 2 — pre-seed link_names with names that
+    // ALIAS the link to its target block's `pc{N}`.  Walker emits no
+    // separate link landing — its `goto_if_not Reg TLabel("pcN")`
+    // jumps directly to the target block's per-PC anchor.  Canonical
+    // emits `goto_if_not Reg TLabel(link_name)` + `Label(link_name)` +
+    // (optional renamings) + recursive `make_bytecode_block(target)`
+    // which emits `Label(target_block_name)`.  With the alias both
+    // canonical Label entries carry the same name string; the runtime's
+    // `pc_anchor_positions` first-wins resolves `pcN` to the link
+    // landing byte position, which then either no-ops (empty
+    // renamings) or runs the renamings before falling through to the
+    // target block's body.  Insn-level byte_equivalent improves
+    // because `TLabel` operand strings now match between walker and
+    // canonical.  Functionality-preserving — extra Label("pcN") emits
+    // are filtered by `count_real_ops` (Label is scaffold).
+    for (link, name) in link_name_overrides {
+        flattener.link_names.push((link.clone(), name.clone()));
     }
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);

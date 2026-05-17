@@ -8348,11 +8348,45 @@ impl CodeWriter {
                     ));
                 }
             }
+            // Task #50 T6 epic slice 2 — derive (LinkRef, pc{N}) name
+            // overrides for each link in the graph whose target block
+            // has a `pc{N}` name in block_name_overrides above.  The
+            // alias makes canonical's `tlabel_for_link(link)` emit the
+            // same `pc{N}` string that walker uses in `goto_if_not Reg
+            // TLabel("pcN")`, closing the dominant remaining TLabel
+            // operand divergence in byte_equivalent.  Canonical still
+            // emits `Label("pcN")` at the link landing (extra Label
+            // filtered by `count_real_ops` since Label is scaffold);
+            // the runtime's `pc_anchor_positions` first-wins resolves
+            // `pcN` to the link landing byte position which no-ops
+            // (empty renamings for non-portal walker shape) before
+            // falling through to the target block's body.  Links whose
+            // target lacks a FrameState (canonical's synthetic blocks
+            // like returnblock / exceptblock) are skipped — they keep
+            // canonical's default `link{N}` naming.
+            let mut link_name_overrides: Vec<(super::flow::LinkRef, String)> = Vec::new();
+            for graph_block in graph.iterblocks() {
+                for link in &graph_block.borrow().exits {
+                    let Some(target) = link.borrow().target.clone() else {
+                        continue;
+                    };
+                    // Find the target block's pre-seeded pc{N} name via
+                    // the linear scan on block_name_overrides (matches
+                    // canonical's `label_name_for_block` first-match
+                    // semantics).
+                    if let Some((_, name)) =
+                        block_name_overrides.iter().find(|(b, _)| b == &target)
+                    {
+                        link_name_overrides.push((link.clone(), name.clone()));
+                    }
+                }
+            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
                 &walker_slot_for_variable,
                 &block_name_overrides,
+                &link_name_overrides,
                 false,
                 Some(self.cpu()),
             );
