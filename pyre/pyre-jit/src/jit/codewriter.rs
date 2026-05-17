@@ -6229,13 +6229,29 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             )
+                            .expect("load_global_fn returns Ref result")
                         } else {
-                            None
+                            // Non-portal helpers: emit_vable_getfield_ref!
+                            // returns None (no graph dual-write of ns / code
+                            // reads because frame_var is not a startblock
+                            // inputarg there), so no graph SpaceOp produces
+                            // the loaded callable.  Allocate a fresh Ref
+                            // Variable anyway so the downstream simple_call
+                            // HLOp's callable arg has a Variable identity to
+                            // resolve through walker_slot; without this the
+                            // simple_call sees a Variable produced by
+                            // fresh_ref_value with no graph op AND no
+                            // walker_slot pairing, causing canonical's
+                            // get_register to fall through to graph regalloc
+                            // and return u16::MAX (Reg(65535)).
+                            graph.fresh_variable(Kind::Ref)
                         };
-                        pair_walker_slot(&mut walker_slot_for_variable, loaded, loaded_dst_reg);
-                        let result_value = loaded
-                            .map(super::flow::FlowValue::from)
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(loaded),
+                            loaded_dst_reg,
+                        );
+                        let result_value: super::flow::FlowValue = loaded.into();
                         // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
                         // const-source pushvalue writes the constant directly to
                         // the stack TOS register and (in portal case) to the
