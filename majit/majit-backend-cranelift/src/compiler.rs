@@ -7326,53 +7326,23 @@ impl CraneliftBackend {
 
             fail_descr_fd.increment_fail_count();
 
-            // llgraph/runner.py:1184-1191 fail_guard: if bridge attached,
-            // raise Jump(target, values).
-            // llgraph's values are concrete (self.env[box]). In Cranelift,
-            // the jitframe uses recovery_layout encoding for virtuals.
-            // rebuild_state_after_failure decodes this to match what the
-            // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
+            // llgraph/runner.py:1192-1194 fail_guard → ExecutionFinished
+            // (LLDeadFrame).
             //
-            // Slice X1-realloc/B: bridges now self-grow their JITFRAME via
-            // the `_check_frame_depth` prologue (compiler.rs:7585), so the
-            // in-code dispatch (`emit_attached_bridge_dispatch`) reaches
-            // every attached bridge unconditionally.  Slice X1-delete
-            // preparation: probe whether this host-loop fallback still
-            // fires.  After `fail_descr_attach_bridge` was reordered to
-            // publish the cache before the BridgeData Arc, the in-code
-            // path should see consistent state on every guard exit and
-            // this branch should be dead.
-            if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
-                static HOST_FALLBACK_FIRED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !HOST_FALLBACK_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!(
-                        "[X1-delete-probe] host-loop bridge fallback fired \
-                         (trace_id={} fail_index={}) — in-code dispatch missed",
-                        fail_descr_fd.trace_id(),
-                        fail_index,
-                    );
-                }
-                let n = bridge.num_inputs.min(outputs.len());
-                let bridge_inputs = outputs[..n].to_vec();
-                if majit_log_enabled() {
-                    eprintln!(
-                        "[bridge-dispatch] fail_idx={} n={} bridge_inputs={:?} types={:?}",
-                        fail_index, n, &bridge_inputs, &bridge.input_types
-                    );
-                }
-                cur_code_ptr = bridge.code_ptr;
-                cur_fail_descrs = bridge.fail_descrs.clone();
-                cur_num_ref_roots = bridge.num_ref_roots;
-                cur_max_output_slots = bridge.max_output_slots;
-
-                cur_inputs = bridge_inputs;
-
-                continue;
-            }
-
-            // llgraph/runner.py:1192-1194 fail_guard without bridge →
-            // ExecutionFinished(LLDeadFrame).
+            // Slice X1-delete: the host-loop bridge dispatch branch that
+            // previously sat between `increment_fail_count` and this
+            // deadframe return has been removed.  After
+            // `fail_descr_attach_bridge` was reordered (compiler.rs:5891)
+            // to publish the bridge code cache before the BridgeData Arc
+            // swap, every guard exit observing a non-null cache reaches
+            // the in-code dispatch (`emit_attached_bridge_dispatch`,
+            // compiler.rs:5464).  The bridge prologue
+            // (`_check_frame_depth`, compiler.rs:7585) handles frame
+            // growth on entry, so the in-code path covers every attached
+            // bridge.  A counter probe confirmed zero host-loop fires in
+            // production traces; when control reaches this return the
+            // descr genuinely has no bridge attached (cache was null at
+            // guard exit time → in-code dispatch returned deadframe).
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         } // end loop
     }
