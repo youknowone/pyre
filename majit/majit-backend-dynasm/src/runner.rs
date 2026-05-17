@@ -3055,13 +3055,15 @@ impl Backend for DynasmBackend {
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Arc<dyn majit_ir::Descr>> {
-        let source_descr =
-            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
-        if bridge_addr == 0 {
-            return None;
-        }
-        Some(source_descr)
+        // Trait contract (majit-backend/lib.rs:1797-1816): identity
+        // recovery for `bridge_source_descr` when the metainterp side
+        // cannot produce the descr (synthetic / cut-tentative ops,
+        // post-retrace stale traces).  Whether a bridge is currently
+        // attached is irrelevant — the bridge-compilation path needs
+        // the source descr identity regardless.  Matches cranelift's
+        // `compiled_bridge_descr_arc` (compiler.rs:14290), which does
+        // not gate on bridge attachment either.
+        Self::try_find_descr(original_token, source_trace_id, source_fail_index)
     }
 
     fn find_source_fail_descr(
