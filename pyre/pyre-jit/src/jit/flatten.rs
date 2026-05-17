@@ -2197,20 +2197,28 @@ where
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
         // Pyre adaptation: emit `Insn::PcAnchor { py_pc }` +
-        // placeholder `-live-` marker immediately after the
-        // block-entry Label when the bridge entry
-        // (`flatten_graph_with_walker_slots`) pre-seeded a py_pc for
-        // this block.  Matches walker's per-PC anchor + `-live-`
-        // pair in `codewriter.rs::emit_mark_label_pc!` so canonical's
-        // output is consumable by the runtime's
-        // `pc_anchor_positions` / `live_marker_indices_by_pc`
-        // lookups (the latter panics if no `-live-` marker is found
-        // between consecutive anchors).  `filter_liveness_in_place`
-        // post-processes the placeholder by writing the actual live
-        // register set into its `args`.  Upstream RPython has no
-        // per-PC anchor concept; this is a pyre-only extension.
-        if let Some((_, py_pc)) = self.block_py_pcs.iter().find(|(b, _)| b == &block) {
-            self.emitline(Insn::pc_anchor(*py_pc));
+        // placeholder `-live-` marker pairs immediately after the
+        // block-entry Label, one pair per py_pc the bridge entry
+        // (`flatten_graph_with_walker_slots`) pre-seeded for this
+        // block.  Walker emits PcAnchor + `-live-` for EVERY Python
+        // PC in `0..num_pcs` (per-PC dispatch is pyre's runtime
+        // contract), and `pc_anchor_positions` asserts every PC has
+        // an anchor.  Canonical bulk-emits all anchors a block
+        // "owns" at block entry so canonical's output stays runtime-
+        // compatible without per-op PC tracking inside the canonical
+        // driver.  `filter_liveness_in_place` post-processes each
+        // placeholder per `live_marker_indices_by_pc`'s first-`-live-`
+        // scan between consecutive anchors (the scan range is 1 op
+        // because PcAnchor and `-live-` are emitted as consecutive
+        // pairs here).  Upstream RPython has no per-PC anchor
+        // concept; this is a pyre-only extension.
+        let py_pcs: Vec<usize> = self
+            .block_py_pcs
+            .iter()
+            .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
+            .collect();
+        for py_pc in py_pcs {
+            self.emitline(Insn::pc_anchor(py_pc));
             self.emitline(Insn::op(OPNAME_LIVE.to_string(), Vec::new()));
         }
         let operations = block.borrow().operations.clone();

@@ -8381,19 +8381,42 @@ impl CodeWriter {
                     }
                 }
             }
-            // Task #50 T6 epic slice 4b — derive `(BlockRef, py_pc)`
-            // pairs so canonical emits `Insn::PcAnchor { py_pc }` after
-            // each block-entry Label, matching walker's per-PC anchor
-            // shape.  Source: SpamBlock.framestate().next_offset (same
-            // as block_name_overrides above).  Necessary precondition
-            // for the Phase 4 production splice: with PcAnchor present,
+            // Task #50 T6 epic slice 4b/4d — derive `(BlockRef, py_pc)`
+            // pairs so canonical emits `Insn::PcAnchor { py_pc }` +
+            // `-live-` placeholder for EVERY Python PC, matching
+            // walker's per-PC anchor shape.  Walker emits PcAnchor +
+            // `-live-` for every py_pc in `0..num_instrs` (per-PC
+            // dispatch is pyre's runtime contract), and
+            // `pc_anchor_positions` asserts every PC has an anchor.
+            // For each py_pc, find the owning SpamBlock via the
+            // most-recent block-entry PC <= py_pc rule (walker's
+            // sequential dispatch behaviour — once it enters a block
+            // it stays there until a block-switch).  Canonical bulk-
+            // emits all anchors a block owns at block entry.
+            // Necessary precondition for the Phase 4 production
+            // splice: with per-PC PcAnchor + `-live-` present,
             // canonical's SSARepr is runtime-compatible with pyre's
             // `pc_anchor_positions` / `live_marker_indices_by_pc`
             // lookups.
+            let mut sorted_entries: Vec<(&SpamBlockRef, usize)> = all_walker_blocks
+                .iter()
+                .filter_map(|s| s.framestate().map(|fs| (s, fs.next_offset)))
+                .collect();
+            // Stable sort preserves walker creation order for ties
+            // (supersede dead+live pair sharing the same entry pc —
+            // the live one's bytes win via dead-block's empty
+            // per_block_ssarepr).
+            sorted_entries.sort_by_key(|(_, pc)| *pc);
             let mut block_py_pc_overrides: Vec<(super::flow::BlockRef, usize)> = Vec::new();
-            for spam in &all_walker_blocks {
-                if let Some(state) = spam.framestate() {
-                    block_py_pc_overrides.push((spam.block(), state.next_offset));
+            for py_pc in 0..code.instructions.len() {
+                // Most-recent entry <= py_pc owns this PC.
+                let owning = sorted_entries
+                    .iter()
+                    .rev()
+                    .find(|(_, entry_pc)| *entry_pc <= py_pc)
+                    .map(|(s, _)| s.block());
+                if let Some(block) = owning {
+                    block_py_pc_overrides.push((block, py_pc));
                 }
             }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
@@ -8577,6 +8600,41 @@ impl CodeWriter {
                         );
                     }
                 }
+            }
+            // Phase 4 production splice — env-gated.  When
+            // `PYRE_PHASE4_USE_CANONICAL=1` AND canonical's stream is a
+            // strict subset of walker's (canonical_unmatched=0), swap
+            // walker's `ssarepr.insns` with canonical's.  Canonical's
+            // stream is the upstream-orthodox emission (recursive
+            // `make_bytecode_block` DFS + `insert_renamings` at link
+            // boundaries) per `flatten.py:67-83 generate_ssa_form`;
+            // walker's stream carries pyre-only NEW-DEVIATION
+            // scaffold (per-PC defensive goto, inline ref_copy for
+            // stack push/pop) that the canonical driver omits.  With
+            // slices 4b/4c canonical also emits `Insn::PcAnchor` +
+            // `-live-` placeholder so the runtime's
+            // `pc_anchor_positions` / `live_marker_indices_by_pc`
+            // lookups consume it without modification.
+            //
+            // Gate on `canonical_unmatched == 0` (canonical is subset
+            // of walker): swapping in canonical can only REMOVE ops
+            // walker had (the pyre-only scaffold).  All ops canonical
+            // emits also appear in walker, so the runtime semantics
+            // are preserved.  Graphs with `canonical_unmatched > 0`
+            // (fannkuch's 3 insert_renamings ref_copies) are skipped
+            // for now — those require canonical-side ops walker
+            // doesn't have, which would change runtime behavior in
+            // ways that need per-bench verification.
+            if canonical_unmatched == 0
+                && std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some()
+            {
+                eprintln!(
+                    "[phase4-production-splice] graph={:?} walker_insns={} → canonical_insns={}",
+                    code.obj_name.as_str(),
+                    ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len(),
+                );
+                ssarepr.insns = canonical_ssarepr.insns;
             }
         }
 
