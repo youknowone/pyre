@@ -480,6 +480,26 @@ impl FailDescr for ResumeGuardDescr {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
+
+    /// `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
+    /// are routed through a synthesised `ResumeGuardDescr` whose
+    /// `external_jump_target` slot carries the cross-loop TargetToken
+    /// `DescrRef` (Slice 7-Tβ8).  Membership in the slot IS the
+    /// external-JUMP predicate.  Slice 7-Tβ14f override: prior to
+    /// CraneliftFailDescr deletion the predicate lived on the backend
+    /// wrapper; with the wrapper gone the FailDescr trait impl must
+    /// answer directly.
+    fn is_external_jump(&self) -> bool {
+        self.external_jump_target.get().is_some()
+    }
+
+    /// `history.py:470` `TargetToken._ll_loop_code` parity: when this
+    /// descr is the synthesised cross-loop JUMP exit, surface the target
+    /// `DescrRef` the dispatcher re-enters via.  `None` for regular
+    /// guard descrs.  Slice 7-Tβ14f override (see `is_external_jump`).
+    fn target_descr(&self) -> Option<DescrRef> {
+        self.external_jump_target.get().cloned()
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
