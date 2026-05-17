@@ -1854,11 +1854,7 @@ where
                         .rev()
                         .map(|op| format!("{}@{}", op.opname, op.offset))
                         .collect();
-                    format!(
-                        "ops={} last_ops={:?}",
-                        b.operations.len(),
-                        last_ops,
-                    )
+                    format!("ops={} last_ops={:?}", b.operations.len(), last_ops,)
                 })
                 .unwrap_or_else(|| "<no-block>".to_string());
             eprintln!(

@@ -1090,6 +1090,13 @@ fn dispatch_op(
                         vable_reg, array_idx, *idx_value, src.index,
                     );
                 }
+                (Operand::ConstInt(idx_value), Operand::ConstInt(src_value)) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_int_const_idx_const_value_with_base(
+                            vable_reg, array_idx, *idx_value, *src_value,
+                        );
+                }
                 (idx, src) => panic!(
                     "setarrayitem_vable_i expects (Register(Int) | ConstInt) index and \
                      (Register(Int) | ConstInt) value, got idx={:?} src={:?}",
@@ -1157,6 +1164,13 @@ fn dispatch_op(
                     state.builder.vable_setarrayitem_float_const_idx_with_base(
                         vable_reg, array_idx, *idx_value, src.index,
                     );
+                }
+                (Operand::ConstInt(idx_value), Operand::ConstFloat(src_value)) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_float_const_idx_const_value_with_base(
+                            vable_reg, array_idx, *idx_value, *src_value,
+                        );
                 }
                 (idx, src) => panic!(
                     "setarrayitem_vable_f expects (Register(Int) | ConstInt) index and \

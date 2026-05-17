@@ -4056,16 +4056,24 @@ fn handle(
             } else {
                 (OpCode::GuardFalse, ctx.trace_ctx.const_int(0))
             };
-            ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
-            // `pyjitpl.py:523-526` const-source short-circuit + `replace`
-            // fold: when `valuebox` is already a Const, the guard pins
-            // the existing constant and no rewrite is needed.  Otherwise
-            // rewrite downstream uses (trace history + walker register
-            // bank) to the promoted const — `trace_ctx.replace_box`
-            // handles the trace side; the Int bank loop handles the
-            // walker's symbolic registers analogously to `switch/id`
-            // (jitcode_dispatch.rs:~1189).
+            // `pyjitpl.py:511-526 opimpl_goto_if_not` calls
+            // `generate_guard(opnum, box, resumepc=orgpc)`; the first
+            // line of `generate_guard` (`pyjitpl.py:2583`) is
+            // `if isinstance(box, Const): return` — Const boxes already
+            // pin the value and need no guard. Same gate then governs
+            // the `replace_box` / register-rewrite path
+            // (`pyjitpl.py:523-526`). Resume-data capture
+            // (`capture_resumedata(resumepc=orgpc)` at
+            // `pyjitpl.py:2603`) is omitted here: the walker's IR is
+            // rolled back via `cut_trace`, so the snapshot the trait
+            // leg builds in `trace_opcode.rs:3275 MIFrame::generate_guard`
+            // has no production effect on this leg. The M4.Cutover
+            // Step 5 endgame (walker becomes the production trace
+            // emitter) needs to thread `op.pc` here as resumepc and
+            // capture the active-box snapshot the same way `MIFrame`
+            // does.
             if !valuebox.is_constant() {
+                ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
                 ctx.trace_ctx.replace_box(valuebox, promoted);
                 for slot in ctx.registers_i.iter_mut() {
                     if *slot == valuebox {
@@ -4595,19 +4603,29 @@ fn handle(
             // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
             let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
-            if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
-                if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
-                    let exc_class_ptr = unsafe {
-                        (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
-                            .ob_header
-                            .ob_type
-                    };
-                    let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
-                    ctx.trace_ctx
-                        .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
-                    ctx.trace_ctx
-                        .heap_cache_mut()
-                        .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
+            // `pyjitpl.py:1688-1693 opimpl_raise` calls
+            // `generate_guard(GUARD_CLASS, exc_value_box, clsbox,
+            // resumepc=orgpc)`; the first line of `generate_guard`
+            // (`pyjitpl.py:2583`) is `if isinstance(box, Const):
+            // return`. Const exception boxes already pin the class so
+            // no guard is needed. Resume-data capture is omitted here
+            // for the same reason as `goto_if_not/iL` above — see that
+            // arm's comment for the M4.Cutover Step 5 endgame.
+            if !exc.is_constant() {
+                if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
+                    if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
+                        let exc_class_ptr = unsafe {
+                            (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                                .ob_header
+                                .ob_type
+                        };
+                        let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
+                        ctx.trace_ctx
+                            .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+                        ctx.trace_ctx
+                            .heap_cache_mut()
+                            .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
+                    }
                 }
             }
             ctx.last_exc_value = Some(exc);

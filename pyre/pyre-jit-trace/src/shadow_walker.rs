@@ -470,32 +470,27 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_stays_out_of_shadow_allow_list_until_int_concrete_shadow_lands() {
-        // PopTop blocker history:
-        //   1. (#73, closed) sub-walk `registers_i` undersized at the
-        //      callee constant-pool slot — `RegisterOutOfRange { pc:
-        //      14, reg: 1, len: 1, bank: "i" }`.  Fixed by sizing each
-        //      sub-walk bank to `num_regs_and_consts_X` and pre-
-        //      populating the constant window via
-        //      `TraceCtx::const_{int,ref,float}` (RPython
-        //      `pyjitpl.py:98-119 MIFrame.copy_constants`).
-        //   2. (#74, closed) walker had no `goto_if_not/iL` handler —
+    fn pop_top_is_in_shadow_allow_list() {
+        // PopTop blocker history (all closed):
+        //   1. (#73) sub-walk `registers_i` undersized at the callee
+        //      constant-pool slot — `RegisterOutOfRange { pc: 14, reg:
+        //      1, len: 1, bank: "i" }`.  Fixed by sizing each sub-walk
+        //      bank to `num_regs_and_consts_X` and pre-populating the
+        //      constant window via `TraceCtx::const_{int,ref,float}`
+        //      (RPython `pyjitpl.py:98-119 MIFrame.copy_constants`).
+        //   2. (#74) walker had no `goto_if_not/iL` handler —
         //      `UnsupportedOpname { pc: 21, key: "goto_if_not/iL" }`.
         //      Ported from `pyjitpl.py:511-526 opimpl_goto_if_not`
         //      with concrete read via `TraceCtx::concrete_of_opref`
         //      mirroring `switch/id`.
         //
-        // The next blocker surfaces under `MAJIT_SHADOW_WALKER=1
-        // raise_catch_loop.py` as `GotoIfNotValueNotConcrete { pc:
-        // 21, value: IntOp(N) }`: the symbolic Int OpRef produced by
-        // an upstream recorded op lacks a concrete value in the trace
-        // recorder.  Closing this needs Int-bank concrete shadow
-        // plumbing into the trace_ctx for every recorded Int op the
-        // walker may downstream-consume — the deferred slice
-        // referenced in `WalkContext.concrete_registers_r`'s docstring
-        // (line ~313).  Until that lands, adding PopTop to the allow
-        // list re-panics the shadow harness on raise_catch.
-        assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
+        // PopTop arm body is `inline_call_r_r/dR>r` into the
+        // `pop_value` sub-jitcode, followed by the standard
+        // `live/catch_exception/goto/reraise/ref_return/live/raise/
+        // ref_return` shoulder. No `goto_if_not/iL` (which would
+        // need Int-bank concrete shadow — task #75), so the LoadFast
+        // blocker doesn't apply here.
+        assert!(opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 
     #[test]

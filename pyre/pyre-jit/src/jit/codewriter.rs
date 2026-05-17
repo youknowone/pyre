@@ -5062,12 +5062,8 @@ impl CodeWriter {
                              emit_vable_getfield_ref! must return a per-SpaceOp \
                              Variable for the `pycode` green arg",
                         );
-                        let graph_args = portal_jit_merge_point_graph_args(
-                            &graph,
-                            py_pc,
-                            pycode_var,
-                            jdindex,
-                        );
+                        let graph_args =
+                            portal_jit_merge_point_graph_args(&graph, py_pc, pycode_var, jdindex);
                         let graph_op = emit_graph_op_void(
                             &current_block.block(),
                             "jit_merge_point",
@@ -7469,11 +7465,7 @@ impl CodeWriter {
                     // gate `emit_catch_exception!` would append a
                     // stray catch link to a block whose exits the
                     // just-emitted opcode already closed.
-                    let block_already_closed = !current_block
-                        .block()
-                        .borrow()
-                        .exits
-                        .is_empty();
+                    let block_already_closed = !current_block.block().borrow().exits.is_empty();
                     if !block_already_closed {
                         emit_catch_exception!(catch_label);
                     }
@@ -7874,9 +7866,7 @@ impl CodeWriter {
                 acc: &mut (usize, Vec<(String, String)>),
             ) {
                 match arg {
-                    super::flow::SpaceOperationArg::Value(
-                        super::flow::FlowValue::Constant(c),
-                    ) => {
+                    super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
                         if let super::flow::ConstantValue::Opaque(o) = &c.value {
                             if c.kind == Some(super::flatten::Kind::Ref) || c.kind.is_none() {
                                 acc.0 += 1;
@@ -7977,8 +7967,7 @@ impl CodeWriter {
                         code.obj_name.as_str(),
                         ssarepr.insns.len(),
                         canonical_ssarepr.insns.len(),
-                        canonical_ssarepr.insns.len() as i64
-                            - ssarepr.insns.len() as i64,
+                        canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
                     );
                 }
                 Err(panic_info) => {
