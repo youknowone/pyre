@@ -5,12 +5,11 @@
 //! `resoperation.rs` for the `RdVirtualInfo` enum declarations) does
 //! not need to lower the closure-bearing accessor surface.
 //!
-//! `Op.descr` is still a plain `Option<DescrRef>` field (the build-
-//! script translator's `expr_unary_not_operand_kind` classifier does
-//! not yet recognise `RefCell<...>` field types).  Until the
-//! translator gains parity, `setdescr` / `cleardescr` take `&mut
-//! self` rather than `&self`; the `Vec<Rc<Op>>`-era flip to interior
-//! mutability is coordinated with the translator update.
+//! `Op.descr` is now `RefCell<Option<DescrRef>>` so the optimizer can
+//! stamp a `ResumeGuardDescr` onto a shared `Op` (reached through
+//! `Rc<Op>` in the BoxPool Slice 1 trace storage migration) the same
+//! way RPython's `op.setdescr(d)` writes on a shared Python object.
+//! `setdescr` / `cleardescr` therefore take `&self`.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -112,8 +111,7 @@ impl Op {
     /// `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return prev`
     /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
     /// chases `prev` automatically.  Returns `Arc<[u8]>` so the slice
-    /// stays valid even after the `op.descr` field is later wrapped in
-    /// `RefCell` (`Vec<Rc<Op>>`-era migration).
+    /// stays valid once the borrow on `op.descr` drops.
     pub fn resolved_rd_numb(&self) -> Option<Arc<[u8]>> {
         self.descr.borrow().as_ref()?.as_fail_descr()?.rd_numb_arc()
     }
