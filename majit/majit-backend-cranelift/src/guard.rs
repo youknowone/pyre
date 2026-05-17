@@ -532,11 +532,17 @@ impl CraneliftFailDescr {
     /// `meta_descr` (codegen-time FINISH `Done*` / external-JUMP
     /// `None`) return `None`; the recovery_layout walker handles
     /// `None` as the no-recovery path (no virtuals to materialise).
+    ///
+    /// The `prev_descr` chase here is INTENTIONAL and PyPy-orthodox:
+    /// `recovery_layout` is a derived view of the resume payload
+    /// (`rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`)
+    /// which `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage()`
+    /// explicitly delegates to `prev`.  Per-emission slots
+    /// (source_op_index / force_token_slots / fail_count / trace_info /
+    /// bridge_*) DO NOT chase prev — they follow `assembler.py:279`
+    /// `guardtok.faildescr.rd_locs = positions` per-emission write
+    /// pattern and each ResumeGuardCopiedDescr owns its own copy.
     pub fn recovery_layout_ref(&self) -> Option<ExitRecoveryLayout> {
-        // `compile.py:849` `ResumeGuardCopiedDescr.get_resumestorage():
-        // return prev`.  Chase `prev_descr` until we land on the donor
-        // `ResumeGuardDescr` — otherwise copied descrs would always
-        // return `None` since their `as_any` is the trait default.
         let mut current = self.meta_descr.as_ref().cloned()?;
         loop {
             if let Some(rgd) = current
@@ -686,9 +692,13 @@ impl CraneliftFailDescr {
     /// only); when they do (test introspection, bridge-attach source
     /// chase), `recovery_layout_ref()` returns `None` and the caller
     /// handles the no-recovery path.
+    ///
+    /// The `prev_descr` chase is INTENTIONAL: recovery_layout is
+    /// derived from the resume payload that `compile.py:849
+    /// ResumeGuardCopiedDescr.get_resumestorage(): return prev`
+    /// shares with the donor.  Per-emission slots do not chase
+    /// (see `recovery_layout_ref` comment).
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
-        // Match `recovery_layout_ref`: chase `prev_descr` through any
-        // `ResumeGuardCopiedDescr` chain to write into the donor's slot.
         let Some(mut current) = self.meta_descr.as_ref().cloned() else {
             return;
         };
