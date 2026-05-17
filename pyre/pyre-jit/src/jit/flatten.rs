@@ -2556,7 +2556,7 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    flatten_graph_with_walker_slots(graph, regallocs, &[], include_all_exc_links, cpu)
+    flatten_graph_with_walker_slots(graph, regallocs, &[], &[], include_all_exc_links, cpu)
 }
 
 /// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
@@ -2565,10 +2565,25 @@ pub fn flatten_graph<'a>(
 /// graph-only Variables (e.g. `last_exception` from
 /// `attach_catch_exception_edge`) have no entry and fall back to
 /// `regallocs[kind].getcolor(v)` per `flatten.py:382-391`.
+///
+/// Task #50 T6 epic slice 1 — `block_name_overrides` pre-seeds the
+/// flattener's `block_names` map so canonical's `Label(block)` /
+/// `tlabel_for_block(target)` emit walker-compatible `pc{N}` names
+/// (where N = block's FrameState `next_offset` = entry Python PC)
+/// instead of the default sequential `block{N}` scheme.  Walker emits
+/// `Label("pcN")` per Python PC (its per-PC dispatch convention);
+/// without the override canonical and walker disagree on every branch
+/// target label name even though they reference the same target
+/// block.  Pre-seeded overrides are first-wins per
+/// `label_name_for_block`'s lookup logic — entries not in the
+/// override list fall back to the `block{N}` default (used for blocks
+/// the walker created but never assigned a `pcN` to, e.g. the implicit
+/// graph startblock when its py_pc has no per-PC anchor).
 pub fn flatten_graph_with_walker_slots<'a>(
     graph: &super::flow::FunctionGraph,
     regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
     walker_slot_for_variable: &'a [Option<u16>],
+    block_name_overrides: &[(super::flow::BlockRef, String)],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2622,6 +2637,15 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
+    // Task #50 T6 epic slice 1 — pre-seed block_names with walker's
+    // `pc{N}` naming so `Label(block)` / `tlabel_for_block(target)`
+    // resolve to walker-compatible names.  Overrides land first in the
+    // Vec; `label_name_for_block` does a linear scan and returns the
+    // first matching entry, so subsequent default `block{N}` insertions
+    // for blocks not in the override list keep their fallback names.
+    for (block, name) in block_name_overrides {
+        flattener.block_names.push((block.clone(), name.clone()));
+    }
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     ssarepr

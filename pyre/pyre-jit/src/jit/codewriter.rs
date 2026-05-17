@@ -8330,10 +8330,29 @@ impl CodeWriter {
                     }
                 }
             }
+            // Task #50 T6 epic slice 1 — derive (BlockRef, pc{N}) name
+            // overrides from `all_walker_blocks` and pass to canonical
+            // so its `Label(block)` / `tlabel_for_block(target)` emit
+            // walker-compatible `pc{N}` names.  Each SpamBlock's
+            // FrameState carries `next_offset` = entry Python PC; that's
+            // the same N walker uses in `emit_mark_label_pc!(py_pc)`.
+            // Blocks without a FrameState (synthetic catch-landing
+            // blocks the walker doesn't anchor at a specific PC) are
+            // skipped — they keep canonical's default `block{N}` name.
+            let mut block_name_overrides: Vec<(super::flow::BlockRef, String)> = Vec::new();
+            for spam in &all_walker_blocks {
+                if let Some(state) = spam.framestate() {
+                    block_name_overrides.push((
+                        spam.block(),
+                        super::flatten::pc_label_name(state.next_offset),
+                    ));
+                }
+            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
                 &walker_slot_for_variable,
+                &block_name_overrides,
                 false,
                 Some(self.cpu()),
             );
