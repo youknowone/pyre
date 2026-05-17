@@ -6773,7 +6773,20 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[0]);
+        // Resolve local `b`'s Ref-bank color via the regalloc-emitted
+        // `pyre_color_for_semantic_local` map.  Hardcoding reg index 0
+        // couples the test to walker's pre-canonical local-slot identity;
+        // canonical `flatten_graph`'s regalloc-coalesced coloring may emit
+        // a different color for the inputarg.  Mirrors the
+        // [[project-flatten-graph-canonical-driver-2026-05-17]] Phase 4
+        // splice-gate convergence pattern landed for
+        // test_restore_guard_failure_uses_runtime_value_kinds_... .
+        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
+        let color_b: u32 = (*local_color_map
+            .get(0)
+            .expect("regalloc must assign a color to local `b`"))
+        .into();
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[color_b]);
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
