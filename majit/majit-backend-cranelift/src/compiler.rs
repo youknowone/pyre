@@ -5607,6 +5607,72 @@ fn emit_attached_bridge_dispatch(
     builder.seal_block(miss_block);
 }
 
+/// `assembler.py:2456-2462 closing_jump` parity for cranelift.
+///
+/// PyPy's x86 backend emits a raw `JMP imm(target_token._ll_loop_code)` at
+/// the source loop's JUMP exit: control transfers directly to the target's
+/// compiled entry, reusing the same JITFRAME with the source's output
+/// values placed in the target's input slots.  Cranelift cannot emit
+/// inter-function JMPs, so this dispatcher does the equivalent:
+///
+/// 1. load `ll_loop_code` from the heap-stable address baked at codegen
+///    (`LoopTargetDescr.ll_loop_code_ptr()`).  Zero ⇔ the target has not
+///    been compiled yet — fall through to the deadframe exit so the host
+///    dispatcher can take the JUMP.
+/// 2. non-zero ⇒ pop the source's shadowstack entry (the target's
+///    `_call_header_with_stack_check` pushes its own), then
+///    `call_indirect` into the target with `jf_ptr`.  The target's
+///    prologue reads inputs from JITFRAME positions 0..N — exactly the
+///    positions `emit_guard_exit`'s fail-arg writes have just populated.
+/// 3. return the target's deadframe verbatim to the caller.
+fn emit_attached_loop_dispatch(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    ll_loop_code_addr: usize,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) {
+    let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
+    let entry = builder
+        .ins()
+        .load(ptr_type, MemFlags::trusted(), cell_ptr, 0);
+    let null = builder.ins().iconst(ptr_type, 0);
+    let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
+    let take_block = builder.create_block();
+    builder.append_block_param(take_block, ptr_type);
+    let miss_block = builder.create_block();
+    builder.ins().brif(
+        has_entry,
+        take_block,
+        &[BlockArg::from(entry)],
+        miss_block,
+        &[],
+    );
+
+    builder.switch_to_block(take_block);
+    builder.seal_block(take_block);
+    let target_code_ptr = builder.block_params(take_block)[0];
+    emit_call_footer_shadowstack(builder, ptr_type);
+    let mut target_sig = Signature::new(call_conv);
+    target_sig.params.push(AbiParam::new(ptr_type));
+    target_sig.returns.push(AbiParam::new(ptr_type));
+    let target_sig_ref = builder.import_signature(target_sig);
+    // `assembler.py:2456-2462 closing_jump` emits a raw inter-function
+    // `JMP imm(target)` — a tail call.  Cranelift exposes the same
+    // semantics via `return_call_indirect`, which replaces the current
+    // frame with the callee's instead of pushing a return address.  A
+    // regular `call_indirect` + `return` would push one frame per
+    // iteration; benchmark traces like fannkuch close-jump tens of
+    // millions of times per run and would exhaust the OS thread stack
+    // within seconds.
+    builder
+        .ins()
+        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
+
+    builder.switch_to_block(miss_block);
+    builder.seal_block(miss_block);
+}
+
 /// genop_finish (assembler.py:2114-2155) parity:
 ///   1. save result to jf_frame[0]
 ///   2. MOV [ebp + jf_descr], faildescrindex
@@ -5690,6 +5756,24 @@ fn emit_guard_exit(
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+
+    // Scaffolding for upcoming in-code `closing_jump` (Slice X2-step4):
+    // `info.external_jump_ll_loop_code_addr` carries the heap-stable
+    // address of the target `LoopTargetDescr.ll_loop_code` slot so a
+    // `return_call_indirect` (tail call) can re-enter the target loop
+    // without growing the host stack.  Wiring the dispatch in requires:
+    // (a) routing all JIT functions through `CallConv::Tail` so the
+    //     caller/callee signatures match cranelift's tail-call ABI
+    //     (`isa::CallConv::Tail`), and
+    // (b) target_argloc remapping — pyre's
+    //     `LoopTargetDescr.ll_loop_code` points at the function entry
+    //     (which runs the preamble reading inputs from positions 0..N
+    //     using the preamble's argloc layout), not at the loop body
+    //     label PyPy targets directly (peeled-loop traces have distinct
+    //     body input positions).  An attempt without (b) hung fannkuch
+    //     because the body label's input argloc layout did not match
+    //     the preamble's, so re-entry corrupted loop induction state.
+    let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
         // RPython/dynasm patched guards enter the bridge before failure
@@ -6560,6 +6644,15 @@ struct GuardInfo {
     /// reduction at guard exit. Each entry maps a fail_arg slot to its
     /// vector accumulator variable and reduction operator.
     accum_info: Vec<AccumInfo>,
+    /// `assembler.py:2456-2462 closing_jump` parity for cross-loop JUMP.
+    /// `Some(addr)` ⇔ this is an external-JUMP exit and `addr` is the
+    /// heap-stable address of the target `LoopTargetDescr`'s
+    /// `ll_loop_code: AtomicUsize` slot.  `emit_guard_exit` reads the
+    /// slot in-code: non-zero → tail-call into the target loop's entry
+    /// (parity with PyPy's `JMP imm(target)`); zero → fall through to
+    /// the standard deadframe exit so the host loop can pick up the
+    /// jump when the target compiles.
+    external_jump_ll_loop_code_addr: Option<usize>,
 }
 
 fn identity_recovery_layout(
@@ -13583,6 +13676,21 @@ fn collect_guards(
         } else {
             None
         };
+        // `assembler.py:2456-2462 closing_jump`: capture the heap-stable
+        // address of the target `LoopTargetDescr.ll_loop_code` slot so
+        // the in-code dispatch in `emit_guard_exit` can read the latest
+        // entry on every JUMP exit (parity with the raw `JMP imm(target)`
+        // PyPy emits — the immediate is rewritten when the target
+        // compiles).  `op.descr` IS the target descr for external JUMPs;
+        // for non-JUMP exits this stays `None`.
+        let external_jump_ll_loop_code_addr = if is_external_jump {
+            op.descr
+                .as_ref()
+                .and_then(|d| d.as_loop_target_descr())
+                .map(|ltd| ltd.ll_loop_code_ptr() as usize)
+        } else {
+            None
+        };
         fail_descrs.push(descr);
         // assembler.py:40-44 must_save_exception parity:
         let must_save_exception = matches!(
@@ -13600,6 +13708,7 @@ fn collect_guards(
             fail_descr_ptr,
             bridge_cache_addrs,
             accum_info,
+            external_jump_ll_loop_code_addr,
         });
     }
 
