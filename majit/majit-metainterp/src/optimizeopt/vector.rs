@@ -156,7 +156,7 @@ impl VectorLoop {
                         *arg = mapped;
                     }
                 }
-                if let Some(ref mut fa) = new_op.fail_args {
+                if let Some(fa) = new_op.fail_args_mut() {
                     for arg in fa.iter_mut() {
                         if let Some(&mapped) = remap.get(arg) {
                             *arg = mapped;
@@ -287,7 +287,7 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ve
     }
     // schedule.py:708-716: unpack guard failargs
     if op.opcode.is_guard() {
-        if let Some(ref mut fail_args) = op.fail_args {
+        if let Some(fail_args) = op.fail_args_mut() {
             for arg in fail_args.iter_mut() {
                 if arg.is_constant() || seen.contains(arg) {
                     continue;

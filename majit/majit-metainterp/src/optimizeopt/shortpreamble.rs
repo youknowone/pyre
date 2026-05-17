@@ -146,7 +146,7 @@ impl ShortPreamble {
                 }
             }
 
-            if let Some(ref mut fail_args) = op.fail_args {
+            if let Some(fail_args) = op.fail_args_mut() {
                 for (fail_arg_pos, label_idx) in &entry.fail_arg_mapping {
                     if let Some(bridge_ref) = bridge_args.get(*label_idx) {
                         if *fail_arg_pos < fail_args.len() {
@@ -2723,7 +2723,7 @@ pub fn produced_short_boxes_from_exported_boxes(
                     *arg = renamed;
                 }
             }
-            if let Some(fail_args) = preamble_op.fail_args.as_mut() {
+            if let Some(fail_args) = preamble_op.fail_args_mut() {
                 for arg in fail_args {
                     if let Some(renamed) = inputarg_rename(*arg) {
                         *arg = renamed;

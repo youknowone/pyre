@@ -2680,7 +2680,7 @@ impl Optimizer {
                     for arg in &mut preamble_op.args {
                         *arg = ctx.get_box_replacement(*arg);
                     }
-                    if let Some(fail_args) = preamble_op.fail_args.as_mut() {
+                    if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
                             *arg = ctx.get_box_replacement(*arg);
                         }
@@ -3004,7 +3004,7 @@ impl Optimizer {
                         *arg = arg.with_raw(new_pos);
                     }
                 }
-                if let Some(ref mut fail_args) = op.fail_args {
+                if let Some(fail_args) = op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&new_pos) = remap.get(&arg.raw()) {
                             *arg = arg.with_raw(new_pos);
@@ -3065,7 +3065,7 @@ impl Optimizer {
                     for arg in &mut entry.op.args {
                         remap_opref(arg);
                     }
-                    if let Some(ref mut fa) = entry.op.fail_args {
+                    if let Some(fa) = entry.op.fail_args_mut() {
                         for arg in fa.iter_mut() {
                             remap_opref(arg);
                         }
@@ -4166,7 +4166,7 @@ impl Optimizer {
         // in rd_numb during numbering, and the liveboxes returned by
         // `finish()` / `descr.store_final_boxes` remain TAGBOX-only for
         // backend regalloc.
-        if let Some(ref mut fail_args) = op.fail_args {
+        if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
                     fail_args[fa_idx] = ctx.get_box_replacement_not_const(fail_args[fa_idx]);

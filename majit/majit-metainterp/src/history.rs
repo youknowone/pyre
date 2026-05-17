@@ -536,7 +536,7 @@ impl TreeLoop {
             for arg in new_op.args.iter_mut() {
                 *arg = remap_ref(arg);
             }
-            if let Some(ref mut fa) = new_op.fail_args {
+            if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     *arg = remap_ref(arg);
                 }

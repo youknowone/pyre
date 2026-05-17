@@ -1887,7 +1887,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             if !replaced {
                 emitted = op.copy_and_change(op.opcode, None, None);
             }
-            if let Some(fail_args) = emitted.fail_args.as_mut() {
+            if let Some(fail_args) = emitted.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     *arg = get_local_box_replacement(forwarding, *arg);
                 }

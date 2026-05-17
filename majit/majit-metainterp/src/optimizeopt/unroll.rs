@@ -3444,7 +3444,7 @@ impl OptUnroll {
                             ctx.make_constant(arg, value);
                         }
                     }
-                } else if let Some(ref mut fail_args) = new_op.fail_args {
+                } else if let Some(fail_args) = new_op.fail_args_mut() {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
                             *arg = mapped;
@@ -4613,7 +4613,7 @@ fn assemble_peeled_trace_with_jump_args(
         // (the snapshot), not the body's final state. body_result_remap
         // applies only to values body-defined AND not visible before the
         // label, so snapshot refs to label args stay intact.
-        if let Some(ref mut fa) = new_op.fail_args {
+        if let Some(fa) = new_op.fail_args_mut() {
             for a in fa.iter_mut() {
                 if let Some(&mapped) = body_result_remap.get(a) {
                     if seen_body_defs.contains(a) && !visible_before_label.contains(a) {
@@ -4784,7 +4784,7 @@ impl OptUnroll {
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
             }
-            if let Some(ref mut fa) = peeled.fail_args {
+            if let Some(fa) = peeled.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(arg) {
                         *arg = new_ref;
@@ -4829,7 +4829,7 @@ impl OptUnroll {
                     *arg = new_ref;
                 }
             }
-            if let Some(ref mut fa) = body_op.fail_args {
+            if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(arg) {
                         *arg = new_ref;

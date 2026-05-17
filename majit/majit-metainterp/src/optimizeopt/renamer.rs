@@ -45,7 +45,7 @@ impl Renamer {
         if op.opcode.is_guard() {
             // renamer.py:27: TODO op.rd_snapshot = self.rename_rd_snapshot(...)
             // renamer.py:28-29: failargs = self.rename_failargs(op, clone=True)
-            if let Some(ref mut fail_args) = op.fail_args {
+            if let Some(fail_args) = op.fail_args_mut() {
                 let cloned: Vec<OpRef> = fail_args
                     .iter()
                     .map(|arg| self.rename_map.get(arg).copied().unwrap_or(*arg))

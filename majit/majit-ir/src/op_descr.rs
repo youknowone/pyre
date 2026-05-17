@@ -175,6 +175,18 @@ impl Op {
         self.fail_args = Some(fail_args);
     }
 
+    /// In-place mutable view of the fail_args slot.  Lets callers iterate
+    /// the SmallVec mutably (`fa.iter_mut()`, `fa[i] = …`) without going
+    /// through a clone/setfailargs round-trip.  Returns `None` when the
+    /// slot is empty.  Requires `&mut Op`; once the slot moves to
+    /// interior mutability, a `with_failargs_mut(&self, f)` closure
+    /// variant will replace this for shared-`Op` callers.
+    pub fn fail_args_mut(
+        &mut self,
+    ) -> Option<&mut smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
+        self.fail_args.as_mut()
+    }
+
     /// Clear the fail_args slot.  PyPy has no separate `clearfailargs`
     /// method; the pattern is `op.setfailargs(None)` in RPython, but
     /// pyre's signature distinguishes the two paths (set vs clear) for

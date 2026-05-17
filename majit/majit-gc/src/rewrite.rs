@@ -647,7 +647,7 @@ impl RewriteState {
         for arg in rewritten.args.iter_mut() {
             *arg = self.resolve(*arg);
         }
-        if let Some(fail_args) = rewritten.fail_args.as_mut() {
+        if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
                 *arg = self.resolve(*arg);
             }
@@ -870,7 +870,7 @@ impl GcRewriterImpl {
         // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
         // guard for the next iteration to pick up.
         let mut new_guard = op.clone();
-        if let Some(ref mut fa) = new_guard.fail_args {
+        if let Some(fa) = new_guard.fail_args_mut() {
             fa[idx] = same_pos;
         }
         // pos is reassigned when emit/emit_result runs on the substituted op.

@@ -469,7 +469,7 @@ impl<'a> TraceIterator<'a> {
         for arg in res.args.iter_mut() {
             *arg = self._untag(*arg);
         }
-        if let Some(ref mut fa) = res.fail_args {
+        if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
                 *arg = self._untag(*arg);
             }
