@@ -6507,19 +6507,25 @@ impl CodeWriter {
                             emit_vsd!(current_depth);
                             continue;
                         }
-                        let arg_regs: Vec<u16> = (0..argc)
-                            .map(|_| ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0)
-                            .collect();
+                        let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
                         let mut item_values_rev = Vec::with_capacity(argc);
-                        for i in (0..argc).rev() {
+                        for _ in 0..argc {
                             let item_reg = emit_popvalue_ref!(current_depth);
                             let item_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            emit_ref_copy!(arg_regs[i], item_reg);
+                            if let super::flow::FlowValue::Variable(v) = &item_value {
+                                pair_walker_slot(
+                                    &mut walker_slot_for_variable,
+                                    Some(*v),
+                                    item_reg,
+                                );
+                            }
+                            arg_regs_rev.push(item_reg);
                             item_values_rev.push(item_value);
                         }
+                        let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                         // build_list_fn(argc, item0, item1, item2) → list. The C ABI is
                         // `extern "C" fn(i64, i64, i64, i64)`; the helper dispatches
                         // internally by `argc`, so unused item slots may be any
