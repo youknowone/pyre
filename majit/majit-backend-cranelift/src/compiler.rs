@@ -7579,18 +7579,38 @@ impl CraneliftBackend {
         let header_pc = self.next_header_pc.take().unwrap_or(0);
         let ptr_type = self.module.target_config().pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
+        // The body uses CallConv::Tail so it can `return_call_indirect` to
+        // another body's entry — `assembler.py:2456-2462 closing_jump` raw
+        // `JMP imm(target)` parity.  The host (Rust) caller cannot speak
+        // Tail ABI (it clobbers AppleAarch64 callee-saves x19-x28/x29), so a
+        // separate `trace_N_entry` wrapper carrying `default_call_conv` is
+        // declared alongside the body and forwards the jitframe pointer to
+        // the body via `call_indirect`.  Wrapper is what host code calls
+        // (`CompiledLoop.code_ptr` / `LoopTargetEntry.code_ptr`); body is
+        // what in-code dispatch tail-calls (`LoopTargetDescr.ll_loop_code`).
+        let body_call_conv = cranelift_codegen::isa::CallConv::Tail;
 
-        let mut sig = Signature::new(call_conv);
+        let mut sig = Signature::new(body_call_conv);
         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
         // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
-        let func_name = format!("trace_{}", self.func_counter);
+        let body_name = format!("trace_{}_body", self.func_counter);
+        let entry_name = format!("trace_{}_entry", self.func_counter);
         self.func_counter += 1;
 
         let func_id = self
             .module
-            .declare_function(&func_name, Linkage::Local, &sig)
+            .declare_function(&body_name, Linkage::Local, &sig)
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+
+        // Wrapper sig: same I/O shape, host call conv.
+        let mut wrapper_sig = Signature::new(call_conv);
+        wrapper_sig.params.push(AbiParam::new(ptr_type));
+        wrapper_sig.returns.push(AbiParam::new(ptr_type));
+        let entry_id = self
+            .module
+            .declare_function(&entry_name, Linkage::Local, &wrapper_sig)
             .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
 
         let mut func = Function::with_name_signature(
@@ -12815,9 +12835,52 @@ impl CraneliftBackend {
             return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));
         }
         self.module.clear_context(&mut ctx);
+
+        // Build trace_N_entry wrapper: forwards jf_ptr to body via call_indirect,
+        // returns body's deadframe pointer.  Host-callable (default_call_conv),
+        // bridging the AppleAarch64/SystemV C ABI to the Tail-conv body.  This
+        // is the only function the host's `run_compiled_code` / iconst-loaded
+        // bridge pointer dispatches to; the body's address is exposed solely
+        // via `LoopTargetDescr.ll_loop_code` for in-code closing_jump.
+        let mut wrapper_func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, entry_id.as_u32()),
+            wrapper_sig.clone(),
+        );
+        {
+            let mut wrapper_ctx =
+                std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
+            let mut wb = FunctionBuilder::new(&mut wrapper_func, &mut wrapper_ctx);
+            let eb = wb.create_block();
+            wb.append_block_params_for_function_params(eb);
+            wb.switch_to_block(eb);
+            wb.seal_block(eb);
+            let jf_ptr_in = wb.block_params(eb)[0];
+            let body_ref = self.module.declare_func_in_func(func_id, wb.func);
+            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in]);
+            let ret = wb.inst_results(call_inst)[0];
+            wb.ins().return_(&[ret]);
+            wb.finalize();
+            self.func_ctx = wrapper_ctx;
+        }
+        let mut wrapper_compile_ctx = Context::for_function(wrapper_func);
+        if let Err(e) = self.module.define_function(entry_id, &mut wrapper_compile_ctx) {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit][clif-error] wrapper {e}\nCLIF IR:\n{}",
+                    wrapper_compile_ctx.func.display()
+                );
+            }
+            self.module.clear_context(&mut wrapper_compile_ctx);
+            return Err(BackendError::CompilationFailed(format!(
+                "wrapper: {e}\n{e:?}"
+            )));
+        }
+        self.module.clear_context(&mut wrapper_compile_ctx);
+
         self.module.finalize_definitions().unwrap();
 
-        let code_ptr = self.module.get_finalized_function(func_id);
+        let body_ptr = self.module.get_finalized_function(func_id);
+        let code_ptr = self.module.get_finalized_function(entry_id);
         if std::env::var_os("MAJIT_LOG").is_some() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
@@ -12829,8 +12892,8 @@ impl CraneliftBackend {
                 })
                 .collect();
             eprintln!(
-                "[jit][compile-loop] trace_id={} header_pc={} code_ptr={:p} fail_descrs={:?}",
-                trace_id, header_pc, code_ptr, fail_descr_preview
+                "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} fail_descrs={:?}",
+                trace_id, header_pc, code_ptr, body_ptr, fail_descr_preview
             );
         }
 
@@ -12872,6 +12935,11 @@ impl CraneliftBackend {
         // function's code_ptr for every Label in this function — re-entry
         // re-runs the preamble. PyPy's raw JMP would skip preamble; for
         // pyre's loops the preamble is just inputarg decoding (idempotent).
+        //
+        // ll_loop_code targets the body (Tail conv) directly so in-code
+        // dispatch can `return_call_indirect` between bodies without the
+        // host-ABI wrapper frame.  Host-loop dispatch (cur_code_ptr) uses
+        // `code_ptr` = wrapper entry (default_call_conv).
         let entry: LoopTargetEntry = LoopTargetEntry {
             code_ptr,
             fail_descrs: fail_descrs.clone(),
@@ -12885,7 +12953,7 @@ impl CraneliftBackend {
             }
             if let Some(descr_ref) = op.descr.as_ref() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
-                    target.set_ll_loop_code(code_ptr as usize);
+                    target.set_ll_loop_code(body_ptr as usize);
                 }
                 register_loop_target(descr_ref, entry.clone());
             }
