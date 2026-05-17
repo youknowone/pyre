@@ -7099,17 +7099,27 @@ impl CodeWriter {
                                 duplicated
                             );
                         } else {
-                            // COPY(d>1): duplicates stack[d] onto TOS. Net: +1.
-                            // assemble.py:1482.
-                            let stack_len = current_state.stack.len();
-                            let duplicated = if d > 0 && d <= stack_len {
-                                current_state.stack[stack_len - d].clone()
-                            } else {
-                                fresh_ref_value(&mut graph)
-                            };
-                            current_state.stack.push(duplicated);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            // CPython COPY n (n>1): pushes PEEK(n) where
+                            // PEEK(1)=TOS.  Source value is
+                            // `stack[len-n]`; source register is
+                            // `stack_base + current_depth - n`.  Generated
+                            // by `Python/compile.c` for try-except cleanup
+                            // handlers (L9 reraise shape) to duplicate the
+                            // pushed exception before POP_EXCEPT clears
+                            // the saved state.  `emit_pushvalue_ref!`
+                            // increments `current_depth` internally;
+                            // explicit `current_depth += 1` is unnecessary.
+                            let stack_idx =
+                                current_state.stack.len().saturating_sub(d);
+                            let src_value = current_state
+                                .stack
+                                .get(stack_idx)
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            current_state.stack.push(src_value.clone());
+                            let src_reg =
+                                stack_base + current_depth.saturating_sub(d as u16);
+                            emit_pushvalue_ref!(current_depth, src_reg, src_value);
                         }
                     }
 
