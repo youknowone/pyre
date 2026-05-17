@@ -16,7 +16,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 // BRIDGE_CACHES_TABLE removed (Slice JJ): the per-descr
 // `Box<AtomicUsize>` cells for bridge code_ptr / frame_depth now live
@@ -81,23 +81,10 @@ use std::sync::{Mutex, OnceLock};
 // CraneliftFailDescr; PyPy recovers equivalent state from
 // `cpu.asmmemmgr_blocks` + `compiled_loop_token`.
 
-/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
-/// `Arc::as_ptr` address to its external-JUMP target `DescrRef`.
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
-/// carry `is_external_jump` / `target_descr` slots; upstream
-/// `assembler.py:2456-2462 closing_jump` emits a raw inter-function
-/// JMP to `target_token._ll_loop_code`.  Cranelift can't emit raw
-/// inter-function JMPs, so the exit returns to the dispatcher which
-/// reads the target descr to re-enter via the registered
-/// `JitCellToken.number → RegisteredLoopTarget` metadata.  Pyre
-/// keeps the per-descr target as a backend-static side-table entry
-/// keyed on `Arc::as_ptr(&descr)`.  Membership in the table is the
-/// canonical `is_external_jump` predicate.
-// EXTERNAL_JUMP_TARGETS removed (Slice GG): write-once after
-// construction (no in-place mutation after `set_external_jump_target`).
-// Lives in `external_jump_target_cell: OnceLock<DescrRef>` on
-// CraneliftFailDescr.  PyPy emits a raw inter-function JMP at
+// EXTERNAL_JUMP_TARGETS removed (Slice GG → Slice 7-Tβ8).  Lives in
+// `ResumeGuardDescr::external_jump_target: OnceLock<DescrRef>` on
+// the meta-side Arc, reached via `as_any` downcast on `meta_descr`.
+// PyPy emits a raw inter-function JMP at
 // `assembler.py:2456-2462 closing_jump`; cranelift's dispatcher
 // returns to the runtime and consults this cell.
 
@@ -333,22 +320,12 @@ pub struct CraneliftFailDescr {
     // meta Arc is the canonical home, reached via `as_any` downcast
     // on `meta_descr`.  Cranelift accessors `set_trace_info` /
     // `trace_info_ref` forward through that chain.
-    /// Per-descr external-JUMP target cell.  PyPy's
-    /// `assembler.py:2456-2462 closing_jump` emits a raw inter-
-    /// function JMP to `target_token._ll_loop_code`; cranelift cannot
-    /// emit raw inter-function JMPs, so the exit returns to the
-    /// dispatcher which reads the target descr here and re-enters via
-    /// the registered `JitCellToken.number -> RegisteredLoopTarget`.
-    ///
-    /// Moved here from `EXTERNAL_JUMP_TARGETS` (Slice GG) for the same
-    /// reason as `recovery_layout_cell` (Slice EE).  Membership in the
-    /// cell (== `OnceLock.get().is_some()`) is the canonical
-    /// `is_external_jump` predicate.
-    ///
-    /// Write-once: set by `CraneliftFailDescr::set_external_jump_target`
-    /// at codegen finalisation.  `OnceLock` is the right primitive —
-    /// the target is immutable for the descr's lifetime.
-    pub external_jump_target_cell: OnceLock<DescrRef>,
+    // external_jump_target_cell moved to ResumeGuardDescr (Slice
+    // 7-Tβ8): the meta Arc is the canonical home, reached via
+    // `as_any` downcast on `meta_descr`.  Cranelift accessors
+    // `set_external_jump_target` / `external_jump_target_ref` and
+    // the `is_external_jump()` predicate now forward through that
+    // chain.
     // source_op_index_cell moved to ResumeGuardDescr (Slice 7-Tβ6):
     // the meta Arc is the canonical home, reached via `as_any`
     // downcast on `meta_descr` (precedent: Slice OO-half for
@@ -388,8 +365,8 @@ impl Drop for CraneliftFailDescr {
     /// this path on the same thread; the swap-to-null sequence is
     /// reentrant (each descr touches only its own cell).
     fn drop(&mut self) {
-        // external_jump_target_cell is descr-local (Slice GG): drops
-        // naturally with self.
+        // external_jump_target moved to ResumeGuardDescr meta-side
+        // slot (Slice 7-Tβ8); no backend-local cell to reclaim.
         // fail_count is descr-local (Slice DD): drops naturally with self.
         // trace_info_cell moved to ResumeGuardDescr meta-side slot
         // (Slice 7-Tβ10); reclaim is owned by ResumeGuardDescr::drop.
@@ -487,7 +464,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         }
@@ -511,7 +487,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         }
@@ -664,24 +639,38 @@ impl CraneliftFailDescr {
             .store(code_ptr, Ordering::Release);
     }
 
-    /// Descr-local write-once cell (Slice GG).  Publishes the
-    /// external-JUMP target descr into the `OnceLock`.  Replaces the
-    /// previous backend-static `EXTERNAL_JUMP_TARGETS` insert.
-    /// Idempotent on equal targets; panics on a conflicting re-set
-    /// (caller bug — `closing_jump` resolves once at codegen).
+    /// Forward the external-JUMP target publish to the meta-side
+    /// `ResumeGuardDescr::set_external_jump_target` slot (Slice 7-Tβ8).
+    /// Panics when `meta_descr` is absent or is not a
+    /// `ResumeGuardDescr` — the caller must have stamped a synthetic
+    /// `ResumeGuardDescr` meta on cross-loop JUMP descrs before
+    /// invoking this (see `_compile_one_block` in compiler.rs which
+    /// uses `make_resume_guard_descr_typed` for the external-JUMP
+    /// path post Slice 7-Tβ7).
     pub fn set_external_jump_target(&self, target: DescrRef) {
-        self.external_jump_target_cell
-            .set(target)
-            .expect("external_jump_target_cell already published");
+        let rgd = self
+            .meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .expect(
+                "set_external_jump_target requires a ResumeGuardDescr meta_descr; \
+                 cross-loop JUMP descrs synthesise one in _compile_one_block",
+            );
+        rgd.set_external_jump_target(target);
     }
 
     #[inline]
-    /// Descr-local read (Slice GG).  Returns the published external-
-    /// JUMP target, or `None` for descrs that are not external-JUMP
-    /// exits.  Membership = the previous `is_external_jump: true`
-    /// predicate.
+    /// Read the external-JUMP target from the meta-side
+    /// `ResumeGuardDescr::external_jump_target` slot (Slice 7-Tβ8).
+    /// Returns `None` for descrs without a `ResumeGuardDescr` meta
+    /// AND for regular guard descrs (the common case).
     pub fn external_jump_target_ref(&self) -> Option<DescrRef> {
-        self.external_jump_target_cell.get().cloned()
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .and_then(|rgd| rgd.external_jump_target())
     }
 
     /// Write recovery_layout to the meta-side `ResumeGuardDescr` slot
@@ -944,7 +933,13 @@ impl majit_ir::Descr for CraneliftFailDescr {
     /// cranelift's external-JUMP descrs are backend-only synthetic
     /// objects with no metainterp counterpart.
     fn is_resume_guard(&self) -> bool {
-        if self.external_jump_target_cell.get().is_some() {
+        // Slice 7-Tβ8: external-JUMP cell now lives on the meta-side
+        // `ResumeGuardDescr`.  Synthetic cross-loop JUMP descrs carry
+        // a `ResumeGuardDescr` meta solely to host the
+        // `external_jump_target` slot — `is_resume_guard()` must
+        // still return false for them so the backend's role reading
+        // does not flip.
+        if self.external_jump_target_ref().is_some() {
             return false;
         }
         // `compile.py:185` `isinstance(descr, ResumeDescr)` — answered by
@@ -1021,11 +1016,12 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_external_jump(&self) -> bool {
         // Backend-only flag, no metainterp counterpart — external-JUMP
-        // descrs are synthesized at the cranelift backend for
-        // cross-loop JUMP targets and have meta_descr == None.  Slice
-        // GG moved the per-descr target to `external_jump_target_cell`;
-        // cell membership is the canonical predicate.
-        self.external_jump_target_cell.get().is_some()
+        // descrs are cranelift-only synthesised exits for cross-loop
+        // JUMP targets.  Slice 7-Tβ8 moved the cell to the meta-side
+        // `ResumeGuardDescr::external_jump_target` slot reached via
+        // `as_any` downcast on `meta_descr`; cell membership is still
+        // the canonical predicate.
+        self.external_jump_target_ref().is_some()
     }
 
     fn target_descr(&self) -> Option<DescrRef> {

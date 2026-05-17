@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use majit_ir::{
@@ -173,6 +173,21 @@ pub struct ResumeGuardDescr {
     /// Null on construction.  Written via
     /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
     pub trace_info: AtomicPtr<CompiledTraceInfo>,
+    /// Per-descr external-JUMP target cell (Slice 7-Tβ8 / cranelift-
+    /// only NEW DEVIATION).  PyPy's `assembler.py:2456-2462 closing_jump`
+    /// emits a raw inter-function JMP to `target_token._ll_loop_code`
+    /// at codegen time, so no per-descr slot exists upstream.  Cranelift
+    /// IR cannot emit raw inter-function JMPs, so cross-loop JUMP descrs
+    /// park the target `DescrRef` here; the dispatcher reads it and re-
+    /// enters the target loop via the registered
+    /// `JitCellToken.number -> RegisteredLoopTarget` metadata.
+    /// Membership (`OnceLock.get().is_some()`) is the canonical
+    /// `is_external_jump` predicate.
+    ///
+    /// Write-once: set at codegen finalisation.  Migrated here from
+    /// `CraneliftFailDescr::external_jump_target_cell` so the meta Arc
+    /// is the single source of truth (Slice 7-Tβ8).
+    pub external_jump_target: OnceLock<DescrRef>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -214,6 +229,7 @@ impl Descr for ResumeGuardDescr {
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
+            external_jump_target: OnceLock::new(),
         }))
     }
 }
@@ -370,6 +386,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
+        external_jump_target: OnceLock::new(),
     })
 }
 
@@ -472,6 +489,29 @@ impl ResumeGuardDescr {
                 Some((*arc).clone())
             }
         }
+    }
+
+    /// Publish the external-JUMP target (Slice 7-Tβ8).  Write-once;
+    /// panics if invoked twice on the same descr (mirrors PyPy's
+    /// `assembler.py:2456-2462 closing_jump` codegen-time finality —
+    /// the target is determined at trace emission and never revised).
+    pub fn set_external_jump_target(&self, target: DescrRef) {
+        self.external_jump_target
+            .set(target)
+            .expect("external_jump_target already published");
+    }
+
+    /// Read the external-JUMP target (Slice 7-Tβ8).  `None` for
+    /// regular guard descrs (the common case); `Some` only for the
+    /// cranelift-synthesised cross-loop JUMP descrs.
+    pub fn external_jump_target(&self) -> Option<DescrRef> {
+        self.external_jump_target.get().cloned()
+    }
+
+    /// Predicate (`is_external_jump` parity) — membership in the
+    /// external-JUMP target cell (Slice 7-Tβ8).
+    pub fn is_external_jump(&self) -> bool {
+        self.external_jump_target.get().is_some()
     }
 }
 

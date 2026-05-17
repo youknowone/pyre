@@ -12885,12 +12885,13 @@ fn collect_guards(
         descr.meta_descr = if is_external_jump {
             // op.descr for external JUMP is the TargetToken (already
             // captured in external_jump_target above) — not a FailDescr.
-            // Synthesize a `ResumeGuardDescr` meta so the meta-side slot
-            // for `force_token_slots` (Slice 7-Tβ7) is reachable; the
-            // TargetToken stays in `external_jump_target_cell`, separate
-            // from `meta_descr`.  `is_resume_guard()` still returns false
-            // for external JUMPs (the cell-membership predicate
-            // short-circuits before the meta_descr check).
+            // Synthesize a `ResumeGuardDescr` meta so the meta-side
+            // slots for `force_token_slots` (Slice 7-Tβ7) and
+            // `external_jump_target` (Slice 7-Tβ8) are reachable.
+            // `is_resume_guard()` still returns false for external
+            // JUMPs (the membership predicate via
+            // `external_jump_target_ref` short-circuits before the
+            // meta_descr.is_resume_guard check).
             Some(majit_backend::make_resume_guard_descr_typed(
                 descr.fail_arg_types.clone(),
             ))
