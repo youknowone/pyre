@@ -1099,6 +1099,27 @@ impl FailDescr for CraneliftFailDescr {
         self.force_token_slots_view().to_vec()
     }
 
+    /// Forward through `meta_descr` so external callers reaching the
+    /// per-emission slot via the `FailDescr` trait (e.g. the
+    /// `fail_descr_layout` free function in `compiler.rs`) observe the
+    /// same value the inherent `source_op_index_ref()` returns.
+    /// Without this override the trait default `None` would mask the
+    /// meta-side slot whenever the descr is downcast to `&dyn FailDescr`.
+    fn source_op_index(&self) -> Option<usize> {
+        self.source_op_index_ref()
+    }
+
+    /// Forward through `meta_descr` so the `fail_descr_trace_info` free
+    /// function (compiler.rs) — which reads `trace_info_any` and
+    /// downcasts — observes the value `set_trace_info` published into
+    /// the meta-side per-emission slot.
+    fn trace_info_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.trace_info_any())
+    }
+
     fn vector_info(&self) -> Vec<AccumInfo> {
         // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
         // — the canonical store lives on the metainterp

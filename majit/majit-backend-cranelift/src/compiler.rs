@@ -27,10 +27,10 @@ use majit_backend::{
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
-use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr};
+use majit_gc::{GcAllocator, GcMap, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
-    AccumInfo, CallDescr, Descr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode,
-    OpRef, OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, Descr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex,
+    Op, OpCode, OpRef, OpTypeIndex, Type, Value,
 };
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
@@ -5670,6 +5670,100 @@ impl CompiledLoop {
     }
 }
 
+/// `assembler.py:write_failure_recovery_description` parity —
+/// derive the GC-map classification on demand from `fail_arg_types`
+/// and the per-emission `force_token_slots`.  Slice 7-Tβ14a: lifted
+/// off `CraneliftFailDescr` to take `&dyn FailDescr` so callers can
+/// invoke it on the bare metainterp `DescrRef` after the wrapper is
+/// retired.
+fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
+    let slots = fd.force_token_slots();
+    let mut gc_map = GcMap::new();
+    for (slot, tp) in fd.fail_arg_types().iter().enumerate() {
+        if *tp == Type::Ref && !slots.contains(&slot) {
+            gc_map.set_ref(slot);
+        }
+    }
+    gc_map
+}
+
+/// Read the `recovery_layout` slot reached via downcast to
+/// `ResumeGuardDescr` (Slice OO-half precedent).  Chases
+/// `prev_descr` through `ResumeGuardCopiedDescr` so `compile.py:849
+/// ResumeGuardCopiedDescr.get_resumestorage(): return prev` parity is
+/// preserved.  Slice 7-Tβ14a: lifted off `CraneliftFailDescr` so the
+/// `DescrRef`-keyed `fail_descrs` storage can drive layout
+/// reconstruction directly.  Takes `&DescrRef` (not `&dyn FailDescr`)
+/// because `prev_descr()` returns a fresh Arc handle for the chase
+/// loop.
+fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
+    let mut current: DescrRef = descr.clone();
+    loop {
+        if let Some(rgd) = current
+            .as_any()
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+        {
+            return rgd.recovery_layout();
+        }
+        match current.prev_descr() {
+            Some(next) => current = next,
+            None => return None,
+        }
+    }
+}
+
+/// Read the per-trace `CompiledTraceInfo` from the meta-side
+/// per-emission slot (Slice 7-Tβ10).  Routes through the
+/// `FailDescr::trace_info_any` trait method so copied descrs return
+/// their own published info instead of `None`.
+fn fail_descr_trace_info(fd: &dyn FailDescr) -> Option<CompiledTraceInfo> {
+    let any = fd.trace_info_any()?;
+    let arc = any.downcast::<CompiledTraceInfo>().ok()?;
+    Some((*arc).clone())
+}
+
+/// Build a `FailDescrLayout` for a fail descr without reading the
+/// `fail_index` / `trace_id` from the descr — those identities come
+/// from the per-trace storage position and the surrounding
+/// `CompiledLoop::trace_id`, since FINISH singletons share Arc
+/// identity across emissions (Slice 7-Tβ3 parity with dynasm
+/// `layout_for_fail_descr` at guard.rs:146).
+fn fail_descr_layout(
+    descr: &DescrRef,
+    fail_index: u32,
+    trace_id: u64,
+) -> majit_backend::FailDescrLayout {
+    let fd = descr
+        .as_fail_descr()
+        .expect("fail_descr_layout requires a Descr that exposes the FailDescr trait");
+    let fail_arg_types = fd.fail_arg_types();
+    let gc_map_local = fail_descr_gc_map(fd);
+    let gc_ref_slots = fail_arg_types
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, _)| gc_map_local.is_ref(slot).then_some(slot))
+        .collect();
+    let recovery = fail_descr_recovery_layout(descr);
+    let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
+    majit_backend::FailDescrLayout {
+        fail_index,
+        source_op_index: fd.source_op_index(),
+        trace_id,
+        trace_info: fail_descr_trace_info(fd),
+        fail_arg_types: fail_arg_types.to_vec(),
+        is_finish: fd.is_finish(),
+        is_exception_exit: fd.is_exit_frame_with_exception(),
+        gc_ref_slots,
+        force_token_slots: fd.force_token_slots(),
+        recovery_layout: recovery,
+        frame_stack,
+        rd_numb: fd.rd_numb().map(|s| s.to_vec()),
+        rd_consts: fd.rd_consts().map(|s| s.to_vec()),
+        rd_virtuals: fd.rd_virtuals().map(|s| s.to_vec()),
+        rd_pendingfields: fd.rd_pendingfields().map(|s| s.to_vec()),
+    }
+}
+
 /// Build the per-trace `FailDescrLayout` view for a slice of
 /// `fail_descrs`.  Slice 7-Tβ3: FINISH descrs are now the static
 /// singletons (`DONE_WITH_THIS_FRAME_DESCR_*`,
@@ -5687,10 +5781,8 @@ fn build_per_trace_layouts(
         .iter()
         .enumerate()
         .map(|(position, descr)| {
-            let mut layout = descr.layout();
-            layout.fail_index = position as u32;
-            layout.trace_id = trace_id;
-            layout
+            let descr_ref: DescrRef = descr.clone();
+            fail_descr_layout(&descr_ref, position as u32, trace_id)
         })
         .collect()
 }
@@ -13946,15 +14038,17 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
 
                 let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
+                let fail_descr_ref: DescrRef = fail_descr_arc.clone();
+                let trace_id = fail_descr.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
-                    exit_layout: Some(fail_descr.layout()),
+                    exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
                     force_token_slots: fail_descr.force_token_slots().to_vec(),
                     savedata,
                     exception_value: exception,
                     fail_index,
-                    trace_id: fail_descr.trace_id(),
+                    trace_id,
                     is_finish: true,
                     is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
                     status: fail_descr.get_status(),
@@ -14001,15 +14095,17 @@ impl majit_backend::Backend for CraneliftBackend {
             }
 
             let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
+            let fail_descr_ref: DescrRef = fail_descr_arc.clone();
+            let trace_id = fail_descr.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
-                exit_layout: Some(fail_descr.layout()),
+                exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
                 force_token_slots: fail_descr.force_token_slots().to_vec(),
                 savedata,
                 exception_value: exception,
                 fail_index,
-                trace_id: fail_descr.trace_id(),
+                trace_id,
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
                 status: fail_descr.get_status(),
