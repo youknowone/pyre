@@ -4753,12 +4753,20 @@ impl CodeWriter {
             ($dst:expr, $src:expr) => {{
                 let dst = $dst;
                 let src = $src;
-                let insn = Insn::op_with_result(
-                    "ref_copy",
-                    vec![Operand::reg(Kind::Ref, src)],
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
+                // Identity copies are dead: same reg on both sides is a
+                // no-op at runtime (no register file mutation) and at
+                // regalloc time (no new SSA def).  Skipping them lets
+                // callers freely route a value's producer directly into
+                // its stack-slot register without inserting a redundant
+                // `ref_copy` byte.
+                if dst != src {
+                    let insn = Insn::op_with_result(
+                        "ref_copy",
+                        vec![Operand::reg(Kind::Ref, src)],
+                        Register::new(Kind::Ref, dst),
+                    );
+                    push_walker_emit(&current_block, insn);
+                }
             }};
         }
 
