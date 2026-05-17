@@ -5657,17 +5657,20 @@ fn emit_attached_loop_dispatch(
     target_sig.params.push(AbiParam::new(ptr_type));
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
-    // `assembler.py:2456-2462 closing_jump` emits a raw inter-function
-    // `JMP imm(target)` — a tail call.  Cranelift exposes the same
-    // semantics via `return_call_indirect`, which replaces the current
-    // frame with the callee's instead of pushing a return address.  A
-    // regular `call_indirect` + `return` would push one frame per
-    // iteration; benchmark traces like fannkuch close-jump tens of
-    // millions of times per run and would exhaust the OS thread stack
-    // within seconds.
-    builder
+    // Investigation note (Slice X2-step4 attempt): a true `JMP
+    // imm(target)` tail call requires both functions to use
+    // `isa::CallConv::Tail`; switching the outer signature broke host
+    // callers (Tail clobbers AppleAarch64 callee-saves), so we use a
+    // regular `call_indirect + return` here while the trampoline-body
+    // split is designed.  Self-jump traces would push one frame per
+    // iteration — bench `raise_catch_loop` (~1M iters) tolerates this;
+    // `fannkuch` (~32M JUMP fires) is the canary that exposes the
+    // overflow.
+    let target_call = builder
         .ins()
-        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
+        .call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
+    let result_jf = builder.inst_results(target_call)[0];
+    builder.ins().return_(&[result_jf]);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -5757,22 +5760,19 @@ fn emit_guard_exit(
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
 
-    // Scaffolding for upcoming in-code `closing_jump` (Slice X2-step4):
-    // `info.external_jump_ll_loop_code_addr` carries the heap-stable
-    // address of the target `LoopTargetDescr.ll_loop_code` slot so a
-    // `return_call_indirect` (tail call) can re-enter the target loop
-    // without growing the host stack.  Wiring the dispatch in requires:
-    // (a) routing all JIT functions through `CallConv::Tail` so the
-    //     caller/callee signatures match cranelift's tail-call ABI
-    //     (`isa::CallConv::Tail`), and
-    // (b) target_argloc remapping — pyre's
-    //     `LoopTargetDescr.ll_loop_code` points at the function entry
-    //     (which runs the preamble reading inputs from positions 0..N
-    //     using the preamble's argloc layout), not at the loop body
-    //     label PyPy targets directly (peeled-loop traces have distinct
-    //     body input positions).  An attempt without (b) hung fannkuch
-    //     because the body label's input argloc layout did not match
-    //     the preamble's, so re-entry corrupted loop induction state.
+    // Slice X2-step4 dispatch is gated off until per-target argloc
+    // matching is in place.  `info.external_jump_ll_loop_code_addr`
+    // would let us tail-call the target loop's entry point, but pyre's
+    // `LoopTargetDescr.ll_loop_code` points at the function entry — its
+    // preamble decodes inputs from positions 0..preamble_arity, while
+    // a JUMP from a peeled-loop body exits with body_arity outputs at
+    // positions 0..body_arity.  Empirical: enabling the dispatch with
+    // either `call_indirect + return` or `return_call_indirect`
+    // produces RecursionError on raise_catch_loop and indefinite loops
+    // on fannkuch/nbody (the latter allocates ~26MB/s suggesting the
+    // re-entered loop spins on stale induction state).  Subsequent
+    // slices (#114, #113) add the runtime arity gate + tail-call
+    // infrastructure before re-enabling.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
