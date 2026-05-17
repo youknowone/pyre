@@ -3730,6 +3730,31 @@ pub struct ResumeGuardCopiedDescr {
     /// loop-token-equivalent metadata onto each emitted descr
     /// individually; the cell is reclaimed in `Drop`.
     trace_info: std::sync::atomic::AtomicPtr<CompiledTraceInfo>,
+    /// Pyre-only per-emission cranelift bridge code-pointer cache.
+    /// `Box` heap-pins the `AtomicUsize` so its address survives
+    /// `Arc::clone` of the meta descr and can be baked into cranelift's
+    /// `emit_attached_bridge_dispatch` as an immediate.  Per-emission
+    /// because each copied descr can have its own bridge attached
+    /// (compile.py:701-717 `handle_fail` applies to both
+    /// ResumeGuardDescr and ResumeGuardCopiedDescr).  `0` means no
+    /// bridge attached.
+    bridge_code_ptr_cache: Box<std::sync::atomic::AtomicUsize>,
+    /// Pyre-only per-emission cranelift bridge frame-depth cache.
+    /// Same shape as `bridge_code_ptr_cache`; baked into the dispatch
+    /// path so the runtime verifies the JIT frame can fit the
+    /// bridge inputs before re-entering.
+    bridge_frame_depth_cache: Box<std::sync::atomic::AtomicUsize>,
+    /// Pyre-only per-emission cranelift bridge dispatch cell.
+    /// Type-erased to `*mut ()` because `BridgeData` lives in
+    /// `majit-backend-cranelift` (downstream); the cleanup function
+    /// registered via `bridge_dispatch_swap` knows the concrete type.
+    /// Reclaimed in `Drop`.
+    bridge_dispatch_cell: std::sync::atomic::AtomicPtr<()>,
+    /// Pyre-only per-emission cranelift bridge dispatch cleanup fn.
+    /// Registered by the backend on first `bridge_dispatch_swap`;
+    /// invoked by `Drop` on the surviving payload to reclaim the
+    /// published `Arc<BridgeData>` without knowing its concrete type.
+    bridge_dispatch_drop_fn: std::sync::OnceLock<fn(*mut ())>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3749,6 +3774,19 @@ impl Drop for ResumeGuardCopiedDescr {
             // Safety: produced by `Arc::into_raw(Arc::new(info))` in
             // `set_trace_info_any`.
             unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
+        }
+        // Reclaim any published bridge dispatch payload via the
+        // backend-registered cleanup function (mirrors
+        // `ResumeGuardDescr::drop` Slice 7-Tβ12 logic).
+        let bridge_ptr = self
+            .bridge_dispatch_cell
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !bridge_ptr.is_null() {
+            if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
+                drop_fn(bridge_ptr);
+            }
+            // else: payload published with no cleanup registered — a
+            // backend bug.  Leaks rather than risking the wrong type.
         }
     }
 }
@@ -3804,6 +3842,10 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -4025,6 +4067,30 @@ impl FailDescr for ResumeGuardCopiedDescr {
             unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
         }
     }
+    /// Per-emission cranelift bridge cells (see field comments).
+    /// Same shape and JIT-bake contract as `ResumeGuardDescr`.
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        Some((
+            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
+            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+        ))
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        self.bridge_frame_depth_cache
+            .store(frame_depth, Ordering::Release);
+        self.bridge_code_ptr_cache
+            .store(code_ptr, Ordering::Release);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        self.bridge_dispatch_cell.load(Ordering::Acquire)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -4074,6 +4140,10 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 force_token_slots: UnsafeCell::new(Vec::new()),
                 fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+                bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+                bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
             },
         }))
     }
@@ -4206,6 +4276,21 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
         self.inner.set_trace_info_any(info);
     }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        self.inner.bridge_cache_addrs()
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        self.inner.bridge_code_ptr()
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        self.inner.store_bridge_caches(code_ptr, frame_depth);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        self.inner.bridge_dispatch_load()
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        self.inner.bridge_dispatch_swap(new_ptr, drop_fn)
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4249,6 +4334,10 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+        bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+        bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
     })
 }
 
@@ -4284,6 +4373,10 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
         },
     })
 }

@@ -458,6 +458,28 @@ impl FailDescr for ResumeGuardDescr {
             unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
         }
     }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        Some((
+            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
+            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+        ))
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        self.bridge_frame_depth_cache
+            .store(frame_depth, Ordering::Release);
+        self.bridge_code_ptr_cache
+            .store(code_ptr, Ordering::Release);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        self.bridge_dispatch_cell.load(Ordering::Acquire)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr

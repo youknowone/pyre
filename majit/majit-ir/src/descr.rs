@@ -1889,6 +1889,45 @@ pub trait FailDescr: Descr {
     /// carry trace info (singletons / synthetic FINISH).
     fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {}
 
+    /// Pyre-only cranelift bridge-attach cell addresses.  Returns
+    /// `(code_ptr_addr, frame_depth_addr)` — heap-pinned `usize`
+    /// addresses cranelift's `emit_attached_bridge_dispatch` bakes
+    /// into machine code as immediates.  Per-emission: each emitted
+    /// descr (including `ResumeGuardCopiedDescr`) can have a bridge
+    /// attached, so the cell addresses must be distinct per emission.
+    /// Default `None` for descrs that never carry bridges (singletons
+    /// / synthetic FINISH).
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Pyre-only cranelift bridge code-pointer read.  Returns 0 when
+    /// no bridge is attached.  Per-emission classification (see
+    /// `bridge_cache_addrs`).
+    fn bridge_code_ptr(&self) -> usize {
+        0
+    }
+
+    /// Pyre-only cranelift bridge cache publish.  Atomic-stores
+    /// `(code_ptr, frame_depth)` into the cells whose addresses
+    /// `bridge_cache_addrs` reported.  Default no-op.
+    fn store_bridge_caches(&self, _code_ptr: usize, _frame_depth: usize) {}
+
+    /// Pyre-only cranelift bridge dispatch payload read (type-erased
+    /// raw pointer, backend re-Arcs via `Arc::from_raw`).  Null when
+    /// no bridge has been attached.  Default null.
+    fn bridge_dispatch_load(&self) -> *mut () {
+        std::ptr::null_mut()
+    }
+
+    /// Pyre-only cranelift bridge dispatch payload publish.  Atomic-
+    /// swaps `new_ptr` in and registers `drop_fn` for cleanup at
+    /// descr teardown.  Returns the previous payload so the caller
+    /// can reclaim.  Default returns null (no slot).
+    fn bridge_dispatch_swap(&self, _new_ptr: *mut (), _drop_fn: fn(*mut ())) -> *mut () {
+        std::ptr::null_mut()
+    }
+
     /// Pyre-only per-emission slot: index of the trace op that produced
     /// this guard at codegen.  Classified per-emission alongside
     /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /

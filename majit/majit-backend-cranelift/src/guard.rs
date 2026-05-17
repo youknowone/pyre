@@ -489,8 +489,8 @@ impl CraneliftFailDescr {
     /// bridges.
     #[inline]
     pub fn bridge_ref(&self) -> Option<Arc<BridgeData>> {
-        let rgd = self.meta_resume_guard_descr()?;
-        let ptr = rgd.bridge_dispatch_load();
+        let fd = self.meta_fail_descr()?;
+        let ptr = fd.bridge_dispatch_load();
         if ptr.is_null() {
             None
         } else {
@@ -576,38 +576,37 @@ impl CraneliftFailDescr {
             .map_or(0, |fd| fd.fail_count())
     }
 
-    /// Forward to the meta-side `ResumeGuardDescr::bridge_code_ptr`
-    /// slot (Slice 7-Tβ11) — whether a bridge has been attached.
-    /// Returns `false` when no `ResumeGuardDescr` meta is present
-    /// (singletons, cross-loop JUMP test scaffolds outside the
-    /// production codepath).
+    /// Forward to the meta-side per-emission `bridge_code_ptr` slot
+    /// (Slice 7-Tβ11) — whether a bridge has been attached.  Routes
+    /// through the `FailDescr` trait so copied descrs are correctly
+    /// queried.  Returns `false` when the trait default applies
+    /// (singletons, cross-loop JUMP test scaffolds).
     pub fn has_bridge(&self) -> bool {
-        self.meta_resume_guard_descr()
-            .is_some_and(|rgd| rgd.bridge_code_ptr() != 0)
+        self.meta_fail_descr()
+            .is_some_and(|fd| fd.bridge_code_ptr() != 0)
     }
 
-    /// Forward to the meta-side `ResumeGuardDescr::bridge_code_ptr`
-    /// slot (Slice 7-Tβ11).  Returns null when no `ResumeGuardDescr`
-    /// meta is present.
+    /// Forward to the meta-side per-emission `bridge_code_ptr` slot
+    /// (Slice 7-Tβ11).  Returns null when no slot is present.
     pub fn bridge_code_ptr(&self) -> *const u8 {
-        self.meta_resume_guard_descr()
-            .map_or(std::ptr::null(), |rgd| rgd.bridge_code_ptr() as *const u8)
+        self.meta_fail_descr()
+            .map_or(std::ptr::null(), |fd| fd.bridge_code_ptr() as *const u8)
     }
 
     /// Forward to the meta-side cell addresses (Slice 7-Tβ11),
     /// suitable for baking into JIT machine code as immediates.
     /// Returns `(code_ptr_addr, frame_depth_addr)`.  Panics when no
-    /// `ResumeGuardDescr` meta is present — all guards that reach
+    /// `FailDescr` meta carries the slot — all guards that reach
     /// `emit_attached_bridge_dispatch` carry one (real `op.descr` or
     /// the test-scaffold synthesis at compiler.rs:12884).
     pub fn bridge_cache_addrs(&self) -> (usize, usize) {
-        self.meta_resume_guard_descr()
+        self.meta_fail_descr()
+            .and_then(|fd| fd.bridge_cache_addrs())
             .expect(
-                "bridge_cache_addrs requires a ResumeGuardDescr meta_descr; \
-                 all bridgeable guards carry one (op.descr or synthesised at \
-                 compiler.rs:12884)",
+                "bridge_cache_addrs requires a FailDescr meta_descr carrying \
+                 the per-emission bridge slot; all bridgeable guards carry \
+                 one (op.descr or synthesised at compiler.rs:12884)",
             )
-            .bridge_cache_addrs()
     }
 
     /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
@@ -615,9 +614,10 @@ impl CraneliftFailDescr {
     /// meta-side dispatch cell (Slice 7-Tβ12), and publish
     /// `(code_ptr, frame_depth)` into the meta-side cache cells
     /// (Slice 7-Tβ11) that `emit_attached_bridge_dispatch` baked
-    /// addresses for.  Registers the backend-side cleanup function
-    /// (idempotent) so `ResumeGuardDescr::drop` can reclaim the
-    /// published `Arc<BridgeData>` without knowing its concrete type.
+    /// addresses for.  Routes through the `FailDescr` trait so
+    /// copied descrs receive their own bridge (PyPy parity:
+    /// `compile.py:701-717 handle_fail` and `compile_and_attach`
+    /// apply to both `ResumeGuardDescr` and `ResumeGuardCopiedDescr`).
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
         let frame_depth = bridge
@@ -625,23 +625,23 @@ impl CraneliftFailDescr {
             .max(bridge.num_inputs)
             .max(1)
             .saturating_add(bridge.num_ref_roots);
-        let rgd = self.meta_resume_guard_descr().expect(
-            "attach_bridge requires a ResumeGuardDescr meta_descr; \
-             all bridgeable guards carry one (op.descr or synthesised at \
-             compiler.rs:12884)",
+        let fd = self.meta_fail_descr().expect(
+            "attach_bridge requires a FailDescr meta_descr carrying the \
+             per-emission bridge slot; all bridgeable guards carry one \
+             (op.descr or synthesised at compiler.rs:12884)",
         );
         // `Arc::into_raw(Arc::new(bridge))` publishes the bridge data
         // as a raw pointer the dispatch path can re-Arc via
         // `increment_strong_count + Arc::from_raw`.  Swap atomically so
         // a re-attach (unusual) reclaims the previous Arc.
-        let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut () as *mut ();
-        let old_ptr = rgd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
+        let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut ();
+        let old_ptr = fd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
         if !old_ptr.is_null() {
             // Safety: prior `attach_bridge` published this pointer;
             // reclaim ownership and drop.
             unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
         }
-        rgd.store_bridge_caches(code_ptr, frame_depth);
+        fd.store_bridge_caches(code_ptr, frame_depth);
     }
 
     /// Forward the external-JUMP target publish to the meta-side
@@ -851,6 +851,16 @@ impl CraneliftFailDescr {
             .as_ref()
             .and_then(|d| d.as_any())
             .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+    }
+
+    /// Bridge-cell / per-emission accessors dispatch through the
+    /// `FailDescr` trait so `ResumeGuardDescr` and
+    /// `ResumeGuardCopiedDescr` are both reached without downcasting
+    /// to a concrete type (the latter lives in `majit-metainterp`,
+    /// downstream from this crate).
+    #[inline]
+    fn meta_fail_descr(&self) -> Option<&dyn FailDescr> {
+        self.meta_descr.as_ref().and_then(|d| d.as_fail_descr())
     }
 
     pub fn layout(&self) -> FailDescrLayout {
