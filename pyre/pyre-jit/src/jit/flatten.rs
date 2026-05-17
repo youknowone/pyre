@@ -1220,6 +1220,20 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// Per-link counterpart to `block_names` for `Label(link)` /
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
+    /// Pyre-only side table mapping graph blocks to their Python PC.
+    /// When non-empty, `make_bytecode_block` emits an `Insn::PcAnchor
+    /// { py_pc }` immediately after the block-entry `Label` for blocks
+    /// present in this table, matching the walker's per-PC anchor
+    /// emission in `codewriter.rs::emit_mark_label_pc!`.  This makes
+    /// the canonical driver's output runtime-compatible with pyre's
+    /// `pc_anchor_positions` / `live_marker_indices_by_pc` lookups
+    /// without requiring runtime refactor.  Upstream RPython has no
+    /// per-PC anchor concept (RPython's runtime dispatch keys off the
+    /// recorded SpamBlock identity, not Python PC), so this is a pyre
+    /// adaptation layer.  Pre-seeded by the bridge entry
+    /// `flatten_graph_with_walker_slots`; empty for plain
+    /// `flatten_graph` test fixtures.
+    block_py_pcs: Vec<(BlockRef, usize)>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1260,6 +1274,7 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1285,6 +1300,7 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1315,6 +1331,7 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
+            block_py_pcs: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -2179,6 +2196,18 @@ where
         self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
+        // Pyre adaptation: emit `Insn::PcAnchor { py_pc }` immediately
+        // after the block-entry Label when the bridge entry
+        // (`flatten_graph_with_walker_slots`) pre-seeded a py_pc for
+        // this block.  Matches walker's per-PC anchor emission in
+        // `codewriter.rs::emit_mark_label_pc!` so canonical's output
+        // is consumable by the runtime's `pc_anchor_positions` /
+        // `live_marker_indices_by_pc` lookups without requiring a
+        // runtime refactor.  Upstream RPython has no per-PC anchor
+        // concept; this is a pyre-only extension.
+        if let Some((_, py_pc)) = self.block_py_pcs.iter().find(|(b, _)| b == &block) {
+            self.emitline(Insn::pc_anchor(*py_pc));
+        }
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
@@ -2556,7 +2585,16 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    flatten_graph_with_walker_slots(graph, regallocs, &[], &[], &[], include_all_exc_links, cpu)
+    flatten_graph_with_walker_slots(
+        graph,
+        regallocs,
+        &[],
+        &[],
+        &[],
+        &[],
+        include_all_exc_links,
+        cpu,
+    )
 }
 
 /// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
@@ -2585,6 +2623,7 @@ pub fn flatten_graph_with_walker_slots<'a>(
     walker_slot_for_variable: &'a [Option<u16>],
     block_name_overrides: &[(super::flow::BlockRef, String)],
     link_name_overrides: &[(super::flow::LinkRef, String)],
+    block_py_pc_overrides: &[(super::flow::BlockRef, usize)],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2664,6 +2703,16 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // are filtered by `count_real_ops` (Label is scaffold).
     for (link, name) in link_name_overrides {
         flattener.link_names.push((link.clone(), name.clone()));
+    }
+    // Task #50 T6 epic slice 4b — pre-seed block_py_pcs so
+    // `make_bytecode_block` emits `Insn::PcAnchor { py_pc }` after
+    // each block's Label, matching walker's per-PC anchor.  Makes
+    // canonical's SSARepr stream runtime-compatible with pyre's
+    // `pc_anchor_positions` lookup — necessary precondition for the
+    // Phase 4 production splice.  Upstream RPython has no per-PC
+    // anchor; this is a pyre adaptation layer.
+    for (block, py_pc) in block_py_pc_overrides {
+        flattener.block_py_pcs.push((block.clone(), *py_pc));
     }
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);

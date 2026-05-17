@@ -8381,12 +8381,28 @@ impl CodeWriter {
                     }
                 }
             }
+            // Task #50 T6 epic slice 4b — derive `(BlockRef, py_pc)`
+            // pairs so canonical emits `Insn::PcAnchor { py_pc }` after
+            // each block-entry Label, matching walker's per-PC anchor
+            // shape.  Source: SpamBlock.framestate().next_offset (same
+            // as block_name_overrides above).  Necessary precondition
+            // for the Phase 4 production splice: with PcAnchor present,
+            // canonical's SSARepr is runtime-compatible with pyre's
+            // `pc_anchor_positions` / `live_marker_indices_by_pc`
+            // lookups.
+            let mut block_py_pc_overrides: Vec<(super::flow::BlockRef, usize)> = Vec::new();
+            for spam in &all_walker_blocks {
+                if let Some(state) = spam.framestate() {
+                    block_py_pc_overrides.push((spam.block(), state.next_offset));
+                }
+            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
                 &walker_slot_for_variable,
                 &block_name_overrides,
                 &link_name_overrides,
+                &block_py_pc_overrides,
                 false,
                 Some(self.cpu()),
             );
