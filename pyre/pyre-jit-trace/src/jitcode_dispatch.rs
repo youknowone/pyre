@@ -10542,7 +10542,7 @@ mod tests {
             std::sync::Arc::ptr_eq(recorded_descr, &descr),
             "GetfieldGcI descr must be descr_refs[d] (the field descr)",
         );
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]

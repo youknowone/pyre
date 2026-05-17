@@ -148,6 +148,14 @@ impl ValueStore for crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> {
     }
 }
 
+#[cfg(test)]
+impl ValueStore for std::collections::HashMap<u32, i64> {
+    #[inline(always)]
+    fn resolve(&self, opref: OpRef) -> i64 {
+        self.get(&opref.raw()).copied().unwrap_or(0)
+    }
+}
+
 impl ValueStore for TraceValues {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {

@@ -2262,6 +2262,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::info::VirtualRawBufferInfo;
     use crate::optimizeopt::optimizer::Optimizer;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     // ── Test descriptors ──
