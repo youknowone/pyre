@@ -8061,6 +8061,63 @@ impl CodeWriter {
                 canonical_ops,
                 canonical_ops as i64 - walker_ops as i64,
             );
+            // Per-opname multiset diff (env-gated separately).  Surfaces
+            // the specific opnames where walker over-emits vs canonical.
+            // Opnames present only on walker side: pyre walker non-orthodoxy
+            // candidates for graph-side porting.  Opnames present only on
+            // canonical side: canonical driver emits something the walker
+            // doesn't (rare; usually `int_copy`/`ref_copy` from canonical's
+            // `insert_renamings` that walker emits inline elsewhere).
+            if std::env::var_os("PYRE_PHASE3_CANONICAL_OPNAME_DIFF").is_some() {
+                fn opname_counts(ssarepr: &super::flatten::SSARepr) -> Vec<(String, usize)> {
+                    let mut pairs: Vec<(String, usize)> = Vec::new();
+                    for insn in &ssarepr.insns {
+                        if let super::flatten::Insn::Op { opname, .. } = insn {
+                            if opname == "-live-" {
+                                continue;
+                            }
+                            if let Some(entry) = pairs.iter_mut().find(|(k, _)| k == opname) {
+                                entry.1 += 1;
+                            } else {
+                                pairs.push((opname.clone(), 1));
+                            }
+                        }
+                    }
+                    pairs
+                }
+                let walker_counts = opname_counts(&ssarepr);
+                let canonical_counts = opname_counts(&canonical_ssarepr);
+                for (opname, w_count) in &walker_counts {
+                    let c_count = canonical_counts
+                        .iter()
+                        .find(|(k, _)| k == opname)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0);
+                    if *w_count != c_count {
+                        eprintln!(
+                            "[phase3-canonical-opname-diff] graph={:?} opname={:?} \
+                             walker={} canonical={} delta={:+}",
+                            code.obj_name.as_str(),
+                            opname,
+                            w_count,
+                            c_count,
+                            c_count as i64 - *w_count as i64,
+                        );
+                    }
+                }
+                for (opname, c_count) in &canonical_counts {
+                    if !walker_counts.iter().any(|(k, _)| k == opname) {
+                        eprintln!(
+                            "[phase3-canonical-opname-diff] graph={:?} opname={:?} \
+                             walker=0 canonical={} delta=+{} (canonical-only)",
+                            code.obj_name.as_str(),
+                            opname,
+                            c_count,
+                            c_count,
+                        );
+                    }
+                }
+            }
         }
 
         // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
