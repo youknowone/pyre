@@ -3644,6 +3644,26 @@ impl CodeWriter {
         // unsupported bytecodes as named opnames.
 
         // RPython parity:
+        // `flatten.py:344` `self.emitline("last_exception", "->",
+        // self.getcolor(w))` — `assembler.py:220` turns it into
+        // `last_exception/>i`. Loads the thread-local exception class
+        // pointer into a Signed register. Canonical
+        // `generate_last_exc` emits this immediately before
+        // `last_exc_value` at every exception link landing whose
+        // `link.args` mentions `link.last_exception`.
+        macro_rules! emit_last_exception {
+            ($dst:expr) => {{
+                let dst = $dst;
+                let insn = Insn::op_with_result(
+                    "last_exception",
+                    Vec::new(),
+                    Register::new(Kind::Int, dst),
+                );
+                push_walker_emit(&current_block, insn);
+            }};
+        }
+
+        // RPython parity:
         // `flatten.py:347` `self.emitline("last_exc_value", "->",
         // self.getcolor(w))` — `assembler.py:220` turns it into
         // `last_exc_value/>r`. pyre emits this once per catch site to
@@ -8042,6 +8062,19 @@ impl CodeWriter {
                 emit_vsd!(depth);
                 exc_slot += 1;
             }
+            // `flatten.py:336-347 generate_last_exc` emits
+            // `last_exception` immediately before `last_exc_value` at
+            // every exception link landing where
+            // `link.last_exception` is in `link.args`.  pyre's walker
+            // synthesises both Variables (exception_edge_vars,
+            // codewriter.rs:944-951), so both must land in the
+            // SSARepr.  Use a fresh Int scratch slot — pyre's
+            // catch-handler bytecode does not currently read the
+            // exception-class register (per-kind PyType makes
+            // type-discrimination implicit), so the write is
+            // structural parity rather than a live consumer.
+            let exc_type_slot = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+            emit_last_exception!(exc_type_slot);
             emit_last_exc_value!(exc_slot);
             if is_portal {
                 let depth_value = (stack_base_absolute + depth as usize) as i64;
