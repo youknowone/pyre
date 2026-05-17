@@ -1,15 +1,21 @@
 //! Port of `rpython/jit/backend/x86/regalloc.py` — arch-specific
-//! register configuration that the shared
-//! `majit-backend-dynasm/src/regalloc.rs` (mirroring
-//! `rpython/jit/backend/llsupport/regalloc.py`) reads at construction
-//! time.
-//!
+//! register configuration plus the `consider_int_*` family that
+//! depends on x86's 2-operand encoding (`OP dst, src` where dst
+//! must be the same as the first operand).
 //! Upstream splits per arch directory; pyre matches that split here.
+//!
+//! Methods that read/write the shared `RegAlloc` state are declared
+//! as a second `impl` block on `crate::regalloc::RegAlloc<'a>`. The
+//! `x86` module is `#[cfg(target_arch = "x86_64")]` gated at
+//! `lib.rs:35`, so these methods only compile on x86_64.
 
+use crate::regalloc::{RegAlloc, RegAllocOp, fits_in_32bits};
 use crate::regloc::{
     EAX, EBP, EBX, ECX, EDI, EDX, ESI, R8, R9, R10, R12, R13, R14, R15, RegLoc, XMM0, XMM1, XMM2,
     XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
 };
+use crate::regloc::Loc;
+use majit_ir::{OpRef, Type};
 
 /// x86/regalloc.py X86_64_RegisterManager.all_regs — the GPR allocation
 /// pool.  Order chosen to prefer caller-save first (popped from end).
@@ -103,3 +109,238 @@ pub const MALLOC_NURSERY_CLOBBER: [RegLoc; 2] = [ECX, EDX];
 /// x86_64: result register after the nursery bump (ecx per
 /// regalloc.py:1021).
 pub const MALLOC_NURSERY_RESULT: RegLoc = ECX;
+
+/// `consider_int_*` family — x86-side `consider_*_j2` entries.
+///
+/// x86's two-operand encoding (`OP dst, src` with dst = first
+/// operand) means the result register is forced onto the lhs slot
+/// via `force_result_in_reg`.  RPython parity:
+/// `rpython/jit/backend/x86/regalloc.py:528 _consider_binop_part`
+/// and `:566 consider_int_add` (plus `_consider_lea` for the
+/// `add reg, imm32` LEA shortcut).
+impl<'a> RegAlloc<'a> {
+    /// x86/regalloc.py:528 `_consider_binop_part`. Sets up `dst =
+    /// lhs` register coupling; for symmetric ops, swaps `lhs`/`rhs`
+    /// when that lets us avoid a spill.
+    fn _consider_binop_part_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        symm: bool,
+    ) -> (Loc, Loc) {
+        let mut x = lhs;
+        let mut y = rhs;
+        let xloc = self.loc(x, self.tp(x));
+        let mut argloc = self.loc(y, self.tp(y));
+
+        if symm && !xloc.is_reg() && argloc.is_reg() {
+            let x_lives_longer = !self.longevity.contains(x)
+                || self.longevity.get(x).unwrap().last_usage > self.rm.position;
+            let y_dies = self
+                .longevity
+                .get(y)
+                .map(|lt| lt.last_usage == self.rm.position)
+                .unwrap_or(false);
+            if x_lives_longer && y_dies {
+                std::mem::swap(&mut x, &mut y);
+                argloc = self.loc(y, self.tp(y));
+            }
+        }
+
+        let tp = self.tp(x);
+        let args = [lhs, rhs];
+        let loc = self.rm.force_result_in_reg(
+            dst,
+            x,
+            tp,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        (loc, argloc)
+    }
+
+    /// x86/regalloc.py:548 `_consider_binop` — asymmetric binop.
+    pub(crate) fn consider_binop_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, false);
+        self.perform(i, vec![loc, argloc], Some(loc), output);
+    }
+
+    /// x86/regalloc.py:552 `_consider_binop_symm` — symmetric binop
+    /// with the swap heuristic.
+    pub(crate) fn consider_binop_symm_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, true);
+        self.perform(i, vec![loc, argloc], Some(loc), output);
+    }
+
+    /// x86/regalloc.py:556 `_consider_lea` — emits `LEA dst, [lhs +
+    /// rhs]` so the result register can differ from `lhs`. Limited
+    /// to RHS constants that fit a 32-bit displacement.
+    fn _consider_lea_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
+        self.possibly_free_var(lhs, self.tp(lhs));
+        let argloc = self.loc(rhs, self.tp(rhs));
+        let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, vec![loc, argloc], Some(resloc), output);
+    }
+
+    /// x86/regalloc.py:566 `consider_int_add` — LEA shortcut when
+    /// the RHS is a 32-bit-fitting immediate, otherwise symmetric
+    /// 2-operand `ADD dst, src`.
+    pub(crate) fn consider_int_add_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        if rhs.is_constant() {
+            let val = self.const_value(rhs);
+            if fits_in_32bits(val) {
+                return self._consider_lea_j2(dst, lhs, rhs, i, output);
+            }
+        }
+        self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// x86/regalloc.py:575 `consider_int_sub` — LEA shortcut with
+    /// negated immediate (`LEA dst, [lhs - imm]`).
+    pub(crate) fn consider_int_sub_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        if rhs.is_constant() {
+            let val = self.const_value(rhs);
+            if fits_in_32bits(-val) {
+                return self._consider_lea_j2(dst, lhs, rhs, i, output);
+            }
+        }
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// x86/regalloc.py:624 `consider_int_lshift` — shift count must
+    /// be in ECX (`SHL/SHR/SAR reg, CL`) unless it's an immediate.
+    pub(crate) fn consider_int_lshift_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc2 = if rhs.is_constant() {
+            self.rm.convert_to_imm(rhs, &self.constants)
+        } else {
+            self.make_sure_var_in_reg(rhs, Type::Int, &[], Some(ECX), false)
+        };
+        let args = [lhs, rhs];
+        let loc1 = self.rm.force_result_in_reg(
+            dst,
+            lhs,
+            Type::Int,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, vec![loc1, loc2], Some(loc1), output);
+    }
+
+    /// x86/regalloc.py:612 `consider_int_neg` / `consider_int_invert`
+    /// — `NEG dst` and `NOT dst` overwrite their argument register.
+    pub(crate) fn consider_unary_int_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [arg];
+        let loc = self.rm.force_result_in_reg(
+            dst,
+            arg,
+            Type::Int,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, vec![loc], Some(loc), output);
+    }
+
+    /// x86/regalloc.py:591 `consider_uint_mul_high` — emits `MUL src`,
+    /// which clobbers EAX (low) and EDX (high), so EAX must be
+    /// pinned to one operand and EDX to the result.
+    pub(crate) fn consider_uint_mul_high_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut arg1 = lhs;
+        let mut arg2 = rhs;
+        if arg1.is_constant() {
+            std::mem::swap(&mut arg1, &mut arg2);
+        }
+        self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
+        let l1 = self.loc(arg1, Type::Int);
+        self.possibly_free_var(arg2, Type::Int);
+        let tmp = self.fresh_temp_var();
+        self.longevity.set(
+            tmp,
+            crate::regalloc::Lifetime::new(self.rm.position, self.rm.position),
+        );
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(EAX),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+        self.rm.force_allocate_reg(
+            dst,
+            &[],
+            Some(EDX),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
+    }
+}

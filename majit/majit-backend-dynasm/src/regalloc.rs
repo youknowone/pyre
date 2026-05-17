@@ -2097,7 +2097,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py:667 perform
-    fn perform(
+    pub(crate) fn perform(
         &mut self,
         op_index: usize,
         arglocs: Vec<Loc>,
@@ -2323,7 +2323,7 @@ impl<'a> RegAlloc<'a> {
     /// `majit-ir/src/op_type_index.rs:144-164` — the same cranelift
     /// caller seeding gap blocks fail-loud here. Convergence path
     /// closes both layers together.
-    fn tp(&self, v: OpRef) -> Type {
+    pub(crate) fn tp(&self, v: OpRef) -> Type {
         self.opref_type(v).unwrap_or(Type::Int)
     }
 
@@ -2333,7 +2333,7 @@ impl<'a> RegAlloc<'a> {
     /// CONST_BIT tag preserved) — see `convert_to_imm` at regalloc.rs
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
-    fn const_value(&self, v: OpRef) -> i64 {
+    pub(crate) fn const_value(&self, v: OpRef) -> i64 {
         self.constants.get(&v.raw()).copied().unwrap_or(0)
     }
 
@@ -3314,174 +3314,13 @@ impl<'a> RegAlloc<'a> {
 
     // ── consider_* methods ──
 
-    fn _consider_binop_part_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        symm: bool,
-    ) -> (Loc, Loc) {
-        let mut x = lhs;
-        let mut y = rhs;
-        let xloc = self.loc(x, self.tp(x));
-        let mut argloc = self.loc(y, self.tp(y));
-
-        if symm && !xloc.is_reg() && argloc.is_reg() {
-            let x_lives_longer = !self.longevity.contains(x)
-                || self.longevity.get(x).unwrap().last_usage > self.rm.position;
-            let y_dies = self
-                .longevity
-                .get(y)
-                .map(|lt| lt.last_usage == self.rm.position)
-                .unwrap_or(false);
-            if x_lives_longer && y_dies {
-                std::mem::swap(&mut x, &mut y);
-                argloc = self.loc(y, self.tp(y));
-            }
-        }
-
-        let tp = self.tp(x);
-        let args = [lhs, rhs];
-        let loc = self.rm.force_result_in_reg(
-            dst,
-            x,
-            tp,
-            &args,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-            &mut self.pending_moves,
-        );
-        (loc, argloc)
-    }
-
-    fn consider_binop_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, false);
-        self.perform(i, vec![loc, argloc], Some(loc), output);
-    }
-
-    fn consider_binop_symm_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, true);
-        self.perform(i, vec![loc, argloc], Some(loc), output);
-    }
-
-    fn _consider_lea_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        let loc = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
-        self.possibly_free_var(lhs, self.tp(lhs));
-        let argloc = self.loc(rhs, self.tp(rhs));
-        let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
-        self.perform(i, vec![loc, argloc], Some(resloc), output);
-    }
-
-    fn consider_int_add_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        if rhs.is_constant() {
-            let val = self.const_value(rhs);
-            if fits_in_32bits(val) {
-                return self._consider_lea_j2(dst, lhs, rhs, i, output);
-            }
-        }
-        self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
-    }
-
-    fn consider_int_sub_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        if rhs.is_constant() {
-            let val = self.const_value(rhs);
-            if fits_in_32bits(-val) {
-                return self._consider_lea_j2(dst, lhs, rhs, i, output);
-            }
-        }
-        self.consider_binop_j2(dst, lhs, rhs, i, output);
-    }
-
-    fn consider_int_lshift_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return self.consider_binop_j2(dst, lhs, rhs, i, output);
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let loc2 = if rhs.is_constant() {
-                self.rm.convert_to_imm(rhs, &self.constants)
-            } else {
-                self.make_sure_var_in_reg(rhs, Type::Int, &[], Some(ECX), false)
-            };
-            let args = [lhs, rhs];
-            let loc1 = self.rm.force_result_in_reg(
-                dst,
-                lhs,
-                Type::Int,
-                &args,
-                &mut self.longevity,
-                &mut self.fm,
-                &self.constants,
-                &mut self.pending_moves,
-            );
-            self.perform(i, vec![loc1, loc2], Some(loc1), output);
-        }
-    }
-
-    fn consider_unary_int_j2(
-        &mut self,
-        dst: OpRef,
-        arg: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        let args = [arg];
-        let loc = self.rm.force_result_in_reg(
-            dst,
-            arg,
-            Type::Int,
-            &args,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-            &mut self.pending_moves,
-        );
-        self.perform(i, vec![loc], Some(loc), output);
-    }
+    // Integer binop / unary `consider_*_j2` methods live in the
+    // arch-specific modules (`crate::aarch64::regalloc` /
+    // `crate::x86::regalloc`) because the result-register coupling
+    // is encoding-dependent: x86 forces `dst = lhs` (2-operand form),
+    // AAPCS64 allocates the result independently (3-operand form).
+    // Mirrors the upstream `rpython/jit/backend/{aarch64,x86}/
+    // regalloc.py` split.
 
     fn consider_compop_j2(
         &mut self,
@@ -3502,53 +3341,9 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
-    fn consider_uint_mul_high_j2(
-        &mut self,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let mut arg1 = lhs;
-            let mut arg2 = rhs;
-            if arg1.is_constant() {
-                std::mem::swap(&mut arg1, &mut arg2);
-            }
-            self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
-            let l1 = self.loc(arg1, Type::Int);
-            self.possibly_free_var(arg2, Type::Int);
-            // x86/regalloc.py:605 tmpvar = TempVar()
-            let tmp = self.fresh_temp_var();
-            self.longevity
-                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-            self.rm.force_allocate_reg(
-                tmp,
-                &[],
-                Some(EAX),
-                false,
-                &mut self.longevity,
-                &mut self.fm,
-            );
-            self.rm
-                .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-            self.rm.force_allocate_reg(
-                dst,
-                &[],
-                Some(EDX),
-                false,
-                &mut self.longevity,
-                &mut self.fm,
-            );
-            self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
-        }
-    }
+    // `consider_uint_mul_high_j2` is arch-specific: aarch64 uses the
+    // 3-operand `umulh`, x86 forces EAX/EDX pinning for `MUL`. See
+    // the arch-specific impl blocks.
 
     fn consider_int_signext_j2(
         &mut self,

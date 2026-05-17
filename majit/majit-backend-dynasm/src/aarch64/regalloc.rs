@@ -1,16 +1,18 @@
 //! Port of `rpython/jit/backend/aarch64/regalloc.py` — arch-specific
-//! register configuration that the shared
-//! `majit-backend-dynasm/src/regalloc.rs` (mirroring
-//! `rpython/jit/backend/llsupport/regalloc.py`) reads at construction
-//! time.
-//!
+//! register configuration plus the `prepare_op_int_*` family that
+//! depends on AAPCS64's 3-operand encoding (`ADD/SUB/MUL Rd, Rn, Rm`).
 //! Upstream splits per arch directory; pyre matches that split here.
-//! The aarch64 file is intentionally small — most of the `consider_*`
-//! and lifetime logic still lives in the shared base, just like
-//! upstream's RPython aarch64 inherits from llsupport.
+//!
+//! Methods that read/write the shared `RegAlloc` state are declared
+//! as a second `impl` block on `crate::regalloc::RegAlloc<'a>`, so
+//! Rust's name resolution picks up the right arch flavour at link
+//! time (the `aarch64` module is `#[cfg(target_arch = "aarch64")]`
+//! gated at `lib.rs:33`).
 
 use crate::aarch64::registers;
-use crate::regloc::RegLoc;
+use crate::regalloc::{RegAlloc, RegAllocOp};
+use crate::regloc::{Loc, RegLoc};
+use majit_ir::{OpRef, Type};
 
 /// aarch64/registers.py:14
 ///   `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
@@ -86,3 +88,161 @@ pub const MALLOC_NURSERY_RESULT: RegLoc = RegLoc {
     value: 0,
     is_xmm: false,
 };
+
+/// `prepare_op_int_*` family — AArch64-side `consider_*_j2` entries.
+///
+/// AAPCS64's `ADD/SUB/MUL/AND/ORR/EOR/LSL/ASR/LSR Rd, Rn, Rm` accepts
+/// three distinct registers, so the result is always allocated via
+/// `force_allocate_reg` independently of the inputs.  RPython parity:
+/// `rpython/jit/backend/aarch64/regalloc.py:341 prepare_op_int_add`
+/// and `:362 prepare_op_int_mul` (the latter is reused for
+/// `and/or/xor/lshift/rshift/urshift/uint_mul_high`).
+impl<'a> RegAlloc<'a> {
+    /// aarch64/regalloc.py:362 `prepare_op_int_mul`. 3-operand form:
+    /// both operands in registers, result allocated separately.
+    pub(crate) fn consider_binop_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
+        let rhs_loc = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
+        self.possibly_free_var(lhs, Type::Int);
+        self.possibly_free_var(rhs, Type::Int);
+        let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        let res_loc = Loc::Reg(res);
+        self.perform(i, vec![lhs_loc, rhs_loc], Some(res_loc), output);
+    }
+
+    /// aarch64/regalloc.py:362 — `prepare_op_int_mul` is reused for
+    /// symmetric binops too; no x86-style swap optimisation is needed
+    /// because 3-operand encoding already lets `res` be distinct.
+    pub(crate) fn consider_binop_symm_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// aarch64/regalloc.py:341 `prepare_op_int_add` → `prepare_int_ri`:
+    /// allows either operand to be an immediate that fits the AArch64
+    /// `add Rd, Rn, #imm12` (or shifted) encoding.  For non-immediate
+    /// or out-of-range constants, fall through to the register form.
+    pub(crate) fn consider_int_add_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_int_ri_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// aarch64/regalloc.py:344 `prepare_op_int_sub`. `lhs` may be
+    /// constant only if it can be materialised into the scratch
+    /// register; the immediate path applies to `rhs` (encoded as
+    /// `sub Rd, Rn, #imm12`).
+    pub(crate) fn consider_int_sub_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        // sub is asymmetric: lhs always becomes Rn.
+        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
+        let rhs_loc = if rhs.is_constant() {
+            self.loc(rhs, Type::Int)
+        } else {
+            self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false)
+        };
+        self.possibly_free_var(lhs, Type::Int);
+        self.possibly_free_var(rhs, Type::Int);
+        let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        self.perform(i, vec![lhs_loc, rhs_loc], Some(Loc::Reg(res)), output);
+    }
+
+    /// aarch64/regalloc.py:362 — shifts piggy-back on `prepare_op_int_mul`.
+    pub(crate) fn consider_int_lshift_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// `prepare_op_int_neg` / `int_invert`. `neg X(d), X(s)` and
+    /// `mvn X(d), X(s)` are both 3-operand: result independent of
+    /// source.
+    pub(crate) fn consider_unary_int_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let arg_loc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
+        self.possibly_free_var(arg, Type::Int);
+        let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        self.perform(i, vec![arg_loc], Some(Loc::Reg(res)), output);
+    }
+
+    /// aarch64/regalloc.py:397 `prepare_op_uint_mul_high = prepare_op_int_mul`.
+    /// `umulh Rd, Rn, Rm` is 3-operand; no scratch-pair constraints
+    /// (unlike x86 which forces EAX/EDX).
+    pub(crate) fn consider_uint_mul_high_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// Internal helper for add: try the `add Rd, Rn, #imm12` immediate
+    /// form when one operand is a constant that fits, otherwise the
+    /// register form.  `lhs`/`rhs` are commutative for add.
+    fn consider_int_ri_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let imm_lhs = lhs.is_constant();
+        let imm_rhs = rhs.is_constant();
+        let (l0, l1) = if imm_lhs && !imm_rhs {
+            // add Rd, Rn, #imm — swap so the immediate stays on the RHS
+            let r0 = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
+            let r1 = self.loc(lhs, Type::Int);
+            (r0, r1)
+        } else if !imm_lhs && imm_rhs {
+            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
+            let r1 = self.loc(rhs, Type::Int);
+            (r0, r1)
+        } else {
+            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
+            let r1 = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
+            (r0, r1)
+        };
+        self.possibly_free_var(lhs, Type::Int);
+        self.possibly_free_var(rhs, Type::Int);
+        let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        self.perform(i, vec![l0, l1], Some(Loc::Reg(res)), output);
+    }
+}
