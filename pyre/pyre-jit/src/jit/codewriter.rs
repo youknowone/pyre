@@ -5768,6 +5768,11 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(result_value),
+                            stack_base + current_depth,
+                        );
                         // BINARY_OP family retirement: emit the lowered
                         // `residual_call_ir_r` Insn directly here via
                         // `build_binary_op_residual_call_ir_r_insn`.
@@ -5813,6 +5818,11 @@ impl CodeWriter {
                             lhs_value,
                             rhs_value,
                             py_pc as i64,
+                        );
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(result_value),
+                            stack_base + current_depth,
                         );
                         // COMPARE_OP family retirement: same closure as
                         // BinaryOp above.  Graph carries only the
