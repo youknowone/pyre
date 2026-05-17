@@ -5670,6 +5670,31 @@ impl CompiledLoop {
     }
 }
 
+/// Build the per-trace `FailDescrLayout` view for a slice of
+/// `fail_descrs`.  Slice 7-Tβ3: FINISH descrs are now the static
+/// singletons (`DONE_WITH_THIS_FRAME_DESCR_*`,
+/// `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) shared across every
+/// trace, so the singleton's `self.fail_index = u32::MAX` and
+/// `self.trace_id = 0` do not carry per-trace identity.  Each
+/// position's per-trace identity is overlaid here, matching the PyPy
+/// `assembler.py:227 self.faildescr.index = i` convention that the
+/// owning compile pass already enforces by position.
+fn build_per_trace_layouts(
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    trace_id: u64,
+) -> Vec<majit_backend::FailDescrLayout> {
+    fail_descrs
+        .iter()
+        .enumerate()
+        .map(|(position, descr)| {
+            let mut layout = descr.layout();
+            layout.fail_index = position as u32;
+            layout.trace_id = trace_id;
+            layout
+        })
+        .collect()
+}
+
 fn find_trace_fail_descr_layouts_in_fail_descrs(
     fail_descrs: &[Arc<CraneliftFailDescr>],
     trace_id: u64,
@@ -5678,13 +5703,7 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
         let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
-                return Some(
-                    bridge
-                        .fail_descrs
-                        .iter()
-                        .map(|descr| descr.layout())
-                        .collect(),
-                );
+                return Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id));
             }
             if let Some(layouts) =
                 find_trace_fail_descr_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
@@ -12845,16 +12864,6 @@ fn collect_guards(
         } else {
             None
         };
-        let mut descr = if is_external_jump {
-            CraneliftFailDescr::new_external_jump(fail_index, trace_id, fail_arg_types)
-        } else {
-            CraneliftFailDescr::new_with_trace_and_kind(
-                fail_index,
-                trace_id,
-                fail_arg_types,
-                is_finish,
-            )
-        };
         let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
             // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
             // lives on the metainterp `AbstractFailDescr`; backend reads
@@ -12868,130 +12877,146 @@ fn collect_guards(
         } else {
             Vec::new()
         };
-        // Capture the metainterp `AbstractFailDescr` Arc as a
-        // back-pointer.  Backend accessors for `_attrs_` fields
-        // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
-        // / rd_vector_info) and resume payload (`compile.py:855` rd_numb
-        // / rd_consts / rd_virtuals / rd_pendingfields / status) forward
-        // through this Arc to the metainterp side.
-        //
-        // FINISH ops without an explicit op.descr (test scaffolding +
-        // codegen-internal FINISH emission) get the class-distinct
-        // metainterp DoneWithThisFrameDescr* matching the result type
-        // so trait predicates (is_finish / fail_arg_types) resolve via
-        // the upstream class hierarchy.
-        descr.meta_descr = if is_external_jump {
-            // op.descr for external JUMP is the TargetToken (already
-            // captured in external_jump_target above) — not a FailDescr.
-            // Synthesize a `ResumeGuardDescr` meta so the meta-side
-            // slots for `force_token_slots` (Slice 7-Tβ7) and
-            // `external_jump_target` (Slice 7-Tβ8) are reachable.
-            // `is_resume_guard()` still returns false for external
-            // JUMPs (the membership predicate via
-            // `external_jump_target_ref` short-circuits before the
-            // meta_descr.is_resume_guard check).
-            Some(majit_backend::make_resume_guard_descr_typed(
-                descr.fail_arg_types.clone(),
-            ))
-        } else if let Some(d) = op.descr.clone() {
-            // When `op.descr` is a `ResumeGuardDescr` (the common case
-            // post-`store_final_boxes_in_guard`), use it directly so
-            // `meta_descr.is_resume_guard()` returns true and the
-            // per-trace stamping at line ~12899 lands on the live Arc.
-            // Non-Resume meta descrs (PropagateExceptionDescr backing
-            // GUARD_NO_EXCEPTION in `compile_tmp_callback`,
-            // ExitFrameWithExceptionDescrRef, etc.) carry no
-            // ResumeGuardDescr-shaped slots — synthesise an empty
-            // ResumeGuardDescr meta so the meta-side bridge caches
-            // (Slice 7-Tβ11) baked into `emit_attached_bridge_dispatch`
-            // resolve to a valid heap-pinned cell that always reads 0.
-            // No bridge is ever attached to these guards (PyPy's
-            // `_assemble_op` skips bridge logic for non-Resume descrs),
-            // so the cells stay 0 and the dispatch falls through to the
-            // deadframe path.
-            if d.is_resume_guard() || d.is_resume_guard_copied() {
-                Some(d)
+        let descr: Arc<CraneliftFailDescr> = if is_finish {
+            // Slice 7-Tβ3: singleton-direct FINISH push (parallel of
+            // dynasm Slice 7-Tα3 commit 3f282e5b19).  PyPy's
+            // `compile.py:626-656 _DoneWithThisFrameDescr*` are module-
+            // level singletons; every FINISH exit of a given result
+            // type resolves to the SAME `Arc::ptr_eq` identity matching
+            // `make_and_attach_done_descrs` parity.  The per-trace
+            // CraneliftFailDescr wrapper was a pyre NEW DEVIATION whose
+            // per-trace state (`recovery_layout`, `force_token_slots`,
+            // `source_op_index`) was already silently no-op'd on the
+            // singleton's non-Resume meta (DoneWithThisFrameDescr* has
+            // no ResumeGuardDescr-shaped slots); the canonical per-FINISH
+            // state lives on `TerminalExitLayout` in
+            // `CompiledLoop::terminal_exit_layouts` instead.
+            //
+            // `is_exit_frame_with_exception` vs DoneWithThisFrame routing
+            // mirrors lines 12992-13001 below — exception exits use the
+            // EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL singleton, ordinary
+            // FINISH uses the result-type-specific DONE_WITH_THIS_FRAME_
+            // DESCR_* singleton.
+            let is_exit_exc = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_fail_descr())
+                .map(|fd| FailDescr::is_exit_frame_with_exception(fd))
+                .unwrap_or(false);
+            if is_exit_exc {
+                EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone()
             } else {
+                let result_type = fail_arg_types.first().copied().unwrap_or(Type::Void);
+                match result_type {
+                    Type::Void => DONE_WITH_THIS_FRAME_DESCR_VOID.clone(),
+                    Type::Int => DONE_WITH_THIS_FRAME_DESCR_INT.clone(),
+                    Type::Ref => DONE_WITH_THIS_FRAME_DESCR_REF.clone(),
+                    Type::Float => DONE_WITH_THIS_FRAME_DESCR_FLOAT.clone(),
+                }
+            }
+        } else {
+            let mut descr = if is_external_jump {
+                CraneliftFailDescr::new_external_jump(fail_index, trace_id, fail_arg_types)
+            } else {
+                CraneliftFailDescr::new_with_trace_and_kind(
+                    fail_index,
+                    trace_id,
+                    fail_arg_types,
+                    is_finish,
+                )
+            };
+            // Capture the metainterp `AbstractFailDescr` Arc as a
+            // back-pointer.  Backend accessors for `_attrs_` fields
+            // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
+            // / rd_vector_info) and resume payload (`compile.py:855` rd_numb
+            // / rd_consts / rd_virtuals / rd_pendingfields / status) forward
+            // through this Arc to the metainterp side.
+            descr.meta_descr = if is_external_jump {
+                // op.descr for external JUMP is the TargetToken (already
+                // captured in external_jump_target above) — not a FailDescr.
+                // Synthesize a `ResumeGuardDescr` meta so the meta-side
+                // slots for `force_token_slots` (Slice 7-Tβ7) and
+                // `external_jump_target` (Slice 7-Tβ8) are reachable.
+                // `is_resume_guard()` still returns false for external
+                // JUMPs (the membership predicate via
+                // `external_jump_target_ref` short-circuits before the
+                // meta_descr.is_resume_guard check).
                 Some(majit_backend::make_resume_guard_descr_typed(
                     descr.fail_arg_types.clone(),
                 ))
-            }
-        } else if is_finish {
-            // `compile.py:626-656` `_DoneWithThisFrameDescr*` are
-            // module-level singletons.  Reuse the metainterp Arc
-            // stashed on the matching `DONE_WITH_THIS_FRAME_DESCR_*`
-            // singleton so every FINISH exit of a given result type
-            // resolves to the SAME `Arc::ptr_eq` identity (matching
-            // `make_and_attach_done_descrs` parity).
-            let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
-            let singleton: &Arc<CraneliftFailDescr> = match result_type {
-                Type::Void => &DONE_WITH_THIS_FRAME_DESCR_VOID,
-                Type::Int => &DONE_WITH_THIS_FRAME_DESCR_INT,
-                Type::Ref => &DONE_WITH_THIS_FRAME_DESCR_REF,
-                Type::Float => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+            } else if let Some(d) = op.descr.clone() {
+                // When `op.descr` is a `ResumeGuardDescr` (the common case
+                // post-`store_final_boxes_in_guard`), use it directly so
+                // `meta_descr.is_resume_guard()` returns true and the
+                // per-trace stamping below lands on the live Arc.  Non-
+                // Resume meta descrs (PropagateExceptionDescr backing
+                // GUARD_NO_EXCEPTION in `compile_tmp_callback`,
+                // ExitFrameWithExceptionDescrRef, etc.) carry no
+                // ResumeGuardDescr-shaped slots — synthesise an empty
+                // ResumeGuardDescr meta so the meta-side bridge caches
+                // (Slice 7-Tβ11) baked into `emit_attached_bridge_dispatch`
+                // resolve to a valid heap-pinned cell that always reads 0.
+                // No bridge is ever attached to these guards (PyPy's
+                // `_assemble_op` skips bridge logic for non-Resume descrs),
+                // so the cells stay 0 and the dispatch falls through to the
+                // deadframe path.
+                if d.is_resume_guard() || d.is_resume_guard_copied() {
+                    Some(d)
+                } else {
+                    Some(majit_backend::make_resume_guard_descr_typed(
+                        descr.fail_arg_types.clone(),
+                    ))
+                }
+            } else {
+                // Guard ops without an explicit op.descr (test scaffolding
+                // bypassing the tracer/optimizer that normally stamps
+                // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
+                // synthesize a ResumeGuardDescr meta so the recovery_layout
+                // slot has somewhere to land — orthodox Slice QQ-4: only the
+                // meta-side slot stores recovery_layout, no backend cell
+                // fallback.
+                Some(majit_backend::make_resume_guard_descr_typed(
+                    descr.fail_arg_types.clone(),
+                ))
             };
-            Some(
-                singleton
-                    .meta_descr
-                    .as_ref()
-                    .cloned()
-                    .expect("DONE_WITH_THIS_FRAME singleton must carry a meta descr"),
-            )
-        } else {
-            // Guard ops without an explicit op.descr (test scaffolding
-            // bypassing the tracer/optimizer that normally stamps
-            // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
-            // synthesize a ResumeGuardDescr meta so the recovery_layout
-            // slot has somewhere to land — orthodox Slice QQ-4: only the
-            // meta-side slot stores recovery_layout, no backend cell
-            // fallback.
-            Some(majit_backend::make_resume_guard_descr_typed(
-                descr.fail_arg_types.clone(),
-            ))
-        };
-        // Stamp the per-trace fail_index and trace_id onto the metainterp
-        // ResumeGuardDescr (`op.descr` or the synthesized
-        // make_resume_guard_descr_typed above).  `compile.py:185` gates
-        // the setters at the ResumeDescr family; non-resume meta descrs
-        // (Done* / Exit* / Propagate / TargetToken for external JUMP)
-        // skip the trait calls so the trait-default panic path stays
-        // unreached.  Stamp AFTER meta_descr is set so test-scaffolding
-        // guards (which would otherwise leave the meta-side
-        // trace_id/fail_index_per_trace at 0) get the right per-trace key
-        // — `FailDescr::trace_id` / `fail_index_per_trace` on
-        // `CraneliftFailDescr` forwards through meta after Slice OO-half-1.
-        if let Some(d) = descr.meta_descr.as_ref() {
-            if d.is_resume_guard() || d.is_resume_guard_copied() {
-                if let Some(fd) = d.as_fail_descr() {
-                    fd.set_fail_index_per_trace(fail_index);
-                    fd.set_trace_id(trace_id);
-                    // Sync fail_arg_types onto the meta side so the
-                    // `FailDescr::fail_arg_types` forwarding accessor
-                    // (guard.rs) returns the codegen-resolved types
-                    // for test scaffolds whose op.descr was synthesised
-                    // empty (or where the optimiser didn't update meta
-                    // post-numbering via store_final_boxes_in_guard).
-                    if fd.fail_arg_types().is_empty() {
-                        fd.set_fail_arg_types(descr.fail_arg_types.clone());
+            // Stamp the per-trace fail_index and trace_id onto the metainterp
+            // ResumeGuardDescr (`op.descr` or the synthesized
+            // make_resume_guard_descr_typed above).  `compile.py:185` gates
+            // the setters at the ResumeDescr family; non-resume meta descrs
+            // skip the trait calls so the trait-default panic path stays
+            // unreached.
+            if let Some(d) = descr.meta_descr.as_ref() {
+                if d.is_resume_guard() || d.is_resume_guard_copied() {
+                    if let Some(fd) = d.as_fail_descr() {
+                        fd.set_fail_index_per_trace(fail_index);
+                        fd.set_trace_id(trace_id);
+                        // Sync fail_arg_types onto the meta side so the
+                        // `FailDescr::fail_arg_types` forwarding accessor
+                        // returns the codegen-resolved types for test
+                        // scaffolds whose op.descr was synthesised empty.
+                        if fd.fail_arg_types().is_empty() {
+                            fd.set_fail_arg_types(descr.fail_arg_types.clone());
+                        }
                     }
                 }
             }
-        }
-        let descr = Arc::new(descr);
-        // Session 5i-cl: source_op_index / recovery_layout writes go to
-        // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
-        // they must follow Arc materialisation.  Slice 7-Tβ7:
-        // `set_force_token_slots` forwards through `meta_descr` (now
-        // always a `ResumeGuardDescr` after the external-JUMP synthesis
-        // above) to the meta-side slot.
-        descr.set_source_op_index(op_idx);
-        descr.set_force_token_slots(force_token_slots);
-        if let Some(layout) = recovery_layout {
-            descr.set_recovery_layout(layout);
-        }
-        if let Some(target) = external_jump_target {
-            descr.set_external_jump_target(target);
-        }
+            let descr = Arc::new(descr);
+            // Session 5i-cl: source_op_index / recovery_layout writes go to
+            // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
+            // they must follow Arc materialisation.  Slice 7-Tβ7:
+            // `set_force_token_slots` forwards through `meta_descr` (now
+            // always a `ResumeGuardDescr` after the external-JUMP synthesis
+            // above) to the meta-side slot.
+            descr.set_source_op_index(op_idx);
+            descr.set_force_token_slots(force_token_slots);
+            if let Some(layout) = recovery_layout {
+                descr.set_recovery_layout(layout);
+            }
+            if let Some(target) = external_jump_target {
+                descr.set_external_jump_target(target);
+            }
+            descr
+        };
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
             eprintln!(
                 "[cl-guard-token] fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?}",
@@ -14002,13 +14027,10 @@ impl majit_backend::Backend for CraneliftBackend {
             .compiled
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        Some(
-            compiled
-                .fail_descrs
-                .iter()
-                .map(|descr| descr.layout())
-                .collect(),
-        )
+        Some(build_per_trace_layouts(
+            &compiled.fail_descrs,
+            compiled.trace_id,
+        ))
     }
 
     fn compiled_bridge_fail_descr_layouts(
@@ -14029,13 +14051,7 @@ impl majit_backend::Backend for CraneliftBackend {
         )?;
         let bridge = source_descr.bridge_ref();
         let bridge = bridge.as_ref()?;
-        Some(
-            bridge
-                .fail_descrs
-                .iter()
-                .map(|descr| descr.layout())
-                .collect(),
-        )
+        Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id))
     }
 
     fn compiled_bridge_descr_arc(
@@ -14080,13 +14096,10 @@ impl majit_backend::Backend for CraneliftBackend {
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         if compiled.trace_id == trace_id {
-            return Some(
-                compiled
-                    .fail_descrs
-                    .iter()
-                    .map(|descr| descr.layout())
-                    .collect(),
-            );
+            return Some(build_per_trace_layouts(
+                &compiled.fail_descrs,
+                compiled.trace_id,
+            ));
         }
         find_trace_fail_descr_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
