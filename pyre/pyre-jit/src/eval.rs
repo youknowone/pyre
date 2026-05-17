@@ -6449,14 +6449,29 @@ mod tests {
         register_test_portal(&code, frame.pycode as *const ());
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
+        // Resolve the per-local Ref-bank color via the regalloc-emitted
+        // `pyre_color_for_semantic_local` map.  Hardcoding reg indices
+        // (e.g. `&3` for local `i`) couples the test to the walker's
+        // pre-canonical regalloc strategy; querying the color map keeps
+        // the assertion shape regardless of which lowering path emits
+        // the jitcode.
+        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
+        let color_i: u32 = (*local_color_map
+            .get(3)
+            .expect("regalloc must assign a color to local `i`"))
+        .into();
+        let color_a: u32 = (*local_color_map.get(0).expect("color for local a")).into();
+        let color_b: u32 = (*local_color_map.get(1).expect("color for local b")).into();
+        let color_c: u32 = (*local_color_map.get(2).expect("color for local c")).into();
         let resume_pc = (0..code.instructions.len())
             .find(|&pc| {
-                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32).contains(&3)
+                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
+                    .contains(&color_i)
             })
             .expect("compiled liveness should expose local i at some Python PC");
         let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
         assert!(
-            live_regs.contains(&3),
+            live_regs.contains(&color_i),
             "selected resume pc must decode the raw-int local slot"
         );
         assert_eq!(
@@ -6495,11 +6510,11 @@ mod tests {
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
-            match reg {
-                0 => values.push(Value::Ref(GcRef(w_int_new(1) as usize))), // local a
-                1 => values.push(Value::Ref(GcRef(w_int_new(2) as usize))), // local b
-                2 => values.push(Value::Ref(GcRef(w_int_new(3) as usize))), // local c
-                3 => values.push(Value::Int(7)),                            // local i
+            match *reg {
+                r if r == color_a => values.push(Value::Ref(GcRef(w_int_new(1) as usize))),
+                r if r == color_b => values.push(Value::Ref(GcRef(w_int_new(2) as usize))),
+                r if r == color_c => values.push(Value::Ref(GcRef(w_int_new(3) as usize))),
+                r if r == color_i => values.push(Value::Int(7)),
                 // pypy/module/pypyjit/interp_jit.py:68 reds = ['frame',
                 // 'ec'] — portal red args ride the live_r mask after
                 // codewriter commit 9f0d0f6c18 (interp_jit.py parity).

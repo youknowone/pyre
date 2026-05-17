@@ -1105,6 +1105,27 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
     })
 }
 
+/// Return the per-semantic-local Ref-bank color assigned by regalloc for
+/// the registered jitcode at `jitcode_index`.  Forward map: local index
+/// `i` → post-rename color holding that local's Variable at trace-recorder
+/// snapshot time.  Empty vector when the jitcode hasn't been finalized.
+///
+/// Mirrors `stack_slot_color_map_at`'s contract for the local half of
+/// `locals_cells_stack_w`; used by `_with_compiled_trace_jitcode` tests
+/// that need to query "what register holds local N" without embedding a
+/// specific reg index that would couple to walker vs canonical regalloc
+/// strategies.
+pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .map(|jc| jc.payload.metadata.pyre_color_for_semantic_local.clone())
+            .unwrap_or_default()
+    })
+}
+
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both `u16::MAX` for
