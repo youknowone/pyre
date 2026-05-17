@@ -4890,7 +4890,10 @@ impl OptContext {
             // layout, so the sharer must inherit fail_arg_types too —
             // otherwise `deserialize_optimizer_knowledge` (bridgeopt.rs:911)
             // reconstructs a different Ref-set and reads past the buffer.
-            op.fail_arg_types = self.new_operations[idx].fail_arg_types.clone();
+            match self.new_operations[idx].get_fail_arg_types() {
+                Some(types) => op.set_fail_arg_types(types.to_vec()),
+                None => op.clear_fail_arg_types(),
+            }
             // optimizer.py:698-699: _maybe_replace_guard_value after copy.
             if op.opcode == OpCode::GuardValue {
                 self.maybe_replace_guard_value(op);
@@ -5239,7 +5242,7 @@ impl OptContext {
             .collect();
 
         op.store_final_boxes(liveboxes);
-        op.fail_arg_types = Some(new_types.clone());
+        op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()

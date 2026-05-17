@@ -327,7 +327,7 @@ impl Trace {
     /// pyjitpl.py:2548 generate_guard parity).
     pub fn set_last_op_fail_arg_types(&mut self, types: Vec<Type>) {
         if let Some(op) = self.ops.last_mut() {
-            op.fail_arg_types = Some(types);
+            op.set_fail_arg_types(types);
         }
     }
 

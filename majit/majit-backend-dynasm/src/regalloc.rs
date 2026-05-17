@@ -6176,7 +6176,7 @@ mod tests {
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());
-        finish.fail_arg_types = Some(vec![]);
+        finish.set_fail_arg_types(vec![]);
 
         let mut constants = HashMap::new();
         constants.insert(c1.raw(), 1);

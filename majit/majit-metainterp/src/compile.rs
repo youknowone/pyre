@@ -2602,7 +2602,7 @@ mod tests {
             OpRef::input_arg_ref(0),
             OpRef::input_arg_int(1)
         ]);
-        guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
+        guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
         let (_resume_data, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
@@ -2653,7 +2653,7 @@ mod tests {
             OpRef::input_arg_ref(2),
             OpRef::input_arg_ref(3)
         ]);
-        guard.fail_arg_types = Some(fail_arg_types);
+        guard.set_fail_arg_types(fail_arg_types);
 
         let (_resume_data, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new());

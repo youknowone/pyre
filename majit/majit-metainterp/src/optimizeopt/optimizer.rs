@@ -4116,7 +4116,11 @@ impl Optimizer {
         // the bridge code falls back to the bridge tracer's (unboxed)
         // inputarg types, and the Ref count disagrees with the serializer
         // → rd_numb over-read. See memory/fannkuch_reg20_root_cause.md.
-        op.fail_arg_types = last.fail_arg_types.clone();
+        if let Some(types) = last.get_fail_arg_types() {
+            op.set_fail_arg_types(types.to_vec());
+        } else {
+            op.clear_fail_arg_types();
+        }
         // ResumeGuardCopiedDescr(prev) parity (compile.py:849
         // `get_resumestorage(): return prev`): the descr-side `prev`
         // pointer (set by `make_resume_guard_copied_descr` above)
@@ -4308,7 +4312,10 @@ impl Optimizer {
             Some(fa) => newop.setfailargs(fa.iter().copied().collect()),
             None => newop.clearfailargs(),
         }
-        newop.fail_arg_types = op.fail_arg_types.clone();
+        match op.get_fail_arg_types() {
+            Some(types) => newop.set_fail_arg_types(types.to_vec()),
+            None => newop.clear_fail_arg_types(),
+        }
         // compile.py:855 _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
@@ -4837,7 +4844,7 @@ mod tests {
             ]
             .into(),
         );
-        guard_a.fail_arg_types = Some(guard_types_a);
+        guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
             &[OpRef::int_op(3)],
@@ -4871,7 +4878,7 @@ mod tests {
             ]
             .into(),
         );
-        guard_b.fail_arg_types = Some(guard_types_b);
+        guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
             &[OpRef::int_op(6)],

@@ -3391,7 +3391,7 @@ impl OptUnroll {
                     // snapshot.
                     new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.clearfailargs();
-                    new_op.fail_arg_types = None;
+                    new_op.clear_fail_arg_types();
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
                     if let Some(ref patch) = ctx.patchguardop {

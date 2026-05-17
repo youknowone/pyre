@@ -300,7 +300,10 @@ impl Guard {
         // reference-shares the donor's payload onto the fresh descr,
         // so `guard_op.descr.fail_descr().rd_*()` returns the donor's
         // values automatically.
-        guard_op.fail_arg_types = self.op.fail_arg_types.clone();
+        match self.op.get_fail_arg_types() {
+            Some(types) => guard_op.set_fail_arg_types(types.to_vec()),
+            None => guard_op.clear_fail_arg_types(),
+        }
         guard_op.rd_resume_position.set(self.op.rd_resume_position.get());
         // guard.py:95: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
@@ -356,7 +359,10 @@ impl Guard {
             Some(fa) => self.op.setfailargs(fa.iter().copied().collect()),
             None => self.op.clearfailargs(),
         }
-        self.op.fail_arg_types = other.op.fail_arg_types.clone();
+        match other.op.get_fail_arg_types() {
+            Some(types) => self.op.set_fail_arg_types(types.to_vec()),
+            None => self.op.clear_fail_arg_types(),
+        }
     }
 
     /// guard.py:134-147: emit_operations(opt)
@@ -400,7 +406,10 @@ impl Guard {
             Some(fa) => guard.setfailargs(fa.iter().copied().collect()),
             None => guard.clearfailargs(),
         }
-        guard.fail_arg_types = self.op.fail_arg_types.clone();
+        match self.op.get_fail_arg_types() {
+            Some(types) => guard.set_fail_arg_types(types.to_vec()),
+            None => guard.clear_fail_arg_types(),
+        }
         guard.rd_resume_position.set(self.op.rd_resume_position.get());
         // compile.py:855 _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
