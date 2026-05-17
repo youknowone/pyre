@@ -8,11 +8,9 @@ use std::sync::Arc;
 use majit_backend::{
     Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
-use majit_backend_cranelift::guard::CraneliftFailDescr;
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
-    Value,
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
 use majit_metainterp::recorder::Trace;
 
@@ -318,19 +316,23 @@ fn test_bridge_end_to_end() {
     bridge_constants.insert(OpRef::const_int(0).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    // Build a CraneliftFailDescr that mirrors the source guard's
-    // identity for the bridge-compile lookup.
-    let bridge_fail_descr =
-        majit_backend_cranelift::guard::CraneliftFailDescr::new_with_trace_and_kind(
-            source_fail_index_per_trace,
-            source_trace_id,
-            vec![Type::Int, Type::Int],
-            false,
-        );
+    // Build a metainterp `ResumeGuardDescr` that mirrors the source
+    // guard's identity for the bridge-compile lookup.  Slice 7-Tβ14f-δ:
+    // no per-emission backend wrapper exists anymore; `compile_bridge`
+    // takes a `&dyn FailDescr` and `ResumeGuardDescr` is the
+    // metainterp class that implements it (`compile.py:840-843`).
+    let _ = source_fail_index_per_trace;
+    let bridge_fail_descr_arc: DescrRef =
+        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+    bridge_fail_descr_arc
+        .as_fail_descr()
+        .expect("ResumeGuardDescr implements FailDescr")
+        .set_trace_id(source_trace_id);
+    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     let bridge_info = backend
         .compile_bridge(
-            &bridge_fail_descr,
+            bridge_fail_descr,
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,
@@ -2368,14 +2370,19 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     bridge_constants.insert(OpRef::const_int(1).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    let bridge_fail_descr =
-        CraneliftFailDescr::new_with_trace_and_kind(0, 910, vec![Type::Int, Type::Int], false);
+    let bridge_fail_descr_arc: DescrRef =
+        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+    bridge_fail_descr_arc
+        .as_fail_descr()
+        .expect("ResumeGuardDescr implements FailDescr")
+        .set_trace_id(910);
+    let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);
     let _bridge_info = backend
         .compile_bridge(
-            &bridge_fail_descr,
+            bridge_fail_descr,
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,

@@ -1320,16 +1320,6 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         None
     }
-    /// Transitional escape hatch for Slice 7-Tβ14 (delete
-    /// `CraneliftFailDescr`).  Returns the metainterp
-    /// `AbstractFailDescr` Arc behind a backend wrapper when one is
-    /// present; `None` for descrs that are not wrappers or do not
-    /// carry a meta back-pointer (singletons, synthetic descrs).
-    /// Deleted in Slice 7-Tβ14f once `fail_descrs` storage holds the
-    /// meta Arc directly — no wrapper to peek past.
-    fn _backend_wrapper_meta_descr(&self) -> Option<DescrRef> {
-        None
-    }
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         None
     }

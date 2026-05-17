@@ -52,7 +52,7 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
-use crate::guard::{drop_bridge_payload, BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
+use crate::guard::{drop_bridge_payload, BridgeData, JitFrameDeadFrame};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
 //
@@ -2585,30 +2585,17 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 /// Owned-Arc counterpart of [`get_latest_descr_from_deadframe`].
 ///
 /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) returns the
-/// descr object the metainterp stamped; pyre threads the same identity
-/// through `Arc<CraneliftFailDescr>` upcast to `Arc<dyn FailDescr>`
-/// so consumer-side bridge entry can route off descr Arc rather than
-/// `(trace_id, fail_index)` surrogates.
+/// metainterp `AbstractFailDescr` Arc the optimizer stamped onto
+/// `op.descr` (or the cpu-attached singleton for FINISH exits).
+/// `JitFrameDeadFrame.fail_descr` IS that Arc — no wrapper indirection
+/// after Slice 7-Tβ14f.
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
-    // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
-    // metainterp `AbstractFailDescr` object op.descr stamped — the
-    // same descr identity PyPy returns.  Walk through the backend
-    // Arc's `meta_descr` back-pointer to recover it.  `register_fail_descrs`
-    // dual-indexes by backend addr + meta addr so downstream
-    // `descr_addr = Arc::as_ptr(arc)` lookups resolve to the backend
-    // Arc for status/start_compiling dispatch.
-    //
-    // Synthetic backend descrs without a meta back-pointer fall back
-    // to the backend Arc upcast.
     let jf = frame
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    if let Some(meta) = jf.fail_descr._backend_wrapper_meta_descr() {
-        return Ok(meta);
-    }
     Ok(jf.fail_descr.clone())
 }
 
@@ -6071,19 +6058,13 @@ fn find_fail_descr_by_ptr(
     descr_ptr: usize,
 ) -> Option<DescrRef> {
     for descr in fail_descrs {
-        // Slice 7-Tβ14e: the JIT-baked `jf_descr` pointer is the meta
-        // `AbstractFailDescr` Arc's data pointer (`history.py:125`
-        // identity).  Until 7-Tβ14f also flips storage to meta Arcs,
-        // `fail_descrs` holds backend wrappers — try both the backend
-        // Arc addr and its `_backend_wrapper_meta_descr` back-pointer
-        // addr so lookups keyed on either side resolve identically.
+        // `history.py:125` identity: the JIT-baked `jf_descr` pointer
+        // is the metainterp `AbstractFailDescr` Arc's data pointer.
+        // Post Slice 7-Tβ14f, `fail_descrs` holds metainterp Arcs
+        // directly (no backend wrapper), so a single addr comparison
+        // resolves the lookup.
         if Arc::as_ptr(descr) as *const () as usize == descr_ptr {
             return Some(descr.clone());
-        }
-        if let Some(meta) = descr._backend_wrapper_meta_descr() {
-            if Arc::as_ptr(&meta) as *const () as usize == descr_ptr {
-                return Some(descr.clone());
-            }
         }
         if let Some(bridge) = fail_descr_bridge_ref(as_fd(descr)).as_ref() {
             if let Some(found) = find_fail_descr_by_ptr(&bridge.fail_descrs, descr_ptr) {
@@ -6864,28 +6845,18 @@ impl CraneliftBackend {
         }
     }
 
-    /// Register backend `Arc<CraneliftFailDescr>` instances into the
-    /// addr→Arc lookup table.  Mirrors dynasm's API: callable from
-    /// future late-stamp helpers that need to land meta-keyed entries
-    /// after the in-codegen call missed them.
+    /// Register metainterp `AbstractFailDescr` Arcs into the addr→Arc
+    /// lookup table keyed on the data-pointer half of each
+    /// `Arc<dyn Descr>` fat pointer (`history.py:125` identity).
+    /// Mirrors dynasm's API: callable from future late-stamp helpers
+    /// that need to land entries after the in-codegen call missed them.
     pub fn register_fail_descrs(&self, descrs: &[DescrRef]) {
         let mut registry = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             let descr_ref: majit_ir::DescrRef = descr.clone();
             registry
                 .entry(Arc::as_ptr(descr) as *const () as usize)
-                .or_insert_with(|| descr_ref.clone());
-            // Unified-Descr Port Epic: also key the same backend Arc by
-            // the metainterp `AbstractFailDescr` Arc's data pointer
-            // (`history.py:125` identity).  `get_latest_descr_arc`
-            // returns the meta Arc when present, so downstream callers
-            // compute `descr_addr = Arc::as_ptr(arc)` from the meta
-            // pointer and would miss the backend-only key without this
-            // dual indexing.
-            if let Some(meta) = descr._backend_wrapper_meta_descr() {
-                let meta_ptr = Arc::as_ptr(&meta) as *const () as usize;
-                registry.insert(meta_ptr, descr_ref.clone());
-            }
+                .or_insert_with(|| descr_ref);
         }
     }
 
@@ -13504,20 +13475,15 @@ impl majit_backend::Backend for CraneliftBackend {
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
         // RPython gates on `isinstance(descr, ResumeDescr)` (`compile.py:185`);
-        // pyre uses `is_resume_guard()` overridden on `CraneliftFailDescr`
-        // to return `!is_finish` — backend descrs play the runtime role
-        // of upstream `ResumeGuardDescr` for guard exits and of the
-        // `DoneWithThisFrame*` family for finish exits.
+        // pyre uses the `Descr::is_resume_guard()` override on
+        // `ResumeGuardDescr` so non-Resume descrs (Done* / ExitExc /
+        // PropagateException) skip the stamp, matching upstream.
         //
-        // PRE-EXISTING-ADAPTATION: the actual stamp happens on the
-        // backend-side `CraneliftFailDescr`, not the metainterp-side
-        // `ResumeGuardDescr` that lives on the IR op.  Convergence
-        // requires unifying the two descr objects per fail (Unified-Descr
-        // Port Epic, Sessions 5+).  The metainterp-side
-        // `op.descr.rd_loop_token_clt` is also stamped in
-        // `pyjitpl/mod.rs::record_loop_or_bridge` (compile.py:185
-        // line-by-line counterpart); the backend stamp here is the
-        // pyre-side parallel write that survives the eventual unification.
+        // Post Slice 7-Tβ14f: `fail_descrs` storage holds the metainterp
+        // `AbstractFailDescr` Arcs directly — there is no backend wrapper
+        // between codegen and metainterp.  The stamp here lands on the
+        // same `op.descr` Arc that `pyjitpl/mod.rs::record_loop_or_bridge`
+        // touches; the two writes converge on a single identity per fail.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             for descr in &compiled.fail_descrs {
                 // `compile.py:185` `isinstance(descr, ResumeDescr)`
@@ -15174,6 +15140,20 @@ mod tests {
         o
     }
 
+    /// Test helper: synthesise a `ResumeGuardDescr` with `trace_id`
+    /// stamped via the FailDescr trait setter, matching how
+    /// `_compile_one_block` constructs source-guard descrs at production
+    /// codegen time.  Mirrors PyPy's `compile.py:840-843 ResumeGuardDescr()`
+    /// + `assembler.py:227 self.faildescr.index = i` pairing.
+    fn mk_test_resume_guard_descr(trace_id: u64, types: Vec<Type>) -> majit_ir::DescrRef {
+        let descr = majit_backend::make_resume_guard_descr_typed(types);
+        descr
+            .as_fail_descr()
+            .expect("ResumeGuardDescr always implements FailDescr")
+            .set_trace_id(trace_id);
+        descr
+    }
+
     #[derive(Debug)]
     struct TestCallDescr {
         arg_types: Vec<Type>,
@@ -16242,13 +16222,14 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let fail_descr = CraneliftFailDescr::new_with_trace_and_kind(0, 90, vec![Type::Int], false);
+        let fail_descr_arc = mk_test_resume_guard_descr(90, vec![Type::Int]);
+        let fail_descr = fail_descr_arc.as_fail_descr().unwrap();
 
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
         backend
             .compile_bridge(
-                &fail_descr,
+                fail_descr,
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
@@ -16369,8 +16350,8 @@ mod tests {
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
 
-        let bridge_fail_descr =
-            CraneliftFailDescr::new_with_trace_and_kind(0, 190, vec![Type::Int], false);
+        let bridge_fail_descr_arc = mk_test_resume_guard_descr(190, vec![Type::Int]);
+        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -16391,7 +16372,7 @@ mod tests {
         backend.set_next_header_pc(2000);
         backend
             .compile_bridge(
-                &bridge_fail_descr,
+                bridge_fail_descr,
                 &inputargs,
                 &bridge_ops,
                 &token,
@@ -16518,8 +16499,8 @@ mod tests {
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout.clone()));
 
-        let bridge_fail_descr =
-            CraneliftFailDescr::new_with_trace_and_kind(0, 290, vec![Type::Int], false);
+        let bridge_fail_descr_arc = mk_test_resume_guard_descr(290, vec![Type::Int]);
+        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -16540,7 +16521,7 @@ mod tests {
         backend.set_next_header_pc(2000);
         backend
             .compile_bridge(
-                &bridge_fail_descr,
+                bridge_fail_descr,
                 &inputargs,
                 &bridge_ops,
                 &token,
@@ -16608,13 +16589,13 @@ mod tests {
             bridge_source_layout.clone()
         ));
 
-        let nested_bridge_fail_descr =
-            CraneliftFailDescr::new_with_trace_and_kind(0, 291, vec![Type::Int], false);
+        let nested_bridge_fail_descr_arc = mk_test_resume_guard_descr(291, vec![Type::Int]);
+        let nested_bridge_fail_descr = nested_bridge_fail_descr_arc.as_fail_descr().unwrap();
         backend.set_next_trace_id(292);
         backend.set_next_header_pc(3000);
         backend
             .compile_bridge(
-                &nested_bridge_fail_descr,
+                nested_bridge_fail_descr,
                 &inputargs,
                 &bridge_ops,
                 &token,
