@@ -8244,14 +8244,16 @@ impl CodeWriter {
         // matching upstream `rpython/jit/codewriter/flatten.py:63-70`.
         // The result is captured in `canonical_ssarepr` and compared
         // against the walker-emitted `ssarepr` via op-count diagnostic.
-        // Canonical runs unwrapped (no catch_unwind) per upstream
+        // Canonical runs unconditionally per upstream
         // `codewriter.py:53` — panics fail loud as walker-orthodoxy
-        // regressions.  Off-default; either
-        // `PYRE_PHASE3_CANONICAL_FLATTEN=1` (probe diagnostics) or
-        // `PYRE_PHASE4_USE_CANONICAL=1` (production splice) enables the
-        // canonical run.
-        if std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN").is_some()
-            || std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some()
+        // regressions.  When `canonical_unmatched=0` AND every Python
+        // PC has a canonical `pc{N}` Label anchor (`pc_coverage_complete`),
+        // the production splice below swaps walker's `ssarepr.insns`
+        // with canonical's; otherwise walker emit is retained.
+        // Diagnostic logs (`[phase3-canonical-*]`) are gated on
+        // `PYRE_PHASE3_CANONICAL_FLATTEN_DIAG=1`.
+        let phase3_diag_on =
+            std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN_DIAG").is_some();
         {
             // First pass: inventory of Opaque(Ref) constants per
             // SpaceOp.  These are the line-by-line porting gaps that
@@ -8300,7 +8302,7 @@ impl CodeWriter {
                     }
                 }
             }
-            if acc.0 > 0 {
+            if phase3_diag_on && acc.0 > 0 {
                 eprintln!(
                     "[phase3-canonical-flatten] graph={:?} opaque_ref_count={} samples={:?}",
                     code.obj_name.as_str(),
@@ -8561,21 +8563,23 @@ impl CodeWriter {
             let walker_unmatched = walker_op_set.len() - matched;
             let canonical_unmatched = remaining_canonical.iter().filter(|b| **b).count();
             let byte_equivalent = walker_unmatched == 0 && canonical_unmatched == 0;
-            eprintln!(
-                "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
-                 delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+} \
-                 byte_equivalent={} walker_unmatched={} canonical_unmatched={}",
-                code.obj_name.as_str(),
-                ssarepr.insns.len(),
-                canonical_ssarepr.insns.len(),
-                canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
-                walker_ops,
-                canonical_ops,
-                canonical_ops as i64 - walker_ops as i64,
-                byte_equivalent,
-                walker_unmatched,
-                canonical_unmatched,
-            );
+            if phase3_diag_on {
+                eprintln!(
+                    "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
+                     delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+} \
+                     byte_equivalent={} walker_unmatched={} canonical_unmatched={}",
+                    code.obj_name.as_str(),
+                    ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
+                    walker_ops,
+                    canonical_ops,
+                    canonical_ops as i64 - walker_ops as i64,
+                    byte_equivalent,
+                    walker_unmatched,
+                    canonical_unmatched,
+                );
+            }
             if std::env::var_os("PYRE_PHASE3_BYTE_DIFF_SAMPLES").is_some()
                 && !byte_equivalent
             {
@@ -8733,21 +8737,25 @@ impl CodeWriter {
                 }
                 let pc_coverage_complete = (0..num_pcs).all(|pc| emitted_pcs.contains(&pc));
                 if !pc_coverage_complete {
-                    eprintln!(
-                        "[phase4-production-splice-skip] graph={:?} \
-                         emitted_pcs={} num_pcs={} (canraise / catch-link \
-                         skip — walker emit retained)",
-                        code.obj_name.as_str(),
-                        emitted_pcs.len(),
-                        num_pcs,
-                    );
+                    if phase3_diag_on {
+                        eprintln!(
+                            "[phase4-production-splice-skip] graph={:?} \
+                             emitted_pcs={} num_pcs={} (canraise / catch-link \
+                             skip — walker emit retained)",
+                            code.obj_name.as_str(),
+                            emitted_pcs.len(),
+                            num_pcs,
+                        );
+                    }
                 } else {
-                    eprintln!(
-                        "[phase4-production-splice] graph={:?} walker_insns={} → canonical_insns={}",
-                        code.obj_name.as_str(),
-                        ssarepr.insns.len(),
-                        canonical_ssarepr.insns.len(),
-                    );
+                    if phase3_diag_on {
+                        eprintln!(
+                            "[phase4-production-splice] graph={:?} walker_insns={} → canonical_insns={}",
+                            code.obj_name.as_str(),
+                            ssarepr.insns.len(),
+                            canonical_ssarepr.insns.len(),
+                        );
+                    }
                     ssarepr.insns = canonical_ssarepr.insns;
                 }
             }
