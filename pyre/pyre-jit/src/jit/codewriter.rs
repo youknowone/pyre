@@ -8022,38 +8022,23 @@ impl CodeWriter {
                     );
                 }
             }
-            let graph_ref = &graph;
-            let cpu_ref = Some(self.cpu());
-            let regallocs_mut = &mut _graph_regallocs;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::flatten::flatten_graph(graph_ref, regallocs_mut, false, cpu_ref)
-            }));
-            match result {
-                Ok(canonical_ssarepr) => {
-                    eprintln!(
-                        "[phase3-canonical-flatten] graph={:?} walker_insn_count={} \
-                         canonical_insn_count={} delta={:+}",
-                        code.obj_name.as_str(),
-                        ssarepr.insns.len(),
-                        canonical_ssarepr.insns.len(),
-                        canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
-                    );
-                }
-                Err(panic_info) => {
-                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "<non-string panic payload>".to_string()
-                    };
-                    eprintln!(
-                        "[phase3-canonical-flatten] graph={:?} PANIC: {}",
-                        code.obj_name.as_str(),
-                        msg,
-                    );
-                }
-            }
+            // `flatten_graph` is panic-free across all 18 production
+            // benches as of Slice 8b (commit `28b8e0849d`).  Upstream
+            // `rpython/jit/codewriter/codewriter.py:53` calls it
+            // unconditionally without any safety net; pyre matches that
+            // shape now.  Any future panic surfaces directly — a
+            // walker non-orthodoxy that needs porting per the same
+            // pattern as Slices 4-8.
+            let canonical_ssarepr =
+                super::flatten::flatten_graph(&graph, &mut _graph_regallocs, false, Some(self.cpu()));
+            eprintln!(
+                "[phase3-canonical-flatten] graph={:?} walker_insn_count={} \
+                 canonical_insn_count={} delta={:+}",
+                code.obj_name.as_str(),
+                ssarepr.insns.len(),
+                canonical_ssarepr.insns.len(),
+                canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
+            );
         }
 
         // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
