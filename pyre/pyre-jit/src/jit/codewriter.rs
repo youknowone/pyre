@@ -6487,19 +6487,22 @@ impl CodeWriter {
                         let n = argc.get(op_arg) as i64;
                         if n >= 1 {
                             // argc==2: pop cause operand (top of stack) first.
-                            // The cause FlowValue is discarded — the exception
-                            // edge in the shadow graph carries the exception
-                            // value, not the cause.
-                            let cause = if n >= 2 {
-                                let _cause_fv = current_state
+                            // Capture the cause FlowValue alongside the
+                            // Operand so the graph dual-write below can
+                            // record the upstream-orthodox call shape.
+                            let (cause, cause_fv): (super::flatten::Operand, super::flow::FlowValue) = if n >= 2 {
+                                let cause_fv = current_state
                                     .stack
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 let cause_reg = emit_popvalue_ref!(current_depth);
-                                super::flatten::Operand::Register(super::flatten::Register::new(
-                                    super::flatten::Kind::Ref,
-                                    cause_reg,
-                                ))
+                                (
+                                    super::flatten::Operand::Register(super::flatten::Register::new(
+                                        super::flatten::Kind::Ref,
+                                        cause_reg,
+                                    )),
+                                    cause_fv,
+                                )
                             } else {
                                 // Tier 4 Epic A: PY_NULL flows directly through
                                 // the residual_call's ListOfKind(Ref) as a
@@ -6510,14 +6513,24 @@ impl CodeWriter {
                                 // through the ref constants pool
                                 // (assembler.rs:1709-1724
                                 // expect_ref_reg_or_pool).
-                                super::flatten::Operand::ConstRef(pyre_object::PY_NULL as i64)
+                                // `Constant::none()` lowers to
+                                // `Operand::ConstRef(0)` per
+                                // `flatten_constant_operand`'s
+                                // `(ConstantValue::None, Some(Kind::Ref))`
+                                // arm, matching `PY_NULL as i64 = 0`
+                                // (std::ptr::null_mut()) for the inline
+                                // emit above.
+                                (
+                                    super::flatten::Operand::ConstRef(pyre_object::PY_NULL as i64),
+                                    super::flow::Constant::none().into(),
+                                )
                             };
                             // Drop the pre-normalization exception operand from
                             // the shadow stack. The residual call below may
                             // rewrite `raise SomeExcClass` into a fresh
                             // instance, so the exception edge must carry a
                             // NEW FlowValue representing the normalized result.
-                            let _ = current_state
+                            let exc_fv = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -6544,8 +6557,7 @@ impl CodeWriter {
                             // matching the production source at
                             // codewriter.rs:2235.  The polymorphic
                             // `cause` Operand (Reg or ConstRef) is
-                            // built inline above.  No graph dual-write
-                            // exists for normalize_raise_varargs_fn.
+                            // built inline above.
                             push_walker_emit(&current_block,
                                 super::flatten::build_normalize_raise_varargs_fn_residual_call_r_r_insn(
                                     normalize_raise_varargs_fn_idx,
@@ -6554,7 +6566,24 @@ impl CodeWriter {
                                     exc_reg,
                                 ),
                             );
-                            let normalized_exc_fv = fresh_ref_value(&mut graph);
+                            // Graph-side `residual_call_r_r` dual-write so the
+                            // canonical `flatten_graph` driver sees the same
+                            // op via passthrough.  `normalize_raise_varargs_fn`
+                            // takes `(exc:Ref, cause:Ref) → Ref` MayForce.
+                            let normalized_exc_fv = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                normalize_raise_varargs_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![],
+                                vec![exc_fv.into(), cause_fv.into()],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            )
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64);
                         } else {
                             // reraise: re-raise exception_last_value
