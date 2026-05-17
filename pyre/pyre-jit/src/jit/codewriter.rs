@@ -3137,6 +3137,16 @@ impl CodeWriter {
         // See `pyre/pyre-jit/src/jit/B6_CODEWRITER_PIPELINE_PLAN.md`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
+        // Phase 4 production-flip bridge: each entry maps a graph
+        // `Variable.id` to the SSARepr slot the walker assigned when
+        // emitting the dual-write.  `flatten::flatten_graph_with_walker_slots`
+        // consults it so the canonical-emitted Register matches the walker
+        // slot, enabling per-graph byte-equivalence before the production
+        // splice.  Synthetic graph-only Variables (no walker counterpart)
+        // leave their entry as `None` and fall back to graph regalloc.
+        #[allow(unused_mut)]
+        let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
+
         // RPython regalloc.py: keep kind-separated register files.
         // Soft minimums; `touch_reg` auto-grows the files as the dispatch
         // loop emits writes against fresh per-arm scratch slots
@@ -8076,8 +8086,13 @@ impl CodeWriter {
             // shape now.  Any future panic surfaces directly — a
             // walker non-orthodoxy that needs porting per the same
             // pattern as Slices 4-8.
-            let canonical_ssarepr =
-                super::flatten::flatten_graph(&graph, &mut _graph_regallocs, false, Some(self.cpu()));
+            let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
+                &graph,
+                &mut _graph_regallocs,
+                &walker_slot_for_variable,
+                false,
+                Some(self.cpu()),
+            );
             // Op-only counts (filter out scaffold: Label, PcAnchor,
             // `-live-`).  Walker emits per-PC PcAnchor + `-live-` for
             // runtime dispatch (NEW-DEVIATION from upstream).  Canonical
