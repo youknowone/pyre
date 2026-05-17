@@ -4466,13 +4466,18 @@ fn assemble_peeled_trace_with_jump_args(
                 }
                 arg
             };
-        for arg in &mut new_op.args {
-            *arg = remap_body_arg(
-                *arg,
-                &assembly_alias_remap,
-                &body_result_remap,
-                &seen_body_defs,
-                &visible_before_label,
+        // optimizer.py:651-652 force_box loop pattern:
+        //   for i in range(op.numargs()): op.setarg(i, ...)
+        for i in 0..new_op.num_args() {
+            new_op.setarg(
+                i,
+                remap_body_arg(
+                    new_op.arg(i),
+                    &assembly_alias_remap,
+                    &body_result_remap,
+                    &seen_body_defs,
+                    &visible_before_label,
+                ),
             );
         }
         if new_op.opcode == OpCode::Label {
@@ -4528,6 +4533,10 @@ fn assemble_peeled_trace_with_jump_args(
             // already dedups by box identity (`extra_inner_set.contains`),
             // so each source_arg appears at most once — which is the
             // RPython-parity behavior for Box-keyed live-in sets.
+            // unroll.py:301 label_op.initarglist(label_op.getarglist() +
+            //                                    sb.used_boxes)
+            let mut extended_args: smallvec::SmallVec<[OpRef; 3]> =
+                new_op.getarglist().into();
             for &source_arg in &extra_inner_sources {
                 // optimizer.py:614-625 freeze: do not follow ctx forwarding
                 // chains here; postprocess Const forwarding on body ops would
@@ -4544,9 +4553,10 @@ fn assemble_peeled_trace_with_jump_args(
                     &seen_body_defs,
                     &visible_before_label,
                 );
-                new_op.args.push(mapped_arg);
+                extended_args.push(mapped_arg);
                 original_args.push(source_arg);
             }
+            new_op.initarglist(extended_args);
         }
         if new_op.opcode == OpCode::Jump {
             // unroll.py:238-242 jump_to_preamble sends the live JUMP after
@@ -4608,7 +4618,8 @@ fn assemble_peeled_trace_with_jump_args(
                     jump_args.push(extra_arg);
                 }
             }
-            new_op.setarglist(jump_args.into());
+            // unroll.py-style bulk replace: jump arity is finalized here.
+            new_op.initarglist(jump_args.into());
         }
         // RPython resume.py parity: fail_args capture guard-point state
         // (the snapshot), not the body's final state. body_result_remap

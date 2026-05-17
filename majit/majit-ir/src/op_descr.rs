@@ -267,15 +267,42 @@ impl Op {
         self.vecinfo.borrow().is_some()
     }
 
-    /// `resoperation.py:300 AbstractResOp.getarglist` parity — returns
-    /// a borrow into the operand vector.
+    /// `resoperation.py:281 AbstractResOp.getarglist` parity — returns
+    /// a borrow into the operand vector.  Subclass mixins (`UnaryOp`,
+    /// `BinaryOp`, ..., `N_aryOp`) implement this differently; pyre
+    /// collapses them into a single SmallVec slot.
     pub fn getarglist(&self) -> &[crate::resoperation::OpRef] {
         &self.args
     }
 
-    /// `resoperation.py:303 AbstractResOp.setarglist` parity — overwrite
-    /// the operand vector.
-    pub fn setarglist(&mut self, args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
+    /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
+    /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
+    /// an owned `SmallVec` clone for the same effect.
+    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::resoperation::OpRef; 3]> {
+        self.args.clone()
+    }
+
+    /// `resoperation.py:277 AbstractResOp.initarglist` parity — bulk
+    /// store the operand list.  In RPython this is "supposed to be
+    /// called only just after the ResOp has been created"
+    /// (resoperation.py:278); pyre matches both the name and intent.
+    ///
+    /// One existing post-creation caller in upstream:
+    /// `unroll.py:301 label_op.initarglist(label_op.getarglist() +
+    ///  sb.used_boxes)` extends the LABEL arg list when finishing the
+    /// peel pass.  pyre's matching call lives in `unroll.rs` and
+    /// rebuilds the SmallVec rather than pushing onto `args`.
+    pub fn initarglist(
+        &mut self,
+        args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>,
+    ) {
         self.args = args;
+    }
+
+    /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
+    /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
+    /// or `_args[i]`; pyre indexes the SmallVec directly.
+    pub fn setarg(&mut self, i: usize, box_: crate::resoperation::OpRef) {
+        self.args[i] = box_;
     }
 }
