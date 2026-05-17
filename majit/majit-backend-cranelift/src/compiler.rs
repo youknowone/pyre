@@ -5761,11 +5761,19 @@ fn emit_guard_exit(
     // cranelift analogue of `JMP imm(target)`), but enabling it
     // empirically leaks ~12 bytes of OS stack per fired tail call on
     // aarch64 — `raise_catch_loop` (1M iterations) hits the 768 KiB
-    // budget after ~61 k tail calls and surfaces `RecursionError`.
-    // Cranelift's `emit_return_call_common_sequence` does pop the
-    // setup_area and fixed_frame_storage, so the leak is either in
-    // cranelift's aarch64 backend or in our wrapper/body call_conv
-    // interaction.  Slice X2-step4b will diagnose.
+    // budget after exactly 61315 tail calls (`MAJIT_X2_PROBE` shows
+    // dispatch_takes=61315 then RecursionError; 768 KiB / 61315 ≈ 12.5
+    // bytes/take).  The call-indirect+return variant leaks the full
+    // frame per call (~35 bytes/take, crashes at 300k iters / 22k
+    // takes).  Both variants also corrupt `nbody` to
+    // `-0.03513379910298962` vs the dynasm reference
+    // `-0.035132020348426815`.  Cranelift 0.130.2 aarch64's
+    // gen_clobber_save/_restore + emit_return_call_common_sequence
+    // look symmetric per inspection, so the leak source is internal
+    // to cranelift's Tail conv handling on aarch64.  Slice X2-step4b
+    // (task #116) documents the diagnosis; until cranelift addresses
+    // the leak the host-loop dispatch handles external JUMPs the
+    // legacy way.  See `project_cranelift_wrapper_body_tail_leak.md`.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
