@@ -376,7 +376,7 @@ impl Drop for CraneliftFailDescr {
 /// by `ResumeGuardDescr::drop` on any payload still in the cell at
 /// descr teardown; reconstructs the owning `Arc<BridgeData>` so its
 /// `Drop` runs.
-fn drop_bridge_payload(ptr: *mut ()) {
+pub(crate) fn drop_bridge_payload(ptr: *mut ()) {
     if !ptr.is_null() {
         // Safety: produced by `Arc::into_raw(Arc::new(bridge))` in
         // `attach_bridge`; reclaim ownership and drop.
