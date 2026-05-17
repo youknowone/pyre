@@ -3163,6 +3163,21 @@ impl CodeWriter {
         // splice.  Synthetic graph-only Variables (no walker counterpart)
         // leave their entry as `None` and fall back to graph regalloc.
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
+        // Seed the bridge with the portal `(frame, ec)` red Variables —
+        // upstream `jtransform.py:840` threads `frame` (and `ec`) as the
+        // leading red args of every vable op; pyre's walker reads them
+        // out of `portal_frame_reg` / `portal_ec_reg` rather than allocating
+        // them per-op, so canonical needs the same fixed slots.
+        pair_walker_slot(
+            &mut walker_slot_for_variable,
+            Some(frame_var),
+            portal_frame_reg,
+        );
+        pair_walker_slot(
+            &mut walker_slot_for_variable,
+            Some(ec_var),
+            portal_ec_reg,
+        );
 
         // RPython regalloc.py: keep kind-separated register files.
         // Soft minimums; `touch_reg` auto-grows the files as the dispatch
@@ -8251,6 +8266,52 @@ impl CodeWriter {
                 walker_unmatched,
                 canonical_unmatched,
             );
+            if std::env::var_os("PYRE_PHASE3_BYTE_DIFF_SAMPLES").is_some()
+                && !byte_equivalent
+            {
+                let mut consumed: Vec<bool> = vec![true; canonical_op_set.len()];
+                // Re-run the match to find canonical's matched indices.
+                for w in &walker_op_set {
+                    for (i, c) in canonical_op_set.iter().enumerate() {
+                        if consumed[i] && w == c {
+                            consumed[i] = false;
+                            break;
+                        }
+                    }
+                }
+                let mut walker_unmatched_samples: Vec<&String> = Vec::new();
+                let mut consumed_for_walker: Vec<bool> = vec![true; canonical_op_set.len()];
+                for w in &walker_op_set {
+                    let mut found = false;
+                    for (i, c) in canonical_op_set.iter().enumerate() {
+                        if consumed_for_walker[i] && w == c {
+                            consumed_for_walker[i] = false;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found && walker_unmatched_samples.len() < 4 {
+                        walker_unmatched_samples.push(w);
+                    }
+                }
+                let canonical_unmatched_samples: Vec<&String> = consumed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b)
+                    .map(|(i, _)| &canonical_op_set[i])
+                    .take(4)
+                    .collect();
+                eprintln!(
+                    "[phase3-canonical-flatten-walker-unmatched] graph={:?} samples={:?}",
+                    code.obj_name.as_str(),
+                    walker_unmatched_samples,
+                );
+                eprintln!(
+                    "[phase3-canonical-flatten-canonical-unmatched] graph={:?} samples={:?}",
+                    code.obj_name.as_str(),
+                    canonical_unmatched_samples,
+                );
+            }
             // Per-opname multiset diff (env-gated separately).  Surfaces
             // the specific opnames where walker over-emits vs canonical.
             // Opnames present only on walker side: pyre walker non-orthodoxy
