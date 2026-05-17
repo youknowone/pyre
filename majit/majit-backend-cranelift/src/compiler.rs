@@ -13885,7 +13885,7 @@ fn collect_terminal_exit_layouts(
                 exit_types,
                 is_finish,
                 is_exception_exit: op
-                    .descr
+                    .getdescr()
                     .as_ref()
                     .and_then(|d| d.as_fail_descr())
                     .is_some_and(|fd| fd.is_exit_frame_with_exception()),
