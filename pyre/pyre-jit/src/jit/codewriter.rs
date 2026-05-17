@@ -771,10 +771,19 @@ fn strip_walker_block_boundary_goto(
     let mut drained: Vec<super::flatten::Insn> = Vec::with_capacity(total_capacity);
     let n = blocks.len();
     for i in 0..n {
-        let next_label_name: Option<String> = blocks
-            .get(i + 1)
-            .and_then(|next| next.first())
-            .and_then(|first| match first {
+        // Scan forward past empty per-block accumulators (dead /
+        // superseded blocks whose `mark_dead` cleared their insns —
+        // `rpython/flowspace/flowcontext.py:455-457` clears
+        // `block.operations` on supersede; pyre mirrors that on
+        // `per_block_ssarepr`).  Without this, a PJIF/PJIT parent
+        // whose boundary goto targets the supersede newblock's
+        // py_pc would fail to strip because the immediate next
+        // entry in `all_walker_blocks` is the now-empty dead block,
+        // not the supersede newblock that holds the matching
+        // `Label(pcN)` / `PcAnchor{N}` first insn.
+        let next_label_name: Option<String> = (i + 1..n)
+            .find_map(|j| blocks[j].first().map(|first| (j, first)))
+            .and_then(|(_, first)| match first {
                 super::flatten::Insn::Label(l) => Some(l.name.clone()),
                 super::flatten::Insn::PcAnchor { py_pc } => {
                     Some(super::flatten::pc_label_name(*py_pc))
