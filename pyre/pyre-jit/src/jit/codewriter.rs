@@ -6438,6 +6438,8 @@ impl CodeWriter {
                         // Args were popped in reverse stack order; reverse to
                         // match the call site's positional order (arg0 first).
                         let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
+                        let arg_values: Vec<super::flow::FlowValue> =
+                            graph_arg_values_rev.iter().rev().cloned().collect();
                         let callable_reg = emit_popvalue_ref!(current_depth);
                         let callable_value = current_state
                             .stack
@@ -6517,13 +6519,48 @@ impl CodeWriter {
                             // production source at codewriter.rs:2175
                             // and 2238-2245 (every `call_fn_N` is
                             // bound MayForce).
+                            // Map (FlowValue, register) → Operand: Constant
+                            // null sentinels lower to ConstRef(0) (matches
+                            // canonical's `lower_simple_call_hlop_to_insn`
+                            // routing Constant args through `lower_constant`,
+                            // which routes `(None, Ref)` to `ConstRef(0)` per
+                            // `flatten_constant_operand`).  Variable values
+                            // emit Register operands as before.  Walker prior
+                            // to this lowering always emitted Registers and
+                            // produced byte-divergence at the CALL site for
+                            // graphs whose `simple_call` carried a Constant
+                            // null arg (e.g. list_reverse, list_pop_append
+                            // after LOAD_ATTR(method) pushes the sentinel).
+                            let to_operand =
+                                |value: &super::flow::FlowValue, reg: u16| -> super::flatten::Operand {
+                                    if let super::flow::FlowValue::Constant(c) = value {
+                                        if matches!(c.value, super::flow::ConstantValue::None) {
+                                            return super::flatten::Operand::ConstRef(0);
+                                        }
+                                    }
+                                    super::flatten::Operand::Register(
+                                        super::flatten::Register::new(
+                                            super::flatten::Kind::Ref,
+                                            reg,
+                                        ),
+                                    )
+                                };
+                            let mut ref_operands: Vec<super::flatten::Operand> =
+                                Vec::with_capacity(1 + arg_regs.len());
+                            ref_operands.push(to_operand(&callable_value, callable_reg));
+                            for (value, reg) in arg_values.iter().zip(arg_regs.iter()) {
+                                ref_operands.push(to_operand(value, *reg));
+                            }
                             push_walker_emit(
                                 &current_block,
-                                super::flatten::build_call_fn_residual_call_r_r_insn(
+                                super::flatten::build_residual_call_r_r_insn_from_operands(
                                     fn_idx,
-                                    callable_reg,
-                                    &arg_regs,
-                                    stack_base + current_depth,
+                                    ref_operands,
+                                    super::flatten::CallFlavor::MayForce,
+                                    super::flatten::Register::new(
+                                        super::flatten::Kind::Ref,
+                                        stack_base + current_depth,
+                                    ),
                                 ),
                             );
                             // Graph-side residual_call_r_r dual-write

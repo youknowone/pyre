@@ -3355,7 +3355,7 @@ pub fn build_get_current_exception_fn_residual_call_r_r_insn(
 /// `arg_kinds = vec![Kind::Ref; ref_operands.len()]`, ResKind = Ref
 /// → kinds `"r"` + reskind `'r'` → opname `"residual_call_r_r"`.
 /// No leading `ListI` (empty `args_i`).  Variable-arity + flavor.
-fn build_residual_call_r_r_insn_from_operands(
+pub fn build_residual_call_r_r_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
