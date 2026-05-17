@@ -8191,8 +8191,12 @@ impl CodeWriter {
         // `flatten_graph` is panic-free across all 14 production
         // benches (upstream `codewriter.py:53` calls it
         // unconditionally without any safety net).  Off-default;
-        // `PYRE_PHASE3_CANONICAL_FLATTEN=1` enables it.
-        if std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN").is_some() {
+        // either `PYRE_PHASE3_CANONICAL_FLATTEN=1` (probe diagnostics)
+        // or `PYRE_PHASE4_USE_CANONICAL=1` (production splice)
+        // enables the canonical run.
+        if std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN").is_some()
+            || std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some()
+        {
             // First pass: inventory of Opaque(Ref) constants per
             // SpaceOp.  These are the line-by-line porting gaps that
             // need either an upstream-orthodox `rtype_opaque_constants`
