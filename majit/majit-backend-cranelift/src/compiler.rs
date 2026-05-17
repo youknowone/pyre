@@ -5510,57 +5510,40 @@ fn emit_attached_bridge_dispatch(
 ) {
     // dynasm/x86 patches the failing guard's jump to the attached bridge.
     // Cranelift cannot patch finalized code, so guard exits do the
-    // equivalent descriptor-cache dispatch before returning a deadframe to
-    // the caller/interpreter.
+    // equivalent descriptor-cache dispatch before returning a deadframe
+    // to the caller/interpreter.
     //
-    // Slice JJ: bridge code_ptr / frame_depth cells live on the descr
-    // as `Box<AtomicUsize>`.  Box gives them a heap-pinned address that
+    // x86/assembler.py:987 `patch_jump_for_descr` parity: the patched
+    // jump is unconditional — PyPy never frame-checks at the dispatch
+    // site because the bridge's own prologue (`_check_frame_depth`,
+    // aarch64/assembler.py:927) reallocates the JITFRAME on entry when
+    // it's too small.  Mirror that here: load the bridge code cell and
+    // dispatch on non-null alone.  The frame_depth cache is no longer
+    // read here — the bridge prologue (compiler.rs:7585) bakes the
+    // expected size as an iconst at compile time.  Slice X1-realloc/B.
+    //
+    // Slice JJ: bridge code_ptr cell lives on the descr as
+    // `Box<AtomicUsize>`.  Box gives it a heap-pinned address that
     // survives the descr being moved into `Arc::new(...)`, so the
-    // addresses are stable for the descr's lifetime and safe to bake
-    // into machine code as immediates.  Slice 7-Tβ14e: the caller pre-
-    // computes the address pair via `fail_descr_bridge_cache_addrs`
+    // address is stable for the descr's lifetime and safe to bake
+    // into machine code as an immediate.  Slice 7-Tβ14e: the caller
+    // pre-computes the address pair via `fail_descr_bridge_cache_addrs`
     // and passes it directly, since `jf_descr` now embeds the meta
     // Arc rather than the backend wrapper that owns the cells.
-    let (bridge_code_cache_addr, bridge_frame_depth_cache_addr) = bridge_cache_addrs;
+    let (bridge_code_cache_addr, _bridge_frame_depth_cache_addr) = bridge_cache_addrs;
     let bridge_code_cache_ptr = builder
         .ins()
         .iconst(ptr_type, bridge_code_cache_addr as i64);
-    let bridge_frame_depth_cache_ptr = builder
-        .ins()
-        .iconst(ptr_type, bridge_frame_depth_cache_addr as i64);
     let bridge_code = builder
         .ins()
         .load(ptr_type, MemFlags::trusted(), bridge_code_cache_ptr, 0);
-    let required_frame_len_raw = builder.ins().load(
-        ptr_type,
-        MemFlags::trusted(),
-        bridge_frame_depth_cache_ptr,
-        0,
-    );
-    let required_frame_len = if ptr_type == cl_types::I64 {
-        required_frame_len_raw
-    } else {
-        builder.ins().uextend(cl_types::I64, required_frame_len_raw)
-    };
-    let frame_len = builder.ins().load(
-        cl_types::I64,
-        MemFlags::trusted(),
-        jf_ptr,
-        JF_FRAME_LENGTH_OFS,
-    );
     let null_ptr = builder.ins().iconst(ptr_type, 0);
     let has_bridge = builder.ins().icmp(IntCC::NotEqual, bridge_code, null_ptr);
-    let frame_fits = builder.ins().icmp(
-        IntCC::UnsignedGreaterThanOrEqual,
-        frame_len,
-        required_frame_len,
-    );
-    let can_dispatch = builder.ins().band(has_bridge, frame_fits);
     let bridge_block = builder.create_block();
     builder.append_block_param(bridge_block, ptr_type);
     let miss_block = builder.create_block();
     builder.ins().brif(
-        can_dispatch,
+        has_bridge,
         bridge_block,
         &[BlockArg::from(bridge_code)],
         miss_block,
