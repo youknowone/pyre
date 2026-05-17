@@ -3144,7 +3144,6 @@ impl CodeWriter {
         // slot, enabling per-graph byte-equivalence before the production
         // splice.  Synthetic graph-only Variables (no walker counterpart)
         // leave their entry as `None` and fall back to graph regalloc.
-        #[allow(unused_mut)]
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
 
         // RPython regalloc.py: keep kind-separated register files.
@@ -5386,6 +5385,13 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
+                        if let Some(var) = boxed {
+                            let idx = var.id.0 as usize;
+                            if walker_slot_for_variable.len() <= idx {
+                                walker_slot_for_variable.resize(idx + 1, None);
+                            }
+                            walker_slot_for_variable[idx] = Some(stack_base + current_depth);
+                        }
                         let stack_value = boxed
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
