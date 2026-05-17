@@ -8031,13 +8031,35 @@ impl CodeWriter {
             // pattern as Slices 4-8.
             let canonical_ssarepr =
                 super::flatten::flatten_graph(&graph, &mut _graph_regallocs, false, Some(self.cpu()));
+            // Op-only counts (filter out scaffold: Label, PcAnchor,
+            // `-live-`).  Walker emits per-PC PcAnchor + `-live-` for
+            // runtime dispatch (NEW-DEVIATION from upstream).  Canonical
+            // doesn't.  Subtracting scaffold yields a more accurate
+            // gap signal: if walker_ops > canonical_ops, walker has
+            // extra inline emits (over-emission); if equal, only the
+            // scaffold differs (expected pre-tracer-rewrite Task #50).
+            fn count_real_ops(ssarepr: &super::flatten::SSARepr) -> usize {
+                ssarepr
+                    .insns
+                    .iter()
+                    .filter(|insn| match insn {
+                        super::flatten::Insn::Op { opname, .. } => opname != "-live-",
+                        _ => false,
+                    })
+                    .count()
+            }
+            let walker_ops = count_real_ops(&ssarepr);
+            let canonical_ops = count_real_ops(&canonical_ssarepr);
             eprintln!(
-                "[phase3-canonical-flatten] graph={:?} walker_insn_count={} \
-                 canonical_insn_count={} delta={:+}",
+                "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
+                 delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+}",
                 code.obj_name.as_str(),
                 ssarepr.insns.len(),
                 canonical_ssarepr.insns.len(),
                 canonical_ssarepr.insns.len() as i64 - ssarepr.insns.len() as i64,
+                walker_ops,
+                canonical_ops,
+                canonical_ops as i64 - walker_ops as i64,
             );
         }
 
