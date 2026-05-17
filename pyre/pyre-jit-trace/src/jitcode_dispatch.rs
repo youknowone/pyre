@@ -10535,11 +10535,10 @@ mod tests {
             "GetfieldGcI args must be [obj] (the r-reg source)",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("GetfieldGcI must carry the field descr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "GetfieldGcI descr must be descr_refs[d] (the field descr)",
         );
         assert_eq!(dst_post, last.pos.get());
@@ -10604,11 +10603,10 @@ mod tests {
             "SetfieldGc args must be [obj, value]",
         );
         let recorded_descr = last
-            .descr
-            .as_ref()
+            .getdescr()
             .expect("SetfieldGc must carry the field descr");
         assert!(
-            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            std::sync::Arc::ptr_eq(&recorded_descr, &descr),
             "SetfieldGc descr must be descr_refs[d] (the field descr)",
         );
     }

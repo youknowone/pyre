@@ -7827,7 +7827,7 @@ mod tests {
                 saw_new = true;
             }
             if op.opcode == OpCode::GetfieldGcI
-                && op.descr.as_ref().map(|d| d.index())
+                && op.getdescr().map(|d| d.index())
                     == Some(pyre_jit_trace::descr::list_int_items_len_descr().index())
             {
                 saw_len_field = true;
@@ -7970,7 +7970,7 @@ mod tests {
                     saw_raw_setitem = true;
                 }
                 if op.opcode == OpCode::SetfieldGc
-                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_len_descr_idx)
+                    && op.getdescr().map(|d| d.index()) == Some(expected_len_descr_idx)
                 {
                     saw_len_update = true;
                 }
