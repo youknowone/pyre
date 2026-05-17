@@ -37,7 +37,7 @@ pub use forwarded::{
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
-    Op, OpCode, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
+    Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn,

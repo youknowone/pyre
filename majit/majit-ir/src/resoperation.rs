@@ -984,6 +984,23 @@ pub trait BoxEnv {
     }
 }
 
+/// Shared-identity handle to an `Op`.
+///
+/// Mirrors RPython's object-identity model: `resoperation.py:250
+/// AbstractResOp` instances are plain Python objects, so every consumer
+/// (`history.py:528 TreeLoop.operations`, `optimizer.py:562 trace.next()`,
+/// short preamble export, resume metadata, backend input lists) reaches
+/// the **same** ResOperation object and reads/writes `_forwarded`
+/// through that shared identity.  Pyre's analog: every consumer holds
+/// the same `Rc<Op>` and reads/writes `forwarded`/`descr`/...  through
+/// the interior-mutable slots.
+///
+/// This alias is the migration target for `Vec<Op>` storage sites
+/// (BoxPool removal plan Slice 1).  Sites already migrated traffic in
+/// `OpRc`; the remaining `Vec<Op>` sites keep the legacy clone-on-copy
+/// shape until they are migrated and `BoxPool` retires (Slice 8).
+pub type OpRc = std::rc::Rc<Op>;
+
 /// A single IR operation.
 ///
 /// Mirrors `rpython/jit/metainterp/resoperation.py:250` `AbstractResOp`.
