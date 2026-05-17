@@ -3054,7 +3054,14 @@ impl Optimizer {
                 }
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
-                    remap_opref(&mut entry.op.pos.get());
+                    // Cell::get() returns a copy; the previous
+                    // `remap_opref(&mut entry.op.pos.get())` mutated that
+                    // temporary and never wrote back.  Read into a local,
+                    // remap, then `set(...)` to persist the new OpRef on
+                    // the Cell.
+                    let mut new_pos = entry.op.pos.get();
+                    remap_opref(&mut new_pos);
+                    entry.op.pos.set(new_pos);
                     for arg in &mut entry.op.args {
                         remap_opref(arg);
                     }
