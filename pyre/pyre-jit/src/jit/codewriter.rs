@@ -8096,16 +8096,10 @@ impl CodeWriter {
             }
             for &kind in &super::flatten::Kind::ALL {
                 let ssa = alloc_result.num_regs.get(&kind).copied().unwrap_or(0);
-                let graph = _graph_regallocs
-                    .get(&kind)
-                    .map(|r| r.num_colors)
-                    .unwrap_or(0);
+                let graph = _graph_regallocs[kind.index()].num_colors;
                 if ssa != graph {
-                    let ssa_var_count = ssa_slots[kind as usize].len();
-                    let graph_var_count = _graph_regallocs
-                        .get(&kind)
-                        .map(|r| r.coloring.len())
-                        .unwrap_or(0);
+                    let ssa_var_count = ssa_slots[kind.index()].len();
+                    let graph_var_count = _graph_regallocs[kind.index()].coloring.len();
                     eprintln!(
                         "[phase3-regalloc-divergence] graph={:?} kind={:?} ssa_num_regs={} \
                          graph_num_colors={} delta={:+} ssa_var_count={} graph_var_count={} \

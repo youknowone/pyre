@@ -80,6 +80,15 @@ impl Kind {
             Kind::Float => 'f',
         }
     }
+
+    /// Dense slot index `0..3` for indexing `[T; 3]` arrays keyed by
+    /// `Kind`.  Pyre uses `[T; 3]` rather than `HashMap<Kind, T>` per
+    /// [[feedback-no-hashmap-ever]] — the RPython `regallocs` dict has
+    /// statically-known keys (`KINDS = ['int', 'ref', 'float']`) so the
+    /// Rust analog is position-indexed not hash-keyed.
+    pub fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// `flatten.py:6-10` `class SSARepr(object)`.
@@ -1967,38 +1976,47 @@ where
         }
         pairs.sort_by_key(|(_, dst)| dst.index);
 
-        let mut renamings: HashMap<Kind, (Vec<RenameOperand>, Vec<RenameOperand>)> = HashMap::new();
+        // `[T; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+        // Mirrors `rpython/jit/codewriter/flatten.py:306-334 insert_renamings`
+        // which keys by kind string in a Python dict.
+        let mut renamings: [(Vec<RenameOperand>, Vec<RenameOperand>); 3] = [
+            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new()),
+        ];
         for (src, dst) in pairs {
-            let (frm, to) = renamings.entry(dst.kind).or_default();
+            let (frm, to) = &mut renamings[dst.kind.index()];
             frm.push(src);
             to.push(RenameOperand::Register(dst));
         }
         for &kind in &Kind::ALL {
-            if let Some((frm, to)) = renamings.get(&kind) {
-                for (src, dst) in reorder_renaming_list(frm, to) {
-                    match (src, dst) {
-                        (Some(src), Some(RenameOperand::Register(dst))) => {
-                            self.emitline(Insn::op_with_result(
-                                format!("{}_copy", kind.as_str()),
-                                vec![src.into_operand()],
-                                dst,
-                            ));
-                        }
-                        (Some(RenameOperand::Register(src)), None) => {
-                            self.emitline(Insn::op(
-                                format!("{}_push", kind.as_str()),
-                                vec![Operand::Register(src)],
-                            ));
-                        }
-                        (None, Some(RenameOperand::Register(dst))) => {
-                            self.emitline(Insn::op_with_result(
-                                format!("{}_pop", kind.as_str()),
-                                Vec::new(),
-                                dst,
-                            ));
-                        }
-                        other => panic!("unexpected renaming step {other:?}"),
+            let (frm, to) = &renamings[kind.index()];
+            if frm.is_empty() {
+                continue;
+            }
+            for (src, dst) in reorder_renaming_list(frm, to) {
+                match (src, dst) {
+                    (Some(src), Some(RenameOperand::Register(dst))) => {
+                        self.emitline(Insn::op_with_result(
+                            format!("{}_copy", kind.as_str()),
+                            vec![src.into_operand()],
+                            dst,
+                        ));
                     }
+                    (Some(RenameOperand::Register(src)), None) => {
+                        self.emitline(Insn::op(
+                            format!("{}_push", kind.as_str()),
+                            vec![Operand::Register(src)],
+                        ));
+                    }
+                    (None, Some(RenameOperand::Register(dst))) => {
+                        self.emitline(Insn::op_with_result(
+                            format!("{}_pop", kind.as_str()),
+                            Vec::new(),
+                            dst,
+                        ));
+                    }
+                    other => panic!("unexpected renaming step {other:?}"),
                 }
             }
         }
@@ -2042,7 +2060,7 @@ where
     pub fn enforce_input_args(
         &mut self,
         graph: &super::flow::FunctionGraph,
-        regallocs: &mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+        regallocs: &mut [super::regalloc::GraphAllocationResult; 3],
     ) {
         super::regalloc::enforce_input_args_simulation(graph, regallocs);
     }
@@ -2452,7 +2470,7 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
 /// the SSARepr — useful for tests against structural-only graphs.
 pub fn flatten_graph<'a>(
     graph: &super::flow::FunctionGraph,
-    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2469,9 +2487,10 @@ pub fn flatten_graph<'a>(
     // `regallocs[kind].coloring[variable.id]` through the closure.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
-        let color = regallocs
-            .get(&kind)
-            .and_then(|r| r.coloring.get(&variable.id).copied())
+        let color = regallocs[kind.index()]
+            .coloring
+            .get(&variable.id)
+            .copied()
             .unwrap_or(u16::MAX);
         Register::new(kind, color)
     };
