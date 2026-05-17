@@ -6171,24 +6171,21 @@ impl CodeWriter {
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
                         );
-                        // Task #48 micro-slice 8: LoadGlobal factor
-                        // refactor.  The prior `emit_residual_call(
-                        // load_global_fn_idx, ...)` call is replaced by
-                        // a single direct push of
-                        // `build_load_global_fn_residual_call_ir_r_insn`,
-                        // which produces the matching `residual_call_ir_r(
-                        // ConstInt(fn_idx), ListI([ConstInt(namei)]),
-                        // ListR([Reg(ns), Reg(code), Reg(frame)]), Descr)
-                        // → Reg(scratch_ns)` Insn shape
-                        // `emit_residual_call_shape` would have
-                        // produced.  LoadGlobal has no frontend HLOp
-                        // (no `lower_load_global_hlop_to_insn` arm);
-                        // the matching graph dual-write below is NOT
-                        // retired in this slice — incremental factor
-                        // refactor only, prepping the future
-                        // `flatten_graph(graph, regallocs)` migration.
-                        // Helper hardcodes `CallFlavor::Plain` matching
-                        // the production source at codewriter.rs:2184.
+                        // Write the load_global result directly to the
+                        // stack slot it will occupy after the push (and
+                        // after the optional NULL push for the
+                        // `raw_namei & 1` LOAD_GLOBAL(push_null) variant).
+                        // The trailing `emit_pushvalue_ref!` then sees
+                        // `src == dst` and elides its `ref_copy` per the
+                        // identity-elide guard in `emit_ref_copy!`,
+                        // matching upstream RPython where pushvalue is
+                        // symbolic and the residual_call writes directly
+                        // to the consumer slot.  Walker non-orthodoxy
+                        // retirement slice: see [[project-flatten-graph-
+                        // canonical-driver-2026-05-17]] item 1
+                        // (emit_pushvalue_ref ref_copy elimination).
+                        let null_offset: u16 = if raw_namei & 1 != 0 { 1 } else { 0 };
+                        let loaded_dst_reg = stack_base + current_depth + null_offset;
                         push_walker_emit(
                             &current_block,
                             super::flatten::build_load_global_fn_residual_call_ir_r_insn(
@@ -6197,7 +6194,7 @@ impl CodeWriter {
                                 scratch_ns,
                                 scratch_code,
                                 portal_frame_reg,
-                                scratch_ns,
+                                loaded_dst_reg,
                             ),
                         );
                         // Task #46 micro-slice 6: graph-side residual_call
@@ -6235,7 +6232,7 @@ impl CodeWriter {
                         } else {
                             None
                         };
-                        pair_walker_slot(&mut walker_slot_for_variable, loaded, scratch_ns);
+                        pair_walker_slot(&mut walker_slot_for_variable, loaded, loaded_dst_reg);
                         let result_value = loaded
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -6244,13 +6241,19 @@ impl CodeWriter {
                         // the stack TOS register and (in portal case) to the
                         // vable slot via setarrayitem_vable_r_const, leaving
                         // the scratch regs untouched for the trailing
-                        // `emit_pushvalue_ref!(scratch_ns)`.
+                        // `emit_pushvalue_ref!(loaded_dst_reg)`.
                         if raw_namei & 1 != 0 {
                             current_state.stack.push(null_stack_sentinel());
                             emit_pushvalue_ref_const!(current_depth, pyre_object::PY_NULL as i64);
                         }
                         current_state.stack.push(result_value.clone());
-                        emit_pushvalue_ref!(current_depth, scratch_ns, result_value);
+                        // `loaded_dst_reg == stack_base + current_depth` here
+                        // (computed before the optional NULL push that bumps
+                        // current_depth by `null_offset`), so the trailing
+                        // `emit_ref_copy!(stack_base + current_depth, loaded_dst_reg)`
+                        // inside `emit_pushvalue_ref!` is the identity copy
+                        // elided by `emit_ref_copy!`'s `dst != src` guard.
+                        emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value);
                     }
 
                     // RPython jtransform.py: rewrite_op_direct_call →
