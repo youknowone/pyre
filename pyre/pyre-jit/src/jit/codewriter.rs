@@ -8173,27 +8173,17 @@ impl CodeWriter {
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
 
-        // Phase 3 (b) Slice 4: env-gated invocation of the canonical
+        // Env-gated invocation of the canonical
         // `flatten_graph(graph, regallocs, _include_all_exc_links, cpu)`
         // matching upstream `rpython/jit/codewriter/flatten.py:63-70`.
-        // The result is captured in `_canonical_ssarepr` and compared
+        // The result is captured in `canonical_ssarepr` and compared
         // against the walker-emitted `ssarepr` via op-count diagnostic.
-        //
-        // This invocation surfaces the line-by-line porting gaps that
-        // block the production source-of-truth flip: any panic raised
-        // by `flatten_graph` identifies an upstream-orthodox primitive
-        // pyre's graph has not yet emitted (most likely a missing
-        // `record_graph_op` site for a walker-emit family, or an
-        // unconverted graph SpaceOp shape).
-        //
-        // Wrapped in `catch_unwind` so production stays stable while
-        // we surface the diagnostic; the wrap retires once
-        // `flatten_graph` is panic-free across all 14 production
-        // benches (upstream `codewriter.py:53` calls it
-        // unconditionally without any safety net).  Off-default;
-        // either `PYRE_PHASE3_CANONICAL_FLATTEN=1` (probe diagnostics)
-        // or `PYRE_PHASE4_USE_CANONICAL=1` (production splice)
-        // enables the canonical run.
+        // Canonical runs unwrapped (no catch_unwind) per upstream
+        // `codewriter.py:53` — panics fail loud as walker-orthodoxy
+        // regressions.  Off-default; either
+        // `PYRE_PHASE3_CANONICAL_FLATTEN=1` (probe diagnostics) or
+        // `PYRE_PHASE4_USE_CANONICAL=1` (production splice) enables the
+        // canonical run.
         if std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN").is_some()
             || std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some()
         {
