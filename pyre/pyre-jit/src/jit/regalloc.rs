@@ -653,17 +653,35 @@ pub(super) struct ExternalInputs {
 
 /// Result of `allocate_registers`.
 ///
-/// `rename` carries the per-kind `(pre_index → post_index)` map
-/// applied by `apply_rename`. `num_regs` carries the per-kind
-/// `max(color)+1` value the assembler stores in `JitCode.num_regs_*`
-/// (codewriter.py:62-67).
+/// `rename` carries the per-kind pre→post coloring map applied by
+/// `apply_rename`.  `[Vec<u16>; 3]` indexed by `Kind::index()` per
+/// [[feedback-no-hashmap-ever]] — each inner `Vec<u16>` is indexed by
+/// the pre-coloring slot and yields the post-coloring color.  Entries
+/// past the vector's length implicitly map to identity (no rename
+/// occurred for that slot).  Mirrors RPython's `(kind, pre) → post`
+/// dict at `codewriter.py:62-67` projected onto pyre's u16 slot space.
+///
+/// `num_regs` carries the per-kind `max(color)+1` value the assembler
+/// stores in `JitCode.num_regs_*` (codewriter.py:62-67).
 pub(super) struct AllocationResult {
-    pub rename: HashMap<(Kind, u16), u16>,
+    pub rename: [Vec<u16>; 3],
     /// Per-kind `max(coloring)+1` indexed by `Kind::index()` per
     /// [[feedback-no-hashmap-ever]].  Mirrors RPython
     /// `codewriter.py:62-67 num_regs[kind]` — pyre's `KINDS` array
     /// of 3 statically-known kinds collapses the dict to `[u16; 3]`.
     pub num_regs: [u16; 3],
+}
+
+/// Lookup helper for the kind-indexed rename vec: returns the post
+/// coloring for `pre`, falling back to identity when no rename was
+/// recorded.
+#[inline]
+pub(super) fn rename_lookup(rename: &[Vec<u16>; 3], kind: Kind, pre: u16) -> u16 {
+    rename[kind.index()]
+        .get(pre as usize)
+        .copied()
+        .filter(|&p| p != u16::MAX)
+        .unwrap_or(pre)
 }
 
 /// Run register allocation on `ssarepr` and produce the rename map
@@ -731,13 +749,24 @@ pub(super) fn allocate_registers(
     enforce_input_args(&mut allocators, nlocals, &inputs);
 
     // codewriter.py:62-67 `num_regs = {kind: max(coloring)+1 if coloring else 0}`.
-    let mut rename: HashMap<(Kind, u16), u16> = HashMap::new();
+    // Per-kind rename map: `[Vec<u16>; 3]` indexed by `Kind::index()`,
+    // inner Vec keyed by pre-coloring slot.  Identity entries (no
+    // rename) are left as the slot's own index; `rename_lookup` returns
+    // identity for indices past the vector length.
+    let mut rename: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut num_regs: [u16; 3] = [0; 3];
     for &kind in &Kind::ALL {
         let alloc = &allocators[kind.index()];
+        let max_pre = alloc.coloring.keys().copied().max().unwrap_or(0);
+        let kind_rename = &mut rename[kind.index()];
+        // Initialize to identity: index i → value i.
+        kind_rename.reserve_exact((max_pre as usize) + 1);
+        for i in 0..=max_pre {
+            kind_rename.push(i);
+        }
         for (&pre, &post) in alloc.coloring.iter() {
             if pre != post {
-                rename.insert((kind, pre), post);
+                kind_rename[pre as usize] = post;
             }
         }
         num_regs[kind.index()] = alloc.find_num_colors();
@@ -1180,8 +1209,8 @@ fn follow_label(
 /// but the handling is order-agnostic: if a `-live-` marker ever
 /// arrives here with registers, they'd be remapped consistently with
 /// the surrounding ops.
-pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), u16>) {
-    if rename.is_empty() {
+pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &[Vec<u16>; 3]) {
+    if rename.iter().all(|v| v.is_empty()) {
         return;
     }
     for insn in ssarepr.insns.iter_mut() {
@@ -1199,7 +1228,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
     }
 }
 
-fn rename_operand(op: &mut Operand, rename: &HashMap<(Kind, u16), u16>) {
+fn rename_operand(op: &mut Operand, rename: &[Vec<u16>; 3]) {
     match op {
         Operand::Register(reg) => rename_register(reg, rename),
         Operand::ListOfKind(lst) => {
@@ -1212,10 +1241,8 @@ fn rename_operand(op: &mut Operand, rename: &HashMap<(Kind, u16), u16>) {
 }
 
 #[inline]
-fn rename_register(reg: &mut Register, rename: &HashMap<(Kind, u16), u16>) {
-    if let Some(&new) = rename.get(&(reg.kind, reg.index)) {
-        reg.index = new;
-    }
+fn rename_register(reg: &mut Register, rename: &[Vec<u16>; 3]) {
+    reg.index = rename_lookup(rename, reg.kind, reg.index);
 }
 
 #[cfg(test)]
@@ -1448,7 +1475,7 @@ mod tests {
             portal_inputs: true,
         };
         let result = allocate_registers(&ssarepr, 2, inputs, &[]);
-        let new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         // locals 0,1 → colors 0,1; portal regs → 2,3.
         assert_eq!(new(0), 0, "local 0 must keep color 0 after enforce");
         assert_eq!(new(1), 1, "local 1 must keep color 1 after enforce");
@@ -1479,7 +1506,7 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
-        let new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
         assert_eq!(
             new(100),
@@ -1565,8 +1592,8 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
-        let new5 = result.rename.get(&(Kind::Ref, 5)).copied().unwrap_or(5);
-        let new6 = result.rename.get(&(Kind::Ref, 6)).copied().unwrap_or(6);
+        let new5 = rename_lookup(&result.rename, Kind::Ref, 5);
+        let new6 = rename_lookup(&result.rename, Kind::Ref, 6);
         assert_eq!(
             new5, new6,
             "coalesce_variables should give ref_copy src and dst the same color (got {} vs {})",
@@ -1607,7 +1634,7 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
-        let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
+        let new50 = rename_lookup(&result.rename, Kind::Ref, 50);
         assert_eq!(
             new50, 0,
             "non-inputarg reg 50 reuses dead inputarg 0's color (RPython parity)"

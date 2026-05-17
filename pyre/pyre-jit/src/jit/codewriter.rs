@@ -8251,16 +8251,10 @@ impl CodeWriter {
         // slots the assembler will actually emit; the blackhole fill
         // path must write the colored portal registers, not the
         // pre-color layout placeholders.
-        let portal_frame_reg = alloc_result
-            .rename
-            .get(&(Kind::Ref, portal_frame_reg))
-            .copied()
-            .unwrap_or(portal_frame_reg);
-        let portal_ec_reg = alloc_result
-            .rename
-            .get(&(Kind::Ref, portal_ec_reg))
-            .copied()
-            .unwrap_or(portal_ec_reg);
+        let portal_frame_reg =
+            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_frame_reg);
+        let portal_ec_reg =
+            super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, portal_ec_reg);
 
         // Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
         // `~/.claude/plans/staged-sauteeing-koala.md`): record each
@@ -8284,11 +8278,7 @@ impl CodeWriter {
         let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
         for d in 0..stack_map_len {
             let pre = stack_base + d;
-            let post = alloc_result
-                .rename
-                .get(&(Kind::Ref, pre))
-                .copied()
-                .unwrap_or(pre);
+            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
             stack_slot_color_map.push(post);
         }
         // SSA-authoritative live_r slice 3a: record each Python-semantic
@@ -8304,11 +8294,7 @@ impl CodeWriter {
         // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
-            let post = alloc_result
-                .rename
-                .get(&(Kind::Ref, i))
-                .copied()
-                .unwrap_or(i);
+            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
             pyre_color_for_semantic_local.push(post);
         }
         // After step C the chordal coloring is free to coalesce
