@@ -3145,8 +3145,9 @@ mod tests {
         for op in ops.iter() {
             let mut resolved_op = op.clone();
             // Keep the op.pos as set by the test (not overriding with index)
-            for arg in &mut resolved_op.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved_op.num_args() {
+                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
             }
             let emitted_op = match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emit_op) => {

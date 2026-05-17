@@ -3202,8 +3202,9 @@ mod tests {
         for op in ops.iter() {
             // Resolve forwarded arguments
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
 
             match pass.propagate_forward(&resolved, &mut ctx) {
@@ -3694,8 +3695,9 @@ mod tests {
         // Simulate the optimizer loop
         for (i, op) in ops.iter().enumerate() {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3745,8 +3747,9 @@ mod tests {
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for op in &ops {
                 let mut resolved = op.clone();
-                for arg in &mut resolved.args {
-                    *arg = ctx.get_box_replacement(*arg);
+                // optimizer.py:651-652 setarg loop parity.
+                for i in 0..resolved.num_args() {
+                    resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
                 }
                 match pass.propagate_forward(&resolved, &mut ctx) {
                     OptimizationResult::Emit(emitted) => {

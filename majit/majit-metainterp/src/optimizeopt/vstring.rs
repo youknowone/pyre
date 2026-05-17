@@ -1414,8 +1414,9 @@ mod tests {
         for op in ops {
             // Resolve forwarded arguments.
             let mut resolved_op = op.clone();
-            for arg in &mut resolved_op.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved_op.num_args() {
+                resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {

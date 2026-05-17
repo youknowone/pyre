@@ -644,8 +644,10 @@ impl RewriteState {
 
     fn rewrite_op(&self, op: &Op) -> Op {
         let mut rewritten = op.clone();
-        for arg in rewritten.args.iter_mut() {
-            *arg = self.resolve(*arg);
+        // optimizer.py:651-652 force_box loop parity:
+        //   for i in range(op.numargs()): op.setarg(i, ...)
+        for i in 0..rewritten.num_args() {
+            rewritten.setarg(i, self.resolve(rewritten.arg(i)));
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
@@ -756,10 +758,11 @@ impl RewriteState {
             let one = self.const_int(1);
 
             let op = &mut self.out[pz.out_index];
-            op.args[1] = scaled_start;
-            op.args[2] = scaled_len;
-            op.args[3] = one;
-            op.args[4] = one;
+            // resoperation.py:290 AbstractResOp.setarg parity.
+            op.setarg(1, scaled_start);
+            op.setarg(2, scaled_len);
+            op.setarg(3, one);
+            op.setarg(4, one);
         }
 
         // rewrite.py:760-766 — NULL-pointer writes still pending for
@@ -2365,7 +2368,7 @@ impl GcRewriterImpl {
             let new_total = st.pending_malloc_total + size;
             if self.can_use_nursery(new_total) {
                 let new_total_ref = st.const_int(new_total as i64);
-                st.out[prev_idx].args[0] = new_total_ref;
+                st.out[prev_idx].setarg(0, new_total_ref);
                 st.pending_malloc_total = new_total;
 
                 // rewrite.py:896: NURSERY_PTR_INCREMENT(last, ConstInt(previous_size))

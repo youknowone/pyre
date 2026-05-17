@@ -658,9 +658,10 @@ impl GuardStrengthenOpt {
 
     /// renamer.py:20-22: rename(op) — apply renamer map to op args.
     fn rename_op(&self, op: &mut Op) {
-        for arg in op.args.iter_mut() {
-            if let Some(&replacement) = self.renamer.get(arg) {
-                *arg = replacement;
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            if let Some(&replacement) = self.renamer.get(&arg) {
+                op.setarg(i, replacement);
             }
         }
     }

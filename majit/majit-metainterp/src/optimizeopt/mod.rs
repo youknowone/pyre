@@ -4961,9 +4961,12 @@ impl OptContext {
             1 => OpCode::GuardTrue,
             _ => return, // optimizer.py:775: strange code, just disable
         };
-        op.opcode = new_opcode;
-        op.args.clear();
-        op.args.push(arg0);
+        // optimizer.py:803 newop = self.replace_op_with(op, opnum,
+        //                                  [op.getarg(0)], descr)
+        // — produce a fresh op with new opcode and trimmed args, descr
+        // unchanged.  copy_and_change preserves fail_args / rd_resume_position
+        // / fail_arg_types for guard ops (resoperation.py:498-503).
+        *op = op.copy_and_change(new_opcode, Some(&[arg0]), None);
     }
 
     /// optimizer.py:345-364 force_box — inline equivalent for

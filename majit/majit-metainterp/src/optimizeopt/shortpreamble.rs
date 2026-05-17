@@ -2209,9 +2209,11 @@ impl ExtendedShortPreambleBuilder {
         self.short_results.clear();
         for entry in &short_preamble.ops {
             let mut op = entry.op.clone();
-            for arg in &mut op.args {
-                if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
-                    *arg = remapped;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..op.num_args() {
+                let arg = op.arg(i);
+                if let Some(&remapped) = self.phase1_to_inputarg.get(&arg) {
+                    op.setarg(i, remapped);
                 }
             }
             // RPython use_box arg loop: insert missing deps before this op.
@@ -2295,9 +2297,11 @@ impl ExtendedShortPreambleBuilder {
         }
         // Remap dep args on-the-fly (don't mutate produced_short_boxes)
         let mut dep_op = dep.preamble_op.clone();
-        for a in &mut dep_op.args {
-            if let Some(&remapped) = self.phase1_to_inputarg.get(a) {
-                *a = remapped;
+        // optimizer.py:651-652 setarg loop parity.
+        for i in 0..dep_op.num_args() {
+            let a = dep_op.arg(i);
+            if let Some(&remapped) = self.phase1_to_inputarg.get(&a) {
+                dep_op.setarg(i, remapped);
             }
         }
         // Recurse into dep's own args first (transitive). If any sub-dep
@@ -2429,9 +2433,11 @@ impl ExtendedShortPreambleBuilder {
             return op.clone();
         }
         let mut remapped = op.clone();
-        for arg in &mut remapped.args {
-            if let Some(&r) = self.phase1_to_inputarg.get(arg) {
-                *arg = r;
+        // optimizer.py:651-652 setarg loop parity.
+        for i in 0..remapped.num_args() {
+            let arg = remapped.arg(i);
+            if let Some(&r) = self.phase1_to_inputarg.get(&arg) {
+                remapped.setarg(i, r);
             }
         }
         remapped
@@ -2729,9 +2735,10 @@ pub fn produced_short_boxes_from_exported_boxes(
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
             let mut preamble_op = entry.op.clone();
-            for arg in &mut preamble_op.args {
-                if let Some(renamed) = inputarg_rename(*arg) {
-                    *arg = renamed;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..preamble_op.num_args() {
+                if let Some(renamed) = inputarg_rename(preamble_op.arg(i)) {
+                    preamble_op.setarg(i, renamed);
                 }
             }
             if let Some(fail_args) = preamble_op.fail_args_mut() {

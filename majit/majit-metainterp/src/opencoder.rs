@@ -460,10 +460,10 @@ impl<'a> TraceIterator<'a> {
         let src = &self.trace[self.pos];
         self.pos += 1;
         let mut res = src.clone();
-        // for i in range(argnum):
+        // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
-        for arg in res.args.iter_mut() {
-            *arg = self._untag(*arg);
+        for i in 0..res.num_args() {
+            res.setarg(i, self._untag(res.arg(i)));
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {

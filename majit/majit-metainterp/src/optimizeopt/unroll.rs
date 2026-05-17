@@ -3375,7 +3375,8 @@ impl OptUnroll {
                 let mut new_op = sp_op.clone();
                 // unroll.py:404: _map_args(mapping, sop.getarglist())
                 // Const passes through unchanged, non-Const must be in mapping.
-                for arg in &mut new_op.args {
+                for i in 0..new_op.num_args() {
+                    let arg = new_op.arg(i);
                     // unroll.py:367: isinstance(box, Const) — true Const objects
                     // only (ConstInt/ConstPtr/ConstFloat). make_constant'd values
                     // are NOT Const objects — they are regular boxes with forwarded
@@ -3388,8 +3389,8 @@ impl OptUnroll {
                     // jump_args, extended by mapping[sop] = op). Missing keys
                     // indicate a structural mismatch (e.g., cross-loop bridge
                     // with incompatible short preamble). Raise InvalidLoop.
-                    match mapping.get(arg) {
-                        Some(&mapped) => *arg = mapped,
+                    match mapping.get(&arg) {
+                        Some(&mapped) => new_op.setarg(i, mapped),
                         None => {
                             // RPython: _map_args raises KeyError for unmapped
                             // args. This is equivalent to InvalidLoop — the
@@ -4789,9 +4790,11 @@ impl OptUnroll {
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             let mut peeled = op.clone();
             peeled.pos.set(new_pos);
-            for arg in &mut peeled.args {
-                if let Some(&new_ref) = ref_map.get(arg) {
-                    *arg = new_ref;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..peeled.num_args() {
+                let arg = peeled.arg(i);
+                if let Some(&new_ref) = ref_map.get(&arg) {
+                    peeled.setarg(i, new_ref);
                 }
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
@@ -4836,9 +4839,11 @@ impl OptUnroll {
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             let mut body_op = op.clone();
             body_op.pos.set(new_pos);
-            for arg in &mut body_op.args {
-                if let Some(&new_ref) = orig_ref_map.get(arg) {
-                    *arg = new_ref;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..body_op.num_args() {
+                let arg = body_op.arg(i);
+                if let Some(&new_ref) = orig_ref_map.get(&arg) {
+                    body_op.setarg(i, new_ref);
                 }
             }
             if let Some(fa) = body_op.fail_args_mut() {
@@ -4947,9 +4952,11 @@ impl Optimization for OptUnroll {
             // Emit the final Jump with remapped args pointing to the
             // body iteration's ops.
             let mut jump = op.clone();
-            for arg in &mut jump.args {
-                if let Some(&new_ref) = orig_ref_map.get(arg) {
-                    *arg = new_ref;
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..jump.num_args() {
+                let arg = jump.arg(i);
+                if let Some(&new_ref) = orig_ref_map.get(&arg) {
+                    jump.setarg(i, new_ref);
                 }
             }
             // Reserve the Jump's own position so it lands above any

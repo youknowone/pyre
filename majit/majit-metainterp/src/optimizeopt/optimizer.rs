@@ -2358,8 +2358,11 @@ impl Optimizer {
             // Phase 2: re-resolve after forcing (force may have changed forwarding)
             // and fix Ref→non-Ref type crossings by force_box
             let mut force_needed: Vec<usize> = Vec::new();
-            for (i, arg) in terminal_op.args.iter_mut().enumerate() {
-                let resolved = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 force_box loop parity:
+            //   for i in range(op.numargs()): op.setarg(i, force_box(...))
+            for i in 0..terminal_op.num_args() {
+                let arg = terminal_op.arg(i);
+                let resolved = ctx.get_box_replacement(arg);
                 let expected_ref =
                     i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
                 // setup_optimizations seeds `trace_inputarg_types` into
@@ -2375,7 +2378,7 @@ impl Optimizer {
                     ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
                 if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
                     let arg_is_virtual = ctx
-                        .get_box_replacement_box(*arg)
+                        .get_box_replacement_box(arg)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
@@ -2393,13 +2396,13 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    *arg = resolved;
+                    terminal_op.setarg(i, resolved);
                 }
             }
             for i in force_needed {
-                let original = terminal_op.args[i];
+                let original = terminal_op.arg(i);
                 let forced = self.force_box(original, &mut ctx);
-                terminal_op.args[i] = ctx.get_box_replacement(forced);
+                terminal_op.setarg(i, ctx.get_box_replacement(forced));
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
@@ -2677,8 +2680,9 @@ impl Optimizer {
                     // calls can diverge when forwarding chains differ.
                     // Use canonical_result (resolved key) for both.
                     preamble_op.pos.set(canonical_result);
-                    for arg in &mut preamble_op.args {
-                        *arg = ctx.get_box_replacement(*arg);
+                    // optimizer.py:651-652 force_box loop parity.
+                    for i in 0..preamble_op.num_args() {
+                        preamble_op.setarg(i, ctx.get_box_replacement(preamble_op.arg(i)));
                     }
                     if let Some(fail_args) = preamble_op.fail_args_mut() {
                         for arg in fail_args {
@@ -2999,9 +3003,10 @@ impl Optimizer {
 
             // Apply remap to all args and fail_args
             for op in &mut ctx.new_operations {
-                for arg in &mut op.args {
+                for i in 0..op.num_args() {
+                    let arg = op.arg(i);
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
-                        *arg = arg.with_raw(new_pos);
+                        op.setarg(i, arg.with_raw(new_pos));
                     }
                 }
                 if let Some(fail_args) = op.fail_args_mut() {
@@ -3062,8 +3067,10 @@ impl Optimizer {
                     let mut new_pos = entry.op.pos.get();
                     remap_opref(&mut new_pos);
                     entry.op.pos.set(new_pos);
-                    for arg in &mut entry.op.args {
-                        remap_opref(arg);
+                    for i in 0..entry.op.num_args() {
+                        let mut arg = entry.op.arg(i);
+                        remap_opref(&mut arg);
+                        entry.op.setarg(i, arg);
                     }
                     if let Some(fa) = entry.op.fail_args_mut() {
                         for arg in fa.iter_mut() {
@@ -3543,8 +3550,9 @@ impl Optimizer {
         // post-`replace_op(_, const_target)` and de-sync from the
         // numbering snapshot.
         let mut resolved_op = op.clone();
-        for arg in &mut resolved_op.args {
-            *arg = ctx.get_box_replacement(*arg);
+        // optimizer.py:651-652 force_box loop parity.
+        for i in 0..resolved_op.num_args() {
+            resolved_op.setarg(i, ctx.get_box_replacement(resolved_op.arg(i)));
         }
 
         let mut current_op = resolved_op;

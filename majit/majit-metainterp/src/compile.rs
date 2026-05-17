@@ -1720,20 +1720,22 @@ pub(crate) fn normalize_closing_jump_args(
         return ops;
     };
 
-    for (idx, arg) in jump.args.iter_mut().enumerate() {
+    // optimizer.py:651-652 setarg loop parity.
+    for idx in 0..jump.num_args() {
         if idx >= label_args.len() {
             break;
         }
+        let arg = jump.arg(idx);
         if constants.contains_key(&arg.raw()) {
             continue;
         }
         if (arg.raw() as usize) < num_inputs {
             continue;
         }
-        if defined.contains(arg) {
+        if defined.contains(&arg) {
             continue;
         }
-        *arg = label_args[idx];
+        jump.setarg(idx, label_args[idx]);
     }
 
     ops

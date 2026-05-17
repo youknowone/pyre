@@ -516,8 +516,10 @@ impl TreeLoop {
                 new_inputargs_count + pi as u32,
                 new_op.opcode.result_type(),
             ));
-            for arg in new_op.args.iter_mut() {
-                *arg = remap_ref(arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..new_op.num_args() {
+                let arg = new_op.arg(i);
+                new_op.setarg(i, remap_ref(&arg));
             }
             // Prefix ops don't need fail_args (they're not guards).
             new_op.clearfailargs();
@@ -533,8 +535,10 @@ impl TreeLoop {
                 new_inputargs_count + prefix_count + i as u32,
                 new_op.opcode.result_type(),
             ));
-            for arg in new_op.args.iter_mut() {
-                *arg = remap_ref(arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for j in 0..new_op.num_args() {
+                let arg = new_op.arg(j);
+                new_op.setarg(j, remap_ref(&arg));
             }
             if let Some(fa) = new_op.fail_args_mut() {
                 for arg in fa.iter_mut() {

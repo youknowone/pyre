@@ -36,9 +36,14 @@ impl Renamer {
 
     /// renamer.py:20-31: rename — apply renaming to all args and fail_args of an op.
     pub fn rename(&self, op: &mut Op) -> bool {
-        for arg in op.args.iter_mut() {
-            if let Some(&renamed) = self.rename_map.get(arg) {
-                *arg = renamed;
+        // renamer.py:21-23:
+        //   for i, arg in enumerate(op.getarglist()):
+        //       arg = self.rename_map.get(arg, arg)
+        //       op.setarg(i, arg)
+        for i in 0..op.num_args() {
+            let arg = op.arg(i);
+            if let Some(&renamed) = self.rename_map.get(&arg) {
+                op.setarg(i, renamed);
             }
         }
 

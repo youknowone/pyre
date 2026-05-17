@@ -151,9 +151,11 @@ impl VectorLoop {
                     remap.insert(op.pos.get(), new_pos);
                 }
                 new_op.pos.set(new_pos);
-                for arg in &mut new_op.args {
-                    if let Some(&mapped) = remap.get(arg) {
-                        *arg = mapped;
+                // optimizer.py:651-652 setarg loop parity.
+                for i in 0..new_op.num_args() {
+                    let arg = new_op.arg(i);
+                    if let Some(&mapped) = remap.get(&arg) {
+                        new_op.setarg(i, mapped);
                     }
                 }
                 if let Some(fa) = new_op.fail_args_mut() {
@@ -169,8 +171,10 @@ impl VectorLoop {
 
         // Update jump args
         if let Some(ref mut jump) = self.jump {
-            for _arg in &mut jump.args {
-                // Use latest remap if available
+            // Use latest remap if available — currently a placeholder; loop
+            // body intentionally empty (preserved from original).
+            for _i in 0..jump.num_args() {
+                // optimizer.py:651-652 setarg loop parity (placeholder).
             }
         }
         self.unroll_factor = count + 1;

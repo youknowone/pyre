@@ -1091,8 +1091,9 @@ impl OptHeap {
         }
 
         // Non-virtual path: resolve forwarding and route after heap
-        for arg in op.args.iter_mut() {
-            *arg = ctx.get_box_replacement(*arg);
+        // optimizer.py:651-652 setarg loop parity.
+        for i in 0..op.num_args() {
+            op.setarg(i, ctx.get_box_replacement(op.arg(i)));
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
@@ -1205,8 +1206,9 @@ impl OptHeap {
             // heap.py:621: cf.force_lazy_set(self, descr) →
             // invalidate first, then emit_extra(op, emit=False),
             // then put_field_back_to_info restores the cache.
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..op.num_args() {
+                op.setarg(i, ctx.get_box_replacement(op.arg(i)));
             }
             let final_value = op.arg(1);
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
@@ -1258,8 +1260,9 @@ impl OptHeap {
                 continue;
             }
 
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..op.num_args() {
+                op.setarg(i, ctx.get_box_replacement(op.arg(i)));
             }
             let final_value = op.arg(2);
             let array_ref = op.arg(0);
@@ -1757,8 +1760,9 @@ impl OptHeap {
             if let Some(cf) = self.get_cached_field_mut(&descr) {
                 cf.invalidate(&descr, ctx);
             }
-            for arg in pending_op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..pending_op.num_args() {
+                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i)));
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
@@ -1788,8 +1792,9 @@ impl OptHeap {
             }
         }
         for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
-            for arg in pending_op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..pending_op.num_args() {
+                pending_op.setarg(i, ctx.get_box_replacement(pending_op.arg(i)));
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -4311,8 +4316,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4640,8 +4646,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5191,8 +5198,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5693,8 +5701,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5761,8 +5770,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5867,8 +5877,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -5952,8 +5963,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6030,8 +6042,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6107,8 +6120,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6183,8 +6197,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6383,8 +6398,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6443,8 +6459,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -6501,8 +6518,9 @@ mod tests {
 
         for op in &ops {
             let mut resolved = op.clone();
-            for arg in &mut resolved.args {
-                *arg = ctx.get_box_replacement(*arg);
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
