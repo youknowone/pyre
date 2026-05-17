@@ -129,39 +129,6 @@ pub fn jit_exc_type_addr() -> usize {
     &JIT_EXC_TYPE as *const _ as usize
 }
 
-/// Process-shared `propagate_exception_descr` pointer.  Published by
-/// `set_propagate_exception_descr` on every CPU install so the
-/// process-shared malloc slowpath trampoline can bake the descr
-/// pointer at build time — PyPy's per-CPU `_build_propagate_exception_path`
-/// (`x86/assembler.py:328`) does the same thing from CPU-local state.
-static PROPAGATE_EXCEPTION_DESCR_PTR: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
-
-/// Backend-only hook: stash `Arc::as_ptr(...) as i64` so subsequent
-/// trampoline builds can embed the value.
-pub fn propagate_exception_descr_ptr_install(ptr: i64) {
-    PROPAGATE_EXCEPTION_DESCR_PTR.store(ptr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Backend-only hook: read the most recently published
-/// `propagate_exception_descr` pointer; zero means no CPU has
-/// installed one yet (test harness or pre-finish-setup), in which case
-/// the malloc trampoline skips the OOM propagate body and lets the
-/// real failure surface through the caller as before.
-pub fn propagate_exception_descr_ptr_load() -> i64 {
-    PROPAGATE_EXCEPTION_DESCR_PTR.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Address of the process-shared `PROPAGATE_EXCEPTION_DESCR_PTR`
-/// atomic for direct memory load from JIT-emitted code.  The malloc
-/// slowpath trampoline's OOM branch reads the descr indirectly
-/// through this address so a descr installed *after* the trampoline
-/// was built still takes effect (the trampoline is built lazily on
-/// first malloc, which can pre-date `MetaInterp::finish_setup`).
-pub fn propagate_exception_descr_ptr_addr() -> usize {
-    &PROPAGATE_EXCEPTION_DESCR_PTR as *const _ as usize
-}
-
 /// Override the JITFRAME type id used by dynasm nursery slow paths.
 ///
 /// The frontend registers `jitframe_type_info()` on its active GC before

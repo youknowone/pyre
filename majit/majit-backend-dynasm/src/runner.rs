@@ -359,8 +359,14 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     result.unwrap_or_else(|| {
         let total = base_size as usize + item_size as usize * length as usize + gc_hdr;
         unsafe {
+            // `libc::calloc` returns NULL on real OOM; the previous
+            // unconditional `raw + gc_hdr` masked failure as a tiny
+            // non-zero "valid" payload pointer and let the JIT continue
+            // past the failure.  Mirror `dynasm_nursery_slowpath`'s
+            // OOM-null preservation so the caller's TEST/JZ propagate
+            // path can fire on real OOM.
             let raw = libc::calloc(1, total) as u64;
-            raw + gc_hdr as u64
+            if raw == 0 { 0 } else { raw + gc_hdr as u64 }
         }
     })
 }
@@ -1650,13 +1656,12 @@ impl Backend for DynasmBackend {
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
         // x86/assembler.py:328 `_build_propagate_exception_path` parity:
         // PyPy bakes `propagate_exception_descr` into the per-CPU
-        // trampoline at setup time.  Pyre's malloc trampoline is
-        // process-shared (lazy `OnceLock`), so it needs a process-wide
-        // hand-off; we publish the descr pointer here.  In single-CPU
-        // configurations subsequent installs overwrite, and we treat
-        // any post-overwrite trampoline build as picking up the latest.
-        let ptr = std::sync::Arc::as_ptr(&descr) as *const () as i64;
-        crate::propagate_exception_descr_ptr_install(ptr);
+        // trampoline at setup time.  Pyre's per-CPU malloc trampoline
+        // reads the descr directly from `descr_attachments` at build
+        // time (keyed by `Arc::as_ptr(cpu_handle)` in
+        // `MALLOC_SLOWPATH_FIXED`), so no separate publish step is
+        // needed — the install below makes the descr visible to any
+        // subsequent trampoline build on this CPU.
         self.descr_attachments
             .write()
             .unwrap()

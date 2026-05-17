@@ -208,13 +208,38 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// `edx` is the runtime size carrier and the caller's regalloc has
 /// already spilled any live value out of both before the call via
 /// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
-static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+///
+/// Per-CPU storage matches PyPy's `_build_malloc_slowpath`
+/// (`x86/assembler.py:231`), which is materialised on each CPU
+/// instance at `setup_once` with that CPU's `propagate_exception_descr`
+/// baked in.  Pyre keys by `Arc::as_ptr(cpu_handle)` so two CPU
+/// instances in the same process — common in tests, possible if a
+/// hosting runtime swaps backends — receive distinct trampolines and
+/// distinct baked descrs.  Old entries leak when the CPU is dropped;
+/// matches PyPy's `asmmemmgr` lifetime where the slowpath buffer
+/// outlives the assembler.
+type MallocTrampolineCache =
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<std::sync::OnceLock<usize>>>>;
+static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<MallocTrampolineCache> =
+    std::sync::OnceLock::new();
 
-pub(crate) fn malloc_slowpath_fixed_addr() -> usize {
-    *MALLOC_SLOWPATH_FIXED.get_or_init(build_malloc_slowpath_fixed)
+pub(crate) fn malloc_slowpath_fixed_addr(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
+    let cpu_id = std::sync::Arc::as_ptr(cpu_handle) as usize;
+    let cache = MALLOC_SLOWPATH_FIXED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Hold the lock just long enough to look up or insert a fresh
+    // `OnceLock` for this CPU; release before calling the builder so
+    // a concurrent compile on another CPU is not blocked.
+    let slot = {
+        let mut map = cache.lock().unwrap();
+        map.entry(cpu_id)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new()))
+            .clone()
+    };
+    *slot.get_or_init(|| build_malloc_slowpath_fixed(cpu_handle))
 }
 
-fn build_malloc_slowpath_fixed() -> usize {
+fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
@@ -327,34 +352,40 @@ fn build_malloc_slowpath_fixed() -> usize {
     // and JMPs to the per-CPU `propagate_exception_path` which the
     // setup-time builder materialised alongside the slowpath.
     //
-    // Pyre's process-shared trampoline cannot bake per-CPU descr at
-    // build time — the trampoline is built lazily on first malloc and
-    // may pre-date the CPU's `set_propagate_exception_descr` call.
-    // Read the descr pointer indirectly through the
-    // `PROPAGATE_EXCEPTION_DESCR_PTR` atomic at run time; a zero load
-    // (test harness or pre-finish-setup) skips the propagate body and
-    // falls through to a plain RET with `rcx = 0`, so the prior
-    // call-site behaviour is preserved.
-    let propagate_addr = crate::propagate_exception_descr_ptr_addr() as i64;
+    // Pyre matches that lifetime: this trampoline is materialised
+    // per-CPU (keyed by `Arc::as_ptr(cpu_handle)`) and the descr
+    // pointer is read directly from the CPU's
+    // `descr_ptrs().propagate_exception_descr` and baked as a 64-bit
+    // immediate.  `compile_loop` always runs after
+    // `MetaInterp::finish_setup` installs the descr, so the build
+    // observes a non-zero pointer in production.  If a test harness
+    // builds the trampoline before any CPU has installed a descr,
+    // the build asserts — there is no fall-through "no-descr" path,
+    // matching PyPy's strict invariant.
+    let propagate_descr = cpu_handle
+        .read()
+        .unwrap()
+        .descr_ptrs()
+        .propagate_exception_descr as i64;
+    assert!(
+        propagate_descr != 0,
+        "build_malloc_slowpath_fixed: cpu_handle.propagate_exception_descr \
+         must be installed (pyjitpl.py:2283) before the first malloc \
+         trampoline build on this CPU"
+    );
     let exc_value_addr = crate::jit_exc_value_addr() as i64;
     let exc_type_addr = crate::jit_exc_type_addr() as i64;
     let success = asm.new_dynamic_label();
-    let no_descr = asm.new_dynamic_label();
     dynasm!(asm ; .arch x64
         ; test rax, rax
         ; jnz =>success
-        // Load propagate_descr from the process-shared atomic.
-        ; mov rcx, QWORD propagate_addr
-        ; mov rcx, [rcx]
-        ; test rcx, rcx
-        ; jz =>no_descr
         // assembler.py:1826-1843 `_store_and_reset_exception(self.mc, eax)`:
         // read pos_exc_value into RAX, clear both globals.  On real
         // OOM pos_exc_value is typically already NULL — the propagate
         // descr's `handle_fail` raises MemoryError directly — but
         // mirror the structure regardless.
         ; mov rax, QWORD exc_value_addr
-        // Use R11 (X86_64_SCRATCH_REG) so RCX still holds propagate_descr.
+        // Use R11 (X86_64_SCRATCH_REG) so RCX is free for the descr.
         ; mov r11, [rax]
         ; mov QWORD [rax], 0
         ; mov rax, QWORD exc_type_addr
@@ -362,6 +393,7 @@ fn build_malloc_slowpath_fixed() -> usize {
         // assembler.py:336-337 — MOV [jf_guard_exc], pos_exc_value
         ; mov [rbp + JF_GUARD_EXC_OFS], r11
         // assembler.py:339-340 — MOV [jf_descr], propagate_descr
+        ; mov rcx, QWORD propagate_descr
         ; mov [rbp + JF_DESCR_OFS], rcx
         // assembler.py:321 `ADD esp, WORD` — pop the trampoline's
         // own CALL return address so `_call_footer` sees rsp at the
@@ -370,13 +402,6 @@ fn build_malloc_slowpath_fixed() -> usize {
         ; add rsp, 8
     );
     emit_call_footer_raw(&mut asm);
-
-    // No-descr fallthrough: pre-finish-setup path leaves ECX zero and
-    // falls into the pop_all + RET below so the caller observes a
-    // NULL payload exactly as the pre-OOM-check trampoline did.
-    dynasm!(asm ; .arch x64 ; =>no_descr ; xor ecx, ecx);
-    pop_all_regs_from_jitframe_raw(&mut asm, &ignored, true);
-    dynasm!(asm ; .arch x64 ; ret);
 
     dynasm!(asm ; .arch x64 ; =>success);
     // assembler.py:304 `MOV_rr(ecx, eax)` — deliver the helper return
@@ -3906,6 +3931,12 @@ impl<'a> Assembler386<'a> {
                 // moved jitframe's gcmap published — a stale gcmap that
                 // a subsequent collecting call would walk.
                 self.reload_frame_if_necessary();
+                // assembler.py:300-322 OOM propagate parity — the
+                // jitframe helper returns NULL on `libc::calloc` /
+                // `gc.alloc_nursery_*` failure; surface that through
+                // `propagate_exception_descr` rather than letting the
+                // caller proceed with a null jitframe.
+                self.emit_propagate_exception_if_zero(0);
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if result_reg.value != 0 {
@@ -3958,6 +3989,13 @@ impl<'a> Assembler386<'a> {
                 // gcmap, otherwise the clear would target the freed
                 // nursery copy.
                 self.reload_frame_if_necessary();
+                // assembler.py:300-322 OOM propagate parity — the
+                // varsize helper now returns NULL on `libc::calloc`
+                // / `gc.alloc_varsize` failure; route that through
+                // `propagate_exception_descr` rather than letting the
+                // caller store a near-zero garbage pointer into the
+                // result slot.
+                self.emit_propagate_exception_if_zero(0);
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -7287,7 +7325,7 @@ impl<'a> Assembler386<'a> {
         } else {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
-        let helper_addr = malloc_slowpath_fixed_addr() as i64;
+        let helper_addr = malloc_slowpath_fixed_addr(&self.cpu_handle) as i64;
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD helper_addr
             ; call rax
