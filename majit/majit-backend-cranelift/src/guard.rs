@@ -1031,7 +1031,16 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn force_token_slots(&self) -> Vec<usize> {
-        self.force_token_slots_view().to_vec()
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or_else(Vec::new, |fd| fd.force_token_slots())
+    }
+
+    fn set_force_token_slots(&self, slots: Vec<usize>) {
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_force_token_slots(slots);
+        }
     }
 
     /// Forward through `meta_descr` so external callers reaching the
@@ -1041,7 +1050,70 @@ impl FailDescr for CraneliftFailDescr {
     /// Without this override the trait default `None` would mask the
     /// meta-side slot whenever the descr is downcast to `&dyn FailDescr`.
     fn source_op_index(&self) -> Option<usize> {
-        self.source_op_index_ref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.source_op_index())
+    }
+
+    fn set_source_op_index(&self, source_op_index: usize) {
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_source_op_index(source_op_index);
+        }
+    }
+
+    fn fail_count(&self) -> u32 {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.fail_count())
+    }
+
+    fn increment_fail_count(&self) -> u32 {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.increment_fail_count())
+    }
+
+    fn set_trace_info_any(&self, info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_trace_info_any(info);
+        }
+    }
+
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.bridge_cache_addrs())
+    }
+
+    fn bridge_code_ptr(&self) -> usize {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.bridge_code_ptr())
+    }
+
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.store_bridge_caches(code_ptr, frame_depth);
+        }
+    }
+
+    fn bridge_dispatch_load(&self) -> *mut () {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(std::ptr::null_mut(), |fd| fd.bridge_dispatch_load())
+    }
+
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(std::ptr::null_mut(), |fd| fd.bridge_dispatch_swap(new_ptr, drop_fn))
     }
 
     /// Forward through `meta_descr` so the `fail_descr_trace_info` free
