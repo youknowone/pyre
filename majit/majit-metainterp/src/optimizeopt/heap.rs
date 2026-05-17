@@ -1794,7 +1794,7 @@ impl OptHeap {
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(2);
             let array_ref = pending_op.arg(0);
-            let descr = pending_op.descr.clone();
+            let descr = pending_op.getdescr();
             let put_back_op = pending_op.clone();
             ctx.emit_extra(heap_pass_idx, pending_op);
             self.cache_arrayitem(array_ref, descr_idx, index, descr.as_ref());

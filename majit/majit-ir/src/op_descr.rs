@@ -24,23 +24,26 @@ use crate::value::Const;
 
 impl Op {
     /// `resoperation.py:244 AbstractResOpOrInputArg.getdescr` + `:462
-    /// ResOpWithDescr.getdescr` parity. Returns an owned clone of the
-    /// `Option<DescrRef>` so callers can chain `.as_ref()`, `.expect()`,
-    /// or pattern-match without holding a reference across the call.
+    /// ResOpWithDescr.getdescr` parity. Returns an owned `Arc` clone of
+    /// the `DescrRef` so callers can chain `.as_ref()`, `.expect()`, or
+    /// pattern-match without holding a `RefCell` borrow across the call.
     pub fn getdescr(&self) -> Option<DescrRef> {
-        self.descr.clone()
+        self.descr.borrow().clone()
     }
 
     /// `resoperation.py:465 ResOpWithDescr.setdescr` parity — overwrites
-    /// the descr slot.
-    pub fn setdescr(&mut self, descr: DescrRef) {
-        self.descr = Some(descr);
+    /// the descr slot.  Takes `&self` (interior mutability) so callers
+    /// holding a shared `Op` (e.g., through `Rc<Op>`) can stamp a fresh
+    /// descr the same way RPython's `op.setdescr(d)` writes on a shared
+    /// Python object.
+    pub fn setdescr(&self, descr: DescrRef) {
+        *self.descr.borrow_mut() = Some(descr);
     }
 
     /// `resoperation.py:474 ResOpWithDescr.cleardescr` parity — clears
     /// the descr slot.
-    pub fn cleardescr(&mut self) {
-        self.descr = None;
+    pub fn cleardescr(&self) {
+        *self.descr.borrow_mut() = None;
     }
 
     // `has_descr` lives in `resoperation.rs` so the build-script
@@ -50,8 +53,11 @@ impl Op {
     /// Project the descr (if any) through a closure operating on a
     /// `&dyn Descr`. `f` may freely return owned values derived from
     /// borrowed projections (`as_field_descr`, `as_array_descr`, etc.).
+    /// Holds the descr `Ref` for the duration of `f`; the inner trait
+    /// object lives behind `Arc`, so callers can safely keep an owned
+    /// clone if they need to outlive the borrow.
     pub fn project_descr<R>(&self, f: impl FnOnce(&dyn Descr) -> R) -> Option<R> {
-        self.descr.as_ref().map(|d| f(&**d))
+        self.descr.borrow().as_ref().map(|d| f(&**d))
     }
 
     /// `as_field_descr` shortcut.
@@ -109,22 +115,34 @@ impl Op {
     /// stays valid even after the `op.descr` field is later wrapped in
     /// `RefCell` (`Vec<Rc<Op>>`-era migration).
     pub fn resolved_rd_numb(&self) -> Option<Arc<[u8]>> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_numb_arc()
+        self.descr.borrow().as_ref()?.as_fail_descr()?.rd_numb_arc()
     }
 
     /// Same as `resolved_rd_numb` but for the `rd_consts` const pool.
     pub fn resolved_rd_consts(&self) -> Option<Arc<[Const]>> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_consts_arc()
+        self.descr
+            .borrow()
+            .as_ref()?
+            .as_fail_descr()?
+            .rd_consts_arc()
     }
 
     /// Same as `resolved_rd_numb` but for the `rd_virtuals` table.
     pub fn resolved_rd_virtuals(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_virtuals_arc()
+        self.descr
+            .borrow()
+            .as_ref()?
+            .as_fail_descr()?
+            .rd_virtuals_arc()
     }
 
     /// Same as `resolved_rd_numb` but for the `rd_pendingfields` table.
     pub fn resolved_rd_pendingfields(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
-        self.descr.as_ref()?.as_fail_descr()?.rd_pendingfields_arc()
+        self.descr
+            .borrow()
+            .as_ref()?
+            .as_fail_descr()?
+            .rd_pendingfields_arc()
     }
 
     /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`

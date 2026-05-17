@@ -3373,7 +3373,7 @@ impl<'a> AssemblerARM64<'a> {
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
         // `build_guard_metadata` (`compile.rs:232`) re-stamps.
-        if let Some(d) = op.descr.as_ref() {
+        if let Some(d) = op.getdescr() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -3383,7 +3383,7 @@ impl<'a> AssemblerARM64<'a> {
         }
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
-        } else if let Some(d) = op.descr.clone() {
+        } else if let Some(d) = op.getdescr() {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
             // directly; per-trace fail_index / trace_id were stamped
@@ -4065,7 +4065,7 @@ impl<'a> AssemblerARM64<'a> {
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
-        if let Some(d) = next_op.descr.as_ref() {
+        if let Some(d) = next_op.getdescr() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -4073,7 +4073,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
         }
-        let descr: majit_ir::DescrRef = if let Some(d) = next_op.descr.clone() {
+        let descr: majit_ir::DescrRef = if let Some(d) = next_op.getdescr() {
             // Same staleness guard as the main guard-emission path: keep
             // descriptor `fail_arg_types` in sync with the inferred list
             // so downstream GC-map / rd_locs readers see the right Ref

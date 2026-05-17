@@ -406,17 +406,17 @@ pub fn diff_recorded_ops(production: &[Op], shadow: &[Op]) -> Option<String> {
                 s.args.as_slice(),
             ));
         }
-        match (&p.descr, &s.descr) {
+        match (p.getdescr(), s.getdescr()) {
             (None, None) => {}
             (Some(pd), Some(sd)) => {
-                if !std::sync::Arc::ptr_eq(pd, sd) {
+                if !std::sync::Arc::ptr_eq(&pd, &sd) {
                     return Some(format!(
                         "shadow_walker: op[{}] ({:?}) descr identity mismatch — \
                          production={:p}, shadow={:p}",
                         idx,
                         p.opcode,
-                        std::sync::Arc::as_ptr(pd),
-                        std::sync::Arc::as_ptr(sd),
+                        std::sync::Arc::as_ptr(&pd),
+                        std::sync::Arc::as_ptr(&sd),
                     ));
                 }
             }
