@@ -8472,7 +8472,7 @@ impl CodeWriter {
                 &link_name_overrides,
                 &block_py_pc_overrides,
                 &live_force_alive_ops,
-                false,
+                std::env::var_os("PYRE_PHASE4_INCLUDE_ALL_EXC_LINKS").is_some(),
                 Some(self.cpu()),
             );
             // Op-only counts (filter out scaffold: Label, PcAnchor,
