@@ -674,6 +674,29 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
     }
 }
 
+/// Returns `true` for HLOp opnames that pyre's walker emits for shadow
+/// consistency with upstream `flowcontext.py` / `flowobject.py` but
+/// whose RPython-orthodox rtyper rewrites (typically `rclass.rtype_type`
+/// / `rclass.rtype_getattr`) pyre's pipeline does not run.  The
+/// canonical `flatten_graph` driver elides these HLOps under
+/// `lowering_ctx` so the resulting `SSARepr` doesn't emit a literal
+/// Insn opname that the runtime cannot dispatch.
+///
+/// `type` — emitted by `codewriter.rs::explicit_raise_exception_pair`
+/// mirroring `flowcontext.py:635 op.type(w_value)`.  The HLOp result
+/// Variable is consumed via `link.last_exception`; the link's
+/// `generate_last_exc` emits a `last_exception` Insn that produces the
+/// type via TLS, so eliding the `type` HLOp itself is safe (the
+/// Variable's color stays allocated and gets written by
+/// `last_exception` at the catch landing).  Upstream `rclass.py:828
+/// rtype_type` rewrites this to `getfield_gc_r(v, '__class__')` —
+/// pyre's runtime exception model bakes type into per-subclass
+/// `W_TypeObject` (see [[project-exception-per-kind-pytype]]) so the
+/// `getfield_gc_r` shape is not required.
+fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
+    matches!(opname, "type")
+}
+
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
@@ -1286,6 +1309,18 @@ where
         // splits out the per-op lowering (HLOp dispatch + arg /
         // result handling); the `emitline` call below matches
         // upstream's final push.
+        //
+        // Pyre-specific elide arm (canonical-driver-only): certain
+        // HLOps emitted by pyre's walker for shadow consistency with
+        // upstream `flowcontext.py` have no runtime Insn counterpart
+        // and would be unsafe to emit literally.  Elide them only
+        // under `lowering_ctx` (canonical production path); the
+        // non-lowering path keeps upstream passthrough behavior
+        // (preserves `graph_flattener_emits_generic_result_op` test
+        // semantics).  See [[project-flatten-graph-canonical-driver-2026-05-17]].
+        if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
+            return;
+        }
         let insn = self.flatten_space_operation(op);
         self.emitline(insn);
     }
