@@ -2631,10 +2631,9 @@ impl GcRewriterImpl {
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }
-        call_asm.fail_args = op
-            .fail_args
-            .as_ref()
-            .map(|fa| fa.iter().map(|&a| st.resolve(a)).collect());
+        if let Some(fa) = op.getfailargs() {
+            call_asm.setfailargs(fa.iter().map(|&a| st.resolve(a)).collect());
+        }
         st.emit_rewritten_from(op, call_asm);
     }
 }
