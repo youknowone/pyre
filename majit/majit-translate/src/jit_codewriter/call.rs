@@ -4506,7 +4506,7 @@ fn resolve_array_identity(
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
     value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
-    phi_sources: &HashMap<crate::model::ValueId, LinkArg>,
+    phi_sources: &HashMap<crate::model::ValueId, Option<LinkArg>>,
     cc: &CallControl,
 ) -> Option<String> {
     fn producer_array_identity(
@@ -4569,7 +4569,10 @@ fn resolve_array_identity(
                 if let Some(identity) = producer_array_identity(vid, value_producers, cc) {
                     return Some(identity);
                 }
-                let Some(next) = phi_sources.get(&vid) else {
+                // `None` entries mark inputargs merged from multiple
+                // predecessors — stop chasing and fall back to the
+                // `item_ty`-only path so the descr stays conservative.
+                let Some(Some(next)) = phi_sources.get(&vid) else {
                     break;
                 };
                 source = next.clone();
@@ -4713,13 +4716,24 @@ fn collect_readwrite_effects(
     // `flowspace/model.py:244 renamevariables` walks `link.args`
     // and `link.target.inputargs` positionally; missing-mapping
     // entries are simply skipped here, never re-indexed.
-    let mut phi_sources: HashMap<crate::model::ValueId, LinkArg> = HashMap::new();
+    // Conservative phi-source map: an inputarg with exactly one
+    // incoming edge gets `Some(src)`; an inputarg merged from two or
+    // more predecessors is demoted to `None` so `resolve_array_identity`
+    // stops chasing provenance and falls back to the existing
+    // `array_type_id` / item-type-only path.  Without this demotion the
+    // last-writer-wins insert would make the array descr selection
+    // depend on HashMap iteration order, which can stamp the wrong
+    // effect bits on cross-block merges.
+    let mut phi_sources: HashMap<crate::model::ValueId, Option<LinkArg>> = HashMap::new();
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
                 for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
                     if let Some(ia) = graph.value_id_of(target_arg) {
-                        phi_sources.insert(ia, src.clone());
+                        phi_sources
+                            .entry(ia)
+                            .and_modify(|entry| *entry = None)
+                            .or_insert_with(|| Some(src.clone()));
                     }
                 }
             }
@@ -6746,11 +6760,13 @@ mod tests {
         let base = ValueId(1);
         let forwarded = ValueId(2);
         let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
-        let mut phi_sources: HashMap<ValueId, LinkArg> = HashMap::new();
-        phi_sources.insert(base, LinkArg::value(&graph, forwarded));
+        let mut phi_sources: HashMap<ValueId, Option<LinkArg>> = HashMap::new();
+        phi_sources.insert(base, Some(LinkArg::value(&graph, forwarded)));
         phi_sources.insert(
             forwarded,
-            LinkArg::from(crate::flowspace::model::ConstValue::List(vec![])),
+            Some(LinkArg::from(
+                crate::flowspace::model::ConstValue::List(vec![]),
+            )),
         );
 
         assert_eq!(

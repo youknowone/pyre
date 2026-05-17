@@ -309,7 +309,33 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // link with `prevblock = block_id`, replacing the caller block's
     // original exits (which have already been moved to the merge block
     // above).
-    graph.set_goto(block_id, callee_entry, vec![]);
+    //
+    // RPython parity (`backendopt/inline.py:265-273
+    // inline_function`): the caller-side Link supplies `call_args`
+    // positionally so the callee entry block's `inputargs` Variables
+    // receive the actual argument values.  Pyre's older `Input`-op
+    // remap path (the `remap_value_in_graph(graph, &block_map,
+    // remapped_input, call_arg)` calls above) rewrites every
+    // reference to a callee Input result with the corresponding
+    // call_arg directly — that path is sufficient when the cloned
+    // callee was built via pyre's frontend (which leaves
+    // `Block.inputargs` empty and threads parameters through
+    // `OpKind::Input` ops).  For callees built via the upstream
+    // Variable-keyed shape (where `startblock.inputargs` carries
+    // the parameter Variables), the Link.args path below is the
+    // required binding mechanism — without it the cloned inputarg
+    // Variables arrive unbound and the link arity diverges from
+    // the target's inputarg count.  Both shapes converge here: an
+    // empty inputarg list yields empty `entry_args`, so the prior
+    // behaviour is preserved bit-for-bit when the callee has no
+    // inputargs.
+    let entry_args: Vec<ValueId> = callee_entry_block
+        .inputarg_value_ids(&callee)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _)| call_args.get(i).copied())
+        .collect();
+    graph.set_goto(block_id, callee_entry, entry_args);
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.

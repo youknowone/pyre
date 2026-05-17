@@ -322,7 +322,7 @@ impl Assembler {
         // the invariant is guaranteed by rtyper's `concretetype`
         // annotation so the lookup cannot miss.
         if std::env::var("MAJIT_COVERAGE_AUDIT").is_ok() {
-            self.run_coverage_audit(ssarepr, regallocs);
+            self.run_coverage_audit(ssarepr, regallocs, graph);
         }
 
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
@@ -639,9 +639,33 @@ impl Assembler {
                 rhs,
                 dst,
             } => {
-                // Parity expectation: all three operands are Int —
-                // overflow-checked integer arithmetic.  Upstream gap
-                // applies if the rtyper miscoloured.
+                // `flatten.py:195-204` only synthesises
+                // `int_*_jump_if_ovf` for `add_ovf` / `sub_ovf` /
+                // `mul_ovf` opnames whose all three operands are
+                // already `Int` by lltype construction.  Origin/main
+                // matched this with a `debug_assert_eq!(kind, 'i')`
+                // for lhs/rhs/dst — keep the fail-fast guard on the
+                // Register payload so test fixtures that hand-build a
+                // miskinded `FlatOp::IntBinOpJumpIfOvf` surface here
+                // instead of garbling the bytecode at decode time.
+                debug_assert_eq!(
+                    lhs.kind,
+                    RegKind::Int,
+                    "IntBinOpJumpIfOvf.lhs must be RegKind::Int; got {:?}",
+                    lhs.kind,
+                );
+                debug_assert_eq!(
+                    rhs.kind,
+                    RegKind::Int,
+                    "IntBinOpJumpIfOvf.rhs must be RegKind::Int; got {:?}",
+                    rhs.kind,
+                );
+                debug_assert_eq!(
+                    dst.kind,
+                    RegKind::Int,
+                    "IntBinOpJumpIfOvf.dst must be RegKind::Int; got {:?}",
+                    dst.kind,
+                );
                 let opname = match op {
                     IntOvfOp::Add => "int_add_jump_if_ovf/Lii>i",
                     IntOvfOp::Sub => "int_sub_jump_if_ovf/Lii>i",
@@ -674,6 +698,15 @@ impl Assembler {
             // disambiguates register vs constant at decode time via
             // `byte >= count_regs[kind]`.
             FlatOp::Move { dst, src } => {
+                // `assembler.py:188-196` — every emitted instruction
+                // (including `*_copy`) records its byte offset in
+                // `startpoints`, so the label-fixup pass can land a
+                // `Label(block)` on a block-opening copy without
+                // misdescribing the bytecode boundary.  Previously
+                // missed here because `FlatOp::Move` bypasses
+                // `encode_op` and the per-arm emitters had each gotten
+                // their own `startpoints.insert` call except this one.
+                state.startpoints.insert(state.code.len());
                 let src_reg = self.encode_regorconst_source(src, dst.kind, state);
                 let kind_char = kind_char_of(dst.kind);
                 let kind_name = kind_long_name(dst.kind);
@@ -2234,7 +2267,12 @@ impl Assembler {
     ///
     /// Output goes through `cargo:warning=` so the build script
     /// runner (`build.rs`) surfaces each line to the user.
-    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+    fn run_coverage_audit(
+        &self,
+        ssarepr: &SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        graph: &crate::model::FunctionGraph,
+    ) {
         // For each ValueId, track: has a def site (result of some op),
         // count of direct operand uses, count of Live markers mentioning
         // it.  Live-only gaps (no def, no operand use) point at backward
@@ -2304,7 +2342,14 @@ impl Assembler {
                     if let Some(r) = inner.result {
                         sites.entry(r).or_default().has_def = true;
                     }
-                    for v in crate::inline::op_value_refs(&inner.kind, None) {
+                    // Pass `Some(graph)` — `op_value_refs` requires a
+                    // graph to project `Variable` operands back to
+                    // `ValueId`, and panics on `None` for most
+                    // variants (the storage-flip leaves only trivial
+                    // `Input` / `Const*` variants graph-free).  The
+                    // audit needs the projection to attribute the use
+                    // counts correctly.
+                    for v in crate::inline::op_value_refs(&inner.kind, Some(graph)) {
                         let s = sites.entry(v).or_default();
                         s.use_count += 1;
                         s.first_use_tag.get_or_insert(tag);

@@ -457,10 +457,21 @@ fn converge_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &
     let target_vids = target_block.inputarg_value_ids(graph);
     for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         match src {
-            LinkArg::Value(_) => {
-                let Some(src_vid) = src.as_value(graph) else {
-                    continue;
-                };
+            LinkArg::Value(var) => {
+                // After the Variable cutover, `as_value(graph) == None`
+                // means the link references a `Variable` the graph
+                // never registered — malformed link metadata.  Silently
+                // skipping convergence would let the dual-gate baseline
+                // pass with degraded types and hide the producer bug;
+                // mirror the `legacy_annotator::link_arg_type`
+                // expect-style contract instead.
+                let src_vid = src.as_value(graph).unwrap_or_else(|| {
+                    panic!(
+                        "converge_link: LinkArg::Value references Variable \
+                         {var:?} that is not registered on the graph — \
+                         malformed link.args"
+                    )
+                });
                 let src_ty = state.get(src_vid).clone();
                 let dst_ty = state.get(*dst).clone();
                 changed |= maybe_seed_concrete_type(state, *dst, src_ty);
@@ -499,7 +510,19 @@ fn converge_raise_link(
             link_arg_concrete_type(state, graph, src)
         };
         changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-        if let Some(src_vid) = src.as_value(graph) {
+        // For LinkArg::Value, propagate the dst kind back to the src
+        // Variable.  `as_value(graph) == None` after the Variable
+        // cutover means malformed link metadata (the LinkArg::Const
+        // arm exits early); fail loud rather than silently skip the
+        // back-propagation.
+        if let LinkArg::Value(var) = src {
+            let src_vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "converge_raise_link: LinkArg::Value references Variable \
+                     {var:?} that is not registered on the graph — \
+                     malformed link.args"
+                )
+            });
             let dst_ty = state.get(*dst).clone();
             changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
         }
@@ -513,10 +536,21 @@ fn link_arg_concrete_type(
     src: &LinkArg,
 ) -> ConcreteType {
     match src {
-        LinkArg::Value(_) => src
-            .as_value(graph)
-            .map(|v| state.get(v).clone())
-            .unwrap_or(ConcreteType::Unknown),
+        // After the Variable cutover an unregistered LinkArg::Value
+        // is malformed metadata — fail loud rather than degrading to
+        // `Unknown` which would let the dual-gate baseline pass with
+        // missing kinds and mask producer bugs.  Mirrors the
+        // `legacy_annotator::link_arg_type` contract.
+        LinkArg::Value(var) => {
+            let vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "link_arg_concrete_type: LinkArg::Value references Variable \
+                     {var:?} that is not registered on the graph — \
+                     malformed link.args"
+                )
+            });
+            state.get(vid).clone()
+        }
         LinkArg::Const(value) => const_value_to_concrete(&value.value),
     }
 }

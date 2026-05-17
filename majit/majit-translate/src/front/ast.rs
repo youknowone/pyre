@@ -2396,6 +2396,7 @@ impl<'a> GraphBuildContext<'a> {
     }
 }
 
+#[derive(Clone)]
 struct LocalBindingSnapshot {
     local_type_roots: HashMap<String, String>,
     local_type_strings: HashMap<String, String>,
@@ -4964,7 +4965,22 @@ fn lower_expr(
             // loop breaks at the first unsupported construct, matching
             // upstream's all-or-nothing flowgraph semantics.
             let mut arm_entries: Vec<BlockId> = Vec::with_capacity(m.arms.len());
-            let mut arm_tails: Vec<(BlockId, Option<ValueId>, FrameState)> =
+            // Each arm carries (tail, value, exit_framestate,
+            // exit_local_bindings).  The trailing
+            // `LocalBindingSnapshot` is the per-arm version of the
+            // `then_exit_ctx` / `else_exit_ctx` captures in
+            // [`lower_if_expr`]: when exactly one arm survives the
+            // merge (siblings all closed via `return` / `raise` /
+            // `break` / `panic!`), the post-merge `ctx` must
+            // restore to that arm's bindings rather than the
+            // pre-match snapshot, so post-merge reads of the
+            // surviving arm's rebinds resolve to the correct SSA
+            // values.  This is the if-let path's regression carrier
+            // — `if let pat = scrut { x = 1; } else { return 0; } x`
+            // desugars to a 2-arm match where only the open arm
+            // contributes bindings, and the bound `x` must be
+            // visible past the merge.
+            let mut arm_tails: Vec<(BlockId, Option<ValueId>, FrameState, LocalBindingSnapshot)> =
                 Vec::with_capacity(m.arms.len());
             for arm in &m.arms {
                 let entry = graph.create_block();
@@ -4987,6 +5003,7 @@ fn lower_expr(
                 // snapshot and falls back to the legacy naked-`Input`
                 // emit, which loses the per-arm rebind information.
                 let arm_exit_snapshot = ctx.getstate(0);
+                let arm_exit_locals = LocalBindingSnapshot::capture(ctx);
                 saved_locals.restore(ctx);
                 let arm_lowered = arm_lowered_result?;
                 // A closed arm (body is `return x` / `break` / `panic!`
@@ -4997,7 +5014,7 @@ fn lower_expr(
                 // sibling walks continue irrespective of this arm's
                 // closure.
                 arm_entries.push(entry);
-                arm_tails.push((tail, arm_lowered.value, arm_exit_snapshot));
+                arm_tails.push((tail, arm_lowered.value, arm_exit_snapshot, arm_exit_locals));
             }
 
             // Merge gets a Phi inputarg iff every arm that actually
@@ -5010,7 +5027,7 @@ fn lower_expr(
             // inputarg arity), so in that case we emit no phi at all.
             let all_open_arms_have_value = arm_tails
                 .iter()
-                .all(|(tail, r, _)| !graph.block(*tail).is_open() || r.is_some());
+                .all(|(tail, r, _, _)| !graph.block(*tail).is_open() || r.is_some());
             let (merge, merge_phi) = if all_open_arms_have_value {
                 let (m_block, phi_args) = graph.create_block_with_args(1);
                 (m_block, Some(phi_args[0]))
@@ -5025,13 +5042,18 @@ fn lower_expr(
             // locals state.  Parity port of Expr::If's both-open-arm
             // merge generalised to N arms — see the union block below
             // for the per-slot semantics.
-            let mut open_arm_snapshots: Vec<FrameState> = Vec::new();
-            for (tail, result, exit_snapshot) in &arm_tails {
+            //
+            // Pair each framestate with the corresponding
+            // `LocalBindingSnapshot` so the post-loop single-open-arm
+            // branch can restore exactly that arm's ctx bindings
+            // (per the carrier-comment above the `arm_tails` decl).
+            let mut open_arm_snapshots: Vec<(FrameState, LocalBindingSnapshot)> = Vec::new();
+            for (tail, result, exit_snapshot, exit_locals) in &arm_tails {
                 if !graph.block(*tail).is_open() {
                     continue;
                 }
                 any_open = true;
-                open_arm_snapshots.push(exit_snapshot.clone());
+                open_arm_snapshots.push((exit_snapshot.clone(), exit_locals.clone()));
                 let goto_args = if all_open_arms_have_value {
                     // Safe: the filter above guarantees every open arm's
                     // `result` is `Some`.
@@ -5191,8 +5213,8 @@ fn lower_expr(
                 // flowcontext-walker rewrite materialises intermediate
                 // SpamBlocks per fold step, the chain becomes load-
                 // bearing without further infrastructure changes.
-                let mut acc = open_arm_snapshots[0].clone();
-                for arm in &open_arm_snapshots[1..] {
+                let mut acc = open_arm_snapshots[0].0.clone();
+                for (arm, _) in &open_arm_snapshots[1..] {
                     // Same `expect` rationale as the `Expr::If` site:
                     // AST-frontend `union` is total today (entries
                     // ValueId-identity, vestigial empty/None for the
@@ -5208,7 +5230,7 @@ fn lower_expr(
                     );
                 }
                 let merged = acc;
-                let first_arm = &open_arm_snapshots[0];
+                let first_arm = &open_arm_snapshots[0].0;
                 // Type unification across arms is annotator-side per
                 // upstream `framestate.py:union` (Hlvalue identity
                 // only).  The prior carry-through retag block was a
@@ -5250,6 +5272,21 @@ fn lower_expr(
                         );
                     }
                 }
+            } else if open_arm_snapshots.len() == 1 {
+                // Companion of `lower_if_expr`'s `then_exit_ctx` /
+                // `else_exit_ctx` restore for the case where exactly
+                // one arm reaches the merge.  Without this restore,
+                // ctx still holds the pre-match snapshot (because
+                // every arm called `saved_locals.restore(ctx)` after
+                // its body walk), and post-merge reads of the
+                // surviving arm's rebinds would resolve to the wrong
+                // (stale) SSA values.  The if-let desugar at the top
+                // of [`lower_if_expr`] funnels patterns like
+                // `if let pat = scrut { x = 1; } else { return 0; } x`
+                // through this match path, so the regression carrier
+                // is `Expr::Match` — restore here keeps the post-`x`
+                // read on the surviving open arm's binding.
+                open_arm_snapshots[0].1.clone().restore(ctx);
             }
 
             *block = merge;

@@ -249,12 +249,25 @@ pub fn apply_from_flowspace_variables(
     value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
 ) {
     for (vid, var) in value_to_var.iter() {
-        // `bind_variable` replaces the slot's backing
-        // `value_variables[vid]` with the upstream Variable so
-        // subsequent `graph.concretetype(v)` / `graph.variable(v)`
-        // reads route through the rtyper-typed Variable's
-        // `concretetype` attribute verbatim — the codewriter
-        // consumes the rtyper-typed Variable as the source of truth.
+        // Honour the docstring contract above: a source `Variable`
+        // whose `concretetype` is still `None` represents the pre-
+        // `setconcretetype` window in RPython, where the graph slot
+        // must remain untouched.  `bind_variable` is defensive about
+        // this (it only copies a `Some` concretetype onto the
+        // placeholder), but invoking it with an untyped source still
+        // registers a spurious `variable_to_vid[var.id()] -> vid`
+        // entry that subsequent `value_id_of(&var)` lookups would
+        // resolve unexpectedly.  Skip the call outright so the
+        // docstring claim holds bit-for-bit.
+        if var.concretetype().is_none() {
+            continue;
+        }
+        // `bind_variable` merges the rtyper Variable's `concretetype`
+        // onto the existing placeholder in `value_variables[vid]`,
+        // preserving Variable identity across every graph slot that
+        // holds the placeholder (Block.inputargs, op operands,
+        // Link.args, exitswitch, last_exception, last_exc_value).
+        // Mirrors upstream `v.concretetype = T` attribute aliasing.
         graph.bind_variable(*vid, var.clone());
     }
 }
