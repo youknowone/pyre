@@ -547,7 +547,8 @@ fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
 
 fn overlay_deadframe_fail_descr(
     base_layout: &FailDescrLayout,
-    recovery_layout: ExitRecoveryLayout,
+    callee_descr: DescrRef,
+    caller_layout: ExitRecoveryLayout,
 ) -> DescrRef {
     // Slice 7-Tβ14f-β: the overlay is a fresh metainterp `ResumeGuardDescr`
     // directly, no `CraneliftFailDescr` wrapper.  `compile.py:870
@@ -559,6 +560,13 @@ fn overlay_deadframe_fail_descr(
     // a recovery_layout, and finish singletons carry none, so the
     // caller's early-return in `wrap_call_assembler_deadframe_with_caller_prefix`
     // ensures finish inner descrs never reach this constructor.
+    //
+    // Path 1 Slice 2: the recovery_layout is stored as overlay_state
+    // (callee_descr + caller_layout) instead of being pre-composed and
+    // stamped into the meta `recovery_layout` cell.  The reader
+    // (`fail_descr_recovery_layout`) prefers overlay_state and composes
+    // on-demand.  Letting the meta cell stay empty for overlay descrs
+    // is a prerequisite for Slice 3's full deletion of the cell.
     let descr: DescrRef = majit_backend::make_resume_guard_descr_typed(
         base_layout.fail_arg_types.clone(),
     );
@@ -568,7 +576,18 @@ fn overlay_deadframe_fail_descr(
         fd.set_source_op_index(source_op_index);
     }
     fd.set_force_token_slots(base_layout.force_token_slots.clone());
-    fail_descr_set_recovery_layout(&descr, recovery_layout);
+    if let Some(rgd) = descr
+        .as_any()
+        .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+    {
+        rgd.set_overlay_state(callee_descr, caller_layout);
+    } else {
+        unreachable!(
+            "overlay_deadframe_fail_descr just minted via \
+             make_resume_guard_descr_typed; downcast to ResumeGuardDescr \
+             cannot fail"
+        );
+    }
     if let Some(trace_info) = base_layout.trace_info.clone() {
         fail_descr_set_trace_info(fd, trace_info);
     }
@@ -646,7 +665,19 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     let Some(layout) = deadframe_layout(&frame) else {
         return frame;
     };
-    let Some(inner_recovery_layout) = deadframe_recovery_layout_for_call_assembler(&layout) else {
+    // Path 1 Slice 2: keep the early-return semantics — only wrap when
+    // the inner deadframe actually has a recovery_layout (or one that
+    // can be synthesised from trace_info).  The composed layout itself
+    // is no longer needed here; the overlay descr re-composes on-demand
+    // via `overlay_state` (callee descr + caller layout).
+    if deadframe_recovery_layout_for_call_assembler(&layout).is_none() {
+        return frame;
+    }
+    let Some(callee_descr) = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .map(|jf| jf.fail_descr.clone())
+    else {
         return frame;
     };
 
@@ -658,14 +689,14 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
         inputs,
         caller_prefix_layout,
     );
-    let recovery_layout = inner_recovery_layout.prefixed_by(Some(&caller_layout));
 
     // Replace fail_descr on the inner JitFrameDeadFrame to carry the
     // caller-prefixed recovery layout.  RPython has no overlay wrapper —
     // the jitframe IS the deadframe with the correct descr.
     // Write to both the Rust wrapper AND the actual jf_frame header so
     // get_latest_descr (reading wrapper) and raw jf_descr consumers agree.
-    let overlay_descr: DescrRef = overlay_deadframe_fail_descr(&layout, recovery_layout);
+    let overlay_descr: DescrRef =
+        overlay_deadframe_fail_descr(&layout, callee_descr, caller_layout);
     // The overlay's Arc address can flow through the C-ABI guard-fail
     // boundary (`call_jit.rs:1711` `Backend::fail_descr_arc_from_addr`)
     // when the BH callback consumes this deadframe.  Register it in the
@@ -5738,6 +5769,21 @@ fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
             .as_any()
             .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
         {
+            // Path 1 Slice 2 — CALL_ASSEMBLER overlay descrs carry their
+            // recovery_layout as (callee_descr, caller_layout) components
+            // instead of the composed value.  First read composes and
+            // memoises via `OverlayState::composed`; subsequent reads
+            // clone the cached `Arc` contents.  Production guards leave
+            // overlay_state unset and fall through to the meta cell.
+            if let Some(state) = rgd.overlay_state() {
+                if let Some(cached) = state.composed.get() {
+                    return Some((**cached).clone());
+                }
+                let inner = fail_descr_recovery_layout(&state.callee_descr)?;
+                let composed = Arc::new(inner.prefixed_by(Some(&state.caller_layout)));
+                let _ = state.composed.set(composed.clone());
+                return Some((*composed).clone());
+            }
             return rgd.recovery_layout();
         }
         match current.prev_descr() {
