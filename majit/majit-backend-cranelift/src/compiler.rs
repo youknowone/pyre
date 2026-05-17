@@ -79,39 +79,22 @@ use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            u32::MAX,
-            0,
-            vec![Type::Int],
-            true,
-            vec![],
-        );
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind(u32::MAX, 0, vec![Type::Int], true);
         d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrInt::new()));
         Arc::new(d)
     });
 
 static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            u32::MAX,
-            0,
-            vec![Type::Float],
-            true,
-            vec![],
-        );
+        let mut d =
+            CraneliftFailDescr::new_with_trace_and_kind(u32::MAX, 0, vec![Type::Float], true);
         d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new()));
         Arc::new(d)
     });
 
 static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            u32::MAX,
-            0,
-            vec![Type::Ref],
-            true,
-            vec![],
-        );
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind(u32::MAX, 0, vec![Type::Ref], true);
         d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrRef::new()));
         Arc::new(d)
     });
@@ -125,13 +108,7 @@ static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDesc
 /// `jitexc.ExitFrameWithExceptionRef`.
 static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            u32::MAX,
-            0,
-            vec![Type::Ref],
-            true,
-            vec![],
-        );
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind(u32::MAX, 0, vec![Type::Ref], true);
         // is_exit_frame_with_exception() forwards through meta_descr to
         // the metainterp ExitFrameWithExceptionDescrRef Arc.
         d.meta_descr = Some(Arc::new(
@@ -142,13 +119,7 @@ static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<Cranelift
 
 static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            u32::MAX,
-            0,
-            vec![],
-            true,
-            vec![],
-        );
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind(u32::MAX, 0, vec![], true);
         d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new()));
         Arc::new(d)
     });
@@ -585,12 +556,11 @@ fn overlay_deadframe_fail_descr(
     base_layout: &FailDescrLayout,
     recovery_layout: ExitRecoveryLayout,
 ) -> Arc<CraneliftFailDescr> {
-    let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+    let mut descr = CraneliftFailDescr::new_with_trace_and_kind(
         base_layout.fail_index,
         base_layout.trace_id,
         base_layout.fail_arg_types.clone(),
         base_layout.is_finish,
-        base_layout.force_token_slots.clone(),
     );
     // Stamp a synthesized ResumeGuardDescr as meta_descr so the
     // recovery_layout publish/read routes through the meta-side slot —
@@ -602,12 +572,13 @@ fn overlay_deadframe_fail_descr(
     ));
     let descr = Arc::new(descr);
     // `set_source_op_index` / `set_recovery_layout` / `set_trace_info` /
-    // `set_force_token_slots` all publish into descr-local cells
-    // (Slices CC–II); they touch `self` so Arc materialisation must
-    // precede them.
+    // `set_force_token_slots` all publish into meta-side slots reached
+    // through `meta_descr`; they touch `self` so Arc materialisation
+    // must precede them.
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
+    descr.set_force_token_slots(base_layout.force_token_slots.clone());
     descr.set_recovery_layout(recovery_layout);
     if let Some(trace_info) = base_layout.trace_info.clone() {
         descr.set_trace_info(trace_info);
@@ -12877,19 +12848,13 @@ fn collect_guards(
             None
         };
         let mut descr = if is_external_jump {
-            CraneliftFailDescr::new_external_jump(
-                fail_index,
-                trace_id,
-                fail_arg_types,
-                force_token_slots,
-            )
+            CraneliftFailDescr::new_external_jump(fail_index, trace_id, fail_arg_types)
         } else {
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            CraneliftFailDescr::new_with_trace_and_kind(
                 fail_index,
                 trace_id,
                 fail_arg_types,
                 is_finish,
-                force_token_slots,
             )
         };
         let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
@@ -12919,12 +12884,16 @@ fn collect_guards(
         // the upstream class hierarchy.
         descr.meta_descr = if is_external_jump {
             // op.descr for external JUMP is the TargetToken (already
-            // captured in external_jump_target above).  TargetToken is
-            // not a FailDescr — leaving it in meta_descr would make
-            // get_latest_descr_arc_from_deadframe hand back a
-            // non-FailDescr to callers that downcast with
-            // as_fail_descr().expect(...).
-            None
+            // captured in external_jump_target above) — not a FailDescr.
+            // Synthesize a `ResumeGuardDescr` meta so the meta-side slot
+            // for `force_token_slots` (Slice 7-Tβ7) is reachable; the
+            // TargetToken stays in `external_jump_target_cell`, separate
+            // from `meta_descr`.  `is_resume_guard()` still returns false
+            // for external JUMPs (the cell-membership predicate
+            // short-circuits before the meta_descr check).
+            Some(majit_backend::make_resume_guard_descr_typed(
+                descr.fail_arg_types.clone(),
+            ))
         } else if let Some(d) = op.descr.clone() {
             Some(d)
         } else if is_finish {
@@ -12991,8 +12960,12 @@ fn collect_guards(
         let descr = Arc::new(descr);
         // Session 5i-cl: source_op_index / recovery_layout writes go to
         // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
-        // they must follow Arc materialisation.
+        // they must follow Arc materialisation.  Slice 7-Tβ7:
+        // `set_force_token_slots` forwards through `meta_descr` (now
+        // always a `ResumeGuardDescr` after the external-JUMP synthesis
+        // above) to the meta-side slot.
         descr.set_source_op_index(op_idx);
+        descr.set_force_token_slots(force_token_slots);
         if let Some(layout) = recovery_layout {
             descr.set_recovery_layout(layout);
         }
@@ -15923,13 +15896,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            0,
-            90,
-            vec![Type::Int],
-            false,
-            Vec::new(),
-        );
+        let fail_descr = CraneliftFailDescr::new_with_trace_and_kind(0, 90, vec![Type::Int], false);
 
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
@@ -16056,13 +16023,8 @@ mod tests {
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
 
-        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            0,
-            190,
-            vec![Type::Int],
-            false,
-            Vec::new(),
-        );
+        let bridge_fail_descr =
+            CraneliftFailDescr::new_with_trace_and_kind(0, 190, vec![Type::Int], false);
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -16210,13 +16172,8 @@ mod tests {
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout.clone()));
 
-        let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            0,
-            290,
-            vec![Type::Int],
-            false,
-            Vec::new(),
-        );
+        let bridge_fail_descr =
+            CraneliftFailDescr::new_with_trace_and_kind(0, 290, vec![Type::Int], false);
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -16305,13 +16262,8 @@ mod tests {
             bridge_source_layout.clone()
         ));
 
-        let nested_bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-            0,
-            291,
-            vec![Type::Int],
-            false,
-            Vec::new(),
-        );
+        let nested_bridge_fail_descr =
+            CraneliftFailDescr::new_with_trace_and_kind(0, 291, vec![Type::Int], false);
         backend.set_next_trace_id(292);
         backend.set_next_header_pc(3000);
         backend

@@ -321,12 +321,11 @@ fn test_bridge_end_to_end() {
     // Build a CraneliftFailDescr that mirrors the source guard's
     // identity for the bridge-compile lookup.
     let bridge_fail_descr =
-        majit_backend_cranelift::guard::CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+        majit_backend_cranelift::guard::CraneliftFailDescr::new_with_trace_and_kind(
             source_fail_index_per_trace,
             source_trace_id,
             vec![Type::Int, Type::Int],
             false,
-            Vec::new(),
         );
 
     let bridge_info = backend
@@ -2369,13 +2368,8 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     bridge_constants.insert(OpRef::const_int(1).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-        0,
-        910,
-        vec![Type::Int, Type::Int],
-        false,
-        Vec::new(),
-    );
+    let bridge_fail_descr =
+        CraneliftFailDescr::new_with_trace_and_kind(0, 910, vec![Type::Int, Type::Int], false);
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);

@@ -143,6 +143,15 @@ pub struct ResumeGuardDescr {
     /// meta Arc is the single source of truth.  `None` for synthetic
     /// FINISH / external-JUMP descrs that have no associated trace op.
     pub source_op_index: UnsafeCell<Option<usize>>,
+    /// Force-token slot positions for runtime GC-root filtering.
+    /// PyPy encodes the same information into the machine code's
+    /// GC-map immediates (`assembler.py` handles force-token slot
+    /// produce/consume inline); cranelift IR has no equivalent inline
+    /// encoding so the vector lives on the descr.  Migrated here from
+    /// `CraneliftFailDescr::force_token_slots_cell` (Slice 7-Tβ7) so
+    /// the meta Arc is the single source of truth.  Sorted and deduped
+    /// at write time so `is_force_token_slot` can use `binary_search`.
+    pub force_token_slots: UnsafeCell<Vec<usize>>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -181,6 +190,7 @@ impl Descr for ResumeGuardDescr {
             fail_index_per_trace: AtomicU32::new(0),
             recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
+            force_token_slots: UnsafeCell::new(Vec::new()),
         }))
     }
 }
@@ -334,6 +344,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         recovery_layout: UnsafeCell::new(None),
         source_op_index: UnsafeCell::new(None),
+        force_token_slots: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -372,5 +383,24 @@ impl ResumeGuardDescr {
     pub fn set_source_op_index(&self, source_op_index: usize) {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
+    }
+
+    /// Read the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Returns `&[]` when codegen has not stamped any slots (the
+    /// common case for guards that do not produce force tokens).
+    pub fn force_token_slots(&self) -> &[usize] {
+        // Safety: single-threaded JIT.
+        unsafe { &*self.force_token_slots.get() }
+    }
+
+    /// Write the codegen-time `force_token_slots` (Slice 7-Tβ7).
+    /// Sorts + dedups so the stored vector satisfies the
+    /// `binary_search` invariant used by
+    /// `CraneliftFailDescr::is_force_token_slot`.
+    pub fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        // Safety: single-threaded JIT.
+        unsafe { *self.force_token_slots.get() = slots };
     }
 }

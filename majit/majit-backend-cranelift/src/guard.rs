@@ -26,23 +26,9 @@ use std::sync::{Mutex, OnceLock};
 // (`compiler.rs::emit_attached_bridge_dispatch`), so they must remain
 // stable for the descr's lifetime.
 
-/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
-/// `Arc::as_ptr` address to its force-token slot vector.
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
-/// `force_token_slots`; upstream `assembler.py` handles force-token
-/// produce/consume as a codegen-time concern, with the slot positions
-/// encoded into the machine code's GC-map immediates.  Cranelift IR
-/// has no equivalent inline encoding, so pyre retains the per-descr
-/// vector in this side-table for runtime GC-root filtering.  The
-/// table is consulted by `FailDescr::force_token_slots()` and
-/// `is_force_token_slot()`.
-// FORCE_TOKEN_SLOTS_TABLE removed (Slice II): write-once at codegen
-// (the slot positions are determined by the trace's force-token
-// produce/consume pairs and do not change after the descr is sealed).
-// Lives in `force_token_slots_cell: OnceLock<Vec<usize>>` on
-// CraneliftFailDescr.  Empty vectors are still elided
-// (`force_token_slots_view` returns `&[]` for unset cells).
+// FORCE_TOKEN_SLOTS_TABLE removed (Slice II): write-once at codegen.
+// Lives in `ResumeGuardDescr::force_token_slots` on the meta-side Arc
+// (Slice 7-Tβ7), reached via `as_any` downcast on `meta_descr`.
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its codegen-time `source_op_index`.
@@ -376,18 +362,12 @@ pub struct CraneliftFailDescr {
     // downcast on `meta_descr` (precedent: Slice OO-half for
     // recovery_layout).  Cranelift accessors `source_op_index_ref` /
     // `set_source_op_index` now forward through that chain.
-    /// Force-token slot positions for runtime GC-root filtering.
-    /// PyPy encodes the same information into the machine code's
-    /// GC-map immediates (`assembler.py` handles force-token slot
-    /// produce/consume inline); cranelift IR has no equivalent inline
-    /// encoding so the vector lives on the descr.
-    ///
-    /// Moved here from `FORCE_TOKEN_SLOTS_TABLE` (Slice II).  Sorted
-    /// and deduped by `set_force_token_slots` so
-    /// `force_token_slots_view` satisfies the `binary_search`
-    /// invariant used by `is_force_token_slot`.  Empty vectors are
-    /// elided (the cell stays unset).
-    pub force_token_slots_cell: OnceLock<Vec<usize>>,
+    // force_token_slots_cell moved to ResumeGuardDescr (Slice 7-Tβ7):
+    // the meta Arc is the canonical home, reached via `as_any`
+    // downcast on `meta_descr` (precedent: Slice 7-Tβ6 for
+    // source_op_index, Slice OO-half for recovery_layout).
+    // Cranelift accessors `force_token_slots_view` /
+    // `set_force_token_slots` now forward through that chain.
     /// Bridge code-pointer cache.  JIT-baked into the dispatch path
     /// (`emit_attached_bridge_dispatch`).  `Box` gives the
     /// `AtomicUsize` a heap-pinned address that survives the descr
@@ -434,8 +414,8 @@ impl Drop for CraneliftFailDescr {
         // (Slice QQ-4); no backend-local cell to reclaim.
         // source_op_index moved to ResumeGuardDescr meta-side slot
         // (Slice 7-Tβ6); no backend-local cell to reclaim.
-        // force_token_slots_cell is descr-local (Slice II): drops
-        // naturally with self.
+        // force_token_slots moved to ResumeGuardDescr meta-side slot
+        // (Slice 7-Tβ7); no backend-local cell to reclaim.
         // bridge_code_ptr_cache / bridge_frame_depth_cache are descr-
         // local Box<AtomicUsize> (Slice JJ): drop naturally with self.
         // Reclaim the published `Arc<BridgeData>` (if any) from the
@@ -503,19 +483,22 @@ impl CraneliftFailDescr {
     ///   - if `recovery_layout` was previously passed: invoke
     ///     `descr.set_recovery_layout(layout)` to publish the layout
     ///     into the descr-local atomic cell (Slice EE).
+    ///   - if `force_token_slots` is non-empty: invoke
+    ///     `descr.set_force_token_slots(...)` AFTER `meta_descr` is
+    ///     assigned (Slice 7-Tβ7) so the write lands on the
+    ///     `ResumeGuardDescr` meta-side slot.
     ///
     /// The `_is_finish` parameter is preserved for caller-site clarity
     /// during the transition; it is no longer stored on the descr —
     /// `compile.py:624 final_descr=True` is answered through meta_descr
     /// forwarding.
-    pub fn new_with_trace_and_kind_and_force_tokens(
+    pub fn new_with_trace_and_kind(
         fail_index: u32,
         trace_id: u64,
         fail_arg_types: Vec<Type>,
         _is_finish: bool,
-        force_token_slots: Vec<usize>,
     ) -> Self {
-        let descr = CraneliftFailDescr {
+        CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
@@ -524,12 +507,9 @@ impl CraneliftFailDescr {
             fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
-            force_token_slots_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
-        };
-        descr.set_force_token_slots(force_token_slots);
-        descr
+        }
     }
 
     /// Construct a fail descriptor for an external JUMP exit.
@@ -537,19 +517,14 @@ impl CraneliftFailDescr {
     /// TargetToken lives in a different compiled function. Cranelift can't
     /// emit raw inter-function JMPs, so the dispatcher receives this descr
     /// and re-enters the target loop via the registered target token.
-    pub fn new_external_jump(
-        fail_index: u32,
-        trace_id: u64,
-        fail_arg_types: Vec<Type>,
-        force_token_slots: Vec<usize>,
-    ) -> Self {
+    pub fn new_external_jump(fail_index: u32, trace_id: u64, fail_arg_types: Vec<Type>) -> Self {
         // Caller is expected to wrap the returned descr in `Arc::new(...)`
         // and immediately publish the external-JUMP target via
         // `descr.set_external_jump_target(target)`.  The constructor
         // cannot do this itself because the callsite needs to perform
         // additional in-place mutations (`set_source_op_index`,
         // `meta_descr`) before sealing the descr behind `Arc`.
-        let descr = CraneliftFailDescr {
+        CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
@@ -558,12 +533,9 @@ impl CraneliftFailDescr {
             fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
-            force_token_slots_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
-        };
-        descr.set_force_token_slots(force_token_slots);
-        descr
+        }
     }
 
     // UnsafeCell accessor helpers — single-threaded, no lock needed.
@@ -806,26 +778,35 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// Descr-local write-once cell (Slice II).  Sorts+dedups the
-    /// vector so the stored slot list satisfies `binary_search`
-    /// (used by `is_force_token_slot`).  Empty vectors are elided
-    /// (cell stays unset; `force_token_slots_view` returns `&[]`).
-    pub fn set_force_token_slots(&self, mut slots: Vec<usize>) {
-        slots.sort_unstable();
-        slots.dedup();
-        if slots.is_empty() {
-            return;
+    /// Forward the force-token slot list to the meta-side
+    /// `ResumeGuardDescr` slot (Slice 7-Tβ7).  `ResumeGuardDescr::
+    /// set_force_token_slots` sorts+dedups the vector so the stored
+    /// list satisfies `binary_search` (used by `is_force_token_slot`).
+    /// When the meta_descr is absent or is not a `ResumeGuardDescr`
+    /// (synthetic FINISH / external-JUMP descrs whose meta is a
+    /// non-resume class), the write is silently discarded — those
+    /// descrs never produce force tokens.
+    pub fn set_force_token_slots(&self, slots: Vec<usize>) {
+        if let Some(rgd) = self
+            .meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+        {
+            rgd.set_force_token_slots(slots);
         }
-        self.force_token_slots_cell
-            .set(slots)
-            .expect("force_token_slots_cell already published");
     }
 
     #[inline]
-    /// Descr-local read (Slice II).  Returns the published slot list
-    /// as a slice or `&[]` when no slots have been registered.
+    /// Read the force-token slot list from the meta-side
+    /// `ResumeGuardDescr` slot (Slice 7-Tβ7).  Returns `&[]` when
+    /// meta_descr is absent or is not a `ResumeGuardDescr`.
     pub fn force_token_slots_view(&self) -> &[usize] {
-        self.force_token_slots_cell.get().map_or(&[], Vec::as_slice)
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .map_or(&[], |rgd| rgd.force_token_slots())
     }
 
     /// Descr-local atomic write (Slice FF).  Callers are `compile_loop`
@@ -844,10 +825,10 @@ impl CraneliftFailDescr {
     }
 
     /// Derive the `GcMap` on demand from `fail_arg_types` and the
-    /// descr-local `force_token_slots_cell` (Slice II).  Replaces the
-    /// previous `pub gc_map: GcMap` field (Session 5i-cl); upstream
-    /// `assembler.py:write_failure_recovery_description` parity
-    /// recomputes equivalent bits inline at codegen time.
+    /// meta-side `ResumeGuardDescr::force_token_slots` slot (Slice
+    /// 7-Tβ7).  Replaces the previous `pub gc_map: GcMap` field
+    /// (Session 5i-cl); upstream `assembler.py:write_failure_recovery_description`
+    /// parity recomputes equivalent bits inline at codegen time.
     pub fn gc_map(&self) -> GcMap {
         // Use the forwarded `fail_arg_types()` — when meta_descr carries
         // an optimizer-stamped `ResumeGuardDescr`, its types are the
@@ -860,8 +841,9 @@ impl CraneliftFailDescr {
     }
 
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
-        // Vector stored in `force_token_slots_cell` is sorted+deduped
-        // at set time, preserving the `binary_search` invariant.
+        // Vector stored in `ResumeGuardDescr::force_token_slots` is
+        // sorted+deduped at set time, preserving the `binary_search`
+        // invariant.
         self.force_token_slots_view().binary_search(&slot).is_ok()
     }
 
