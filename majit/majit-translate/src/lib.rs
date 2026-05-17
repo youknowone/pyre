@@ -1644,8 +1644,8 @@ mod tests {
         let mut result = result;
         crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
-        let regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
-        let flattened = flatten::flatten_graph(&result.graph, &regallocs);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
+        let flattened = flatten::flatten_graph(&result.graph, &mut regallocs);
         eprintln!(
             "load_fast graph ops: {:?}",
             load_fast_graph.block(load_fast_graph.startblock).operations

@@ -362,37 +362,28 @@ fn switch_llexitcase_key(link: &Link) -> Option<i64> {
 /// on the assigned color, not on the pre-regalloc ValueId identity.
 pub fn flatten_graph(
     graph: &FunctionGraph,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
+    regallocs: &mut HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
-    // Mirrors `flatten.py:81-86 __init__ + flatten_graph()` invocation
-    // order: `enforce_input_args` runs first on a freshly-built
-    // GraphFlattener with `&mut regallocs`.  This signature still takes
-    // `&regallocs` (immutable) for backward compatibility with test
-    // call sites that hand in `&identity_regallocs(...)`; callers that
-    // need the swap to persist into downstream consumers (assembler,
-    // jitcode) must run [`enforce_input_args`] themselves before this
-    // call — see [`flatten_graph_mut`] / `codewriter.rs` for that path.
+    // Direct line-by-line port of `flatten.py:63-66`:
+    //   flattener = GraphFlattener(graph, regallocs, ...)
+    //   flattener.enforce_input_args()
+    //   flattener.generate_ssa_form()
+    //   return flattener.ssarepr
+    // The `enforce_input_args` free-function call mutates
+    // `regallocs` in place via `swapcolors` so the startblock
+    // inputargs end up at colors `0..N` per kind — the same
+    // mutation upstream performs on `self.regallocs[kind]`
+    // through method dispatch.  The post-construction
+    // `GraphFlattener::enforce_input_args` debug-assert shell
+    // verifies the rotation invariant holds before the
+    // generate_ssa_form walk runs.
+    enforce_input_args(graph, regallocs);
     let mut flattener = GraphFlattener::new(graph, regallocs, false);
     flattener.enforce_input_args();
     flattener.generate_ssa_form();
     let mut ssarepr = flattener.ssarepr;
     ssarepr.num_values = compute_num_values(graph, &ssarepr.insns);
     ssarepr
-}
-
-/// `flatten_graph` variant that runs the [`enforce_input_args`]
-/// rotation in-place on `regallocs` before flattening — the
-/// orthodox `flatten.py:81 + enforce_input_args` call order with
-/// the swap persisted into the caller's regallocs.  Pyre's
-/// codewriter routes through this so the assembler / jitcode
-/// downstream see the dense `0..N` startblock-inputarg color
-/// numbering.
-pub fn flatten_graph_mut(
-    graph: &FunctionGraph,
-    regallocs: &mut HashMap<RegKind, RegAllocResult>,
-) -> SSARepr {
-    enforce_input_args(graph, regallocs);
-    flatten_graph(graph, regallocs)
 }
 
 /// `flatten.py:88-100 enforce_input_args(self)` — free-function port
@@ -445,7 +436,7 @@ pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind
 /// Backward-compatible alias for [`flatten_graph`].  Older callers still
 /// reach for `flatten()`; new code should use `flatten_graph` to match
 /// `flatten.py`.
-pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResult>) -> SSARepr {
+pub fn flatten(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocResult>) -> SSARepr {
     flatten_graph(graph, regallocs)
 }
 
@@ -645,12 +636,14 @@ impl<'a> GraphFlattener<'a> {
     /// [`enforce_input_args`] (module-level) because the swap needs
     /// `&mut regallocs` while every other GraphFlattener accessor
     /// re-borrows `regallocs` immutably — see the free function's
-    /// doc for the Rust-language adaptation rationale.  Production
-    /// callers route through [`flatten_graph`], which calls the free
-    /// function *before* constructing the GraphFlattener, so by the
+    /// doc for the Rust-language adaptation rationale.
+    /// [`flatten_graph`] runs the free function unconditionally
+    /// immediately before constructing the GraphFlattener (matching
+    /// upstream `flatten.py:63-66` invocation order), so by the
     /// time this method runs the rotation is complete and the
     /// invariant below holds; the assertion catches direct callers
-    /// that forgot the pre-pass.
+    /// that constructed a GraphFlattener without going through
+    /// [`flatten_graph`].
     pub fn enforce_input_args(&mut self) {
         let inputargs = self
             .graph
@@ -1435,7 +1428,7 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
 pub fn flatten_with_types(
     graph: &FunctionGraph,
     _types: &crate::jit_codewriter::type_state::TypeResolutionState,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
+    regallocs: &mut HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
     flatten_graph(graph, regallocs)
 }
@@ -1709,7 +1702,8 @@ mod tests {
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_return(entry, Some(v));
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         assert_eq!(flat.name, "simple");
         // Label + ConstInt op = 2 flat ops
         assert!(flat.insns.len() >= 2);
@@ -1730,7 +1724,8 @@ mod tests {
         graph.set_goto(else_block, merge, vec![]);
         graph.set_return(merge, None);
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         // Should have labels + jumps
         let has_jump = flat
             .insns
@@ -1780,7 +1775,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten_graph(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten_graph(&graph, &mut regallocs);
         // RPython `flatten.py:264-267` lays out the true (fall-through)
         // body INLINE after the `goto_if_not`; the false side then
         // appears at the `Label(linkfalse)` landing pad.  After the
@@ -1837,7 +1833,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         let expected_value = Register::new(RegKind::Int, cond.0);
         assert!(
             flat.insns.iter().any(|op| matches!(
@@ -1879,7 +1876,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1911,7 +1909,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             flat.insns
                 .iter()
@@ -1943,7 +1942,8 @@ mod tests {
         graph.set_goto(body, header, vec![]);
         graph.set_return(exit, None);
 
-        let flat = flatten_graph(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten_graph(&graph, &mut regallocs);
         // RPython `flatten.py:106-128 make_bytecode_block` falls through
         // for unseen targets and only emits `goto, TLabel(block); ---`
         // when re-entering an already-emitted block.  In this loop only
@@ -1999,7 +1999,8 @@ mod tests {
 
         graph.set_goto(entry, target, vec![val]);
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         let moves: Vec<_> = flat
             .insns
             .iter()
@@ -2039,7 +2040,8 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(sum));
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,
@@ -2088,7 +2090,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             flat.insns
                 .iter()
@@ -2153,7 +2156,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2194,7 +2198,8 @@ mod tests {
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
         graph.set_goto(entry, exc_block, vec![last_exception, last_exc_value]);
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         // identity_regallocs colors ValueId(n) as Int n; Raise carries
         // the exception value's Register (always Ref-kinded).  The
         // test fixture uses identity coloring so the matching Register
@@ -2234,7 +2239,8 @@ mod tests {
             )],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2296,7 +2302,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         let expected_lhs = Register::new(RegKind::Int, lhs.0);
         let expected_rhs = Register::new(RegKind::Int, rhs.0);
         let expected_dst = Register::new(RegKind::Int, sum.0);
@@ -2366,7 +2373,8 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(&graph, 16);
+        let flat = flatten(&graph, &mut regallocs);
         let standard_overflow = crate::flowspace::model::HOST_ENV
             .lookup_standard_exception_instance("OverflowError")
             .expect("missing standard OverflowError instance");
@@ -2710,7 +2718,8 @@ mod tests {
     use crate::jit_codewriter::format::format_assembler;
 
     fn flat_to_text(graph: &FunctionGraph) -> String {
-        let ssa = flatten_graph(graph, &identity_regallocs(&graph, 16));
+        let mut regallocs = identity_regallocs(graph, 16);
+        let ssa = flatten_graph(graph, &mut regallocs);
         format_assembler(&ssa)
     }
 

@@ -6764,9 +6764,9 @@ mod tests {
         phi_sources.insert(base, Some(LinkArg::value(&graph, forwarded)));
         phi_sources.insert(
             forwarded,
-            Some(LinkArg::from(
-                crate::flowspace::model::ConstValue::List(vec![]),
-            )),
+            Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
+                vec![],
+            ))),
         );
 
         assert_eq!(

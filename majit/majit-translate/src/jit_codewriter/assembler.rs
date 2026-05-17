@@ -4229,8 +4229,8 @@ mod tests {
         rewritten.set_concretetype(base, crate::model::ConcreteType::GcRef);
         rewritten.set_concretetype(result, crate::model::ConcreteType::Signed);
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &regallocs);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
         // exceptblock-augmented map — `flatten_graph` (without type
         // state) leaves it empty, but the Slice C-3 lookup_coloring
@@ -4360,8 +4360,8 @@ mod tests {
             .graph;
         crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &regallocs);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
@@ -4482,8 +4482,8 @@ mod tests {
             .graph;
         crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &regallocs);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
@@ -4572,8 +4572,8 @@ mod tests {
         graph.set_concretetype(sum, crate::model::ConcreteType::Signed);
 
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
-        let regallocs = regalloc::perform_all_register_allocations(&graph);
-        let mut flat = flatten_graph(&graph, &regallocs);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,

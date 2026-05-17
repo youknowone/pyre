@@ -109,18 +109,13 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     // canonical exceptblock stamp.  No `value_kinds` HashMap surface
     // any more — the graph IS the kind table.
     crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transform_result.graph);
-    let mut regallocs =
-        crate::regalloc::perform_all_register_allocations(&transform_result.graph);
-    // `flatten.py:81-100 __init__ + enforce_input_args` — the
-    // RPython equivalent of this call always runs the swapcolors
-    // rotation up-front so startblock inputargs occupy the dense
-    // `0..N` color prefix per kind.  Routing through
-    // `flatten_graph_mut` keeps the legacy-baseline pipeline
-    // structurally identical to the production codewriter path; the
-    // immutable `flatten_graph` left the rotation unpersisted, which
-    // is harmless when the regalloc already assigned `0..N` colors
-    // by coincidence but diverges from upstream when it did not.
-    let flattened = flatten::flatten_graph_mut(&transform_result.graph, &mut regallocs);
+    let mut regallocs = crate::regalloc::perform_all_register_allocations(&transform_result.graph);
+    // `flatten_graph` runs `enforce_input_args` (flatten.py:88-100)
+    // internally as part of the upstream `flatten.py:63-66`
+    // invocation order, so the startblock inputargs occupy the
+    // dense `0..N` color prefix per kind and the rotation persists
+    // into the assembler call.
+    let flattened = flatten::flatten_graph(&transform_result.graph, &mut regallocs);
 
     PipelineResult {
         name: func.name.clone(),
