@@ -3413,6 +3413,99 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
     })
 }
 
+/// `_build_frame_realloc_slowpath` parity
+/// (`rpython/jit/backend/llsupport/assembler.py:118` setup;
+/// `rpython/jit/backend/aarch64/assembler.py:434` body).  PyPy's bridge
+/// prologue (`_check_frame_depth`, aarch64/assembler.py:927) calls this
+/// when `jf_frame.length < expected_size`: it allocates a wider
+/// JITFRAME, copies the live slots, threads `jf_forward = new_frame`,
+/// and returns the new pointer.  Mirrors dynasm's
+/// `runner::dynasm_realloc_frame`, but works against cranelift's
+/// frame-info-less allocation pattern (`run_compiled_code_inner` sets
+/// `jf_frame_info = std::ptr::null()` since cranelift does not
+/// pre-allocate `JitFrameInfo` per CompiledLoop yet).
+///
+/// Allocates a fresh libc-backed `JitFrame` with capacity `new_depth`,
+/// copies header + items, sets `jf_forward` so `jitframe_resolve` follows
+/// the forwarding chain (`jitframe.py:54`), and registers the new payload
+/// with the shadow-stack tracer so GC scans interior Ref slots.
+///
+/// Currently registered but unwired — the cranelift bridge dispatch
+/// path (`emit_attached_bridge_dispatch`) still falls through to the
+/// host-loop bridge fallback when the frame is too small.  A future
+/// slice (#103/#111) replaces the host fallback by routing the
+/// frame-fits-false branch through this helper, mirroring PyPy's
+/// `_check_frame_depth` → `_frame_realloc_slowpath` flow.
+///
+/// # Safety
+/// - `old_jf` must be a live, currently-running `JitFrame` whose
+///   compiled code is about to dispatch into an attached bridge.
+/// - The caller (the JIT-emitted dispatch path) has already published
+///   all live fail-args into `old_jf->jf_frame[...]` via `emit_guard_exit`
+///   spills; this helper only needs to copy those words verbatim.
+#[inline(never)]
+pub unsafe extern "C" fn cranelift_realloc_frame(
+    old_jf: *mut i64,
+    new_depth: usize,
+) -> *mut i64 {
+    let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
+    let new_total = header_words + new_depth;
+    let new_bytes = new_total * 8;
+
+    // `libc::calloc` parity using `std::alloc::alloc_zeroed`; matches
+    // the dynasm runner's `register_libc_jitframe`-tracked allocation
+    // strategy in `runner::dynasm_realloc_frame`.
+    let layout = std::alloc::Layout::from_size_align(new_bytes, 8)
+        .expect("cranelift_realloc_frame: invalid layout");
+    let new_jf = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
+    assert!(
+        !new_jf.is_null(),
+        "cranelift_realloc_frame: alloc_zeroed failed"
+    );
+
+    let old_base = old_jf as usize;
+    let new_base = new_jf as usize;
+
+    unsafe {
+        // jitframe.py:54-56 — copy fixed header (jf_frame_info,
+        // jf_descr, jf_force_descr, jf_gcmap, jf_savedata,
+        // jf_guard_exc, jf_forward).
+        std::ptr::copy_nonoverlapping(
+            old_jf as *const u8,
+            new_jf as *mut u8,
+            JF_FRAME_OFS,
+        );
+        // jitframe.py:84 — jf_frame's `length` word.
+        *((new_base + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = new_depth;
+
+        // llmodel.py:143-146 — copy items, zero source slots.
+        let old_len = *((old_base + JF_FRAME_LENGTH_OFS as usize) as *const usize);
+        let copy = old_len.min(new_depth);
+        let old_items = (old_base + JF_FRAME_ITEM0_OFS as usize) as *mut i64;
+        let new_items = (new_base + JF_FRAME_ITEM0_OFS as usize) as *mut i64;
+        for i in 0..copy {
+            *new_items.add(i) = *old_items.add(i);
+            *old_items.add(i) = 0;
+        }
+
+        // llmodel.py:141 — frame.jf_forward = new_frame.
+        *((old_base + JF_FORWARD_OFS as usize) as *mut *mut i64) = new_jf;
+    }
+
+    // Mirror dynasm's `register_libc_jitframe` so the GC visitor sees
+    // the new payload's interior Ref slots through the registered
+    // libc-jitframe tracer.
+    majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
+
+    if majit_log_enabled() {
+        eprintln!(
+            "[cranelift][realloc-frame] old={old_jf:p} new={new_jf:p} new_depth={new_depth}"
+        );
+    }
+
+    new_jf
+}
+
 fn raw_varsize_alloc_typed_and_set_len(
     type_id: u32,
     base_size: usize,
