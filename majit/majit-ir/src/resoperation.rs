@@ -4009,7 +4009,7 @@ mod tests {
         assert_eq!(op.args.len(), 2);
         assert_eq!(op.args[0], lhs);
         assert_eq!(op.args[1], rhs);
-        assert!(op.descr.is_none());
+        assert!(op.getdescr().is_none());
         assert!(op.fail_args.is_none());
         assert_eq!(op.result_type(), Type::Int);
         assert_eq!(op.num_args(), 2);
