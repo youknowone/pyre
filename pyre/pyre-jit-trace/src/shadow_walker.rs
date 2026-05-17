@@ -110,6 +110,15 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
+            // M4.PoC.2: PopTop arm body is `inline_call_r_r/dR>r` into
+            // the `pop_value` sub-jitcode, followed by the standard
+            // `live/catch_exception/goto/reraise/ref_return/live/raise/
+            // ref_return` shoulder.  No `goto_if_not/iL` (which would
+            // need Int-bank concrete shadow), so the LoadFast blocker
+            // doesn't apply here.  See
+            // `pop_top_jitcode_op_sequence_matches_expected_shape` test
+            // for the locked-in arm shape.
+            | Instruction::PopTop
     )
     // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
     // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
@@ -119,8 +128,8 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // fail-loud path because `concrete_registers_i` doesn't exist.
     // Blocker is the Int-bank concrete shadow plumbing — see
     // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
-    // for the Int-bank shadow" section.  Allow-list expansion past Nop
-    // is gated on that work.
+    // for the Int-bank shadow" section.  Allow-list expansion past
+    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it

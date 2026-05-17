@@ -3949,16 +3949,37 @@ impl CodeWriter {
                 // joinpoints.get(&py_pc)` arm, which correctly switches
                 // to the joinpoint candidate POP_JUMP_IF_FALSE's
                 // mergeblock just created at `fallthrough_pc`.
+                // `rpython/flowspace/flowcontext.py:130-156
+                // guessexception` closes the canraise block at the
+                // op that just attached the exception edge, so the
+                // next PC's bytecode lands in a fresh egg.  Pyre's
+                // `emit_catch_exception!` only attaches the exception
+                // edge (sets `exitswitch = LastException`) and leaves
+                // the canraise block "half-closed" — the walker keeps
+                // emitting subsequent ops into the same block, and a
+                // later POP_JUMP_IF overwrites `exitswitch` with its
+                // bool var, leaving the orphan exception edge in
+                // `exits[0]` and tripping `flatten.py:275-296
+                // insert_switch_exits` ("switch link requires
+                // Signed/Bool llexitcase").  Force a block boundary
+                // here so the next PC's ops emit into a fresh egg.
+                let canraise_pending = matches!(
+                    current_block.block().borrow().exitswitch,
+                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                        ref c,
+                    ))) if matches!(c.value, super::flow::ConstantValue::Atom(super::flow::Atom::LastException))
+                );
                 let force_branch_boundary = needs_fallthrough
-                    && branch_target_pcs.contains(&py_pc)
                     && current_block
                         .framestate()
                         .map_or(true, |fs| fs.next_offset != py_pc)
-                    && current_block.block().borrow().exits.is_empty();
+                    && (canraise_pending
+                        || (branch_target_pcs.contains(&py_pc)
+                            && current_block.block().borrow().exits.is_empty()));
                 let new_block = if needs_fallthrough
                     && (current_state.next_offset != py_pc || force_branch_boundary)
                 {
-                    mergeblock(
+                    let merged = mergeblock(
                         code,
                         &mut graph,
                         &mut joinpoints,
@@ -3968,7 +3989,28 @@ impl CodeWriter {
                         &mut link_exit_states,
                         &mut pendingblocks,
                         &mut all_walker_blocks,
-                    )
+                    );
+                    if canraise_pending {
+                        // `flowcontext.py:130-156 guessexception` builds
+                        // `block.exits = [normal_to_egg,
+                        // exception_to_handler]` — normal at index 0,
+                        // exception at index 1.  Pyre's
+                        // `emit_catch_exception!` attached the exception
+                        // edge first (it ran during op dispatch, before
+                        // any normal-flow edge existed); the mergeblock
+                        // above appended the normal edge to the end.
+                        // Restore the upstream order so
+                        // `flatten.py:1665-1670` (`exits[0].exitcase
+                        // is None` + `normal_link = exits[0]`) lands
+                        // the right link in the right slot.
+                        let block_rc = current_block.block();
+                        let mut block_mut = block_rc.borrow_mut();
+                        if block_mut.exits.len() >= 2 {
+                            let last = block_mut.exits.len() - 1;
+                            block_mut.exits.swap(0, last);
+                        }
+                    }
+                    merged
                 } else if let Some(target) = joinpoints
                     .get(&py_pc)
                     .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
