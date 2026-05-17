@@ -6877,7 +6877,7 @@ impl CodeWriter {
                         // Phase 4 walker-orthodoxy: compare_fn(exc,
                         // match_type, ISINSTANCE_OP:Int) → Ref shape
                         // residual_call_ir_r.  No frame_var threading.
-                        let _ = record_residual_call_graph_op(
+                        let cmp_result = record_residual_call_graph_op(
                             &mut graph,
                             &current_block.block(),
                             compare_fn_idx,
@@ -6889,6 +6889,7 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
+                        pair_walker_slot(&mut walker_slot_for_variable, cmp_result, scratch_match);
                         let result_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(result_value.clone());
                         emit_pushvalue_ref!(current_depth, scratch_match, result_value);
