@@ -8403,7 +8403,7 @@ impl CodeWriter {
                             break;
                         }
                     }
-                    if !found && walker_unmatched_samples.len() < 4 {
+                    if !found && walker_unmatched_samples.len() < 16 {
                         walker_unmatched_samples.push(w);
                     }
                 }
@@ -8412,7 +8412,7 @@ impl CodeWriter {
                     .enumerate()
                     .filter(|(_, b)| **b)
                     .map(|(i, _)| &canonical_op_set[i])
-                    .take(4)
+                    .take(16)
                     .collect();
                 eprintln!(
                     "[phase3-canonical-flatten-walker-unmatched] graph={:?} samples={:?}",
