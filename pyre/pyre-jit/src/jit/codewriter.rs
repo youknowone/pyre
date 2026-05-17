@@ -790,9 +790,16 @@ fn strip_walker_block_boundary_goto(
                 }
                 _ => None,
             });
+        let first_label_for_diag = blocks[i].first().and_then(|insn| match insn {
+            super::flatten::Insn::Label(l) => Some(l.name.clone()),
+            super::flatten::Insn::PcAnchor { py_pc } => {
+                Some(super::flatten::pc_label_name(*py_pc))
+            }
+            _ => None,
+        });
         let block_insns = &mut blocks[i];
         let len = block_insns.len();
-        let strip_tail = if len >= 2 {
+        let (strip_tail, goto_target_for_diag) = if len >= 2 {
             match (
                 &block_insns[len - 2],
                 &block_insns[len - 1],
@@ -806,13 +813,32 @@ fn strip_walker_block_boundary_goto(
                     && args.len() == 1
                     && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
                 {
-                    2
+                    (2, None)
                 }
-                _ => 0,
+                (
+                    super::flatten::Insn::Op { opname, args, .. },
+                    super::flatten::Insn::Unreachable,
+                    _,
+                ) if opname == "goto" && args.len() == 1 => {
+                    let target = match &args[0] {
+                        Operand::TLabel(t) => Some(t.name.clone()),
+                        _ => None,
+                    };
+                    (0, target)
+                }
+                _ => (0, None),
             }
         } else {
-            0
+            (0, None)
         };
+        if std::env::var_os("PYRE_PHASE3_STRIP_DIAG").is_some() {
+            if let Some(target) = goto_target_for_diag {
+                eprintln!(
+                    "[phase3-strip-no-match] block_index={} block_first={:?} goto_target={} next_label={:?}",
+                    i, first_label_for_diag, target, next_label_name,
+                );
+            }
+        }
         block_insns.truncate(len - strip_tail);
         drained.append(block_insns);
     }
