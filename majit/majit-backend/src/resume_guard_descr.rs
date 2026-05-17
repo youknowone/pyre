@@ -233,47 +233,6 @@ pub struct ResumeGuardDescr {
     /// reclaimed by the owning crate.  `OnceLock` so the registration
     /// is idempotent across re-attach.
     pub bridge_dispatch_drop_fn: OnceLock<fn(*mut ())>,
-    /// Path 1 Slice 2 — CALL_ASSEMBLER overlay state.  When set, the
-    /// descr's `recovery_layout` is composed on-demand from the inner
-    /// deadframe's recovery_layout (read off `callee_descr`) prefixed
-    /// by `caller_layout`, instead of being stored in the
-    /// `recovery_layout` cell above.  Only the cranelift CALL_ASSEMBLER
-    /// overlay path (`wrap_call_assembler_deadframe_with_caller_prefix`)
-    /// sets this — production guards leave it `None`.
-    ///
-    /// Why: PyPy's CALL_ASSEMBLER threads the resume chain naturally
-    /// through `rebuild_state_after_failure`; pyre's cranelift
-    /// adaptation pre-builds an `ExitRecoveryLayout` and stamps it onto
-    /// a synthetic overlay descr.  Storing the components instead of
-    /// the composed layout lets us delete the meta-side
-    /// `recovery_layout` cell in Slice 3 — production guards will read
-    /// via `recovery_layout_via_callback`, overlay descrs will compose
-    /// from `overlay_state`.
-    pub overlay_state: OnceLock<OverlayState>,
-}
-
-/// Components of a CALL_ASSEMBLER overlay descr's recovery_layout.
-/// Path 1 Slice 2 — see `ResumeGuardDescr::overlay_state`.
-#[derive(Debug)]
-pub struct OverlayState {
-    /// The inner deadframe's `jf_descr` — provides the callee trace's
-    /// recovery_layout via `fail_descr_recovery_layout(&callee_descr)`.
-    pub callee_descr: DescrRef,
-    /// The CALL_ASSEMBLER caller-prefix layout synthesised by
-    /// `caller_prefix_recovery_layout` (compiler.rs:595).  `Arc` so the
-    /// `OnceLock` insert doesn't have to clone-on-read.
-    pub caller_layout: Arc<ExitRecoveryLayout>,
-    /// Lazy memoisation of the composed `caller_layout.prefixed_by(callee)`.
-    /// `ExitRecoveryLayout.prefixed_by` clones every frame /
-    /// virtual_layout / pending_field_layout so callers that read the
-    /// overlay layout repeatedly (e.g. raise_catch's per-iteration
-    /// CALL_ASSEMBLER deopt) would otherwise re-pay the composition
-    /// cost on each `fail_descr_recovery_layout` query.  First read
-    /// composes and populates this cell; subsequent reads clone the
-    /// `Arc` contents.  Distinct from the meta-side `recovery_layout`
-    /// cell — this cache is overlay-private so Slice 3 can delete the
-    /// meta cell without losing the memoisation.
-    pub composed: OnceLock<Arc<ExitRecoveryLayout>>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -320,7 +279,6 @@ impl Descr for ResumeGuardDescr {
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
-            overlay_state: OnceLock::new(),
         }))
     }
 }
@@ -576,7 +534,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
-        overlay_state: OnceLock::new(),
     })
 }
 
@@ -702,28 +659,6 @@ impl ResumeGuardDescr {
     /// external-JUMP target cell (Slice 7-Tβ8).
     pub fn is_external_jump(&self) -> bool {
         self.external_jump_target.get().is_some()
-    }
-
-    /// Publish the CALL_ASSEMBLER overlay state (Path 1 Slice 2).
-    /// Called once by `overlay_deadframe_fail_descr` (cranelift
-    /// compiler.rs:548) on a freshly minted overlay descr.  The
-    /// reader (`fail_descr_recovery_layout`) prefers this over the
-    /// `recovery_layout` cell so the overlay path no longer writes
-    /// the cell; production guards continue to read the cell as
-    /// before until Slice 3 deletes it.
-    pub fn set_overlay_state(&self, callee_descr: DescrRef, caller_layout: ExitRecoveryLayout) {
-        let _ = self.overlay_state.set(OverlayState {
-            callee_descr,
-            caller_layout: Arc::new(caller_layout),
-            composed: OnceLock::new(),
-        });
-    }
-
-    /// Read the CALL_ASSEMBLER overlay state (Path 1 Slice 2).
-    /// `None` for production guards (the common case); `Some` only
-    /// when the overlay path stamped it.
-    pub fn overlay_state(&self) -> Option<&OverlayState> {
-        self.overlay_state.get()
     }
 
     /// Heap-pinned addresses of the two bridge-cache atomic cells

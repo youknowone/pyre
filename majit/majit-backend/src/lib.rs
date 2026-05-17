@@ -25,10 +25,10 @@ pub use finish_descrs::{
 };
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
-    OverlayState, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK,
-    STATUS_TY_FLOAT, STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK,
-    alloc_fail_index, build_vector_info_chain, flatten_vector_info,
-    make_resume_guard_descr_typed, push_vector_info, reset_fail_index_counter,
+    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
+    STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
+    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed, push_vector_info,
+    reset_fail_index_counter,
 };
 pub use resume_value::{
     FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
