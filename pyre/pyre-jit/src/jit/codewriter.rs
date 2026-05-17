@@ -6230,19 +6230,27 @@ impl CodeWriter {
                     // Pop in reverse: args, null_or_self, callable.
                     Instruction::Call { argc } => {
                         let nargs = argc.get(op_arg) as usize;
-                        let arg_regs: Vec<u16> = (0..nargs)
-                            .map(|_| ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0)
-                            .collect();
+                        let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(nargs);
                         let mut graph_arg_values_rev = Vec::with_capacity(nargs);
-                        for i in (0..nargs).rev() {
+                        for _ in 0..nargs {
                             let arg_reg = emit_popvalue_ref!(current_depth);
                             let arg_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            emit_ref_copy!(arg_regs[i], arg_reg);
+                            if let super::flow::FlowValue::Variable(v) = &arg_value {
+                                pair_walker_slot(
+                                    &mut walker_slot_for_variable,
+                                    Some(*v),
+                                    arg_reg,
+                                );
+                            }
+                            arg_regs_rev.push(arg_reg);
                             graph_arg_values_rev.push(arg_value);
                         }
+                        // Args were popped in reverse stack order; reverse to
+                        // match the call site's positional order (arg0 first).
+                        let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                         let callable_reg = emit_popvalue_ref!(current_depth);
                         let callable_value = current_state
                             .stack
