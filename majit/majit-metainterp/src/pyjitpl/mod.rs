@@ -158,7 +158,8 @@ pub(crate) struct CompiledTrace {
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts:
+        crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -698,7 +699,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
             for a in &op.args {
                 hw = hw.max(opref_high_water(*a));
             }
-            if let Some(fa) = &op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 for a in fa {
                     hw = hw.max(opref_high_water(*a));
                 }
@@ -900,7 +901,8 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
-    pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    pending_preamble_tokens:
+        crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -4420,7 +4422,7 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&compiled_ops, &constants));
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
-                    if let Some(ref fa) = op.fail_args {
+                    if let Some(fa) = op.getfailargs() {
                         let raw: Vec<String> = fa
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
@@ -4580,9 +4582,7 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     } else {
                         self.pending_preamble_tokens
-                            .entry_or_insert_with(green_key, || {
-                                unroll_opt.target_tokens.clone()
-                            });
+                            .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
@@ -7219,8 +7219,7 @@ impl<M: Clone> MetaInterp<M> {
             // `OpTypeIndex::opref_type_at`'s constant_types miss to the
             // hard-panic boundary (`history.py:220` parity), so reuse
             // the saved map instead.
-            let type_index =
-                majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
+            let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op
@@ -8367,7 +8366,10 @@ impl<M: Clone> MetaInterp<M> {
             for (i, op) in optimized_ops.iter().enumerate() {
                 eprintln!(
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
-                    op.opcode, op.pos.get(), op.args, op.descr
+                    op.opcode,
+                    op.pos.get(),
+                    op.args,
+                    op.descr
                 );
             }
         }
@@ -9856,7 +9858,8 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
+                        .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -9937,7 +9940,8 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
+                        .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -10152,7 +10156,8 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
+                        .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -10233,7 +10238,8 @@ impl<M: Clone> MetaInterp<M> {
                     let fallback_fail_index = trace
                         .ops
                         .get(guard_index)
-                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace())).unwrap_or(fail_index);
+                        .and_then(|op| op.with_fail_descr(|fd| fd.fail_index_per_trace()))
+                        .unwrap_or(fail_index);
                     let exit_layout = Self::compiled_exit_layout_from_trace(
                         trace,
                         green_key,
@@ -13847,9 +13853,8 @@ pub struct MetaInterpStaticData {
     /// Mutex-wrapped because `Arc<MetaInterpStaticData>` is shared
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
-    pub dispatch_array_descr_cache: std::sync::Mutex<
-        crate::optimizeopt::vec_assoc::VecAssoc<DispatchArrayDescrKey, DescrRef>,
-    >,
+    pub dispatch_array_descr_cache:
+        std::sync::Mutex<crate::optimizeopt::vec_assoc::VecAssoc<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -17079,7 +17084,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_populates_opcode_names() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         insns.insert("bar".to_string(), 1u8);
         sd.setup_insns(&insns);
@@ -17092,7 +17098,8 @@ mod metainterp_static_data_tests {
     fn setup_insns_caches_opcode_ids_or_minus_one() {
         // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("live/".to_string(), 5u8);
         insns.insert("goto/L".to_string(), 6u8);
         insns.insert("catch_exception/L".to_string(), 7u8);
@@ -17115,7 +17122,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+            majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         sd.setup_insns(&insns);
         assert_eq!(sd.op_live, -1);
@@ -17733,7 +17741,8 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -17823,7 +17832,8 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -18978,9 +18988,7 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_token = call
-            .with_call_descr(|cd| cd.call_target_token())
-            .flatten();
+        let call_token = call.with_call_descr(|cd| cd.call_target_token()).flatten();
         assert_eq!(call_token, Some(4242));
     }
 
@@ -19057,9 +19065,7 @@ mod tests {
             .into_iter()
             .find(|op| op.opcode == OpCode::CallAssemblerI)
             .expect("CALL_ASSEMBLER_I recorded");
-        let call_token2 = call
-            .with_call_descr(|cd| cd.call_target_token())
-            .flatten();
+        let call_token2 = call.with_call_descr(|cd| cd.call_target_token()).flatten();
         assert_eq!(call_token2, Some(token_number));
     }
 

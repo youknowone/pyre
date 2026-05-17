@@ -277,7 +277,7 @@ impl WasmBackend {
                     self.constants.insert(arg.raw(), 0);
                 }
             }
-            if let Some(ref fail_args) = op.fail_args {
+            if let Some(fail_args) = op.getfailargs() {
                 for &arg in fail_args.iter() {
                     if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
                         self.constants.insert(arg.raw(), 0);

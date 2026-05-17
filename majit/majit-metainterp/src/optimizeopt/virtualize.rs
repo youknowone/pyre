@@ -370,11 +370,8 @@ impl OptVirtualize {
         source_op: &Op,
         ctx: &mut OptContext,
     ) {
-        let opinfo = crate::optimizeopt::info::VirtualRawBufferInfo::new(
-            func,
-            size,
-            source_op.getdescr(),
-        );
+        let opinfo =
+            crate::optimizeopt::info::VirtualRawBufferInfo::new(func, size, source_op.getdescr());
         let b = ctx
             .ensure_box(source_op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -503,7 +500,7 @@ impl OptVirtualize {
         // arg, descr=op.getdescr())` — array descr discriminates the
         // pure-cache key so the reverse ARRAYLEN→size fold doesn't
         // collide across distinct array types.
-        if let Some(descr) = op.descr.clone() {
+        if let Some(descr) = op.getdescr() {
             ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, op.pos.get(), size_ref, descr);
         } else {
             ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos.get(), size_ref);
@@ -696,9 +693,7 @@ impl OptVirtualize {
                     majit_ir::OpCode::GetfieldGcPureI | majit_ir::OpCode::GetfieldGcI
                 )
             {
-                let is_typeptr = op
-                    .with_field_descr(|fd| fd.is_typeptr())
-                    .unwrap_or(false);
+                let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
                 if is_typeptr {
                     let vtable = match &info {
                         PtrInfo::Virtual(vinfo) => vinfo
@@ -2523,7 +2518,8 @@ mod tests {
             // (`opref.ty()`) resolves via the variant tag without
             // falling through to the inputarg-slot fallback (which
             // collides with low op-position raws).
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
     }
 
@@ -2536,8 +2532,7 @@ mod tests {
         // overwrites guard.fail_args with the numbered liveboxes.
         seed_guard_snapshots_with(ops, |guard| {
             guard
-                .fail_args
-                .as_deref()
+                .getfailargs()
                 .map(|fail_args| fail_args.iter().copied().collect())
                 .unwrap_or_default()
         })
@@ -4433,7 +4428,8 @@ mod tests {
             ),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed((idx + 2) as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed((idx + 2) as u32, op.opcode.result_type()));
         }
 
         let mut opt = Optimizer::default_pipeline();

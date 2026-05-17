@@ -273,10 +273,10 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::vec_assoc::VecAssoc<String, u8>>
                     BYTES.len(),
                 )
             });
-    // Overlay the helper-side `_pyre/P` adapter keys so the static
-    // decoder shares a key set with the production blackhole builder.
-    // pyre_extension_insns() is the same source the runtime builder
-    // hands to `setup_insns(...)`.
+        // Overlay the helper-side `_pyre/P` adapter keys so the static
+        // decoder shares a key set with the production blackhole builder.
+        // pyre_extension_insns() is the same source the runtime builder
+        // hands to `setup_insns(...)`.
         for (key, byte) in majit_translate::insns::pyre_extension_insns() {
             if let Some(&prev) = table.get(key) {
                 assert_eq!(

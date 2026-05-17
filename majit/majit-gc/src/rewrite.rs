@@ -3852,11 +3852,10 @@ mod tests {
         // at the position where OpRef::ref_op(2) (the IntLt result) used to appear.
         let same_pos = result[same_idx].pos.get();
         let guard_fa = result[guard_idx]
-            .fail_args
-            .as_ref()
+            .getfailargs()
             .expect("guard keeps failargs");
         assert_eq!(
-            guard_fa.as_slice(),
+            guard_fa,
             &[OpRef::int_op(0), same_pos, OpRef::int_op(1)],
             "OpRef::ref_op(2) → SAME_AS_I substitution"
         );

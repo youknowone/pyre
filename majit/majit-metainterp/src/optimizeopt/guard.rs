@@ -304,7 +304,9 @@ impl Guard {
             Some(types) => guard_op.set_fail_arg_types(types.to_vec()),
             None => guard_op.clear_fail_arg_types(),
         }
-        guard_op.rd_resume_position.set(self.op.rd_resume_position.get());
+        guard_op
+            .rd_resume_position
+            .set(self.op.rd_resume_position.get());
         // guard.py:95: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
@@ -353,7 +355,9 @@ impl Guard {
         // compile.py:861-872 / 840-842: in-place copy preserving
         // myop.descr identity (`fail_index` / status / subtype tag).
         crate::compile::copy_all_attributes_from(&my_descr, &donor_descr);
-        self.op.rd_resume_position.set(other.op.rd_resume_position.get());
+        self.op
+            .rd_resume_position
+            .set(other.op.rd_resume_position.get());
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
         match other.op.getfailargs() {
             Some(fa) => self.op.setfailargs(fa.iter().copied().collect()),
@@ -410,7 +414,9 @@ impl Guard {
             Some(types) => guard.set_fail_arg_types(types.to_vec()),
             None => guard.clear_fail_arg_types(),
         }
-        guard.rd_resume_position.set(self.op.rd_resume_position.get());
+        guard
+            .rd_resume_position
+            .set(self.op.rd_resume_position.get());
         // compile.py:855 _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
         // guard.py:145-147
@@ -702,7 +708,8 @@ impl GuardStrengthenOpt {
 
         // guard.py:283-299
         let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
-        let guards_snapshot: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>> = self.strongest_guards.clone();
+        let guards_snapshot: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>> =
+            self.strongest_guards.clone();
         for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
@@ -1046,7 +1053,8 @@ mod tests {
     /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
             if op.opcode.is_guard() && !op.has_descr() {
                 op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }

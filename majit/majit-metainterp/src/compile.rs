@@ -387,8 +387,10 @@ pub(crate) fn build_guard_metadata(
     crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
     crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
 ) {
-    let mut result: crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut result: crate::optimizeopt::vec_assoc::VecAssoc<
+        u32,
+        crate::resume::ResumeLayoutSummary,
+    > = crate::optimizeopt::vec_assoc::VecAssoc::new();
     let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
     let mut fail_index = 0u32;
@@ -502,7 +504,7 @@ pub(crate) fn build_guard_metadata(
                     .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                     .collect()
             }
-        } else if let Some(ref fail_args) = op.fail_args {
+        } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
             // reduced liveboxes' types authoritatively. Prefer the descr's
             // fail_arg_types (single source of truth, matches RPython
@@ -638,8 +640,7 @@ pub(crate) fn build_guard_metadata(
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
                 builder.push_frame(0, pc);
                 let num_slots = op
-                    .fail_args
-                    .as_ref()
+                    .getfailargs()
                     .map(|fa| fa.len())
                     .unwrap_or(exit_types.len());
                 for slot_idx in 0..num_slots {
@@ -702,8 +703,12 @@ pub(crate) fn build_guard_metadata(
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                    let (num_failargs, vable_values, vref_values, frames) =
-                        rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &exit_types, fvc_ref);
+                    let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
+                        &rd_numb_bytes,
+                        &rd_consts_data,
+                        &exit_types,
+                        fvc_ref,
+                    );
                     debug_assert!(
                         vref_values.len() & 1 == 0,
                         "vref_values length must be even, got {}",
@@ -1163,7 +1168,7 @@ pub(crate) fn merge_backend_exit_layouts(
                 storage: storage_from_backend.clone(),
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: None,
-                });
+            });
         entry.source_op_index = layout.source_op_index;
         // Backfill descr if the entry was inserted before `op.descr` was
         // available (or the op walk produced a fresh handle). Keeps
@@ -1199,7 +1204,9 @@ pub(crate) fn merge_backend_exit_layouts(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>) {
+pub(crate) fn validate_exit_layouts(
+    exit_layouts: &crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -1437,8 +1444,8 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             })
         });
         let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
-        let entry = terminal_exit_layouts.entry_or_insert_with(layout.op_index, || {
-            StoredExitLayout {
+        let entry =
+            terminal_exit_layouts.entry_or_insert_with(layout.op_index, || StoredExitLayout {
                 source_op_index: Some(layout.op_index),
                 gc_ref_slots: layout.gc_ref_slots.clone(),
                 force_token_slots: layout.force_token_slots.clone(),
@@ -1447,8 +1454,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 storage: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
-            }
-        });
+            });
         entry.source_op_index = Some(layout.op_index);
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
@@ -1581,7 +1587,7 @@ pub(crate) fn infer_terminal_exit_layout(
         })
         .collect();
     let is_exception_exit = op
-        .descr
+        .getdescr()
         .as_ref()
         .and_then(|d| d.as_fail_descr())
         .is_some_and(|fd| fd.is_exit_frame_with_exception());
@@ -1916,7 +1922,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .flat_map(|op| {
             std::iter::once(op.pos.get())
                 .chain(op.args.iter().copied())
-                .chain(op.fail_args.iter().flatten().copied())
+                .chain(op.getfailargs().into_iter().flatten().copied())
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())

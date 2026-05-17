@@ -2006,7 +2006,9 @@ impl OptIntBounds {
             return Some(&ctx.new_operations[idx]);
         }
         // Otherwise search by pos field
-        ctx.new_operations.iter().rfind(|op| op.pos.get() == cond_ref)
+        ctx.new_operations
+            .iter()
+            .rfind(|op| op.pos.get() == cond_ref)
     }
 
     // ── Bound narrowing helpers ──

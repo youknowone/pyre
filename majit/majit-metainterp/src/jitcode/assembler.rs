@@ -75,8 +75,7 @@ pub struct JitCodeBuilder {
     /// different trace wrappers that share a concrete function pointer.
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
-    call_descr_to_call_target:
-        crate::optimizeopt::vec_assoc::VecAssoc<u16, JitCallTarget>,
+    call_descr_to_call_target: crate::optimizeopt::vec_assoc::VecAssoc<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by

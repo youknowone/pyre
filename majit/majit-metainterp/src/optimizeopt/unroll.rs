@@ -834,7 +834,7 @@ impl UnrollOptimizer {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
                     let rd_numb_len = op.resolved_rd_numb().map(|s| s.len()).unwrap_or(0);
-                    if let Some(ref fa) = op.fail_args {
+                    if let Some(fa) = op.getfailargs() {
                         let fa_raw: Vec<String> = fa
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
@@ -850,7 +850,10 @@ impl UnrollOptimizer {
                     } else {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
-                            op.opcode, op.pos.get(), op.rd_resume_position.get(), rd_numb_len,
+                            op.opcode,
+                            op.pos.get(),
+                            op.rd_resume_position.get(),
+                            rd_numb_len,
                         );
                     }
                 }
@@ -870,7 +873,9 @@ impl UnrollOptimizer {
             for (i, op) in p2_ops.iter().enumerate() {
                 eprintln!(
                     "[jit] p2[{i}]: {:?} pos={:?} args={:?}",
-                    op.opcode, op.pos.get(), op.args
+                    op.opcode,
+                    op.pos.get(),
+                    op.args
                 );
             }
         }
@@ -1018,7 +1023,7 @@ impl UnrollOptimizer {
                             .args
                             .iter()
                             .copied()
-                            .chain(op.fail_args.iter().flatten().copied());
+                            .chain(op.getfailargs().into_iter().flatten().copied());
                         for arg in arg_iter {
                             if !is_trace_runtime_ref(arg, &consts_p2) {
                                 continue;
@@ -1631,7 +1636,8 @@ pub struct ExportedState {
     /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
     /// union of these three cases.
-    pub exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+    pub exported_infos:
+        crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -1750,7 +1756,10 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         renamed_inputarg_types: Vec<Type>,
@@ -1813,7 +1822,7 @@ impl ExportedState {
             for &arg in &op.args {
                 visit(arg);
             }
-            if let Some(ref fail_args) = op.fail_args {
+            if let Some(fail_args) = op.getfailargs() {
                 for &arg in fail_args {
                     visit(arg);
                 }
@@ -2546,7 +2555,9 @@ impl OptUnroll {
         renamed_inputargs: &[OpRef],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
@@ -2562,7 +2573,10 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut infos: crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
@@ -2733,8 +2747,13 @@ impl OptUnroll {
         &self,
         arg: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         let resolved = ctx.get_box_replacement(arg);
         if infos.contains_key(&resolved) {
@@ -2782,8 +2801,13 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
     ) {
         let opref_box = ctx.get_box_replacement_box(opref);
         let fields: Vec<OpRef> = match opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -3106,9 +3130,14 @@ impl OptUnroll {
                             // preamble ops are GC-tracked and survive across
                             // compilations. build_short_preamble_struct scans
                             // all op args to capture referenced constants.
-                            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> = crate::optimizeopt::vec_assoc::VecAssoc::new();
-                            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type> =
-                                crate::optimizeopt::vec_assoc::VecAssoc::new();
+                            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                                u32,
+                                i64,
+                            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
+                                u32,
+                                majit_ir::Type,
+                            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
                             for (&k, &tp) in optimizer.constant_types.iter() {
                                 loop_constant_types.insert(k, tp);
                             }
@@ -3395,7 +3424,9 @@ impl OptUnroll {
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
                     if let Some(ref patch) = ctx.patchguardop {
-                        new_op.rd_resume_position.set(patch.rd_resume_position.get());
+                        new_op
+                            .rd_resume_position
+                            .set(patch.rd_resume_position.get());
                     }
                     // Re-register guard constant args from preamble's constant pool.
                     for &arg in &new_op.args {
@@ -3606,7 +3637,8 @@ impl OptUnroll {
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
         // depend on a downstream `register_value_type` patch.
-        let mut result_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut result_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (source, produced) in &exported_state.short_boxes {
             let result_type = produced.preamble_op.result_type();
             let result = match produced.kind {
@@ -3640,7 +3672,8 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut imported_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
@@ -3667,7 +3700,8 @@ impl OptUnroll {
         // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
         // value is the body-visible OpRef per `replay_pos` in
         // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
                 ctx,
@@ -3716,7 +3750,9 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+        >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
         let resolved = ctx.get_box_replacement(opref);
@@ -3800,7 +3836,10 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         ctx: &mut OptContext,
     ) {
         ctx.setinfo_from_preamble_item(opref, info, exported_infos);
@@ -3813,7 +3852,9 @@ pub(crate) fn export_state(
     renamed_inputargs: &[OpRef],
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
-    exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
+    exported_int_bounds: Option<
+        &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>,
+    >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
         jump_args,
@@ -4145,7 +4186,10 @@ fn assemble_peeled_trace_with_jump_args(
             })
             .collect();
         for op in &result {
-            if !op.pos.get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
+            if !op.pos.get().is_none()
+                && op.opcode != OpCode::Jump
+                && op.result_type() != Type::Void
+            {
                 s.insert(op.pos.get());
             }
         }
@@ -4182,7 +4226,7 @@ fn assemble_peeled_trace_with_jump_args(
                 max_pos = max_pos.max(arg.raw().saturating_add(1));
             }
         }
-        if let Some(ref fa) = op.fail_args {
+        if let Some(fa) = op.getfailargs() {
             for &arg in fa.iter() {
                 if is_trace_runtime_ref(arg, constants) {
                     max_pos = max_pos.max(arg.raw().saturating_add(1));
@@ -4348,7 +4392,8 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's Box identity makes this implicit — the alias's Box is
     // the same Python object that body ops already hold. Pyre's flat
     // OpRef model needs an explicit forwarding registration here.
-    let mut assembly_alias_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut assembly_alias_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     // Keep the assembly-only alias map separate from the general `_forwarded`
     // walk. PyPy has object identity for these short-preamble boxes; pyre needs
     // the explicit jump_source -> label_arg substitution, but must not follow
@@ -4403,22 +4448,23 @@ fn assemble_peeled_trace_with_jump_args(
         // forwarding chains again here: postprocess_GUARD_TRUE/FALSE may have
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
-        let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-                              body_result_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-                              seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
-                              visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
-         -> OpRef {
-            if let Some(&mapped) = assembly_alias_remap.get(&arg) {
-                return mapped;
-            }
-            if let Some(&mapped) = body_result_remap.get(&arg) {
-                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+        let remap_body_arg =
+            |arg: OpRef,
+             assembly_alias_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+             body_result_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+             seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
+             visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
+             -> OpRef {
+                if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                     return mapped;
                 }
-            }
-            arg
-        };
+                if let Some(&mapped) = body_result_remap.get(&arg) {
+                    if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
+                        return mapped;
+                    }
+                }
+                arg
+            };
         for arg in &mut new_op.args {
             *arg = remap_body_arg(
                 *arg,
@@ -4442,7 +4488,7 @@ fn assemble_peeled_trace_with_jump_args(
                     .args
                     .iter()
                     .copied()
-                    .chain(later_op.fail_args.iter().flatten().copied())
+                    .chain(later_op.getfailargs().into_iter().flatten().copied())
                 {
                     if arg.is_none()
                         || constants.contains_key(&arg.raw())
@@ -4583,7 +4629,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .args
                 .iter()
                 .copied()
-                .chain(new_op.fail_args.iter().flatten().copied())
+                .chain(new_op.getfailargs().into_iter().flatten().copied())
             {
                 if arg.is_none()
                     || constants.contains_key(&arg.raw())
@@ -4708,7 +4754,11 @@ impl OptUnroll {
     /// closes that collision and lets the Box.type invariant enforce
     /// itself uniformly at `emit()` / `emit_extra()` /
     /// `propagate_from_pass_range`.
-    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> {
+    fn peel_iteration(
+        &self,
+        jump_op: &Op,
+        ctx: &mut OptContext,
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type (Slice 0.5 follow-up — `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -4717,7 +4767,8 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos.get(), new_pos);
         }
@@ -4763,7 +4814,8 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut orig_ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos.get(), new_pos);
         }
@@ -4924,7 +4976,8 @@ mod tests {
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(base + i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.opcode.result_type()));
         }
     }
 
@@ -4982,8 +5035,7 @@ mod tests {
             // snapshot so remapping can verify the TraceIterator cache
             // semantics that RPython gets from opencoder.py.
             guard
-                .fail_args
-                .as_deref()
+                .getfailargs()
                 .map(|fail_args| fail_args.iter().copied().collect())
                 .unwrap_or_default()
         });
@@ -6443,11 +6495,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(64)]);
         assert_eq!(
-            combined[1]
-                .fail_args
-                .as_ref()
-                .expect("guard fail args")
-                .as_slice(),
+            combined[1].getfailargs().expect("guard fail args"),
             &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);

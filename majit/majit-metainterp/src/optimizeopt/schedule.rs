@@ -557,8 +557,7 @@ impl GuardAnalysis {
     /// A guard is hoistable if its arguments are loop-invariant
     /// (not produced by any op in the loop body).
     pub fn analyze(ops: &[Op]) -> Self {
-        let mut body_results: majit_ir::vec_set::VecSet<OpRef> =
-            majit_ir::vec_set::VecSet::new();
+        let mut body_results: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
         for op in ops {
             if !op.pos.get().is_none() {
                 body_results.insert(op.pos.get());
@@ -1013,8 +1012,8 @@ pub fn prepare_fail_arguments(
     if !first_op.opcode.is_guard() {
         return;
     }
-    if let Some(ref fail_args) = first_op.fail_args {
-        let mut new_fail_args = fail_args.clone();
+    if let Some(fail_args) = first_op.getfailargs() {
+        let mut new_fail_args: smallvec::SmallVec<[OpRef; 3]> = fail_args.iter().copied().collect();
         for arg in new_fail_args.iter_mut() {
             // schedule.py:393-394: look up if arg is in a vector box
             let (_pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));

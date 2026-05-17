@@ -139,11 +139,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
         }
 
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-            let fail_args = op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.as_slice())
-                .unwrap_or(&op.args);
+            let fail_args = op.getfailargs().unwrap_or(&op.args);
             let fail_arg_types = op
                 .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
@@ -1333,11 +1329,7 @@ fn emit_guard_exit(
     guard_idx: u32,
     op: &Op,
 ) {
-    let fail_args = op
-        .fail_args
-        .as_ref()
-        .map(|fa| fa.as_slice())
-        .unwrap_or(&op.args);
+    let fail_args = op.getfailargs().unwrap_or(&op.args);
 
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;

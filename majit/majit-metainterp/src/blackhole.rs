@@ -287,7 +287,7 @@ pub fn blackhole_execute_full(
                 continue;
             }
             OpResult::GuardFailed => {
-                let fail_values = if let Some(ref fail_args) = op.fail_args {
+                let fail_values = if let Some(fail_args) = op.getfailargs() {
                     fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
@@ -668,7 +668,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 continue;
             }
             OpResult::GuardFailed => {
-                let fail_values = if let Some(ref fail_args) = op.fail_args {
+                let fail_values = if let Some(fail_args) = op.getfailargs() {
                     fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
@@ -3861,7 +3861,8 @@ mod tests {
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
             use majit_translate::insns;
             let mut builder = BlackholeInterpBuilder::new();
-            let mut entries: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+            let mut entries: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             entries.insert("int_copy_pyre_u16/i>i".to_string(), insns::BC_MOVE_I);
             entries.insert("ref_copy_pyre_u16/r>r".to_string(), insns::BC_MOVE_R);
             entries.insert("int_add_pyre_u16/ii>i".to_string(), insns::BC_INT_ADD);
@@ -4461,7 +4462,8 @@ mod tests {
             // Opcode 0 = "live/" (liveness marker, skip 2 bytes)
             // Opcode 1 = "int_add/ii>i" (3 register bytes: a, b, dst)
             // Opcode 2 = "int_return/i" (1 register byte)
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("live/".to_string(), 0u8);
             insns.insert("int_add/ii>i".to_string(), 1u8);
             insns.insert("int_return/i".to_string(), 2u8);
@@ -4505,7 +4507,8 @@ mod tests {
             // majit-translate assembler.rs FieldRead/FieldWrite/ArrayRead
             // /VableFieldRead/VableFieldWrite derive the opname kind
             // suffix from the value/result register kind.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
             insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
             insns.insert("setfield_gc_i/iid".to_string(), 2u8);
@@ -4536,7 +4539,8 @@ mod tests {
             // assembler.rs:2106-2130,2226-2250 negative asserts). Kept as
             // guard tests so any regression that reintroduces a `_v` key
             // surfaces at setup_insns time rather than at first dispatch.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             insns.insert("setfield_gc_v/rid".to_string(), 0u8);
             insns.insert("setfield_gc_v/iid".to_string(), 1u8);
             insns.insert("setfield_gc_v/ird".to_string(), 2u8);
@@ -4573,7 +4577,8 @@ mod tests {
             // RPython blackhole integer arithmetic is `@arguments("i", "i",
             // returns="i")` (blackhole.py:458+). Ref/int-mixed `int_*`
             // opnames are kind-flow bugs, not alternate blackhole surfaces.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
+                majit_ir::vec_assoc::VecAssoc::new();
             let fake_opnames = [
                 "int_add/ri>i",
                 "int_add/ir>i",
@@ -7279,8 +7284,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     {
         builder.cpu = Some(pyre_production_cpu());
     }
-    let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-        majit_ir::vec_assoc::VecAssoc::new();
+    let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
     insns.insert(
         "inline_call_pyre_nested/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,

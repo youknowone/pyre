@@ -1651,7 +1651,8 @@ impl OptHeap {
         // bit-count — `effectinfo.py:201-206 set_single_write_descr_array`
         // populates the field in addition to flipping the array bit, and
         // heapcache reads back the field directly.
-        let has_single_write_descr = op.with_call_descr(|cd| cd.get_extra_info().single_write_descr_array.is_some())
+        let has_single_write_descr = op
+            .with_call_descr(|cd| cd.get_extra_info().single_write_descr_array.is_some())
             .unwrap_or(false);
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
@@ -2199,7 +2200,9 @@ impl OptHeap {
             // be silently dropped under the patchguardop-only fallback.
             let guard_op = Op::new(OpCode::GuardTrue, &[cmp_pos]);
             if let Some(ref patch) = ctx.patchguardop {
-                guard_op.rd_resume_position.set(patch.rd_resume_position.get());
+                guard_op
+                    .rd_resume_position
+                    .set(patch.rd_resume_position.get());
             }
             ctx.emit(guard_op);
             return OptimizationResult::Remove;
@@ -2519,7 +2522,7 @@ impl OptHeap {
                 }
                 // heap.py:141-143 put_field_back_to_info(op, opinfo, optheap)
                 let final_value = lazy_op.arg(1);
-                let lazy_descr = put_back_op.descr.as_ref().unwrap().clone();
+                let lazy_descr = put_back_op.getdescr().unwrap();
                 let lazy_field_idx = Self::field_slot_index(&lazy_descr);
                 self.cache_field(lazy_obj, &lazy_descr);
                 ctx.structinfo_setfield(&put_back_op, lazy_field_idx, final_value);
@@ -3017,7 +3020,9 @@ impl OptHeap {
                 if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
                         "[opt-heap] postpone {:?} pos={:?} descr={:?}",
-                        op.opcode, op.pos.get(), op.descr
+                        op.opcode,
+                        op.pos.get(),
+                        op.descr
                     );
                 }
                 // RPython emitting_operation: calls go through
@@ -3049,7 +3054,10 @@ impl OptHeap {
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
                             "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
-                            postponed.opcode, postponed.pos.get(), op.opcode, op.pos.get()
+                            postponed.opcode,
+                            postponed.pos.get(),
+                            op.opcode,
+                            op.pos.get()
                         );
                     }
                     // RPython emit_postponed_op: route through next_optimization
@@ -3057,7 +3065,8 @@ impl OptHeap {
                 } else if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
                         "[opt-heap] no postponed op before {:?} pos={:?}",
-                        op.opcode, op.pos.get()
+                        op.opcode,
+                        op.pos.get()
                     );
                 }
                 // RPython emitting_operation for guards:

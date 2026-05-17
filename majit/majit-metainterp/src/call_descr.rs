@@ -651,8 +651,8 @@ pub fn make_call_descr_with_effect(
     // structurally, so repeated construction of the same call shape
     // yields the same descr identity.  The VecAssoc is that RPython
     // descriptor cache, not a side table for per-box optimizer state.
-    let cache = CALL_DESCR_CACHE
-        .get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
+    let cache =
+        CALL_DESCR_CACHE.get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
     let mut cache = cache.lock().unwrap();
     if let Some(descr) = cache.get(&key) {
         return descr.clone();
@@ -687,8 +687,8 @@ pub fn make_call_descr_with_effect(
 /// The returned `Vec` clones the cached `Arc<dyn Descr>` handles so
 /// the caller can release the cache lock before processing.
 pub fn cached_call_descrs() -> Vec<DescrRef> {
-    let cache = CALL_DESCR_CACHE
-        .get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
+    let cache =
+        CALL_DESCR_CACHE.get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
     let cache = cache.lock().unwrap();
     cache.values().cloned().collect()
 }

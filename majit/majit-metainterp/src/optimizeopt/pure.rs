@@ -1148,8 +1148,10 @@ impl Optimization for OptPure {
             // optimize_call_pure_old with adjusted start_index.
             for &pos in &self.call_pure_positions {
                 if let Some(old_op) = ctx.new_operations.get(pos) {
-                    let old_descr_identity =
-                        old_op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
+                    let old_descr_identity = old_op
+                        .getdescr()
+                        .as_ref()
+                        .map(majit_ir::descr::descr_identity);
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
@@ -1260,7 +1262,10 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(&mut self, results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>) {
+    fn set_call_pure_results(
+        &mut self,
+        results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    ) {
         self.call_pure_results = results.clone();
     }
 
@@ -1368,7 +1373,9 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            ctx.set_potential_extra_op(source, crate::optimizeopt::info::PreambleOp {
+            ctx.set_potential_extra_op(
+                source,
+                crate::optimizeopt::info::PreambleOp {
                     op: source,
                     invented_name: false,
                     preamble_op: {
@@ -1376,7 +1383,8 @@ mod tests {
                         same_as.pos.set(source);
                         same_as
                     },
-                });
+                },
+            );
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;

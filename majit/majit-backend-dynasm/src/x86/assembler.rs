@@ -3019,12 +3019,8 @@ impl<'a> Assembler386<'a> {
                          (regalloc.py:1158 force_allocate_reg invariant), got {other:?}",
                     ),
                 };
-                let ofs = op
-                    .with_field_descr(|fd| fd.offset() as i32)
-                    .unwrap_or(0);
-                let field_size = op
-                    .with_field_descr(|fd| fd.field_size())
-                    .unwrap_or(8);
+                let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                 if dst.is_xmm {
                     dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
                 } else {
@@ -4795,11 +4791,7 @@ impl<'a> Assembler386<'a> {
             jump_offset: self.mc.offset(),
             fail_label,
             fail_descr: descr.clone(),
-            fail_args: op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.to_vec())
-                .unwrap_or_default(),
+            fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
             gcmap,
@@ -5368,7 +5360,7 @@ impl<'a> Assembler386<'a> {
                         })
                     })
                     .collect()
-            } else if let Some(ref fa) = op.fail_args {
+            } else if let Some(fa) = op.getfailargs() {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
@@ -5399,7 +5391,7 @@ impl<'a> Assembler386<'a> {
             } else {
                 Vec::new()
             }
-        } else if let Some(ref fa) = op.fail_args {
+        } else if let Some(fa) = op.getfailargs() {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {

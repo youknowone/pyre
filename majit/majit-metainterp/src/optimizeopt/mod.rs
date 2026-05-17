@@ -4910,7 +4910,7 @@ impl OptContext {
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
-            if let Some(ref fa) = op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {

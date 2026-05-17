@@ -3188,7 +3188,8 @@ mod tests {
     /// Helper: assign positions to ops so the optimizer can track them.
     fn with_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
     }
 

@@ -3460,7 +3460,8 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>
+    {
         let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for pass in &self.passes {
             for (opref, bound) in pass.export_arg_int_bounds(args, ctx).iter() {
@@ -4017,7 +4018,7 @@ impl Optimizer {
             // post-finish (mod.rs::store_final_boxes_in_guard).
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py:681-683: force_box on each fail_arg for unrolling.
-            if let Some(ref fa) = op.fail_args {
+            if let Some(fa) = op.getfailargs() {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {
@@ -4770,7 +4771,8 @@ mod tests {
             Op::new(OpCode::Finish, &[OpRef::int_op(9)]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
 
         let mut opt = Optimizer::default_pipeline();
@@ -4901,7 +4903,8 @@ mod tests {
             finish,
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
         call_a.pos.set(ops[0].pos.get());
         call_b.pos.set(ops[4].pos.get());
@@ -4918,7 +4921,8 @@ mod tests {
             .map(|op| op.pos.get())
             .collect();
         assert!(
-            call_positions.contains(&call_a.pos.get()) && call_positions.contains(&call_b.pos.get()),
+            call_positions.contains(&call_a.pos.get())
+                && call_positions.contains(&call_b.pos.get()),
             "optimized trace lost CallMayForceR producer(s): {result:?}"
         );
         let guarded = result
@@ -4952,7 +4956,8 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
@@ -5126,7 +5131,8 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -5276,7 +5282,11 @@ mod tests {
                 .iter()
                 .position(|op| op.pos.get() == set_op.pos.get())
                 .unwrap_or_else(|| {
-                    panic!("missing setfield pos {:?} in {:?}", set_op.pos.get(), result)
+                    panic!(
+                        "missing setfield pos {:?} in {:?}",
+                        set_op.pos.get(),
+                        result
+                    )
                 });
             assert!(
                 new_idx < set_idx,
@@ -5421,7 +5431,8 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
         let result = opt.optimize_with_constants_and_inputs(
@@ -5444,10 +5455,7 @@ mod tests {
             guard.resolved_rd_virtuals().is_some(),
             "virtual structure should be encoded into rd_virtuals tree"
         );
-        let fail_args = guard
-            .fail_args
-            .as_ref()
-            .expect("guard should keep fail args");
+        let fail_args = guard.getfailargs().expect("guard should keep fail args");
         // resume.py:411-417 parity: liveboxes is TAGBOX-only.  The virtual
         // p0 is encoded into rd_virtuals; only its int field (OpRef::int_op(11))
         // survives in liveboxes.
@@ -5756,7 +5764,9 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        ctx.set_potential_extra_op(OpRef::int_op(14), crate::optimizeopt::info::PreambleOp {
+        ctx.set_potential_extra_op(
+            OpRef::int_op(14),
+            crate::optimizeopt::info::PreambleOp {
                 op: OpRef::int_op(14),
                 invented_name: false,
                 preamble_op: {
@@ -5764,7 +5774,8 @@ mod tests {
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
                     op
                 },
-            });
+            },
+        );
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
         guard.pos.set(OpRef::op_typed(15, guard.result_type()));
@@ -5798,7 +5809,8 @@ mod tests {
         ];
         ops[1].setfailargs(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
         let (ops, snapshots) = super::super::seed_guard_snapshots_with(&ops, |_| {

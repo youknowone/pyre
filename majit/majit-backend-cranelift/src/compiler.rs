@@ -4598,7 +4598,7 @@ fn build_ref_root_slots(
         for &arg in op
             .args
             .iter()
-            .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+            .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
         {
             if inputarg_oprefs.contains(&arg.raw()) {
                 used_inputargs.insert(arg.raw());
@@ -5181,7 +5181,7 @@ fn ref_root_slots_with_future_regular_uses(
                 && ops
                     .iter()
                     .skip(position + 1)
-                    .flat_map(|op| op.args.iter().chain(op.fail_args.iter().flatten()))
+                    .flat_map(|op| op.args.iter().chain(op.getfailargs().into_iter().flatten()))
                     .any(|arg| arg.raw() == *var_idx)
         })
         .copied()
@@ -7722,7 +7722,7 @@ impl CraneliftBackend {
                 for &arg in op
                     .args
                     .iter()
-                    .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+                    .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
                 {
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
@@ -7971,7 +7971,7 @@ impl CraneliftBackend {
             for &arg in op
                 .args
                 .iter()
-                .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+                .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
             {
                 if !arg.is_none()
                     && !declared_vars.contains(&arg.raw())
@@ -13138,7 +13138,7 @@ fn collect_guards(
                 infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
             };
             (refs, types)
-        } else if let Some(ref fa) = op.fail_args {
+        } else if let Some(fa) = op.getfailargs() {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
             let __descr_arc_descr_fd = op.getdescr();
             let descr_fd = __descr_arc_descr_fd

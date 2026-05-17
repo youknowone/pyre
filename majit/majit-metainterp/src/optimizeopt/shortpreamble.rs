@@ -274,11 +274,9 @@ impl CollectedShortPreambleBuilder {
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
-                if let Some(fail_args) = &op.fail_args {
+                if let Some(fail_args) = op.getfailargs() {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
-                        if let Some(label_idx) =
-                            label_args.iter().position(|a| a == fail_arg_ref)
-                        {
+                        if let Some(label_idx) = label_args.iter().position(|a| a == fail_arg_ref) {
                             fail_arg_mapping.push((fail_arg_pos, label_idx));
                         }
                     }
@@ -972,11 +970,9 @@ impl CollectedExtendedShortPreambleBuilder {
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
-                if let Some(fail_args) = &preamble_op.op.fail_args {
+                if let Some(fail_args) = preamble_op.op.getfailargs() {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
-                        if let Some(label_idx) =
-                            label_args.iter().position(|a| a == fail_arg_ref)
-                        {
+                        if let Some(label_idx) = label_args.iter().position(|a| a == fail_arg_ref) {
                             fail_arg_mapping.push((fail_arg_pos, label_idx));
                         }
                     }
@@ -1193,7 +1189,10 @@ impl ProducedShortOp {
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
@@ -1369,7 +1368,10 @@ impl ProducedShortOp {
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
@@ -1461,7 +1463,10 @@ impl ProducedShortOp {
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
+            OpRef,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
@@ -1619,8 +1624,7 @@ impl ProducedShortOp {
         {
             entry.1 = source;
         } else {
-            ctx.imported_loop_invariant_results
-                .push((func_ptr, source));
+            ctx.imported_loop_invariant_results.push((func_ptr, source));
         }
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
@@ -1782,9 +1786,8 @@ fn build_short_preamble_struct_from_ops(
     loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
     loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
 ) -> ShortPreamble {
-    let inputarg_idx = |arg: &OpRef| -> Option<usize> {
-        short_inputargs.iter().position(|a| a == arg)
-    };
+    let inputarg_idx =
+        |arg: &OpRef| -> Option<usize> { short_inputargs.iter().position(|a| a == arg) };
     // Collect all OpRefs defined by the short preamble ops (as results).
     let mut defined_by_ops: VecSet<OpRef> = VecSet::new();
     for ia in short_inputargs {
@@ -1808,8 +1811,7 @@ fn build_short_preamble_struct_from_ops(
                 })
                 .collect();
             let fail_arg_mapping = op
-                .fail_args
-                .as_ref()
+                .getfailargs()
                 .map(|fail_args| {
                     fail_args
                         .iter()
@@ -1831,7 +1833,8 @@ fn build_short_preamble_struct_from_ops(
     // In RPython, Const objects are stored in op args and are GC-tracked. Here,
     // we snapshot the loop's constant pool entries for any OpRef referenced by
     // short preamble ops that isn't defined by the ops themselves.
-    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     // RPython parity: typed `OpRef::Const{Int,Float,Ptr}` carry the type
     // tag intrinsically (history.py:220/261/307). Only `OpRef::Untyped`
     // (legacy `from_raw` producers) needs the lockstep side-table; missing
@@ -1857,7 +1860,7 @@ fn build_short_preamble_struct_from_ops(
                 }
             }
         }
-        if let Some(ref fa) = op.fail_args {
+        if let Some(fa) = op.getfailargs() {
             for &arg in fa {
                 if !defined_by_ops.contains(&arg) {
                     if let Some(&val) = loop_constants.get(&arg.raw()) {
@@ -2207,7 +2210,9 @@ impl ExtendedShortPreambleBuilder {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
                             "[jit] short_preamble setup: dropping inline (unresolved arg {:?} in op pos={:?} opcode={:?})",
-                            arg, op.pos.get(), op.opcode
+                            arg,
+                            op.pos.get(),
+                            op.opcode
                         );
                     }
                     self.short.clear();
@@ -2599,9 +2604,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     };
 
     let label_args = &peeled_ops[label_pos].args;
-    let label_arg_idx = |arg: &OpRef| -> Option<usize> {
-        label_args.iter().position(|a| a == arg)
-    };
+    let label_arg_idx = |arg: &OpRef| -> Option<usize> { label_args.iter().position(|a| a == arg) };
 
     // shortpreamble.py: Collect guards AND pure operations from the preamble.
     // Guards must be replayed so the body's assumptions hold.
@@ -2621,8 +2624,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
                     .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
                     .collect();
                 let ovf_fail_arg_mapping: Vec<(usize, usize)> = ovf_op
-                    .fail_args
-                    .as_ref()
+                    .getfailargs()
                     .into_iter()
                     .flat_map(|fail_args| fail_args.iter().enumerate())
                     .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
@@ -2654,8 +2656,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
             .collect();
         let fail_arg_mapping: Vec<(usize, usize)> = op
-            .fail_args
-            .as_ref()
+            .getfailargs()
             .into_iter()
             .flat_map(|fail_args| fail_args.iter().enumerate())
             .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
@@ -2834,7 +2835,8 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
 
@@ -3475,7 +3477,10 @@ mod tests {
 
         assert_eq!(builder.used_boxes(), &[OpRef::int_op(41)]);
         assert_eq!(builder.short_preamble_jump().len(), 1);
-        assert_eq!(builder.short_preamble_jump()[0].pos.get(), OpRef::int_op(14));
+        assert_eq!(
+            builder.short_preamble_jump()[0].pos.get(),
+            OpRef::int_op(14)
+        );
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);

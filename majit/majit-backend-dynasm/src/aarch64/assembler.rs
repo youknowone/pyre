@@ -3977,7 +3977,7 @@ impl<'a> AssemblerARM64<'a> {
                         })
                     })
                     .collect()
-            } else if let Some(ref fa) = op.fail_args {
+            } else if let Some(fa) = op.getfailargs() {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
@@ -4008,7 +4008,7 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 Vec::new()
             }
-        } else if let Some(ref fa) = op.fail_args {
+        } else if let Some(fa) = op.getfailargs() {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {

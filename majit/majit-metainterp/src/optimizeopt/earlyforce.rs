@@ -196,7 +196,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GuardNotForced);
-        assert!(result[0].fail_args.is_some());
+        assert!(result[0].has_failargs());
     }
 
     #[test]

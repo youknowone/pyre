@@ -59,7 +59,7 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
         format!("v{} = {:?}({args})", vars.id_for(op.pos.get()), op.opcode)
     };
 
-    if let Some(fail_args) = &op.fail_args {
+    if let Some(fail_args) = op.getfailargs() {
         let fail_args = fail_args
             .iter()
             .map(|&arg| render_arg(arg, constants, vars))

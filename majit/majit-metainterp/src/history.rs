@@ -258,7 +258,7 @@ impl TreeLoop {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
-                if let Some(ref fa) = op.fail_args {
+                if let Some(fa) = op.getfailargs() {
                     for arg in fa.iter() {
                         if arg.is_none() {
                             continue;
@@ -273,7 +273,7 @@ impl TreeLoop {
                 }
             } else if check_descr {
                 // history.py:592-593: non-guard ops must have no fail_args
-                if op.fail_args.is_some() {
+                if op.has_failargs() {
                     return false;
                 }
             }
@@ -856,7 +856,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        assert!(guards[0].fail_args.is_none());
+        assert!(!guards[0].has_failargs());
     }
 
     #[test]

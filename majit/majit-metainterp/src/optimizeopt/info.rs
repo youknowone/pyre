@@ -180,7 +180,6 @@ impl ForwardableValue for OpInfo {
 
 impl AbstractInfo for OpInfo {}
 
-
 impl OpInfo {
     /// Helper for constructing `OpInfo::Ptr` from owned `PtrInfo` —
     /// wraps in a fresh `Rc<RefCell<>>` for the shared-identity storage.

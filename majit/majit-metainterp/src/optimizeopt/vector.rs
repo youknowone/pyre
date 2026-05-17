@@ -220,8 +220,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     if !op.opcode.is_guard() {
         return;
     }
-    if let Some(ref fa) = op.fail_args {
-        let mut new_fa = fa.clone();
+    if let Some(fa) = op.getfailargs() {
+        let mut new_fa: smallvec::SmallVec<[majit_ir::OpRef; 3]> = fa.iter().copied().collect();
         for (fi, arg) in new_fa.iter_mut().enumerate() {
             if arg.is_none() {
                 continue;
@@ -858,7 +858,8 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
 

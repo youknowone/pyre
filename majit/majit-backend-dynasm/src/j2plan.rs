@@ -358,7 +358,7 @@ fn lower_op(op: &Op) -> LirOp {
         opcode if opcode.is_guard() => LirOp::Guard {
             kind: guard_kind(opcode),
             args: op.args.to_vec(),
-            fail_args: op.fail_args.as_deref().unwrap_or(&[]).to_vec(),
+            fail_args: op.getfailargs().unwrap_or(&[]).to_vec(),
         },
         opcode if opcode.is_call() => LirOp::Call {
             opcode,
@@ -369,7 +369,7 @@ fn lower_op(op: &Op) -> LirOp {
             opcode,
             dst: result_ref(op),
             args: op.args.to_vec(),
-            fail_args: op.fail_args.as_deref().unwrap_or(&[]).to_vec(),
+            fail_args: op.getfailargs().unwrap_or(&[]).to_vec(),
         },
     }
 }
