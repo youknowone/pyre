@@ -406,6 +406,14 @@ impl FailDescr for ResumeGuardDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
+    fn source_op_index(&self) -> Option<usize> {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() }
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() = Some(source_op_index) };
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr

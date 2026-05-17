@@ -706,50 +706,33 @@ impl CraneliftFailDescr {
     }
 
     /// Write the codegen-time trace-op index through to the meta-side
-    /// `ResumeGuardDescr` slot (Slice 7-Tβ6).  Silently skips synthetic
-    /// descrs without a `ResumeGuardDescr` `meta_descr` — those descrs
-    /// (FINISH `Done*` / external-JUMP TargetToken) have no associated
-    /// trace op upstream either.
+    /// per-emission slot (Slice 7-Tβ6).  Per-emission classification
+    /// matches `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /
+    /// `adr_jump_offset` (`assembler.py:279` writes onto each emitted
+    /// faildescr directly, never chasing `prev`).  Routed through the
+    /// `FailDescr` trait so `ResumeGuardDescr` and
+    /// `ResumeGuardCopiedDescr` each receive into their own slot — a
+    /// `prev_descr` chase here would conflate multiple copied descrs
+    /// sharing one donor (`optimizer.py:691` /
+    /// `optimizeopt/mod.rs:4438-4470`).  Silently skipped for descrs
+    /// whose `FailDescr::set_source_op_index` is the trait default
+    /// (synthetic FINISH / singleton descrs that have no associated
+    /// trace op).
     pub fn set_source_op_index(&self, source_op_index: usize) {
-        // Match `recovery_layout_ref` shape: chase `prev_descr` through
-        // any `ResumeGuardCopiedDescr` chain to write into the donor.
-        let Some(mut current) = self.meta_descr.as_ref().cloned() else {
-            return;
-        };
-        loop {
-            if let Some(rgd) = current
-                .as_any()
-                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            {
-                rgd.set_source_op_index(source_op_index);
-                return;
-            }
-            match current.prev_descr() {
-                Some(next) => current = next,
-                None => return,
-            }
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_source_op_index(source_op_index);
         }
     }
 
     #[inline]
     /// Read the codegen-time trace-op index from the meta-side
-    /// `ResumeGuardDescr` slot (Slice 7-Tβ6).  Returns `None` for
-    /// synthetic descrs without a `ResumeGuardDescr` meta or for
-    /// descrs whose codegen never stamped the slot.
+    /// per-emission slot (Slice 7-Tβ6).  Returns `None` for descrs
+    /// without a stamped slot (trait default).
     pub fn source_op_index_ref(&self) -> Option<usize> {
-        let mut current = self.meta_descr.as_ref().cloned()?;
-        loop {
-            if let Some(rgd) = current
-                .as_any()
-                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            {
-                return rgd.source_op_index();
-            }
-            match current.prev_descr() {
-                Some(next) => current = next,
-                None => return None,
-            }
-        }
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.source_op_index())
     }
 
     /// Forward the force-token slot list to the meta-side

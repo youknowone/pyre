@@ -1842,6 +1842,28 @@ pub trait FailDescr: Descr {
         Vec::new()
     }
 
+    /// Pyre-only per-emission slot: index of the trace op that produced
+    /// this guard at codegen.  Classified per-emission alongside
+    /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /
+    /// `adr_jump_offset` — `assembler.py:279`
+    /// `guardtok.faildescr.rd_locs = positions` writes onto the per-
+    /// emitted descr without chasing `prev`, and the source op index
+    /// shares that classification (one codegen emission = one op).
+    /// Default `None` for non-resume FailDescrs.  Overridden on both
+    /// `ResumeGuardDescr` and `ResumeGuardCopiedDescr` so the cranelift
+    /// backend never has to chase `prev_descr` to find the storage —
+    /// the chase would conflate multiple `ResumeGuardCopiedDescr`
+    /// siblings sharing a donor (optimizer.py:691 / optimizeopt/mod.rs).
+    fn source_op_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// Pyre-only per-emission slot write.  See `source_op_index` for
+    /// the per-emission rationale.  Default no-op for non-resume
+    /// FailDescrs (singleton FINISH / synthetic descrs have no
+    /// associated trace op upstream).
+    fn set_source_op_index(&self, _source_op_index: usize) {}
+
     /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
     /// — packs `ST_BUSY_FLAG` + type tag + hash on the resume-guard
     /// descr.  `compile.py:741-745` `self.status` read for

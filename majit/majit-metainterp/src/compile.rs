@@ -3701,6 +3701,14 @@ pub struct ResumeGuardCopiedDescr {
     /// Pyre-only per-trace fail-index — same role as on
     /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
     fail_index_per_trace: AtomicU32,
+    /// Pyre-only per-emission slot: codegen-time trace-op index.
+    /// Classified per-emission alongside `history.py:132
+    /// AbstractFailDescr._attrs_` `rd_locs` / `adr_jump_offset`
+    /// (`assembler.py:279` writes onto each emitted faildescr directly,
+    /// never chasing `prev`).  Owned per copied descr so multiple
+    /// copies of a single donor (optimizer.py:691 / optimizeopt/mod.rs)
+    /// do not clobber each other's op indices.
+    source_op_index: UnsafeCell<Option<usize>>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3753,6 +3761,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            source_op_index: UnsafeCell::new(None),
         }))
     }
 }
@@ -3913,6 +3922,17 @@ impl FailDescr for ResumeGuardCopiedDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
+    /// Per-emission `source_op_index` (see field comment).  Owned per
+    /// copied descr — each copy in `optimizeopt/mod.rs:4438-4470`
+    /// records its own trace-op origin, matching how
+    /// `assembler.py:279` writes `rd_locs` onto each emitted descr
+    /// directly.
+    fn source_op_index(&self) -> Option<usize> {
+        unsafe { *self.source_op_index.get() }
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        unsafe { *self.source_op_index.get() = Some(source_op_index) };
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -3958,6 +3978,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                source_op_index: UnsafeCell::new(None),
             },
         }))
     }
@@ -4066,6 +4087,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
         self.inner.set_rd_loop_token_clt(clt)
     }
+    fn source_op_index(&self) -> Option<usize> {
+        self.inner.source_op_index()
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        self.inner.set_source_op_index(source_op_index);
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4105,6 +4132,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        source_op_index: UnsafeCell::new(None),
     })
 }
 
@@ -4136,6 +4164,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            source_op_index: UnsafeCell::new(None),
         },
     })
 }
