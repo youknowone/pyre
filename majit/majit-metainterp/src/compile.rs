@@ -3723,10 +3723,35 @@ pub struct ResumeGuardCopiedDescr {
     /// independently of the donor.  Owned per copied descr so each
     /// copy's failures accrue separately.
     fail_count: AtomicU32,
+    /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
+    /// and atomic-swap discipline as
+    /// `ResumeGuardDescr::trace_info`.  Per-emission because
+    /// `record_loop_or_bridge` (compile.py:185-186) stamps the
+    /// loop-token-equivalent metadata onto each emitted descr
+    /// individually; the cell is reclaimed in `Drop`.
+    trace_info: std::sync::atomic::AtomicPtr<CompiledTraceInfo>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
 unsafe impl Sync for ResumeGuardCopiedDescr {}
+
+impl Drop for ResumeGuardCopiedDescr {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Reclaim any published `Arc<CompiledTraceInfo>`; mirrors
+        // `ResumeGuardDescr::drop`.  Swap-to-null first so a concurrent
+        // reader either bumps the strong count on the live pointer or
+        // observes null.
+        let ptr = self
+            .trace_info
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info_any`.
+            unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
+        }
+    }
+}
 
 impl ResumeGuardCopiedDescr {
     /// Read the current `prev` Arc.
@@ -3778,6 +3803,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
+            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }))
     }
 }
@@ -3972,6 +3998,33 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn increment_fail_count(&self) -> u32 {
         self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
     }
+    /// Per-emission `trace_info` (see field comment).  Same
+    /// atomic-swap discipline as `ResumeGuardDescr::set_trace_info` —
+    /// owning Arc reclaimed by `Drop`.
+    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        let ptr = self.trace_info.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info_any`.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some(arc as Arc<dyn std::any::Any + Send + Sync>)
+            }
+        }
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: Arc<CompiledTraceInfo> = info
+            .downcast::<CompiledTraceInfo>()
+            .expect("set_trace_info_any expected Arc<CompiledTraceInfo>");
+        let new_ptr = Arc::into_raw(typed) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -4020,6 +4073,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 source_op_index: UnsafeCell::new(None),
                 force_token_slots: UnsafeCell::new(Vec::new()),
                 fail_count: AtomicU32::new(0),
+                trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             },
         }))
     }
@@ -4146,6 +4200,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn increment_fail_count(&self) -> u32 {
         self.inner.increment_fail_count()
     }
+    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.inner.trace_info_any()
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
+        self.inner.set_trace_info_any(info);
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4188,6 +4248,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
+        trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     })
 }
 
@@ -4222,6 +4283,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
+            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         },
     })
 }

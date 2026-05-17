@@ -1870,6 +1870,25 @@ pub trait FailDescr: Descr {
         0
     }
 
+    /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
+    /// `Arc<dyn Any + Send + Sync>` so the trait can live in
+    /// `majit-ir` without depending on `majit-backend`'s
+    /// `CompiledTraceInfo`; concrete callers downcast.  Per-emission
+    /// classification matches `record_loop_or_bridge`
+    /// (`compile.py:185-186`) which stamps the loop-token-equivalent
+    /// data on each emitted descr; copied descrs in the same trace
+    /// share the same `CompiledTraceInfo` value but write into their
+    /// own slot.  Default `None`.
+    fn trace_info_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// Pyre-only per-emission `CompiledTraceInfo` slot write.  Caller
+    /// passes an `Arc<CompiledTraceInfo>` upcast to `Arc<dyn Any>`;
+    /// the impl downcasts.  Default no-op for descrs that never
+    /// carry trace info (singletons / synthetic FINISH).
+    fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {}
+
     /// Pyre-only per-emission slot: index of the trace op that produced
     /// this guard at codegen.  Classified per-emission alongside
     /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /

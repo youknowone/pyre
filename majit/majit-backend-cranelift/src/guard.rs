@@ -511,17 +511,18 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    /// Read the per-trace `CompiledTraceInfo` from the meta-side
-    /// `ResumeGuardDescr::trace_info` slot (Slice 7-Tβ10).  Returns
-    /// `None` when meta_descr is absent or is not a `ResumeGuardDescr`
-    /// (synthetic FINISH / singleton descrs), or when no trace info
-    /// has been published.
+    /// Read the per-trace `CompiledTraceInfo` from the meta-side per-
+    /// emission slot (Slice 7-Tβ10).  Routes through the `FailDescr`
+    /// trait so copied descrs return their own published info instead
+    /// of `None`.
     pub fn trace_info_ref(&self) -> Option<CompiledTraceInfo> {
-        self.meta_descr
+        let any = self
+            .meta_descr
             .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            .and_then(|rgd| rgd.trace_info())
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.trace_info_any())?;
+        let arc = any.downcast::<CompiledTraceInfo>().ok()?;
+        Some((*arc).clone())
     }
 
     #[inline]
@@ -766,20 +767,19 @@ impl CraneliftFailDescr {
     }
 
     /// Forward the per-trace `CompiledTraceInfo` publish to the meta-
-    /// side `ResumeGuardDescr::set_trace_info` slot (Slice 7-Tβ10).
-    /// Callers are `compile_loop` (codegen finaliser) and
+    /// side per-emission slot (Slice 7-Tβ10).  Callers are
+    /// `compile_loop` (codegen finaliser) and
     /// `overlay_deadframe_fail_descr` (CALL_ASSEMBLER prefix overlay).
-    /// Silently dropped when meta_descr is absent or is not a
-    /// `ResumeGuardDescr` (synthetic singletons that never carry
-    /// per-trace metadata).
+    /// Routes through the `FailDescr` trait so copied descrs receive
+    /// into their own slot — the previous downcast-to-`ResumeGuardDescr`-
+    /// only path silently dropped writes for copied guards.
+    /// Silently dropped only when meta_descr is absent or its
+    /// `set_trace_info_any` is the trait default (synthetic
+    /// singletons that never carry per-trace metadata).
     pub fn set_trace_info(self: &Arc<Self>, trace_info: CompiledTraceInfo) {
-        if let Some(rgd) = self
-            .meta_descr
-            .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        {
-            rgd.set_trace_info(trace_info);
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            let arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(trace_info);
+            fd.set_trace_info_any(arc);
         }
     }
 

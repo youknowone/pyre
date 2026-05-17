@@ -430,6 +430,34 @@ impl FailDescr for ResumeGuardDescr {
     fn increment_fail_count(&self) -> u32 {
         self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
     }
+    fn trace_info_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let ptr = self.trace_info.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: stored via `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info_any` / `set_trace_info`.  Bump the strong
+            // count and reconstruct so the caller gets an owning Arc
+            // without taking ownership from the cell.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some(arc as Arc<dyn Any + Send + Sync>)
+            }
+        }
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn Any + Send + Sync>) {
+        let typed: Arc<CompiledTraceInfo> = info
+            .downcast::<CompiledTraceInfo>()
+            .expect("set_trace_info_any expected Arc<CompiledTraceInfo>");
+        let new_ptr = Arc::into_raw(typed) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior swap produced this pointer via the same
+            // `Arc::into_raw(Arc::new(...))` invariant.
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
