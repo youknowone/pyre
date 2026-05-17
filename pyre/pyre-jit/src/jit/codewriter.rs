@@ -6158,15 +6158,53 @@ impl CodeWriter {
                         // exitswitches like this truthiness branch.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
-                            // POP_JUMP_IF_TRUE: emit_goto_if_not(fallthrough)
-                            // always targets PC+1 (forward, never emitted),
-                            // Phase A.4 retired the back-edge gate;
-                            // emit_goto's mergeblock now always appends
-                            // linktrue, so case stamp always applies.
+                            // `rpython/jit/codewriter/flatten.py:240-267
+                            // insert_exits` (Bool 2-exit arm) emits
+                            // `make_link(linktrue)` BEFORE
+                            // `make_link(linkfalse)`.  For POP_JUMP_IF_TRUE
+                            // linktrue = target_py_pc (jump on TRUE), so
+                            // target_block must physically follow parent
+                            // immediately in walker emission order to match
+                            // canonical's inline `make_link(linktrue)`
+                            // body.  Mergeblock the target FIRST so it
+                            // pops first from `pendingblocks`, then
+                            // `emit_goto_if_not!` appends the FALSE link
+                            // and queues fallthrough second.  Unlike
+                            // POP_JUMP_IF_FALSE (whose linktrue IS the
+                            // PC-sequential next block), POP_JUMP_IF_TRUE's
+                            // linktrue is the jump target — the PC-
+                            // sequential walker's auto-switch at PC+1
+                            // would inject a `goto pc{PC+1}` boundary
+                            // routing through `emit_mark_label_pc!` that
+                            // `strip_walker_block_boundary_goto` cannot
+                            // elide (next block in walker order is
+                            // target_block, not fallthrough_block).
+                            // Setting `needs_fallthrough = false` here
+                            // suppresses that boundary injection — the
+                            // exits are already laid out via the two
+                            // mergeblocks above; no implicit fallthrough
+                            // link is needed.
+                            mergeblock(
+                                code,
+                                &mut graph,
+                                &mut joinpoints,
+                                &current_block,
+                                &{
+                                    let mut branch_state = current_state.clone();
+                                    branch_state.next_offset = target_py_pc;
+                                    branch_state.blocklist =
+                                        frame_blocks_for_offset(code, target_py_pc);
+                                    branch_state
+                                },
+                                target_py_pc,
+                                &mut link_exit_states,
+                                &mut pendingblocks,
+                                &mut all_walker_blocks,
+                            );
+                            set_last_bool_exitcase(&current_block.block(), true);
                             emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
-                            emit_goto!(target_py_pc);
-                            set_last_bool_exitcase(&current_block.block(), true);
+                            needs_fallthrough = false;
                         }
                     }
 
