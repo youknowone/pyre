@@ -12255,21 +12255,19 @@ impl CraneliftBackend {
         // path mutates the vector. `Box<[T]>` reflects this contract in
         // the type system (mirrors RPython compile.py:183-203's frozen
         // descrs after record_loop_or_bridge).
-        //
-        // Load-bearing identity invariant for runtime dispatch: cranelift's
-        // guard-fail handler indexes `compiled.fail_descrs[idx]` by the
-        // descr-index slot stamped at compile time (compiler.rs guard
-        // emission writes the per-loop `fail_index` into the deadframe).
-        // Promoting from `debug_assert!` so a release build catches the
-        // position/fail_index mismatch eagerly rather than dispatching to
-        // the wrong descr at runtime.
-        assert!(
-            fail_descrs
-                .iter()
-                .enumerate()
-                .all(|(i, d)| FailDescr::fail_index_per_trace(d.as_ref()) as usize == i),
-            "fail_descrs position must equal fail_index"
-        );
+        // Position is the canonical fail_index identity (matching
+        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
+        // carry per-emission `fail_index` on the descr itself).  Codegen
+        // increments the `fail_index` counter in lockstep with
+        // `fail_descrs.push`, so the contract is structural rather than
+        // descr-internal.  The earlier per-descr assertion was a pyre
+        // NEW DEVIATION removed in Session 7-Tβ4 (parallels dynasm
+        // Tα4 cf05a9e99c): singleton FINISH descrs (the
+        // `DONE_WITH_THIS_FRAME_DESCR_*` cl statics whose
+        // `fail_index_per_trace()` is stamped once at module init) would
+        // mismatch their Vec position on every non-zero codegen, and
+        // post-Slice 7-Tβ1 the runtime lookup is position-based via
+        // `find_fail_descr_in_fail_descrs` rather than descr-internal.
         let fail_descrs: Box<[Arc<CraneliftFailDescr>]> = fail_descrs.into_boxed_slice();
         // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py:990-993
         // parity: set TargetToken._ll_loop_code on every Label in this
