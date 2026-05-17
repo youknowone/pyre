@@ -16,7 +16,7 @@
 //! `---` and generic `Op` instructions) plus `Operand` for everything
 //! that appears inside a tuple.
 
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use majit_ir::Descr;
 use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
@@ -1202,9 +1202,24 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     ssarepr: &'a mut SSARepr,
     get_register: F,
     lower_constant: C,
-    seen_blocks: HashMap<BlockRef, bool>,
-    block_names: HashMap<BlockRef, String>,
-    link_names: HashMap<LinkRef, String>,
+    /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
+    /// the recursive `make_bytecode_block` DFS tracks which blocks have
+    /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
+    /// Per [[feedback-no-hashmap-ever]] pyre uses `Vec<BlockRef>` with
+    /// linear scan: graph block counts stay in the dozens for production
+    /// workloads, so O(N) `.contains()` is acceptable and matches the
+    /// upstream dict's "identity membership" semantics without a hash.
+    seen_blocks: Vec<BlockRef>,
+    /// `flatten.py` does not name blocks directly — the upstream
+    /// `Label(block)` shape uses the block's identity hash via Python's
+    /// default `__hash__`.  Pyre needs a stringly Label/TLabel name for
+    /// the runtime's PC-dispatch lookup, so this side-table assigns
+    /// sequential `block{N}` names on first sight.  Same Vec-scan rule
+    /// as `seen_blocks`.
+    block_names: Vec<(BlockRef, String)>,
+    /// Per-link counterpart to `block_names` for `Label(link)` /
+    /// `TLabel(link)` shapes emitted at canraise / switch sites.
+    link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1242,9 +1257,9 @@ where
             ssarepr,
             get_register,
             lower_constant: flatten_constant_operand,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1267,9 +1282,9 @@ where
             ssarepr,
             get_register,
             lower_constant,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1297,9 +1312,9 @@ where
             ssarepr,
             get_register,
             lower_constant,
-            seen_blocks: HashMap::new(),
-            block_names: HashMap::new(),
-            link_names: HashMap::new(),
+            seen_blocks: Vec::new(),
+            block_names: Vec::new(),
+            link_names: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1355,22 +1370,22 @@ where
     }
 
     fn label_name_for_block(&mut self, block: &BlockRef) -> String {
-        if let Some(name) = self.block_names.get(block) {
+        if let Some((_, name)) = self.block_names.iter().find(|(b, _)| b == block) {
             return name.clone();
         }
         let name = format!("block{}", self.next_label_id);
         self.next_label_id += 1;
-        self.block_names.insert(block.clone(), name.clone());
+        self.block_names.push((block.clone(), name.clone()));
         name
     }
 
     fn label_name_for_link(&mut self, link: &LinkRef) -> String {
-        if let Some(name) = self.link_names.get(link) {
+        if let Some((_, name)) = self.link_names.iter().find(|(l, _)| l == link) {
             return name.clone();
         }
         let name = format!("link{}", self.next_label_id);
         self.next_label_id += 1;
-        self.link_names.insert(link.clone(), name.clone());
+        self.link_names.push((link.clone(), name.clone()));
         name
     }
 
@@ -2139,13 +2154,13 @@ where
             self.make_return(&args);
             return;
         }
-        if self.seen_blocks.contains_key(&block) {
+        if self.seen_blocks.contains(&block) {
             let target = self.tlabel_for_block(&block);
             self.emitline(Insn::op("goto", vec![target]));
             self.emitline(Insn::Unreachable);
             return;
         }
-        self.seen_blocks.insert(block.clone(), true);
+        self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
         let operations = block.borrow().operations.clone();
