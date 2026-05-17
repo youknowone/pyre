@@ -1965,6 +1965,22 @@ where
                 exitcase_summary,
             );
         };
+        // `flatten.py:275-276` `kind = getkind(block.exitswitch.concretetype)
+        // assert kind == 'int'    # XXX` — upstream enforces that a switch
+        // dispatches on a Signed/Int Variable.  Pyre's `Variable.kind` is
+        // already typed; assert structurally here so a walker non-orthodoxy
+        // that produced a non-Int exitswitch surfaces at flatten time
+        // rather than at runtime (or via a SwitchDictDescr key shape
+        // mismatch downstream).
+        let switch_kind = match &exitswitch {
+            FlowValue::Variable(variable) => variable.kind,
+            FlowValue::Constant(constant) => constant.kind,
+        };
+        assert!(
+            matches!(switch_kind, Some(Kind::Int)),
+            "flatten.py:275-276 invariant: switch exitswitch must be \
+             Int-kinded (got {switch_kind:?})"
+        );
         let mut switches: Vec<LinkRef> = exits
             .iter()
             .filter(|link| !is_default_exitcase(&link.borrow().exitcase))
