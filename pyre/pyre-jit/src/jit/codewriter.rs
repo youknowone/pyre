@@ -3271,6 +3271,21 @@ impl CodeWriter {
                 truth_fn_idx,
                 store_subscr_fn_idx,
                 build_list_fn_idx,
+                // `[u16; 9]` indexed by nargs (0..=8) per
+                // [[feedback-no-hashmap-ever]].  `call_fn_idx` (nargs=1)
+                // is the unsuffixed binding from line 3153; the suffixed
+                // 0/2..=8 fill the surrounding slots.
+                call_fn_idx_by_nargs: [
+                    call_fn_0_idx,
+                    call_fn_idx,
+                    call_fn_2_idx,
+                    call_fn_3_idx,
+                    call_fn_4_idx,
+                    call_fn_5_idx,
+                    call_fn_6_idx,
+                    call_fn_7_idx,
+                    call_fn_8_idx,
+                ],
             });
         }
 
@@ -6177,33 +6192,19 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            // Task #46 micro-slice 5: graph-side residual_call
-                            // dual-write — call_fn_N signature
-                            // `(ref, ref, ..., ref) -> ref` (nargs+1 refs,
-                            // callable + nargs).  All-ref args make the
-                            // shape `residual_call_r_r`.
-                            //
-                            // Phase 4 walker-orthodoxy: dual-write fires
-                            // regardless of `is_portal`.  Upstream RPython
-                            // builds full flow graphs for every function;
-                            // pyre's prior is_portal gate dropped graph
-                            // coverage for inner-helper CodeWriters.
-                            let mut graph_args_r: Vec<super::flow::FlowValue> =
-                                Vec::with_capacity(nargs + 1);
-                            graph_args_r.push(callable_value);
-                            graph_args_r.extend(graph_arg_values_rev.into_iter().rev());
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                fn_idx,
-                                CallFlavor::MayForce,
-                                vec![],
-                                graph_args_r,
-                                vec![],
-                                vec![Kind::Ref; nargs + 1],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
+                            // Graph-side residual_call_r_r dual-write
+                            // retired (2026-05-17) — replaced by canonical
+                            // driver's `lower_simple_call_hlop_to_insn`
+                            // arm which lowers the `simple_call` HLOp
+                            // recorded above into the same
+                            // `residual_call_r_r` Insn shape.  Keeping
+                            // both produced a double-emission (visible
+                            // via `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
+                            // as `residual_call_r_r delta=+1`).  Matches
+                            // upstream RPython where `simple_call` IS the
+                            // graph form and `residual_call_r_r` only
+                            // appears post-flatten.
+                            let _ = (callable_value, graph_arg_values_rev);
                         }
                         current_state.stack.push(call_result_value);
                         current_depth += 1;

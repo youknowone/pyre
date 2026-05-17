@@ -2724,6 +2724,19 @@ pub struct LoweringContext {
     /// `abort_permanent` instead, so the canonical lowering arm
     /// returns `None` (passthrough) on argc > 3.
     pub build_list_fn_idx: u16,
+    /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
+    /// codewriter.rs:3206-3245 for the production source.  CALL
+    /// (single HLOp opname `simple_call`) lowers to
+    /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
+    /// Descr) → reg` via [`build_call_fn_residual_call_r_r_insn`].
+    /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`) per
+    /// [[feedback-no-hashmap-ever]] — `[u16; 9]` keeps the
+    /// statically-known 0..=8 arity range position-indexed.
+    /// `simple_call` HLOps with nargs > 8 are walker non-orthodox
+    /// (the walker emits `abort_permanent` instead and skips the
+    /// HLOp record), so the lowering arm returns `None`
+    /// (passthrough) on nargs > 8.
+    pub call_fn_idx_by_nargs: [u16; 9],
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3623,7 +3636,66 @@ where
     if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register) {
         return Some(insn);
     }
+    if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register) {
+        return Some(insn);
+    }
     None
+}
+
+/// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
+/// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
+/// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
+/// arg0, ...]), Descr) → reg` Insn.  Mirrors the inline emit at
+/// codewriter.rs:6171-6179 (`build_call_fn_residual_call_r_r_insn`).
+///
+/// Arity dispatch: nargs = op.args.len() - 1 selects
+/// `ctx.call_fn_idx_by_nargs[nargs]`.  Walker contract: CALL with
+/// nargs > 8 takes the `abort_permanent` branch (codewriter.rs:6118-
+/// 6133) and does NOT record `simple_call` on the graph, so a
+/// graph-side `simple_call` with nargs > 8 indicates walker
+/// non-orthodoxy — return `None` (passthrough).
+///
+/// Returns `None` for non-`simple_call` opnames so the caller can
+/// fall through to other lowering arms.
+pub fn lower_simple_call_hlop_to_insn<F>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+{
+    if op.opname != "simple_call" {
+        return None;
+    }
+    if op.args.is_empty() {
+        return None;
+    }
+    let nargs = op.args.len() - 1;
+    if nargs > 8 {
+        return None;
+    }
+    // First arg is the callable, rest are call arguments.  All Ref.
+    let mut arg_var_regs: Vec<u16> = Vec::with_capacity(op.args.len());
+    for arg in &op.args {
+        let var = match arg {
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => *var,
+            _ => return None,
+        };
+        arg_var_regs.push(get_register(var).index);
+    }
+    let callable_reg = arg_var_regs[0];
+    let arg_regs: Vec<u16> = arg_var_regs[1..].to_vec();
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var).index,
+        _ => return None,
+    };
+    Some(build_call_fn_residual_call_r_r_insn(
+        ctx.call_fn_idx_by_nargs[nargs],
+        callable_reg,
+        &arg_regs,
+        dst_reg,
+    ))
 }
 
 /// Lower a BUILD_LIST-family pre-rtype HLOp `newlist(items)` →
@@ -4871,6 +4943,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -4997,6 +5070,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -5127,6 +5201,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -5307,6 +5382,7 @@ mod tests {
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         });
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
@@ -5492,6 +5568,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5575,6 +5652,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5602,6 +5680,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -5697,6 +5776,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5756,6 +5836,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5781,6 +5862,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -5813,6 +5895,7 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5872,6 +5955,7 @@ mod tests {
             truth_fn_idx: 23,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5894,6 +5978,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -5930,6 +6015,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5982,6 +6068,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6019,6 +6106,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -6051,6 +6139,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6079,6 +6168,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6107,6 +6197,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6140,6 +6231,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6187,6 +6279,7 @@ mod tests {
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7307,6 +7400,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
         };
         flatten_graph_with_lowering(
             &graph,
