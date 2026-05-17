@@ -3178,6 +3178,21 @@ impl CodeWriter {
             Some(ec_var),
             portal_ec_reg,
         );
+        // Function args occupy graph startblock inputargs `VariableId(0..nargs)`
+        // and live in walker register slots `0..nargs` (the fast-local
+        // bank base).  Without seeding them, ref_return on `arg0` falls
+        // through to graph regalloc and gets a different colour than the
+        // walker's `Operand::reg(Kind::Ref, 0)` emit.
+        for idx in 0..entry_arg_slots(code) as u16 {
+            pair_walker_slot(
+                &mut walker_slot_for_variable,
+                Some(super::flow::Variable::new(
+                    super::flow::VariableId(idx as u32),
+                    Kind::Ref,
+                )),
+                idx,
+            );
+        }
 
         // RPython regalloc.py: keep kind-separated register files.
         // Soft minimums; `touch_reg` auto-grows the files as the dispatch
