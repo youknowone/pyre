@@ -6047,12 +6047,27 @@ impl CodeWriter {
                         // `flatten.py:275`.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
-                            emit_goto_if_not!(scratch_truth, target_py_pc);
-                            // Phase A.4 retired the back-edge gate;
-                            // emit_goto_if_not's mergeblock now always
-                            // appends a fresh linkfalse, so case stamp
-                            // always applies.
-                            set_last_bool_exitcase(&current_block.block(), false);
+                            // `rpython/jit/codewriter/flatten.py:240-267
+                            // insert_exits` (Bool 2-exit arm) emits
+                            // `make_link(linktrue)` BEFORE
+                            // `make_link(linkfalse)` so the TRUE arm
+                            // body is physically next after
+                            // `goto_if_not`, leaving `linkfalse` to
+                            // reach its `Label(linkfalse)` via
+                            // explicit dispatch.  Walker must match
+                            // this order so the boundary
+                            // `goto pc{TRUE_arm}` emitted by the next
+                            // PC's `emit_mark_label_pc!` strips
+                            // cleanly against the immediately-following
+                            // TRUE arm block (see
+                            // `strip_walker_block_boundary_goto`).
+                            // Mergeblock the fallthrough (TRUE arm)
+                            // FIRST so it pops first from
+                            // `pendingblocks`; `emit_goto_if_not!`
+                            // then appends the FALSE link.  Canonical
+                            // `flatten.rs:1875-1880 insert_exits`
+                            // normalises the [TRUE, FALSE] exits
+                            // ordering via the llexitcase swap.
                             mergeblock(
                                 code,
                                 &mut graph,
@@ -6071,6 +6086,8 @@ impl CodeWriter {
                                 &mut all_walker_blocks,
                             );
                             set_last_bool_exitcase(&current_block.block(), true);
+                            emit_goto_if_not!(scratch_truth, target_py_pc);
+                            set_last_bool_exitcase(&current_block.block(), false);
                         }
                     }
 
