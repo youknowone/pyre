@@ -152,6 +152,14 @@ pub struct ResumeGuardDescr {
     /// the meta Arc is the single source of truth.  Sorted and deduped
     /// at write time so `is_force_token_slot` can use `binary_search`.
     pub force_token_slots: UnsafeCell<Vec<usize>>,
+    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
+    /// drives `must_compile` via `jitcounter.tick(status_hash)` in
+    /// RPython.  Pyre keeps a raw per-descr counter (Slice 7-Tβ9):
+    /// the cranelift dispatch hot path calls `increment_fail_count()`
+    /// once per guard failure to drive the same threshold logic.
+    /// Migrated here from `CraneliftFailDescr::fail_count` so the
+    /// meta Arc is the single source of truth.
+    pub fail_count: AtomicU32,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -191,6 +199,7 @@ impl Descr for ResumeGuardDescr {
             recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            fail_count: AtomicU32::new(0),
         }))
     }
 }
@@ -345,6 +354,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         recovery_layout: UnsafeCell::new(None),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        fail_count: AtomicU32::new(0),
     })
 }
 
@@ -402,5 +412,18 @@ impl ResumeGuardDescr {
         slots.dedup();
         // Safety: single-threaded JIT.
         unsafe { *self.force_token_slots.get() = slots };
+    }
+
+    /// Increment the per-descr `fail_count` (Slice 7-Tβ9).  Returns
+    /// the post-increment value.  Mirrors PyPy's `jitcounter.tick`
+    /// semantics: one increment per observed guard failure, drives
+    /// `must_compile` threshold in `compile.py:701-717`.
+    pub fn increment_fail_count(&self) -> u32 {
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Read the per-descr `fail_count` (Slice 7-Tβ9).
+    pub fn get_fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
     }
 }

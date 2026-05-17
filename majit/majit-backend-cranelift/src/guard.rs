@@ -15,7 +15,7 @@ use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // BRIDGE_CACHES_TABLE removed (Slice JJ): the per-descr
@@ -321,14 +321,14 @@ pub struct CraneliftFailDescr {
     /// from `Arc::into_raw(Arc::new(bridge_data))` after
     /// `attach_bridge`; `Drop` reclaims the Arc.
     pub bridge_dispatch_cell: Box<std::sync::atomic::AtomicPtr<BridgeData>>,
-    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
-    /// drives `must_compile` via `jitcounter.tick(status_hash)` in
-    /// RPython.  Pyre's cranelift keeps a raw per-descr counter
-    /// (`compiler.rs:3065 fail_descr.increment_fail_count()`).
-    /// Moved here from `FAIL_COUNT_TABLE` (Slice DD) for the same
-    /// reason as `bridge_dispatch_cell`: dispatch hot path was
-    /// observing a Mutex+HashMap lookup per guard failure.
-    pub fail_count: AtomicU32,
+    // fail_count moved to ResumeGuardDescr (Slice 7-Tβ9): the meta
+    // Arc is the canonical home, reached via `as_any` downcast on
+    // `meta_descr` (precedent: Slice 7-Tβ6 source_op_index, Slice 7-Tβ7
+    // force_token_slots).  Cranelift accessors `increment_fail_count`
+    // / `get_fail_count` now forward through that chain.  Singletons
+    // and external-JUMP descrs (no ResumeGuardDescr meta) silently
+    // no-op on increment, which is correct — singletons never carry
+    // bridges, and external JUMPs do not drive bridge thresholds.
     /// Per-descr `CompiledTraceInfo` cell.  PyPy recovers the same
     /// state on demand from `cpu.asmmemmgr_blocks` +
     /// `compiled_loop_token`.  Cranelift parks the per-trace metadata
@@ -504,7 +504,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
@@ -530,7 +529,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
@@ -618,17 +616,27 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// Increment the failure counter and return the new value.
-    /// Backed by the descr-local `fail_count: AtomicU32` field
-    /// (Slice DD) — single relaxed `fetch_add` on the dispatch hot
-    /// path (`compiler.rs:3065`).
+    /// Forward the failure counter increment to the meta-side
+    /// `ResumeGuardDescr::fail_count` slot (Slice 7-Tβ9).  Returns
+    /// the post-increment value; returns 0 when meta_descr is
+    /// absent or is not a `ResumeGuardDescr` (synthetic FINISH /
+    /// singleton descrs that never carry bridges).
     pub fn increment_fail_count(&self) -> u32 {
-        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .map_or(0, |rgd| rgd.increment_fail_count())
     }
 
-    /// Get the current failure count (Slice DD: descr-local atomic).
+    /// Read the failure counter from the meta-side
+    /// `ResumeGuardDescr::fail_count` slot (Slice 7-Tβ9).
     pub fn get_fail_count(&self) -> u32 {
-        self.fail_count.load(Ordering::Relaxed)
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .map_or(0, |rgd| rgd.get_fail_count())
     }
 
     /// Descr-local atomic read (Slice JJ) — whether a bridge has been
