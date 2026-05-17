@@ -369,12 +369,12 @@ impl PreambleOp {
                 let mut op = self.op.clone();
                 let preamble_arg = sb.produce_arg(ctx, self.op.arg(0))?;
                 if self.op.opcode.is_getfield() {
-                    op.args = vec![preamble_arg].into();
+                    op.setarglist(smallvec::smallvec![preamble_arg]);
                 } else {
                     // shortpreamble.py:99-102: GETARRAYITEM keeps the
                     // original constant index; only the array/base arg goes
                     // through produce_arg().
-                    op.args = vec![preamble_arg, self.op.arg(1)].into();
+                    op.setarglist(smallvec::smallvec![preamble_arg, self.op.arg(1)]);
                 }
                 op
             }
@@ -386,7 +386,7 @@ impl PreambleOp {
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
-                op.args = args.into_iter().collect();
+                op.setarglist(args.into_iter().collect());
                 if op.opcode.is_call() {
                     op.opcode = match op.opcode {
                         OpCode::CallI => OpCode::CallPureI,
@@ -406,7 +406,7 @@ impl PreambleOp {
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
-                op.args = args.into_iter().collect();
+                op.setarglist(args.into_iter().collect());
                 op.opcode = match op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
                     OpCode::CallR => OpCode::CallLoopinvariantR,

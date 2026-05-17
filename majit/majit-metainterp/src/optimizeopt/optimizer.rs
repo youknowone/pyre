@@ -3253,7 +3253,7 @@ impl Optimizer {
                 });
                 // unroll.py:240-242: jump_to_preamble → send_extra_operation
                 let mut jump_op = terminal_jump.clone();
-                jump_op.args = pre_opt_jump_args.clone().into();
+                jump_op.setarglist(pre_opt_jump_args.clone().into());
                 jump_op.setdescr(preamble_token.as_jump_target_descr());
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
@@ -3322,7 +3322,7 @@ impl Optimizer {
                 if let Some(preamble_token) = front_target_tokens.first() {
                     ctx.clear_newoperations();
                     let mut jump_op = terminal_jump.clone();
-                    jump_op.args = pre_opt_jump_args.clone().into();
+                    jump_op.setarglist(pre_opt_jump_args.clone().into());
                     jump_op.setdescr(preamble_token.as_jump_target_descr());
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
@@ -3398,7 +3398,7 @@ impl Optimizer {
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();
             let mut jump_op = terminal_jump.clone();
-            jump_op.args = pre_opt_jump_args.into();
+            jump_op.setarglist(pre_opt_jump_args.into());
             jump_op.setdescr(preamble_token.as_jump_target_descr());
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;

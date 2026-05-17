@@ -4561,7 +4561,7 @@ fn assemble_peeled_trace_with_jump_args(
                     jump_args.push(extra_arg);
                 }
             }
-            new_op.args = jump_args.into();
+            new_op.setarglist(jump_args.into());
         }
         // RPython resume.py parity: fail_args capture guard-point state
         // (the snapshot), not the body's final state. body_result_remap

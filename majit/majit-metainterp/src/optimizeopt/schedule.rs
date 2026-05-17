@@ -830,7 +830,7 @@ impl VecScheduleState {
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
         vinfo.count = count as i16;
-        op.vecinfo = Some(Box::new(vinfo));
+        op.set_vecinfo(vinfo);
         self.register_vec_type(op.pos.get(), datatype == 'f');
         op
     }
