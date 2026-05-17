@@ -8201,9 +8201,45 @@ impl CodeWriter {
             }
             let walker_ops = count_real_ops(&ssarepr);
             let canonical_ops = count_real_ops(&canonical_ssarepr);
+            // Phase 4 byte-equivalent gate: compare Insn::Op Debug
+            // representations between walker and canonical (Insn does
+            // not derive PartialEq).  Debug formats fold Register
+            // indices + Constant payloads so this surfaces walker_slot
+            // alignment failures alongside structural diffs.  scaffold
+            // (`-live-`, PcAnchor, Label) is filtered out per
+            // `count_real_ops`.
+            fn op_debug_strings(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
+                ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|insn| match insn {
+                        super::flatten::Insn::Op { opname, .. } if opname != "-live-" => {
+                            Some(format!("{insn:?}"))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            let walker_op_set = op_debug_strings(&ssarepr);
+            let canonical_op_set = op_debug_strings(&canonical_ssarepr);
+            let mut matched = 0usize;
+            let mut remaining_canonical: Vec<bool> = vec![true; canonical_op_set.len()];
+            for w in &walker_op_set {
+                for (i, c) in canonical_op_set.iter().enumerate() {
+                    if remaining_canonical[i] && w == c {
+                        remaining_canonical[i] = false;
+                        matched += 1;
+                        break;
+                    }
+                }
+            }
+            let walker_unmatched = walker_op_set.len() - matched;
+            let canonical_unmatched = remaining_canonical.iter().filter(|b| **b).count();
+            let byte_equivalent = walker_unmatched == 0 && canonical_unmatched == 0;
             eprintln!(
                 "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
-                 delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+}",
+                 delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+} \
+                 byte_equivalent={} walker_unmatched={} canonical_unmatched={}",
                 code.obj_name.as_str(),
                 ssarepr.insns.len(),
                 canonical_ssarepr.insns.len(),
@@ -8211,6 +8247,9 @@ impl CodeWriter {
                 walker_ops,
                 canonical_ops,
                 canonical_ops as i64 - walker_ops as i64,
+                byte_equivalent,
+                walker_unmatched,
+                canonical_unmatched,
             );
             // Per-opname multiset diff (env-gated separately).  Surfaces
             // the specific opnames where walker over-emits vs canonical.
