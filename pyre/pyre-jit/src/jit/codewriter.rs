@@ -5548,7 +5548,15 @@ impl CodeWriter {
                             // reference a non-existent `pycode_var`
                             // input — fall back to a fresh placeholder
                             // matching the prior shape.
-                            fresh_ref_value(&mut graph)
+                            let placeholder = fresh_ref_value(&mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &placeholder {
+                                pair_walker_slot(
+                                    &mut walker_slot_for_variable,
+                                    Some(*v),
+                                    dst_slot,
+                                );
+                            }
+                            placeholder
                         };
                         current_state.stack.push(value);
                         current_depth += 1;
