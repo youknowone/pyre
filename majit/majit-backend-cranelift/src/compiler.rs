@@ -7629,11 +7629,85 @@ impl CraneliftBackend {
         builder.switch_to_block(stack_check_continue);
         builder.seal_block(stack_check_continue);
 
+        // aarch64/assembler.py:927 `_check_frame_depth` parity — bridge
+        // prologue.  Bridges may require a wider JITFRAME than the
+        // failing parent guard's frame supplies (the parent was sized
+        // for its own `max_output_slots + num_ref_roots`, the bridge
+        // for potentially more).  PyPy emits this check in every bridge
+        // prologue; on `jf_frame.length < expected_size` it calls
+        // `_frame_realloc_slowpath` (assembler.py:118 / aarch64:434),
+        // which `cranelift_realloc_frame` line-by-line ports.  Main
+        // loops skip the check because `run_compiled_code_inner`
+        // (compiler.rs:6191) allocates the frame at exactly the size
+        // the body needs.  Source-guard presence is the bridge
+        // discriminator (`compile_bridge` is the only do_compile caller
+        // that supplies it; `compile_loop` passes `None`).
+        let mut jf_ptr = if source_guard.is_some() {
+            let expected_size = (precompute_max_output_slots(inputargs, ops)
+                + ref_root_slots.len()) as i64;
+            // jitframe.py:84 — `jf_frame.length` is the count of `Signed`
+            // payload slots after the length word.  aarch64/assembler.py:935
+            // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
+            let frame_len = builder.ins().load(
+                cl_types::I64,
+                MemFlags::trusted(),
+                initial_jf_ptr,
+                JF_FRAME_LENGTH_OFS,
+            );
+            let expected_v = builder.ins().iconst(cl_types::I64, expected_size);
+            // aarch64/assembler.py:942 `CMP_rr` + :944 `BRK` / patched
+            // `B_ofs_cond(currpos - jg_location, c.GE)` — fall through
+            // when frame_len >= expected, branch to realloc otherwise.
+            let fits = builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, frame_len, expected_v);
+            let realloc_block = builder.create_block();
+            let frame_ok_block = builder.create_block();
+            builder.append_block_param(frame_ok_block, ptr_type);
+            builder.ins().brif(
+                fits,
+                frame_ok_block,
+                &[BlockArg::from(initial_jf_ptr)],
+                realloc_block,
+                &[],
+            );
+
+            builder.switch_to_block(realloc_block);
+            builder.seal_block(realloc_block);
+            // aarch64/assembler.py:954 `mc.BL(self._frame_realloc_slowpath)`
+            // parity.  `cranelift_realloc_frame(old_jf, new_depth)` returns
+            // the new GC-nursery jitframe pointer with header copied,
+            // items copied + zeroed in old, jf_forward threaded
+            // (compiler.rs:3407 body).
+            let realloc_addr = builder.ins().iconst(
+                ptr_type,
+                cranelift_realloc_frame as *const () as i64,
+            );
+            let mut realloc_sig = Signature::new(call_conv);
+            realloc_sig.params.push(AbiParam::new(ptr_type));
+            realloc_sig.params.push(AbiParam::new(cl_types::I64));
+            realloc_sig.returns.push(AbiParam::new(ptr_type));
+            let realloc_sig_ref = builder.import_signature(realloc_sig);
+            let realloc_call = builder.ins().call_indirect(
+                realloc_sig_ref,
+                realloc_addr,
+                &[initial_jf_ptr, expected_v],
+            );
+            let new_jf = builder.inst_results(realloc_call)[0];
+            builder
+                .ins()
+                .jump(frame_ok_block, &[BlockArg::from(new_jf)]);
+
+            builder.switch_to_block(frame_ok_block);
+            builder.seal_block(frame_ok_block);
+            builder.block_params(frame_ok_block)[0]
+        } else {
+            initial_jf_ptr
+        };
         // jf_ptr serves as both inputs_ptr (entry) and the exit-frame base.
         // RPython: EBP = jitframe pointer throughout compiled code.
         // After a collecting call, _reload_frame_if_necessary reloads
         // jf_ptr from the shadow stack (GC may have moved the jitframe).
-        let mut jf_ptr = initial_jf_ptr;
         let inputs_ptr = jf_ptr; // alias for entry loading
 
         // assembler.py:1074 _call_header_shadowstack — inline MOVs:
@@ -12748,6 +12822,55 @@ impl Drop for CraneliftBackend {
         let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
         let _ = CRANELIFT_JITFRAME_TYPE_ID.try_with(|c| c.set(None));
     }
+}
+
+/// Upper bound on `max_output_slots` derivable from `(inputargs, ops)`
+/// alone.  Mirrors the accumulation in `collect_guards` at compiler.rs
+/// ~12821 (`if n > *max_output_slots { *max_output_slots = n }`) but as
+/// a pure pre-pass that performs no codegen side effects.  Used by the
+/// bridge prologue (`_check_frame_depth`, aarch64/assembler.py:927
+/// parity) to size the frame-depth check before `collect_guards` runs.
+/// The value MUST equal what `collect_guards` computes — anything
+/// smaller would let a bridge enter a too-small frame without
+/// triggering `cranelift_realloc_frame`.
+fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    // x86/regalloc.py:1273 / aarch64/regalloc.py:276 line-by-line: a JUMP
+    // whose descr targets a same-function Label with matching arity is an
+    // internal jump (no fail args); otherwise external and contributes
+    // `op.args.len()` slots.
+    let label_arity_by_descr: HashMap<u32, usize> = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .filter_map(|op| op.descr.as_ref().map(|d| (d.index(), op.args.len())))
+        .collect();
+    let num_inputs = inputargs.len();
+    let mut max_slots = num_inputs;
+    for op in ops {
+        let is_guard = op.opcode.is_guard();
+        let is_finish = op.opcode == OpCode::Finish;
+        let is_external_jump = op.opcode == OpCode::Jump
+            && op
+                .descr
+                .as_ref()
+                .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
+                    None => true,
+                    Some(&arity) => arity != op.args.len(),
+                });
+        if !is_guard && !is_finish && !is_external_jump {
+            continue;
+        }
+        let n = if is_finish || is_external_jump {
+            op.args.len()
+        } else if let Some(ref fa) = op.fail_args {
+            fa.len()
+        } else {
+            num_inputs
+        };
+        if n > max_slots {
+            max_slots = n;
+        }
+    }
+    max_slots
 }
 
 fn collect_guards(
