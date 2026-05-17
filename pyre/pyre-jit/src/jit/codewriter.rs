@@ -1398,6 +1398,31 @@ fn pair_walker_slot(
     }
 }
 
+/// First-wins variant of `pair_walker_slot`.  Used by the post-walk
+/// FrameState pairing pass that re-iterates every block's mergeable to
+/// seed inputarg Variables; per-PC emit sites have already paired the
+/// Variables they directly produce, and that pairing reflects the
+/// register slot the walker actually wrote into.  A FrameState-derived
+/// slot for the same Variable may differ when the Variable flows through
+/// a stack push/pop that lands it at a non-canonical slot temporarily —
+/// the per-PC pairing must take precedence so canonical's `get_register`
+/// resolves to the slot the walker emit chose.
+fn pair_walker_slot_if_absent(
+    table: &mut Vec<Option<u16>>,
+    var: Option<super::flow::Variable>,
+    walker_slot: u16,
+) {
+    if let Some(v) = var {
+        let idx = v.id.0 as usize;
+        if table.len() <= idx {
+            table.resize(idx + 1, None);
+        }
+        if table[idx].is_none() {
+            table[idx] = Some(walker_slot);
+        }
+    }
+}
+
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py:1898-1906 do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
@@ -8246,6 +8271,38 @@ impl CodeWriter {
             // shape now.  Any future panic surfaces directly — a
             // walker non-orthodoxy that needs porting per the same
             // pattern as Slices 4-8.
+            //
+            // Post-walk pairing pass.  Walker per-PC emits seed
+            // `walker_slot_for_variable` for Variables it directly
+            // produces (HLOp results, push/pop slot writes).  Block
+            // INPUTARGS — the Variables in `block.inputargs` set by
+            // `initialize_spam_block` / `make_next_block` / `mergeblock`
+            // from `state.getvariables()` — are NOT seeded by per-PC
+            // emits.  Without the pairing here, canonical
+            // `insert_renamings` would resolve inputarg destinations
+            // via graph regalloc fallback, producing Register indices
+            // that diverge from the walker's slot-numbered destinations.
+            // Walk every block's FrameState `mergeable()` and pair each
+            // Variable with its `mergeable_index_to_slot()` (locals at
+            // `0..nlocals`, stack at `nlocals..nlocals+stackdepth`).
+            // The last_exception pair / portal_extras tail returns
+            // `None` from `mergeable_index_to_slot` and is skipped.
+            for spam in &all_walker_blocks {
+                let Some(state) = spam.framestate() else {
+                    continue;
+                };
+                for (idx, value) in state.mergeable().iter().enumerate() {
+                    if let Some(super::flow::FlowValue::Variable(v)) = value {
+                        if let Some(slot) = state.mergeable_index_to_slot(idx) {
+                            pair_walker_slot_if_absent(
+                                &mut walker_slot_for_variable,
+                                Some(v.clone()),
+                                slot,
+                            );
+                        }
+                    }
+                }
+            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
