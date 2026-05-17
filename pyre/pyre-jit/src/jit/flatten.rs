@@ -3311,11 +3311,42 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_regs: &[u16],
     dst_reg: u16,
 ) -> Insn {
+    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    let item_operands: Vec<Operand> = arg_regs
+        .iter()
+        .map(|&reg| Operand::Register(Register::new(Kind::Ref, reg)))
+        .collect();
+    build_build_list_fn_residual_call_ir_r_insn_from_operands(
+        build_list_fn_idx,
+        argc,
+        item_operands,
+        dst_reg,
+    )
+}
+
+/// Operand-flexible variant of `build_build_list_fn_residual_call_ir_r_insn`.
+/// Each item slot can be a `Register` (resolved Variable) OR a `Const*`
+/// (lowered Constant via `flatten_arg`'s Constant arm).  Used by the
+/// canonical driver's `lower_newlist_hlop_to_insn` to handle graph
+/// `newlist` HLOps whose items are Constants — upstream RPython's
+/// rtype pass would have pre-loaded these into Variables, but pyre's
+/// graph carries the un-rewritten Constants per
+/// [[project-flatten-graph-canonical-driver-2026-05-17]].
+pub fn build_build_list_fn_residual_call_ir_r_insn_from_operands(
+    build_list_fn_idx: u16,
+    argc: usize,
+    item_operands: Vec<Operand>,
+    dst_reg: u16,
+) -> Insn {
     assert!(
         argc <= 3,
         "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
     );
-    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    assert_eq!(
+        item_operands.len(),
+        argc,
+        "item_operands length must match argc"
+    );
     let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
     let mut args_i: Vec<Operand> = Vec::with_capacity(4);
     let mut args_r: Vec<Operand> = Vec::with_capacity(3);
@@ -3323,10 +3354,11 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_kinds.push(Kind::Int);
     args_i.push(Operand::ConstInt(argc as i64));
     // Trailing 3 slots — Ref if present, Int dummy `0` if absent.
+    let mut item_iter = item_operands.into_iter();
     for i in 0..3 {
         if i < argc {
             arg_kinds.push(Kind::Ref);
-            args_r.push(Operand::Register(Register::new(Kind::Ref, arg_regs[i])));
+            args_r.push(item_iter.next().unwrap());
         } else {
             arg_kinds.push(Kind::Int);
             args_i.push(Operand::ConstInt(0));
@@ -3633,10 +3665,10 @@ where
     if let Some(insn) = lower_setitem_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register) {
+    if let Some(insn) = lower_newlist_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register) {
+    if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     None
@@ -3657,13 +3689,15 @@ where
 ///
 /// Returns `None` for non-`simple_call` opnames so the caller can
 /// fall through to other lowering arms.
-pub fn lower_simple_call_hlop_to_insn<F>(
+pub fn lower_simple_call_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
     get_register: &mut F,
+    lower_constant: &mut LC,
 ) -> Option<Insn>
 where
     F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
 {
     if op.opname != "simple_call" {
         return None;
@@ -3676,24 +3710,32 @@ where
         return None;
     }
     // First arg is the callable, rest are call arguments.  All Ref.
-    let mut arg_var_regs: Vec<u16> = Vec::with_capacity(op.args.len());
+    // Constant args are accepted via `lower_constant` (matches
+    // `flatten.py:340-345 flatten_arg`'s Constant arm); upstream
+    // RPython's rtype pass would have rewritten Constant args to
+    // pre-loaded Variables, but pyre's graph carries the un-rewritten
+    // Constants per [[project-flatten-graph-canonical-driver-2026-05-17]].
+    let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
     for arg in &op.args {
-        let var = match arg {
-            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => *var,
+        let operand = match arg {
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
+                Operand::Register(get_register(*var))
+            }
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
+                lower_constant(c)
+            }
             _ => return None,
         };
-        arg_var_regs.push(get_register(var).index);
+        operands.push(operand);
     }
-    let callable_reg = arg_var_regs[0];
-    let arg_regs: Vec<u16> = arg_var_regs[1..].to_vec();
     let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var).index,
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    Some(build_call_fn_residual_call_r_r_insn(
+    Some(build_residual_call_r_r_insn_from_operands(
         ctx.call_fn_idx_by_nargs[nargs],
-        callable_reg,
-        &arg_regs,
+        operands,
+        CallFlavor::MayForce,
         dst_reg,
     ))
 }
@@ -3715,13 +3757,15 @@ where
 ///
 /// Returns `None` for non-`newlist` opnames so the caller can fall
 /// through to other lowering arms.
-pub fn lower_newlist_hlop_to_insn<F>(
+pub fn lower_newlist_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
     get_register: &mut F,
+    lower_constant: &mut LC,
 ) -> Option<Insn>
 where
     F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
 {
     if op.opname != "newlist" {
         return None;
@@ -3735,12 +3779,17 @@ where
     // regs to the helper.  The canonical entry doesn't see those
     // inline `ref_copy`s — it reads the item Variables directly off
     // the SpaceOperation and resolves them through `get_register`.
-    let arg_regs: Vec<u16> = op
+    // Constant items lower via `lower_constant` per
+    // `flatten.py:340-345 flatten_arg`'s Constant arm.
+    let item_operands: Vec<Operand> = op
         .args
         .iter()
         .map(|arg| match arg {
             super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
-                Some(get_register(*var).index)
+                Some(Operand::Register(get_register(*var)))
+            }
+            super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Constant(c)) => {
+                Some(lower_constant(c))
             }
             _ => None,
         })
@@ -3749,10 +3798,10 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var).index,
         _ => return None,
     };
-    Some(build_build_list_fn_residual_call_ir_r_insn(
+    Some(build_build_list_fn_residual_call_ir_r_insn_from_operands(
         ctx.build_list_fn_idx,
         argc,
-        &arg_regs,
+        item_operands,
         dst_reg,
     ))
 }
