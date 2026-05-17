@@ -3270,6 +3270,7 @@ impl CodeWriter {
                 compare_op_fn_idx: compare_fn_idx,
                 truth_fn_idx,
                 store_subscr_fn_idx,
+                build_list_fn_idx,
             });
         }
 
