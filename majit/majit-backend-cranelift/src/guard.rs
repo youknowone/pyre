@@ -329,18 +329,10 @@ pub struct CraneliftFailDescr {
     // and external-JUMP descrs (no ResumeGuardDescr meta) silently
     // no-op on increment, which is correct — singletons never carry
     // bridges, and external JUMPs do not drive bridge thresholds.
-    /// Per-descr `CompiledTraceInfo` cell.  PyPy recovers the same
-    /// state on demand from `cpu.asmmemmgr_blocks` +
-    /// `compiled_loop_token`.  Cranelift parks the per-trace metadata
-    /// (input types / header_pc / source_guard tuple) on the descr.
-    ///
-    /// Moved here from `TRACE_INFO_TABLE` (Slice FF) for the same
-    /// reason as `recovery_layout_cell` (Slice EE): Mutex+HashMap
-    /// lookup on the dispatch hot path.
-    ///
-    /// Null on construction.  Written via
-    /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
-    pub trace_info_cell: AtomicPtr<CompiledTraceInfo>,
+    // trace_info_cell moved to ResumeGuardDescr (Slice 7-Tβ10): the
+    // meta Arc is the canonical home, reached via `as_any` downcast
+    // on `meta_descr`.  Cranelift accessors `set_trace_info` /
+    // `trace_info_ref` forward through that chain.
     /// Per-descr external-JUMP target cell.  PyPy's
     /// `assembler.py:2456-2462 closing_jump` emits a raw inter-
     /// function JMP to `target_token._ll_loop_code`; cranelift cannot
@@ -399,17 +391,8 @@ impl Drop for CraneliftFailDescr {
         // external_jump_target_cell is descr-local (Slice GG): drops
         // naturally with self.
         // fail_count is descr-local (Slice DD): drops naturally with self.
-        // trace_info_cell is descr-local (Slice FF): reclaim the
-        // published `Arc<CompiledTraceInfo>` by swapping the cell to
-        // null and reconstructing the Arc.
-        let info_ptr = self
-            .trace_info_cell
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !info_ptr.is_null() {
-            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
-            // `set_trace_info`; reclaim ownership and drop.
-            unsafe { drop(Arc::from_raw(info_ptr as *const CompiledTraceInfo)) };
-        }
+        // trace_info_cell moved to ResumeGuardDescr meta-side slot
+        // (Slice 7-Tβ10); reclaim is owned by ResumeGuardDescr::drop.
         // recovery_layout moved to ResumeGuardDescr meta-side slot
         // (Slice QQ-4); no backend-local cell to reclaim.
         // source_op_index moved to ResumeGuardDescr meta-side slot
@@ -504,7 +487,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
@@ -529,7 +511,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
@@ -569,24 +550,17 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    /// Descr-local atomic read (Slice FF).  Returns the owned
-    /// `CompiledTraceInfo` clone, or `None` when no trace info has been
-    /// published for this descr.  Lock-free and HashMap-free.
+    /// Read the per-trace `CompiledTraceInfo` from the meta-side
+    /// `ResumeGuardDescr::trace_info` slot (Slice 7-Tβ10).  Returns
+    /// `None` when meta_descr is absent or is not a `ResumeGuardDescr`
+    /// (synthetic FINISH / singleton descrs), or when no trace info
+    /// has been published.
     pub fn trace_info_ref(&self) -> Option<CompiledTraceInfo> {
-        let ptr = self.trace_info_cell.load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            // Safety: `ptr` was produced by
-            // `Arc::into_raw(Arc::new(info))` in `set_trace_info`;
-            // increment_strong_count + from_raw yields an extra owning
-            // Arc the caller can deref + clone.
-            unsafe {
-                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
-                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
-                Some((*arc).clone())
-            }
-        }
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .and_then(|rgd| rgd.trace_info())
     }
 
     #[inline]
@@ -817,18 +791,21 @@ impl CraneliftFailDescr {
             .map_or(&[], |rgd| rgd.force_token_slots())
     }
 
-    /// Descr-local atomic write (Slice FF).  Callers are `compile_loop`
-    /// (codegen finaliser) and `overlay_deadframe_fail_descr`
-    /// (CALL_ASSEMBLER prefix overlay).  Publishes the trace info via
-    /// `Arc::into_raw(Arc::new(...))`; any previously published Arc is
-    /// reclaimed by the swap.
+    /// Forward the per-trace `CompiledTraceInfo` publish to the meta-
+    /// side `ResumeGuardDescr::set_trace_info` slot (Slice 7-Tβ10).
+    /// Callers are `compile_loop` (codegen finaliser) and
+    /// `overlay_deadframe_fail_descr` (CALL_ASSEMBLER prefix overlay).
+    /// Silently dropped when meta_descr is absent or is not a
+    /// `ResumeGuardDescr` (synthetic singletons that never carry
+    /// per-trace metadata).
     pub fn set_trace_info(self: &Arc<Self>, trace_info: CompiledTraceInfo) {
-        let new_ptr = Arc::into_raw(Arc::new(trace_info)) as *mut CompiledTraceInfo;
-        let old_ptr = self.trace_info_cell.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            // Safety: prior `set_trace_info` published this pointer;
-            // reclaim ownership and drop.
-            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        if let Some(rgd) = self
+            .meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+        {
+            rgd.set_trace_info(trace_info);
         }
     }
 

@@ -13,13 +13,14 @@ use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
 };
 
 use crate::CompiledLoopToken;
+use crate::CompiledTraceInfo;
 use crate::ExitRecoveryLayout;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
@@ -160,6 +161,18 @@ pub struct ResumeGuardDescr {
     /// Migrated here from `CraneliftFailDescr::fail_count` so the
     /// meta Arc is the single source of truth.
     pub fail_count: AtomicU32,
+    /// Per-descr `CompiledTraceInfo` cell (Slice 7-Tβ10).  PyPy
+    /// recovers the same state on demand from `cpu.asmmemmgr_blocks` +
+    /// `compiled_loop_token`; cranelift parks the per-trace metadata
+    /// (input types / header_pc / source_guard tuple) here so the
+    /// deopt and CALL_ASSEMBLER overlay paths can read it without a
+    /// per-trace table lookup.  Migrated here from
+    /// `CraneliftFailDescr::trace_info_cell` so the meta Arc is the
+    /// single source of truth.
+    ///
+    /// Null on construction.  Written via
+    /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
+    pub trace_info: AtomicPtr<CompiledTraceInfo>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -200,6 +213,7 @@ impl Descr for ResumeGuardDescr {
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
+            trace_info: AtomicPtr::new(std::ptr::null_mut()),
         }))
     }
 }
@@ -355,6 +369,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
+        trace_info: AtomicPtr::new(std::ptr::null_mut()),
     })
 }
 
@@ -425,5 +440,51 @@ impl ResumeGuardDescr {
     /// Read the per-descr `fail_count` (Slice 7-Tβ9).
     pub fn get_fail_count(&self) -> u32 {
         self.fail_count.load(Ordering::Relaxed)
+    }
+
+    /// Publish the per-trace `CompiledTraceInfo` into the descr-local
+    /// atomic cell (Slice 7-Tβ10).  Any previously published Arc is
+    /// reclaimed by the swap.
+    pub fn set_trace_info(&self, info: CompiledTraceInfo) {
+        let new_ptr = Arc::into_raw(Arc::new(info)) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior `set_trace_info` published this pointer;
+            // reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
+    }
+
+    /// Read the per-trace `CompiledTraceInfo` (Slice 7-Tβ10).
+    /// Returns an owned clone of the published value, or `None` when
+    /// no trace info has been published.  Lock-free.
+    pub fn trace_info(&self) -> Option<CompiledTraceInfo> {
+        let ptr = self.trace_info.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: `ptr` was produced by `Arc::into_raw(Arc::new(info))`
+            // in `set_trace_info`; increment_strong_count + from_raw
+            // yields an extra owning Arc the caller can deref + clone.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some((*arc).clone())
+            }
+        }
+    }
+}
+
+impl Drop for ResumeGuardDescr {
+    fn drop(&mut self) {
+        // Slice 7-Tβ10: reclaim any published `Arc<CompiledTraceInfo>`
+        // by swapping the cell to null and reconstructing the Arc so
+        // its Drop runs.
+        let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info`.
+            unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
+        }
     }
 }
