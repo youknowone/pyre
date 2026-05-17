@@ -1851,6 +1851,25 @@ pub trait FailDescr: Descr {
     /// Implementations must sort+dedup so consumers can `binary_search`.
     fn set_force_token_slots(&self, _slots: Vec<usize>) {}
 
+    /// Pyre-only per-emission failure counter.  PyPy carries the
+    /// equivalent jitcounter hash in the per-descr `status` slot
+    /// (`compile.py:683` `AbstractResumeGuardDescr._attrs_ =
+    /// ('status',)`) — both `ResumeGuardDescr` and
+    /// `ResumeGuardCopiedDescr` get their own status by inheritance
+    /// from `AbstractResumeGuardDescr`.  Pyre's counter follows the
+    /// same per-emission classification.  Default returns 0 for
+    /// descrs that never compile bridges.
+    fn fail_count(&self) -> u32 {
+        0
+    }
+
+    /// Pyre-only per-emission failure-count increment.  Returns the
+    /// post-increment value.  Default no-op returning 0 for descrs
+    /// that never compile bridges.
+    fn increment_fail_count(&self) -> u32 {
+        0
+    }
+
     /// Pyre-only per-emission slot: index of the trace op that produced
     /// this guard at codegen.  Classified per-emission alongside
     /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /

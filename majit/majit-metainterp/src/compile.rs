@@ -3716,6 +3716,13 @@ pub struct ResumeGuardCopiedDescr {
     /// lives on the descr.  Same per-emission scoping as
     /// `source_op_index` / `rd_locs` — owned per copied descr.
     force_token_slots: UnsafeCell<Vec<usize>>,
+    /// Pyre-only per-emission failure counter for bridge compilation
+    /// thresholds.  PyPy carries the equivalent jitcounter hash in
+    /// `compile.py:683 AbstractResumeGuardDescr._attrs_ ('status',)`
+    /// — each copied descr has its own status, retracing
+    /// independently of the donor.  Owned per copied descr so each
+    /// copy's failures accrue separately.
+    fail_count: AtomicU32,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3770,6 +3777,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            fail_count: AtomicU32::new(0),
         }))
     }
 }
@@ -3954,6 +3962,16 @@ impl FailDescr for ResumeGuardCopiedDescr {
         slots.dedup();
         unsafe { *self.force_token_slots.get() = slots };
     }
+    /// Per-emission `fail_count` (see field comment).  Owned per
+    /// copied descr — PyPy parity with per-descr `status` jitcounter
+    /// hash so each copied guard's bridge threshold accrues
+    /// independently of the donor.
+    fn fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -4001,6 +4019,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 force_token_slots: UnsafeCell::new(Vec::new()),
+                fail_count: AtomicU32::new(0),
             },
         }))
     }
@@ -4121,6 +4140,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_force_token_slots(&self, slots: Vec<usize>) {
         self.inner.set_force_token_slots(slots);
     }
+    fn fail_count(&self) -> u32 {
+        self.inner.fail_count()
+    }
+    fn increment_fail_count(&self) -> u32 {
+        self.inner.increment_fail_count()
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4162,6 +4187,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        fail_count: AtomicU32::new(0),
     })
 }
 
@@ -4195,6 +4221,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            fail_count: AtomicU32::new(0),
         },
     })
 }

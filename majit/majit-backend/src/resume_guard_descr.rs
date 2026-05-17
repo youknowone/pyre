@@ -424,6 +424,12 @@ impl FailDescr for ResumeGuardDescr {
         // Safety: single-threaded JIT.
         unsafe { *self.force_token_slots.get() = slots };
     }
+    fn fail_count(&self) -> u32 {
+        self.fail_count.load(Ordering::Relaxed)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr

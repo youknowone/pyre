@@ -551,27 +551,28 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// Forward the failure counter increment to the meta-side
-    /// `ResumeGuardDescr::fail_count` slot (Slice 7-Tβ9).  Returns
-    /// the post-increment value; returns 0 when meta_descr is
-    /// absent or is not a `ResumeGuardDescr` (synthetic FINISH /
-    /// singleton descrs that never carry bridges).
+    /// Forward the failure counter increment to the meta-side per-
+    /// emission slot (Slice 7-Tβ9).  Per-emission classification
+    /// matches PyPy `compile.py:683 AbstractResumeGuardDescr._attrs_
+    /// ('status',)` — each `ResumeGuardCopiedDescr` retraces
+    /// independently of the donor.  Routed through the `FailDescr`
+    /// trait so copied descrs hit their own counter instead of the
+    /// pre-fix silent 0 (the downcast-to-`ResumeGuardDescr`-only
+    /// path dropped writes whenever a copied guard reached deopt).
     pub fn increment_fail_count(&self) -> u32 {
         self.meta_descr
             .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            .map_or(0, |rgd| rgd.increment_fail_count())
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.increment_fail_count())
     }
 
-    /// Read the failure counter from the meta-side
-    /// `ResumeGuardDescr::fail_count` slot (Slice 7-Tβ9).
+    /// Read the failure counter from the meta-side per-emission slot
+    /// (Slice 7-Tβ9).
     pub fn get_fail_count(&self) -> u32 {
         self.meta_descr
             .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            .map_or(0, |rgd| rgd.get_fail_count())
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.fail_count())
     }
 
     /// Forward to the meta-side `ResumeGuardDescr::bridge_code_ptr`
