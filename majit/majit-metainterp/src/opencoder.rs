@@ -287,11 +287,7 @@ impl<'a> TraceIterator<'a> {
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
                     .chain(op.args.iter().copied())
-                    .chain(
-                        op.getfailargs()
-                            .into_iter()
-                            .flat_map(|fa| fa.iter().copied()),
-                    )
+                    .chain(op.getfailargs().into_iter().flatten())
             })
             .filter(|opref| !opref.is_none() && !opref.is_constant())
             .map(|opref| opref.raw())

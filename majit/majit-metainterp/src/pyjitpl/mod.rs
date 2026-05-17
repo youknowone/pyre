@@ -701,7 +701,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
             }
             if let Some(fa) = op.getfailargs() {
                 for a in fa {
-                    hw = hw.max(opref_high_water(*a));
+                    hw = hw.max(opref_high_water(a));
                 }
             }
             hw

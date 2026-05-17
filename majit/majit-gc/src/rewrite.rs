@@ -3855,7 +3855,7 @@ mod tests {
             .getfailargs()
             .expect("guard keeps failargs");
         assert_eq!(
-            guard_fa,
+            guard_fa.as_slice(),
             &[OpRef::int_op(0), same_pos, OpRef::int_op(1)],
             "OpRef::ref_op(2) → SAME_AS_I substitution"
         );
@@ -3921,7 +3921,7 @@ mod tests {
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
         let gv_fa = gv.getfailargs().expect("GuardValue inherits failargs");
-        assert_eq!(gv_fa, &[OpRef::int_op(10), OpRef::int_op(11)]);
+        assert_eq!(gv_fa.as_slice(), &[OpRef::int_op(10), OpRef::int_op(11)]);
     }
 
     #[test]

@@ -1023,7 +1023,7 @@ impl UnrollOptimizer {
                             .args
                             .iter()
                             .copied()
-                            .chain(op.getfailargs().into_iter().flatten().copied());
+                            .chain(op.getfailargs().into_iter().flatten());
                         for arg in arg_iter {
                             if !is_trace_runtime_ref(arg, &consts_p2) {
                                 continue;
@@ -1823,7 +1823,7 @@ impl ExportedState {
                 visit(arg);
             }
             if let Some(fail_args) = op.getfailargs() {
-                for &arg in fail_args {
+                for arg in fail_args {
                     visit(arg);
                 }
             }
@@ -4276,8 +4276,9 @@ fn assemble_peeled_trace_with_jump_args(
             let all_refs = op
                 .args
                 .iter()
-                .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()));
-            for &arg in all_refs {
+                .copied()
+                .chain(op.getfailargs().into_iter().flatten());
+            for arg in all_refs {
                 if !is_trace_runtime_ref(arg, constants) {
                     continue; // skip NONE and constants
                 }
@@ -4488,7 +4489,7 @@ fn assemble_peeled_trace_with_jump_args(
                     .args
                     .iter()
                     .copied()
-                    .chain(later_op.getfailargs().into_iter().flatten().copied())
+                    .chain(later_op.getfailargs().into_iter().flatten())
                 {
                     if arg.is_none()
                         || constants.contains_key(&arg.raw())
@@ -4629,7 +4630,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .args
                 .iter()
                 .copied()
-                .chain(new_op.getfailargs().into_iter().flatten().copied())
+                .chain(new_op.getfailargs().into_iter().flatten())
             {
                 if arg.is_none()
                     || constants.contains_key(&arg.raw())
@@ -6495,7 +6496,7 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(64)]);
         assert_eq!(
-            combined[1].getfailargs().expect("guard fail args"),
+            combined[1].getfailargs().expect("guard fail args").as_slice(),
             &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);

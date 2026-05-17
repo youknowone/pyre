@@ -2355,7 +2355,7 @@ impl GuardRequirement {
                 // — known_class is a ConstPtr to the class.
                 let class_const = ctx.make_constant_ref(*expected_class);
                 let mut op = Op::new(OpCode::GuardNonnullClass, &[arg, class_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardNonnull {

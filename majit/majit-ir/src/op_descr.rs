@@ -144,10 +144,15 @@ impl Op {
     }
 
     /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`
-    /// parity. Returns a borrow into the fail_args slot — None for
-    /// non-guard ops.
-    pub fn getfailargs(&self) -> Option<&[crate::resoperation::OpRef]> {
-        self.fail_args.as_deref()
+    /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
+    /// None for non-guard ops.  Clone is cheap because OpRef is `Copy` and
+    /// fail_args almost always fits inline (≤3 entries).  Owned return
+    /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
+    /// `.into_iter().flatten()` or `.iter()` patterns.
+    pub fn getfailargs(
+        &self,
+    ) -> Option<smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
+        self.fail_args.borrow().clone()
     }
 
     /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
@@ -158,7 +163,8 @@ impl Op {
     /// fail-args bug surfaces at the call site rather than returning
     /// a silently-empty vector.
     pub fn getfailargs_copy(&self) -> Vec<crate::resoperation::OpRef> {
-        let fa = self.fail_args.as_ref().unwrap_or_else(|| {
+        let borrow = self.fail_args.borrow();
+        let fa = borrow.as_ref().unwrap_or_else(|| {
             panic!(
                 "getfailargs_copy on op with fail_args=None — RPython \
                  `self._fail_args[:]` raises TypeError; pyre matches the \
@@ -169,35 +175,36 @@ impl Op {
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
-    /// the fail_args slot.  Takes `&mut self` until the `Vec<Rc<Op>>`
-    /// migration flips the field to interior-mutable.
-    pub fn setfailargs(&mut self, fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
-        self.fail_args = Some(fail_args);
+    /// the fail_args slot.  Takes `&self` (interior mutability) so the
+    /// optimizer can stamp fail_args onto a shared `Op` reached through
+    /// `Rc<Op>`.
+    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
+        *self.fail_args.borrow_mut() = Some(fail_args);
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
     /// the SmallVec mutably (`fa.iter_mut()`, `fa[i] = …`) without going
     /// through a clone/setfailargs round-trip.  Returns `None` when the
-    /// slot is empty.  Requires `&mut Op`; once the slot moves to
-    /// interior mutability, a `with_failargs_mut(&self, f)` closure
-    /// variant will replace this for shared-`Op` callers.
+    /// slot is empty.  Uses `RefCell::get_mut` so it requires `&mut Op`;
+    /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
+    /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(
         &mut self,
     ) -> Option<&mut smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
-        self.fail_args.as_mut()
+        self.fail_args.get_mut().as_mut()
     }
 
     /// Clear the fail_args slot.  PyPy has no separate `clearfailargs`
     /// method; the pattern is `op.setfailargs(None)` in RPython, but
     /// pyre's signature distinguishes the two paths (set vs clear) for
     /// clarity.
-    pub fn clearfailargs(&mut self) {
-        self.fail_args = None;
+    pub fn clearfailargs(&self) {
+        *self.fail_args.borrow_mut() = None;
     }
 
     /// True iff the fail_args slot is populated.
     pub fn has_failargs(&self) -> bool {
-        self.fail_args.is_some()
+        self.fail_args.borrow().is_some()
     }
 
     /// Per-failarg type vector accessor.  Pyre's `fail_arg_types` slot

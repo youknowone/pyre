@@ -1922,7 +1922,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .flat_map(|op| {
             std::iter::once(op.pos.get())
                 .chain(op.args.iter().copied())
-                .chain(op.getfailargs().into_iter().flatten().copied())
+                .chain(op.getfailargs().into_iter().flatten())
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())

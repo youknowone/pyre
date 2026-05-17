@@ -2293,7 +2293,7 @@ impl<'a> RegAlloc<'a> {
             Some(fa) => fa,
             None => return Vec::new(),
         };
-        self.locs_for_fail_args(fail_args)
+        self.locs_for_fail_args(&fail_args)
     }
 
     fn locs_for_fail_args(&mut self, fail_args: &[OpRef]) -> Vec<Option<Loc>> {
@@ -2387,7 +2387,7 @@ impl<'a> RegAlloc<'a> {
             }
         }
         if let Some(fail_args) = op.getfailargs() {
-            for &arg in fail_args {
+            for &arg in fail_args.iter() {
                 if !arg.is_constant() && !arg.is_none() {
                     let tp = self.tp(arg);
                     self.possibly_free_var(arg, tp);

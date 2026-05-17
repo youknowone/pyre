@@ -4598,7 +4598,7 @@ fn build_ref_root_slots(
         for &arg in op
             .args
             .iter()
-            .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
+            .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
         {
             if inputarg_oprefs.contains(&arg.raw()) {
                 used_inputargs.insert(arg.raw());
@@ -5181,7 +5181,12 @@ fn ref_root_slots_with_future_regular_uses(
                 && ops
                     .iter()
                     .skip(position + 1)
-                    .flat_map(|op| op.args.iter().chain(op.getfailargs().into_iter().flatten()))
+                    .flat_map(|op| {
+                        op.args
+                            .iter()
+                            .copied()
+                            .chain(op.getfailargs().into_iter().flatten())
+                    })
                     .any(|arg| arg.raw() == *var_idx)
         })
         .copied()
@@ -7722,7 +7727,7 @@ impl CraneliftBackend {
                 for &arg in op
                     .args
                     .iter()
-                    .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
+                    .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
                 {
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
@@ -7971,7 +7976,7 @@ impl CraneliftBackend {
             for &arg in op
                 .args
                 .iter()
-                .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()))
+                .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
             {
                 if !arg.is_none()
                     && !declared_vars.contains(&arg.raw())
