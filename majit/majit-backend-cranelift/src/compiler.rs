@@ -6193,6 +6193,14 @@ fn run_compiled_code_inner(
     } else {
         let mut buf = vec![0i64; jf_total];
         let gcref = GcRef(buf.as_mut_ptr() as usize);
+        // jitframe.py:84 parity — `jf_frame.length` is the count of `Signed`
+        // payload slots after the length word.  The GC-alloc branch above
+        // already does this at line 6282; mirror it here so frame-size
+        // checks (e.g. `emit_attached_bridge_dispatch`'s `frame_fits` gate)
+        // behave identically in nursery-backed and Vec-backed modes.
+        unsafe {
+            *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
+        }
         (gcref, Some(buf))
     };
 
