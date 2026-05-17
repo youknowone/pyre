@@ -144,19 +144,24 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
 /// starts with the fixed-size kind which is the only `dynasm_nursery_slowpath`
 /// caller in the x86 emit path.
 ///
-/// **Calling convention (matches PyPy line 233-236):**
+/// **Calling convention (matches PyPy line 233-243):**
 /// - Entry: `rbp` = jitframe, `rcx` = old `nursery_head`,
 ///   `rdx` = `nursery_head + total_size` (set by the per-call-site
 ///   fast path's `lea rdx, [rcx + total_size]`).  `total_size`
 ///   recovered at runtime via `sub rdx, rcx`.  The caller has already
 ///   pushed the gcmap to `[rbp + JF_GCMAP_OFS]`.
-/// - Exit: `rax` = payload pointer; `rbp` reloaded from shadow stack
-///   top in case a minor GC fired and moved the frame; all other
-///   GPR/XMM state restored from the jitframe save area.
+/// - Exit: `rcx` = payload pointer (or 0 on OOM), matching PyPy line
+///   304 `MOV_rr(ecx, eax)`; `rbp` reloaded from shadow stack top in
+///   case a minor GC fired and moved the frame; every other GPR/XMM
+///   restored from the jitframe save area, including `rax` which is
+///   reset to its pre-call value.
 ///
-/// `rax` and `rdx` are excluded from push_all_regs / pop_all_regs:
-/// `rax` carries the return value, `rdx` is the runtime size carrier
-/// and the caller does not read it after the slowpath returns.
+/// `ecx` and `edx` are the only registers excluded from
+/// push_all_regs / pop_all_regs: `ecx` carries the return value
+/// (assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`),
+/// `edx` is the runtime size carrier and the caller's regalloc has
+/// already spilled any live value out of both before the call via
+/// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
 static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub(crate) fn malloc_slowpath_fixed_addr() -> usize {
@@ -165,16 +170,17 @@ pub(crate) fn malloc_slowpath_fixed_addr() -> usize {
 
 fn build_malloc_slowpath_fixed() -> usize {
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
-    let ignored = [crate::regloc::EAX, crate::regloc::EDX];
+    let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
     // assembler.py:264 `SUB_rr(edx, ecx)` — recover total_size at runtime.
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
 
     // assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
-    // Pyre's slow-path entry has already let the caller spill nothing
-    // through ECX (live only on the fast path's nursery_head load);
-    // EDX still holds the total_size we just computed.  Save all the
-    // rest so the slow-path call's caller-clobber set is contained.
+    // Saves every managed GPR/XMM except ECX/EDX so the inner CALL's
+    // caller-clobber set is contained.  EAX is included in the save
+    // set (unlike pyre's prior `[EAX, EDX]` mask), preserving any
+    // live caller value across the slowpath — the regalloc only
+    // promises ECX/EDX clobber to the caller.
     push_all_regs_to_jitframe_raw(&mut asm, &ignored, true);
 
     // assembler.py:258-261 — reserve Win64 shadow space (if any).  The
@@ -209,6 +215,10 @@ fn build_malloc_slowpath_fixed() -> usize {
 
     // assembler.py:296 `_reload_frame_if_necessary(mc)` — rebind rbp
     // from the shadow stack in case a minor GC moved the jitframe.
+    // ECX is used as scratch here (matches PyPy `_reload_frame_if_necessary`
+    // assembler.py:1375); the helper return value still lives in RAX at
+    // this point and is moved into ECX only after the reload (and after
+    // the WB inline below, which preserves RAX via push/pop).
     let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
     dynasm!(asm ; .arch x64
         ; mov rcx, QWORD rst_addr
@@ -263,6 +273,13 @@ fn build_malloc_slowpath_fixed() -> usize {
         );
         dynasm!(asm ; .arch x64 ; =>skip_wb);
     }
+
+    // assembler.py:304 `MOV_rr(ecx, eax)` — deliver the helper return
+    // value through ECX so it survives `pop_all` (which restores RAX
+    // from the save area).  RAX is still valid at this point because
+    // the WB inline above brackets its inner CALL with `push rax /
+    // pop rax`.
+    dynasm!(asm ; .arch x64 ; mov rcx, rax);
 
     // assembler.py:307 `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
     pop_all_regs_from_jitframe_raw(&mut asm, &ignored, true);
@@ -1806,6 +1823,33 @@ impl<'a> Assembler386<'a> {
         // gcmap in a register).
         self.push_gcmap(gcmap);
 
+        // assembler.py:173 — `_store_and_reset_exception(mc, None,
+        // ebx, tmpreg)` parity.  pos_exc_value goes into
+        // [rbp + JF_GUARD_EXC_OFS] (copied by `realloc_frame` to the
+        // new frame at jitframe.rs:432); pos_exception goes into RBX
+        // (callee-save across the C `realloc_frame` call).  Both globals
+        // are cleared so the helper does not see leftover state.
+        //
+        // RBX's frame save slot already holds the caller's pre-slowpath
+        // value (written by `push_all_regs_to_jitframe` above); we only
+        // transiently use the RBX *register* during this slowpath, and
+        // `pop_all_regs_from_jitframe` restores it before continuing.
+        // The minor-GC root walk sees the saved value through the
+        // RBX slot and the jf_guard_exc slot — both managed positions.
+        let scratch_for_exc = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch_for_exc), QWORD exc_value_addr
+            ; mov Rq(scratch_for_exc), [Rq(scratch_for_exc)]
+            ; mov [rbp + JF_GUARD_EXC_OFS], Rq(scratch_for_exc)
+            ; mov Rq(scratch_for_exc), QWORD exc_type_addr
+            ; mov rbx, [Rq(scratch_for_exc)]
+            ; mov QWORD [Rq(scratch_for_exc)], 0
+            ; mov Rq(scratch_for_exc), QWORD exc_value_addr
+            ; mov QWORD [Rq(scratch_for_exc)], 0
+        );
+
         // assembler.py:150-152 — MOV ARG0 = rbp, ARG1 = depth (from
         // stack in PyPy's shared trampoline; here from a patched imm).
         self.emit_abi_int_arg_from_reg(0, crate::regloc::EBP.value);
@@ -1831,6 +1875,22 @@ impl<'a> Assembler386<'a> {
 
         // assembler.py:176 — MOV ebp, eax: rbp ← new jitframe.
         dynasm!(self.mc ; .arch x64 ; mov rbp, rax);
+
+        // assembler.py:177 — `_restore_exception(mc, None, ebx, ecx)`
+        // parity.  pos_exc_value comes back from the new frame's
+        // JF_GUARD_EXC slot (copied by `realloc_frame`); pos_exception
+        // comes back from RBX, which the C `realloc_frame` call has
+        // preserved as a callee-save register.  Clear JF_GUARD_EXC
+        // after the read so the slot does not retain a stale exc value
+        // on the next guard exit.
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch_for_exc), [rbp + JF_GUARD_EXC_OFS]
+            ; mov QWORD [rbp + JF_GUARD_EXC_OFS], 0
+            ; mov rax, QWORD exc_value_addr
+            ; mov [rax], Rq(scratch_for_exc)
+            ; mov rax, QWORD exc_type_addr
+            ; mov [rax], rbx
+        );
 
         // assembler.py:181-184 — update shadow-stack top entry.  The
         // `gen_shadowstack_header` push writes the live jf at
@@ -3856,46 +3916,11 @@ impl<'a> Assembler386<'a> {
             //   3. mov [jf_descr], propagate_exception_descr
             //   4. _call_footer
             OpCode::CheckMemoryError => {
-                let propagate_descr = self.propagate_exception_descr_ptr();
-                if propagate_descr == 0 {
-                    // Unattached `propagate_exception_descr` — typical
-                    // for unit tests that bypass `MetaInterp::finish_setup`.
-                    // Skip the null-check; in production
-                    // (`pyjitpl.py:2283 self.cpu.propagate_exception_descr
-                    // = exc_descr`) the descr is always set before
-                    // `compile_loop` runs.
-                } else {
-                    let reg = match arglocs.first() {
-                        Some(Loc::Reg(r)) if !r.is_xmm => r.value,
-                        _ => panic!("CheckMemoryError arglocs[0] must be a non-xmm register"),
-                    };
-                    let skip = self.mc.new_dynamic_label();
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    let exc_value_addr = crate::jit_exc_value_addr() as i64;
-                    let exc_type_addr = crate::jit_exc_type_addr() as i64;
-                    // rax is freely clobberable on the propagate path:
-                    // the next instruction emitted after the dynasm! block
-                    // is `_call_footer` (assembler.py:1097: mov eax, ebp;
-                    // ret), which overwrites rax with rbp before returning.
-                    dynasm!(self.mc ; .arch x64
-                        ; test Rq(reg), Rq(reg)
-                        ; jnz =>skip
-                        // assembler.py:1836 — MOV tmp, [pos_exc_value]
-                        ; mov Rq(scratch), QWORD exc_value_addr
-                        ; mov rax, [Rq(scratch)]
-                        // assembler.py:1842-1843 — clear both globals.
-                        ; mov QWORD [Rq(scratch)], 0
-                        ; mov Rq(scratch), QWORD exc_type_addr
-                        ; mov QWORD [Rq(scratch)], 0
-                        // assembler.py:336-337 — MOV [jf_guard_exc], tmp
-                        ; mov [rbp + JF_GUARD_EXC_OFS], rax
-                        // assembler.py:339-340 — MOV [jf_descr], descr
-                        ; mov Rq(scratch), QWORD propagate_descr
-                        ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
-                    );
-                    self._call_footer();
-                    dynasm!(self.mc ; .arch x64 ; =>skip);
-                }
+                let reg = match arglocs.first() {
+                    Some(Loc::Reg(r)) if !r.is_xmm => r.value,
+                    _ => panic!("CheckMemoryError arglocs[0] must be a non-xmm register"),
+                };
+                self.emit_propagate_exception_if_zero(reg);
             }
             // x86/assembler.py:2438 genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
@@ -4254,6 +4279,56 @@ impl<'a> Assembler386<'a> {
             ; mov Rq(tmp.value), [Rq(tmp.value)]
         );
         self.emit_cmp_reg_loc_i64(tmp.value, expected_loc);
+    }
+
+    /// `assembler.py:328-345 _build_propagate_exception_path` inline.
+    /// Emits `TEST reg, reg; JNZ skip; <propagate body>; skip:` —
+    /// the per-site propagate sequence used by both `CheckMemoryError`
+    /// (assembler.py:1630 `genop_discard_check_memory_error`) and the
+    /// caller-side `CallMallocNursery` OOM check (`assembler.py:300-322`,
+    /// which PyPy emits inside the shared `_build_malloc_slowpath`).
+    ///
+    /// `_call_footer` overwrites `rax` with `rbp` before returning, so
+    /// `rax` is freely clobberable on the propagate path.  No-op when
+    /// `propagate_exception_descr` is unattached (test harnesses that
+    /// bypass `MetaInterp::finish_setup`); production
+    /// (`pyjitpl.py:2283`) always sets it before `compile_loop` runs.
+    fn emit_propagate_exception_if_zero(&mut self, reg: u8) {
+        let propagate_descr = self.propagate_exception_descr_ptr();
+        if propagate_descr == 0 {
+            return;
+        }
+        let skip = self.mc.new_dynamic_label();
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; test Rq(reg), Rq(reg)
+            ; jnz =>skip
+            // assembler.py:1836 — MOV tmp, [pos_exc_value]
+            ; mov Rq(scratch), QWORD exc_value_addr
+            ; mov rax, [Rq(scratch)]
+            // assembler.py:1842-1843 — clear both globals.
+            ; mov QWORD [Rq(scratch)], 0
+            ; mov Rq(scratch), QWORD exc_type_addr
+            ; mov QWORD [Rq(scratch)], 0
+            // assembler.py:336-337 — MOV [jf_guard_exc], tmp
+            ; mov [rbp + JF_GUARD_EXC_OFS], rax
+            // assembler.py:339-340 — MOV [jf_descr], descr
+            ; mov Rq(scratch), QWORD propagate_descr
+            ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
+        );
+        self._call_footer();
+        dynasm!(self.mc ; .arch x64 ; =>skip);
+    }
+
+    /// `CallMallocNursery` OOM check: helper returns the payload in
+    /// `rcx` or zero on `libc::calloc` failure (PyPy emits this inside
+    /// `_build_malloc_slowpath` at assembler.py:300-322; pyre's
+    /// process-shared trampoline has no access to per-cpu
+    /// `propagate_exception_descr`, so it goes at the call site).
+    fn emit_call_site_oom_propagate(&mut self) {
+        self.emit_propagate_exception_if_zero(crate::regloc::ECX.value);
     }
 
     /// `_store_and_reset_exception`: result = pos_exc_value; clear both
@@ -7152,10 +7227,29 @@ impl<'a> Assembler386<'a> {
             ; mov rax, QWORD helper_addr
             ; call rax
         );
+        // assembler.py:300-322 OOM check — the trampoline's underlying
+        // `dynasm_nursery_slowpath` falls back to `libc::calloc`, which
+        // can return NULL under host OOM; the trampoline preserves that
+        // NULL through to the caller in ECX.  PyPy emits this `TEST/JZ
+        // propagate` inside the trampoline; pyre cannot, because the
+        // process-shared `MALLOC_SLOWPATH_FIXED` trampoline has no
+        // access to the per-cpu `propagate_exception_descr` attachment.
+        // Emit the call-site equivalent here, mirroring the
+        // `CheckMemoryError` path (assembler.rs:3863).
+        self.emit_call_site_oom_propagate();
+        // assembler.py:304 — helper returns the payload in ECX
+        // (`MOV_rr(ecx, eax)` inside the trampoline) so the value
+        // survives the trampoline's `pop_all_regs([ECX, EDX])`.  The
+        // regalloc forces `result_reg = MALLOC_NURSERY_RESULT = ECX`
+        // (regalloc.rs:105), so the value already lives in the right
+        // register and no caller-side copy is needed.  If a future
+        // regalloc change picks a different `result_reg`, copy it
+        // from RCX (not RAX, which was restored to its pre-call
+        // value by the trampoline's pop_all).
         if let Some(Loc::Reg(r)) = result_loc {
-            if r.value != 0 {
+            if r.value != crate::regloc::ECX.value {
                 let rv = r.value;
-                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
+                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
             }
         }
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
