@@ -1234,6 +1234,20 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// `flatten_graph_with_walker_slots`; empty for plain
     /// `flatten_graph` test fixtures.
     block_py_pcs: Vec<(BlockRef, usize)>,
+    /// Pyre-only force-alive Register operands threaded into every
+    /// `-live-` placeholder emitted by `make_bytecode_block` (matches
+    /// walker's `emit_live_placeholder!` macro at
+    /// `codewriter.rs::4329-4339`).  Walker keeps the portal red args
+    /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`)
+    /// alive across every PC by emitting their Register operands into
+    /// each per-PC `-live-` — `compute_liveness` then propagates them
+    /// backward into the alive set per `liveness.py:11-12`.  Without
+    /// the operands the bridge's `setup_bridge_sym` sees the portal
+    /// `ec` register missing from the guard point's live R-bank set,
+    /// crashing `bridge_registers_r[portal_ec_reg]` lookup.  Pre-
+    /// seeded by `flatten_graph_with_walker_slots` from codewriter's
+    /// `portal_frame_reg` / `portal_ec_reg`.
+    live_force_alive_ops: Vec<Operand>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1275,6 +1289,7 @@ where
             block_names: Vec::new(),
             link_names: Vec::new(),
             block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1301,6 +1316,7 @@ where
             block_names: Vec::new(),
             link_names: Vec::new(),
             block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1332,6 +1348,7 @@ where
             block_names: Vec::new(),
             link_names: Vec::new(),
             block_py_pcs: Vec::new(),
+            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -2217,9 +2234,10 @@ where
             .iter()
             .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
             .collect();
+        let force_alive = self.live_force_alive_ops.clone();
         for py_pc in py_pcs {
             self.emitline(Insn::pc_anchor(py_pc));
-            self.emitline(Insn::op(OPNAME_LIVE.to_string(), Vec::new()));
+            self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
         }
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
@@ -2605,6 +2623,7 @@ pub fn flatten_graph<'a>(
         &[],
         &[],
         &[],
+        &[],
         include_all_exc_links,
         cpu,
     )
@@ -2637,6 +2656,7 @@ pub fn flatten_graph_with_walker_slots<'a>(
     block_name_overrides: &[(super::flow::BlockRef, String)],
     link_name_overrides: &[(super::flow::LinkRef, String)],
     block_py_pc_overrides: &[(super::flow::BlockRef, usize)],
+    live_force_alive_ops: &[Operand],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2727,6 +2747,12 @@ pub fn flatten_graph_with_walker_slots<'a>(
     for (block, py_pc) in block_py_pc_overrides {
         flattener.block_py_pcs.push((block.clone(), *py_pc));
     }
+    // Phase 4 slice 2 — pre-seed live force-alive ops so canonical's
+    // per-PC `-live-` placeholders carry the portal red args matching
+    // walker's `emit_live_placeholder!` shape.  Without these, the
+    // bridge's `setup_bridge_sym` crashes at portal_ec_reg lookup
+    // (compute_liveness misses the unforced register).
+    flattener.live_force_alive_ops = live_force_alive_ops.to_vec();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     ssarepr

@@ -8423,6 +8423,23 @@ impl CodeWriter {
                     block_py_pc_overrides.push((block, py_pc));
                 }
             }
+            // Phase 4 slice 2 — derive force-alive operands matching
+            // walker's `emit_live_placeholder!` at codewriter.rs:4329.
+            // Portal red args (`reds=['frame', 'ec']`) must reach
+            // `compute_liveness` via per-PC `-live-` operands so the
+            // bridge's `setup_bridge_sym` finds them in the guard's
+            // live R-bank set.
+            let mut live_force_alive_ops: Vec<super::flatten::Operand> = Vec::new();
+            if portal_frame_reg != u16::MAX {
+                live_force_alive_ops.push(super::flatten::Operand::Register(
+                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_frame_reg),
+                ));
+            }
+            if portal_ec_reg != u16::MAX {
+                live_force_alive_ops.push(super::flatten::Operand::Register(
+                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_ec_reg),
+                ));
+            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
@@ -8430,6 +8447,7 @@ impl CodeWriter {
                 &block_name_overrides,
                 &link_name_overrides,
                 &block_py_pc_overrides,
+                &live_force_alive_ops,
                 false,
                 Some(self.cpu()),
             );
