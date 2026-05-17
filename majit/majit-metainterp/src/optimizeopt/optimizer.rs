@@ -3251,10 +3251,14 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                // unroll.py:240-242: jump_to_preamble → send_extra_operation
-                let mut jump_op = terminal_jump.clone();
-                jump_op.setarglist(pre_opt_jump_args.clone().into());
-                jump_op.setdescr(preamble_token.as_jump_target_descr());
+                // unroll.py:239-240: jump_to_preamble →
+                //   jump_op = jump_op.copy_and_change(rop.JUMP, descr=...)
+                //   self.send_extra_operation(jump_op)
+                let jump_op = terminal_jump.copy_and_change(
+                    OpCode::Jump,
+                    Some(&pre_opt_jump_args),
+                    Some(Some(preamble_token.as_jump_target_descr())),
+                );
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
@@ -3321,9 +3325,12 @@ impl Optimizer {
             Err(()) => {
                 if let Some(preamble_token) = front_target_tokens.first() {
                     ctx.clear_newoperations();
-                    let mut jump_op = terminal_jump.clone();
-                    jump_op.setarglist(pre_opt_jump_args.clone().into());
-                    jump_op.setdescr(preamble_token.as_jump_target_descr());
+                    // unroll.py:239-240 jump_to_preamble parity.
+                    let jump_op = terminal_jump.copy_and_change(
+                        OpCode::Jump,
+                        Some(&pre_opt_jump_args),
+                        Some(Some(preamble_token.as_jump_target_descr())),
+                    );
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
@@ -3397,9 +3404,12 @@ impl Optimizer {
         }
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();
-            let mut jump_op = terminal_jump.clone();
-            jump_op.setarglist(pre_opt_jump_args.into());
-            jump_op.setdescr(preamble_token.as_jump_target_descr());
+            // unroll.py:239-240 jump_to_preamble parity.
+            let jump_op = terminal_jump.copy_and_change(
+                OpCode::Jump,
+                Some(&pre_opt_jump_args),
+                Some(Some(preamble_token.as_jump_target_descr())),
+            );
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));

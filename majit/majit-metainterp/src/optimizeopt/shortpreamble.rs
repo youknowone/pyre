@@ -364,55 +364,66 @@ impl PreambleOp {
         let preamble_op = match &self.kind {
             PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
             PreambleOpKind::Heap => {
-                let mut op = self.op.clone();
+                // shortpreamble.py:91-102 HeapOp.add_op_to_short:
+                //   preamble_arg = sb.produce_arg(sop.getarg(0))
+                //   if rop.is_getfield(sop.opnum):
+                //       preamble_op = ResOperation(sop.getopnum(), [preamble_arg], descr=sop.getdescr())
+                //   else:
+                //       preamble_op = ResOperation(sop.getopnum(), [preamble_arg, sop.getarg(1)], descr=sop.getdescr())
                 let preamble_arg = sb.produce_arg(ctx, self.op.arg(0))?;
-                if self.op.opcode.is_getfield() {
-                    op.setarglist(smallvec::smallvec![preamble_arg]);
+                let args: smallvec::SmallVec<[OpRef; 3]> = if self.op.opcode.is_getfield() {
+                    smallvec::smallvec![preamble_arg]
                 } else {
-                    // shortpreamble.py:99-102: GETARRAYITEM keeps the
-                    // original constant index; only the array/base arg goes
-                    // through produce_arg().
-                    op.setarglist(smallvec::smallvec![preamble_arg, self.op.arg(1)]);
-                }
-                op
+                    smallvec::smallvec![preamble_arg, self.op.arg(1)]
+                };
+                self.op.copy_and_change(self.op.opcode, Some(&args), None)
             }
             PreambleOpKind::Pure => {
+                // shortpreamble.py:128-140 PureOp.add_op_to_short:
+                //   arglist = [sb.produce_arg(arg) for arg in op.getarglist()]
+                //   if rop.is_call(op.opnum):
+                //       opnum = OpHelpers.call_pure_for_descr(op.getdescr())
+                //   else:
+                //       opnum = op.getopnum()
+                //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
                     .op
                     .args
                     .iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
-                    .collect::<Option<Vec<_>>>()?;
-                let mut op = self.op.clone();
-                op.setarglist(args.into_iter().collect());
-                if op.opcode.is_call() {
-                    op.opcode = match op.opcode {
+                    .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
+                let opnum = if self.op.opcode.is_call() {
+                    match self.op.opcode {
                         OpCode::CallI => OpCode::CallPureI,
                         OpCode::CallR => OpCode::CallPureR,
                         OpCode::CallF => OpCode::CallPureF,
                         OpCode::CallN => OpCode::CallPureN,
                         other => other,
-                    };
-                }
-                op
+                    }
+                } else {
+                    self.op.opcode
+                };
+                self.op.copy_and_change(opnum, Some(&args), None)
             }
             PreambleOpKind::LoopInvariant => {
+                // shortpreamble.py:160-170 LoopInvariantOp.add_op_to_short:
+                //   arglist = [sb.produce_arg(arg) for arg in op.getarglist()]
+                //   opnum = OpHelpers.call_loopinvariant_for_descr(op.getdescr())
+                //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
                     .op
                     .args
                     .iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
-                    .collect::<Option<Vec<_>>>()?;
-                let mut op = self.op.clone();
-                op.setarglist(args.into_iter().collect());
-                op.opcode = match op.opcode {
+                    .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
+                let opnum = match self.op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
                     OpCode::CallR => OpCode::CallLoopinvariantR,
                     OpCode::CallF => OpCode::CallLoopinvariantF,
                     OpCode::CallN => OpCode::CallLoopinvariantN,
                     other => other,
                 };
-                op
+                self.op.copy_and_change(opnum, Some(&args), None)
             }
         };
         Some(ProducedShortOp {
