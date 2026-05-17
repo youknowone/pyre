@@ -20,7 +20,6 @@ use std::any::Any;
 use std::rc::Rc;
 
 use crate::resoperation::OpRef;
-use crate::value::Const;
 
 /// `resoperation.py:29` `AbstractValue` — base of the hierarchy whose
 /// instances can be stored in `_forwarded`.
@@ -81,9 +80,13 @@ pub enum Forwarded {
     OpRef(OpRef),
     /// `_forwarded = constbox` (`optimizer.py:413 make_constant`).
     ///
-    /// PyPy stores a `Const` instance with its own object identity;
-    /// pyre's `Const` is `Copy`, so the value is embedded directly.
-    Const(Const),
+    /// PyPy stores a `Const` instance whose object identity IS the box.
+    /// Pyre encodes the same identity as a typed `OpRef::Const*` variant
+    /// from the constant pool — `OpRef::ConstInt(idx)` / `ConstFloat(idx)`
+    /// / `ConstPtr(idx)` (history.py:220/261/307). Storing the typed
+    /// OpRef here lets `get_box_replacement` advance into the Const and
+    /// return the const-OpRef just as RPython returns the Const box.
+    Const(OpRef),
     /// `_forwarded = AbstractInfo` (`info.py:17`).
     Info(Rc<dyn AbstractInfo>),
 }
@@ -134,8 +137,15 @@ pub trait AbstractResOpOrInputArg {
     }
 
     /// `optimizer.py:413` `make_constant` — replace with constbox.
-    fn set_forwarded_const(&self, c: Const) {
-        self.set_forwarded(Forwarded::Const(c));
+    /// Takes the typed `OpRef::Const*` (history.py:220/261/307) that
+    /// identifies the pooled constant; RPython equivalent uses the
+    /// `Const` box object itself as the identity.
+    fn set_forwarded_const(&self, const_opref: OpRef) {
+        debug_assert!(
+            const_opref.is_constant(),
+            "set_forwarded_const requires a typed OpRef::Const* variant, got {const_opref:?}",
+        );
+        self.set_forwarded(Forwarded::Const(const_opref));
     }
 
     /// `optimizer.py:393` setting an `AbstractInfo` instance.
@@ -189,11 +199,16 @@ pub fn get_box_replacement(
         let Some(slot) = forwarded_slot_at(cur, trace_ops, inputargs, num_inputargs) else {
             return cur;
         };
+        // RPython `resoperation.py:58-64 get_box_replacement`: stop when
+        // `_forwarded` is None, an Info, or (when `not_const=True`) a
+        // constant; otherwise advance to `_forwarded`.  A Const advance
+        // exits on the next iteration because `forwarded_slot_at` returns
+        // None for Const variants (Const isn't `AbstractResOpOrInputArg`).
         let step = match &*slot.borrow() {
             Forwarded::None => StepOut::Stop,
             Forwarded::Info(_) => StepOut::Stop,
             Forwarded::Const(_) if not_const => StepOut::Stop,
-            Forwarded::Const(_) => StepOut::Stop, // Const itself isn't AbstractResOpOrInputArg
+            Forwarded::Const(target) => StepOut::Advance(*target),
             Forwarded::OpRef(target) => StepOut::Advance(*target),
         };
         match step {
