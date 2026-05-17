@@ -3178,6 +3178,45 @@ impl FailDescr for ResumeAtPositionDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
+    fn source_op_index(&self) -> Option<usize> {
+        FailDescr::source_op_index(&self.inner)
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        FailDescr::set_source_op_index(&self.inner, source_op_index);
+    }
+    fn force_token_slots(&self) -> Vec<usize> {
+        FailDescr::force_token_slots(&self.inner)
+    }
+    fn set_force_token_slots(&self, slots: Vec<usize>) {
+        FailDescr::set_force_token_slots(&self.inner, slots);
+    }
+    fn fail_count(&self) -> u32 {
+        FailDescr::fail_count(&self.inner)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        FailDescr::increment_fail_count(&self.inner)
+    }
+    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        FailDescr::trace_info_any(&self.inner)
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
+        FailDescr::set_trace_info_any(&self.inner, info);
+    }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        FailDescr::bridge_cache_addrs(&self.inner)
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        FailDescr::bridge_code_ptr(&self.inner)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        FailDescr::bridge_dispatch_load(&self.inner)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
+    }
 }
 
 /// Create a ResumeAtPositionDescr with auto-assigned fail_index, the
@@ -3397,6 +3436,45 @@ impl FailDescr for ResumeGuardForcedDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
+    fn source_op_index(&self) -> Option<usize> {
+        FailDescr::source_op_index(&self.inner)
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        FailDescr::set_source_op_index(&self.inner, source_op_index);
+    }
+    fn force_token_slots(&self) -> Vec<usize> {
+        FailDescr::force_token_slots(&self.inner)
+    }
+    fn set_force_token_slots(&self, slots: Vec<usize>) {
+        FailDescr::set_force_token_slots(&self.inner, slots);
+    }
+    fn fail_count(&self) -> u32 {
+        FailDescr::fail_count(&self.inner)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        FailDescr::increment_fail_count(&self.inner)
+    }
+    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        FailDescr::trace_info_any(&self.inner)
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
+        FailDescr::set_trace_info_any(&self.inner, info);
+    }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        FailDescr::bridge_cache_addrs(&self.inner)
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        FailDescr::bridge_code_ptr(&self.inner)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        FailDescr::bridge_dispatch_load(&self.inner)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
+    }
 }
 
 /// Create a ResumeGuardForcedDescr with auto-assigned fail_index, the
@@ -3599,6 +3677,45 @@ impl FailDescr for ResumeGuardExcDescr {
             .downcast::<CompiledLoopToken>()
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
+    }
+    fn source_op_index(&self) -> Option<usize> {
+        FailDescr::source_op_index(&self.inner)
+    }
+    fn set_source_op_index(&self, source_op_index: usize) {
+        FailDescr::set_source_op_index(&self.inner, source_op_index);
+    }
+    fn force_token_slots(&self) -> Vec<usize> {
+        FailDescr::force_token_slots(&self.inner)
+    }
+    fn set_force_token_slots(&self, slots: Vec<usize>) {
+        FailDescr::set_force_token_slots(&self.inner, slots);
+    }
+    fn fail_count(&self) -> u32 {
+        FailDescr::fail_count(&self.inner)
+    }
+    fn increment_fail_count(&self) -> u32 {
+        FailDescr::increment_fail_count(&self.inner)
+    }
+    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        FailDescr::trace_info_any(&self.inner)
+    }
+    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
+        FailDescr::set_trace_info_any(&self.inner, info);
+    }
+    fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
+        FailDescr::bridge_cache_addrs(&self.inner)
+    }
+    fn bridge_code_ptr(&self) -> usize {
+        FailDescr::bridge_code_ptr(&self.inner)
+    }
+    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    }
+    fn bridge_dispatch_load(&self) -> *mut () {
+        FailDescr::bridge_dispatch_load(&self.inner)
+    }
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+        FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
 }
 
