@@ -4054,6 +4054,19 @@ impl CodeWriter {
                 } else if !current_block.dead() {
                     // Natural fall-through within current_block — Phase
                     // A.1+A.2 cover branch targets via boundary force.
+                    // When `current_block` was closed by a previous
+                    // terminator emit (`emit_goto!`, `emit_ref_return!`,
+                    // `emit_raise!`, `emit_reraise!`, POP_JUMP_IF) and
+                    // no joinpoint exists at `py_pc`, this arm still
+                    // returns `current_block` so PcAnchor + `-live-`
+                    // are emitted for pyre's per-PC dispatch invariants
+                    // (`pc_anchor_positions`).  The
+                    // `block_closed_by_terminator` gate after
+                    // `emit_live_placeholder!()` then suppresses op
+                    // dispatch into the closed block — mirroring
+                    // `rpython/flowspace/flowcontext.py:407-475` which
+                    // raises `StopFlowing` from `closeblock` and pops
+                    // the next block.
                     current_block.clone()
                 } else {
                     // `current_block` already closed and no joinpoint
@@ -5011,6 +5024,62 @@ impl CodeWriter {
                 // its own `-live-` marker.
                 depth_at_pc[py_pc] = current_depth;
                 emit_live_placeholder!();
+
+                // Dead-code dispatch gate: `current_block` has already
+                // been closed by a previous terminator emit (`emit_goto!`,
+                // `emit_ref_return!`, `emit_raise!`, `emit_reraise!`,
+                // POP_JUMP_IF) that appended a normal-flow / bool /
+                // raise / return exit, and no joinpoint exists at
+                // `py_pc`.  PcAnchor + `-live-` have been emitted to
+                // satisfy pyre's per-PC dispatch invariants
+                // (`pc_anchor_positions`, `live_marker_indices_by_pc`),
+                // but dispatching the op would append more SpaceOps and
+                // potentially more exits (orphan `(None,None)` link) to
+                // the closed block.  Upstream
+                // `rpython/flowspace/flowcontext.py:407-475` never
+                // reaches dead-code PCs because `StopFlowing` from
+                // `closeblock` pops the next pending block; pyre's
+                // PC-sequential walker scans through but skips dispatch.
+                //
+                // The `exitswitch=LastException` exclusion preserves
+                // dispatch after `attach_catch_exception_edge` — the
+                // canraise op attaches its exception edge but the walker
+                // is expected to continue processing the canraise op's
+                // normal-flow result and subsequent ops.  `emit_abort_
+                // permanent!` is excluded by checking `exits.is_empty()`
+                // — it inserts a runtime abort marker without closing
+                // the block, so subsequent ops still need dispatch for
+                // stack-depth parity (e.g. `Instruction::LoadName` +
+                // `Instruction::StoreName` patterns at module scope).
+                let block_closed_by_terminator = {
+                    let block_rc = current_block.block();
+                    let block = block_rc.borrow();
+                    !block.exits.is_empty()
+                        && !matches!(
+                            block.exitswitch,
+                            Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                                ref c,
+                            ))) if matches!(
+                                c.value,
+                                super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
+                            )
+                        )
+                };
+                if block_closed_by_terminator {
+                    // Advance `current_state.next_offset` to `py_pc + 1`
+                    // mirroring the line ~6927 update that runs at the
+                    // end of every dispatched op.  Without this, the
+                    // next PC's `emit_mark_label_pc!` first arm would
+                    // see `current_state.next_offset != py_pc` and
+                    // fire `mergeblock(currentblock=closed_block,
+                    // target=py_pc)`, appending an orphan
+                    // `(None,None)` exit on top of the terminator's
+                    // already-attached exit.
+                    current_state.next_offset = py_pc + 1;
+                    current_state.blocklist =
+                        frame_blocks_for_offset(code, current_state.next_offset);
+                    continue;
+                }
 
                 if loop_header_pcs.contains(&py_pc) {
                     if is_portal {
