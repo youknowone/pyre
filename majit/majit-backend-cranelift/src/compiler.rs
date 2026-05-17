@@ -5923,12 +5923,20 @@ pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
         .max(bridge.num_inputs)
         .max(1)
         .saturating_add(bridge.num_ref_roots);
+    // assembler.py:987 patch_jump_for_descr ordering parity: publish the
+    // dispatch cache BEFORE the BridgeData Arc swap so any JIT execution
+    // observing a non-null `bridge_dispatch` cell also sees a populated
+    // cache.  Reversing the order would leave a window where the host-
+    // loop bridge fallback at compiler.rs:7287 fires with a freshly
+    // published Arc but a still-null cache, which the in-code dispatch
+    // (`emit_attached_bridge_dispatch`) cannot reach.  Slice X1-delete
+    // preparation.
+    fd.store_bridge_caches(code_ptr, frame_depth);
     let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut ();
     let old_ptr = fd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
     if !old_ptr.is_null() {
         unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
     }
-    fd.store_bridge_caches(code_ptr, frame_depth);
 }
 
 /// Whether a bridge has been attached to this descr.  Helper around
@@ -7324,7 +7332,27 @@ impl CraneliftBackend {
             // the jitframe uses recovery_layout encoding for virtuals.
             // rebuild_state_after_failure decodes this to match what the
             // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
+            //
+            // Slice X1-realloc/B: bridges now self-grow their JITFRAME via
+            // the `_check_frame_depth` prologue (compiler.rs:7585), so the
+            // in-code dispatch (`emit_attached_bridge_dispatch`) reaches
+            // every attached bridge unconditionally.  Slice X1-delete
+            // preparation: probe whether this host-loop fallback still
+            // fires.  After `fail_descr_attach_bridge` was reordered to
+            // publish the cache before the BridgeData Arc, the in-code
+            // path should see consistent state on every guard exit and
+            // this branch should be dead.
             if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
+                static HOST_FALLBACK_FIRED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !HOST_FALLBACK_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[X1-delete-probe] host-loop bridge fallback fired \
+                         (trace_id={} fail_index={}) — in-code dispatch missed",
+                        fail_descr_fd.trace_id(),
+                        fail_index,
+                    );
+                }
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
                 if majit_log_enabled() {
