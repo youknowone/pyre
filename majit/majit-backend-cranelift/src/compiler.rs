@@ -13153,11 +13153,11 @@ fn collect_guards(
             // inheriting the donor's op.fail_arg_types instead; that is
             // the only path left where op-level types are load-bearing.
             let types = match (
-                descr_fd.map(|fd| fd.fail_arg_types()),
-                op.fail_arg_types.as_ref(),
+                descr_fd.map(|fd| fd.fail_arg_types().to_vec()),
+                op.get_fail_arg_types().map(|t| t.to_vec()),
             ) {
-                (Some(dt), _) if dt.len() == refs.len() => dt.to_vec(),
-                (_, Some(explicit)) if explicit.len() == refs.len() => explicit.clone(),
+                (Some(dt), _) if dt.len() == refs.len() => dt,
+                (_, Some(explicit)) if explicit.len() == refs.len() => explicit,
                 _ => resolve_fail_arg_types(
                     &refs,
                     descr_fd,

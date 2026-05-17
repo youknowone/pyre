@@ -1683,7 +1683,10 @@ impl OptRewrite {
                     // one. This path writes directly into new_operations, so
                     // perform the descr copy inline before replacing the op.
                     let new_descr = crate::compile::make_resume_guard_descr_typed(
-                        old_guard.fail_arg_types.clone().unwrap_or_default(),
+                        old_guard
+                            .get_fail_arg_types()
+                            .map(|t| t.to_vec())
+                            .unwrap_or_default(),
                     );
                     let old_descr = old_guard
                         .getdescr()

@@ -3955,14 +3955,14 @@ impl<'a> AssemblerARM64<'a> {
                 return dt.to_vec();
             }
         }
-        if let Some(ref ts) = op.fail_arg_types {
+        if let Some(ts) = op.get_fail_arg_types() {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.args.len()
             } else {
                 op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
-                ts.clone()
+                ts.to_vec()
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.args
                     .iter()
@@ -4299,9 +4299,9 @@ impl<'a> AssemblerARM64<'a> {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();
-        let fail_arg_types = if let Some(ref explicit) = op.fail_arg_types {
+        let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
-                explicit.clone()
+                explicit.to_vec()
             } else {
                 finish_refs
                     .iter()

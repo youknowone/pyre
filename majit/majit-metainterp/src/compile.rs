@@ -510,7 +510,7 @@ pub(crate) fn build_guard_metadata(
             // `fail_arg_types` on sharing-path (no descr); fall back to
             // per-arg reconstruction via guard-point `value_types` when arity
             // mismatches.
-            let fa_types = op.fail_arg_types.as_ref();
+            let fa_types = op.get_fail_arg_types();
             if let Some(types) = descr_types {
                 if types.len() == fail_args.len() {
                     types.to_vec()
@@ -522,7 +522,7 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(fa) = fa_types {
+                            if let Some(fa) = fa_types.as_ref() {
                                 if let Some(&tp) = fa.get(i) {
                                     return tp;
                                 }
@@ -565,8 +565,8 @@ pub(crate) fn build_guard_metadata(
             }
         } else if let Some(dt) = descr_types {
             dt.to_vec()
-        } else if let Some(ref types) = op.fail_arg_types {
-            types.clone()
+        } else if let Some(types) = op.get_fail_arg_types() {
+            types.to_vec()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };

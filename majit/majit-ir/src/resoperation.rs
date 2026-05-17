@@ -1017,7 +1017,11 @@ pub struct Op {
     pub fail_args: Option<SmallVec<[OpRef; 3]>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
-    pub fail_arg_types: Option<Vec<Type>>,
+    /// `RefCell` so the optimizer can stamp types onto a shared `Op`
+    /// reached through `Rc<Op>` (BoxPool removal Slice 1 prep): RPython
+    /// writes `op.fail_arg_types = [...]` on the same Python object the
+    /// trace/backend/short preamble all observe.
+    pub fail_arg_types: std::cell::RefCell<Option<Vec<Type>>>,
     /// resoperation.py: GuardResOp.rd_resume_position — index of the
     /// guard in the trace for resume data lookup. Set by unroll when
     /// creating extra guards from short preamble / virtual state.
@@ -1053,7 +1057,7 @@ impl Clone for Op {
             pos: std::cell::Cell::new(self.pos.get()),
             type_: self.type_,
             fail_args: self.fail_args.clone(),
-            fail_arg_types: self.fail_arg_types.clone(),
+            fail_arg_types: std::cell::RefCell::new(self.fail_arg_types.borrow().clone()),
             rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
@@ -1136,7 +1140,7 @@ impl Op {
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
             fail_args: None,
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
@@ -1151,7 +1155,7 @@ impl Op {
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
             fail_args: None,
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
@@ -1203,7 +1207,7 @@ impl Op {
             pos: std::cell::Cell::new(self.pos.get()),
             type_: opcode.result_type(),
             fail_args: None,
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
             // copy datatype/bytesize/signed/count from the source.  pyre
@@ -1225,7 +1229,7 @@ impl Op {
         if opcode.is_guard() || self.opcode.is_guard() {
             let mut newop = newop;
             newop.fail_args = self.fail_args.clone();
-            newop.fail_arg_types = self.fail_arg_types.clone();
+            *newop.fail_arg_types.borrow_mut() = self.fail_arg_types.borrow().clone();
             newop.rd_resume_position.set(self.rd_resume_position.get());
             return newop;
         }
@@ -4226,7 +4230,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4236,7 +4240,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4247,7 +4251,7 @@ mod tests {
                 fail_args: None,
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
@@ -4268,7 +4272,7 @@ mod tests {
             pos: std::cell::Cell::new(OpRef::int_op(6)),
             fail_args: None,
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
@@ -4284,7 +4288,7 @@ mod tests {
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
@@ -4301,7 +4305,7 @@ mod tests {
             fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
@@ -4317,7 +4321,7 @@ mod tests {
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         };
         let s = format!("{op}");
@@ -4333,7 +4337,7 @@ mod tests {
             pos: std::cell::Cell::new(OpRef::int_op(1)),
             fail_args: None,
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
@@ -4353,7 +4357,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4363,7 +4367,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4374,7 +4378,7 @@ mod tests {
                 fail_args: None,
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
@@ -4394,7 +4398,7 @@ mod tests {
             fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
 
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         }];
         let mut constants = std::collections::HashMap::new();
@@ -4425,7 +4429,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4435,7 +4439,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4445,7 +4449,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4456,7 +4460,7 @@ mod tests {
                 fail_args: None,
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
@@ -4488,7 +4492,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4498,7 +4502,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4508,7 +4512,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4519,7 +4523,7 @@ mod tests {
                 fail_args: None,
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
@@ -4548,7 +4552,7 @@ mod tests {
             pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
-            fail_arg_types: None,
+            fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
@@ -4579,7 +4583,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4589,7 +4593,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4599,7 +4603,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4609,7 +4613,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(2)]),
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4619,7 +4623,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4630,7 +4634,7 @@ mod tests {
                 fail_args: None,
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];
@@ -4662,7 +4666,7 @@ mod tests {
                 pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0)]),
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
             op! {
@@ -4673,7 +4677,7 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]),
 
 
-                fail_arg_types: None,
+                fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
             },
         ];

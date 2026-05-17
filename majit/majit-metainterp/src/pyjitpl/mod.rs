@@ -1478,8 +1478,8 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or(false)
         })?;
         let op = trace.ops.get(op_index)?;
-        if let Some(types) = &op.fail_arg_types {
-            return Some(types.clone());
+        if let Some(types) = op.get_fail_arg_types() {
+            return Some(types.to_vec());
         }
         op.with_fail_descr(|descr| descr.fail_arg_types().to_vec())
             .filter(|types| !types.is_empty())

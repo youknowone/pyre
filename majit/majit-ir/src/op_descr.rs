@@ -192,31 +192,33 @@ impl Op {
     /// caches the types the optimizer assigned to each `fail_arg` (the
     /// `compile.py:855 _attrs_` set lives on the descr, but the
     /// per-op view is kept here for backend dispatch convenience).
-    pub fn get_fail_arg_types(&self) -> Option<&[crate::value::Type]> {
-        self.fail_arg_types.as_deref()
+    /// Returns an owned `Vec` clone now that the slot is `RefCell`-
+    /// wrapped; callers no longer hold a borrow across other `Op`
+    /// accesses.
+    pub fn get_fail_arg_types(&self) -> Option<Vec<crate::value::Type>> {
+        self.fail_arg_types.borrow().clone()
     }
 
     /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
     pub fn get_fail_arg_types_copy(&self) -> Vec<crate::value::Type> {
-        match &self.fail_arg_types {
-            Some(t) => t.clone(),
-            None => Vec::new(),
-        }
+        self.fail_arg_types.borrow().clone().unwrap_or_default()
     }
 
-    /// Overwrite the per-failarg type vector.
-    pub fn set_fail_arg_types(&mut self, types: Vec<crate::value::Type>) {
-        self.fail_arg_types = Some(types);
+    /// Overwrite the per-failarg type vector.  Takes `&self`
+    /// (interior mutability through `RefCell`) so shared `Op` instances
+    /// can be re-stamped without `&mut`.
+    pub fn set_fail_arg_types(&self, types: Vec<crate::value::Type>) {
+        *self.fail_arg_types.borrow_mut() = Some(types);
     }
 
     /// Clear the per-failarg type vector.
-    pub fn clear_fail_arg_types(&mut self) {
-        self.fail_arg_types = None;
+    pub fn clear_fail_arg_types(&self) {
+        *self.fail_arg_types.borrow_mut() = None;
     }
 
     /// True iff the per-failarg type vector slot is populated.
     pub fn has_fail_arg_types(&self) -> bool {
-        self.fail_arg_types.is_some()
+        self.fail_arg_types.borrow().is_some()
     }
 
     /// `resoperation.py:156-200 VectorizationInfo` slot accessor —
