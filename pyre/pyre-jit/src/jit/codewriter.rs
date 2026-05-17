@@ -8830,6 +8830,17 @@ impl CodeWriter {
             // for now — those require canonical-side ops walker
             // doesn't have, which would change runtime behavior in
             // ways that need per-bench verification.
+            //
+            // ENV-GATE REASON: canonical's `-live-` placeholder emits
+            // empty `force_alive` args, while walker's `emit_live_
+            // placeholder!` emits the per-PC live Variables that
+            // `filter_liveness_in_place` later filters.  Tests in
+            // `eval.rs::test_*_with_compiled_trace_jitcode` query
+            // liveness at specific PCs and fail when canonical's
+            // placeholders propagate.  Closing requires either
+            // canonical-side per-PC live-Variable emission or a
+            // walker post-process pass that rewrites canonical's
+            // placeholders with the walker's per-PC live sets.
             if canonical_unmatched == 0
                 && std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some()
             {
