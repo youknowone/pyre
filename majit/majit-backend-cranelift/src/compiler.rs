@@ -12896,7 +12896,28 @@ fn collect_guards(
                 descr.fail_arg_types.clone(),
             ))
         } else if let Some(d) = op.descr.clone() {
-            Some(d)
+            // When `op.descr` is a `ResumeGuardDescr` (the common case
+            // post-`store_final_boxes_in_guard`), use it directly so
+            // `meta_descr.is_resume_guard()` returns true and the
+            // per-trace stamping at line ~12899 lands on the live Arc.
+            // Non-Resume meta descrs (PropagateExceptionDescr backing
+            // GUARD_NO_EXCEPTION in `compile_tmp_callback`,
+            // ExitFrameWithExceptionDescrRef, etc.) carry no
+            // ResumeGuardDescr-shaped slots — synthesise an empty
+            // ResumeGuardDescr meta so the meta-side bridge caches
+            // (Slice 7-Tβ11) baked into `emit_attached_bridge_dispatch`
+            // resolve to a valid heap-pinned cell that always reads 0.
+            // No bridge is ever attached to these guards (PyPy's
+            // `_assemble_op` skips bridge logic for non-Resume descrs),
+            // so the cells stay 0 and the dispatch falls through to the
+            // deadframe path.
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                Some(d)
+            } else {
+                Some(majit_backend::make_resume_guard_descr_typed(
+                    descr.fail_arg_types.clone(),
+                ))
+            }
         } else if is_finish {
             // `compile.py:626-656` `_DoneWithThisFrameDescr*` are
             // module-level singletons.  Reuse the metainterp Arc

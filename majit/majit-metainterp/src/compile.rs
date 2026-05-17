@@ -16,7 +16,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use smallvec::smallvec;
 
@@ -2903,6 +2903,8 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
+        bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
     })
 }
 
@@ -2991,6 +2993,8 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
+        bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
     })
 }
 
@@ -3200,6 +3204,8 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         },
     })
 }
@@ -3415,6 +3421,8 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         },
     })
 }
@@ -3614,6 +3622,8 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         },
     })
 }

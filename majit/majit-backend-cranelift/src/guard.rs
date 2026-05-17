@@ -15,15 +15,15 @@ use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
-// BRIDGE_CACHES_TABLE removed (Slice JJ): the per-descr
+// BRIDGE_CACHES_TABLE removed (Slice JJ → Slice 7-Tβ11): the
 // `Box<AtomicUsize>` cells for bridge code_ptr / frame_depth now live
-// on CraneliftFailDescr directly.  Box gives each cell a heap-pinned
-// address that survives the descr being moved into `Arc::new(...)`;
-// the JIT bakes those addresses into the machine code
-// (`compiler.rs::emit_attached_bridge_dispatch`), so they must remain
+// on `ResumeGuardDescr` (meta side).  Box gives each cell a heap-
+// pinned address that survives `Arc::clone` of the meta Arc; the JIT
+// bakes those addresses into the machine code
+// (`compiler.rs::emit_attached_bridge_dispatch`) so they must remain
 // stable for the descr's lifetime.
 
 // FORCE_TOKEN_SLOTS_TABLE removed (Slice II): write-once at codegen.
@@ -337,17 +337,15 @@ pub struct CraneliftFailDescr {
     // source_op_index, Slice OO-half for recovery_layout).
     // Cranelift accessors `force_token_slots_view` /
     // `set_force_token_slots` now forward through that chain.
-    /// Bridge code-pointer cache.  JIT-baked into the dispatch path
-    /// (`emit_attached_bridge_dispatch`).  `Box` gives the
-    /// `AtomicUsize` a heap-pinned address that survives the descr
-    /// being moved into `Arc::new(...)`.  `0` = no bridge attached.
-    ///
-    /// Moved here from `BRIDGE_CACHES_TABLE` (Slice JJ).
-    pub bridge_code_ptr_cache: Box<AtomicUsize>,
-    /// Bridge frame-depth cache.  Same shape as
-    /// `bridge_code_ptr_cache`; baked into the dispatch path so the
-    /// runtime can grow the JIT frame before re-entering the bridge.
-    pub bridge_frame_depth_cache: Box<AtomicUsize>,
+    // bridge_code_ptr_cache / bridge_frame_depth_cache moved to
+    // ResumeGuardDescr (Slice 7-Tβ11): the meta Arc is the canonical
+    // home, reached via `as_any` downcast on `meta_descr`.  Cranelift
+    // accessors `bridge_cache_addrs` / `bridge_code_ptr` / `has_bridge`
+    // / `attach_bridge` now forward through that chain.  All guards
+    // that reach `emit_attached_bridge_dispatch` carry a
+    // `ResumeGuardDescr` meta (real `op.descr` or the test-scaffold
+    // synthesis at compiler.rs:12884), so the downcast always
+    // succeeds.
 }
 
 impl Drop for CraneliftFailDescr {
@@ -464,8 +462,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         }
     }
 
@@ -487,8 +483,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
-            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         }
     }
 
@@ -588,33 +582,45 @@ impl CraneliftFailDescr {
             .map_or(0, |rgd| rgd.get_fail_count())
     }
 
-    /// Descr-local atomic read (Slice JJ) — whether a bridge has been
-    /// attached to this guard.
+    /// Forward to the meta-side `ResumeGuardDescr::bridge_code_ptr`
+    /// slot (Slice 7-Tβ11) — whether a bridge has been attached.
+    /// Returns `false` when no `ResumeGuardDescr` meta is present
+    /// (singletons, cross-loop JUMP test scaffolds outside the
+    /// production codepath).
     pub fn has_bridge(&self) -> bool {
-        self.bridge_code_ptr_cache.load(Ordering::Acquire) != 0
+        self.meta_resume_guard_descr()
+            .is_some_and(|rgd| rgd.bridge_code_ptr() != 0)
     }
 
-    /// Descr-local atomic read (Slice JJ) — bridge code_ptr.
+    /// Forward to the meta-side `ResumeGuardDescr::bridge_code_ptr`
+    /// slot (Slice 7-Tβ11).  Returns null when no `ResumeGuardDescr`
+    /// meta is present.
     pub fn bridge_code_ptr(&self) -> *const u8 {
-        self.bridge_code_ptr_cache.load(Ordering::Acquire) as *const u8
+        self.meta_resume_guard_descr()
+            .map_or(std::ptr::null(), |rgd| rgd.bridge_code_ptr() as *const u8)
     }
 
-    /// Heap-pinned addresses of the two bridge-cache atomic cells,
+    /// Forward to the meta-side cell addresses (Slice 7-Tβ11),
     /// suitable for baking into JIT machine code as immediates.
-    /// Returns `(code_ptr_addr, frame_depth_addr)`.
+    /// Returns `(code_ptr_addr, frame_depth_addr)`.  Panics when no
+    /// `ResumeGuardDescr` meta is present — all guards that reach
+    /// `emit_attached_bridge_dispatch` carry one (real `op.descr` or
+    /// the test-scaffold synthesis at compiler.rs:12884).
     pub fn bridge_cache_addrs(&self) -> (usize, usize) {
-        (
-            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
-        )
+        self.meta_resume_guard_descr()
+            .expect(
+                "bridge_cache_addrs requires a ResumeGuardDescr meta_descr; \
+                 all bridgeable guards carry one (op.descr or synthesised at \
+                 compiler.rs:12884)",
+            )
+            .bridge_cache_addrs()
     }
 
     /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
     /// parity — atomic-store the bridge `Arc` raw pointer into the
-    /// descr-local dispatch cell.  PyPy patches the JMP rel32; pyre
-    /// patches the heap-pinned atomic cell.  Cell address is stable
-    /// for the descr's lifetime (heap-pinned via `Box`), so the
-    /// JIT-baked dispatch can read it lock-free.
+    /// descr-local dispatch cell, and publish `(code_ptr, frame_depth)`
+    /// into the meta-side cache cells (Slice 7-Tβ11) that
+    /// `emit_attached_bridge_dispatch` baked addresses for.
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
         let frame_depth = bridge
@@ -633,10 +639,12 @@ impl CraneliftFailDescr {
             // reclaim ownership and drop.
             unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
         }
-        self.bridge_frame_depth_cache
-            .store(frame_depth, Ordering::Release);
-        self.bridge_code_ptr_cache
-            .store(code_ptr, Ordering::Release);
+        let rgd = self.meta_resume_guard_descr().expect(
+            "attach_bridge requires a ResumeGuardDescr meta_descr; \
+             all bridgeable guards carry one (op.descr or synthesised at \
+             compiler.rs:12884)",
+        );
+        rgd.store_bridge_caches(code_ptr, frame_depth);
     }
 
     /// Forward the external-JUMP target publish to the meta-side
@@ -853,6 +861,21 @@ impl CraneliftFailDescr {
         } else {
             None
         }
+    }
+
+    /// `as_any` downcast on `meta_descr` to recover the concrete
+    /// `majit_backend::ResumeGuardDescr`.  Used by the cells migrated
+    /// in Slice 7-Tβ6..11 whose accessor needs the concrete type (not
+    /// the `FailDescr` trait surface) — e.g. `bridge_cache_addrs` /
+    /// `store_bridge_caches` are inherent methods on
+    /// `ResumeGuardDescr` rather than trait methods because their
+    /// signature exposes the heap-pinned Box addresses.
+    #[inline]
+    fn meta_resume_guard_descr(&self) -> Option<&majit_backend::ResumeGuardDescr> {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
     }
 
     pub fn layout(&self) -> FailDescrLayout {
