@@ -184,11 +184,12 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     dynasm!(asm ; .arch x64 ; ret);
 }
 
-/// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` — process-
-/// scoped shared trampoline materialised lazily on first use.  PyPy
-/// builds the four kinds (fixed/var/str/unicode) at `setup_once`; pyre
-/// starts with the fixed-size kind which is the only `dynasm_nursery_slowpath`
-/// caller in the x86 emit path.
+/// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
+/// pure builder.  Caching/ownership is the caller's responsibility:
+/// `DynasmBackend::ensure_malloc_slowpath_fixed` (`runner.rs`) stores
+/// the resulting address in the backend's `malloc_slowpath_fixed`
+/// field, matching PyPy's `self.malloc_slowpath` attribute on
+/// `Assembler386`.
 ///
 /// **Calling convention (matches PyPy line 233-243):**
 /// - Entry: `rbp` = jitframe, `rcx` = old `nursery_head`,
@@ -209,37 +210,11 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// already spilled any live value out of both before the call via
 /// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
 ///
-/// Per-CPU storage matches PyPy's `_build_malloc_slowpath`
-/// (`x86/assembler.py:231`), which is materialised on each CPU
-/// instance at `setup_once` with that CPU's `propagate_exception_descr`
-/// baked in.  Pyre keys by `Arc::as_ptr(cpu_handle)` so two CPU
-/// instances in the same process — common in tests, possible if a
-/// hosting runtime swaps backends — receive distinct trampolines and
-/// distinct baked descrs.  Old entries leak when the CPU is dropped;
-/// matches PyPy's `asmmemmgr` lifetime where the slowpath buffer
-/// outlives the assembler.
-type MallocTrampolineCache =
-    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<std::sync::OnceLock<usize>>>>;
-static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<MallocTrampolineCache> =
-    std::sync::OnceLock::new();
-
-pub(crate) fn malloc_slowpath_fixed_addr(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
-    let cpu_id = std::sync::Arc::as_ptr(cpu_handle) as usize;
-    let cache = MALLOC_SLOWPATH_FIXED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    // Hold the lock just long enough to look up or insert a fresh
-    // `OnceLock` for this CPU; release before calling the builder so
-    // a concurrent compile on another CPU is not blocked.
-    let slot = {
-        let mut map = cache.lock().unwrap();
-        map.entry(cpu_id)
-            .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new()))
-            .clone()
-    };
-    *slot.get_or_init(|| build_malloc_slowpath_fixed(cpu_handle))
-}
-
-fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
+/// `propagate_exception_descr` is read from `cpu_handle` and baked
+/// as an i64 immediate in the OOM branch.  Caller must guarantee the
+/// descr is installed (`MetaInterp::finish_setup`, `pyjitpl.py:2283`)
+/// before invoking this builder; the build asserts otherwise.
+pub(crate) fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
@@ -352,9 +327,9 @@ fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHandle) -> usi
     // and JMPs to the per-CPU `propagate_exception_path` which the
     // setup-time builder materialised alongside the slowpath.
     //
-    // Pyre matches that lifetime: this trampoline is materialised
-    // per-CPU (keyed by `Arc::as_ptr(cpu_handle)`) and the descr
-    // pointer is read directly from the CPU's
+    // Pyre matches that lifetime: this trampoline is materialised once
+    // per `DynasmBackend` and stored in its `malloc_slowpath_fixed`
+    // field.  The descr pointer is read directly from the CPU's
     // `descr_ptrs().propagate_exception_descr` and baked as a 64-bit
     // immediate.  `compile_loop` always runs after
     // `MetaInterp::finish_setup` installs the descr, so the build
@@ -676,6 +651,12 @@ pub struct Assembler386<'a> {
     /// machine-code buffer* (i.e. pre-`rawstart`); `patch_stack_checks`
     /// adds `rawstart` to obtain the absolute address.
     frame_depth_to_patch: Vec<usize>,
+    /// `x86/assembler.py:63` `self.malloc_slowpath` parity — entry
+    /// pointer of the per-CPU fixed-size malloc slowpath helper,
+    /// resolved by `DynasmBackend::ensure_malloc_slowpath_fixed`
+    /// and passed in at construction time so the emit path bakes
+    /// it as a 64-bit immediate without re-touching the backend.
+    malloc_slowpath_fixed: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -765,6 +746,7 @@ impl<'a> Assembler386<'a> {
         classptr_to_subclass_range: HashMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
+        malloc_slowpath_fixed: usize,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -808,6 +790,7 @@ impl<'a> Assembler386<'a> {
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
+            malloc_slowpath_fixed,
         }
     }
 
@@ -1818,8 +1801,8 @@ impl<'a> Assembler386<'a> {
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     /// Thin wrapper around the free-fn `emit_call_footer_raw` so the
-    /// process-shared malloc trampoline can emit byte-identical
-    /// epilogue sequences when exiting through `propagate_exception_descr`.
+    /// backend-owned malloc trampoline can emit byte-identical epilogue
+    /// sequences when exiting through `propagate_exception_descr`.
     fn _call_footer(&mut self) {
         emit_call_footer_raw(&mut self.mc);
     }
@@ -7325,7 +7308,7 @@ impl<'a> Assembler386<'a> {
         } else {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
-        let helper_addr = malloc_slowpath_fixed_addr(&self.cpu_handle) as i64;
+        let helper_addr = self.malloc_slowpath_fixed as i64;
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD helper_addr
             ; call rax
