@@ -5878,6 +5878,11 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(bool_value),
+                            scratch_truth,
+                        );
                         // BOOL family retirement: emit the lowered
                         // `residual_call_r_i` Insn directly here via the
                         // `(Ref) → Int` shape constructor.  Graph carries
@@ -5964,6 +5969,11 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            Some(bool_value),
+                            scratch_truth,
+                        );
                         // Task #48 micro-slice 5: BOOL family
                         // retirement (sibling of the PopJumpIfFalse
                         // closure above) — same `(Ref) → Int` shape
