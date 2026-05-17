@@ -5653,24 +5653,19 @@ fn emit_attached_loop_dispatch(
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
     emit_call_footer_shadowstack(builder, ptr_type);
+    // `call_conv` here is the body's Tail conv (callers pass
+    // `body_call_conv`).  Both this body and the target body were
+    // compiled with `CallConv::Tail`, so `return_call_indirect`
+    // replaces the current frame with the callee's — the cranelift
+    // analogue of `assembler.py:2456-2462 closing_jump`'s raw
+    // `JMP imm(target)`.
     let mut target_sig = Signature::new(call_conv);
     target_sig.params.push(AbiParam::new(ptr_type));
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
-    // Investigation note (Slice X2-step4 attempt): a true `JMP
-    // imm(target)` tail call requires both functions to use
-    // `isa::CallConv::Tail`; switching the outer signature broke host
-    // callers (Tail clobbers AppleAarch64 callee-saves), so we use a
-    // regular `call_indirect + return` here while the trampoline-body
-    // split is designed.  Self-jump traces would push one frame per
-    // iteration — bench `raise_catch_loop` (~1M iters) tolerates this;
-    // `fannkuch` (~32M JUMP fires) is the canary that exposes the
-    // overflow.
-    let target_call = builder
+    builder
         .ins()
-        .call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
-    let result_jf = builder.inst_results(target_call)[0];
-    builder.ins().return_(&[result_jf]);
+        .return_call_indirect(target_sig_ref, target_code_ptr, &[jf_ptr]);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -5760,19 +5755,17 @@ fn emit_guard_exit(
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
 
-    // Slice X2-step4 dispatch is gated off until per-target argloc
-    // matching is in place.  `info.external_jump_ll_loop_code_addr`
-    // would let us tail-call the target loop's entry point, but pyre's
-    // `LoopTargetDescr.ll_loop_code` points at the function entry — its
-    // preamble decodes inputs from positions 0..preamble_arity, while
-    // a JUMP from a peeled-loop body exits with body_arity outputs at
-    // positions 0..body_arity.  Empirical: enabling the dispatch with
-    // either `call_indirect + return` or `return_call_indirect`
-    // produces RecursionError on raise_catch_loop and indefinite loops
-    // on fannkuch/nbody (the latter allocates ~26MB/s suggesting the
-    // re-entered loop spins on stale induction state).  Subsequent
-    // slices (#114, #113) add the runtime arity gate + tail-call
-    // infrastructure before re-enabling.
+    // `assembler.py:2456-2462 closing_jump` parity is staged but not
+    // yet enabled at this call site.  `emit_attached_loop_dispatch`
+    // tail-calls the target body via `return_call_indirect` (the
+    // cranelift analogue of `JMP imm(target)`), but enabling it
+    // empirically leaks ~12 bytes of OS stack per fired tail call on
+    // aarch64 — `raise_catch_loop` (1M iterations) hits the 768 KiB
+    // budget after ~61 k tail calls and surfaces `RecursionError`.
+    // Cranelift's `emit_return_call_common_sequence` does pop the
+    // setup_area and fixed_frame_storage, so the leak is either in
+    // cranelift's aarch64 backend or in our wrapper/body call_conv
+    // interaction.  Slice X2-step4b will diagnose.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
