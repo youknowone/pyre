@@ -3709,6 +3709,13 @@ pub struct ResumeGuardCopiedDescr {
     /// copies of a single donor (optimizer.py:691 / optimizeopt/mod.rs)
     /// do not clobber each other's op indices.
     source_op_index: UnsafeCell<Option<usize>>,
+    /// Pyre-only per-emission slot: GC-root classification for force-
+    /// token producer slots.  PyPy bakes the equivalent GC map into
+    /// machine code via `assembler.py:write_failure_recovery_description`
+    /// per emission; cranelift has no inline encoding so the slot list
+    /// lives on the descr.  Same per-emission scoping as
+    /// `source_op_index` / `rd_locs` — owned per copied descr.
+    force_token_slots: UnsafeCell<Vec<usize>>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3762,6 +3769,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
+            force_token_slots: UnsafeCell::new(Vec::new()),
         }))
     }
 }
@@ -3933,6 +3941,19 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
+    /// Per-emission `force_token_slots` (see field comment).  Owned
+    /// per copied descr so each emission's GC-root classification
+    /// stays distinct — PyPy bakes the equivalent map inline per
+    /// emission via `assembler.py:write_failure_recovery_description`,
+    /// no sharing through `prev`.
+    fn force_token_slots(&self) -> Vec<usize> {
+        unsafe { (&*self.force_token_slots.get()).clone() }
+    }
+    fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        unsafe { *self.force_token_slots.get() = slots };
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -3979,6 +4000,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
+                force_token_slots: UnsafeCell::new(Vec::new()),
             },
         }))
     }
@@ -4093,6 +4115,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         self.inner.set_source_op_index(source_op_index);
     }
+    fn force_token_slots(&self) -> Vec<usize> {
+        self.inner.force_token_slots()
+    }
+    fn set_force_token_slots(&self, slots: Vec<usize>) {
+        self.inner.set_force_token_slots(slots);
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4133,6 +4161,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
+        force_token_slots: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -4165,6 +4194,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
+            force_token_slots: UnsafeCell::new(Vec::new()),
         },
     })
 }

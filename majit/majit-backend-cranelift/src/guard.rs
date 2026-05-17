@@ -735,35 +735,33 @@ impl CraneliftFailDescr {
             .and_then(|fd| fd.source_op_index())
     }
 
-    /// Forward the force-token slot list to the meta-side
-    /// `ResumeGuardDescr` slot (Slice 7-Tβ7).  `ResumeGuardDescr::
-    /// set_force_token_slots` sorts+dedups the vector so the stored
-    /// list satisfies `binary_search` (used by `is_force_token_slot`).
-    /// When the meta_descr is absent or is not a `ResumeGuardDescr`
-    /// (synthetic FINISH / external-JUMP descrs whose meta is a
-    /// non-resume class), the write is silently discarded — those
-    /// descrs never produce force tokens.
+    /// Forward the force-token slot list to the meta-side per-emission
+    /// slot (Slice 7-Tβ7).  Per-emission classification matches PyPy's
+    /// inline GC map encoded per emission in
+    /// `assembler.py:write_failure_recovery_description` — no sharing
+    /// through `prev`.  Routed through the `FailDescr` trait so
+    /// `ResumeGuardDescr` and `ResumeGuardCopiedDescr` each receive
+    /// into their own slot; a downcast-to-`ResumeGuardDescr`-only path
+    /// (Slice 7-Tβ7 original) silently dropped writes whenever a
+    /// copied guard reached codegen, blanking its GC classification.
+    /// Implementations sort+dedup so the stored list satisfies the
+    /// `binary_search` invariant in `is_force_token_slot`.
     pub fn set_force_token_slots(&self, slots: Vec<usize>) {
-        if let Some(rgd) = self
-            .meta_descr
-            .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        {
-            rgd.set_force_token_slots(slots);
+        if let Some(fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_force_token_slots(slots);
         }
     }
 
     #[inline]
-    /// Read the force-token slot list from the meta-side
-    /// `ResumeGuardDescr` slot (Slice 7-Tβ7).  Returns `&[]` when
-    /// meta_descr is absent or is not a `ResumeGuardDescr`.
-    pub fn force_token_slots_view(&self) -> &[usize] {
+    /// Read the force-token slot list from the meta-side per-emission
+    /// slot (Slice 7-Tβ7).  Returns an empty `Vec` when meta_descr is
+    /// absent or its `FailDescr::force_token_slots` is the trait
+    /// default.
+    pub fn force_token_slots_view(&self) -> Vec<usize> {
         self.meta_descr
             .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            .map_or(&[], |rgd| rgd.force_token_slots())
+            .and_then(|d| d.as_fail_descr())
+            .map_or(Vec::new(), |fd| fd.force_token_slots())
     }
 
     /// Forward the per-trace `CompiledTraceInfo` publish to the meta-
@@ -794,14 +792,12 @@ impl CraneliftFailDescr {
         // an optimizer-stamped `ResumeGuardDescr`, its types are the
         // canonical view that downstream GC root classification depends
         // on (it may differ from the construction-time backend list).
-        Self::gc_map_for_types(
-            <Self as FailDescr>::fail_arg_types(self),
-            self.force_token_slots_view(),
-        )
+        let slots = self.force_token_slots_view();
+        Self::gc_map_for_types(<Self as FailDescr>::fail_arg_types(self), &slots)
     }
 
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
-        // Vector stored in `ResumeGuardDescr::force_token_slots` is
+        // Vector stored in the meta-side per-emission slot is
         // sorted+deduped at set time, preserving the `binary_search`
         // invariant.
         self.force_token_slots_view().binary_search(&slot).is_ok()

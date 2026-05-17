@@ -1842,6 +1842,15 @@ pub trait FailDescr: Descr {
         Vec::new()
     }
 
+    /// Pyre-only per-emission write of the force-token slot list.
+    /// `assembler.py:write_failure_recovery_description` bakes the
+    /// equivalent GC map into machine code at codegen time per
+    /// emission; the slot list is the cranelift analog and follows
+    /// the same per-emission classification as `rd_locs`
+    /// (`assembler.py:279`).  Default no-op for non-resume FailDescrs.
+    /// Implementations must sort+dedup so consumers can `binary_search`.
+    fn set_force_token_slots(&self, _slots: Vec<usize>) {}
+
     /// Pyre-only per-emission slot: index of the trace op that produced
     /// this guard at codegen.  Classified per-emission alongside
     /// `history.py:132 AbstractFailDescr._attrs_` `rd_locs` /

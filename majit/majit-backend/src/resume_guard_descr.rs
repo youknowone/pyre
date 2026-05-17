@@ -414,6 +414,16 @@ impl FailDescr for ResumeGuardDescr {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
+    fn force_token_slots(&self) -> Vec<usize> {
+        // Safety: single-threaded JIT.
+        unsafe { (&*self.force_token_slots.get()).clone() }
+    }
+    fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        // Safety: single-threaded JIT.
+        unsafe { *self.force_token_slots.get() = slots };
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
