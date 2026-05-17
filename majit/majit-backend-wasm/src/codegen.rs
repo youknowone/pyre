@@ -145,9 +145,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 .map(|fa| fa.as_slice())
                 .unwrap_or(&op.args);
             let fail_arg_types = op
-                .fail_arg_types
-                .as_ref()
-                .cloned()
+                .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
 
             guards.push(GuardExit {
@@ -155,7 +153,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 fail_arg_refs: fail_args.to_vec(),
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
-                meta_descr: op.descr.clone(),
+                meta_descr: op.getdescr(),
             });
             fail_index += 1;
         }

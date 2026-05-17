@@ -13574,9 +13574,7 @@ fn collect_guards(
         // `meta_descr`) before wrapping it in `Arc::new`.
         let external_jump_target: Option<majit_ir::DescrRef> = if is_external_jump {
             Some(
-                op.descr
-                    .as_ref()
-                    .cloned()
+                op.getdescr()
                     .expect("external JUMP must carry a TargetToken descr"),
             )
         } else {
