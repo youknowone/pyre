@@ -1380,6 +1380,24 @@ fn record_graph_op(
     op
 }
 
+/// Phase 4 production-flip bridge: pair a graph dual-write's result
+/// `Variable` with the SSARepr slot the walker assigned in the same
+/// emit.  No-op when `var` is `None` (residual_call with `ResKind::Void`,
+/// non-portal CodeWriter, etc.).
+fn pair_walker_slot(
+    table: &mut Vec<Option<u16>>,
+    var: Option<super::flow::Variable>,
+    walker_slot: u16,
+) {
+    if let Some(v) = var {
+        let idx = v.id.0 as usize;
+        if table.len() <= idx {
+            table.resize(idx + 1, None);
+        }
+        table[idx] = Some(walker_slot);
+    }
+}
+
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py:1898-1906 do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
@@ -5385,13 +5403,11 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
-                        if let Some(var) = boxed {
-                            let idx = var.id.0 as usize;
-                            if walker_slot_for_variable.len() <= idx {
-                                walker_slot_for_variable.resize(idx + 1, None);
-                            }
-                            walker_slot_for_variable[idx] = Some(stack_base + current_depth);
-                        }
+                        pair_walker_slot(
+                            &mut walker_slot_for_variable,
+                            boxed,
+                            stack_base + current_depth,
+                        );
                         let stack_value = boxed
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -5484,6 +5500,7 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
+                            pair_walker_slot(&mut walker_slot_for_variable, loaded, dst_slot);
                             loaded
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph))
