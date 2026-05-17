@@ -8095,7 +8095,7 @@ impl CodeWriter {
                 slots.dedup();
             }
             for &kind in &super::flatten::Kind::ALL {
-                let ssa = alloc_result.num_regs.get(&kind).copied().unwrap_or(0);
+                let ssa = alloc_result.num_regs[kind.index()];
                 let graph = _graph_regallocs[kind.index()].num_colors;
                 if ssa != graph {
                     let ssa_var_count = ssa_slots[kind.index()].len();
@@ -8221,21 +8221,9 @@ impl CodeWriter {
         // step so `JitCode.num_regs_*` reflect the post-regalloc
         // ceiling rather than the pre-regalloc PyFrame-slot range.
         let num_regs = super::assembler::NumRegs {
-            int: alloc_result
-                .num_regs
-                .get(&super::flatten::Kind::Int)
-                .copied()
-                .unwrap_or(0),
-            ref_: alloc_result
-                .num_regs
-                .get(&super::flatten::Kind::Ref)
-                .copied()
-                .unwrap_or(0),
-            float: alloc_result
-                .num_regs
-                .get(&super::flatten::Kind::Float)
-                .copied()
-                .unwrap_or(0),
+            int: alloc_result.num_regs[super::flatten::Kind::Int.index()],
+            ref_: alloc_result.num_regs[super::flatten::Kind::Ref.index()],
+            float: alloc_result.num_regs[super::flatten::Kind::Float.index()],
         };
 
         // codewriter.py:67-72 step 4 — assemble the SSARepr into an

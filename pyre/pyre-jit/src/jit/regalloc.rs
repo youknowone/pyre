@@ -603,8 +603,9 @@ pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usi
 /// counts are tracked separately so the walker→flatten transition
 /// (Task #227) can be quantified before flipping the canonical SSARepr
 /// source.
-pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> HashMap<Kind, usize> {
-    let mut counts: HashMap<Kind, usize> = HashMap::new();
+pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> [usize; 3] {
+    // `[usize; 3]` indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut counts: [usize; 3] = [0; 3];
     for insn in &ssarepr.insns {
         if let Insn::Op { opname, .. } = insn {
             for &kind in &Kind::ALL {
@@ -614,7 +615,7 @@ pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> HashMap<Kind, us
                     Kind::Float => "float_copy",
                 };
                 if opname == prefix {
-                    *counts.entry(kind).or_insert(0) += 1;
+                    counts[kind.index()] += 1;
                     break;
                 }
             }
@@ -658,7 +659,11 @@ pub(super) struct ExternalInputs {
 /// (codewriter.py:62-67).
 pub(super) struct AllocationResult {
     pub rename: HashMap<(Kind, u16), u16>,
-    pub num_regs: HashMap<Kind, u16>,
+    /// Per-kind `max(coloring)+1` indexed by `Kind::index()` per
+    /// [[feedback-no-hashmap-ever]].  Mirrors RPython
+    /// `codewriter.py:62-67 num_regs[kind]` — pyre's `KINDS` array
+    /// of 3 statically-known kinds collapses the dict to `[u16; 3]`.
+    pub num_regs: [u16; 3],
 }
 
 /// Run register allocation on `ssarepr` and produce the rename map
@@ -681,8 +686,11 @@ pub(super) fn allocate_registers(
     cfg_coalesce_pairs: &[(u16, u16)],
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
-    //   regallocs[kind] = perform_register_allocation(graph, kind)`
-    let mut allocators: HashMap<Kind, RegAllocator> = HashMap::new();
+    //   regallocs[kind] = perform_register_allocation(graph, kind)`.
+    // `[RegAllocator; 3]` indexed by `Kind::index()` per
+    // [[feedback-no-hashmap-ever]].
+    let mut allocators: [RegAllocator; 3] =
+        std::array::from_fn(|_| RegAllocator::new());
     for &kind in &Kind::ALL {
         let mut external: Vec<u16> = Vec::new();
         if kind == Kind::Ref {
@@ -712,8 +720,8 @@ pub(super) fn allocate_registers(
         } else {
             &[]
         };
-        let alloc = perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
-        allocators.insert(kind, alloc);
+        allocators[kind.index()] =
+            perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
     }
 
     // flatten.py:88-100 `enforce_input_args` — rotate inputarg colors
@@ -724,14 +732,15 @@ pub(super) fn allocate_registers(
 
     // codewriter.py:62-67 `num_regs = {kind: max(coloring)+1 if coloring else 0}`.
     let mut rename: HashMap<(Kind, u16), u16> = HashMap::new();
-    let mut num_regs: HashMap<Kind, u16> = HashMap::new();
-    for (&kind, alloc) in allocators.iter() {
+    let mut num_regs: [u16; 3] = [0; 3];
+    for &kind in &Kind::ALL {
+        let alloc = &allocators[kind.index()];
         for (&pre, &post) in alloc.coloring.iter() {
             if pre != post {
                 rename.insert((kind, pre), post);
             }
         }
-        num_regs.insert(kind, alloc.find_num_colors());
+        num_regs[kind.index()] = alloc.find_num_colors();
     }
     AllocationResult { rename, num_regs }
 }
@@ -760,13 +769,11 @@ pub(super) fn allocate_registers(
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
 fn enforce_input_args(
-    allocators: &mut HashMap<Kind, RegAllocator>,
+    allocators: &mut [RegAllocator; 3],
     nlocals: usize,
     inputs: &ExternalInputs,
 ) {
-    let alloc = allocators
-        .get_mut(&Kind::Ref)
-        .expect("Ref allocator must exist");
+    let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
     // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
     // rotated into fixed colors. The decoder consults
@@ -1480,8 +1487,8 @@ mod tests {
             "temp 100 reuses local 0's color (local dies before temp's def)"
         );
         assert_eq!(
-            result.num_regs.get(&Kind::Ref).copied(),
-            Some(1),
+            result.num_regs[Kind::Ref.index()],
+            1,
             "single color for the disjoint live ranges"
         );
     }
@@ -1510,9 +1517,9 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
-        assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
-        assert_eq!(result.num_regs.get(&Kind::Int).copied(), Some(1));
-        assert_eq!(result.num_regs.get(&Kind::Float).copied(), Some(0));
+        assert_eq!(result.num_regs[Kind::Ref.index()], 3);
+        assert_eq!(result.num_regs[Kind::Int.index()], 1);
+        assert_eq!(result.num_regs[Kind::Float.index()], 0);
     }
 
     #[test]
@@ -1566,8 +1573,8 @@ mod tests {
             new5, new6
         );
         assert_eq!(
-            result.num_regs.get(&Kind::Ref).copied(),
-            Some(1),
+            result.num_regs[Kind::Ref.index()],
+            1,
             "after coalesce only one Ref color is needed"
         );
     }
@@ -1748,8 +1755,8 @@ mod tests {
             .insns
             .push(op_use("ref_return", vec![reg(Kind::Ref, 1)]));
         let counts = count_ssa_copy_ops_per_kind(&ssarepr);
-        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 2);
-        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 1);
-        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+        assert_eq!(counts[Kind::Int.index()], 2);
+        assert_eq!(counts[Kind::Ref.index()], 1);
+        assert_eq!(counts[Kind::Float.index()], 0);
     }
 }
