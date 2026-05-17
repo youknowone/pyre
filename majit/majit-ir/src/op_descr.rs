@@ -136,12 +136,20 @@ impl Op {
 
     /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
     /// Returns an owned `Vec` copy of the fail_args slot — equivalent
-    /// to RPython's `self._fail_args[:]`.
+    /// to RPython's `self._fail_args[:]`, which raises `TypeError:
+    /// 'NoneType' object is not subscriptable` when `_fail_args` is
+    /// `None`.  Mirror that fail-loud behaviour here so a missing-
+    /// fail-args bug surfaces at the call site rather than returning
+    /// a silently-empty vector.
     pub fn getfailargs_copy(&self) -> Vec<crate::resoperation::OpRef> {
-        match &self.fail_args {
-            Some(fa) => fa.iter().copied().collect(),
-            None => Vec::new(),
-        }
+        let fa = self.fail_args.as_ref().unwrap_or_else(|| {
+            panic!(
+                "getfailargs_copy on op with fail_args=None — RPython \
+                 `self._fail_args[:]` raises TypeError; pyre matches the \
+                 fail-loud shape (resoperation.py:492)"
+            )
+        });
+        fa.iter().copied().collect()
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
