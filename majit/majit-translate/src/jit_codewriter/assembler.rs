@@ -606,9 +606,23 @@ impl Assembler {
             }
 
             FlatOp::Switch { value, targets } => {
-                // Parity expectation: `value.kind == RegKind::Int`
-                // (`flatten.py:276` `assert kind == 'int'`).  Same
-                // upstream-gap caveat as `GotoIfNot.cond` above.
+                // `flatten.py:275-276` — `kind = getkind(block.exitswitch.
+                // concretetype); assert kind == 'int'`.  The production
+                // path goes through `flatten.rs::insert_exits` (which
+                // already asserts `kind == 'i'` before constructing
+                // `FlatOp::Switch`), so a non-Int `value.kind` here can
+                // only mean a test fixture built `FlatOp::Switch`
+                // directly with the wrong kind.  Fail loud — the
+                // `switch/id` opcode reads the int register file, so a
+                // Ref / Float index byte would silently address the
+                // wrong slot at runtime.
+                assert_eq!(
+                    value.kind,
+                    RegKind::Int,
+                    "FlatOp::Switch.value must be RegKind::Int \
+                     (flatten.py:275-276 `assert kind == 'int'`); got {:?}",
+                    value.kind,
+                );
                 let descr_idx = self.emit_pending_switch_descr(targets.clone());
                 let opnum = self.get_opnum("switch/id");
                 state.startpoints.insert(state.code.len());

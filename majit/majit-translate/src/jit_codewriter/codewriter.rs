@@ -424,14 +424,18 @@ impl CodeWriter {
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
-        let regallocs = crate::regalloc::perform_all_register_allocations(&rewritten.graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&rewritten.graph);
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
         // Each `ValueId`'s backing `Variable.concretetype` is the
         // kind source after the merge/hydration steps above; flatten
-        // reads it via `graph.concretetype(v)`.
-        let mut ssarepr = crate::flatten::flatten_graph(&rewritten.graph, &regallocs);
+        // reads it via `graph.concretetype(v)`.  `flatten_graph_mut`
+        // runs `enforce_input_args` first (flatten.py:88-100) so the
+        // startblock inputarg colors land in the dense `0..N` prefix
+        // of each kind, and the rotation persists into the assembler
+        // call below.
+        let mut ssarepr = crate::flatten::flatten_graph_mut(&rewritten.graph, &mut regallocs);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)

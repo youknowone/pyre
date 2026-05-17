@@ -5595,7 +5595,10 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
     // index 1 onto the wrong Variable.  Same correctness concern as
     // the `phi_sources` zip above.
     let exceptblock_args = &graph.block(graph.exceptblock).inputargs;
-    let Some(except_value) = exceptblock_args.get(1).and_then(|arg| graph.value_id_of(arg)) else {
+    let Some(except_value) = exceptblock_args
+        .get(1)
+        .and_then(|arg| graph.value_id_of(arg))
+    else {
         return false;
     };
 

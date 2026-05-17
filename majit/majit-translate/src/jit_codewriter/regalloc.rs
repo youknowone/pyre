@@ -474,6 +474,21 @@ impl RegAllocResult {
     pub fn contains_variable(&self, var: &crate::flowspace::model::Variable) -> bool {
         self.coloring.contains_key(var)
     }
+
+    /// `tool/algo/regalloc.py:138-143 swapcolors(col1, col2)` — swap
+    /// every Variable holding `col1` with `col2` and vice versa.
+    /// Used by `flatten.py:88-100 enforce_input_args` to renumber
+    /// the startblock inputargs into the dense `0..N` prefix of
+    /// each kind's color range.
+    pub fn swapcolors(&mut self, col1: usize, col2: usize) {
+        for color in self.coloring.values_mut() {
+            if *color == col1 {
+                *color = col2;
+            } else if *color == col2 {
+                *color = col1;
+            }
+        }
+    }
 }
 
 // `perform_register_allocation` previously took a

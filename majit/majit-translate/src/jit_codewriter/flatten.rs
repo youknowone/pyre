@@ -364,12 +364,82 @@ pub fn flatten_graph(
     graph: &FunctionGraph,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
+    // Mirrors `flatten.py:81-86 __init__ + flatten_graph()` invocation
+    // order: `enforce_input_args` runs first on a freshly-built
+    // GraphFlattener with `&mut regallocs`.  This signature still takes
+    // `&regallocs` (immutable) for backward compatibility with test
+    // call sites that hand in `&identity_regallocs(...)`; callers that
+    // need the swap to persist into downstream consumers (assembler,
+    // jitcode) must run [`enforce_input_args`] themselves before this
+    // call — see [`flatten_graph_mut`] / `codewriter.rs` for that path.
     let mut flattener = GraphFlattener::new(graph, regallocs, false);
     flattener.enforce_input_args();
     flattener.generate_ssa_form();
     let mut ssarepr = flattener.ssarepr;
     ssarepr.num_values = compute_num_values(graph, &ssarepr.insns);
     ssarepr
+}
+
+/// `flatten_graph` variant that runs the [`enforce_input_args`]
+/// rotation in-place on `regallocs` before flattening — the
+/// orthodox `flatten.py:81 + enforce_input_args` call order with
+/// the swap persisted into the caller's regallocs.  Pyre's
+/// codewriter routes through this so the assembler / jitcode
+/// downstream see the dense `0..N` startblock-inputarg color
+/// numbering.
+pub fn flatten_graph_mut(
+    graph: &FunctionGraph,
+    regallocs: &mut HashMap<RegKind, RegAllocResult>,
+) -> SSARepr {
+    enforce_input_args(graph, regallocs);
+    flatten_graph(graph, regallocs)
+}
+
+/// `flatten.py:88-100 enforce_input_args(self)` — free-function port
+/// that mutates `regallocs` in place.
+///
+/// **Rust-language adaptation** — RPython has `regallocs` as a dict
+/// of mutable `RegAllocator` instances, so `self.regallocs[kind].
+/// swapcolors(realcol, curcol)` mutates the value through dict
+/// indexing without re-borrowing the dict.  Rust's borrow checker
+/// forbids the equivalent `self.regallocs.get_mut(&kind)` call from
+/// the middle of `flatten_graph` because `GraphFlattener` carries a
+/// shared borrow `&HashMap<…>` for every other read site (lookup
+/// kind, kind-color, etc.).  Splitting the mutation out into a free
+/// function that runs **before** the GraphFlattener is constructed
+/// preserves the upstream method-body shape (the function body below
+/// is identical to flatten.py:88-100) while honoring Rust's
+/// aliasing rules.  Call this from the codewriter immediately after
+/// `perform_all_register_allocations`, before [`flatten_graph`].
+pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocResult>) {
+    let inputargs = graph.block(graph.startblock).inputarg_value_ids(graph);
+    let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
+    for v in inputargs {
+        let Some((kind, curcol)) = lookup_kind_color(v, graph, regallocs) else {
+            continue;
+        };
+        let realcol = numkinds.get(&kind).copied().unwrap_or(0);
+        numkinds.insert(kind, realcol + 1);
+        if curcol != realcol {
+            // `flatten.py:99 assert curcol > realcol` — startblock
+            // inputargs cannot already occupy a color smaller than
+            // their own slot index (the regalloc would have packed
+            // them tighter).
+            assert!(
+                curcol > realcol,
+                "enforce_input_args: inputarg {v:?} (kind {kind:?}) has \
+                 curcol={curcol} < realcol={realcol} — regalloc ordering \
+                 violates the dense `0..N` invariant",
+            );
+            regallocs
+                .get_mut(&kind)
+                .expect(
+                    "enforce_input_args: kind class present in lookup must \
+                         remain present in regallocs",
+                )
+                .swapcolors(realcol, curcol);
+        }
+    }
 }
 
 /// Backward-compatible alias for [`flatten_graph`].  Older callers still
@@ -568,18 +638,19 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:88-100 def enforce_input_args(self)`.
+    /// `flatten.py:88-100 def enforce_input_args(self)` — method
+    /// shell that asserts the rotation already happened.
     ///
-    /// Swaps colors so the startblock inputargs occupy colors `0..N`
-    /// per kind, in inputarg order — the calling-convention contract
-    /// for entry into a JitCode.  Pyre's [`crate::regalloc::RegAllocResult`]
-    /// does not yet expose `swapcolors`, so this routine walks the
-    /// inputargs and merely tallies the per-kind slot count to mirror
-    /// the upstream loop shape.  The actual color rotation is a TODO
-    /// alongside the `value_kinds` removal in Phase 3 of
-    /// `~/.claude/plans/delightful-cooking-salamander.md`; until then
-    /// downstream consumers must continue to derive the calling-
-    /// convention slot from `regallocs[kind].coloring`.
+    /// The actual color-swapping body lives in the free function
+    /// [`enforce_input_args`] (module-level) because the swap needs
+    /// `&mut regallocs` while every other GraphFlattener accessor
+    /// re-borrows `regallocs` immutably — see the free function's
+    /// doc for the Rust-language adaptation rationale.  Production
+    /// callers route through [`flatten_graph`], which calls the free
+    /// function *before* constructing the GraphFlattener, so by the
+    /// time this method runs the rotation is complete and the
+    /// invariant below holds; the assertion catches direct callers
+    /// that forgot the pre-pass.
     pub fn enforce_input_args(&mut self) {
         let inputargs = self
             .graph
@@ -587,13 +658,19 @@ impl<'a> GraphFlattener<'a> {
             .inputarg_value_ids(self.graph);
         let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
         for v in inputargs {
-            let Some((kind, _curcol)) = lookup_kind_color(v, self.graph, self.regallocs) else {
+            let Some((kind, curcol)) = lookup_kind_color(v, self.graph, self.regallocs) else {
                 continue;
             };
             let realcol = numkinds.get(&kind).copied().unwrap_or(0);
             numkinds.insert(kind, realcol + 1);
-            // `if curcol != realcol: self.regallocs[kind].swapcolors(realcol, curcol)`
-            // — port deferred until `RegAllocResult::swapcolors` lands.
+            debug_assert_eq!(
+                curcol, realcol,
+                "GraphFlattener::enforce_input_args: startblock inputarg {v:?} \
+                 (kind {kind:?}) still has curcol={curcol} ≠ realcol={realcol}; \
+                 caller must invoke the free-function pre-pass \
+                 `crate::flatten::enforce_input_args(graph, &mut regallocs)` \
+                 before constructing the GraphFlattener",
+            );
         }
     }
 
