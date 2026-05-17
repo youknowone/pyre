@@ -3750,6 +3750,25 @@ impl CodeWriter {
             () => {{
                 let insn = Insn::op("abort_permanent", Vec::new());
                 push_walker_emit(&current_block, insn);
+                // Graph-side dual-write so the canonical `flatten_graph`
+                // driver sees the same `abort_permanent` SpaceOp via
+                // passthrough.  Without this dual-write, canonical
+                // would omit the runtime bail-out marker that pyre's
+                // walker emits inline — production-flip-unsafe (the
+                // compiled trace would continue past unsupported
+                // opcodes instead of falling back to the interpreter).
+                // `abort_permanent` is pyre-specific (no upstream
+                // RPython counterpart); use `offset = -1` matching
+                // `emit_vsd!`'s synthetic-op convention since
+                // `abort_permanent` is an emission-time bail-out
+                // marker, not tied to a single Python bytecode PC.
+                record_graph_op(
+                    &current_block.block(),
+                    "abort_permanent",
+                    Vec::new(),
+                    None,
+                    -1,
+                );
                 // pyre-only dead-end: the block has no successor in
                 // the shadow graph. Leaving `needs_fallthrough = false`
                 // blocks the auto-fallthrough at the next

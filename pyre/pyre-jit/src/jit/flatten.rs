@@ -693,8 +693,24 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// pyre's runtime exception model bakes type into per-subclass
 /// `W_TypeObject` (see [[project-exception-per-kind-pytype]]) so the
 /// `getfield_gc_r` shape is not required.
+///
+/// `getattr` — emitted by `codewriter.rs::emit_frontend_getattr`
+/// mirroring `flowcontext.py:862-867 op.getattr(w_obj, w_attributename)`.
+/// Pyre's walker pairs every `emit_frontend_getattr` callsite with an
+/// inline `emit_abort_permanent!` (see codewriter.rs:6867 LoadAttr
+/// arm) because pyre's runtime cannot compile attribute lookups; the
+/// trace bails out to the interpreter before any consumer reads the
+/// HLOp's result Variable.  After the `emit_abort_permanent!` graph
+/// dual-write (codewriter.rs:3756), canonical's per-block iteration
+/// already emits the `abort_permanent` Insn that terminates the
+/// compiled trace — emitting a literal `getattr` Insn would be both
+/// unreachable at runtime AND undispatchable by the assembler.
+/// Upstream `rclass.py:838 rtype_getattr` would rewrite this to
+/// `getfield_gc_X(v, descr)` after rtyping; pyre's lack of rtyping
+/// keeps the HLOp unmodified, so eliding it under lowering_ctx is the
+/// production-safe path.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
-    matches!(opname, "type")
+    matches!(opname, "type" | "getattr")
 }
 
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
