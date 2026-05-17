@@ -5437,33 +5437,25 @@ impl CodeWriter {
                         // (no separate fresh placeholder); the call is
                         // recorded only when the symbolic stack is
                         // about to consume its result Variable.
-                        // `frontend_constant_flow_value` recognises a
-                        // small set of constants (e.g. `None`) directly
-                        // as Ref-kind FlowValues — for those, the
-                        // upstream optimizer does not record a
-                        // residual_call at all (jtransform.py inlines
-                        // the constant), so skip the graph dual-write
-                        // to avoid an orphan call result.
-                        let raw_value = code
-                            .constants
-                            .get(idx)
-                            .and_then(frontend_constant_flow_value);
-                        let recognised_ref = match &raw_value {
-                            Some(super::flow::FlowValue::Constant(c))
-                                if c.kind == Some(Kind::Ref) =>
-                            {
-                                Some(super::flow::FlowValue::Constant(c.clone()))
-                            }
-                            Some(super::flow::FlowValue::Variable(v))
-                                if v.kind == Some(Kind::Ref) =>
-                            {
-                                Some(super::flow::FlowValue::Variable(v.clone()))
-                            }
-                            _ => None,
-                        };
-                        let value = if let Some(constant_value) = recognised_ref {
-                            constant_value
-                        } else if let Some(pycode_var) = pycode_graph_var {
+                        //
+                        // Walker emits the inline `residual_call_ir_r`
+                        // (line 5424) unconditionally for every
+                        // LoadConst regardless of constant shape — the
+                        // runtime must materialize the value into the
+                        // dst_slot register either way.  The graph
+                        // dual-write must mirror that emit so the
+                        // canonical `flatten_graph` driver sees the
+                        // same residual_call_ir_r count.  Previously
+                        // skipped for "recognised Ref" constants (None
+                        // / Bool / Str) under the rationale that
+                        // upstream `jtransform.py` inlines the
+                        // constant; but pyre's pipeline doesn't run
+                        // that inlining pass, so skipping the
+                        // dual-write while still emitting inline
+                        // created a structural divergence visible via
+                        // `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
+                        // (residual_call_ir_r walker > canonical).
+                        let value = if let Some(pycode_var) = pycode_graph_var {
                             let loaded = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
@@ -5480,7 +5472,12 @@ impl CodeWriter {
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph))
                         } else {
-                            // is_portal=false: no graph dual-write at all.
+                            // is_portal=false: pycode_var is None per
+                            // `emit_vable_getfield_ref!` gate above.
+                            // Non-portal CodeWriters' graphs would
+                            // reference a non-existent `pycode_var`
+                            // input — fall back to a fresh placeholder
+                            // matching the prior shape.
                             fresh_ref_value(&mut graph)
                         };
                         current_state.stack.push(value);
