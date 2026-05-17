@@ -2557,19 +2557,25 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     let jf_force_descr = unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) };
     unsafe { *jf_ptr.add(JF_DESCR_OFS as usize / 8) = jf_force_descr };
     let jf_gcref = GcRef(jf_ptr as usize);
-    let descr_ptr = jf_force_descr as usize as *const CraneliftFailDescr;
     assert!(
-        !descr_ptr.is_null(),
+        jf_force_descr != 0,
         "force_token_to_dead_frame: jf_force_descr is null"
     );
-    let fail_descr: Arc<CraneliftFailDescr> = unsafe {
-        Arc::increment_strong_count(descr_ptr);
-        Arc::from_raw(descr_ptr)
-    };
-    // Register jf_gcref as GC root so moving GC can update the
-    // pointer. Shadow stack keeps the object alive, but does NOT
-    // update this separate copy of jf_gcref.
-    let fail_descr: DescrRef = fail_descr;
+    // Slice 7-Tβ14e: `jf_force_descr` carries the metainterp
+    // `AbstractFailDescr` Arc's data pointer (`history.py:125`
+    // identity).  Recover the live DescrRef from the active backend's
+    // registry — the JIT-baked address must round-trip through
+    // `register_fail_descrs` for this lookup to succeed.
+    let fail_descr = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|reg| reg.lock().ok().and_then(|m| m.get(&(jf_force_descr as usize)).cloned()))
+        })
+        .expect(
+            "force_token_to_dead_frame: jf_force_descr address not in \
+             fail_descr_registry — every JIT-baked descr must be registered",
+        );
     deadframe_from_jitframe(jf_gcref, fail_descr, None)
 }
 
@@ -2948,11 +2954,33 @@ fn call_assembler_guard_failure_inner(
 
     let target = unsafe { &*fast_lookup_ca_target(token_number) };
 
+    // Slice 7-Tβ14e: `fail_descr_ptr` is the JIT-baked metainterp
+    // `AbstractFailDescr` Arc's data pointer (`history.py:125`).
+    // Resolve via the active backend's registry — `register_fail_descrs`
+    // dual-keys the table on both backend and meta addresses, so this
+    // lookup succeeds whether the runtime stamps the meta pointer
+    // (post-14e) or the backend wrapper pointer (legacy paths).
+    let fail_descr_owned = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|reg| {
+                    reg.lock()
+                        .ok()
+                        .and_then(|m| m.get(&(fail_descr_ptr as usize)).cloned())
+                })
+        })
+        .expect(
+            "call_assembler helper: fail_descr_ptr not registered in \
+             fail_descr_registry — every JIT-baked descr must round-trip \
+             through register_fail_descrs",
+        );
+    let fail_descr_ref: &dyn FailDescr = as_fd(&fail_descr_owned);
+
     // Fast path: read the attached bridge directly from the fail_descr
-    // pointer (which IS jf_descr from the callee's guard exit). Skip
+    // (which IS jf_descr from the callee's guard exit). Skip
     // fail_count increment when bridge is available, as patched PyPy
     // code jumps to the bridge instead of re-entering the guard helper.
-    let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
         let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
@@ -5420,7 +5448,7 @@ fn emit_cmp_guard_class(
 fn emit_attached_bridge_dispatch(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
-    fail_descr_ptr: i64,
+    bridge_cache_addrs: (usize, usize),
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
 ) {
@@ -5428,14 +5456,16 @@ fn emit_attached_bridge_dispatch(
     // Cranelift cannot patch finalized code, so guard exits do the
     // equivalent descriptor-cache dispatch before returning a deadframe to
     // the caller/interpreter.
-    let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
+    //
     // Slice JJ: bridge code_ptr / frame_depth cells live on the descr
     // as `Box<AtomicUsize>`.  Box gives them a heap-pinned address that
     // survives the descr being moved into `Arc::new(...)`, so the
-    // returned addresses are stable for the descr's lifetime and safe
-    // to bake into machine code as immediates.
-    let (bridge_code_cache_addr, bridge_frame_depth_cache_addr) =
-        fail_descr_bridge_cache_addrs(fail_descr_ref);
+    // addresses are stable for the descr's lifetime and safe to bake
+    // into machine code as immediates.  Slice 7-Tβ14e: the caller pre-
+    // computes the address pair via `fail_descr_bridge_cache_addrs`
+    // and passes it directly, since `jf_descr` now embeds the meta
+    // Arc rather than the backend wrapper that owns the cells.
+    let (bridge_code_cache_addr, bridge_frame_depth_cache_addr) = bridge_cache_addrs;
     let bridge_code_cache_ptr = builder
         .ins()
         .iconst(ptr_type, bridge_code_cache_addr as i64);
@@ -5592,7 +5622,15 @@ fn emit_guard_exit(
         // recovery. Cranelift still has to publish failargs into jf_frame
         // because bridge input locations are frame based, but a bridge hit
         // should skip the deadframe-only gcmap/write-barrier/descr stores.
-        emit_attached_bridge_dispatch(builder, jf_ptr, info.fail_descr_ptr, ptr_type, call_conv);
+        emit_attached_bridge_dispatch(
+            builder,
+            jf_ptr,
+            info.bridge_cache_addrs.expect(
+                "can_have_bridge=true GuardInfo must carry bridge_cache_addrs",
+            ),
+            ptr_type,
+            call_conv,
+        );
     }
 
     // _build_failure_recovery (assembler.py:2102-2105) parity:
@@ -5649,7 +5687,15 @@ fn emit_guard_exit(
     if info.can_have_bridge && info.must_save_exception {
         // Exception guards need the exception payload saved before a bridge
         // sees the frame, so keep their bridge check after recovery stores.
-        emit_attached_bridge_dispatch(builder, jf_ptr, info.fail_descr_ptr, ptr_type, call_conv);
+        emit_attached_bridge_dispatch(
+            builder,
+            jf_ptr,
+            info.bridge_cache_addrs.expect(
+                "can_have_bridge=true GuardInfo must carry bridge_cache_addrs",
+            ),
+            ptr_type,
+            call_conv,
+        );
     }
     builder
         .ins()
@@ -6056,8 +6102,19 @@ fn find_fail_descr_by_ptr(
     descr_ptr: usize,
 ) -> Option<DescrRef> {
     for descr in fail_descrs {
+        // Slice 7-Tβ14e: the JIT-baked `jf_descr` pointer is the meta
+        // `AbstractFailDescr` Arc's data pointer (`history.py:125`
+        // identity).  Until 7-Tβ14f also flips storage to meta Arcs,
+        // `fail_descrs` holds backend wrappers — try both the backend
+        // Arc addr and its `_backend_wrapper_meta_descr` back-pointer
+        // addr so lookups keyed on either side resolve identically.
         if Arc::as_ptr(descr) as *const () as usize == descr_ptr {
             return Some(descr.clone());
+        }
+        if let Some(meta) = descr._backend_wrapper_meta_descr() {
+            if Arc::as_ptr(&meta) as *const () as usize == descr_ptr {
+                return Some(descr.clone());
+            }
         }
         if let Some(bridge) = fail_descr_bridge_ref(as_fd(descr)).as_ref() {
             if let Some(found) = find_fail_descr_by_ptr(&bridge.fail_descrs, descr_ptr) {
@@ -6332,9 +6389,16 @@ fn run_compiled_code_inner(
         let _ = metainterp_finish;
         (u32::MAX, Some(cl_singleton))
     } else {
-        let descr_ptr = jf_descr_raw as *const CraneliftFailDescr;
-        let fi = unsafe { &*descr_ptr }.fail_index();
+        // Slice 7-Tβ14e: `jf_descr_raw` is the metainterp
+        // `AbstractFailDescr` Arc's data pointer.  Resolve via the
+        // `fail_descrs` collection (which still holds backend wrappers
+        // until 7-Tβ14f — `find_fail_descr_by_ptr` tries both backend
+        // and meta back-pointer addresses).  Derive `fail_index` from
+        // the resolved Arc via the FailDescr trait — never dereference
+        // the raw pointer as a concrete type, since the meta side can
+        // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
         let arc = find_fail_descr_by_ptr(fail_descrs, jf_descr_raw as usize);
+        let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
         // compile.py:665-674 parity: done_with_this_frame_descr is a
         // global singleton — it won't appear in per-trace fail_descrs.
         let arc = arc.or_else(|| {
@@ -6392,10 +6456,20 @@ struct GuardInfo {
     /// gcmap bitmap: bit i set ⇔ fail_arg[i] is Ref type.
     /// allocate_gcmap (gcmap.py:7-18) parity.
     gcmap: u64,
-    /// RPython assembler.py:2126 get_gcref_from_faildescr parity:
-    /// stores Arc::as_ptr(CraneliftFailDescr) as i64.
-    /// The FailDescr GCREF pointer is written to jf_descr on guard exit.
+    /// assembler.py:2126 get_gcref_from_faildescr parity: written to
+    /// jf_descr on guard exit.  Slice 7-Tβ14e: this is the metainterp
+    /// `AbstractFailDescr` Arc's data pointer (matching `history.py:125`
+    /// identity) for non-FINISH guards, or the FINISH singleton's
+    /// `Arc` address for FINISH guards.
     fail_descr_ptr: i64,
+    /// Slice 7-Tβ14e: per-emission bridge cache cell addresses
+    /// (`(code_ptr, frame_depth)`) baked into machine code as
+    /// immediates by `emit_attached_bridge_dispatch`.  Pre-computed at
+    /// codegen time via `fail_descr_bridge_cache_addrs` so the dispatch
+    /// emitter no longer needs to deref a `*const CraneliftFailDescr`
+    /// from `fail_descr_ptr` (which now points at the meta Arc, not
+    /// the backend wrapper).  `Some` ⇔ `can_have_bridge`.
+    bridge_cache_addrs: Option<(usize, usize)>,
     /// vector_ext.py:119 _update_at_exit: accumulation metadata for vector
     /// reduction at guard exit. Each entry maps a fail_arg slot to its
     /// vector accumulator variable and reduction operator.
@@ -13337,7 +13411,31 @@ fn collect_guards(
                 attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
             }
         } else {
-            Arc::as_ptr(&descr) as i64
+            // Slice 7-Tβ14e: bake the metainterp `AbstractFailDescr`
+            // Arc's data pointer into `jf_descr` (`history.py:125`
+            // identity).  PyPy's `assembler.py:2126
+            // get_gcref_from_faildescr` writes the same Arc the
+            // metainterp stamped onto `op.descr`; the backend wrapper's
+            // address was a pyre NEW DEVIATION dating from the
+            // split-descr era.  `meta_descr` is always populated after
+            // 7-Tβ14d (either `op.descr` for ResumeGuardDescr or a
+            // synthesised meta for external JUMP / non-Resume guards).
+            let meta = descr.meta_descr.as_ref().expect(
+                "non-FINISH guard descr must carry a meta back-pointer \
+                 after Slice 7-Tβ14d",
+            );
+            Arc::as_ptr(meta) as *const () as i64
+        };
+        // Slice 7-Tβ14e: pre-compute the per-emission bridge cache cell
+        // addresses while we still have the concrete `&CraneliftFailDescr`
+        // handle.  After 14e, `fail_descr_ptr` carries the meta Arc data
+        // pointer (not the wrapper address), so the dispatch emitter can
+        // no longer recover the wrapper by `*const CraneliftFailDescr`
+        // cast — we hand it the cache addresses directly via GuardInfo.
+        let bridge_cache_addrs = if is_guard {
+            Some(fail_descr_bridge_cache_addrs(descr.as_ref()))
+        } else {
+            None
         };
         fail_descrs.push(descr);
         // assembler.py:40-44 must_save_exception parity:
@@ -13354,6 +13452,7 @@ fn collect_guards(
             must_save_exception,
             gcmap,
             fail_descr_ptr,
+            bridge_cache_addrs,
             accum_info,
         });
     }
