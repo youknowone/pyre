@@ -394,7 +394,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("source_op_index", &self.source_op_index_ref())
             .field("trace_id", &self.trace_id)
             .field("fail_arg_types", &self.fail_arg_types)
-            .field("gc_map", &self.gc_map())
+            .field("gc_map", &crate::compiler::fail_descr_gc_map(self))
             .field("is_finish", &<Self as FailDescr>::is_finish(self))
             .field(
                 "external_jump_target",
@@ -417,16 +417,6 @@ unsafe impl Send for CraneliftFailDescr {}
 unsafe impl Sync for CraneliftFailDescr {}
 
 impl CraneliftFailDescr {
-    fn gc_map_for_types(fail_arg_types: &[Type], force_token_slots: &[usize]) -> GcMap {
-        let mut gc_map = GcMap::new();
-        for (slot, tp) in fail_arg_types.iter().enumerate() {
-            if *tp == Type::Ref && !force_token_slots.contains(&slot) {
-                gc_map.set_ref(slot);
-            }
-        }
-        gc_map
-    }
-
     /// Caller responsibility after `Arc::new(descr)`:
     ///   - if `recovery_layout` was previously passed: invoke
     ///     `descr.set_recovery_layout(layout)` to publish the layout
@@ -793,19 +783,10 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// Derive the `GcMap` on demand from `fail_arg_types` and the
-    /// meta-side `ResumeGuardDescr::force_token_slots` slot (Slice
-    /// 7-Tβ7).  Replaces the previous `pub gc_map: GcMap` field
-    /// (Session 5i-cl); upstream `assembler.py:write_failure_recovery_description`
-    /// parity recomputes equivalent bits inline at codegen time.
-    pub fn gc_map(&self) -> GcMap {
-        // Use the forwarded `fail_arg_types()` — when meta_descr carries
-        // an optimizer-stamped `ResumeGuardDescr`, its types are the
-        // canonical view that downstream GC root classification depends
-        // on (it may differ from the construction-time backend list).
-        let slots = self.force_token_slots_view();
-        Self::gc_map_for_types(<Self as FailDescr>::fail_arg_types(self), &slots)
-    }
+    // The inherent `gc_map()` moved to `crate::compiler::fail_descr_gc_map`
+    // (Slice 7-Tβ14a) so the GC-map derivation runs on `&dyn FailDescr`
+    // — `Debug` impl + tests now invoke the free function so the
+    // composite helper can be deleted alongside `CraneliftFailDescr`.
 
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
         // Vector stored in the meta-side per-emission slot is
@@ -848,21 +829,6 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// `as_any` downcast on `meta_descr` to recover the concrete
-    /// `majit_backend::ResumeGuardDescr`.  Used by the cells migrated
-    /// in Slice 7-Tβ6..11 whose accessor needs the concrete type (not
-    /// the `FailDescr` trait surface) — e.g. `bridge_cache_addrs` /
-    /// `store_bridge_caches` are inherent methods on
-    /// `ResumeGuardDescr` rather than trait methods because their
-    /// signature exposes the heap-pinned Box addresses.
-    #[inline]
-    fn meta_resume_guard_descr(&self) -> Option<&majit_backend::ResumeGuardDescr> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-    }
-
     /// Bridge-cell / per-emission accessors dispatch through the
     /// `FailDescr` trait so `ResumeGuardDescr` and
     /// `ResumeGuardCopiedDescr` are both reached without downcasting
@@ -873,44 +839,13 @@ impl CraneliftFailDescr {
         self.meta_descr.as_ref().and_then(|d| d.as_fail_descr())
     }
 
-    pub fn layout(&self) -> FailDescrLayout {
-        // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
-        // Read through the metainterp ResumeGuardDescr Arc gated by
-        // isinstance(descr, ResumeDescr) — single source of truth for
-        // resume-guard descrs; falls back to backend-local fields
-        // otherwise (synthetic FINISH / external-JUMP descrs and
-        // Done*/ExitExc/PropagateException meta descrs that are not
-        // ResumeDescr upstream).
-        let meta_fd = self.meta_resume_fd();
-        let fail_arg_types = <Self as FailDescr>::fail_arg_types(self);
-        let gc_map_local = self.gc_map();
-        let gc_ref_slots = fail_arg_types
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, _)| gc_map_local.is_ref(slot).then_some(slot))
-            .collect();
-        let recovery = self.recovery_layout_ref();
-        let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
-        FailDescrLayout {
-            fail_index: self.fail_index,
-            source_op_index: self.source_op_index_ref(),
-            trace_id: <Self as FailDescr>::trace_id(self),
-            trace_info: self.trace_info_ref(),
-            fail_arg_types: fail_arg_types.to_vec(),
-            is_finish: <Self as FailDescr>::is_finish(self),
-            is_exception_exit: <Self as FailDescr>::is_exit_frame_with_exception(self),
-            gc_ref_slots,
-            force_token_slots: self.force_token_slots_view().to_vec(),
-            recovery_layout: recovery,
-            frame_stack,
-            rd_numb: meta_fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec()),
-            rd_consts: meta_fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec()),
-            rd_virtuals: meta_fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec()),
-            rd_pendingfields: meta_fd
-                .and_then(|fd| fd.rd_pendingfields())
-                .map(|s| s.to_vec()),
-        }
-    }
+    // The inherent `layout()` method moved to `crate::compiler::
+    // fail_descr_layout` (Slice 7-Tβ14a) so the layout pipeline can
+    // run on a bare `DescrRef` after `CraneliftFailDescr` retires —
+    // callers thread the per-trace `fail_index` / `trace_id`
+    // explicitly instead of reading the singleton placeholder values.
+    // The inherent `gc_map()` is the only remaining composite helper;
+    // it stays for `Debug` + test introspection.
 }
 
 impl majit_ir::Descr for CraneliftFailDescr {

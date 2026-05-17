@@ -546,10 +546,16 @@ fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
 }
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
-    frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
-        .map(|jf| jf.fail_descr.layout())
+    let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
+    let descr_ref: DescrRef = jf.fail_descr.clone();
+    // Use the descr's structural `fail_index` / `trace_id` to preserve
+    // pre-7-Tβ14a behavior — deadframe lookups did not have access to
+    // a runtime per-trace position so the descr-internal values flow
+    // through.  For singleton FINISH descrs this means u32::MAX / 0,
+    // matching the prior `descr.layout()` semantics.
+    let fail_index = jf.fail_descr.fail_index;
+    let trace_id = <crate::guard::CraneliftFailDescr as FailDescr>::trace_id(&jf.fail_descr);
+    Some(fail_descr_layout(&descr_ref, fail_index, trace_id))
 }
 
 fn overlay_deadframe_fail_descr(
@@ -5676,7 +5682,7 @@ impl CompiledLoop {
 /// off `CraneliftFailDescr` to take `&dyn FailDescr` so callers can
 /// invoke it on the bare metainterp `DescrRef` after the wrapper is
 /// retired.
-fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
+pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
     let slots = fd.force_token_slots();
     let mut gc_map = GcMap::new();
     for (slot, tp) in fd.fail_arg_types().iter().enumerate() {
@@ -19274,10 +19280,11 @@ mod tests {
             .downcast_ref::<CompiledLoop>()
             .unwrap();
         let descr = &compiled.fail_descrs[0];
-        assert!(!descr.gc_map().is_ref(0));
-        assert!(descr.gc_map().is_ref(1));
-        assert!(!descr.gc_map().is_ref(2));
-        assert!(descr.gc_map().is_ref(3));
+        let gc_map = fail_descr_gc_map(descr.as_ref());
+        assert!(!gc_map.is_ref(0));
+        assert!(gc_map.is_ref(1));
+        assert!(!gc_map.is_ref(2));
+        assert!(gc_map.is_ref(3));
     }
 
     #[test]
