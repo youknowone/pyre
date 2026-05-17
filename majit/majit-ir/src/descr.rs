@@ -1124,6 +1124,19 @@ pub trait LoopTargetDescr: Descr {
     fn is_preamble_target(&self) -> bool;
     fn ll_loop_code(&self) -> usize;
     fn set_ll_loop_code(&self, loop_code: usize);
+    /// `assembler.py:2456-2462 closing_jump` reads `_ll_loop_code`
+    /// at JMP-emit time.  Cranelift needs the *address* of the slot
+    /// (not its value) so the in-code dispatch can load the latest
+    /// entry on every call.  Default impl panics: only
+    /// `LoopTargetDescr` impls backed by an `AtomicUsize` slot can
+    /// support a stable address.
+    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        panic!(
+            "ll_loop_code_ptr requires an AtomicUsize-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
@@ -1142,7 +1155,6 @@ pub trait LoopTargetDescr: Descr {
 
 #[derive(Debug, Default)]
 struct BasicLoopTargetDescrState {
-    ll_loop_code: usize,
     target_arglocs: Vec<TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled at
     /// compile-time once the owning JitCellToken is created.
@@ -1153,6 +1165,15 @@ struct BasicLoopTargetDescrState {
 struct BasicLoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
+    /// `history.py:470` `TargetToken._ll_loop_code` parity: a single
+    /// integer recording the address of the loop's compiled entry
+    /// point.  RPython sets this with a plain `setattr` (atomic w.r.t.
+    /// the GIL); pyre uses `AtomicUsize` so cranelift-emitted in-code
+    /// `closing_jump` dispatch can read it without holding a Mutex.
+    /// Offset of this field is baked into the JIT'd code via
+    /// `loop_target_ll_loop_code_ptr` so a `JMP imm(target)` parity
+    /// instruction can load the latest entry address.
+    ll_loop_code: std::sync::atomic::AtomicUsize,
     state: Mutex<BasicLoopTargetDescrState>,
 }
 
@@ -1161,6 +1182,7 @@ impl BasicLoopTargetDescr {
         Self {
             token_id,
             is_preamble_target,
+            ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(BasicLoopTargetDescrState::default()),
         }
     }
@@ -1194,11 +1216,17 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
     }
 
     fn ll_loop_code(&self) -> usize {
-        self.state.lock().unwrap().ll_loop_code
+        self.ll_loop_code
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn set_ll_loop_code(&self, loop_code: usize) {
-        self.state.lock().unwrap().ll_loop_code = loop_code;
+        self.ll_loop_code
+            .store(loop_code, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.ll_loop_code as *const _
     }
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc> {
