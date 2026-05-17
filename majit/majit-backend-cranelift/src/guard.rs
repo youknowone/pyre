@@ -120,7 +120,7 @@ pub struct BridgeData {
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at construction.
-    pub fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
+    pub fail_descrs: Box<[DescrRef]>,
     /// Number of input arguments the bridge expects.
     /// Set to parent guard's fail_arg count (not optimizer-reduced count)
     /// so execute_bridge passes all parent outputs and indices align.
@@ -569,6 +569,15 @@ impl majit_ir::Descr for CraneliftFailDescr {
         self.meta_descr.as_ref().and_then(|d| d.as_any())
     }
 
+    /// Slice 7-Tβ14d transitional: expose the backend wrapper's
+    /// `meta_descr` back-pointer Arc to `register_fail_descrs` (dual
+    /// addr-keying) and `get_latest_descr_arc_from_deadframe` (meta
+    /// identity per `history.py:125`).  Deleted along with
+    /// `CraneliftFailDescr` in Slice 7-Tβ14f.
+    fn _backend_wrapper_meta_descr(&self) -> Option<DescrRef> {
+        self.meta_descr.clone()
+    }
+
     /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity. Backend
     /// `CraneliftFailDescr` plays the role of upstream's
     /// `ResumeGuardDescr` for guard-failure exits, of the
@@ -927,8 +936,14 @@ impl FailDescr for CraneliftFailDescr {
 pub struct JitFrameDeadFrame {
     /// GcRef pointing to the heap-allocated JitFrame.
     pub jf_gcref: GcRef,
-    /// The fail descriptor for this exit.
-    pub fail_descr: Arc<CraneliftFailDescr>,
+    /// The fail descriptor for this exit.  Stored as `DescrRef`
+    /// (`Arc<dyn Descr>`) so the deadframe carries the same Arc identity
+    /// the metainterp stamps onto `op.descr` — matching PyPy's
+    /// `frame.jf_descr = descr` (llmodel.py:270) line-by-line.  The
+    /// backend wrapper `CraneliftFailDescr` is on its way out; this slot
+    /// already accepts the upcast forwarders so the eventual deletion
+    /// is a pure type substitution.
+    pub fail_descr: DescrRef,
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
@@ -952,7 +967,7 @@ const JF_GUARD_EXC_BYTES: usize = 40;
 impl JitFrameDeadFrame {
     pub fn new(
         jf_gcref: GcRef,
-        fail_descr: Arc<CraneliftFailDescr>,
+        fail_descr: DescrRef,
         latest_descr: Option<DescrRef>,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {

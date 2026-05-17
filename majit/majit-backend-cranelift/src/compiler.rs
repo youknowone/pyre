@@ -139,6 +139,20 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
     }
 }
 
+/// Helper for the `fail_descrs: Box<[DescrRef]>` storage migration
+/// (Slice 7-Tβ14d).  Every entry in a `fail_descrs` collection
+/// implements `FailDescr` by construction (codegen pushes singleton
+/// `Arc<CraneliftFailDescr>` instances upcast to `DescrRef`); this
+/// helper makes the `as_fail_descr()` downcast explicit at every
+/// FailDescr-method callsite so the `Box<[DescrRef]>` field can drive
+/// trait-method dispatch through the metainterp's `ResumeGuardDescr`
+/// (post Slice 7-Tβ14f) without backend-wrapper indirection.
+#[inline]
+fn as_fd(d: &DescrRef) -> &dyn FailDescr {
+    d.as_fail_descr()
+        .expect("fail_descrs entries always implement FailDescr")
+}
+
 fn attached_descr_ptrs_with_fallbacks(
     attached: majit_backend::AttachedDescrPtrs,
 ) -> majit_backend::AttachedDescrPtrs {
@@ -188,7 +202,7 @@ fn attached_descr_ptrs_with_fallbacks(
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
     attachments: &CpuDescrAttachments,
-) -> Option<(majit_ir::DescrRef, Arc<CraneliftFailDescr>)> {
+) -> Option<(majit_ir::DescrRef, DescrRef)> {
     let ptr = jf_descr_raw as usize;
     fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<majit_ir::DescrRef> {
         slot.as_ref().and_then(|arc| {
@@ -222,7 +236,8 @@ fn match_metainterp_finish_descr(
         ),
     ] {
         if let Some(arc) = check(slot, ptr) {
-            return Some((arc, cl_singleton.clone()));
+            let cl: DescrRef = cl_singleton.clone();
+            return Some((arc, cl));
         }
     }
     None
@@ -468,7 +483,7 @@ struct RegisteredLoopTarget {
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
     /// contract (compile.py:183-203 record_loop_or_bridge).  Position
     /// equals `descr.fail_index` by an invariant asserted at construction.
-    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
+    fail_descrs: Box<[DescrRef]>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -512,7 +527,7 @@ struct LoopTargetEntry {
     code_ptr: *const u8,
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
     /// contract (compile.py:183-203 record_loop_or_bridge).
-    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
+    fail_descrs: Box<[DescrRef]>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -548,13 +563,17 @@ fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
     let descr_ref: DescrRef = jf.fail_descr.clone();
+    let fd = jf
+        .fail_descr
+        .as_fail_descr()
+        .expect("JitFrameDeadFrame.fail_descr always implements FailDescr");
     // Use the descr's structural `fail_index` / `trace_id` to preserve
     // pre-7-Tβ14a behavior — deadframe lookups did not have access to
     // a runtime per-trace position so the descr-internal values flow
     // through.  For singleton FINISH descrs this means u32::MAX / 0,
     // matching the prior `descr.layout()` semantics.
-    let fail_index = jf.fail_descr.fail_index;
-    let trace_id = <crate::guard::CraneliftFailDescr as FailDescr>::trace_id(&jf.fail_descr);
+    let fail_index = fd.fail_index();
+    let trace_id = fd.trace_id();
     Some(fail_descr_layout(&descr_ref, fail_index, trace_id))
 }
 
@@ -699,6 +718,8 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
         unsafe { *((jf.jf_gcref.0 + JF_DESCR_OFS as usize) as *mut usize) = descr_ptr };
         jf.fail_descr = overlay_descr;
         return frame;
+        // (overlay_descr is `Arc<CraneliftFailDescr>` which coerces to
+        // `DescrRef` via the unsized-coercion at assignment.)
     }
     // Fallback: return as-is (should not happen after FrameData removal).
     frame
@@ -1610,7 +1631,7 @@ pub(crate) fn recovery_layout_via_callback(
 /// (synthesise the meta + populate rd_numb) is the right response,
 /// not reviving a backend-local cache.
 fn rebuild_state_after_failure_dispatch(
-    fail_descr: &Arc<CraneliftFailDescr>,
+    fail_descr: &DescrRef,
     outputs: &mut Vec<i64>,
     fail_arg_types: &[Type],
     bridge_num_inputs: usize,
@@ -1622,12 +1643,13 @@ fn rebuild_state_after_failure_dispatch(
     let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
     let _ = (fail_arg_types, bridge_num_inputs); // walker path removed
     if !cb(descr_addr, outputs, fail_arg_types, bridge_num_inputs) {
+        let fd = as_fd(fail_descr);
         panic!(
             "cranelift_resumedata_deopt callback returned false for a runtime guard \
              failure — descr's meta_descr is not a ResumeGuardDescr or rd_numb is empty. \
              trace_id={} fail_index_per_trace={} fail_arg_types_len={}",
-            fail_descr.trace_id(),
-            <CraneliftFailDescr as FailDescr>::fail_index_per_trace(fail_descr),
+            fd.trace_id(),
+            fd.fail_index_per_trace(),
             fail_arg_types.len(),
         );
     }
@@ -2025,18 +2047,18 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
 }
 
 fn actual_call_assembler_target_result_kind(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
 ) -> Result<u64, BackendError> {
     let finish_descr = fail_descrs
         .iter()
-        .find(|descr| descr.is_finish())
+        .find(|descr| as_fd(descr).is_finish())
         .ok_or_else(|| {
             unsupported_semantics(
                 OpCode::CallAssemblerN,
                 "call-assembler target must expose at least one finish exit",
             )
         })?;
-    actual_call_assembler_result_kind(finish_descr.as_ref())
+    actual_call_assembler_result_kind(as_fd(finish_descr))
 }
 
 fn validate_call_assembler_target_result_kind(
@@ -2102,15 +2124,15 @@ fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
 fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
     unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(bridge.trace_id));
     for descr in &bridge.fail_descrs {
-        if let Some(child_bridge) = fail_descr_bridge_ref(descr.as_ref()) {
+        if let Some(child_bridge) = fail_descr_bridge_ref(as_fd(descr)) {
             unregister_bridge_call_assembler_expectations(&child_bridge);
         }
     }
 }
 
-fn unregister_call_assembler_bridge_tree(fail_descrs: &[Arc<CraneliftFailDescr>]) {
+fn unregister_call_assembler_bridge_tree(fail_descrs: &[DescrRef]) {
     for descr in fail_descrs {
-        if let Some(bridge) = fail_descr_bridge_ref(descr.as_ref()) {
+        if let Some(bridge) = fail_descr_bridge_ref(as_fd(descr)) {
             unregister_bridge_call_assembler_expectations(&bridge);
         }
     }
@@ -2280,10 +2302,12 @@ fn register_call_assembler_target(
     // pick the metainterp-attached `Arc<DoneWithThisFrameDescr*>` when
     // available and fall back to the cranelift-side singleton in its
     // absence (backend-only tests).
-    if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| {
-        FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref())
-    }) {
-        let result_type = finish_descr
+    if let Some(finish_descr) = compiled
+        .fail_descrs
+        .iter()
+        .find(|d| as_fd(d).is_finish() && !as_fd(d).is_exit_frame_with_exception())
+    {
+        let result_type = as_fd(finish_descr)
             .fail_arg_types()
             .first()
             .copied()
@@ -2378,11 +2402,9 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
     let new_finish_descr_ptr = new_target
         .fail_descrs
         .iter()
-        .find(|d| {
-            FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref())
-        })
+        .find(|d| as_fd(d).is_finish() && !as_fd(d).is_exit_frame_with_exception())
         .map(|d| {
-            let result_type = d.fail_arg_types().first().copied().unwrap_or(Type::Void);
+            let result_type = as_fd(d).fail_arg_types().first().copied().unwrap_or(Type::Void);
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
         })
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
@@ -2473,11 +2495,8 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
         let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
         let fail_descr = &jf.fail_descr;
         let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
-        (
-            fail_descr.is_finish(),
-            descr_addr,
-            fail_descr.fail_arg_types().to_vec(),
-        )
+        let fd = as_fd(fail_descr);
+        (fd.is_finish(), descr_addr, fd.fail_arg_types().to_vec())
     };
     if is_finish {
         return finish_result_from_deadframe(&mut frame).ok();
@@ -2543,19 +2562,20 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         !descr_ptr.is_null(),
         "force_token_to_dead_frame: jf_force_descr is null"
     );
-    let fail_descr = unsafe {
+    let fail_descr: Arc<CraneliftFailDescr> = unsafe {
         Arc::increment_strong_count(descr_ptr);
         Arc::from_raw(descr_ptr)
     };
     // Register jf_gcref as GC root so moving GC can update the
     // pointer. Shadow stack keeps the object alive, but does NOT
     // update this separate copy of jf_gcref.
+    let fail_descr: DescrRef = fail_descr;
     deadframe_from_jitframe(jf_gcref, fail_descr, None)
 }
 
 fn deadframe_from_jitframe(
     jf_gcref: GcRef,
-    fail_descr: Arc<CraneliftFailDescr>,
+    fail_descr: DescrRef,
     heap_owner: Option<Vec<i64>>,
 ) -> DeadFrame {
     let mut frame = Box::new(JitFrameDeadFrame::new(
@@ -2584,7 +2604,7 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(jf.fail_descr.as_ref())
+    Ok(as_fd(&jf.fail_descr))
 }
 
 /// Owned-Arc counterpart of [`get_latest_descr_from_deadframe`].
@@ -2611,10 +2631,10 @@ pub fn get_latest_descr_arc_from_deadframe(
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    if let Some(meta) = jf.fail_descr.meta_descr.clone() {
+    if let Some(meta) = jf.fail_descr._backend_wrapper_meta_descr() {
         return Ok(meta);
     }
-    Ok(Arc::clone(&jf.fail_descr) as Arc<dyn majit_ir::Descr>)
+    Ok(jf.fail_descr.clone())
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
@@ -2704,8 +2724,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let fail_descr_arc =
             direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
-        fail_descr.increment_fail_count();
-        if let Some(bridge) = fail_descr_bridge_ref(fail_descr.as_ref()) {
+        let fail_descr_fd = as_fd(fail_descr);
+        fail_descr_fd.increment_fail_count();
+        if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
@@ -2714,7 +2735,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 let bridge_frame = CraneliftBackend::execute_bridge(
                     &bridge,
                     &raw_outputs,
-                    fail_descr.fail_arg_types(),
+                    fail_descr_fd.fail_arg_types(),
                     &attachments,
                 );
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
@@ -2754,7 +2775,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
             // shape.
             let mut mat_outputs = outputs.clone();
-            let fail_arg_types = fail_descr.fail_arg_types();
+            let fail_arg_types = fail_descr_fd.fail_arg_types();
             rebuild_state_after_failure_dispatch(
                 fail_descr,
                 &mut mat_outputs,
@@ -3102,13 +3123,14 @@ fn call_assembler_fast_path_heap(
     let fail_descr_arc =
         direct_descr.unwrap_or_else(|| target.fail_descrs[fail_index as usize].clone());
     let fail_descr = &fail_descr_arc;
+    let fail_descr_fd = as_fd(fail_descr);
 
-    if fail_descr.is_finish() {
+    if fail_descr_fd.is_finish() {
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
         }
-        return match fail_descr.fail_arg_types() {
+        return match fail_descr_fd.fail_arg_types() {
             [] | [Type::Void] => 0,
             // compile.py:649 DoneWithThisFrameDescr*.get_result:
             // cpu.get_{int,ref,float}_value(deadframe, 0)
@@ -3118,13 +3140,13 @@ fn call_assembler_fast_path_heap(
     }
 
     // Guard failure — check for bridge, then fall back to force
-    fail_descr.increment_fail_count();
+    fail_descr_fd.increment_fail_count();
 
-    if let Some(bridge) = fail_descr_bridge_ref(fail_descr.as_ref()) {
+    if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
         // Slice QQ-3: dispatch routes on-demand ResumeDataDirectReader
         // callback first; falls back to recovery_layout walker.
         let mut bridge_outputs = outputs;
-        let fail_arg_types = fail_descr.fail_arg_types();
+        let fail_arg_types = fail_descr_fd.fail_arg_types();
         rebuild_state_after_failure_dispatch(
             fail_descr,
             &mut bridge_outputs,
@@ -3157,11 +3179,11 @@ fn call_assembler_fast_path_heap(
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
-        let raw_num = fail_descr.fail_arg_types().len();
+        let raw_num = fail_descr_fd.fail_arg_types().len();
         let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
         // Slice QQ-3: same on-demand dispatch as the bridge path above.
-        let fail_arg_types_for_dispatch = fail_descr.fail_arg_types();
+        let fail_arg_types_for_dispatch = fail_descr_fd.fail_arg_types();
         rebuild_state_after_failure_dispatch(
             fail_descr,
             &mut bh_outputs,
@@ -4091,14 +4113,14 @@ fn resolve_call_assembler_target(
     let finish_descr = target
         .fail_descrs
         .iter()
-        .find(|descr| descr.is_finish())
+        .find(|descr| as_fd(descr).is_finish())
         .ok_or_else(|| {
             unsupported_semantics(
                 opcode,
                 "call-assembler target must expose at least one finish exit",
             )
         })?;
-    let finish_types = finish_descr.fail_arg_types();
+    let finish_types = as_fd(finish_descr).fail_arg_types();
 
     // Validate that the finish result type matches the call descriptor.
     // When force_token_slots are present the finish output type is Ref
@@ -4141,16 +4163,17 @@ fn expected_call_assembler_result_kind(
             let finish_descr = target
                 .fail_descrs
                 .iter()
-                .find(|descr| descr.is_finish())
+                .find(|descr| as_fd(descr).is_finish())
                 .ok_or_else(|| {
                     unsupported_semantics(
                         OpCode::CallAssemblerR,
                         "call-assembler target must expose at least one finish exit",
                     )
                 })?;
+            let finish_fd = as_fd(finish_descr);
             Ok(
-                if finish_descr.fail_arg_types() == [Type::Ref]
-                    && finish_descr.force_token_slots() == [0]
+                if finish_fd.fail_arg_types() == [Type::Ref]
+                    && finish_fd.force_token_slots() == [0]
                 {
                     CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF
                 } else {
@@ -4193,11 +4216,14 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
                 unsupported_semantics(op.opcode, "call-assembler descriptor must be a CallDescr")
             })?;
             if let Some(target) = resolve_call_assembler_target(op.opcode, call_descr)? {
-                if let Some(finish_descr) =
-                    target.fail_descrs.iter().find(|descr| descr.is_finish())
+                if let Some(finish_descr) = target
+                    .fail_descrs
+                    .iter()
+                    .find(|descr| as_fd(descr).is_finish())
                 {
-                    if finish_descr.fail_arg_types() == [Type::Ref]
-                        && finish_descr.force_token_slots() == [0]
+                    let finish_fd = as_fd(finish_descr);
+                    if finish_fd.fail_arg_types() == [Type::Ref]
+                        && finish_fd.force_token_slots() == [0]
                     {
                         force_tokens.insert(result_var);
                     }
@@ -5649,7 +5675,7 @@ struct CompiledLoop {
     _func_id: FuncId,
     code_ptr: *const u8,
     code_size: usize,
-    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
+    fail_descrs: Box<[DescrRef]>,
     terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -5916,7 +5942,7 @@ pub(crate) fn fail_descr_set_external_jump_target(descr: &DescrRef, target: Desc
 /// `assembler.py:227 self.faildescr.index = i` convention that the
 /// owning compile pass already enforces by position.
 fn build_per_trace_layouts(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
 ) -> Vec<majit_backend::FailDescrLayout> {
     fail_descrs
@@ -5930,11 +5956,11 @@ fn build_per_trace_layouts(
 }
 
 fn find_trace_fail_descr_layouts_in_fail_descrs(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
 ) -> Option<Vec<majit_backend::FailDescrLayout>> {
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
                 return Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id));
@@ -5950,11 +5976,11 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
 }
 
 fn find_trace_terminal_exit_layouts_in_fail_descrs(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
 ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
                 return Some(bridge.terminal_exit_layouts_ref().clone());
@@ -5970,11 +5996,11 @@ fn find_trace_terminal_exit_layouts_in_fail_descrs(
 }
 
 fn find_trace_info_in_fail_descrs(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
 ) -> Option<CompiledTraceInfo> {
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
                 return Some(CompiledTraceInfo {
@@ -5993,10 +6019,10 @@ fn find_trace_info_in_fail_descrs(
 }
 
 fn find_fail_descr_in_fail_descrs(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
     fail_index: u32,
-) -> Option<Arc<CraneliftFailDescr>> {
+) -> Option<DescrRef> {
     // Position is the canonical fail_index identity for a trace, matching
     // PyPy's `assembler.py:227 self.faildescr.index = i` (Python has no
     // per-emission `fail_index` on the descr itself).  Codegen increments
@@ -6008,12 +6034,12 @@ fn find_fail_descr_in_fail_descrs(
     // directly so this function does not depend on the descr-internal
     // accessor.
     if let Some(descr) = fail_descrs.get(fail_index as usize) {
-        if descr.trace_id() == trace_id {
+        if as_fd(descr).trace_id() == trace_id {
             return Some(descr.clone());
         }
     }
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if let Some(found) =
                 find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
@@ -6026,14 +6052,14 @@ fn find_fail_descr_in_fail_descrs(
 }
 
 fn find_fail_descr_by_ptr(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     descr_ptr: usize,
-) -> Option<Arc<CraneliftFailDescr>> {
+) -> Option<DescrRef> {
     for descr in fail_descrs {
-        if Arc::as_ptr(descr) as usize == descr_ptr {
+        if Arc::as_ptr(descr) as *const () as usize == descr_ptr {
             return Some(descr.clone());
         }
-        if let Some(bridge) = fail_descr_bridge_ref(descr.as_ref()).as_ref() {
+        if let Some(bridge) = fail_descr_bridge_ref(as_fd(descr)).as_ref() {
             if let Some(found) = find_fail_descr_by_ptr(&bridge.fail_descrs, descr_ptr) {
                 return Some(found);
             }
@@ -6050,7 +6076,7 @@ struct JitExecResult {
     jf_gcref: GcRef,
     heap_owner: Option<Vec<i64>>,
     fail_index: u32,
-    direct_descr: Option<Arc<CraneliftFailDescr>>,
+    direct_descr: Option<DescrRef>,
 }
 
 impl JitExecResult {
@@ -6070,7 +6096,7 @@ impl JitExecResult {
 
 fn run_compiled_code(
     code_ptr: *const u8,
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
@@ -6094,7 +6120,7 @@ fn run_compiled_code(
 
 fn run_compiled_code_inner(
     code_ptr: *const u8,
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
@@ -6288,10 +6314,8 @@ fn run_compiled_code_inner(
         // surface the cranelift singleton directly so the consumer
         // still sees `is_exit_frame_with_exception=true`.
         if propagate_descr_ptr != 0 {
-            (
-                u32::MAX,
-                Some(EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone()),
-            )
+            let cl: DescrRef = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone();
+            (u32::MAX, Some(cl))
         } else {
             (0u32, None)
         }
@@ -6322,7 +6346,8 @@ fn run_compiled_code_inner(
                 &*DONE_WITH_THIS_FRAME_DESCR_VOID,
             ] {
                 if Arc::as_ptr(global) as usize == ptr {
-                    return Some(global.clone());
+                    let r: DescrRef = global.clone();
+                    return Some(r);
                 }
             }
             None
@@ -6421,7 +6446,7 @@ fn identity_recovery_layout(
 }
 
 fn patch_fail_descr_recovery_layout(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
     fail_index: u32,
     recovery_layout: &ExitRecoveryLayout,
@@ -6429,14 +6454,14 @@ fn patch_fail_descr_recovery_layout(
     // Position-based lookup — see `find_fail_descr_in_fail_descrs` above
     // for the invariant rationale.
     if let Some(descr) = fail_descrs.get(fail_index as usize) {
-        if descr.trace_id() == trace_id {
+        if as_fd(descr).trace_id() == trace_id {
             let descr_ref: DescrRef = descr.clone();
             fail_descr_set_recovery_layout(&descr_ref, recovery_layout.clone());
             return true;
         }
     }
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if patch_fail_descr_recovery_layout(
                 &bridge.fail_descrs,
@@ -6470,7 +6495,7 @@ fn patch_terminal_exit_recovery_layout_in_vec(
 
 fn patch_terminal_exit_recovery_layout(
     root_terminal_exit_layouts: &UnsafeCell<Vec<TerminalExitLayout>>,
-    fail_descrs: &[Arc<CraneliftFailDescr>],
+    fail_descrs: &[DescrRef],
     trace_id: u64,
     op_index: usize,
     recovery_layout: &ExitRecoveryLayout,
@@ -6485,7 +6510,7 @@ fn patch_terminal_exit_recovery_layout(
     }
 
     for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(descr.as_ref());
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if patch_terminal_exit_recovery_layout(
                 &bridge.terminal_exit_layouts,
@@ -6716,12 +6741,13 @@ impl CraneliftBackend {
                 .and_then(|c| c.downcast_ref::<CompiledLoop>())
             {
                 for prev_d in &prev_compiled.fail_descrs {
-                    if fail_descr_has_bridge(prev_d.as_ref()) {
-                        let fi = prev_d.fail_index();
-                        let tid = prev_d.trace_id();
+                    if fail_descr_has_bridge(as_fd(prev_d)) {
+                        let prev_fd = as_fd(prev_d);
+                        let fi = prev_fd.fail_index();
+                        let tid = prev_fd.trace_id();
                         if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi) {
-                            if !fail_descr_has_bridge(new_d.as_ref()) {
-                                if let Some(b) = fail_descr_bridge_ref(prev_d.as_ref()) {
+                            if !fail_descr_has_bridge(as_fd(&new_d)) {
+                                if let Some(b) = fail_descr_bridge_ref(as_fd(prev_d)) {
                                     if std::env::var_os("MAJIT_LOG").is_some() {
                                         eprintln!(
                                             "[jit] propagate bridge tid={} fi={} to new token",
@@ -6729,7 +6755,7 @@ impl CraneliftBackend {
                                         );
                                     }
                                     fail_descr_attach_bridge(
-                                        new_d.as_ref(),
+                                        as_fd(&new_d),
                                         BridgeData {
                                             trace_id: b.trace_id,
                                             input_types: b.input_types.clone(),
@@ -6797,12 +6823,12 @@ impl CraneliftBackend {
     /// addr→Arc lookup table.  Mirrors dynasm's API: callable from
     /// future late-stamp helpers that need to land meta-keyed entries
     /// after the in-codegen call missed them.
-    pub fn register_fail_descrs(&self, descrs: &[Arc<CraneliftFailDescr>]) {
+    pub fn register_fail_descrs(&self, descrs: &[DescrRef]) {
         let mut registry = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
-            let descr_ref: majit_ir::DescrRef = Arc::clone(descr) as majit_ir::DescrRef;
+            let descr_ref: majit_ir::DescrRef = descr.clone();
             registry
-                .entry(Arc::as_ptr(descr) as usize)
+                .entry(Arc::as_ptr(descr) as *const () as usize)
                 .or_insert_with(|| descr_ref.clone());
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
@@ -6811,8 +6837,8 @@ impl CraneliftBackend {
             // compute `descr_addr = Arc::as_ptr(arc)` from the meta
             // pointer and would miss the backend-only key without this
             // dual indexing.
-            if let Some(meta) = &descr.meta_descr {
-                let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
+            if let Some(meta) = descr._backend_wrapper_meta_descr() {
+                let meta_ptr = Arc::as_ptr(&meta) as *const () as usize;
                 registry.insert(meta_ptr, descr_ref.clone());
             }
         }
@@ -7094,7 +7120,7 @@ impl CraneliftBackend {
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Box<[Arc<CraneliftFailDescr>]> = compiled.fail_descrs.clone();
+        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
@@ -7141,7 +7167,7 @@ impl CraneliftBackend {
             } else {
                 // Search bridge fail_descrs for nested guard failures.
                 let found = compiled.fail_descrs.iter().find_map(|d| {
-                    let guard = fail_descr_bridge_ref(d.as_ref());
+                    let guard = fail_descr_bridge_ref(as_fd(d));
                     guard.as_ref().and_then(|b| {
                         find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
                     })
@@ -7154,6 +7180,7 @@ impl CraneliftBackend {
                 })
             };
             let fail_descr = &fail_descr;
+            let fail_descr_fd = as_fd(fail_descr);
 
             // llgraph/runner.py:1130-1140 Jump exception caught by execute():
             // cross-loop JUMP — switch to the target loop trace identified
@@ -7161,8 +7188,8 @@ impl CraneliftBackend {
             // assembler.py:2456-2462 closing_jump: raw JMP to
             // `target_token._ll_loop_code`. Cranelift can't emit inter-
             // function JMPs, so we return and re-enter the target loop here.
-            if fail_descr.is_external_jump() {
-                let target_entry = fail_descr
+            if fail_descr_fd.is_external_jump() {
+                let target_entry = fail_descr_fd
                     .target_descr()
                     .as_ref()
                     .and_then(lookup_loop_target)
@@ -7175,14 +7202,14 @@ impl CraneliftBackend {
                 continue;
             }
             // llgraph/runner.py:1200-1201 execute_finish → ExecutionFinished.
-            if FailDescr::is_finish(fail_descr.as_ref()) {
+            if fail_descr_fd.is_finish() {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
                 return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
             }
 
-            fail_descr.increment_fail_count();
+            fail_descr_fd.increment_fail_count();
 
             // llgraph/runner.py:1184-1191 fail_guard: if bridge attached,
             // raise Jump(target, values).
@@ -7190,7 +7217,7 @@ impl CraneliftBackend {
             // the jitframe uses recovery_layout encoding for virtuals.
             // rebuild_state_after_failure decodes this to match what the
             // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
-            if let Some(bridge) = fail_descr_bridge_ref(fail_descr.as_ref()) {
+            if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
                 if majit_log_enabled() {
@@ -7254,22 +7281,23 @@ impl CraneliftBackend {
         let fail_descr_arc =
             direct_descr.unwrap_or_else(|| bridge.fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
+        let fail_descr_fd = as_fd(fail_descr);
 
         // RPython parity: FINISH exits in bridges return directly,
         // just like in execute_with_inputs. Without this, the FINISH
         // bridge's exit is misinterpreted as a guard failure.
-        if FailDescr::is_finish(fail_descr.as_ref()) {
+        if fail_descr_fd.is_finish() {
             // jf_guard_exc already written by emit_guard_exit.
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
 
-        fail_descr.increment_fail_count();
+        fail_descr_fd.increment_fail_count();
 
-        if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr.as_ref()) {
+        if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             return Self::execute_bridge(
                 &next_bridge,
                 &outputs,
-                fail_descr.fail_arg_types(),
+                fail_descr_fd.fail_arg_types(),
                 attachments,
             );
         }
@@ -7337,7 +7365,7 @@ impl CraneliftBackend {
 
         // Pre-scan
         let force_tokens = build_force_token_set(inputargs, ops)?;
-        let mut fail_descrs: Vec<Arc<CraneliftFailDescr>> = Vec::new();
+        let mut fail_descrs: Vec<DescrRef> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
         let attached_descrs = self.attached_descr_ptrs();
@@ -12486,8 +12514,8 @@ impl CraneliftBackend {
                 .iter()
                 .map(|descr| {
                     (
-                        FailDescr::fail_index_per_trace(descr.as_ref()),
-                        Arc::as_ptr(descr) as usize,
+                        as_fd(descr).fail_index_per_trace(),
+                        Arc::as_ptr(descr) as *const () as usize,
                     )
                 })
                 .collect();
@@ -12504,7 +12532,7 @@ impl CraneliftBackend {
             source_guard: None,
         };
         for descr in &fail_descrs {
-            fail_descr_set_trace_info(descr.as_ref(), trace_info.clone());
+            fail_descr_set_trace_info(as_fd(descr), trace_info.clone());
         }
         // Freeze the fail_descrs vector. The collect_guards loop assigns
         // `fail_index = vec.len() as u32` immediately before pushing each
@@ -12525,7 +12553,7 @@ impl CraneliftBackend {
         // mismatch their Vec position on every non-zero codegen, and
         // post-Slice 7-Tβ1 the runtime lookup is position-based via
         // `find_fail_descr_in_fail_descrs` rather than descr-internal.
-        let fail_descrs: Box<[Arc<CraneliftFailDescr>]> = fail_descrs.into_boxed_slice();
+        let fail_descrs: Box<[DescrRef]> = fail_descrs.into_boxed_slice();
         // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py:990-993
         // parity: set TargetToken._ll_loop_code on every Label in this
         // function, and register the entry in LOOP_TARGET_REGISTRY so that
@@ -12602,7 +12630,7 @@ fn collect_guards(
     ops: &[Op],
     inputargs: &[InputArg],
     force_tokens: &HashSet<u32>,
-    fail_descrs: &mut Vec<Arc<CraneliftFailDescr>>,
+    fail_descrs: &mut Vec<DescrRef>,
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
     trace_id: u64,
@@ -13471,12 +13499,12 @@ impl majit_backend::Backend for CraneliftBackend {
                 // covers both `ResumeGuardDescr` and
                 // `ResumeGuardCopiedDescr`; copied descrs own their
                 // `rd_loop_token` directly per `history.py:127` `_attrs_`.
-                if !(descr.is_resume_guard() || descr.is_resume_guard_copied()) {
+                let fd = as_fd(descr);
+                if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
                     continue;
                 }
-                descr
-                    .set_rd_loop_token_clt(std::sync::Arc::clone(clt)
-                        as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                    as std::sync::Arc<dyn std::any::Any + Send + Sync>);
             }
         }
 
@@ -13665,18 +13693,18 @@ impl majit_backend::Backend for CraneliftBackend {
         };
         let clt_arc = original_token.compiled_loop_token.clone();
         for descr in &compiled.fail_descrs {
-            fail_descr_set_trace_info(descr.as_ref(), bridge_trace_info.clone());
+            let fd = as_fd(descr);
+            fail_descr_set_trace_info(fd, bridge_trace_info.clone());
             // `compile.py:183-186 record_loop_or_bridge`: a bridge's
             // ResumeDescrs inherit the original loop's CompiledLoopToken.
             // `compile.py:185 isinstance(descr, ResumeDescr)` covers
             // both `ResumeGuardDescr` and `ResumeGuardCopiedDescr`.
-            if !(descr.is_resume_guard() || descr.is_resume_guard_copied()) {
+            if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
                 continue;
             }
             if let Some(clt) = clt_arc.as_ref() {
-                descr
-                    .set_rd_loop_token_clt(std::sync::Arc::clone(clt)
-                        as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                    as std::sync::Arc<dyn std::any::Any + Send + Sync>);
             }
         }
         {
@@ -13687,7 +13715,7 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         {
             if let Some(ref sd) = source_descr {
-                if let Some(bridge) = fail_descr_bridge_ref(sd.as_ref()) {
+                if let Some(bridge) = fail_descr_bridge_ref(as_fd(sd)) {
                     unregister_bridge_call_assembler_expectations(&bridge);
                 }
             }
@@ -13701,9 +13729,9 @@ impl majit_backend::Backend for CraneliftBackend {
             // the `execute_bridge` entry marshaling path; derive it from
             // the compiled fail_descrs' is_external_jump flag rather than
             // re-scanning ops + mutating descrs after the fact.
-            let loop_reentry = compiled.fail_descrs.iter().any(|d| d.is_external_jump());
+            let loop_reentry = compiled.fail_descrs.iter().any(|d| as_fd(d).is_external_jump());
             fail_descr_attach_bridge(
-                sd.as_ref(),
+                as_fd(sd),
                 BridgeData {
                     trace_id: compiled.trace_id,
                     input_types: compiled.input_types.clone(),
@@ -13737,12 +13765,12 @@ impl majit_backend::Backend for CraneliftBackend {
                         source_trace_id,
                         fail_descr.fail_index_per_trace(),
                     ) {
-                        if !fail_descr_has_bridge(prev_descr.as_ref()) {
+                        if !fail_descr_has_bridge(as_fd(&prev_descr)) {
                             // Reconstruct a minimal BridgeData from the
                             // bridge already attached to `sd`.
-                            if let Some(b) = fail_descr_bridge_ref(sd.as_ref()) {
+                            if let Some(b) = fail_descr_bridge_ref(as_fd(sd)) {
                                 fail_descr_attach_bridge(
-                                    prev_descr.as_ref(),
+                                    as_fd(&prev_descr),
                                     BridgeData {
                                     trace_id: b.trace_id,
                                     input_types: b.input_types.clone(),
@@ -13786,7 +13814,10 @@ impl majit_backend::Backend for CraneliftBackend {
             if let Some(descr) =
                 find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
             {
-                return (descr.get_status(), std::sync::Arc::as_ptr(&descr) as usize);
+                return (
+                    as_fd(&descr).get_status(),
+                    std::sync::Arc::as_ptr(&descr) as *const () as usize,
+                );
             }
         }
         (0, 0)
@@ -13823,10 +13854,11 @@ impl majit_backend::Backend for CraneliftBackend {
                     // `PropagateExceptionDescr`) since they answer
                     // `is_finish() == false`.  Gate on the canonical
                     // `ResumeDescr` family instead.
-                    if (descr.is_resume_guard() || descr.is_resume_guard_copied())
-                        && descr.get_status() == 0
+                    let fd = as_fd(descr);
+                    if (fd.is_resume_guard() || fd.is_resume_guard_copied())
+                        && fd.get_status() == 0
                     {
-                        descr.store_hash(hash);
+                        fd.store_hash(hash);
                     }
                 }
             }
@@ -13852,15 +13884,16 @@ impl majit_backend::Backend for CraneliftBackend {
                 source_fail_index,
             );
             if let Some(descr) = source_descr {
-                if let Some(bridge) = fail_descr_bridge_ref(descr.as_ref()) {
+                if let Some(bridge) = fail_descr_bridge_ref(as_fd(&descr)) {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(bd) = bridge.fail_descrs.get(i) {
                             // Same `ResumeDescr`-family gate as in
                             // `store_guard_hashes` above (compile.py:826-829).
-                            if (bd.is_resume_guard() || bd.is_resume_guard_copied())
-                                && bd.get_status() == 0
+                            let fd = as_fd(bd);
+                            if (fd.is_resume_guard() || fd.is_resume_guard_copied())
+                                && fd.get_status() == 0
                             {
-                                bd.store_hash(hash);
+                                fd.store_hash(hash);
                             }
                         }
                     }
@@ -13921,22 +13954,22 @@ impl majit_backend::Backend for CraneliftBackend {
             return;
         };
         for old_fd in &old.fail_descrs {
-            let Some(b) = fail_descr_bridge_ref(old_fd.as_ref()) else {
+            let Some(b) = fail_descr_bridge_ref(as_fd(old_fd)) else {
                 continue;
             };
             // Match by (trace_id, fail_index) — same key used by
             // find_fail_descr_in_fail_descrs and BridgeData.source_guard.
             let target = find_fail_descr_in_fail_descrs(
                 &new.fail_descrs,
-                old_fd.trace_id(),
-                FailDescr::fail_index_per_trace(old_fd.as_ref()),
+                as_fd(old_fd).trace_id(),
+                as_fd(old_fd).fail_index_per_trace(),
             );
             if let Some(new_fd) = target {
-                if !fail_descr_has_bridge(new_fd.as_ref()) {
+                if !fail_descr_has_bridge(as_fd(&new_fd)) {
                     // Clone the bridge (don't take_bridge — old code may
                     // still reference old_fd and needs bridge dispatch).
                     fail_descr_attach_bridge(
-                        new_fd.as_ref(),
+                        as_fd(&new_fd),
                         BridgeData {
                             trace_id: b.trace_id,
                             input_types: b.input_types.clone(),
@@ -14047,7 +14080,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // closing-jump / bridge-follow / FINISH branches) so a parity
         // edit to one stays mechanically applicable to the other.
         let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Box<[Arc<CraneliftFailDescr>]> = compiled.fail_descrs.clone();
+        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = args.to_vec();
@@ -14136,7 +14169,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 cur_fail_descrs[fail_index as usize].clone()
             } else {
                 let found = compiled.fail_descrs.iter().find_map(|d| {
-                    let guard = fail_descr_bridge_ref(d.as_ref());
+                    let guard = fail_descr_bridge_ref(as_fd(d));
                     guard.as_ref().and_then(|b| {
                         find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
                     })
@@ -14150,11 +14183,13 @@ impl majit_backend::Backend for CraneliftBackend {
             };
             let fail_descr = &fail_descr_arc;
 
+            let fail_descr_fd = as_fd(fail_descr);
+
             // llgraph/runner.py:1130-1140 closing_jump: cross-loop JUMP
             // re-enters the target loop trace identified by the
             // TargetToken on the fail descriptor.
-            if fail_descr.is_external_jump() {
-                let target_entry = fail_descr
+            if fail_descr_fd.is_external_jump() {
+                let target_entry = fail_descr_fd
                     .target_descr()
                     .as_ref()
                     .and_then(lookup_loop_target)
@@ -14171,7 +14206,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // the dispatch loop with the trace's payload — the raw path
             // reads outputs / savedata / exception directly from the
             // jitframe and emits a `RawExecResult`.
-            if FailDescr::is_finish(fail_descr.as_ref()) {
+            if fail_descr_fd.is_finish() {
                 let savedata = {
                     let raw =
                         unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
@@ -14181,10 +14216,10 @@ impl majit_backend::Backend for CraneliftBackend {
                     unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
                 let exception = GcRef(exc_raw);
 
-                let exit_arity = fail_descr.fail_arg_types().len();
+                let exit_arity = fail_descr_fd.fail_arg_types().len();
                 outputs.truncate(exit_arity);
                 let mut typed_outputs = Vec::with_capacity(exit_arity);
-                for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+                for (&raw, &tp) in outputs.iter().zip(fail_descr_fd.fail_arg_types().iter()) {
                     match tp {
                         Type::Int => typed_outputs.push(Value::Int(raw)),
                         Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
@@ -14193,30 +14228,30 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
+                let descr_addr = Arc::as_ptr(&fail_descr_arc) as *const () as usize;
                 let fail_descr_ref: DescrRef = fail_descr_arc.clone();
-                let trace_id = fail_descr.trace_id();
+                let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
                     exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
-                    force_token_slots: fail_descr.force_token_slots().to_vec(),
+                    force_token_slots: fail_descr_fd.force_token_slots().to_vec(),
                     savedata,
                     exception_value: exception,
                     fail_index,
                     trace_id,
                     is_finish: true,
-                    is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
-                    status: fail_descr.get_status(),
+                    is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
+                    status: fail_descr_fd.get_status(),
                     descr_addr,
-                    descr_arc: Arc::clone(&fail_descr_arc) as Arc<dyn FailDescr>,
+                    descr_arc: fail_descr_arc.clone(),
                 };
             }
 
-            fail_descr.increment_fail_count();
+            fail_descr_fd.increment_fail_count();
 
             // llgraph/runner.py:1184-1191 fail_guard with bridge.
-            if let Some(bridge) = fail_descr_bridge_ref(fail_descr.as_ref()) {
+            if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
                 cur_code_ptr = bridge.code_ptr;
@@ -14238,10 +14273,10 @@ impl majit_backend::Backend for CraneliftBackend {
                 unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
             let exception = GcRef(exc_raw);
 
-            let exit_arity = fail_descr.fail_arg_types().len();
+            let exit_arity = fail_descr_fd.fail_arg_types().len();
             outputs.truncate(exit_arity);
             let mut typed_outputs = Vec::with_capacity(exit_arity);
-            for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+            for (&raw, &tp) in outputs.iter().zip(fail_descr_fd.fail_arg_types().iter()) {
                 match tp {
                     Type::Int => typed_outputs.push(Value::Int(raw)),
                     Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
@@ -14250,23 +14285,23 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
+            let descr_addr = Arc::as_ptr(&fail_descr_arc) as *const () as usize;
             let fail_descr_ref: DescrRef = fail_descr_arc.clone();
-            let trace_id = fail_descr.trace_id();
+            let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
                 exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
-                force_token_slots: fail_descr.force_token_slots().to_vec(),
+                force_token_slots: fail_descr_fd.force_token_slots().to_vec(),
                 savedata,
                 exception_value: exception,
                 fail_index,
                 trace_id,
                 is_finish: false,
-                is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
-                status: fail_descr.get_status(),
+                is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
+                status: fail_descr_fd.get_status(),
                 descr_addr,
-                descr_arc: Arc::clone(&fail_descr_arc) as Arc<dyn FailDescr>,
+                descr_arc: fail_descr_arc.clone(),
             };
         }
     }
@@ -14301,7 +14336,7 @@ impl majit_backend::Backend for CraneliftBackend {
             source_trace_id,
             source_fail_index,
         )?;
-        let bridge = fail_descr_bridge_ref(source_descr.as_ref());
+        let bridge = fail_descr_bridge_ref(as_fd(&source_descr));
         let bridge = bridge.as_ref()?;
         Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id))
     }
@@ -14321,7 +14356,7 @@ impl majit_backend::Backend for CraneliftBackend {
             source_trace_id,
             source_fail_index,
         )?;
-        Some(source_descr as Arc<dyn majit_ir::Descr>)
+        Some(source_descr)
     }
 
     fn find_source_fail_descr(
@@ -14378,9 +14413,10 @@ impl majit_backend::Backend for CraneliftBackend {
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
-            descr.fail_index == source_fail_index && descr.trace_id() == source_trace_id
+            let fd = as_fd(descr);
+            fd.fail_index() == source_fail_index && fd.trace_id() == source_trace_id
         })?;
-        let bridge = fail_descr_bridge_ref(source_descr.as_ref());
+        let bridge = fail_descr_bridge_ref(as_fd(source_descr));
         let bridge = bridge.as_ref()?;
         Some(bridge.terminal_exit_layouts_ref().clone())
     }
@@ -19164,7 +19200,7 @@ mod tests {
         );
         let bridge_info = backend
             .compile_bridge(
-                &*real_fail_descr,
+                as_fd(&real_fail_descr),
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
@@ -19221,7 +19257,7 @@ mod tests {
                 .downcast_ref::<CompiledLoop>()
                 .unwrap();
             let descr = &compiled.fail_descrs[0];
-            assert_eq!(descr.fail_count(), i);
+            assert_eq!(as_fd(descr).fail_count(), i);
         }
 
         // Execute with x = 1 (guard passes, reaches finish)
@@ -19234,7 +19270,7 @@ mod tests {
             .unwrap();
         // Guard descr count unchanged (guard didn't fail this time)
         let guard_descr = &compiled.fail_descrs[0];
-        assert_eq!(guard_descr.fail_count(), 5);
+        assert_eq!(as_fd(guard_descr).fail_count(), 5);
     }
 
     #[test]
@@ -19313,7 +19349,7 @@ mod tests {
         );
         backend
             .compile_bridge(
-                &*real_fail_descr,
+                as_fd(&real_fail_descr),
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
@@ -19430,7 +19466,7 @@ mod tests {
             .downcast_ref::<CompiledLoop>()
             .unwrap();
         let descr = &compiled.fail_descrs[0];
-        let gc_map = fail_descr_gc_map(descr.as_ref());
+        let gc_map = fail_descr_gc_map(as_fd(descr));
         assert!(!gc_map.is_ref(0));
         assert!(gc_map.is_ref(1));
         assert!(!gc_map.is_ref(2));
@@ -20258,8 +20294,9 @@ mod tests {
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let failed_descr = get_latest_descr_from_deadframe(&failed)
             .expect("base-case guard should produce a valid descr");
-        assert_eq!(failed_descr.fail_index(), guard_descr.fail_index());
-        assert_eq!(guard_descr.fail_count(), 1);
+        let guard_fd = as_fd(guard_descr);
+        assert_eq!(failed_descr.fail_index(), guard_fd.fail_index());
+        assert_eq!(guard_fd.fail_count(), 1);
 
         backend.set_constants(HashMap::new());
         let bridge_ops = vec![
@@ -20279,7 +20316,7 @@ mod tests {
         assert!(descr.is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 4);
         assert_eq!(
-            guard_descr.fail_count(),
+            as_fd(guard_descr).fail_count(),
             1,
             "CALL_ASSEMBLER guard with attached bridge should dispatch directly without recounting the original faildescr",
         );
