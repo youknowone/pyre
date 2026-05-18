@@ -1491,36 +1491,14 @@ pub trait Backend: Send {
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
-    /// Register constant OpRef → i64 values consumed by the next
-    /// `compile_loop` / `compile_bridge` call.  Default is no-op — only
-    /// backends that honour constants at emit time override.  The
-    /// companion `set_constant_types` carries the per-OpRef `Type`
-    /// tag.
-    fn set_constants(&mut self, _constants: std::collections::HashMap<u32, i64>) {}
-
-    /// Register constant OpRef → `Type` annotations.
-    fn set_constant_types(&mut self, _constant_types: std::collections::HashMap<u32, Type>) {}
-
-    /// Unified typed-constant pool — registers OpRef → `Const` for the
-    /// next `compile_loop` / `compile_bridge` call.  `Const` carries
-    /// both value and `Type` (history.py:220/261/307 ConstInt/Float/Ptr
-    /// `.type` parity), retiring the two-call `(set_constants,
-    /// set_constant_types)` shape.
+    /// Register the typed constant pool (`OpRef` → `Const`) consumed by
+    /// the next `compile_loop` / `compile_bridge` call.  `Const` carries
+    /// both value and `Type` (history.py:220/261/307
+    /// ConstInt/ConstFloat/ConstPtr `.type` parity).
     ///
-    /// Default routes through the legacy pair so existing backends
-    /// continue to work without override.  Backends that consume the
-    /// typed pool natively override this method and stop overriding the
-    /// legacy pair.
-    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, Const>) {
-        let mut bits = std::collections::HashMap::with_capacity(constants.len());
-        let mut types = std::collections::HashMap::with_capacity(constants.len());
-        for (&k, c) in constants.iter() {
-            bits.insert(k, c.as_raw_i64());
-            types.insert(k, c.get_type());
-        }
-        self.set_constants(bits);
-        self.set_constant_types(types);
-    }
+    /// Default is a no-op — only backends that honour constants at emit
+    /// time override.
+    fn set_constants_pool(&mut self, _constants: majit_ir::VecAssoc<u32, Const>) {}
 
     /// Force the next `compile_loop` / `compile_bridge` call to stamp
     /// this trace id on exits.

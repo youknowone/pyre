@@ -358,10 +358,6 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
         self.constants.clear();
         self.constants.reserve(constants.len());
@@ -374,8 +370,8 @@ impl majit_backend::Backend for WasmBackend {
         self.trace_counter = trace_id;
     }
 
-    // `set_constant_types` / `set_next_header_pc` use the trait default
-    // (no-op) — wasm does not currently honour either value.
+    // `set_next_header_pc` uses the trait default (no-op) — wasm does
+    // not currently honour it.
 
     fn compile_bridge(
         &mut self,

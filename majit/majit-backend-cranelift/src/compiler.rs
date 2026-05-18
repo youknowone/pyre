@@ -6944,6 +6944,20 @@ pub struct CraneliftBackend {
 }
 
 impl CraneliftBackend {
+    /// Legacy test-only entry point.  Production code passes the typed
+    /// pool through `Backend::set_constants_pool`; this raw-`i64`
+    /// helper is retained for in-crate tests that construct
+    /// `HashMap<u32, i64>` literals by hand.
+    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+        self.constants = constants;
+    }
+
+    /// Legacy test-only entry point — counterpart to `set_constants`
+    /// above; production callers route through `set_constants_pool`.
+    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
+    }
+
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
     ///
     /// PRE-EXISTING-ADAPTATION: RPython's `llop.raw_load(STYPE, gcref, ofs)`
@@ -13967,14 +13981,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
         token.compiled = Some(Box::new(compiled));
         Ok(info)
-    }
-
-    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
     }
 
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {

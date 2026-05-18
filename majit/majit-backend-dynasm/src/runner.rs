@@ -699,6 +699,23 @@ pub struct DynasmBackend {
 }
 
 impl DynasmBackend {
+    /// Legacy test-only entry point.  Production code routes the typed
+    /// pool through `Backend::set_constants_pool`; this raw-`i64`
+    /// helper is retained for in-crate tests that construct
+    /// `HashMap<u32, i64>` literals by hand.
+    pub fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
+        self.constants = constants;
+    }
+
+    /// Legacy test-only entry point — counterpart to `set_constants`
+    /// above; production callers route through `set_constants_pool`.
+    pub fn set_constant_types(
+        &mut self,
+        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    ) {
+        self.constant_types = constant_types;
+    }
+
     #[inline]
     fn raw_mem_ptr(addr: i64, offset: i64) -> usize {
         assert_ne!(
@@ -1711,17 +1728,6 @@ impl Backend for DynasmBackend {
             code_addr,
             code_size,
         })
-    }
-
-    fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    fn set_constant_types(
-        &mut self,
-        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
-    ) {
-        self.constant_types = constant_types;
     }
 
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
