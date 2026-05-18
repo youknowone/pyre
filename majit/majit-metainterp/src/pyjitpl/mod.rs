@@ -4630,11 +4630,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     &compiled_constant_types,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &compiled_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -5493,11 +5490,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     &compiled_constant_types,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &combined_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -5976,11 +5970,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     &compiled_constant_types,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &optimized_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -6333,11 +6324,8 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     &compiled_constant_types,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    &inputargs,
-                    &compiled_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -8437,11 +8425,8 @@ impl<M: Clone> MetaInterp<M> {
                     original_green_key,
                     &compiled_constant_types,
                 );
-                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                    bridge_inputargs,
-                    &optimized_ops,
-                    &compiled_constant_types,
-                );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -9068,11 +9053,8 @@ impl<M: Clone> MetaInterp<M> {
                         green_key,
                         &compiled_constant_types,
                     );
-                    let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
-                        bridge_inputargs,
-                        &optimized_ops,
-                        &compiled_constant_types,
-                    );
+                    let mut terminal_exit_layouts =
+                        compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
                         source_jct.as_ref(),
                         source_trace_id,
@@ -18149,8 +18131,7 @@ mod tests {
             .expect("loop should compile");
         let (mut resume_data, mut exit_layouts) =
             compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
-        let mut terminal_exit_layouts =
-            compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
+        let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);
         }

@@ -1544,7 +1544,6 @@ pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize)
 pub(crate) fn infer_terminal_exit_layout(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
-    constant_types: &HashMap<u32, Type>,
     owning_key: u64,
     trace_id: u64,
     op_index: usize,
@@ -1604,7 +1603,6 @@ pub(crate) fn infer_terminal_exit_layout(
 pub(crate) fn build_terminal_exit_layouts(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
-    constant_types: &HashMap<u32, Type>,
 ) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> {
     let mut layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
@@ -1612,9 +1610,7 @@ pub(crate) fn build_terminal_exit_layouts(
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
         }
-        if let Some(layout) =
-            infer_terminal_exit_layout(inputargs, ops, constant_types, 0, 0, op_index)
-        {
+        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, 0, op_index) {
             // For JUMP exits the descr is `LoopTargetDescr`
             // (`history.py:470`), which has no `fail_arg_types`.  Cache
             // the per-arg types so `StoredExitLayout::resolve_exit_types()`
@@ -1663,7 +1659,6 @@ pub(crate) fn terminal_exit_layout_for_trace(
     infer_terminal_exit_layout(
         &trace.inputargs,
         &trace.ops,
-        &trace.constant_types,
         owning_key,
         trace_id,
         op_index,
