@@ -5727,11 +5727,21 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
-    // 2026-05-18 hypothesis test (reverted, no effect on nbody):
-    // mirroring `run_compiled_code`'s `write_bytes(gcref, 0, ITEM0_OFS)`
-    // header-clear by setting jf_gcmap / jf_descr / jf_guard_exc to 0
-    // before the tail call did NOT fix the nbody corruption — confirms
-    // the dispatch-path corruption is not from stale GC roots / descr.
+    // 2026-05-18 hypothesis tests (all reverted, no effect on nbody_50k
+    // corruption `-0.03513214049650899` vs. dynasm reference
+    // `-0.035132020348426815`):
+    //   - probe 1: per-LABEL gate on `label_block_id == 0` to skip
+    //     non-first-LABEL targets that mismatch preamble inputarg count
+    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc before tail
+    //     call to mirror `run_compiled_code`'s header zero step
+    //     (compiler.rs:6418)
+    //   - probe 3: zero source body's ref_root area to prevent target
+    //     body's post-GC ref reload from reading source's stale writes
+    // All three ruled out as the corruption source.  Deeper diagnosis
+    // requires empirical instrumentation comparing jf_frame state
+    // byte-by-byte between wrapper-direct entry and tail-call entry
+    // for the same (source, target) pair, plus inspection of the
+    // generated machine code's stack-slot reuse pattern.
     emit_call_footer_shadowstack(builder, ptr_type);
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
@@ -5859,14 +5869,15 @@ fn emit_guard_exit(
     //     `emit_return_call_common_sequence` (Tail conv aarch64) —
     //     unchanged between 0.130.2 and 0.131.1.
     //
-    // Gate stays off: 2026-05-18 second probe (jf_gcmap+jf_descr+
-    // jf_guard_exc clear before tail-call) still reproduces nbody_50k
-    // corruption `-0.03513214049650899` (vs. dynasm reference
-    // `-0.035132020348426815`).  Header-state staleness was not the
-    // cause; the dispatch path corruption mechanism remains undiagnosed.
-    // raise_catch / fannkuch continue to crash/hang via the cranelift
-    // 0.130/0.131 aarch64 Tail-conv stack leak (12.5 bytes/take),
-    // independent of any pyre-side fix.
+    // Gate stays off.  Three corruption-source hypotheses ruled out
+    // (per-LABEL inputarg count, stale jf_gcmap/jf_descr, stale
+    // ref_root area).  nbody_50k still corrupts to
+    // `-0.03513214049650899`; further diagnosis is gated behind an
+    // empirical instrumentation epic that compares jf_frame state
+    // byte-for-byte between wrapper-direct entry and tail-call entry
+    // for the same source/target pair.  Independent of the corruption,
+    // raise_catch / fannkuch continue to hit the cranelift 0.130/0.131
+    // aarch64 Tail-conv ~12.5 bytes/take stack leak.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
