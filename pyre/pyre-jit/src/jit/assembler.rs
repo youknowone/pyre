@@ -538,7 +538,7 @@ fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
     label
 }
 
-/// First-wins record of a `Label`/`PcAnchor` byte position.  When the
+/// First-wins record of an `Insn::Label` byte position.  When the
 /// same label name appears multiple times in the drained `SSARepr`
 /// stream (the supersede-newblock re-walk case under pyre's `pc{N}`
 /// PC-keyed labelling: both the original SpamBlock and the supersede

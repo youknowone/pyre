@@ -753,14 +753,12 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
-/// The next-block label is recognised in two shapes:
-/// * `Insn::Label(L)` — upstream-orthodox block / link / catch-landing
-///   labels (`flatten.py:116 self.emit(Label(block))`).
-/// * `Insn::PcAnchor { py_pc }` — pyre's per-PC anchor introduced
-///   when the transitional `Label("pcN")` shape was retired. The
-///   matching `goto TLabel("pcN")` carries the name produced by
-///   `pc_label_name(py_pc)`; both shapes resolve to the same string
-///   key, so the strip recogniser unifies them.
+/// The next-block label is recognised as `Insn::Label(L)`, covering
+/// both upstream-orthodox block / link / catch-landing labels
+/// (`flatten.py:116 self.emit(Label(block))`) and pyre's per-PC anchors
+/// (synthesized name `pc_label_name(py_pc)`).  The matching
+/// `goto TLabel(...)` carries the same name, so a single string-key
+/// match suffices.
 ///
 /// **Mutates** each block's `Vec<Insn>` in place to drop the strip
 /// tail; appends moved (not cloned) into the output `Vec`.
@@ -780,7 +778,7 @@ fn strip_walker_block_boundary_goto(
         // py_pc would fail to strip because the immediate next
         // entry in `all_walker_blocks` is the now-empty dead block,
         // not the supersede newblock that holds the matching
-        // `Label(pcN)` / `PcAnchor{N}` first insn.
+        // `Label(pcN)` first insn.
         let next_label_name: Option<String> = (i + 1..n)
             .find_map(|j| blocks[j].first().map(|first| (j, first)))
             .and_then(|(_, first)| match first {
@@ -1014,8 +1012,8 @@ enum SpliceSite {
     /// trailing terminator (goto / *_return).  Single-exit case.
     SourceBeforeTerminator,
     /// Splice into target block's `per_block_ssarepr` AFTER its
-    /// leading Label/PcAnchor/`-live-` scaffold.  Multi-exit case
-    /// with unique-predecessor target.
+    /// leading Label / `-live-` scaffold.  Multi-exit case with
+    /// unique-predecessor target.
     TargetAfterAnchor,
 }
 
@@ -1153,8 +1151,8 @@ fn emit_link_renamings_into_block<F>(
             // Scan backward from the END to find the terminator op,
             // splicing immediately before it.  A walker SpamBlock can
             // contain content from PCs AFTER its terminator (e.g. the
-            // next linear PC's leading `Label + PcAnchor + -live-`
-            // scaffold appended via supersede / fall-through when the
+            // next linear PC's leading `Label + -live-` scaffold
+            // appended via supersede / fall-through when the
             // same SpamBlock spans multiple Python PCs), so naive
             // "check last insn" misses the terminator.  Canonical
             // `flatten.py:154 insert_renamings(link)` runs immediately
@@ -1183,8 +1181,8 @@ fn emit_link_renamings_into_block<F>(
             pos
         }
         SpliceSite::TargetAfterAnchor => {
-            // Skip target's leading scaffold (Label / PcAnchor /
-            // `-live-`).  Renamings land between the anchor and the
+            // Skip target's leading scaffold (Label / `-live-`).
+            // Renamings land between the anchor and the
             // first semantic op so that runtime dispatch via
             // `pc_anchor_positions[N]` lands on the anchor and then
             // falls through into the renamings before any semantic
@@ -2987,16 +2985,16 @@ fn register_helper_fn_pointers(
 use super::flatten::label_pc_index;
 
 fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Per-PC anchor positions are resolved from `Insn::PcAnchor { py_pc }`
-    // entries.
+    // Per-PC anchor positions are resolved from `Insn::Label` entries
+    // whose name matches `pc{N}` (recognised via `label_pc_index`).
     //
     // Pyre vs RPython label keying (structural difference): RPython uses
     // `Label(block)` per SpamBlock object (`flatten.py:116
     // self.emitline(Label(block))`), so two SpamBlocks reaching the same
     // Python PC carry distinct Label values. Pyre keys labels by Python
     // PC (`pc{N}` via `pc_label_name`), so two alive SpamBlocks both
-    // joining at PC N emit `Insn::PcAnchor { py_pc: N }` independently —
-    // both can survive R5's dead-block filter when neither is superseded.
+    // joining at PC N emit `Insn::Label(Label::new("pc{N}"))` independently
+    // — both can survive R5's dead-block filter when neither is superseded.
     //
     // The runtime resolves `pc{N}` to the FIRST anchor in the drained
     // stream (first-wins below). Subsequent alive duplicates belong to
@@ -3030,7 +3028,7 @@ fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec
 }
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Map py_pc → anchor insn_idx via `Insn::PcAnchor { py_pc }` entries.
+    // Map py_pc → anchor insn_idx via `Insn::Label("pc{N}")` entries.
     // Reuses `pc_anchor_positions`'s first-wins semantics; the documented
     // pyre-vs-RPython label-keying difference there applies here too.
     // Position-indexed `Vec<usize>` matches the no-HashMap invariant
@@ -4043,7 +4041,7 @@ impl CodeWriter {
                     // walker's current py_pc.  Walker emits emit_vsd!
                     // INLINE during each PC's handler; canonical
                     // make_bytecode_block (flatten.rs:2258-2303) sorts ops
-                    // by op.offset for per-PC PcAnchor interleaving, and
+                    // by op.offset for per-PC label interleaving, and
                     // offset=-1 routes synthetic ops to current_pc (the
                     // last anchored PC), landing them in the wrong PC's
                     // region when emit_vsd ran mid-stream.  Recording
@@ -4618,8 +4616,9 @@ impl CodeWriter {
                     // terminator emit (`emit_goto!`, `emit_ref_return!`,
                     // `emit_raise!`, `emit_reraise!`, POP_JUMP_IF) and
                     // no joinpoint exists at `py_pc`, this arm still
-                    // returns `current_block` so PcAnchor + `-live-`
-                    // are emitted for pyre's per-PC dispatch invariants
+                    // returns `current_block` so the per-PC anchor
+                    // (`Insn::Label("pc{N}")`) + `-live-` are emitted
+                    // for pyre's per-PC dispatch invariants
                     // (`pc_anchor_positions`).  The
                     // `block_closed_by_terminator` gate after
                     // `emit_live_placeholder!()` then suppresses op
@@ -5630,23 +5629,24 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    // `emit_mark_label_pc!` just pushed `Insn::PcAnchor
-                    // { py_pc }` into the current block's per-block
-                    // accumulator (see the same-block arm at codewriter.rs
-                    // ~3957).  PcAnchor is pyre's per-Python-PC anchor —
-                    // a NEW-DEVIATION from upstream RPython, whose
-                    // `flatten.py` only emits `Label(block)` at block
-                    // entry (`flatten.py:116`) because RPython's runtime
-                    // has no per-PC dispatch concept.  Pyre's blackhole /
-                    // bridge dispatch resolves resume PCs through
-                    // `pc_anchor_positions` (codewriter.rs:2427) +
-                    // `live_marker_indices_by_pc`, both of which scan for
-                    // PcAnchor entries, so the per-PC anchor must stay
+                    // `emit_mark_label_pc!` just pushed
+                    // `Insn::Label(Label::new("pc{N}"))` into the current
+                    // block's per-block accumulator (see the same-block
+                    // arm at codewriter.rs ~3957).  The per-PC label is
+                    // pyre's per-Python-PC anchor — a NEW-DEVIATION from
+                    // upstream RPython, whose `flatten.py` only emits
+                    // `Label(block)` at block entry (`flatten.py:116`)
+                    // because RPython's runtime has no per-PC dispatch
+                    // concept.  Pyre's blackhole / bridge dispatch
+                    // resolves resume PCs through `pc_anchor_positions`
+                    // (codewriter.rs:2427) + `live_marker_indices_by_pc`,
+                    // both of which scan for `Label("pc{N}")` entries via
+                    // `label_pc_index`, so the per-PC anchor must stay
                     // alongside the upstream-orthodox block Labels until
                     // the dispatcher is refactored to look up by block
                     // identity instead of py_pc.  `remove_repeated_live`
-                    // breaks its merge run on PcAnchor so each PC keeps
-                    // its own `-live-` marker.
+                    // breaks its merge run on per-PC labels so each PC
+                    // keeps its own `-live-` marker.
                     depth_at_pc[py_pc] = current_depth;
 
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
@@ -5726,8 +5726,9 @@ impl CodeWriter {
                     // `emit_ref_return!`, `emit_raise!`, `emit_reraise!`,
                     // POP_JUMP_IF) that appended a normal-flow / bool /
                     // raise / return exit, and no joinpoint exists at
-                    // `py_pc`.  PcAnchor + `-live-` have been emitted to
-                    // satisfy pyre's per-PC dispatch invariants
+                    // `py_pc`.  The per-PC `Insn::Label("pc{N}")` +
+                    // `-live-` have been emitted to satisfy pyre's
+                    // per-PC dispatch invariants
                     // (`pc_anchor_positions`, `live_marker_indices_by_pc`),
                     // but dispatching the op would append more SpaceOps and
                     // potentially more exits (orphan `(None,None)` link) to
@@ -8696,10 +8697,11 @@ impl CodeWriter {
         // pass strips the pair when the next block actually opens with
         // a per-PC anchor for the SAME N — turning a runtime no-op
         // branch into implicit fall-through.  Pyre's per-PC anchor is
-        // `Insn::PcAnchor { py_pc: N }` (NEW-DEVIATION from upstream;
-        // RPython's per-block `Label(block)` has no per-PC concept);
-        // `strip_walker_block_boundary_goto` unifies both anchor shapes
-        // through `pc_label_name(N)`.  Upstream `flatten.py:106-155
+        // `Insn::Label(Label::new("pc{N}"))` (NEW-DEVIATION from
+        // upstream; RPython's per-block `Label(block)` has no per-PC
+        // concept); `strip_walker_block_boundary_goto` resolves both
+        // upstream-orthodox block labels and pyre's per-PC labels
+        // through their shared name key.  Upstream `flatten.py:106-155
         // make_link` skips the goto outright via recursive descent +
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
@@ -9051,8 +9053,8 @@ impl CodeWriter {
                 true,
                 Some(self.cpu()),
             );
-            // Op-only counts (filter out scaffold: Label, PcAnchor,
-            // `-live-`).  Walker emits per-PC PcAnchor + `-live-` for
+            // Op-only counts (filter out scaffold: Label, `-live-`).
+            // Walker emits per-PC `Label("pc{N}")` + `-live-` for
             // runtime dispatch (NEW-DEVIATION from upstream).  Canonical
             // doesn't.  Subtracting scaffold yields a more accurate
             // gap signal: if walker_ops > canonical_ops, walker has
@@ -9075,8 +9077,7 @@ impl CodeWriter {
             // not derive PartialEq).  Debug formats fold Register
             // indices + Constant payloads so this surfaces walker_slot
             // alignment failures alongside structural diffs.  scaffold
-            // (`-live-`, PcAnchor, Label) is filtered out per
-            // `count_real_ops`.
+            // (`-live-`, Label) is filtered out per `count_real_ops`.
             fn op_debug_strings(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
                 ssarepr
                     .insns
@@ -9281,10 +9282,11 @@ impl CodeWriter {
             // walker's stream carries pyre-only NEW-DEVIATION
             // scaffold (per-PC defensive goto, inline ref_copy for
             // stack push/pop) that the canonical driver omits.  With
-            // slices 4b/4c canonical also emits `Insn::PcAnchor` +
-            // `-live-` placeholder so the runtime's
-            // `pc_anchor_positions` / `live_marker_indices_by_pc`
-            // lookups consume it without modification.
+            // slices 4b/4c canonical also emits
+            // `Insn::Label("pc{N}")` + `-live-` placeholder so the
+            // runtime's `pc_anchor_positions` /
+            // `live_marker_indices_by_pc` lookups consume it without
+            // modification.
             //
             // Gate on `byte_equivalent` (walker_unmatched == 0 AND
             // canonical_unmatched == 0): when both streams produce
@@ -9317,7 +9319,7 @@ impl CodeWriter {
                 // `make_bytecode_block` DFS; canraise blocks without
                 // trailing `-live-` early-return after the normal link
                 // (`flatten.py:206-217`), skipping catch-link target
-                // blocks and dropping their PcAnchors.  raise_catch_loop
+                // blocks and dropping their per-PC labels.  raise_catch_loop
                 // hits this — 68 of 97 PCs missing.  Skip splice when
                 // canonical's anchors don't cover every py_pc; walker
                 // emit remains the production path for those graphs.
@@ -10116,11 +10118,9 @@ mod tests {
     use std::sync::Arc;
 
     /// R4 regression test: tail-strip pass must recognise the per-PC
-    /// anchor shape the walker emits at PC block boundaries.  T6
-    /// retired the dedicated `Insn::PcAnchor` variant in favor of
-    /// `Insn::Label(Label::new(pc_label_name(N)))`, so the strip
-    /// recogniser now matches on `label_pc_index`, which accepts
-    /// both forms.
+    /// anchor `Insn::Label(Label::new(pc_label_name(N)))` the walker
+    /// emits at PC block boundaries.  The strip recogniser matches
+    /// on `label_pc_index`.
     #[test]
     fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
         use super::super::flatten::{Insn, Operand, label_pc_index, pc_label_name, pc_tlabel};
@@ -10158,7 +10158,7 @@ mod tests {
         assert_eq!(
             drained.len(),
             4,
-            "goto/--- must remain when target != next block's PcAnchor",
+            "goto/--- must remain when target != next block's per-PC anchor",
         );
 
         // Sanity for the upstream-orthodox `Insn::Label` shape — strip
@@ -11155,11 +11155,11 @@ mod tests {
                 Kind::Ref,
                 0,
             ))]));
-        // PcAnchor is a merge boundary in `remove_repeated_live`, so
-        // each PC keeps its own `-live-` marker without cross-PC
-        // merge-then-reorder.  The anchor scan resolves each PC anchor
-        // at its PcAnchor position; the live marker for each PC stays
-        // at its pre-merge position.
+        // The per-PC anchor is a merge boundary in
+        // `remove_repeated_live`, so each PC keeps its own `-live-`
+        // marker without cross-PC merge-then-reorder.  The anchor scan
+        // resolves each PC anchor at its label position; the live
+        // marker for each PC stays at its pre-merge position.
         ssarepr.insns.push(Insn::pc_anchor(1));
         ssarepr
             .insns

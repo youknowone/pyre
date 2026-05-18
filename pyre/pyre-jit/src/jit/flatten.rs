@@ -219,10 +219,9 @@ impl TLabel {
 ///
 /// All five emit / branch sites that materialise the `pc{N}` naming
 /// route through these helpers so the convention is single-sourced.
-/// A future Phase 4 step can rename the marker shape (e.g.,
-/// `Insn::PcAnchor { py_pc }` distinct from `Insn::Label`) by changing
-/// only these two functions plus the runtime consumers
-/// (`pc_anchor_positions` / `live_marker_indices_by_pc`).
+/// Renaming the marker shape only requires changing these two
+/// functions plus the runtime consumers (`pc_anchor_positions` /
+/// `live_marker_indices_by_pc`).
 pub fn pc_label_name(py_pc: usize) -> String {
     format!("pc{py_pc}")
 }
@@ -1151,10 +1150,7 @@ impl Insn {
     /// pyre-only per-PC anchor for `py_pc`.  Walker emits one per
     /// Python PC entry as `Insn::Label(Label::new(pc_label_name(py_pc)))`;
     /// the runtime resolves `pc{N}` jumps via the same machinery as any
-    /// other `Label`.  The dedicated `PcAnchor` variant is retired —
-    /// per-PC labels share the surface shape with upstream-orthodox
-    /// block / link / catch-landing labels and `label_pc_index` is the
-    /// canonical way to recover the py_pc.
+    /// other `Label`.  Use `label_pc_index` to recover the py_pc.
     pub fn pc_anchor(py_pc: usize) -> Self {
         Insn::Label(Label::new(pc_label_name(py_pc)))
     }
@@ -2209,9 +2205,10 @@ where
         // `flatten.py:285`) and from the liveness post-pass
         // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
         // interleaving here was a pyre-only adaptation for runtime
-        // PC dispatch via `Insn::PcAnchor`; that runtime mechanism
-        // remains on the walker side until the T6 epic retires it,
-        // but canonical now matches upstream's structure exactly.
+        // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
+        // mechanism remains on the walker side until the T6 epic
+        // retires it, but canonical now matches upstream's structure
+        // exactly.
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
@@ -4210,7 +4207,7 @@ mod tests {
     #[test]
     fn label_pc_index_rejects_non_anchor_insns() {
         // Block / link / catch-landing labels must be rejected — only
-        // `Insn::PcAnchor` returns Some(py_pc).
+        // labels with the `pc{N}` naming convention return Some(py_pc).
         for name in ["block0", "block42", "link1", "catch_landing_3"] {
             assert_eq!(
                 label_pc_index(&Insn::Label(Label::new(name))),
