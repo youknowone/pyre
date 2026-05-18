@@ -4550,6 +4550,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
         self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
@@ -4628,7 +4630,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &compiled_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
@@ -5397,6 +5399,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
         self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
@@ -5488,7 +5492,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &combined_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
@@ -5940,6 +5944,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
         self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
@@ -5968,7 +5974,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &optimized_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
@@ -6294,6 +6300,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
         self.backend.set_constant_types(backend_constant_types);
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
@@ -6322,7 +6330,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &compiled_ops,
                     green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
@@ -8358,6 +8366,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -8423,7 +8433,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_inputargs,
                     &optimized_ops,
                     original_green_key,
-                    &compiled_constant_types,
+                    &compiled_constants_typed,
                 );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -8917,6 +8927,8 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants = backend_constants.clone();
         let compiled_constant_types = backend_constant_types.clone();
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let bridge_trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -9051,7 +9063,7 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         green_key,
-                        &compiled_constant_types,
+                        &compiled_constants_typed,
                     );
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -18129,8 +18141,12 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops_rc, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
+        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+            inputargs,
+            &ops,
+            green_key,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);

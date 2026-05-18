@@ -382,7 +382,7 @@ pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-    constant_types: &std::collections::HashMap<u32, Type>,
+    constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> (
     crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
     crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
@@ -414,9 +414,9 @@ pub(crate) fn build_guard_metadata(
     for arg in inputargs.iter() {
         value_types.insert(arg.index, arg.tp);
     }
-    for (&idx, &tp) in constant_types {
+    for (&idx, c) in constants.iter() {
         if !value_types.contains_key(&idx) {
-            value_types.insert(idx, tp);
+            value_types.insert(idx, c.get_type());
         }
     }
 
@@ -2605,7 +2605,12 @@ mod tests {
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
         let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
+            build_guard_metadata(
+                &inputargs,
+                &[guard],
+                8,
+                &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2656,7 +2661,12 @@ mod tests {
         guard.set_fail_arg_types(fail_arg_types);
 
         let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new());
+            build_guard_metadata(
+                &inputargs,
+                &[guard],
+                0,
+                &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(

@@ -253,6 +253,23 @@ pub(crate) fn lower_typed_constants_to_backend(
     (bits, types)
 }
 
+/// Lower a typed-`Value` constants pool into the dense
+/// `VecAssoc<u32, Const>` shape consumed by pyre-side guard metadata
+/// builders and CompiledTrace storage.
+///
+/// history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
+/// constant classes — `Value::Void` panics rather than fabricate a
+/// nonexistent `ConstVoid`.
+pub(crate) fn lower_typed_constants_to_const_pool(
+    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+) -> crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> {
+    let mut pool = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    for (&k, v) in constants {
+        pool.insert(k, v.to_const());
+    }
+    pool
+}
+
 fn type_for_backend_constant(
     raw_key: u32,
     ops: &[Op],
