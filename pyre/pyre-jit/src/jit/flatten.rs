@@ -2775,15 +2775,29 @@ pub fn flatten_graph_with_walker_slots<'a>(
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:382-391 getcolor(v)`, prepended with the Phase 4
     // bridge lookup documented on `flatten_graph_with_walker_slots`.
+    //
+    // Phase 4 endgame Step 0 — coverage audit.  Counts paired (walker
+    // bridge hit) vs fallback (graph regalloc) lookups so we can
+    // quantify how much of the canonical-vs-walker color divergence is
+    // attributable to incomplete `pair_walker_slot` coverage vs
+    // structural walker NEW-DEVIATION.  Env-gated via
+    // `PYRE_PHASE4_GET_REGISTER_AUDIT=1` so production stays silent.
+    // Counters are mutated via interior mutability (`Cell`) so the
+    // closure remains `FnMut` and matches `GraphFlattener`'s trait
+    // bound.  Drained after `generate_ssa_form` returns.
+    let audit_counters = std::cell::Cell::new((0u32, 0u32));
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
         let walker_slot = walker_slot_for_variable
             .get(variable.id.0 as usize)
             .copied()
             .flatten();
+        let (paired, fallback) = audit_counters.get();
         if let Some(slot) = walker_slot {
+            audit_counters.set((paired + 1, fallback));
             return Register::new(kind, slot);
         }
+        audit_counters.set((paired, fallback + 1));
         let color = regallocs[kind.index()]
             .coloring
             .get(&variable.id)
@@ -2859,6 +2873,26 @@ pub fn flatten_graph_with_walker_slots<'a>(
     flattener.live_force_alive_ops = live_force_alive_ops.to_vec();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
+    // Drop the flattener so its closure-borrowed `audit_counters` Cell
+    // is freed before we read it.  Without the explicit drop the borrow
+    // checker keeps `flattener` (and its captured `get_register`) alive
+    // until the end of the function, which is fine for `Cell::get` (no
+    // exclusive borrow required), but the explicit drop documents the
+    // ownership transition.
+    drop(flattener);
+    if std::env::var_os("PYRE_PHASE4_GET_REGISTER_AUDIT").is_some() {
+        let (paired, fallback) = audit_counters.get();
+        let total = paired + fallback;
+        let paired_pct = if total > 0 {
+            (paired as f64) * 100.0 / (total as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[phase4-get-register-audit] graph={:?} paired={} fallback={} total={} paired_pct={:.1}",
+            graph.name, paired, fallback, total, paired_pct,
+        );
+    }
     ssarepr
 }
 
