@@ -5672,6 +5672,7 @@ fn emit_attached_loop_dispatch(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     ll_loop_code_addr: usize,
+    label_block_id_addr: usize,
     ptr_type: cranelift_codegen::ir::Type,
 ) {
     let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
@@ -5680,13 +5681,45 @@ fn emit_attached_loop_dispatch(
         .load(ptr_type, MemFlags::trusted(), cell_ptr, 0);
     let null = builder.ins().iconst(ptr_type, 0);
     let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
-    let take_block = builder.create_block();
-    builder.append_block_param(take_block, ptr_type);
+    let check_block_id = builder.create_block();
+    builder.append_block_param(check_block_id, ptr_type);
     let miss_block = builder.create_block();
     builder.ins().brif(
         has_entry,
-        take_block,
+        check_block_id,
         &[BlockArg::from(entry)],
+        miss_block,
+        &[],
+    );
+
+    builder.switch_to_block(check_block_id);
+    builder.seal_block(check_block_id);
+    let target_code_ptr = builder.block_params(check_block_id)[0];
+    // `assembler.py:990-993` per-LABEL `_ll_loop_code` parity gate:
+    // pyre's body function shares one entry across all LABELs in the
+    // trace, so the function entry's preamble decodes inputargs in the
+    // FIRST LABEL's layout.  Tail-calling into the entry is correct
+    // only when the JUMP targets the first LABEL (label_block_id == 0).
+    // For non-first LABELs, the target's inputarg count/layout
+    // differs (verified for nbody: trace_id=1 has labels with 24 and
+    // 15 inputargs), so we fall back to the deadframe exit and let
+    // the host loop re-enter the right wrapper via `execute_token`.
+    // Once cranelift's body-entry `br_table` per-LABEL dispatch lands,
+    // this gate can be relaxed.
+    let lbid_ptr = builder
+        .ins()
+        .iconst(ptr_type, label_block_id_addr as i64);
+    let lbid = builder
+        .ins()
+        .load(cl_types::I32, MemFlags::trusted(), lbid_ptr, 0);
+    let zero_i32 = builder.ins().iconst(cl_types::I32, 0);
+    let is_first_label = builder.ins().icmp(IntCC::Equal, lbid, zero_i32);
+    let take_block = builder.create_block();
+    builder.append_block_param(take_block, ptr_type);
+    builder.ins().brif(
+        is_first_label,
+        take_block,
+        &[BlockArg::from(target_code_ptr)],
         miss_block,
         &[],
     );
@@ -6662,14 +6695,18 @@ struct GuardInfo {
     /// vector accumulator variable and reduction operator.
     accum_info: Vec<AccumInfo>,
     /// `assembler.py:2456-2462 closing_jump` parity for cross-loop JUMP.
-    /// `Some(addr)` ⇔ this is an external-JUMP exit and `addr` is the
-    /// heap-stable address of the target `LoopTargetDescr`'s
-    /// `ll_loop_code: AtomicUsize` slot.  `emit_guard_exit` reads the
-    /// slot in-code: non-zero → tail-call into the target loop's entry
-    /// (parity with PyPy's `JMP imm(target)`); zero → fall through to
-    /// the standard deadframe exit so the host loop can pick up the
-    /// jump when the target compiles.
-    external_jump_ll_loop_code_addr: Option<usize>,
+    /// `Some((ll_addr, lbid_addr))` ⇔ this is an external-JUMP exit;
+    /// `ll_addr` is the heap-stable address of the target
+    /// `LoopTargetDescr`'s `ll_loop_code: AtomicUsize` slot, `lbid_addr`
+    /// is the address of its `label_block_id: AtomicU32` slot.
+    /// `emit_guard_exit` reads both in-code: tail-call only when
+    /// `ll_loop_code != 0 && label_block_id == 0` (i.e. the target is
+    /// the first LABEL of its compiled body so the function entry's
+    /// preamble decodes the right inputarg layout — parity with PyPy's
+    /// per-LABEL `JMP imm(target._ll_loop_code)`).  Anything else falls
+    /// through to the standard deadframe exit so the host loop can
+    /// dispatch via `execute_token` to the right wrapper.
+    external_jump_ll_loop_code_addr: Option<(usize, usize)>,
 }
 
 fn identity_recovery_layout(
@@ -12894,10 +12931,22 @@ impl CraneliftBackend {
         // function, and register the entry in LOOP_TARGET_REGISTRY so that
         // an external JUMP whose descr is one of these Labels can re-enter
         // here (assembler.py:2456-2462 closing_jump).
-        // Cranelift can't expose individual block addresses, so we use the
-        // function's code_ptr for every Label in this function — re-entry
-        // re-runs the preamble. PyPy's raw JMP would skip preamble; for
-        // pyre's loops the preamble is just inputarg decoding (idempotent).
+        // Cranelift can't expose individual block addresses, so every
+        // LABEL in this function gets the same `body_ptr` for
+        // `ll_loop_code` and a per-position `label_block_id`
+        // (0, 1, 2, ...).  `assembler.py:990-993`'s per-LABEL
+        // _ll_loop_code semantics are reconstructed at dispatch time:
+        // `emit_attached_loop_dispatch` checks the target's
+        // `label_block_id` cell at runtime and only takes the in-code
+        // tail-call when it's 0 (i.e. the target IS the first LABEL of
+        // its compiled body, so re-entering at the function entry runs
+        // the right preamble for the target's inputargs).  Non-zero
+        // means the JUMP targets a non-first LABEL whose inputarg
+        // count / layout differs from the function entry's preamble
+        // (verified for nbody: trace_id=1 has labels with 24-input
+        // preamble and 15-input body); for those, the dispatch falls
+        // through to the deadframe exit and the host loop re-enters
+        // the right wrapper via `execute_token`.
         //
         // ll_loop_code targets the body (Tail conv) directly so in-code
         // dispatch can `return_call_indirect` between bodies without the
@@ -12910,6 +12959,7 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
         };
+        let mut label_block_id: u32 = 0;
         for op in ops.iter() {
             if op.opcode != OpCode::Label {
                 continue;
@@ -12917,9 +12967,11 @@ impl CraneliftBackend {
             if let Some(descr_ref) = op.descr.as_ref() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
                     target.set_ll_loop_code(body_ptr as usize);
+                    target.set_label_block_id(label_block_id);
                 }
                 register_loop_target(descr_ref, entry.clone());
             }
+            label_block_id += 1;
         }
         Ok(CompiledLoop {
             trace_id,
@@ -13716,12 +13768,21 @@ fn collect_guards(
         // entry on every JUMP exit (parity with the raw `JMP imm(target)`
         // PyPy emits — the immediate is rewritten when the target
         // compiles).  `op.descr` IS the target descr for external JUMPs;
-        // for non-JUMP exits this stays `None`.
+        // for non-JUMP exits this stays `None`.  We also capture the
+        // `label_block_id` slot so the dispatch can refuse to enter the
+        // function preamble when the JUMP targets a non-first LABEL
+        // whose inputarg layout differs (`assembler.py:990-993` per-
+        // LABEL `_ll_loop_code` parity gate).
         let external_jump_ll_loop_code_addr = if is_external_jump {
             op.descr
                 .as_ref()
                 .and_then(|d| d.as_loop_target_descr())
-                .map(|ltd| ltd.ll_loop_code_ptr() as usize)
+                .map(|ltd| {
+                    (
+                        ltd.ll_loop_code_ptr() as usize,
+                        ltd.label_block_id_ptr() as usize,
+                    )
+                })
         } else {
             None
         };

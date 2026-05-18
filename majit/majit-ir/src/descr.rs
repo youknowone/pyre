@@ -1137,6 +1137,34 @@ pub trait LoopTargetDescr: Descr {
             std::any::type_name::<Self>(),
         );
     }
+
+    /// Cranelift parity for `assembler.py:990-993 TargetToken._ll_loop_code`
+    /// per-LABEL entry: PyPy stores each TargetToken's instruction address
+    /// directly, so a JMP lands at the LABEL's first instruction (skipping
+    /// any preamble that precedes a different LABEL).  Cranelift can't expose
+    /// internal block addresses, so the body function takes a `label_index`
+    /// parameter and `br_table`s to the right per-LABEL entry block at
+    /// runtime.  This slot records WHICH LABEL within the compiled body
+    /// function this TargetToken refers to (0 for the first LABEL, 1 for
+    /// the second, ...).  Set by `compile_loop`'s LABEL-registration loop
+    /// at codegen completion.  Read by `emit_attached_loop_dispatch` so the
+    /// source body's `return_call_indirect` passes the right index to the
+    /// target body's `br_table` entry.
+    ///
+    /// Dynasm backend ignores this slot; PyPy x86 instead emits the LABEL
+    /// address directly into `_ll_loop_code`.
+    fn label_block_id(&self) -> u32 {
+        0
+    }
+    fn set_label_block_id(&self, _id: u32) {}
+    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
+        panic!(
+            "label_block_id_ptr requires an AtomicU32-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
@@ -1174,6 +1202,14 @@ struct BasicLoopTargetDescr {
     /// `loop_target_ll_loop_code_ptr` so a `JMP imm(target)` parity
     /// instruction can load the latest entry address.
     ll_loop_code: std::sync::atomic::AtomicUsize,
+    /// `assembler.py:990-993 TargetToken._ll_loop_code` per-LABEL parity:
+    /// records which LABEL within the body function (0 for first LABEL,
+    /// 1 for second, ...) so cranelift's per-LABEL `br_table` dispatch
+    /// can route the `return_call_indirect` to the right entry block.
+    /// Set by cranelift `compile_loop`'s LABEL-registration loop after
+    /// codegen; default 0 covers single-LABEL traces and dynasm (which
+    /// ignores the slot and uses raw LABEL addresses in `_ll_loop_code`).
+    label_block_id: std::sync::atomic::AtomicU32,
     state: Mutex<BasicLoopTargetDescrState>,
 }
 
@@ -1183,6 +1219,7 @@ impl BasicLoopTargetDescr {
             token_id,
             is_preamble_target,
             ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
+            label_block_id: std::sync::atomic::AtomicU32::new(0),
             state: Mutex::new(BasicLoopTargetDescrState::default()),
         }
     }
@@ -1227,6 +1264,20 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 
     fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
         &self.ll_loop_code as *const _
+    }
+
+    fn label_block_id(&self) -> u32 {
+        self.label_block_id
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_label_block_id(&self, id: u32) {
+        self.label_block_id
+            .store(id, std::sync::atomic::Ordering::Release);
+    }
+
+    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
+        &self.label_block_id as *const _
     }
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc> {
