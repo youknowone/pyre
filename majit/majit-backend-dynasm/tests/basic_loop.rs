@@ -12,7 +12,7 @@ use std::sync::{LazyLock, Mutex};
 
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::{
-    GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr,
+    Const, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, VecAssoc, make_array_descr,
     make_loop_target_descr,
 };
 
@@ -62,9 +62,9 @@ fn test_simple_int_add() {
     let const_1 = OpRef::const_int(1);
 
     // Set constant: OpRef::const_int(1) = 1
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
@@ -102,9 +102,9 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
 
     let const_1 = OpRef::const_int(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(const_1.raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_1.raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
@@ -138,9 +138,9 @@ fn test_float_add() {
     let const_half = OpRef::const_float(1);
 
     // constant 0.5 as raw bits
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_float(1).raw(), 0.5f64.to_bits() as i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_float(1).raw(), Const::Float(0.5));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![InputArg::from_type(Type::Float, 0)];
 
@@ -179,9 +179,9 @@ fn test_setarrayitem_raw_float_roundtrip() {
 
     let const_index = OpRef::const_int(3);
 
-    let mut constants = HashMap::new();
-    constants.insert(const_index.raw(), 3i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_index.raw(), Const::Int(3));
+    backend.set_constants_pool(constants);
 
     let array_descr = make_array_descr(0, 8, Type::Float);
 
@@ -277,10 +277,10 @@ fn test_guard_and_loop() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(5).raw(), 5i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    constants.insert(OpRef::const_int(5).raw(), Const::Int(5));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let loop_descr = make_loop_target_descr(token.number, false);
@@ -329,11 +329,11 @@ fn test_float_loop_carried_across_jump() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(5).raw(), 5i64);
-    constants.insert(OpRef::const_float(10).raw(), 0.5f64.to_bits() as i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(OpRef::const_int(5).raw(), Const::Int(5));
+    constants.insert(OpRef::const_float(10).raw(), Const::Float(0.5));
+    constants.insert(OpRef::const_int(1).raw(), Const::Int(1));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),
@@ -424,10 +424,10 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
 
     let const_child_tid = OpRef::const_int(1);
     let const_root_vtable = OpRef::const_int(2);
-    let mut constants = HashMap::new();
-    constants.insert(const_child_tid.raw(), child_tid as i64);
-    constants.insert(const_root_vtable.raw(), root_vtable as i64);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_child_tid.raw(), Const::Int(child_tid as i64));
+    constants.insert(const_root_vtable.raw(), Const::Int(root_vtable as i64));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
     let i0 = inputargs[0].opref();
@@ -473,9 +473,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut token = JitCellToken::new(45);
 
         let const_child_tid = OpRef::const_int(1);
-        let mut constants = HashMap::new();
-        constants.insert(const_child_tid.raw(), child_tid as i64);
-        backend.set_constants(constants);
+        let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+        constants.insert(const_child_tid.raw(), Const::Int(child_tid as i64));
+        backend.set_constants_pool(constants);
 
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
@@ -545,9 +545,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut token = JitCellToken::new(47);
 
         let const_root_a_vtable = OpRef::const_int(1);
-        let mut constants = HashMap::new();
-        constants.insert(const_root_a_vtable.raw(), root_a_vtable as i64);
-        backend.set_constants(constants);
+        let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+        constants.insert(const_root_a_vtable.raw(), Const::Int(root_a_vtable as i64));
+        backend.set_constants_pool(constants);
 
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
@@ -582,9 +582,9 @@ fn test_exception_guards_use_dynasm_emit() {
 
     let expected_class = 0x5151_0000_i64;
     let const_expected_class = OpRef::const_int(1);
-    let mut constants = HashMap::new();
-    constants.insert(const_expected_class.raw(), expected_class);
-    backend.set_constants(constants);
+    let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
+    constants.insert(const_expected_class.raw(), Const::Int(expected_class));
+    backend.set_constants_pool(constants);
 
     let inputargs = vec![];
 
