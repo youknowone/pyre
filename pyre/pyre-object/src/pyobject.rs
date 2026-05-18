@@ -394,25 +394,43 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::excobject::EXC_VALUE_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
+        // UnicodeError is the intermediate parent of UnicodeDecodeError
+        // and UnicodeEncodeError per `pypy/module/exceptions/
+        // interp_exceptions.py:418 W_UnicodeError = _new_exception(
+        // 'UnicodeError', W_ValueError, ...)`.  Register before its
+        // subclasses so the topological-order constraint of the
+        // foreign-pytype loop in pyre-jit's eval init holds.
         (
-            &crate::excobject::EXC_UNICODE_DECODE_ERROR_TYPE,
+            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
             &crate::excobject::EXC_VALUE_ERROR_TYPE,
         ),
         (
+            &crate::excobject::EXC_UNICODE_DECODE_ERROR_TYPE,
+            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
+        ),
+        (
             &crate::excobject::EXC_UNICODE_ENCODE_ERROR_TYPE,
-            &crate::excobject::EXC_VALUE_ERROR_TYPE,
+            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
         ),
         (
             &crate::excobject::EXC_NAME_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
+        // LookupError is the intermediate parent of IndexError and
+        // KeyError per `pypy/module/exceptions/interp_exceptions.py:474
+        // W_LookupError = _new_exception('LookupError', W_Exception,
+        // ...)`.  Register before its subclasses.
         (
-            &crate::excobject::EXC_INDEX_ERROR_TYPE,
+            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
         ),
         (
+            &crate::excobject::EXC_INDEX_ERROR_TYPE,
+            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
+        ),
+        (
             &crate::excobject::EXC_KEY_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
         ),
         (
             &crate::excobject::EXC_ATTRIBUTE_ERROR_TYPE,

@@ -1002,9 +1002,9 @@ thread_local! {
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
         // default which would underallocate `W_ExceptionObject`.
-        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SystemError as u8) {
+        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::UnicodeError as u8) {
             // Round-trip the byte through the enum so we don't depend
-            // on unsafe transmute; every value in [0, SystemError] is
+            // on unsafe transmute; every value in [0, UnicodeError] is
             // a valid `ExcKind` variant by construction.
             let kind = match kind_idx {
                 0 => pyre_object::excobject::ExcKind::BaseException,
@@ -1033,6 +1033,8 @@ thread_local! {
                 23 => pyre_object::excobject::ExcKind::SystemExit,
                 24 => pyre_object::excobject::ExcKind::MemoryError,
                 25 => pyre_object::excobject::ExcKind::SystemError,
+                26 => pyre_object::excobject::ExcKind::LookupError,
+                27 => pyre_object::excobject::ExcKind::UnicodeError,
                 _ => unreachable!(),
             };
             let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
@@ -1450,11 +1452,23 @@ thread_local! {
             (ExcKind::ZeroDivisionError, Some(ExcKind::ArithmeticError)),
             (ExcKind::TypeError, Some(ExcKind::Exception)),
             (ExcKind::ValueError, Some(ExcKind::Exception)),
-            (ExcKind::UnicodeDecodeError, Some(ExcKind::ValueError)),
-            (ExcKind::UnicodeEncodeError, Some(ExcKind::ValueError)),
+            // `pypy/module/exceptions/interp_exceptions.py:418
+            // W_UnicodeError = _new_exception('UnicodeError',
+            // W_ValueError, ...)` — intermediate parent for the two
+            // Unicode error variants; must register before children
+            // because `parent_kind` is resolved by `per_exc_tid`
+            // lookup in this same loop.
+            (ExcKind::UnicodeError, Some(ExcKind::ValueError)),
+            (ExcKind::UnicodeDecodeError, Some(ExcKind::UnicodeError)),
+            (ExcKind::UnicodeEncodeError, Some(ExcKind::UnicodeError)),
             (ExcKind::NameError, Some(ExcKind::Exception)),
-            (ExcKind::IndexError, Some(ExcKind::Exception)),
-            (ExcKind::KeyError, Some(ExcKind::Exception)),
+            // `pypy/module/exceptions/interp_exceptions.py:474
+            // W_LookupError = _new_exception('LookupError',
+            // W_Exception, ...)` — intermediate parent for IndexError
+            // and KeyError.
+            (ExcKind::LookupError, Some(ExcKind::Exception)),
+            (ExcKind::IndexError, Some(ExcKind::LookupError)),
+            (ExcKind::KeyError, Some(ExcKind::LookupError)),
             (ExcKind::AttributeError, Some(ExcKind::Exception)),
             (ExcKind::RuntimeError, Some(ExcKind::Exception)),
             (ExcKind::NotImplementedError, Some(ExcKind::RuntimeError)),

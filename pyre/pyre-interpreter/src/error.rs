@@ -654,11 +654,23 @@ impl PyError {
             ExcKind::OSError => PyErrorKind::OSError,
             ExcKind::FileNotFoundError => PyErrorKind::FileNotFoundError,
             // Unicode errors don't have a dedicated PyErrorKind; they
-            // flow through the general ValueError handler.
-            ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
+            // flow through the general ValueError handler.  UnicodeError
+            // is the intermediate parent of UnicodeDecodeError and
+            // UnicodeEncodeError (`pypy/module/exceptions/
+            // interp_exceptions.py:418`).
+            ExcKind::UnicodeError
+            | ExcKind::UnicodeDecodeError
+            | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
             ExcKind::MemoryError => PyErrorKind::MemoryError,
             ExcKind::SystemError => PyErrorKind::SystemError,
+            // LookupError is the intermediate parent of IndexError and
+            // KeyError (`pypy/module/exceptions/interp_exceptions.py:474`).
+            // No dedicated PyErrorKind variant; the closest non-subclass
+            // mapping is IndexError, which preserves the LookupError-as-
+            // catchall behaviour for runtime callers that don't know
+            // which subclass they're seeing.
+            ExcKind::LookupError => PyErrorKind::IndexError,
         }
     }
 

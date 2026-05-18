@@ -42,6 +42,14 @@ pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
 pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
 pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+/// PyPy `pypy/module/exceptions/interp_exceptions.py:474
+/// W_LookupError = _new_exception('LookupError', W_Exception, ...)`
+/// — intermediate parent for IndexError and KeyError.
+pub static EXC_LOOKUP_ERROR_TYPE: PyType = crate::pyobject::new_pytype("LookupError");
+/// PyPy `pypy/module/exceptions/interp_exceptions.py:418
+/// W_UnicodeError = _new_exception('UnicodeError', W_ValueError, ...)`
+/// — intermediate parent for UnicodeDecodeError and UnicodeEncodeError.
+pub static EXC_UNICODE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnicodeError");
 
 /// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
 /// returned pointer into the allocated `W_ExceptionObject` so the
@@ -76,6 +84,8 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
         ExcKind::MemoryError => &EXC_MEMORY_ERROR_TYPE,
         ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
+        ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
+        ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
     }
 }
 
@@ -127,6 +137,15 @@ pub enum ExcKind {
     /// raised by interpreter-internal invariants (e.g.
     /// `chain_exceptions` rejecting non-BaseException context).
     SystemError = 25,
+    /// `pypy/module/exceptions/interp_exceptions.py:474
+    /// W_LookupError = _new_exception('LookupError', W_Exception, ...)`
+    /// — intermediate parent for IndexError and KeyError.
+    LookupError = 26,
+    /// `pypy/module/exceptions/interp_exceptions.py:418
+    /// W_UnicodeError = _new_exception('UnicodeError', W_ValueError, ...)`
+    /// — intermediate parent for UnicodeDecodeError and
+    /// UnicodeEncodeError.
+    UnicodeError = 27,
 }
 
 /// Layout: `[ob_header | kind: ExcKind | message: *mut String | args_w: PyObjectRef]`
@@ -259,8 +278,10 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 /// One slot per `ExcKind` variant.  Indexed by `kind as u8 as usize`,
 /// so `EXC_KIND_COUNT - 1` is the largest valid index.  Public so
 /// downstream crates (e.g. pyre-jit's GC init) can size per-kind
-/// arrays against the same authoritative bound.
-pub const EXC_KIND_COUNT: usize = (ExcKind::SystemError as u8 as usize) + 1;
+/// arrays against the same authoritative bound.  Anchored on the
+/// highest-numbered variant so adding new ExcKinds at the end of the
+/// enum extends the bound automatically.
+pub const EXC_KIND_COUNT: usize = (ExcKind::UnicodeError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -562,6 +583,8 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::SystemExit => "SystemExit",
         ExcKind::MemoryError => "MemoryError",
         ExcKind::SystemError => "SystemError",
+        ExcKind::LookupError => "LookupError",
+        ExcKind::UnicodeError => "UnicodeError",
     }
 }
 
@@ -592,11 +615,30 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
     if type_name == "OSError" || type_name == "IOError" || type_name == "EnvironmentError" {
         return matches!(kind, ExcKind::OSError | ExcKind::FileNotFoundError);
     }
-    // Unicode errors are subclasses of ValueError.
+    // Unicode errors are subclasses of UnicodeError which is a
+    // subclass of ValueError, so "ValueError" matches everything in
+    // the UnicodeError subtree too.
     if type_name == "ValueError" {
         return matches!(
             kind,
-            ExcKind::ValueError | ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError
+            ExcKind::ValueError
+                | ExcKind::UnicodeError
+                | ExcKind::UnicodeDecodeError
+                | ExcKind::UnicodeEncodeError
+        );
+    }
+    if type_name == "UnicodeError" {
+        return matches!(
+            kind,
+            ExcKind::UnicodeError | ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError
+        );
+    }
+    // LookupError is the intermediate parent of IndexError and KeyError
+    // (`pypy/module/exceptions/interp_exceptions.py:474`).
+    if type_name == "LookupError" {
+        return matches!(
+            kind,
+            ExcKind::LookupError | ExcKind::IndexError | ExcKind::KeyError
         );
     }
     exc_kind_name(kind) == type_name
@@ -644,6 +686,8 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "SystemExit" => Some(ExcKind::SystemExit),
         "MemoryError" => Some(ExcKind::MemoryError),
         "SystemError" => Some(ExcKind::SystemError),
+        "LookupError" => Some(ExcKind::LookupError),
+        "UnicodeError" => Some(ExcKind::UnicodeError),
         _ => None,
     }
 }
@@ -718,6 +762,8 @@ mod tests {
             ExcKind::SystemExit,
             ExcKind::MemoryError,
             ExcKind::SystemError,
+            ExcKind::LookupError,
+            ExcKind::UnicodeError,
         ] {
             let name = exc_kind_name(kind);
             assert_eq!(
