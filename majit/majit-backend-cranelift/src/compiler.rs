@@ -14509,30 +14509,32 @@ impl majit_backend::Backend for CraneliftBackend {
         let _registry_guard = FailDescrRegistryGuard;
 
         // llmodel.py:290-329 `execute_token` parity (raw-output variant).
-        // PyPy's `execute_token` performs exactly one `func(ll_frame, ...)`
-        // call and returns the resulting deadframe; cross-trace transitions
+        // PyPy's `execute_token` performs one `func(ll_frame, ...)` call
+        // and returns the resulting deadframe; cross-trace transitions
         // (bridge attach, `closing_jump`) happen entirely inside the
         // generated machine code via `emit_attached_bridge_dispatch`
         // (compiler.rs:5464) and the JMP-target overlay.  The raw consumer
         // surface (resume-trace builder via `[`crate::pyre`]`) needs the
-        // exit-slot bytes BEFORE virtual reconstruction, so this entry
-        // point preserves the raw-output assembly but does not introduce
-        // any host-side dispatch loop — there is no orthodox equivalent
-        // in RPython.  Slice X2-step2: probe (compiler.rs:slice_x2_probe)
-        // confirmed both `execute_with_inputs` and `execute_token_ints_raw`
-        // already have in-code coverage for bridges (X1-delete) and that
-        // `execute_token_ints_raw` never observes a cross-loop JUMP exit
-        // in any production benchmark — every JUMP exit terminates raw
-        // dispatch with its `is_external_jump` descr.
-        let cur_code_ptr = compiled.code_ptr;
-        let cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
-        let cur_num_ref_roots = compiled.num_ref_roots;
-        let cur_max_output_slots = compiled.max_output_slots;
-        let cur_inputs = args.to_vec();
+        // exit-slot bytes BEFORE virtual reconstruction.
+        //
+        // External JUMP fallback (Slice X2 upstream blocker): cranelift's
+        // in-code `closing_jump` dispatch (`emit_attached_loop_dispatch`)
+        // stays gated off pending the aarch64 Tail-conv defect fix
+        // (`project_cranelift_wrapper_body_tail_leak.md`).  Until then a
+        // guard exit may legitimately surface an `is_external_jump` descr
+        // here, and the host loop re-enters the target trace exactly as
+        // `execute_with_inputs` (compiler.rs:7357) does.  This block
+        // mirrors that dispatch loop with one additional raw-output
+        // termination per `execute_token_ints_raw`'s contract.
+        let mut cur_code_ptr = compiled.code_ptr;
+        let mut cur_fail_descrs: Box<[DescrRef]> = compiled.fail_descrs.clone();
+        let mut cur_num_ref_roots = compiled.num_ref_roots;
+        let mut cur_max_output_slots = compiled.max_output_slots;
+        let mut cur_inputs = args.to_vec();
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
         let attachments: &CpuDescrAttachments = &*attachments_guard;
 
-        {
+        loop {
             let exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
@@ -14625,21 +14627,27 @@ impl majit_backend::Backend for CraneliftBackend {
 
             let fail_descr_fd = as_fd(fail_descr);
 
-            // Cross-loop JUMP must not surface here in raw dispatch: the raw
-            // consumer terminates each call after a single
-            // `run_compiled_code` invocation per `execute_token` parity.
-            // Slice X2-step2 measurement showed zero fires across the full
-            // production bench suite; a non-zero observation indicates the
-            // raw entry has acquired a new caller that re-enters across a
-            // closing_jump exit, which would need its own orthodox port.
-            assert!(
-                !fail_descr_fd.is_external_jump(),
-                "execute_token_ints_raw observed a cross-loop JUMP exit \
-                 (trace_id={}, fail_index={}); raw dispatch is single-call \
-                 per llmodel.py:execute_token parity",
-                fail_descr_fd.trace_id(),
-                fail_index,
-            );
+            // llgraph/runner.py:1130-1140 cross-loop JUMP: switch to the
+            // target trace identified by the TargetToken stored on the
+            // fail descriptor and continue dispatch, mirroring
+            // `execute_with_inputs`.  Required until in-code `closing_jump`
+            // (Slice X2) lands — see
+            // `project_cranelift_wrapper_body_tail_leak.md` for the
+            // upstream cranelift aarch64 Tail-conv blocker.
+            if fail_descr_fd.is_external_jump() {
+                slice_x2_probe::record_execute_with_inputs_hit();
+                let target_entry = fail_descr_fd
+                    .target_descr()
+                    .as_ref()
+                    .and_then(lookup_loop_target)
+                    .expect("external JUMP target must be a registered LoopTargetDescr");
+                cur_code_ptr = target_entry.code_ptr;
+                cur_fail_descrs = target_entry.fail_descrs;
+                cur_num_ref_roots = target_entry.num_ref_roots;
+                cur_max_output_slots = target_entry.max_output_slots;
+                cur_inputs = outputs;
+                continue;
+            }
 
             // llgraph/runner.py:1200-1201 execute_finish.  Finish exits
             // the dispatch loop with the trace's payload — the raw path
@@ -14936,6 +14944,15 @@ impl majit_backend::Backend for CraneliftBackend {
         if force_token.0 == 0 {
             return None;
         }
+        // `force_token_to_dead_frame` resolves `jf_force_descr` via
+        // `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY`. `execute_token*` paths
+        // install this TLS handle via `FailDescrRegistryGuard`, but
+        // `force()` may also be invoked outside an `execute_token*`
+        // scope (e.g. async-forcing / virtualref paths).  Establish the
+        // registry on this thread first so the helper can resolve the
+        // JIT-baked descr address regardless of caller.
+        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
+        let _registry_guard = FailDescrRegistryGuard;
         Some(force_token_to_dead_frame(force_token))
     }
 
