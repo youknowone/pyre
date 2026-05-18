@@ -5869,15 +5869,10 @@ fn emit_guard_exit(
     //     `emit_return_call_common_sequence` (Tail conv aarch64) —
     //     unchanged between 0.130.2 and 0.131.1.
     //
-    // Gate stays off.  Three corruption-source hypotheses ruled out
-    // (per-LABEL inputarg count, stale jf_gcmap/jf_descr, stale
-    // ref_root area).  nbody_50k still corrupts to
-    // `-0.03513214049650899`; further diagnosis is gated behind an
-    // empirical instrumentation epic that compares jf_frame state
-    // byte-for-byte between wrapper-direct entry and tail-call entry
-    // for the same source/target pair.  Independent of the corruption,
-    // raise_catch / fannkuch continue to hit the cranelift 0.130/0.131
-    // aarch64 Tail-conv ~12.5 bytes/take stack leak.
+    // Gate stays off — 4 hypotheses tested + ruled out (per-LABEL,
+    // jf_gcmap/jf_descr clear, ref_root zero, main-loop frame-realloc).
+    // Next diagnostic step requires runtime instrumentation comparing
+    // wrapper-direct vs tail-call entry byte-by-byte.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
