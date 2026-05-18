@@ -455,6 +455,21 @@ pub trait JitCodeSym {
 
 pub trait JitCodeRuntime {
     fn label_at(&self, pc: usize) -> usize;
+
+    /// Slice X-D: resolve a `JitCellToken.number` to the production
+    /// `Arc<JitCellToken>` that the warm cell / `CompiledEntry::token` /
+    /// `alive_loops` already hold.  When the dispatcher sees a
+    /// `BC_CALL_ASSEMBLER_*` opcode it asks the runtime for the real Arc
+    /// so the recorded descr carries production token identity
+    /// (compile.py:187 parity) and skips the synth-Arc +
+    /// `jitcell_token_by_number` keepalive fallback.  Returns `None` for
+    /// standalone test runtimes that have no warmstate / metainterp.
+    fn jitcell_token_arc_for_number(
+        &self,
+        _token_number: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        None
+    }
 }
 
 pub struct ClosureRuntime<FLabel> {
@@ -473,6 +488,42 @@ where
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
+    }
+}
+
+/// Slice X-D-aware `JitCodeRuntime` carrying both the `label_at` and
+/// the `jitcell_token_arc_for_number` closures.  Used by
+/// `MetaInterp::trace_jitcode_with_framestack` so the dispatcher can
+/// resolve CALL_ASSEMBLER targets to their production Arcs via
+/// `MetaInterp::jitcell_token_by_number`.
+pub struct ClosureRuntimeWithResolver<FLabel, FResolve> {
+    label_at: FLabel,
+    resolve_token: FResolve,
+}
+
+impl<FLabel, FResolve> ClosureRuntimeWithResolver<FLabel, FResolve> {
+    pub fn new(label_at: FLabel, resolve_token: FResolve) -> Self {
+        Self {
+            label_at,
+            resolve_token,
+        }
+    }
+}
+
+impl<FLabel, FResolve> JitCodeRuntime for ClosureRuntimeWithResolver<FLabel, FResolve>
+where
+    FLabel: Fn(usize) -> usize,
+    FResolve: Fn(u64) -> Option<std::sync::Arc<majit_backend::JitCellToken>>,
+{
+    fn label_at(&self, pc: usize) -> usize {
+        (self.label_at)(pc)
+    }
+
+    fn jitcell_token_arc_for_number(
+        &self,
+        token_number: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        (self.resolve_token)(token_number)
     }
 }
 
@@ -3990,7 +4041,10 @@ where
                 call_void_function(concrete_ptr, &concrete_args);
                 // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
                 //    direct_assembler_call → history.record_nospec)
-                ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
+                match _runtime.jitcell_token_arc_for_number(token_number) {
+                    Some(arc) => ctx.call_assembler_void_arc_typed(arc, &args, &arg_types),
+                    None => ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types),
+                }
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py:2078-2079)
                 if matches!(
@@ -4210,8 +4264,10 @@ where
                 self.clear_exception();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
-                let traced =
-                    ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
+                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
+                    Some(arc) => ctx.call_assembler_int_arc_typed(arc, &args, &arg_types),
+                    None => ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types),
+                };
                 self.set_int_reg(dst, Some(traced), Some(concrete));
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -4269,8 +4325,10 @@ where
                 self.clear_exception();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
-                let traced =
-                    ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
+                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
+                    Some(arc) => ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types),
+                    None => ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types),
+                };
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -4328,8 +4386,12 @@ where
                 self.clear_exception();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
-                let traced =
-                    ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
+                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
+                    Some(arc) => ctx.call_assembler_float_arc_typed(arc, &args, &arg_types),
+                    None => {
+                        ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types)
+                    }
+                };
                 self.set_float_reg(dst, Some(traced), Some(concrete));
                 if matches!(
                     Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
