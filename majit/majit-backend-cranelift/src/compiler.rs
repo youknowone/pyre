@@ -693,6 +693,35 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
         inputs,
         caller_prefix_layout,
     );
+
+    // Slice X3-B dual-verify: the stack-top `CallAssemblerCallerContext`
+    // pushed by the dispatch function (`execute_with_inputs` /
+    // `execute_bridge` / `execute_registered_loop_target` /
+    // `execute_token_ints_raw`) must reconstruct the same caller_layout
+    // as the explicit parameters.  Slice X3-C drops the parameters and
+    // makes the stack the sole source; this assert protects the
+    // transition by catching producer/consumer divergence.
+    with_current_call_assembler_caller_context(|maybe_ctx| {
+        let ctx = maybe_ctx.expect(
+            "X3-B: CallAssemblerCallerContextGuard must be in scope at \
+             every wrap_call_assembler_deadframe_with_caller_prefix call \
+             site",
+        );
+        let from_stack = caller_prefix_recovery_layout(
+            ctx.trace_id,
+            ctx.header_pc,
+            ctx.source_guard,
+            &ctx.input_types,
+            &ctx.inputs,
+            ctx.caller_prefix_layout.as_ref(),
+        );
+        assert_eq!(
+            from_stack, caller_layout,
+            "X3-B: CallAssemblerCallerContext stack-top must reconstruct \
+             the same caller_layout as the wrap parameters"
+        );
+    });
+
     let recovery_layout = inner_recovery_layout.prefixed_by(Some(&caller_layout));
 
     // Replace fail_descr on the inner JitFrameDeadFrame to carry the
@@ -744,7 +773,6 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
 /// once Slice X4 collapses the dispatch loop to a single-call
 /// `execute_token` (PyPy `llmodel.execute_token`).
 #[derive(Clone)]
-#[allow(dead_code)] // wired up by Slice X3-B
 struct CallAssemblerCallerContext {
     trace_id: u64,
     header_pc: u64,
@@ -754,7 +782,6 @@ struct CallAssemblerCallerContext {
     caller_prefix_layout: Option<ExitRecoveryLayout>,
 }
 
-#[allow(dead_code)] // wired up by Slice X3-B
 impl CallAssemblerCallerContext {
     fn from_compiled_loop(compiled: &CompiledLoop, inputs: &[i64]) -> Self {
         Self {
@@ -798,29 +825,57 @@ thread_local! {
     /// caller of any CALL_ASSEMBLER deadframe interception currently
     /// being processed.
     ///
-    /// Slice X3-A: declared but not pushed/popped — Slice X3-B wires
-    /// the producer/consumer during the dual-write transition with the
-    /// existing overlay descr synthesis.  Thread-local matches pyre's
-    /// single-threaded JIT execution, mirroring the surrounding
-    /// `LOOP_TARGET_REGISTRY` shape.
-    #[allow(dead_code)]
+    /// Slice X3-B wires the producer (CallAssemblerCallerContextGuard at
+    /// every wrap site) and the consumer (dual-verify in
+    /// `wrap_call_assembler_deadframe_with_caller_prefix`).  Thread-local
+    /// matches pyre's single-threaded JIT execution, mirroring the
+    /// surrounding `LOOP_TARGET_REGISTRY` shape.
     static CALL_ASSEMBLER_CALLER_STACK: RefCell<Vec<CallAssemblerCallerContext>> =
         const { RefCell::new(Vec::new()) };
 }
 
-#[allow(dead_code)] // wired up by Slice X3-B
 fn push_call_assembler_caller_context(ctx: CallAssemblerCallerContext) {
     CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow_mut().push(ctx));
 }
 
-#[allow(dead_code)] // wired up by Slice X3-B
 fn pop_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
     CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow_mut().pop())
 }
 
-#[allow(dead_code)] // consumed by Slice X3-B deopt callback
+#[allow(dead_code)] // consumed by Slice X3-C deopt callback
 fn current_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
     CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow().last().cloned())
+}
+
+/// Borrow-form reader for the stack-top `CallAssemblerCallerContext`.
+/// Lets the dual-verify check in
+/// `wrap_call_assembler_deadframe_with_caller_prefix` reconstruct the
+/// caller-prefix layout without cloning the context's Vec fields.
+fn with_current_call_assembler_caller_context<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<&CallAssemblerCallerContext>) -> R,
+{
+    CALL_ASSEMBLER_CALLER_STACK.with(|s| f(s.borrow().last()))
+}
+
+/// RAII guard that pushes a `CallAssemblerCallerContext` on construction
+/// and pops on drop.  Used at every `wrap_call_assembler_deadframe_with_
+/// caller_prefix` call site so the wrap consumer can read the caller's
+/// data off the stack — Slice X3-B dual-write phase keeps the explicit
+/// parameter path active alongside; Slice X3-C drops the parameters.
+struct CallAssemblerCallerContextGuard;
+
+impl CallAssemblerCallerContextGuard {
+    fn push(ctx: CallAssemblerCallerContext) -> Self {
+        push_call_assembler_caller_context(ctx);
+        Self
+    }
+}
+
+impl Drop for CallAssemblerCallerContextGuard {
+    fn drop(&mut self) {
+        pop_call_assembler_caller_context();
+    }
 }
 
 /// Global exception state for JIT-compiled code.
@@ -2806,6 +2861,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // registers never set `source_guard`, so pass `None` directly.
             // Bridges carry their own `BridgeData.source_guard` and never
             // reach this `execute_registered_loop_target` path.
+            let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
+                CallAssemblerCallerContext::from_registered_loop_target(
+                    target,
+                    &current_inputs,
+                ),
+            );
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 target.trace_id,
@@ -7491,6 +7552,9 @@ impl CraneliftBackend {
 
             // CALL_ASSEMBLER deadframe interception.
             if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+                let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
+                    CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
+                );
                 return wrap_call_assembler_deadframe_with_caller_prefix(
                     frame,
                     compiled.trace_id,
@@ -7602,6 +7666,9 @@ impl CraneliftBackend {
         let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+            let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
+                CallAssemblerCallerContext::from_bridge_data(bridge, bridge_inputs),
+            );
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 bridge.trace_id,
@@ -14614,6 +14681,9 @@ impl majit_backend::Backend for CraneliftBackend {
 
             // CALL_ASSEMBLER deadframe interception — exits raw dispatch.
             if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+                let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
+                    CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
+                );
                 let frame = wrap_call_assembler_deadframe_with_caller_prefix(
                     frame,
                     compiled.trace_id,
