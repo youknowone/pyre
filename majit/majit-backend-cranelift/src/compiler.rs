@@ -13977,6 +13977,17 @@ impl majit_backend::Backend for CraneliftBackend {
         self.constant_types = constant_types;
     }
 
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+        self.constants.clear();
+        self.constant_types.clear();
+        self.constants.reserve(constants.len());
+        self.constant_types.reserve(constants.len());
+        for (&k, c) in constants.iter() {
+            self.constants.insert(k, c.as_raw_i64());
+            self.constant_types.insert(k, c.get_type());
+        }
+    }
+
     fn set_next_trace_id(&mut self, trace_id: u64) {
         self.next_trace_id = Some(trace_id);
     }

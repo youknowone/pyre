@@ -362,6 +362,14 @@ impl majit_backend::Backend for WasmBackend {
         self.constants = constants;
     }
 
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+        self.constants.clear();
+        self.constants.reserve(constants.len());
+        for (&k, c) in constants.iter() {
+            self.constants.insert(k, c.as_raw_i64());
+        }
+    }
+
     fn set_next_trace_id(&mut self, trace_id: u64) {
         self.trace_counter = trace_id;
     }
