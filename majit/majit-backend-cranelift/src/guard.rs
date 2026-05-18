@@ -151,6 +151,15 @@ pub struct JitFrameDeadFrame {
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
+    /// Slice X3-D side-channel: caller-prefix layout assembled from the
+    /// `CALL_ASSEMBLER_CALLER_STACK` top at deadframe interception
+    /// (`wrap_call_assembler_deadframe_with_caller_prefix`).  When `Some`,
+    /// `compiler.rs::deadframe_layout` prefixes the descr's own recovery
+    /// layout by this value before returning.  Replaces the old overlay
+    /// descr synthesis (`overlay_deadframe_fail_descr` + overlay registry)
+    /// — the deadframe's `fail_descr` now keeps the callee's own Arc
+    /// identity rather than being swapped for a synthetic one.
+    pub call_assembler_caller_layout: Option<ExitRecoveryLayout>,
     /// True when `register_roots` has registered `jf_gcref` with the
     /// active cranelift GC, so `Drop` knows to remove it. Replaces the
     /// pre-removal `gc_runtime_id` field that paired registration with
@@ -179,6 +188,7 @@ impl JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
             latest_descr,
+            call_assembler_caller_layout: None,
             roots_registered: false,
             _heap_owner: heap_owner,
         }
