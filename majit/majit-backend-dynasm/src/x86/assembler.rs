@@ -161,6 +161,13 @@ pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
 pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     emit_footer_shadowstack_raw(asm);
     dynasm!(asm ; .arch x64 ; mov rax, rbp);
+    // Win64: 8 callee-save GPRs × 8 = 64 bytes.  PyPy's
+    // `arch.py:43` notes "never use r13 on Win64", but pyre's
+    // `genop_call_assembler` uses r13 as a scratch that survives
+    // a `free()` call (no other unused callee-save reg is live
+    // enough at that point), so pyre adds r13 to the saved set —
+    // filling the slot that was 8-byte padding under PyPy's
+    // "5 regs + r14/r15 in shadow store + 12 pad" layout.
     #[cfg(target_os = "windows")]
     dynasm!(asm ; .arch x64
         ; mov rbx, [rsp + 0]
@@ -170,6 +177,7 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
         ; mov r14, [rsp + 32]
         ; mov r15, [rsp + 40]
         ; mov rbp, [rsp + 48]
+        ; mov r13, [rsp + 56]
         ; add rsp, 64
     );
     #[cfg(not(target_os = "windows"))]
@@ -213,7 +221,14 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// otherwise.  PyPy itself would silently bake 0 in this case (and
 /// fail at `handle_fail` dispatch time); pyre prefers a build-time
 /// fail-fast for the same invariant.
-pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
+///
+/// Returns `(buffer, entry_addr)`.  The caller (`X86CpuExt`) owns the
+/// `ExecutableBuffer` for the lifetime of the per-CPU stash so the RX
+/// page is unmapped when the CPU drops — matches PyPy's `asmmemmgr`,
+/// which roots helper buffers on the CPU.
+pub(crate) fn build_propagate_exception_path(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+) -> (ExecutableBuffer, usize) {
     let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
     let propagate_descr = cpu_handle
         .read()
@@ -251,9 +266,7 @@ pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescr
     emit_call_footer_raw(&mut asm);
     let buffer = asm.finalize().expect("propagate_exception_path: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
-    // Process-lifetime mapping; PyPy roots through `asmmemmgr`.
-    std::mem::forget(buffer);
-    ptr
+    (buffer, ptr)
 }
 
 /// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
@@ -288,10 +301,14 @@ pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescr
 /// (`X86CpuExt::ensure_malloc_slowpath_fixed`) builds the propagate
 /// path first and threads its address here, matching PyPy's
 /// `setup_once` ordering.
+///
+/// Returns `(buffer, entry_addr)`.  Same ownership rule as
+/// `build_propagate_exception_path` — the caller (`X86CpuExt`) holds
+/// the `ExecutableBuffer` so the RX page lives as long as the CPU.
 pub(crate) fn build_malloc_slowpath_fixed(
     cpu_handle: &crate::guard::CpuDescrHandle,
     propagate_path: usize,
-) -> usize {
+) -> (ExecutableBuffer, usize) {
     // `cpu_handle` is still threaded through for symmetry with PyPy
     // (where `_build_malloc_slowpath` reads several `self.cpu`-rooted
     // attrs).  The propagate descr itself is now baked once into the
@@ -444,11 +461,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
 
     let buffer = asm.finalize().expect("malloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
-    // The helper code must stay mapped for the lifetime of the process.
-    // PyPy uses the shared `asmmemmgr` for the same role; pyre leaks the
-    // ExecutableBuffer so the underlying VirtualAlloc page is retained.
-    std::mem::forget(buffer);
-    ptr
+    (buffer, ptr)
 }
 
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
@@ -1445,14 +1458,19 @@ impl<'a> Assembler386<'a> {
         // Layout (lowest address first, all offsets relative to the new
         // rsp after the SUB):
         //   Win64:  [+0 rbx, +8 rsi, +16 rdi, +24 r12, +32 r14, +40 r15,
-        //            +48 rbp, +56 pad]  → SUB 64 (8 slots; body rsp at
+        //            +48 rbp, +56 r13]   → SUB 64 (8 slots; body rsp at
         //            8 mod 16 since function entry rsp was 8 mod 16 too)
         //   SysV:   [+0 rbx, +8 r12, +16 r13, +24 r14, +32 r15, +40 rbp]
         //            → SUB 48 (6 slots; body rsp at 8 mod 16)
         //
         // `r12` carries the caller's `rbp` (saved jf_ptr) across nested
         // `genop_call_assembler` reentries, so it must be preserved
-        // alongside the rest of the callee-save set.
+        // alongside the rest of the callee-save set.  Win64 also saves
+        // `r13` even though PyPy's `arch.py:43` skips it ("never use
+        // r13"): pyre's `genop_call_assembler` does use r13 as a
+        // scratch reg that must survive `free()`, so r13 occupies the
+        // previously-padding slot at +56 and is restored by every
+        // `_call_footer`/`emit_call_footer_raw` variant.
         #[cfg(target_os = "windows")]
         dynasm!(self.mc
             ; .arch x64
@@ -1464,6 +1482,7 @@ impl<'a> Assembler386<'a> {
             ; mov [rsp + 32], r14
             ; mov [rsp + 40], r15
             ; mov [rsp + 48], rbp
+            ; mov [rsp + 56], r13
             ; mov rbp, rcx
         );
         #[cfg(not(target_os = "windows"))]
@@ -1524,6 +1543,9 @@ impl<'a> Assembler386<'a> {
                     // path, so no shadow-stack entry has been pushed yet.
                     ; mov rax, rbp
                 );
+                // Win64: r13 restored from the +56 slot — see
+                // `_call_header` for why pyre saves r13 even though
+                // PyPy's `arch.py:43` does not.
                 #[cfg(target_os = "windows")]
                 dynasm!(self.mc
                     ; .arch x64
@@ -1534,6 +1556,7 @@ impl<'a> Assembler386<'a> {
                     ; mov r14, [rsp + 32]
                     ; mov r15, [rsp + 40]
                     ; mov rbp, [rsp + 48]
+                    ; mov r13, [rsp + 56]
                     ; add rsp, 64
                 );
                 #[cfg(not(target_os = "windows"))]

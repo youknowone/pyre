@@ -14,30 +14,36 @@
 //! sequences today and has no per-CPU trampoline to memoise.
 
 use crate::guard::CpuDescrHandle;
+use dynasmrt::ExecutableBuffer;
 
-/// Lazily-materialised per-CPU x86 trampoline addresses.
+/// Lazily-materialised per-CPU x86 trampolines.
 ///
-/// Both fields are set once on first use and reused for every
+/// Both addresses are set once on first use and reused for every
 /// subsequent `compile_loop` / `compile_bridge` on this CPU.  The
-/// underlying executable buffers are `mem::forget`-leaked into
-/// executable memory inside `build_*`, matching PyPy's `asmmemmgr`
-/// rooting the buffer for the CPU's lifetime.
+/// owning `ExecutableBuffer`s are kept alongside so the RX pages are
+/// unmapped exactly when the CPU is dropped — matching PyPy's
+/// `asmmemmgr`, which roots helper buffers on the CPU.
 pub(crate) struct X86CpuExt {
-    /// `assembler.py:63 self.malloc_slowpath` parity.  Address of the
-    /// fixed-size malloc slowpath helper built by
-    /// `build_malloc_slowpath_fixed`.
+    /// `assembler.py:63 self.malloc_slowpath` parity.  Entry address
+    /// of the fixed-size malloc slowpath helper built by
+    /// `build_malloc_slowpath_fixed`; `_buffer` is the matching RX
+    /// mapping kept for the lifetime of this struct.
     malloc_slowpath_fixed: Option<usize>,
+    _malloc_slowpath_fixed_buffer: Option<ExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath (and, in PyPy,
     /// the stack check slowpath) JMPs to on OOM / propagate.
     propagate_exception_path: Option<usize>,
+    _propagate_exception_path_buffer: Option<ExecutableBuffer>,
 }
 
 impl X86CpuExt {
     pub(crate) fn new() -> Self {
         Self {
             malloc_slowpath_fixed: None,
+            _malloc_slowpath_fixed_buffer: None,
             propagate_exception_path: None,
+            _propagate_exception_path_buffer: None,
         }
     }
 
@@ -53,7 +59,13 @@ impl X86CpuExt {
         if let Some(addr) = self.propagate_exception_path {
             return addr;
         }
-        let addr = super::assembler::build_propagate_exception_path(cpu_handle);
+        let (buffer, addr) = super::assembler::build_propagate_exception_path(cpu_handle);
+        debug_assert!(
+            addr != 0,
+            "build_propagate_exception_path returned NULL entry address — \
+             dynasm finalize is expected to yield a non-zero buffer_ptr"
+        );
+        self._propagate_exception_path_buffer = Some(buffer);
         self.propagate_exception_path = Some(addr);
         addr
     }
@@ -73,7 +85,14 @@ impl X86CpuExt {
             return addr;
         }
         let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let addr = super::assembler::build_malloc_slowpath_fixed(cpu_handle, propagate_path);
+        let (buffer, addr) =
+            super::assembler::build_malloc_slowpath_fixed(cpu_handle, propagate_path);
+        debug_assert!(
+            addr != 0,
+            "build_malloc_slowpath_fixed returned NULL entry address — \
+             dynasm finalize is expected to yield a non-zero buffer_ptr"
+        );
+        self._malloc_slowpath_fixed_buffer = Some(buffer);
         self.malloc_slowpath_fixed = Some(addr);
         addr
     }

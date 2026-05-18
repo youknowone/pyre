@@ -1698,14 +1698,33 @@ impl Backend for DynasmBackend {
         // propagate trampoline at setup time.  Pyre defers the bake to
         // `X86CpuExt::ensure_propagate_exception_path` (x86/cpu_ext.rs),
         // which reads the descr pointer directly from
-        // `descr_attachments` and embeds it in the helper.  Storing the
-        // descr Arc here is the only step needed; the malloc slowpath
-        // later tail-JMPs to that propagate trampoline so it does not
-        // read the descr itself.
-        self.descr_attachments
-            .write()
-            .unwrap()
-            .propagate_exception_descr = Some(descr);
+        // `descr_attachments` and embeds it in the helper.
+        //
+        // Per `pyjitpl.py:2283` and pyre's `attach_descrs_to_cpu` (this
+        // setter is intentionally idempotent across repeated
+        // `register_jitdriver_sd` calls) the same `Arc<Descr>` may be
+        // re-installed multiple times during init.  That is fine — the
+        // baked immediate stays valid because the Arc identity (and
+        // therefore the pointer) is unchanged.  What is *not* fine is
+        // installing a *different* descr after the trampoline has
+        // baked the previous one as an immediate: the cached helper
+        // would silently keep routing OOM exits through the old descr.
+        // Reject that mismatch here so the wire-up bug surfaces
+        // immediately rather than at the next OOM.
+        let mut attachments = self.descr_attachments.write().unwrap();
+        if let Some(existing) = attachments.propagate_exception_descr.as_ref() {
+            assert!(
+                std::sync::Arc::ptr_eq(existing, &descr),
+                "set_propagate_exception_descr received a different descr Arc \
+                 after the previous install; pyre's per-CPU propagate \
+                 trampoline bakes the descr as an i64 immediate at first \
+                 build, so swapping the descr would leave the cached helper \
+                 routing OOM exits through the old descr (pyjitpl.py:2283 \
+                 expects a single stable descr per CPU)."
+            );
+            return;
+        }
+        attachments.propagate_exception_descr = Some(descr);
     }
 
     fn compile_bridge(
