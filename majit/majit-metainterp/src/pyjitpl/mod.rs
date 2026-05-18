@@ -160,10 +160,12 @@ pub(crate) struct CompiledTrace {
     pub(crate) inputargs: Vec<InputArg>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
     pub(crate) ops: Vec<majit_ir::Op>,
-    /// Constant pool paired with `ops` for blackhole fallback.
-    pub(crate) constants: HashMap<u32, i64>,
-    /// Constant types for the constant pool entries.
-    pub(crate) constant_types: HashMap<u32, Type>,
+    /// Typed constant pool paired with `ops` for blackhole fallback.
+    /// history.py:220/261/307 `ConstInt`/`ConstFloat`/`ConstPtr` pin
+    /// type with value, so `Const` carries both — the legacy
+    /// `(constants: HashMap<u32, i64>, constant_types: HashMap<u32, Type>)`
+    /// parallel pair has been collapsed.
+    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
@@ -4684,8 +4686,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: inputargs.clone(),
                         ops: compiled_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -5539,8 +5540,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: inputargs.clone(),
                         ops: combined_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -6019,8 +6019,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: trace.inputargs.clone(),
                         ops: optimized_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types.clone(),
+                        constants: compiled_constants_typed.clone(),
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -6375,8 +6374,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: trace.inputargs.clone(),
                         ops: compiled_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types,
+                        constants: compiled_constants_typed,
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -8479,8 +8477,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTrace {
                         inputargs: bridge_inputargs.to_vec(),
                         ops: optimized_ops,
-                        constants: compiled_constants,
-                        constant_types: compiled_constant_types,
+                        constants: compiled_constants_typed,
                         exit_layouts,
                         terminal_exit_layouts,
                     },
@@ -9116,8 +9113,7 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledTrace {
                             inputargs: bridge_inputargs.to_vec(),
                             ops: optimized_ops,
-                            constants: compiled_constants,
-                            constant_types: compiled_constant_types,
+                            constants: compiled_constants_typed,
                             exit_layouts,
                             terminal_exit_layouts,
                         },
@@ -9248,12 +9244,7 @@ impl<M: Clone> MetaInterp<M> {
         // Int/Ref mismatch. Reserve bridge's pool past the parent's
         // highest const index so every new allocation is disjoint.
         if let Some((_, source_trace)) = Self::trace_for_exit(compiled, norm_tid) {
-            let max_const = source_trace
-                .constants
-                .keys()
-                .copied()
-                .chain(source_trace.constant_types.keys().copied())
-                .max();
+            let max_const = source_trace.constants.keys().copied().max();
             if let (Some(max), Some(ref mut ctx)) = (max_const, self.tracing.as_mut()) {
                 ctx.constants.reserve_index_past(max);
             }
@@ -9707,9 +9698,17 @@ impl<M: Clone> MetaInterp<M> {
 
         let initial_values_hm: HashMap<u32, i64> =
             initial_values.iter().map(|(&k, &v)| (k, v)).collect();
+        // Lower typed `Const` pool to the legacy `(u32 → i64)` shape the
+        // blackhole interpreter consumes; `Const::as_raw_i64()` projects
+        // each variant to its encoded `rd_consts[idx].0` bits.
+        let constants_hm: HashMap<u32, i64> = trace
+            .constants
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
         Some(blackhole_execute_with_state_ca(
             &trace.ops,
-            &trace.constants,
+            &constants_hm,
             &initial_values_hm,
             guard_op_index + 1,
             exception,
@@ -17608,9 +17607,10 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants = HashMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 2);
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        constants.insert(100, majit_ir::Const::Int(1));
+        constants.insert(101, majit_ir::Const::Int(2));
         let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
@@ -17618,7 +17618,6 @@ mod tests {
                 inputargs: inputargs.clone(),
                 ops,
                 constants,
-                constant_types: HashMap::new(),
                 exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
@@ -17792,8 +17791,7 @@ mod tests {
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: HashMap::new(),
-                constant_types: HashMap::new(),
+                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 exit_layouts,
                 terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
@@ -17889,8 +17887,7 @@ mod tests {
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: HashMap::new(),
-                constant_types: HashMap::new(),
+                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 exit_layouts,
                 terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
@@ -18173,14 +18170,18 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
+        let mut constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for (&k, &v) in &constants {
+            constants_typed.insert(k, majit_ir::Const::Int(v));
+        }
         let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.to_vec(),
                 ops,
-                constants,
-                constant_types: HashMap::new(),
+                constants: constants_typed,
                 exit_layouts,
                 terminal_exit_layouts,
             },

@@ -1351,14 +1351,27 @@ impl std::fmt::Display for Op {
     }
 }
 
+/// Lookup-by-u32 abstraction so `format_trace` can accept any
+/// constant-pool shape (`HashMap<u32, V>`, `VecAssoc<u32, V>`, …)
+/// without prescribing the underlying container.
+pub trait ConstLookup<V> {
+    fn lookup(&self, key: u32) -> Option<&V>;
+}
+
+impl<V> ConstLookup<V> for std::collections::HashMap<u32, V> {
+    fn lookup(&self, key: u32) -> Option<&V> {
+        self.get(&key)
+    }
+}
+
 /// Format a trace (list of ops) with optional constants for debugging.
 ///
 /// Generic over the constants value type so both the optimizer-side
 /// typed `Value` pool and the backend-side legacy `i64` pool format
 /// uniformly through their `Debug` impls.
-pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>>(
+pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
     ops: &[T],
-    constants: &std::collections::HashMap<u32, V>,
+    constants: &C,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1377,7 +1390,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>>(
             if i > 0 {
                 write!(out, ", ").unwrap();
             }
-            if let Some(val) = constants.get(&arg.raw()) {
+            if let Some(val) = constants.lookup(arg.raw()) {
                 write!(out, "{val:?}").unwrap();
             } else {
                 write!(out, "v{}", arg.raw()).unwrap();
@@ -1397,7 +1410,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>>(
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                if let Some(val) = constants.get(&arg.raw()) {
+                if let Some(val) = constants.lookup(arg.raw()) {
                     write!(out, "{val:?}").unwrap();
                 } else {
                     write!(out, "v{}", arg.raw()).unwrap();

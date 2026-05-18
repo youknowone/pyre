@@ -195,3 +195,9 @@ impl<'a, K: Eq, V> IntoIterator for &'a VecAssoc<K, V> {
             .map(split as fn(&'a (K, V)) -> (&'a K, &'a V))
     }
 }
+
+impl<V> crate::resoperation::ConstLookup<V> for VecAssoc<u32, V> {
+    fn lookup(&self, key: u32) -> Option<&V> {
+        self.get(&key)
+    }
+}
