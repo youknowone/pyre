@@ -1787,21 +1787,30 @@ impl Backend for DynasmBackend {
         // The common case is the *same* `Arc<Descr>` arriving twice —
         // idempotent, no observable effect.  Tests that mint a fresh
         // `PropagateExceptionDescr` on every call also reach this
-        // setter; allow the overwrite so the second install does not
-        // panic.  The remaining risk — a *different* descr being
-        // installed *after* the trampoline has baked the previous
-        // pointer as an immediate — is a strictly post-`compile_loop`
-        // hazard; in production the descr is set exactly once before
-        // any compile fires, so this path never executes there.
-        let mut attachments = self.descr_attachments.write().unwrap();
-        if attachments
-            .propagate_exception_descr
-            .as_ref()
-            .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
+        // setter, so a non-identical `Arc` is allowed to overwrite the
+        // previous attachment.
+        //
+        // When the `Arc` actually changes after the per-CPU propagate
+        // / malloc trampolines have been built, those trampolines
+        // still carry the *previous* descr pointer baked as an
+        // immediate; OOM exits would write the stale pointer into
+        // `jf_descr` and miss the propagate-exception dispatch.
+        // Invalidate the dependent caches so the next
+        // `ensure_propagate_exception_path` /
+        // `ensure_malloc_slowpath_fixed` rebuilds against the new
+        // descr pointer.
         {
-            return;
+            let mut attachments = self.descr_attachments.write().unwrap();
+            if attachments
+                .propagate_exception_descr
+                .as_ref()
+                .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
+            {
+                return;
+            }
+            attachments.propagate_exception_descr = Some(descr);
         }
-        attachments.propagate_exception_descr = Some(descr);
+        self.arch_cpu_ext.invalidate_propagate_dependent();
     }
 
     fn compile_bridge(

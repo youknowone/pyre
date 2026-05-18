@@ -19,4 +19,11 @@ impl Aarch64CpuExt {
     pub(crate) fn new() -> Self {
         Self
     }
+
+    /// Cross-arch stub matching `X86CpuExt::invalidate_propagate_dependent`.
+    /// aarch64 doesn't cache propagate / malloc trampolines yet (the
+    /// sequences are inlined per call site), so there is nothing to
+    /// drop here.  When aarch64 grows per-CPU trampolines, mirror the
+    /// x86 invalidation.
+    pub(crate) fn invalidate_propagate_dependent(&mut self) {}
 }

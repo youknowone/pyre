@@ -96,4 +96,23 @@ impl X86CpuExt {
         self.malloc_slowpath_fixed = Some(addr);
         addr
     }
+
+    /// Drop cached trampolines that bake `propagate_exception_descr`
+    /// as an immediate.  Called from
+    /// `DynasmBackend::set_propagate_exception_descr` whenever the
+    /// attached descr `Arc` is replaced (test harnesses that re-mint
+    /// the descr per setup), so the next
+    /// `ensure_propagate_exception_path` / `ensure_malloc_slowpath_fixed`
+    /// rebuilds against the new pointer instead of routing OOM exits
+    /// through a stale baked descr.
+    ///
+    /// Both addresses must clear together: `build_malloc_slowpath_fixed`
+    /// bakes the propagate-path entry as an immediate, so a fresh
+    /// propagate path requires a fresh malloc slowpath too.
+    pub(crate) fn invalidate_propagate_dependent(&mut self) {
+        self.malloc_slowpath_fixed = None;
+        self._malloc_slowpath_fixed_buffer = None;
+        self.propagate_exception_path = None;
+        self._propagate_exception_path_buffer = None;
+    }
 }
