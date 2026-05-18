@@ -6,5 +6,6 @@
 pub mod arch;
 pub mod assembler;
 pub mod callbuilder;
+pub mod cpu_ext;
 pub mod regalloc;
 pub mod reghint;

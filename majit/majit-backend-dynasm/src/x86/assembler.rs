@@ -187,10 +187,10 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 
 /// `assembler.py:328 _build_propagate_exception_path` parity —
 /// pure builder.  Caching/ownership is the caller's responsibility:
-/// `DynasmBackend::ensure_propagate_exception_path` (`runner.rs`)
-/// stores the resulting address in the backend's
-/// `propagate_exception_path` field, matching PyPy's
-/// `self.propagate_exception_path` attribute on `Assembler386`.
+/// `X86CpuExt::ensure_propagate_exception_path` (`x86/cpu_ext.rs`)
+/// stores the resulting address in its `propagate_exception_path`
+/// field, matching PyPy's `self.propagate_exception_path` attribute
+/// on `Assembler386`.
 ///
 /// **Calling convention (matches PyPy line 328-345):**
 /// - Entry: reached only via `JMP` (not `CALL`) from a slowpath that
@@ -258,8 +258,8 @@ pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescr
 
 /// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
 /// pure builder.  Caching/ownership is the caller's responsibility:
-/// `DynasmBackend::ensure_malloc_slowpath_fixed` (`runner.rs`) stores
-/// the resulting address in the backend's `malloc_slowpath_fixed`
+/// `X86CpuExt::ensure_malloc_slowpath_fixed` (`x86/cpu_ext.rs`)
+/// stores the resulting address in its `malloc_slowpath_fixed`
 /// field, matching PyPy's `self.malloc_slowpath` attribute on
 /// `Assembler386`.
 ///
@@ -285,7 +285,7 @@ pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescr
 /// On OOM (`rax == 0` after the helper call) the trampoline tail-jumps
 /// to `propagate_path` — the standalone `_build_propagate_exception_path`
 /// trampoline returned by `build_propagate_exception_path`.  Caller
-/// (`DynasmBackend::ensure_malloc_slowpath_fixed`) builds the propagate
+/// (`X86CpuExt::ensure_malloc_slowpath_fixed`) builds the propagate
 /// path first and threads its address here, matching PyPy's
 /// `setup_once` ordering.
 pub(crate) fn build_malloc_slowpath_fixed(
@@ -705,7 +705,7 @@ pub struct Assembler386<'a> {
     frame_depth_to_patch: Vec<usize>,
     /// `x86/assembler.py:63` `self.malloc_slowpath` parity — entry
     /// pointer of the per-CPU fixed-size malloc slowpath helper,
-    /// resolved by `DynasmBackend::ensure_malloc_slowpath_fixed`
+    /// resolved by `X86CpuExt::ensure_malloc_slowpath_fixed`
     /// and passed in at construction time so the emit path bakes
     /// it as a 64-bit immediate without re-touching the backend.
     malloc_slowpath_fixed: usize,

@@ -14,12 +14,16 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
 use crate::codebuf;
 use crate::frame::FrameData;
 use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
+#[cfg(target_arch = "x86_64")]
+use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 
 /// Global CALL_ASSEMBLER target registry.
 ///
@@ -647,26 +651,15 @@ pub struct DynasmBackend {
     /// source descr to its bridge `CompiledCode`; this table is the
     /// indirection that lets us do that without polluting the descr.
     bridge_addr_by_descr: Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
-    /// `rpython/jit/backend/x86/assembler.py:63` `self.malloc_slowpath`
-    /// (set by `_build_malloc_slowpath(kind='fixed')` at
-    /// `setup_once`) parity.  Lazy: materialised the first time
-    /// `compile_loop` / `compile_bridge` needs the helper address, after
-    /// `MetaInterp::finish_setup` has installed
-    /// `propagate_exception_descr` on `descr_attachments`.
-    /// Holding the address as a backend-owned `Option<usize>` matches
-    /// PyPy's per-CPU attribute lifetime; the helper buffer itself is
-    /// leaked into executable memory (matches PyPy's `asmmemmgr` rooting
-    /// the buffer for the CPU's lifetime).
-    malloc_slowpath_fixed: Option<usize>,
-    /// `rpython/jit/backend/x86/assembler.py:344`
-    /// `self.propagate_exception_path` (set by
-    /// `_build_propagate_exception_path` at `setup_once`) parity.
-    /// Standalone trampoline that the malloc slowpath (and, in PyPy,
-    /// the stack check slowpath) JMPs to on OOM / propagate.  Built
-    /// lazily on first use and stored here so subsequent
-    /// `ensure_malloc_slowpath_fixed` / future `ensure_stack_check_slowpath`
-    /// calls share the same per-CPU entry point.
-    propagate_exception_path: Option<usize>,
+    /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
+    /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
+    /// `self.propagate_exception_path` at `assembler.py:63,344` and
+    /// `aarch64/assembler.py:577`).  PyPy's assembler is one-per-CPU;
+    /// pyre's `Asm` is per-`compile_loop`/`compile_bridge`, so the
+    /// per-CPU stash lives here instead.  See
+    /// `crate::x86::cpu_ext::X86CpuExt` /
+    /// `crate::aarch64::cpu_ext::Aarch64CpuExt`.
+    arch_cpu_ext: ArchCpuExt,
 }
 
 impl DynasmBackend {
@@ -738,52 +731,8 @@ impl DynasmBackend {
             )),
             fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            malloc_slowpath_fixed: None,
-            propagate_exception_path: None,
+            arch_cpu_ext: ArchCpuExt::new(),
         }
-    }
-
-    /// `rpython/jit/backend/x86/assembler.py:328
-    /// _build_propagate_exception_path` parity: materialise the
-    /// standalone propagate trampoline that
-    /// `_store_and_reset_exception`s, writes `jf_guard_exc` / `jf_descr`,
-    /// and tail-calls `_call_footer`.  The malloc slowpath (and, in
-    /// PyPy, the stack check slowpath) JMP into this single entry
-    /// point.  Materialised lazily; the address is then memoised on
-    /// the backend so every slowpath built on this CPU shares the
-    /// same propagate path (matches PyPy's `self.propagate_exception_path`
-    /// attribute).
-    pub(crate) fn ensure_propagate_exception_path(&mut self) -> usize {
-        if let Some(addr) = self.propagate_exception_path {
-            return addr;
-        }
-        let addr = crate::x86::assembler::build_propagate_exception_path(&self.descr_attachments);
-        self.propagate_exception_path = Some(addr);
-        addr
-    }
-
-    /// `rpython/jit/backend/x86/assembler.py:231 _build_malloc_slowpath`
-    /// parity: materialise the fixed-size malloc slowpath helper on
-    /// first use and stash its address in the backend.  Subsequent
-    /// `compile_loop` / `compile_bridge` invocations reuse the same
-    /// helper, matching PyPy's `setup_once` semantics where the
-    /// helper is built once per CPU and referenced as
-    /// `self.malloc_slowpath` thereafter.
-    ///
-    /// Ensures the propagate trampoline exists first so the slowpath's
-    /// OOM branch can `JMP` to it (matches PyPy's `setup_once` ordering:
-    /// `_build_propagate_exception_path` then `_build_malloc_slowpath`).
-    pub(crate) fn ensure_malloc_slowpath_fixed(&mut self) -> usize {
-        if let Some(addr) = self.malloc_slowpath_fixed {
-            return addr;
-        }
-        let propagate_path = self.ensure_propagate_exception_path();
-        let addr = crate::x86::assembler::build_malloc_slowpath_fixed(
-            &self.descr_attachments,
-            propagate_path,
-        );
-        self.malloc_slowpath_fixed = Some(addr);
-        addr
     }
 
     /// Bridge entry-pointer registration keyed on the source guard
@@ -827,10 +776,11 @@ impl DynasmBackend {
         // `MetaInterp::new` / `MetaInterpStaticData.finish_setup`.
         // Backend-only tests that skip the metainterp call this to land
         // the same descrs the runtime classifier expects — and so that
-        // `ensure_propagate_exception_path` can bake a non-zero descr
-        // pointer into the propagate trampoline (matching PyPy's
-        // `setup_once` ordering, which builds trampolines after
-        // `finish_setup` has installed every CPU descr).
+        // `X86CpuExt::ensure_propagate_exception_path` can bake a
+        // non-zero descr pointer into the propagate trampoline
+        // (matching PyPy's `setup_once` ordering, which builds
+        // trampolines after `finish_setup` has installed every CPU
+        // descr).
         let void: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new());
         let int: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrInt::new());
         let r: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
@@ -1596,7 +1546,10 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
-        let malloc_slowpath_fixed = self.ensure_malloc_slowpath_fixed();
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -1607,6 +1560,7 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
             inputargs,
             &prepared_ops,
@@ -1735,11 +1689,12 @@ impl Backend for DynasmBackend {
         // x86/assembler.py:328 `_build_propagate_exception_path` parity:
         // PyPy bakes `propagate_exception_descr` into the per-CPU
         // propagate trampoline at setup time.  Pyre defers the bake to
-        // `ensure_propagate_exception_path`, which reads the descr
-        // pointer directly from `descr_attachments` and embeds it in
-        // the helper.  Storing the descr Arc here is the only step
-        // needed; the malloc slowpath later tail-JMPs to that
-        // propagate trampoline so it does not read the descr itself.
+        // `X86CpuExt::ensure_propagate_exception_path` (x86/cpu_ext.rs),
+        // which reads the descr pointer directly from
+        // `descr_attachments` and embeds it in the helper.  Storing the
+        // descr Arc here is the only step needed; the malloc slowpath
+        // later tail-JMPs to that propagate trampoline so it does not
+        // read the descr itself.
         self.descr_attachments
             .write()
             .unwrap()
@@ -1775,7 +1730,10 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
-        let malloc_slowpath_fixed = self.ensure_malloc_slowpath_fixed();
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -1786,6 +1744,7 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
             inputargs,
             &prepared_ops,
