@@ -399,16 +399,6 @@ impl ConstantPool {
             .collect()
     }
 
-    /// Clone the per-OpRef `Type` map without consuming the pool, by
-    /// projecting each stored `Value`'s variant.  history.py:220/261/307
-    /// box.type parity — every Const Box pins its `.type` intrinsically,
-    /// so the projection is total.
-    pub fn constant_types_snapshot(&self) -> HashMap<u32, Type> {
-        self.constants
-            .iter()
-            .map(|(&k, v)| (k, v.get_type()))
-            .collect()
-    }
 }
 
 impl Default for ConstantPool {
