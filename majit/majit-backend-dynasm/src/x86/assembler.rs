@@ -2697,7 +2697,42 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
-            OpCode::IntSub | OpCode::IntMul | OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor => {
+            // x86/assembler.py:1268-1284 `_binaryop_or_lea(asmop='SUB',
+            // is_add=False)`: when `result_loc is arglocs[0]` emit
+            // `SUB dst, src` in place; otherwise the regalloc routed
+            // through `_consider_lea` (consider_int_sub at
+            // x86/regalloc.py:575) and produced a fresh result register,
+            // and we must emit `LEA result_loc, [arglocs[0] - delta]`
+            // — never `SUB dst, src`, which would corrupt `dst`'s stale
+            // value (the bug seen in fannkuch as `q.int_items.ptr - 1`
+            // landing in a fresh result register that previously held
+            // the base pointer).  IntMul / IntAnd / IntOr / IntXor never
+            // take the LEA path (regalloc.rs:2960 routes them through
+            // `consider_binop_symm` which keeps result==arglocs[0]), so
+            // a plain in-place op is correct for them.
+            OpCode::IntSub => {
+                if let (Some(Loc::Reg(dst)), Some(a0), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    let same_as_lhs = matches!(a0, Loc::Reg(a) if a.value == dst.value);
+                    if same_as_lhs {
+                        self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                    } else {
+                        match (a0, src) {
+                            (Loc::Reg(a), Loc::Immed(i)) => {
+                                let v = -(i.value as i32);
+                                dynasm!(self.mc ; .arch x64
+                                    ; lea Rq(dst.value), [Rq(a.value) + v])
+                            }
+                            _ => panic!(
+                                "IntSub: result_loc != arglocs[0] requires LEA form \
+                                 (arglocs[0]=Reg, arglocs[1]=Immed); got a0={a0:?} src={src:?}",
+                            ),
+                        }
+                    }
+                }
+            }
+            OpCode::IntMul | OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor => {
                 if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
                     self.emit_binop_reg_loc(op.opcode, dst.value, src);
                 }
@@ -7280,42 +7315,46 @@ impl<'a> Assembler386<'a> {
 
         let nf = nf_addr as i64;
         let nt = nt_addr as i64;
+        // assembler.py:2556 `malloc_cond` clobbers only ECX/EDX (the pair
+        // regalloc spilled via MALLOC_NURSERY_CLOBBER) because PyPy's
+        // encoder supports `MOV [imm64], reg` directly.  dynasm-rs has no
+        // such encoding so we need a third register to stage the absolute
+        // nursery slot addresses; use R11 (X86_64_SCRATCH_REG, outside
+        // ALL_CORE_REGS) instead of RAX — RAX is in the regalloc pool and
+        // clobbering it would silently destroy any live Box the regalloc
+        // bound to it.  The slow path preserves RAX via push_all_regs.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
 
         // ecx = nursery_free, edx = new nursery_free
         dynasm!(self.mc ; .arch x64
-            ; mov rcx, QWORD nf
-            ; mov rcx, [rcx]
+            ; mov Rq(scratch), QWORD nf
+            ; mov rcx, [Rq(scratch)]
             ; lea rdx, [rcx + total_size as i32]
-            ; mov rax, QWORD nt
-            ; cmp rdx, [rax]
+            ; mov Rq(scratch), QWORD nt
+            ; cmp rdx, [Rq(scratch)]
         );
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
 
-        // Fast path: update nursery_free, zero header, compute obj ptr
+        // Fast path: update nursery_free, zero header, compute obj ptr.
+        // Stage the `*nf = new_free` store through R11; materialise the
+        // payload pointer directly into `result_reg` (regalloc forces it
+        // to ECX, MALLOC_NURSERY_RESULT) so both paths converge with the
+        // payload in the same register.
         dynasm!(self.mc ; .arch x64
-            ; mov rax, QWORD nf
-            ; mov [rax], rdx
+            ; mov Rq(scratch), QWORD nf
+            ; mov [Rq(scratch)], rdx
             ; mov QWORD [rcx], 0       // zero GcHeader
-            ; lea rax, [rcx + gc_header_size as i32]
         );
-        // Mirror the slow-path's copy of `rax` into the result register
-        // so the post-`done` read at the join (`mov rax, Rq(result_reg)`)
-        // observes the past-header payload pointer from both paths.
-        // Without this, the fast path leaves only `rax` updated and the
-        // join read reverts `rax` to the stale `result_reg`, causing
-        // subsequent `mov [result + (-WORD)], type_id` writes (which use
-        // the result-register-relative addressing for the GcHeader slot)
-        // to land outside the nursery — corrupting the heap-manager's
-        // HEAP_ENTRY metadata for the nursery block.
-        if let Some(Loc::Reg(r)) = result_loc {
-            if r.value != 0 {
-                let rv = r.value;
-                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
-            }
-        }
+        let result_reg_for_payload = match result_loc {
+            Some(Loc::Reg(r)) => r.value,
+            _ => crate::regloc::ECX.value,
+        };
+        dynasm!(self.mc ; .arch x64
+            ; lea Rq(result_reg_for_payload), [rcx + gc_header_size as i32]
+        );
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
 
         // Slow path: helper extraction (PyPy assembler.py:295 `mc.CALL`).
@@ -7326,10 +7365,19 @@ impl<'a> Assembler386<'a> {
         } else {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
+        // Stage the trampoline address through R11 so RAX still holds
+        // the caller's pre-call value at the trampoline entry — its
+        // `push_all_regs_to_frame([ECX, EDX])` then saves the real RAX,
+        // and the matching pop restores it after the helper call.
+        // Loading `helper_addr` into RAX here (the previous shape) would
+        // clobber the caller's RAX, and the trampoline would save+restore
+        // that already-clobbered value, silently dropping any live Box
+        // the regalloc kept in RAX across this op.
         let helper_addr = self.malloc_slowpath_fixed as i64;
+        let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         dynasm!(self.mc ; .arch x64
-            ; mov rax, QWORD helper_addr
-            ; call rax
+            ; mov Rq(call_scratch), QWORD helper_addr
+            ; call Rq(call_scratch)
         );
         // assembler.py:304 — helper returns the payload in ECX
         // (`MOV_rr(ecx, eax)` inside the trampoline) so the value
@@ -7338,8 +7386,8 @@ impl<'a> Assembler386<'a> {
         // (regalloc.rs:105), so the value already lives in the right
         // register and no caller-side copy is needed.  If a future
         // regalloc change picks a different `result_reg`, copy it
-        // from RCX (not RAX, which was restored to its pre-call
-        // value by the trampoline's pop_all).
+        // from RCX (not RAX, which is now the caller's preserved
+        // pre-call value, not the helper return).
         //
         // OOM propagation: assembler.py:300-322 emits the `TEST/JZ
         // propagate_exception_path` *inside* the slowpath itself, and
@@ -7358,13 +7406,24 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
 
         dynasm!(self.mc ; .arch x64 ; =>done);
-        if !op.pos.get().is_none() {
-            if let Some(Loc::Reg(r)) = result_loc {
-                if r.value != 0 {
-                    dynasm!(self.mc ; .arch x64 ; mov rax, Rq(r.value));
+        // Spill the result to the regalloc-assigned jitframe slot.  Stage
+        // it directly from `result_reg`; routing through RAX (the previous
+        // shape) silently clobbered any live Box the regalloc bound to
+        // RAX across this op, since the malloc-nursery clobber set is
+        // only ECX/EDX.
+        let pos = op.pos.get();
+        if !pos.is_none() {
+            let slot = self.allocate_slot(pos);
+            let offset = Self::slot_offset(slot);
+            match result_loc {
+                Some(Loc::Reg(r)) => {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], rax);
                 }
             }
-            self.store_rax_to_result(op.pos.get());
         }
     }
 
