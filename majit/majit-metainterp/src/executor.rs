@@ -49,26 +49,6 @@ impl TraceValues {
         }
     }
 
-    pub fn from_hashmap(map: &std::collections::HashMap<u32, i64>) -> Self {
-        let max_op = map
-            .keys()
-            .filter(|&&k| !OpRef::raw_is_constant(k))
-            .max()
-            .copied()
-            .unwrap_or(0) as usize;
-        let max_const = map
-            .keys()
-            .filter(|&&k| OpRef::raw_is_constant(k))
-            .max()
-            .map(|&k| OpRef::raw_const_index(k) as usize)
-            .unwrap_or(0);
-        let mut tv = Self::new(max_op + 1, max_const + 1);
-        for (&k, &v) in map {
-            tv.set(k, v);
-        }
-        tv
-    }
-
     pub fn from_vec_assoc(map: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>) -> Self {
         // Index-keyed pool namespace probe (Slice P3 category E):
         // raw u32 keys carry the constant-namespace bit directly, so use
@@ -142,14 +122,6 @@ pub(crate) trait ValueStore {
 }
 
 impl ValueStore for crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> {
-    #[inline(always)]
-    fn resolve(&self, opref: OpRef) -> i64 {
-        self.get(&opref.raw()).copied().unwrap_or(0)
-    }
-}
-
-#[cfg(test)]
-impl ValueStore for std::collections::HashMap<u32, i64> {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {
         self.get(&opref.raw()).copied().unwrap_or(0)

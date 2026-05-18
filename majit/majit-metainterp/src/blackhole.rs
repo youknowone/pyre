@@ -10,8 +10,7 @@ use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
 };
-use majit_ir::{GcRef, Op, OpRc, OpCode};
-use std::collections::HashMap;
+use majit_ir::{GcRef, Op, OpRc, OpCode, VecAssoc};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -186,8 +185,8 @@ pub enum BlackholeResult {
 #[allow(deprecated)]
 pub fn blackhole_execute(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
 ) -> BlackholeResult {
     blackhole_execute_with_exception(
@@ -205,8 +204,8 @@ pub fn blackhole_execute(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_execute_with_memory(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     memory: &dyn BlackholeMemory,
 ) -> BlackholeResult {
@@ -225,17 +224,17 @@ pub fn blackhole_execute_with_memory(
 /// RPython _run_forever parity: Jump loops back to Label.
 pub fn blackhole_execute_full(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
     memory: &dyn BlackholeMemory,
 ) -> (BlackholeResult, ExceptionState) {
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        merged.entry(k).or_insert(v);
+        merged.entry_or_insert_with(k, || v);
     }
-    let mut tv = TraceValues::from_hashmap(&merged);
+    let mut tv = TraceValues::from_vec_assoc(&merged);
     drop(merged);
     let mut exc_state = initial_exception;
 
@@ -528,8 +527,8 @@ pub type CallAssemblerFn = dyn Fn(i64) -> i64;
 
 pub(crate) fn blackhole_execute_with_state(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
 ) -> (BlackholeResult, ExceptionState) {
@@ -545,17 +544,17 @@ pub(crate) fn blackhole_execute_with_state(
 
 pub(crate) fn blackhole_execute_with_state_ca(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
     call_assembler_fn: Option<&CallAssemblerFn>,
 ) -> (BlackholeResult, ExceptionState) {
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        merged.entry(k).or_insert(v);
+        merged.entry_or_insert_with(k, || v);
     }
-    let mut tv = TraceValues::from_hashmap(&merged);
+    let mut tv = TraceValues::from_vec_assoc(&merged);
     drop(merged);
     let mut exc_state = initial_exception;
 
@@ -701,8 +700,8 @@ pub(crate) fn blackhole_execute_with_state_ca(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_execute_with_exception(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
 ) -> BlackholeResult {
@@ -720,8 +719,8 @@ pub fn blackhole_execute_with_exception(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_with_virtuals(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_data: Option<&ResumeData>,
 ) -> BlackholeResult {
@@ -739,8 +738,8 @@ pub fn blackhole_with_virtuals(
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
 pub fn blackhole_with_resume_layout(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_layout: Option<&ResumeLayoutSummary>,
 ) -> BlackholeResult {
@@ -756,8 +755,8 @@ pub fn blackhole_with_resume_layout(
 
 fn blackhole_with_recovery_layout(
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
-    initial_values: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
+    initial_values: &VecAssoc<u32, i64>,
     start_index: usize,
     resume_data: Option<&ResumeData>,
     resume_layout: Option<&ResumeLayoutSummary>,
@@ -3085,11 +3084,11 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 10i64);
         initial.insert(1, 20i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![30]),
             other => panic!(
                 "expected Finish, got {:?}",
@@ -3108,10 +3107,10 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 1i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![1]),
             _ => panic!("expected Finish"),
         }
@@ -3124,10 +3123,10 @@ mod tests {
             mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 42i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![42]),
             _ => panic!("expected Finish when no exception is pending"),
         }
@@ -3142,12 +3141,12 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 42i64);
 
         match blackhole_execute_with_exception(
             &ops,
-            &HashMap::new(),
+            &VecAssoc::new(),
             &initial,
             0,
             ExceptionState {
@@ -3168,12 +3167,12 @@ mod tests {
             mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64);
 
         match blackhole_execute_with_exception(
             &ops,
-            &HashMap::new(),
+            &VecAssoc::new(),
             &initial,
             0,
             ExceptionState {
@@ -3209,11 +3208,11 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64); // exc_class
         initial.insert(1, 200i64); // exc_value
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![100, 200]),
             _ => panic!("expected Finish"),
         }
@@ -3238,11 +3237,11 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64);
         initial.insert(1, 200i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::GuardFailed { .. } => {} // expected
             _ => panic!("expected GuardFailed when exception is pending"),
         }
@@ -3266,11 +3265,11 @@ mod tests {
             mk_op(OpCode::GuardException, &[OpRef::int_op(0)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 100i64); // exc_class
         initial.insert(1, 200i64); // exc_value
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values: vals, .. } => {
                 // GuardException should return the exc_value
                 assert_eq!(vals, vec![200]);
@@ -3288,10 +3287,10 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, 0i64);
 
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::GuardFailed { fail_values, .. } => {
                 assert_eq!(fail_values, vec![0]);
             }
@@ -3315,10 +3314,10 @@ mod tests {
             mk_op(opcode, &[OpRef::int_op(0), OpRef::int_op(1)], 2),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, a);
         initial.insert(1, b);
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values, .. } => values[0],
             other => panic!(
                 "expected Finish for {:?}, got {:?}",
@@ -3338,9 +3337,9 @@ mod tests {
             mk_op(opcode, &[OpRef::int_op(0)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut initial = HashMap::new();
+        let mut initial: VecAssoc<u32, i64> = VecAssoc::new();
         initial.insert(0, a);
-        match blackhole_execute(&ops, &HashMap::new(), &initial, 0) {
+        match blackhole_execute(&ops, &VecAssoc::new(), &initial, 0) {
             BlackholeResult::Finish { values, .. } => values[0],
             other => panic!(
                 "expected Finish for {:?}, got {:?}",
@@ -3568,7 +3567,7 @@ mod tests {
     #[test]
     fn test_executor_same_as_zero_arg_constant_placeholder() {
         let op = mk_op(OpCode::SameAsI, &[], 8);
-        let mut values = HashMap::new();
+        let mut values: VecAssoc<u32, i64> = VecAssoc::new();
         values.insert(8, 123);
         let mut exc = ExceptionState::default();
         match execute_one(&op, &values, &mut exc) {
@@ -3788,12 +3787,12 @@ mod tests {
             OpRef::int_op(10_001),
             OpRef::int_op(10_002),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
         constants.insert(10_000, 1i64);
         constants.insert(10_001, 2i64);
         constants.insert(10_002, 3i64);
 
-        let mut values: HashMap<u32, i64> = constants.clone();
+        let mut values: VecAssoc<u32, i64> = constants.clone();
         let mut exc = ExceptionState::default();
 
         for opcode in OpCode::all() {

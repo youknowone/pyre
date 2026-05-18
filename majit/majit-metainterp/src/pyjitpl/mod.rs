@@ -9613,20 +9613,17 @@ impl<M: Clone> MetaInterp<M> {
             ));
         }
 
-        let initial_values_hm: HashMap<u32, i64> =
-            initial_values.iter().map(|(&k, &v)| (k, v)).collect();
         // Lower typed `Const` pool to the legacy `(u32 → i64)` shape the
         // blackhole interpreter consumes; `Const::as_raw_i64()` projects
         // each variant to its encoded `rd_consts[idx].0` bits.
-        let constants_hm: HashMap<u32, i64> = trace
-            .constants
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
+        let mut constants_va: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        for (&k, c) in trace.constants.iter() {
+            constants_va.insert(k, c.as_raw_i64());
+        }
         Some(blackhole_execute_with_state_ca(
             &trace.ops,
-            &constants_hm,
-            &initial_values_hm,
+            &constants_va,
+            &initial_values,
             guard_op_index + 1,
             exception,
             call_assembler_fn,
