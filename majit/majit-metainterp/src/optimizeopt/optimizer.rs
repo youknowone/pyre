@@ -247,8 +247,9 @@ pub(crate) fn lower_typed_constants_to_backend(
     let mut bits = std::collections::HashMap::with_capacity(constants.len());
     let mut types = std::collections::HashMap::with_capacity(constants.len());
     for (&k, v) in constants {
-        bits.insert(k, value_to_backend_constant_bits(v));
-        types.insert(k, v.get_type());
+        let c = v.to_const();
+        bits.insert(k, c.as_raw_i64());
+        types.insert(k, c.get_type());
     }
     (bits, types)
 }
@@ -333,22 +334,6 @@ fn opref_and_type_for_backend_constant(
     (opref, tp)
 }
 
-pub(crate) fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
-    match value {
-        majit_ir::Value::Int(v) => *v,
-        majit_ir::Value::Ref(r) => r.0 as i64,
-        majit_ir::Value::Float(f) => f.to_bits() as i64,
-        // history.py:220/261/307 — only ConstInt/ConstFloat/ConstPtr
-        // exist upstream; there is no `ConstVoid` class. A Void constant
-        // reaching the backend boundary indicates a bookkeeping bug;
-        // surface it instead of silently lowering to a zero Int payload.
-        majit_ir::Value::Void => panic!(
-            "value_to_backend_constant_bits: Value::Void has no constant lowering \
-             (no ConstVoid upstream)"
-        ),
-    }
-}
-
 fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
     let live_limit = ops
         .iter()
@@ -377,7 +362,7 @@ pub(crate) fn sanitize_backend_constants_for_ops(
 /// Export newly-discovered constants from `OptContext` into the
 /// optimizer's `constants: HashMap<u32, Value>` value pool. The
 /// backend boundary lowers the typed `Value` map back to its raw
-/// `i64` shape via `value_to_backend_constant_bits` when the
+/// `i64` shape via `Value::to_const().as_raw_i64()` when the
 /// `set_constants` call is made.
 ///
 /// history.py:220/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`

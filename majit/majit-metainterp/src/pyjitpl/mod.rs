@@ -321,9 +321,8 @@ impl StoredExitLayout {
 /// via is_const/get_const (resume.py:157 getconst parity).
 /// Decode a raw virtualizable-slot `i64` from `VirtualizableInfo::read_all_boxes`
 /// into the typed `majit_ir::Value` the parallel virtualizable concrete
-/// shadow expects. Mirrors the inverse of `value_to_backend_constant_bits`
-/// (optimizeopt/optimizer.rs) so the shadow never disagrees with the
-/// register-shadow encoding.
+/// shadow expects. Mirrors the inverse of `Const::as_raw_i64()` so the
+/// shadow never disagrees with the register-shadow encoding.
 fn heap_value_for(ty: Type, bits: i64) -> Value {
     match ty {
         Type::Int => Value::Int(bits),

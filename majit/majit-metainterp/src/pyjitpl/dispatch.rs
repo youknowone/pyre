@@ -301,7 +301,7 @@ impl Drop for ObserverGuard {
 /// `Value::Void` means the vable layout was not available at read time (heap
 /// fallback) — callers substitute zero to preserve pre-existing behaviour for
 /// test-only paths. All three helpers must match the encoding convention used
-/// by `value_to_backend_constant_bits` (optimizeopt/optimizer.rs).
+/// by `Const::as_raw_i64()` (majit-ir/src/value.rs).
 fn value_as_int_bits(value: Value) -> i64 {
     match value {
         Value::Int(v) => v,
