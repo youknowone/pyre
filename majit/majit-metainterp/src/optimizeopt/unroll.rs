@@ -3156,14 +3156,10 @@ impl OptUnroll {
                             // RPython's Const objects survive across compilations
                             // via GC tracing. In majit, we must carry forward
                             // constants from the previous build that may not
-                            // exist in the current Phase 2 context. The
-                            // legacy `ShortPreamble.constants` field still
-                            // carries `(i64, Type)` tuples until a follow-up
-                            // slice migrates that field; lift each pair into
-                            // a typed `Const`.
-                            for (&k, &(v, tp)) in &sp.constants {
+                            // exist in the current Phase 2 context.
+                            for (&k, &c) in &sp.constants {
                                 if !loop_constants.contains_key(&k) {
-                                    loop_constants.insert(k, majit_ir::Const::from_raw_i64(v, tp));
+                                    loop_constants.insert(k, c);
                                 }
                             }
                             target_token.short_preamble =
@@ -3228,13 +3224,9 @@ impl OptUnroll {
         // constant pool. These OpRefs aren't in the bridge's context.
         // Register them as constants in the bridge's OptContext so the ops
         // can reference them correctly.
-        for (&idx, &(val, tp)) in &short_preamble.constants {
-            let value = match tp {
-                majit_ir::Type::Int => majit_ir::Value::Int(val),
-                majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(val as usize)),
-                majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(val as u64)),
-                majit_ir::Type::Void => majit_ir::Value::Int(val),
-            };
+        for (&idx, &c) in &short_preamble.constants {
+            let tp = c.get_type();
+            let value = c.to_value();
             // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
             // disjoint Box subclasses pinned to `box.type` at construction.
             // Mint the typed `OpRef::const_*` variant so the imported
@@ -3426,18 +3418,8 @@ impl OptUnroll {
                     }
                     // Re-register guard constant args from preamble's constant pool.
                     for &arg in new_op.getarglist().iter() {
-                        if let Some(&(val, tp)) = short_preamble.constants.get(&arg.raw()) {
-                            let value = match tp {
-                                majit_ir::Type::Int => majit_ir::Value::Int(val),
-                                majit_ir::Type::Ref => {
-                                    majit_ir::Value::Ref(majit_ir::GcRef(val as usize))
-                                }
-                                majit_ir::Type::Float => {
-                                    majit_ir::Value::Float(f64::from_bits(val as u64))
-                                }
-                                majit_ir::Type::Void => majit_ir::Value::Int(val),
-                            };
-                            ctx.make_constant(arg, value);
+                        if let Some(&c) = short_preamble.constants.get(&arg.raw()) {
+                            ctx.make_constant(arg, c.to_value());
                         }
                     }
                 } else if let Some(fail_args) = new_op.fail_args_mut() {

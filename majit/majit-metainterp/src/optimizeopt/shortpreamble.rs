@@ -83,9 +83,10 @@ pub struct ShortPreamble {
     /// RPython parity: constant values referenced by short preamble ops.
     /// In RPython, short preamble ops embed Const objects (GC-tracked) that
     /// survive across compilations. In pyre, OpRef indices reference the
-    /// loop's constant pool. This map captures (value, type) for each
-    /// constant OpRef so bridges can re-register them in their own pool.
-    pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
+    /// loop's constant pool. This map captures the `Const` (type + value
+    /// in one box per history.py:220/261/307) for each constant OpRef so
+    /// bridges can re-register them in their own pool.
+    pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
     /// Used by inline_short_preamble to propagate PtrInfo to jump_args
@@ -1835,19 +1836,19 @@ fn build_short_preamble_struct_from_ops(
     // In RPython, Const objects are stored in op args and are GC-tracked. Here,
     // we snapshot the loop's constant pool entries for any OpRef referenced by
     // short preamble ops that isn't defined by the ops themselves.
-    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)> =
+    let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
     // history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr.type` invariant:
     // every Const box carries its type intrinsically as an instance
     // attribute. Pyre's `majit_ir::Const` enum captures the same shape
     // (`Const::Int/Float/Ref` carries both type and value), so the
-    // separate `loop_constant_types` side-table is no longer needed —
-    // the type is read directly from the `Const` arm via `.get_type()`.
+    // captured snapshot stores `Const` directly rather than the legacy
+    // `(i64, Type)` pair.
     for op in ops {
         for &arg in op.getarglist().iter() {
             if !defined_by_ops.contains(&arg) {
                 if let Some(c) = loop_constants.get(&arg.raw()) {
-                    constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
+                    constants.insert(arg.raw(), *c);
                 }
             }
         }
@@ -1855,7 +1856,7 @@ fn build_short_preamble_struct_from_ops(
             for arg in fa {
                 if !defined_by_ops.contains(&arg) {
                     if let Some(c) = loop_constants.get(&arg.raw()) {
-                        constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
+                        constants.insert(arg.raw(), *c);
                     }
                 }
             }
@@ -1865,7 +1866,7 @@ fn build_short_preamble_struct_from_ops(
     for &arg in jump_args {
         if !defined_by_ops.contains(&arg) {
             if let Some(c) = loop_constants.get(&arg.raw()) {
-                constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
+                constants.insert(arg.raw(), *c);
             }
         }
     }
