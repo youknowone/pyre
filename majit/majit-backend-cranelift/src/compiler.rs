@@ -724,6 +724,105 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     frame
 }
 
+/// Caller-side data captured at a CALL_ASSEMBLER site so the callee's
+/// guard-failure deopt can reconstruct the caller's frame on demand.
+///
+/// PyPy carries this implicitly: an assembler call is a regular machine
+/// call, and the caller's host stack frame is the deopt's reconstruction
+/// anchor (`pyjitpl.MetaInterp.framestack` mirrors it for blackhole
+/// resume; `portal_call_depth` counts the recursion).  cranelift's host-
+/// loop dispatch (`execute_with_inputs`) cannot piggyback on the host
+/// stack — the live host frame is the dispatch loop, not the caller's
+/// compiled code — so the equivalent state must be captured explicitly.
+///
+/// This struct mirrors the six values
+/// `wrap_call_assembler_deadframe_with_caller_prefix` already takes one
+/// at a time.  Slice X3-B will route the deopt-callback reader through
+/// it; Slice X3-C will stop synthesising the overlay descr in favour of
+/// the same data; Slice X3-D will delete the descr synthesis machinery.
+/// The struct itself disappears together with `execute_with_inputs`
+/// once Slice X4 collapses the dispatch loop to a single-call
+/// `execute_token` (PyPy `llmodel.execute_token`).
+#[derive(Clone)]
+#[allow(dead_code)] // wired up by Slice X3-B
+struct CallAssemblerCallerContext {
+    trace_id: u64,
+    header_pc: u64,
+    source_guard: Option<(u64, u32)>,
+    input_types: Vec<Type>,
+    inputs: Vec<i64>,
+    caller_prefix_layout: Option<ExitRecoveryLayout>,
+}
+
+#[allow(dead_code)] // wired up by Slice X3-B
+impl CallAssemblerCallerContext {
+    fn from_compiled_loop(compiled: &CompiledLoop, inputs: &[i64]) -> Self {
+        Self {
+            trace_id: compiled.trace_id,
+            header_pc: compiled.header_pc,
+            source_guard: None,
+            input_types: compiled.input_types.clone(),
+            inputs: inputs.to_vec(),
+            caller_prefix_layout: compiled.caller_prefix_layout.clone(),
+        }
+    }
+
+    fn from_bridge_data(bridge: &BridgeData, inputs: &[i64]) -> Self {
+        Self {
+            trace_id: bridge.trace_id,
+            header_pc: bridge.header_pc,
+            source_guard: Some(bridge.source_guard),
+            input_types: bridge.input_types.clone(),
+            inputs: inputs.to_vec(),
+            caller_prefix_layout: bridge.caller_prefix_layout.clone(),
+        }
+    }
+
+    fn from_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> Self {
+        Self {
+            trace_id: target.trace_id,
+            header_pc: target.header_pc,
+            source_guard: None,
+            input_types: target.inputarg_types.clone(),
+            inputs: inputs.to_vec(),
+            caller_prefix_layout: target.caller_prefix_layout.clone(),
+        }
+    }
+}
+
+thread_local! {
+    /// Host-side caller stack scaffold for CALL_ASSEMBLER deopt
+    /// reconstruction.  Each entry corresponds to one in-progress host-
+    /// loop iteration in `execute_with_inputs` / `execute_bridge` /
+    /// `execute_registered_loop_target`; the top of the stack is the
+    /// caller of any CALL_ASSEMBLER deadframe interception currently
+    /// being processed.
+    ///
+    /// Slice X3-A: declared but not pushed/popped — Slice X3-B wires
+    /// the producer/consumer during the dual-write transition with the
+    /// existing overlay descr synthesis.  Thread-local matches pyre's
+    /// single-threaded JIT execution, mirroring the surrounding
+    /// `LOOP_TARGET_REGISTRY` shape.
+    #[allow(dead_code)]
+    static CALL_ASSEMBLER_CALLER_STACK: RefCell<Vec<CallAssemblerCallerContext>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[allow(dead_code)] // wired up by Slice X3-B
+fn push_call_assembler_caller_context(ctx: CallAssemblerCallerContext) {
+    CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow_mut().push(ctx));
+}
+
+#[allow(dead_code)] // wired up by Slice X3-B
+fn pop_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
+    CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow_mut().pop())
+}
+
+#[allow(dead_code)] // consumed by Slice X3-B deopt callback
+fn current_call_assembler_caller_context() -> Option<CallAssemblerCallerContext> {
+    CALL_ASSEMBLER_CALLER_STACK.with(|s| s.borrow().last().cloned())
+}
+
 /// Global exception state for JIT-compiled code.
 /// pyre is no-GIL single-threaded, so global statics are safe and allow
 /// GUARD_NO_EXCEPTION to emit a direct memory load instead of a TLS call.
