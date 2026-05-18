@@ -90,7 +90,7 @@ impl crate::Backend for SyntheticCpu {
     fn compile_loop(
         &mut self,
         _inputargs: &[majit_ir::InputArg],
-        _ops: &[majit_ir::Op],
+        _ops: &[majit_ir::OpRc],
         _token: &mut crate::JitCellToken,
     ) -> Result<crate::AsmInfo, crate::BackendError> {
         unreachable!("SyntheticCpu does not compile native code; only services bh_call_* dispatch")
@@ -100,7 +100,7 @@ impl crate::Backend for SyntheticCpu {
         &mut self,
         _fail_descr: &dyn majit_ir::FailDescr,
         _inputargs: &[majit_ir::InputArg],
-        _ops: &[majit_ir::Op],
+        _ops: &[majit_ir::OpRc],
         _original_token: &crate::JitCellToken,
         _previous_tokens: &[std::sync::Arc<crate::JitCellToken>],
         _caller_recovery_layout: Option<&crate::ExitRecoveryLayout>,

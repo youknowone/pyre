@@ -2411,7 +2411,7 @@ mod tests {
             .ops
             .iter()
             .filter(|op| op.opcode != OpCode::Jump)
-            .cloned()
+            .map(|rc| (**rc).clone())
             .collect()
     }
 

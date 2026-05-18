@@ -4,7 +4,7 @@
 ///
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{GcRef, Op, OpRc, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};

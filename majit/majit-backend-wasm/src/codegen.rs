@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
     ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,

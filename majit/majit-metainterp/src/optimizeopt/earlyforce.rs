@@ -8,7 +8,7 @@
 /// earlyforce.py:32: self.optimizer.optearlyforce = self
 /// The pass registers itself so force_at_the_end_of_preamble can route
 /// forced operations starting from earlyforce.next (= heap).
-use majit_ir::{Op, OpCode};
+use majit_ir::{Op, OpRc, OpCode};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 

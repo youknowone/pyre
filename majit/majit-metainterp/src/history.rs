@@ -5,7 +5,7 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 
@@ -40,7 +40,15 @@ pub struct TreeLoop {
     /// Input arguments to the trace (loop header variables).
     pub inputargs: Vec<InputArg>,
     /// The recorded operations, in execution order.
-    pub ops: Vec<Op>,
+    ///
+    /// `history.py:528` `# self.operations = list of ResOperations` —
+    /// PyPy's `TreeLoop.operations` holds Python references that are the
+    /// *same* objects reached from recorder build-time, optimizer
+    /// forwarding state, short preamble export, resume metadata, and
+    /// backend input lists. Pyre uses `Rc<Op>` so every consumer that
+    /// holds an `OpRc` reads and writes `forwarded`/`descr`/... through
+    /// the shared identity (BoxPool removal plan slice 1).
+    pub ops: Vec<OpRc>,
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.
     pub snapshots: Vec<crate::recorder::Snapshot>,
@@ -66,10 +74,14 @@ impl TreeLoop {
     }
 
     /// Create a new trace from input arguments and operations.
+    ///
+    /// `ops` are wrapped in `Rc` at construction so that every downstream
+    /// consumer reaches the same `Op` object (history.py:528 PyPy
+    /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
             inputargs,
-            ops,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots: Vec::new(),
             box_pool: crate::r#box::BoxPool::new(),
         }
@@ -83,7 +95,7 @@ impl TreeLoop {
     ) -> Self {
         TreeLoop {
             inputargs,
-            ops,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
             box_pool: crate::r#box::BoxPool::new(),
         }
@@ -96,6 +108,26 @@ impl TreeLoop {
     pub fn with_box_pool(
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
+        snapshots: Vec<crate::recorder::Snapshot>,
+        box_pool: impl Into<crate::r#box::BoxPool>,
+    ) -> Self {
+        TreeLoop {
+            inputargs,
+            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            snapshots,
+            box_pool: box_pool.into(),
+        }
+    }
+
+    /// Construct from `Vec<OpRc>` directly, preserving shared identity for
+    /// callers that already track Op via `Rc`. This is the canonical
+    /// constructor used internally once consumers traffic in `OpRc`; the
+    /// `new` / `with_snapshots` / `with_box_pool` overloads above wrap a
+    /// `Vec<Op>` into `Vec<OpRc>` for legacy test sites still building
+    /// ops by value.
+    pub fn from_oprc(
+        inputargs: Vec<InputArg>,
+        ops: Vec<OpRc>,
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: impl Into<crate::r#box::BoxPool>,
     ) -> Self {
@@ -130,12 +162,12 @@ impl TreeLoop {
     }
 
     /// Iterate over all operations.
-    pub fn iter_ops(&self) -> impl Iterator<Item = &Op> {
+    pub fn iter_ops(&self) -> impl Iterator<Item = &OpRc> {
         self.ops.iter()
     }
 
     /// Iterate over all guard operations.
-    pub fn iter_guards(&self) -> impl Iterator<Item = &Op> {
+    pub fn iter_guards(&self) -> impl Iterator<Item = &OpRc> {
         self.ops.iter().filter(|op| op.opcode.is_guard())
     }
 
@@ -145,7 +177,7 @@ impl TreeLoop {
     }
 
     /// Get the final operation (Jump or Finish).
-    pub fn get_final_op(&self) -> Option<&Op> {
+    pub fn get_final_op(&self) -> Option<&OpRc> {
         self.ops.last().filter(|op| op.opcode.is_final())
     }
 
@@ -156,7 +188,7 @@ impl TreeLoop {
 
     /// Split at Label: returns (preamble_ops, body_ops).
     /// If no Label, returns (all_ops, empty).
-    pub fn split_at_label(&self) -> (&[Op], &[Op]) {
+    pub fn split_at_label(&self) -> (&[OpRc], &[OpRc]) {
         match self.find_label() {
             Some(pos) => (&self.ops[..pos], &self.ops[pos..]),
             None => (&self.ops, &[]),
@@ -511,7 +543,10 @@ impl TreeLoop {
         for (pi, &r) in op_escaped.iter().enumerate() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;
             let orig_op = &self.ops[op_idx];
-            let mut new_op = orig_op.clone();
+            // Deep-clone through the Rc: re-emitted prefix ops must have
+            // fresh identity (new pos, fresh _forwarded) per
+            // history.py:551-558 cut_trace_from re-emission.
+            let mut new_op: Op = (**orig_op).clone();
             new_op.pos.set(OpRef::op_typed(
                 new_inputargs_count + pi as u32,
                 new_op.opcode.result_type(),
@@ -530,7 +565,10 @@ impl TreeLoop {
         let mut new_ops: Vec<Op> = Vec::with_capacity(prefix_ops.len() + cut_ops.len());
         new_ops.extend(prefix_ops);
         for (i, op) in cut_ops.iter().enumerate() {
-            let mut new_op = op.clone();
+            // Deep-clone through the Rc: re-emitted post-cut ops carry
+            // fresh identity in the new trace per history.py:cut_trace_from
+            // semantics (RPython makes new ResOperation objects).
+            let mut new_op: Op = (**op).clone();
             new_op.pos.set(OpRef::op_typed(
                 new_inputargs_count + prefix_count + i as u32,
                 new_op.opcode.result_type(),
@@ -1088,10 +1126,10 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
-        trace2.ops.push(Op::new(
+        trace2.ops.push(std::rc::Rc::new(Op::new(
             OpCode::IntSub,
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
-        ));
+        )));
         assert_eq!(trace.num_ops(), 2);
         assert_eq!(trace2.num_ops(), 3);
     }
@@ -4300,7 +4338,7 @@ mod history_record_tests {
         let mut recorder = ctx.recorder;
         recorder.close_loop(jump_args);
         let mut trace = recorder.get_trace();
-        trace.ops.remove(0)
+        (*trace.ops.remove(0)).clone()
     }
 
     #[test]

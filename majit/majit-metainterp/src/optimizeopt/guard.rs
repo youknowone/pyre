@@ -36,7 +36,7 @@
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{DescrRef, Op, OpCode, OpRef};
+use majit_ir::{DescrRef, Op, OpRc, OpCode, OpRef};
 
 use crate::optimizeopt::dependency::IndexVar;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};

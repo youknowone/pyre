@@ -17,7 +17,7 @@ use std::sync::Arc;
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, Op, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 
 thread_local! {
     /// llmodel.py self.gc_ll_descr — owned by the active wasm
@@ -294,9 +294,11 @@ impl majit_backend::Backend for WasmBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
@@ -371,7 +373,7 @@ impl majit_backend::Backend for WasmBackend {
         &mut self,
         _fail_descr: &dyn FailDescr,
         _inputargs: &[InputArg],
-        _ops: &[Op],
+        _ops: &[OpRc],
         _original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,

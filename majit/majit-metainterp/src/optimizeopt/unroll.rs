@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, Op, OpRc, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
@@ -382,10 +382,16 @@ impl UnrollOptimizer {
             // per-arg type list (length must equal `num_inputs`).
             let p1_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
             debug_assert_eq!(p1_inputarg_types.len(), num_inputs);
+            // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
+            // surface receives shared identity (history.py:528). The
+            // deep-clone here corresponds to PyPy's `cls()` per-op fresh
+            // allocation inside `TraceIterator.next` (opencoder.py:399-401).
+            let ops_oprc: Vec<majit_ir::OpRc> =
+                ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
             let mut p1_iter = crate::opencoder::TraceIterator::new(
-                ops,
+                &ops_oprc,
                 0,
-                ops.len(),
+                ops_oprc.len(),
                 None,
                 p1_inputarg_types,
                 0,    // start_fresh = 0 — inputargs at [0..num_inputs)
@@ -703,10 +709,13 @@ impl UnrollOptimizer {
         // as Phase 1 (Phase 2 walks the body half of the same trace).
         let p2_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
         debug_assert_eq!(p2_inputarg_types.len(), body_num_inputs);
+        // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
+        let ops_oprc: Vec<majit_ir::OpRc> =
+            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         let mut iter = crate::opencoder::TraceIterator::new(
-            &ops,
+            &ops_oprc,
             0,
-            ops.len(),
+            ops_oprc.len(),
             None,
             p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)

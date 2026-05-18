@@ -10,7 +10,8 @@ use majit_backend::{
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+    ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef,
+    Type, Value,
 };
 use majit_metainterp::recorder::Trace;
 
@@ -1109,7 +1110,7 @@ fn call_descr_can_raise(idx: u32) -> DescrRef {
 }
 
 /// Assign sequential positions to ops starting at `base`.
-fn assign_positions(ops: &mut [Op], base: u32) {
+fn assign_positions(ops: &mut [OpRc], base: u32) {
     for (i, op) in ops.iter_mut().enumerate() {
         let pos = base + i as u32;
         op.pos.set(OpRef::op_typed(pos, op.result_type()));

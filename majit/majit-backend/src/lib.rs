@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
+use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
 pub mod call_stub;
 pub mod finish_descrs;
@@ -1487,7 +1487,7 @@ pub trait Backend: Send {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
@@ -1584,7 +1584,7 @@ pub trait Backend: Send {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&ExitRecoveryLayout>,

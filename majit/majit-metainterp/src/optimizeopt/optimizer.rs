@@ -12,7 +12,7 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, Op, OpRc, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};

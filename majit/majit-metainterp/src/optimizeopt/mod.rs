@@ -36,7 +36,7 @@ pub mod vstring;
 use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpRc, OpCode, OpRef, Type, Value};
 use std::collections::{HashMap, VecDeque};
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
@@ -8450,7 +8450,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Type, Value};
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpRc, OpCode, OpRef, SizeDescr, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -8935,7 +8935,7 @@ mod intbound_invariant_tests {
 #[cfg(test)]
 mod imported_short_preamble_fallback_tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{Op, OpRc, OpCode, OpRef};
 
     #[test]
     fn force_op_from_preamble_replays_pop_without_builder_lookup() {

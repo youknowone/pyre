@@ -11,7 +11,7 @@
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, InputArg, Op, OpRc, OpCode, OpRef, Type};
 
 use crate::r#box::BoxRef;
 

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
-use majit_ir::resoperation::{Op, OpCode, OpRef};
+use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 

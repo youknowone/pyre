@@ -9,7 +9,7 @@ use std::collections::BinaryHeap;
 use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpRc, OpCode, OpRef};
 
 // ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
 
@@ -804,7 +804,7 @@ impl IndexVar {
     /// In RPython this is `ConstInt(value)` — an inline constant box.
     /// In majit, constants need explicit OpRef allocation.
     pub fn get_operations(&self, mut next_const: impl FnMut(i64) -> OpRef) -> Vec<majit_ir::Op> {
-        use majit_ir::{Op, OpCode};
+        use majit_ir::{Op, OpRc, OpCode};
         let mut var = self.var;
         let mut tolist = Vec::new();
         if self.coefficient_mul != 1 {

@@ -17,7 +17,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::BackendError;
-use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
+use majit_ir::{FailDescr, InputArg, Op, OpRc, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;

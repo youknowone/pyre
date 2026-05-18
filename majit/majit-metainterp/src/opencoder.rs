@@ -202,7 +202,7 @@ pub fn untag(tagged: u32) -> (u8, u32) {
 /// opencoder.py:249 class TraceIterator(BaseTrace).
 pub struct TraceIterator<'a> {
     /// opencoder.py:252 self.trace
-    pub trace: &'a [majit_ir::Op],
+    pub trace: &'a [majit_ir::OpRc],
     /// opencoder.py:255 self._cache: per-iterator map from raw trace
     /// position to fresh box (OpRef) materialized for this iteration.
     /// In RPython this is `[None] * trace._index`; here `Vec<Option<OpRef>>`.
@@ -268,7 +268,7 @@ impl<'a> TraceIterator<'a> {
     /// ranges. RPython does not need this because each iteration's
     /// `cls()` allocation produces distinct Python objects.
     pub fn new(
-        trace: &'a [majit_ir::Op],
+        trace: &'a [majit_ir::OpRc],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
@@ -459,7 +459,7 @@ impl<'a> TraceIterator<'a> {
         }
         let src = &self.trace[self.pos];
         self.pos += 1;
-        let mut res = src.clone();
+        let mut res: majit_ir::Op = (**src).clone();
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
@@ -545,7 +545,7 @@ impl<'a> TraceIterator<'a> {
 // `TraceIterator` (opencoder.py:249-406).  It walks
 // `TraceRecordBuffer._ops` byte-by-byte, producing a fresh `Op` per
 // iteration.  The existing `TraceIterator<'a>` above still exists for
-// legacy consumers that hold a pre-materialized `&[Op]` slice (via
+// legacy consumers that hold a pre-materialized `&[OpRc]` slice (via
 // `TreeLoop.ops`); both coexist during the M2–M7 migration and
 // `ByteTraceIter` takes over once every consumer is migrated off the
 // structured-IR slice.
@@ -1160,7 +1160,7 @@ impl<'a> Iterator for TopDownSnapshotIterator<'a> {
 /// RPython's `SnapshotIterator` holds the enclosing `TraceIterator` as
 /// `main_iter` so `get(tagged)` can dispatch through `_untag` and the
 /// per-iteration fresh-box cache. Pyre's `TraceIterator` still walks
-/// a `&[Op]` slice (pre-byte-stream), so this port exposes the
+/// a `&[OpRc]` slice (pre-byte-stream), so this port exposes the
 /// read-side surface without coupling to `TraceIterator`: callers that
 /// need TAGBOX → fresh-box mapping use a separate `_untag` helper on
 /// their `TraceIterator` instance. The non-TAGBOX surface
@@ -1260,7 +1260,7 @@ impl<'a> SnapshotIterator<'a> {
     /// construction (opencoder.py:204); pyre's `SnapshotIterator`
     /// does not own a `main_iter` because the legacy
     /// `TraceIterator<'a>` (pre-byte-stream) cannot be constructed
-    /// without the `&[Op]` slice it walks, and the byte-stream
+    /// without the `&[OpRc]` slice it walks, and the byte-stream
     /// `ByteTraceIter` carries its own `ConstantPool` lifetime.
     /// Callers pass the iterator explicitly instead so this helper
     /// stays structurally equivalent to `main_iter._untag(index)`.
@@ -2982,6 +2982,7 @@ mod tests {
 
         // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
         // as InputArgInt(0..2), op results follow as BoxInt(2..).
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         assert_eq!(iter.inputargs, vec![iarg(0), iarg(1)]);
         assert_eq!(iter._cache[0], Some(iarg(0)));
@@ -3024,6 +3025,7 @@ mod tests {
 
         // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
@@ -3081,6 +3083,7 @@ mod tests {
         let const_ref = OpRef::const_int(5);
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), const_ref])];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(1));
@@ -3106,6 +3109,7 @@ mod tests {
         // _index (raw trace position) and _fresh (fresh OpRef counter)
         // surfaces as an out-of-bounds panic or stale cache slot.
         let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
@@ -3137,6 +3141,7 @@ mod tests {
             guard,
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10, None);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(11));
@@ -3164,6 +3169,7 @@ mod tests {
             majit_ir::Type::Int,
             majit_ir::Type::Int,
         ];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
 
         assert_eq!(

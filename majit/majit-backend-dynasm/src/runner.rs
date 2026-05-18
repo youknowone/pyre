@@ -9,8 +9,8 @@ use std::sync::Mutex;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
-use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -1590,15 +1590,21 @@ impl Backend for DynasmBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline. Backend
+        // stages do not depend on shared `_forwarded` identity with the
+        // trace; the optimizer has already resolved forwarding by the
+        // time ops reach `compile_loop` (history.py:528 vs. the
+        // backend-emit `Vec<Op>` boundary).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
@@ -1791,15 +1797,18 @@ impl Backend for DynasmBackend {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline (see
+        // compile_loop above for rationale).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
         if crate::majit_log_enabled() && trace_id == 2 {

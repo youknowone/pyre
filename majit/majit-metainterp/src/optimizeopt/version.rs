@@ -4,7 +4,7 @@
 //! When a guard is known to fail frequently, a specialized version of
 //! the loop can be compiled and stitched directly to that guard.
 
-use majit_ir::{Op, OpRef};
+use majit_ir::{Op, OpRc, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
 

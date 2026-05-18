@@ -33,7 +33,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpRc, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -128,6 +128,10 @@ pub enum CompileOutcome {
 struct SimpleCompileViews<'a> {
     data: compile::SimpleCompileData<'a>,
     trace_snapshots: Vec<crate::recorder::Snapshot>,
+    /// Deep-cloned `Op` copies of the trace's `Vec<OpRc>` storage.
+    /// The optimizer pipeline still threads `&[Op]` internally; the
+    /// `TreeLoop.ops`-side `Rc<Op>` identity is preserved by re-wrapping
+    /// at the post-optimize boundary (see `TreeLoop::new`).
     trace_ops: Vec<Op>,
 }
 
@@ -138,7 +142,12 @@ fn make_simple_compile_views<'a>(
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
     let trace_snapshots = data.base.snapshots().to_vec();
-    let trace_ops = data.base.operations().to_vec();
+    let trace_ops: Vec<Op> = data
+        .base
+        .operations()
+        .iter()
+        .map(|rc| (**rc).clone())
+        .collect();
     SimpleCompileViews {
         data,
         trace_snapshots,
@@ -498,7 +507,7 @@ fn translate_trace_iter_box_map(
 /// reference (op args, fail_args, snapshot boxes, vable boxes,
 /// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
 fn prepare_bridge_trace_for_optimizer(
-    bridge_ops: &[Op],
+    bridge_ops: &[OpRc],
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -4161,7 +4170,16 @@ impl<M: Clone> MetaInterp<M> {
         ctx.constants.refresh_from_gc();
         let mut constants = ctx.constants.into_inner_typed();
 
-        let trace_ops = preamble_data.base.operations().to_vec();
+        // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
+        // optimizer's `&[Op]` surface gets owned data. The deep-clone
+        // mirrors PyPy's `cls()` fresh ResOperation per iteration —
+        // optimizer mutations don't leak into TreeLoop.ops identity.
+        let trace_ops: Vec<Op> = preamble_data
+            .base
+            .operations()
+            .iter()
+            .map(|rc| (**rc).clone())
+            .collect();
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
@@ -4548,10 +4566,15 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        // Wrap optimizer-output `Vec<Op>` into `Vec<OpRc>` for the
+        // backend's `&[OpRc]` boundary (history.py:528 ResOperation
+        // identity at trace level).
+        let compiled_ops_rc: Vec<majit_ir::OpRc> =
+            compiled_ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend.compile_loop(
                 &inputargs,
-                &compiled_ops,
+                &compiled_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -5217,7 +5240,7 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
 
-        let trace_ops = {
+        let trace_ops: Vec<Op> = {
             let loop_data = compile::UnrolledLoopData::new(
                 &trace,
                 &loop_jitcell_token,
@@ -5225,7 +5248,12 @@ impl<M: Clone> MetaInterp<M> {
                 &call_pure_results,
                 self.warm_state.get_enable_opts(),
             );
-            loop_data.base.operations().to_vec()
+            loop_data
+                .base
+                .operations()
+                .iter()
+                .map(|rc| (**rc).clone())
+                .collect()
         };
 
         if crate::majit_log_enabled() {
@@ -5406,9 +5434,14 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+            let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             self.backend.compile_loop(
                 &inputargs,
-                &combined_ops,
+                &combined_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -5941,9 +5974,13 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         match self.backend.compile_loop(
             &inputargs,
-            &optimized_ops,
+            &optimized_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
         ) {
@@ -6305,9 +6342,13 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
+        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         match self.backend.compile_loop(
             &inputargs,
-            &compiled_ops,
+            &compiled_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
         ) {
@@ -8211,8 +8252,14 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // Wrap `&[Op]` into `Vec<OpRc>` for the prepare_bridge_trace_for_optimizer
+        // boundary (history.py:528 identity at trace level).
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            bridge_ops,
+            &bridge_ops_rc,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -8393,9 +8440,13 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             self.backend.compile_loop(
                 bridge_inputargs,
-                &optimized_ops,
+                &optimized_ops_rc,
                 Arc::get_mut(&mut token)
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
@@ -8732,8 +8783,12 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            bridge_ops,
+            &bridge_ops_rc,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -8969,11 +9024,16 @@ impl<M: Clone> MetaInterp<M> {
                 .get(&fail_descr.trace_id())
                 .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
                 .and_then(|sl| sl.recovery_layout.clone());
+            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+            let optimized_ops_rc_for_bridge: Vec<majit_ir::OpRc> = optimized_ops
+                .iter()
+                .map(|op| std::rc::Rc::new(op.clone()))
+                .collect();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
                     bridge_inputargs,
-                    &optimized_ops,
+                    &optimized_ops_rc_for_bridge,
                     &source_jct,
                     previous_tokens,
                     caller_recovery_layout.as_ref(),
@@ -17349,7 +17409,7 @@ mod tests {
         set_savedata_ref_on_deadframe,
     };
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
-    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
+    use majit_ir::{DescrRef, InputArg, Op, OpRc, OpCode, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -17493,8 +17553,12 @@ mod tests {
             cls_of_box: None,
         };
 
+        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops,
+            &bridge_ops_rc,
             &bridge_inputargs,
             snapshot_boxes,
             Vec::new(),
@@ -18111,8 +18175,9 @@ mod tests {
         let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
+        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(std::rc::Rc::new).collect();
         meta.backend
-            .compile_loop(inputargs, &ops, &mut token)
+            .compile_loop(inputargs, &ops_rc, &mut token)
             .expect("loop should compile");
         let (mut resume_data, mut exit_layouts) =
             compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
@@ -18556,6 +18621,7 @@ mod tests {
             .ops
             .into_iter()
             .filter(|op| op.opcode != OpCode::Jump)
+            .map(|rc| (*rc).clone())
             .collect()
     }
 

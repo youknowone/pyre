@@ -31,7 +31,7 @@
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpRc, OpCode, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -858,7 +858,7 @@ fn is_float_opcode(opcode: OpCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{Op, OpRc, OpCode, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {

@@ -1157,6 +1157,12 @@ impl VectorizationInfo {
     }
 }
 
+impl AsRef<Op> for Op {
+    fn as_ref(&self) -> &Op {
+        self
+    }
+}
+
 impl Op {
     pub fn new(opcode: OpCode, args: &[OpRef]) -> Self {
         Op {
@@ -1350,13 +1356,14 @@ impl std::fmt::Display for Op {
 /// Generic over the constants value type so both the optimizer-side
 /// typed `Value` pool and the backend-side legacy `i64` pool format
 /// uniformly through their `Debug` impls.
-pub fn format_trace<V: std::fmt::Debug>(
-    ops: &[Op],
+pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>>(
+    ops: &[T],
     constants: &std::collections::HashMap<u32, V>,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for op in ops {
+        let op: &Op = op.as_ref();
         // Replace known constants in display
         write!(out, "  ").unwrap();
         if op.opcode.is_guard() {

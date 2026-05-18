@@ -32,7 +32,7 @@
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpRc, OpCode, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;
@@ -2838,7 +2838,7 @@ pub fn build_short_preamble_from_exported_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{Op, OpRc, OpCode, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {

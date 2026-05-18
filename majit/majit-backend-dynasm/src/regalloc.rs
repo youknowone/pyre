@@ -18,7 +18,7 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
-use majit_ir::{InputArg, Op, OpCode, OpRef, OpTypeIndex, Type, descr_identity};
+use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, OpTypeIndex, Type, descr_identity};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -6076,7 +6076,7 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
     use std::collections::HashMap;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {

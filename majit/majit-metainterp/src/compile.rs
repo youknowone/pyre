@@ -254,7 +254,7 @@ impl<'a> CompileData<'a> {
         &self.trace.inputargs
     }
 
-    pub fn operations(&self) -> &'a [Op] {
+    pub fn operations(&self) -> &'a [majit_ir::OpRc] {
         &self.trace.ops
     }
 
@@ -2512,7 +2512,10 @@ pub fn compile_tmp_callback(
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs, portal_finishtoken);
-    let operations = vec![call_op, guard_op, finish_op];
+    let operations: Vec<majit_ir::OpRc> = vec![call_op, guard_op, finish_op]
+        .into_iter()
+        .map(std::rc::Rc::new)
+        .collect();
     //
     // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
     // pyre has no immutable-list transformation.

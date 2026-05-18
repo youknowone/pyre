@@ -30,7 +30,7 @@ use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcMap, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
     AccumInfo, CallDescr, Descr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex,
-    Op, OpCode, OpRef, OpTypeIndex, Type, Value,
+    Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -13910,9 +13910,13 @@ impl majit_backend::Backend for CraneliftBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
+        // boundary; backend stages do not depend on `_forwarded` sharing).
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
@@ -14049,11 +14053,13 @@ impl majit_backend::Backend for CraneliftBackend {
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
-        ops: &[Op],
+        ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let ops: &[Op] = &ops_owned;
         let invalidated_arc = original_token.invalidated.clone();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;

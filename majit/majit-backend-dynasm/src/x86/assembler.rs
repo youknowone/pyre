@@ -18,7 +18,7 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, Executab
 
 use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
 use majit_ir::{
-    FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
 
 use crate::arch::*;

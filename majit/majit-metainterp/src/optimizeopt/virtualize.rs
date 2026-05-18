@@ -8,7 +8,7 @@
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpRc, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,

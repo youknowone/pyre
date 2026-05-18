@@ -7,7 +7,7 @@
 use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
-use majit_ir::{Op, OpCode, OpRef, Type};
+use majit_ir::{Op, OpRc, OpCode, OpRef, Type};
 use std::collections::HashMap;
 
 /// regalloc.py:26-28.

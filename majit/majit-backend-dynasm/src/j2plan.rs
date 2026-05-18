@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use majit_ir::{InputArg, Op, OpCode, OpRef};
+use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef};
 
 /// A lowered dynasm-backend operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,7 +180,7 @@ pub(crate) struct DeoptSpillPoint {
 
 impl TracePlan {
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let lowered: Vec<LirOp> = ops.iter().map(lower_op).collect();
+        let lowered: Vec<LirOp> = ops.iter().map(|op| lower_op(op)).collect();
         let live_points = compute_live_points(&lowered);
         let deopt_spill_points = compute_deopt_spill_points(&lowered);
         let max_live = live_points
@@ -626,7 +626,7 @@ fn add_refs(live: &mut Vec<OpRef>, args: &[OpRef]) {
 
 #[cfg(test)]
 mod tests {
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 
