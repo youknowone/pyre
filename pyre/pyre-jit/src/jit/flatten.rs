@@ -234,20 +234,23 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
     TLabel::new(pc_label_name(py_pc))
 }
 
-/// Recover the Python PC index from a `Insn::PcAnchor`, or `None`
-/// for any other Insn shape.  Consumed by the runtime's
-/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans.
+/// Recover the Python PC index from a `Insn::PcAnchor` or from an
+/// `Insn::Label` whose name matches the `pc{N}` convention.  Returns
+/// `None` for any other Insn shape.  Consumed by the
+/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans plus the
+/// `strip_walker_block_boundary_goto` pass.
 ///
-/// `Insn::Label("pc{N}")` was the transitional shape before the
-/// `Insn::PcAnchor` variant landed; every walker emit site and every
-/// in-tree test fixture now produces `Insn::PcAnchor` directly, so the
-/// recognition path is retired and `Insn::Label` is reserved purely
-/// for upstream-orthodox block / link / catch-landing labels.
+/// The dual recognition is transitional: T6 retires the `PcAnchor`
+/// variant in favor of `Insn::Label(Label::new(pc_label_name(N)))` so
+/// per-PC labels share the same surface shape as upstream-orthodox
+/// block / link / catch-landing labels.  All callers must reach the
+/// py_pc through this helper rather than pattern-matching on
+/// `PcAnchor` directly.
 pub fn label_pc_index(insn: &Insn) -> Option<usize> {
-    if let Insn::PcAnchor { py_pc } = insn {
-        Some(*py_pc)
-    } else {
-        None
+    match insn {
+        Insn::PcAnchor { py_pc } => Some(*py_pc),
+        Insn::Label(label) => label.name.strip_prefix("pc").and_then(|s| s.parse().ok()),
+        _ => None,
     }
 }
 
@@ -1160,11 +1163,14 @@ impl Insn {
     }
 
     /// pyre-only per-PC anchor for `py_pc`.  Walker emits one per
-    /// Python PC entry; the runtime resolves `pc{N}` jumps via
-    /// `pc_anchor_positions` / `live_marker_indices_by_pc` scans
-    /// against this variant.
+    /// Python PC entry as `Insn::Label(Label::new(pc_label_name(py_pc)))`;
+    /// the runtime resolves `pc{N}` jumps via the same machinery as any
+    /// other `Label`.  The dedicated `PcAnchor` variant is retired —
+    /// per-PC labels share the surface shape with upstream-orthodox
+    /// block / link / catch-landing labels and `label_pc_index` is the
+    /// canonical way to recover the py_pc.
     pub fn pc_anchor(py_pc: usize) -> Self {
-        Insn::PcAnchor { py_pc }
+        Insn::Label(Label::new(pc_label_name(py_pc)))
     }
 
     /// `true` iff this instruction is a `-live-` marker.

@@ -10120,17 +10120,15 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// R4 regression test: tail-strip pass must recognise the
-    /// `Insn::PcAnchor { py_pc }` shape the walker emits at PC block
-    /// boundaries (commit 0b016d9bde retired the transitional
-    /// `Insn::Label("pcN")` shape, but the strip recogniser still
-    /// only matched `Insn::Label`, so the defensive
-    /// `goto pcN; ---` pair was left in the drained stream — extra
-    /// control-flow RPython's recursive `make_link` would never
-    /// emit per `flatten.py:106-155`).
+    /// R4 regression test: tail-strip pass must recognise the per-PC
+    /// anchor shape the walker emits at PC block boundaries.  T6
+    /// retired the dedicated `Insn::PcAnchor` variant in favor of
+    /// `Insn::Label(Label::new(pc_label_name(N)))`, so the strip
+    /// recogniser now matches on `label_pc_index`, which accepts
+    /// both forms.
     #[test]
     fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
-        use super::super::flatten::{Insn, Operand, pc_label_name, pc_tlabel};
+        use super::super::flatten::{Insn, Operand, label_pc_index, pc_label_name, pc_tlabel};
 
         let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(7))]);
         let trailing_unreachable = Insn::Unreachable;
@@ -10144,15 +10142,15 @@ mod tests {
 
         let drained = super::strip_walker_block_boundary_goto(&mut blocks);
 
-        // Block A's goto + Unreachable were stripped; block B's
-        // PcAnchor opens the fall-through directly.
+        // Block A's goto + Unreachable were stripped; block B's per-PC
+        // anchor opens the fall-through directly.
         assert_eq!(
             drained.len(),
             3,
-            "expected [live, PcAnchor, live] after strip, got {drained:?}",
+            "expected [live, pc-anchor, live] after strip, got {drained:?}",
         );
         assert!(matches!(drained[0], Insn::Op { ref opname, .. } if opname == "-live-"));
-        assert!(matches!(drained[1], Insn::PcAnchor { py_pc: 7 },));
+        assert_eq!(label_pc_index(&drained[1]), Some(7));
         assert!(matches!(drained[2], Insn::Op { ref opname, .. } if opname == "-live-"));
 
         // The strip should NOT fire when the goto target doesn't

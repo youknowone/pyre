@@ -292,7 +292,11 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
             if next.is_live() {
                 lives.push(next);
                 i += 1;
-            } else if matches!(&next, Insn::PcAnchor { .. }) {
+            } else if super::flatten::label_pc_index(&next).is_some() {
+                // Per-PC anchor — break out of the merge so
+                // `live_marker_indices_by_pc` can find one `-live-`
+                // marker per anchor.  Matches both `Insn::PcAnchor`
+                // and `Insn::Label(Label::new(pc_label_name(N)))`.
                 break;
             } else if matches!(next, Insn::Label(_)) {
                 labels.push(next);
