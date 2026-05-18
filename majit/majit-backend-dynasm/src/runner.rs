@@ -1555,8 +1555,20 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
+        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // builds the per-CPU malloc / propagate trampolines, but the
+        // pyre `Backend::setup_once` hook isn't yet wired into every
+        // tracing entry (`force_start_tracing` builds the trace ctx
+        // inline rather than going through `setup_tracing`).  Ensure
+        // the trampoline is materialised lazily on the first
+        // `compile_loop`/`compile_bridge` instead — idempotent and
+        // cheap after the cache hit, matching PyPy's "build once per
+        // CPU" semantics without requiring every trace-start path to
+        // remember to call `_setup_once`.
         #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_fixed = self.arch_cpu_ext.malloc_slowpath_fixed();
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -1756,8 +1768,20 @@ impl Backend for DynasmBackend {
             self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
+        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // builds the per-CPU malloc / propagate trampolines, but the
+        // pyre `Backend::setup_once` hook isn't yet wired into every
+        // tracing entry (`force_start_tracing` builds the trace ctx
+        // inline rather than going through `setup_tracing`).  Ensure
+        // the trampoline is materialised lazily on the first
+        // `compile_loop`/`compile_bridge` instead — idempotent and
+        // cheap after the cache hit, matching PyPy's "build once per
+        // CPU" semantics without requiring every trace-start path to
+        // remember to call `_setup_once`.
         #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_fixed = self.arch_cpu_ext.malloc_slowpath_fixed();
+        let malloc_slowpath_fixed = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             0,
