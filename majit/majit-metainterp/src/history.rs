@@ -3888,6 +3888,75 @@ impl TraceCtx {
         self.call_assembler_typed_by_number(target_number, args, arg_types, Type::Float)
     }
 
+    /// Slice X-D step: variant of `call_assembler_typed_by_number` that
+    /// uses a pre-resolved `Arc<JitCellToken>` so the recorded descr
+    /// carries production token identity (compile.py:187 parity).
+    /// Skips the synth-Arc + `jitcell_token_by_number` keepalive fallback
+    /// that the number-only path relies on in `record_loop_or_bridge`.
+    fn call_assembler_typed_arc(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+        result_type: Type,
+    ) -> OpRef {
+        let descr =
+            crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
+        let opcode = OpCode::call_assembler_for_type(result_type);
+        let result = self.record_op_with_descr(opcode, args, descr);
+        self.constants.refresh_from_gc();
+        let constants = &self.constants;
+        let oracle: &dyn majit_trace::heapcache::SameConstantOracle = constants;
+        let const_value = |opref| match constants.get_value(opref) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
+            _ => None,
+        };
+        self.heap_cache.invalidate_caches_varargs(
+            OpCode::call_may_force_for_type(result_type),
+            None,
+            args,
+            oracle,
+            const_value,
+        );
+        result
+    }
+
+    pub fn call_assembler_void_arc_typed(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) {
+        let _ = self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Void);
+    }
+
+    pub fn call_assembler_int_arc_typed(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Int)
+    }
+
+    pub fn call_assembler_ref_arc_typed(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Ref)
+    }
+
+    pub fn call_assembler_float_arc_typed(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Float)
+    }
+
     /// rewrite.py:665-695 handle_call_assembler parity.
     /// Emit CALL_ASSEMBLER with only the frame reference as arg; the backend
     /// expands to the full callee inputarg layout via `VableExpansion`.
