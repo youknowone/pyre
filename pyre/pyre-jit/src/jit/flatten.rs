@@ -2351,21 +2351,16 @@ where
             }
             self.serialize_op(op);
         }
-        // Emit anchors for any owned PCs that didn't appear in any
-        // op's `offset` (e.g. PCs whose walker emit produced only
-        // scaffold — PA + `-live-` — and no graph SpaceOp).
-        // `pc_anchor_positions` asserts every PC has an anchor; this
-        // tail emission satisfies that invariant.  These trailing
-        // anchors sit between the block's last op and `insert_exits`'s
-        // terminator emission — runtime entry into them would no-op
-        // through the terminator's goto / return because they carry
-        // no preceding ops in this block.
-        for &p in &owned_pcs_sorted {
-            if !anchored_pcs.contains(&p) {
-                self.emitline(Insn::pc_anchor(p));
-                self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
-            }
-        }
+        // `flatten.py:106-128` make_bytecode_block emits NO per-PC
+        // anchors at all — Label(block) at entry, then ops, then
+        // insert_exits.  The catch-up emit inside the op loop above
+        // remains pyre's adaptation for runtime per-PC dispatch; the
+        // trailing PA + `-live-` for unanchored owned PCs that used
+        // to live here was extra pyre-only scaffolding diverging from
+        // upstream.  Owned PCs without any op are intentionally left
+        // unanchored — runtime dispatch never targets them (no graph
+        // SpaceOp means no observable side effect, hence no guard /
+        // bridge entry).
         self.insert_exits(&block, handling_ovf);
     }
 
