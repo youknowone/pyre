@@ -3,34 +3,30 @@
 //! RPython manages constants implicitly in Trace — ConstPtr boxes are
 //! GC-managed objects, so GC can update them when objects move.
 //!
-//! majit stores Ref constants as raw i64 in a HashMap, invisible to GC.
-//! To achieve RPython parity, Ref constants are rooted on the shadow
-//! stack (gcreftracer.py:GCREFTRACER parity). GC's walk_roots updates
-//! shadow stack entries in place; refresh_from_gc copies updated values
-//! back to the HashMap before consumption.
+//! majit stores Ref constants as raw i64 entries in a VecAssoc,
+//! invisible to GC. To achieve RPython parity, Ref constants are rooted
+//! on the shadow stack (gcreftracer.py:GCREFTRACER parity). GC's
+//! walk_roots updates shadow stack entries in place; refresh_from_gc
+//! copies updated values back to the VecAssoc before consumption.
 //!
-//! ## Task #297 migration status (typed `Value` over raw `i64`)
-//!
-//! Internal storage is `HashMap<u32, Value>`.  Production callers and
+//! Internal storage is `VecAssoc<u32, Value>`.  Production callers and
 //! `Backend::set_constants_pool` consume the typed `VecAssoc<u32,
 //! Const>` shape.  The remaining raw-`i64` egress paths are:
 //!
-//!   * `into_inner` / `snapshot_raw` / `raw_bits` — raw `i64` readers
-//!     kept for integer-typed regalloc consumers (offsets, sizes,
-//!     scales) in `dynasm/regalloc.rs` and parity-test helpers.
-//!     `raw_bits` round-trips through `as_raw_i64()` without
-//!     information loss for integer constants.
+//!   * `into_inner` / `raw_bits` — raw `i64` readers kept for
+//!     integer-typed regalloc consumers (offsets, sizes, scales) in
+//!     `dynasm/regalloc.rs` and parity-test helpers. `raw_bits`
+//!     round-trips through `as_raw_i64()` without information loss for
+//!     integer constants.
 //!   * `into_inner_typed` / `snapshot` / `get_value` — typed `Value`
 //!     egress, used by callers that need to distinguish
 //!     `Value::Int`/`Float`/`Ref`.
-
-use std::collections::HashMap;
 
 use majit_gc::shadow_stack;
 use majit_ir::{GcRef, OpRef, Type, Value, VecAssoc};
 
 /// Encode a typed `Value` to the raw `i64` shape used by the legacy
-/// backend boundary (`set_constants(HashMap<u32, i64>)`).
+/// backend boundary.
 fn value_to_raw_bits(value: &Value) -> i64 {
     match value {
         Value::Int(v) => *v,
@@ -58,13 +54,12 @@ fn value_to_raw_bits(value: &Value) -> i64 {
 ///
 /// Storage shape: `VecAssoc<u32, Value>` mirrors RPython where each
 /// `ConstInt/ConstFloat/ConstPtr` Box carries `.type` intrinsically
-/// (history.py:220/261/307). The legacy split `(HashMap<u32, i64>,
-/// HashMap<u32, Type>)` is retired — type rides on the `Value` variant
-/// tag, eliminating the lockstep risk between value and type maps.
+/// (history.py:220/261/307). Type rides on the `Value` variant tag,
+/// eliminating the lockstep risk between value and type maps.
 ///
 /// gcreftracer.py parity: Ref-typed constants are pushed onto the GC
 /// shadow stack so that GC can trace and update them if objects move.
-/// On consumption (into_inner / snapshot), the HashMap is refreshed
+/// On consumption (into_inner / snapshot), the VecAssoc is refreshed
 /// from the shadow stack to pick up any GC-updated pointers.
 pub struct ConstantPool {
     /// Keyed by OpRef.0 (tagged constant value, i.e. index | CONST_BIT).
@@ -82,8 +77,8 @@ pub struct ConstantPool {
     /// storage of non-small-int constant values, in mint order. Slot
     /// `bigints[k] = (opref_raw, value)` where `opref_raw =
     /// opref.raw()` for the k-th ConstInt minted. Populated alongside
-    /// `constants` HashMap as a structural mirror; consumers continue
-    /// to use the HashMap until subsequent slices migrate readers.
+    /// `constants` VecAssoc as a structural mirror; consumers continue
+    /// to use the VecAssoc until subsequent slices migrate readers.
     bigints: Vec<(u32, i64)>,
     /// opencoder.py:486 `self._floats = []` parity. Dense per-pool
     /// storage of ConstFloat constants in mint order. Slot
@@ -125,7 +120,7 @@ impl ConstantPool {
         self.next_const_idx += 1;
         self.constants.insert(opref.raw(), Value::Int(value));
         // opencoder.py:621 `self._bigints.append(value)` parity:
-        // structural mirror of the HashMap write into the dense
+        // structural mirror of the VecAssoc write into the dense
         // per-pool Vec.
         self.bigints.push((opref.raw(), value));
         opref
@@ -318,19 +313,20 @@ impl ConstantPool {
         }
     }
 
-    /// Consume the pool and return the legacy raw-bits map.
+    /// Consume the pool and return the raw-bits map.
     ///
     /// The raw-bits view is preserved for backend / parity-print
-    /// consumers that still operate on `HashMap<u32, i64>`.  Each
+    /// consumers that still operate on `i64` payloads. Each
     /// `Value` is lowered via `value_to_raw_bits`.
-    pub fn into_inner(mut self) -> HashMap<u32, i64> {
+    pub fn into_inner(mut self) -> VecAssoc<u32, i64> {
         self.refresh_from_gc();
         let constants = std::mem::take(&mut self.constants);
         self.release_roots();
-        constants
-            .into_iter()
-            .map(|(k, v)| (k, value_to_raw_bits(&v)))
-            .collect()
+        let mut out: VecAssoc<u32, i64> = VecAssoc::new();
+        for (k, v) in constants.into_iter() {
+            out.insert(k, value_to_raw_bits(&v));
+        }
+        out
     }
 
     /// Consume the pool, returning the canonical typed `VecAssoc<u32,
@@ -374,17 +370,6 @@ impl ConstantPool {
     pub fn snapshot(&mut self) -> VecAssoc<u32, Value> {
         self.refresh_from_gc();
         self.constants.clone()
-    }
-
-    /// Legacy raw-bits snapshot for callers that still operate on
-    /// `HashMap<u32, i64>`. Each entry is lowered via `value_to_raw_bits`.
-    /// Refreshes from GC first.
-    pub fn snapshot_raw(&mut self) -> HashMap<u32, i64> {
-        self.refresh_from_gc();
-        self.constants
-            .iter()
-            .map(|(&k, v)| (k, value_to_raw_bits(v)))
-            .collect()
     }
 
 }

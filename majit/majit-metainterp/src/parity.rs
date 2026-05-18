@@ -4,7 +4,6 @@
 use crate::history::TreeLoop;
 use crate::optimizeopt::vec_assoc::VecAssoc;
 use majit_ir::{Op, OpRc, OpRef, Type};
-use std::collections::HashMap;
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.
@@ -37,7 +36,7 @@ impl VarRenumbering {
     }
 }
 
-fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
+fn render_arg(arg: OpRef, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering) -> String {
     if let Some(value) = constants.get(&arg.raw()) {
         value.to_string()
     } else {
@@ -45,7 +44,7 @@ fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumberi
     }
 }
 
-fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
+fn render_op(op: &Op, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering) -> String {
     let args = op.getarglist().iter()
         .map(|&arg| render_arg(arg, constants, vars))
         .collect::<Vec<_>>()
@@ -78,7 +77,7 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
 /// shifting op-result IDs and breaking the stable line format
 /// parity cases expect (mirrors RPython `opimpl_*` trace shapes that
 /// assume the inputarg slot numbering is the canonical prefix).
-pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
+pub fn normalize_trace(trace: &TreeLoop, constants: &VecAssoc<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
     for inputarg in &trace.inputargs {
         // Pre-allocate v0..vN for the inputarg slots. RPython inputargs
@@ -96,7 +95,7 @@ pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<S
 
 /// Normalize an op slice into the same stable line format used by
 /// [`normalize_trace`].
-pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
+pub fn normalize_ops(ops: &[Op], constants: &VecAssoc<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
     ops.iter()
         .map(|op| render_op(op, constants, &mut vars))
@@ -106,7 +105,7 @@ pub fn normalize_ops(ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<String> {
 /// Assert that a trace matches a normalized parity case.
 pub fn assert_trace_parity(
     trace: &TreeLoop,
-    constants: &HashMap<u32, i64>,
+    constants: &VecAssoc<u32, i64>,
     case: &TraceParityCase<'_>,
 ) {
     let actual = normalize_trace(trace, constants);
@@ -130,7 +129,7 @@ mod tests {
     use crate::{TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
 
-    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, HashMap<u32, i64>) {
+    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, VecAssoc<u32, i64>) {
         ctx.finish(finish_args, make_fail_descr(finish_args.len()));
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();

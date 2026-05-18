@@ -3759,7 +3759,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, majit_ir::VecAssoc<u32, i64>)> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
