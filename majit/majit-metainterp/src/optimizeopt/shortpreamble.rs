@@ -1788,8 +1788,7 @@ fn build_short_preamble_struct_from_ops(
     ops: &[Op],
     used_boxes: &[OpRef],
     jump_args: &[OpRef],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
-    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let inputarg_idx =
         |arg: &OpRef| -> Option<usize> { short_inputargs.iter().position(|a| a == arg) };
@@ -1838,36 +1837,25 @@ fn build_short_preamble_struct_from_ops(
     // short preamble ops that isn't defined by the ops themselves.
     let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)> =
         crate::optimizeopt::vec_assoc::VecAssoc::new();
-    // RPython parity: typed `OpRef::Const{Int,Float,Ptr}` carry the type
-    // tag intrinsically (history.py:220/261/307). Only `OpRef::Untyped`
-    // (legacy `from_raw` producers) needs the lockstep side-table; missing
-    // type entry for a known constant in that case is a structural bug.
-    let const_type_for =
-        |arg: OpRef| -> majit_ir::Type {
-            if let Some(tp) = arg.ty() {
-                return tp;
-            }
-            loop_constant_types.get(&arg.raw()).copied().unwrap_or_else(|| {
-            panic!(
-                "loop_constant_types missing entry for raw={} though loop_constants has it: \
-                 the two maps must be populated in lockstep",
-                arg.raw()
-            )
-        })
-        };
+    // history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr.type` invariant:
+    // every Const box carries its type intrinsically as an instance
+    // attribute. Pyre's `majit_ir::Const` enum captures the same shape
+    // (`Const::Int/Float/Ref` carries both type and value), so the
+    // separate `loop_constant_types` side-table is no longer needed —
+    // the type is read directly from the `Const` arm via `.get_type()`.
     for op in ops {
         for &arg in op.getarglist().iter() {
             if !defined_by_ops.contains(&arg) {
-                if let Some(&val) = loop_constants.get(&arg.raw()) {
-                    constants.insert(arg.raw(), (val, const_type_for(arg)));
+                if let Some(c) = loop_constants.get(&arg.raw()) {
+                    constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
                 }
             }
         }
         if let Some(fa) = op.getfailargs() {
             for arg in fa {
                 if !defined_by_ops.contains(&arg) {
-                    if let Some(&val) = loop_constants.get(&arg.raw()) {
-                        constants.insert(arg.raw(), (val, const_type_for(arg)));
+                    if let Some(c) = loop_constants.get(&arg.raw()) {
+                        constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
                     }
                 }
             }
@@ -1876,8 +1864,8 @@ fn build_short_preamble_struct_from_ops(
     // Also check jump_args for constants
     for &arg in jump_args {
         if !defined_by_ops.contains(&arg) {
-            if let Some(&val) = loop_constants.get(&arg.raw()) {
-                constants.insert(arg.raw(), (val, const_type_for(arg)));
+            if let Some(c) = loop_constants.get(&arg.raw()) {
+                constants.insert(arg.raw(), (c.as_raw_i64(), c.get_type()));
             }
         }
     }
@@ -2070,8 +2058,7 @@ impl ShortPreambleBuilder {
 
     pub fn build_short_preamble_struct(
         &self,
-        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
-        loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     ) -> ShortPreamble {
         let jump_args: Vec<OpRef> = self
             .state
@@ -2085,7 +2072,6 @@ impl ShortPreambleBuilder {
             &self.state.used_boxes,
             &jump_args,
             loop_constants,
-            loop_constant_types,
         )
     }
 
@@ -2515,8 +2501,7 @@ impl ExtendedShortPreambleBuilder {
 
     pub fn build_short_preamble_struct(
         &self,
-        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
-        loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     ) -> ShortPreamble {
         // short[..len-1] excludes the JUMP sentinel
         let ops: Vec<Op> = self.short[..self.short_ops_len()].to_vec();
@@ -2531,7 +2516,6 @@ impl ExtendedShortPreambleBuilder {
             &self.used_boxes,
             &self.short_jump_args,
             loop_constants,
-            loop_constant_types,
         );
         if inputargs != &self.short_inputargs {
             sp.phase1_inputargs = Some(self.short_inputargs.clone());
@@ -2762,8 +2746,7 @@ pub fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
-    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
     // shortpreamble.py:288 `produce_arg` parity: known_constants holds
@@ -2781,32 +2764,23 @@ pub fn build_short_preamble_from_produced_boxes(
     //     Wrapping these as `Const*` (via `const_typed`) would
     //     OR `CONST_BIT` and break variant-aware identity
     //     (history.py:182 box class identity).
-    for &idx in loop_constants.keys() {
-        // history.py:220 `ConstInt.type` invariant: every Const carries an
-        // intrinsic `.type`. `loop_constants` and `loop_constant_types`
-        // are populated in lockstep by the optimizer
-        // (optimizer.rs::backend_constants seeding); a missing type entry
-        // for an existing key is a structural bookkeeping bug, not a
-        // case to silently default. Sister site
-        // `build_short_preamble_struct_from_ops::const_type_for`
-        // (shortpreamble.rs:1855-1863) panics with the same message —
-        // keep the two readers consistent.
-        let tp = loop_constant_types.get(&idx).copied().unwrap_or_else(|| {
-            panic!(
-                "loop_constant_types missing entry for raw={} though loop_constants has it: \
-                 the two maps must be populated in lockstep (history.py:220 box.type)",
-                idx
-            )
-        });
+    for (idx, c) in loop_constants.iter() {
+        // history.py:220/261/307 `Const{Int,Float,Ptr}.type` invariant:
+        // every Const box carries its `.type` intrinsically. Pyre's
+        // `majit_ir::Const` enum captures the same shape; `c.get_type()`
+        // returns the typed `Const` arm so we no longer need the
+        // parallel `loop_constant_types` side-table to recover the
+        // type for a `loop_constants` key.
+        let tp = c.get_type();
         // `const_typed` takes a pool index (history.py:220 `ConstInt(idx)`
         // construction shape); the CONST_BIT live in `loop_constants` keys
         // is a raw-namespace artifact and must be stripped before handing
         // the index to the factory. `raw_const_index` is the canonical
         // un-OR helper (resoperation.rs:191).
-        let opref = if OpRef::raw_is_constant(idx) {
-            OpRef::const_typed(OpRef::raw_const_index(idx), tp)
+        let opref = if OpRef::raw_is_constant(*idx) {
+            OpRef::const_typed(OpRef::raw_const_index(*idx), tp)
         } else {
-            OpRef::op_typed(idx, tp)
+            OpRef::op_typed(*idx, tp)
         };
         builder.note_known_constant(opref);
     }
@@ -2814,15 +2788,14 @@ pub fn build_short_preamble_from_produced_boxes(
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
-    builder.build_short_preamble_struct(loop_constants, loop_constant_types)
+    builder.build_short_preamble_struct(loop_constants)
 }
 
 pub fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
-    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
-    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 ) -> ShortPreamble {
     let produced =
         produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
@@ -2831,7 +2804,6 @@ pub fn build_short_preamble_from_exported_boxes(
         short_inputargs,
         &produced,
         loop_constants,
-        loop_constant_types,
     )
 }
 
@@ -3107,7 +3079,6 @@ mod tests {
             &[OpRef::int_op(10), OpRef::int_op(11)],
             &exported,
             &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
@@ -3146,7 +3117,6 @@ mod tests {
             &label_args,
             &short_inputargs,
             &exported,
-            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
             &crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
         let opcodes: Vec<OpCode> = sp.ops.iter().map(|entry| entry.op.opcode).collect();

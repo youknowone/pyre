@@ -3354,16 +3354,16 @@ impl OptContext {
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
         self.active_short_preamble_producer.as_ref().map(|builder| {
-            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+            // history.py:220/261/307: `Const` boxes carry both type and
+            // value intrinsically. Pyre's typed `majit_ir::Const` enum
+            // unifies the legacy `(loop_constants, loop_constant_types)`
+            // parallel maps into a single `VecAssoc<u32, Const>`. This
+            // path has no values to seed (the optimizer's
+            // `make_constant` chain populates the producer's known
+            // constants directly), so an empty `loop_constants` suffices.
+            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
                 crate::optimizeopt::vec_assoc::VecAssoc::new();
-            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
-                u32,
-                majit_ir::Type,
-            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-            for (&k, &tp) in self.constant_types.iter() {
-                loop_constant_types.insert(k, tp);
-            }
-            builder.build_short_preamble_struct(&empty_loop_constants, &loop_constant_types)
+            builder.build_short_preamble_struct(&empty_loop_constants)
         })
     }
 
@@ -3384,27 +3384,32 @@ impl OptContext {
                 // across compilations via GC tracing. In majit, we must
                 // snapshot the constant pool so build_short_preamble_struct
                 // can capture referenced constants.
-                let value_to_raw = |val: &majit_ir::Value| -> i64 {
+                // history.py:220/261/307 `Const` carries both type and
+                // value intrinsically. Pyre's `majit_ir::Const` enum
+                // captures the same shape so the legacy
+                // `(loop_constants: u32->i64, loop_constant_types:
+                // u32->Type)` parallel maps unify into a single
+                // `VecAssoc<u32, Const>`. The `Value::Void` arm has no
+                // corresponding `Const` variant (no `ConstVoid` upstream)
+                // and would indicate a bookkeeping bug; the
+                // `value_to_const` helper panics rather than silently
+                // synthesizing one.
+                let value_to_const = |val: &majit_ir::Value| -> majit_ir::Const {
                     match val {
-                        majit_ir::Value::Int(v) => *v,
-                        majit_ir::Value::Float(f) => f.to_bits() as i64,
-                        majit_ir::Value::Ref(r) => r.0 as i64,
-                        majit_ir::Value::Void => 0,
+                        majit_ir::Value::Int(v) => majit_ir::Const::Int(*v),
+                        majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
+                        majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
+                        majit_ir::Value::Void => panic!(
+                            "build_imported_short_preamble: Value::Void has no Const equivalent \
+                             (history.py:220/261/307 — no ConstVoid upstream)"
+                        ),
                     }
                 };
-                let value_to_type = |val: &majit_ir::Value| -> majit_ir::Type {
-                    match val {
-                        majit_ir::Value::Int(_) => majit_ir::Type::Int,
-                        majit_ir::Value::Float(_) => majit_ir::Type::Float,
-                        majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
-                        majit_ir::Value::Void => majit_ir::Type::Void,
-                    }
-                };
-                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
                     crate::optimizeopt::vec_assoc::VecAssoc::new();
                 for (i, val) in self.const_pool.iter() {
                     loop_constants
-                        .insert(Self::const_ref_for_value(i, val).raw(), value_to_raw(val));
+                        .insert(Self::const_ref_for_value(i, val).raw(), value_to_const(val));
                 }
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -3420,34 +3425,12 @@ impl OptContext {
                     if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                         if let Some(val) = target.const_value() {
                             if !loop_constants.contains_key(&(idx as u32)) {
-                                loop_constants.insert(idx as u32, value_to_raw(&val));
+                                loop_constants.insert(idx as u32, value_to_const(&val));
                             }
                         }
                     }
                 }
-                let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
-                    u32,
-                    majit_ir::Type,
-                > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-                for (&k, &tp) in self.constant_types.iter() {
-                    loop_constant_types.insert(k, tp);
-                }
-                for (i, val) in self.const_pool.iter() {
-                    let k = Self::const_ref_for_value(i, val).raw();
-                    if !loop_constant_types.contains_key(&k) {
-                        loop_constant_types.insert(k, value_to_type(val));
-                    }
-                }
-                for (idx, b) in self.box_pool.iter_indexed() {
-                    if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
-                        if let Some(val) = target.const_value() {
-                            if !loop_constant_types.contains_key(&(idx as u32)) {
-                                loop_constant_types.insert(idx as u32, value_to_type(&val));
-                            }
-                        }
-                    }
-                }
-                builder.build_short_preamble_struct(&loop_constants, &loop_constant_types)
+                builder.build_short_preamble_struct(&loop_constants)
             })
     }
 

@@ -1065,34 +1065,31 @@ impl UnrollOptimizer {
             // exported_state.short_boxes` parity: consume the eagerly-derived
             // ProducedShortOp list stored on ExportedState at export time.
             //
-            // history.py:220 box.type parity: `build_short_preamble_from_produced_boxes`
-            // consumes the legacy `(i64, Type)` shape via VecAssoc; lower the
-            // typed `Value` pool back at the call boundary.
-            let (consts_p1_bits, consts_p1_types) =
-                crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&consts_p1);
-            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
-                u32,
-                majit_ir::Type,
-            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-            for (&k, &tp) in self.constant_types.iter() {
-                loop_constant_types.insert(k, tp);
-            }
-            for (&k, &tp) in consts_p1_types.iter() {
-                if !loop_constant_types.contains_key(&k) {
-                    loop_constant_types.insert(k, tp);
-                }
-            }
-            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+            // history.py:220/261/307 `Const` carries both type and value
+            // intrinsically. Pyre's typed `majit_ir::Const` unifies the
+            // legacy `(i64, Type)` parallel maps into a single
+            // `VecAssoc<u32, Const>`; the conversion from typed `Value`
+            // happens directly at the call boundary, with no parallel
+            // `loop_constant_types` side-table.
+            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
                 crate::optimizeopt::vec_assoc::VecAssoc::new();
-            for (&k, &v) in consts_p1_bits.iter() {
-                loop_constants.insert(k, v);
+            for (&k, v) in consts_p1.iter() {
+                let c = match v {
+                    majit_ir::Value::Int(i) => majit_ir::Const::Int(*i),
+                    majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
+                    majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
+                    majit_ir::Value::Void => panic!(
+                        "import_state: Value::Void has no Const equivalent \
+                         (history.py:220/261/307 — no ConstVoid upstream)"
+                    ),
+                };
+                loop_constants.insert(k, c);
             }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
                 &exported_short_boxes_produced,
                 &loop_constants,
-                &loop_constant_types,
             )
         });
         // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
@@ -3131,54 +3128,46 @@ impl OptUnroll {
                             ctx,
                         );
                         if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                            // RPython parity: extract constant pool from
-                            // OptContext. In RPython, Const objects in short
-                            // preamble ops are GC-tracked and survive across
-                            // compilations. build_short_preamble_struct scans
-                            // all op args to capture referenced constants.
+                            // history.py:220/261/307: `Const` carries both
+                            // type and value intrinsically. Pyre's typed
+                            // `majit_ir::Const` enum unifies the legacy
+                            // `(loop_constants, loop_constant_types)`
+                            // parallel maps into a single
+                            // `VecAssoc<u32, Const>`; the type tag rides on
+                            // the `Const` arm so no companion `Type` map is
+                            // needed.
                             let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
                                 u32,
-                                i64,
+                                majit_ir::Const,
                             > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-                            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
-                                u32,
-                                majit_ir::Type,
-                            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-                            for (&k, &tp) in optimizer.constant_types.iter() {
-                                loop_constant_types.insert(k, tp);
-                            }
                             for (const_idx, val) in ctx.const_pool.iter() {
-                                let (raw, tp) = match val {
-                                    majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
-                                    majit_ir::Value::Float(f) => {
-                                        (f.to_bits() as i64, majit_ir::Type::Float)
-                                    }
-                                    majit_ir::Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                                    majit_ir::Value::Void => (0, majit_ir::Type::Void),
+                                let c = match val {
+                                    majit_ir::Value::Int(v) => majit_ir::Const::Int(*v),
+                                    majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
+                                    majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
+                                    majit_ir::Value::Void => panic!(
+                                        "build_short_preamble: Value::Void has no Const equivalent \
+                                         (history.py:220/261/307 — no ConstVoid upstream)"
+                                    ),
                                 };
-                                let opref = OpRef::const_typed(const_idx, tp);
-                                loop_constants.insert(opref.raw(), raw);
-                                if !loop_constant_types.contains_key(&opref.raw()) {
-                                    loop_constant_types.insert(opref.raw(), tp);
-                                }
+                                let opref = OpRef::const_typed(const_idx, c.get_type());
+                                loop_constants.insert(opref.raw(), c);
                             }
                             // RPython's Const objects survive across compilations
                             // via GC tracing. In majit, we must carry forward
                             // constants from the previous build that may not
-                            // exist in the current Phase 2 context.
+                            // exist in the current Phase 2 context. The
+                            // legacy `ShortPreamble.constants` field still
+                            // carries `(i64, Type)` tuples until a follow-up
+                            // slice migrates that field; lift each pair into
+                            // a typed `Const`.
                             for (&k, &(v, tp)) in &sp.constants {
                                 if !loop_constants.contains_key(&k) {
-                                    loop_constants.insert(k, v);
-                                }
-                                if !loop_constant_types.contains_key(&k) {
-                                    loop_constant_types.insert(k, tp);
+                                    loop_constants.insert(k, majit_ir::Const::from_raw_i64(v, tp));
                                 }
                             }
                             target_token.short_preamble =
-                                Some(builder.build_short_preamble_struct(
-                                    &loop_constants,
-                                    &loop_constant_types,
-                                ));
+                                Some(builder.build_short_preamble_struct(&loop_constants));
                             target_token.short_preamble_producer = Some(builder);
                         }
                     } else {
