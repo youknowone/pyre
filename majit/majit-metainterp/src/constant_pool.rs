@@ -90,6 +90,25 @@ pub struct ConstantPool {
     rooted_refs: Vec<(u32, usize)>,
     /// Shadow stack depth at pool creation. release_roots pops to here.
     shadow_stack_base: usize,
+    /// opencoder.py:484 `self._bigints = []` parity. Dense per-pool
+    /// storage of non-small-int constant values, in mint order. Slot
+    /// `bigints[k] = (opref_raw, value)` where `opref_raw =
+    /// opref.raw()` for the k-th ConstInt minted. Populated alongside
+    /// `constants` HashMap as a structural mirror; consumers continue
+    /// to use the HashMap until subsequent slices migrate readers.
+    bigints: Vec<(u32, i64)>,
+    /// opencoder.py:486 `self._floats = []` parity. Dense per-pool
+    /// storage of ConstFloat constants in mint order. Slot
+    /// `floats[k] = (opref_raw, bit_pattern)` for the k-th
+    /// ConstFloat minted.
+    floats: Vec<(u32, i64)>,
+    /// opencoder.py:482 `self._refs = [lltype.nullptr(llmemory.GCREF.TO)]`
+    /// parity. Dense per-pool storage of ConstPtr constants in mint
+    /// order. Slot `refs[k] = (opref_raw, gc_addr)` for the k-th
+    /// ConstPtr minted. RPython prepends a null sentinel at index 0;
+    /// pyre tracks every minted ConstPtr including null values, so
+    /// the sentinel slot is not pre-seeded here.
+    refs: Vec<(u32, i64)>,
 }
 
 impl ConstantPool {
@@ -99,6 +118,9 @@ impl ConstantPool {
             next_const_idx: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
+            bigints: Vec::new(),
+            floats: Vec::new(),
+            refs: Vec::new(),
         }
     }
 
@@ -114,6 +136,10 @@ impl ConstantPool {
         let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
         self.constants.insert(opref.raw(), Value::Int(value));
+        // opencoder.py:621 `self._bigints.append(value)` parity:
+        // structural mirror of the HashMap write into the dense
+        // per-pool Vec.
+        self.bigints.push((opref.raw(), value));
         opref
     }
 
@@ -134,12 +160,17 @@ impl ConstantPool {
                 self.next_const_idx += 1;
                 self.constants
                     .insert(opref.raw(), Value::Float(f64::from_bits(value as u64)));
+                // opencoder.py:627 `self._floats.append(box.getfloatstorage())`
+                // parity.
+                self.floats.push((opref.raw(), value));
                 opref
             }
             Type::Int => {
                 let opref = OpRef::const_int(self.next_const_idx);
                 self.next_const_idx += 1;
                 self.constants.insert(opref.raw(), Value::Int(value));
+                // opencoder.py:621 `self._bigints.append(value)` parity.
+                self.bigints.push((opref.raw(), value));
                 opref
             }
             Type::Ref => {
@@ -147,6 +178,8 @@ impl ConstantPool {
                 self.next_const_idx += 1;
                 self.constants
                     .insert(opref.raw(), Value::Ref(GcRef(value as usize)));
+                // opencoder.py:598 `self._refs.append(addr)` parity.
+                self.refs.push((opref.raw(), value));
                 // gcreftracer.py: non-null Ref constants must be rooted
                 // on the shadow stack so the GC can update them when
                 // objects move. One root per ConstPtr mint mirrors
@@ -159,6 +192,32 @@ impl ConstantPool {
                 opref
             }
         }
+    }
+
+    /// opencoder.py:484 `_bigints` accessor. Returns the dense per-pool
+    /// storage of `ConstInt` constants in mint order. Each entry is
+    /// `(opref_raw, value)` where `opref_raw = const_int_opref.raw()`.
+    pub fn bigints(&self) -> &[(u32, i64)] {
+        &self.bigints
+    }
+
+    /// opencoder.py:486 `_floats` accessor. Returns the dense per-pool
+    /// storage of `ConstFloat` constants in mint order. Each entry is
+    /// `(opref_raw, bit_pattern)` where the bit pattern is the i64
+    /// reinterpret of the `f64` value (`history.py:265
+    /// ConstFloat.getfloatstorage`).
+    pub fn floats(&self) -> &[(u32, i64)] {
+        &self.floats
+    }
+
+    /// opencoder.py:482 `_refs` accessor. Returns the dense per-pool
+    /// storage of `ConstPtr` constants in mint order. Each entry is
+    /// `(opref_raw, gc_address)`. RPython prepends a null sentinel at
+    /// index 0; pyre tracks every minted ConstPtr including null
+    /// values so the slot 0 is the first minted ConstPtr (not a
+    /// pre-seeded null).
+    pub fn refs(&self) -> &[(u32, i64)] {
+        &self.refs
     }
 
     /// Get the type of a constant.
@@ -245,6 +304,13 @@ impl ConstantPool {
         for &(opref_key, ss_idx) in &self.rooted_refs {
             let current = shadow_stack::get(ss_idx);
             self.constants.insert(opref_key, Value::Ref(current));
+            // Mirror the GC update into the dense `refs` pool so it
+            // stays consistent with `constants`. The entry was appended
+            // by `get_or_insert_typed(_, Ref)`; its raw key is unique
+            // per mint, so the first match is the right slot.
+            if let Some(slot) = self.refs.iter_mut().find(|(k, _)| *k == opref_key) {
+                slot.1 = current.0 as i64;
+            }
         }
     }
 
@@ -475,5 +541,27 @@ mod tests {
             pool.same_constant(a, b),
             "two get_or_insert_typed(_, Ref) calls must satisfy same_constant"
         );
+    }
+
+    /// opencoder.py:482/484/486 `_refs`/`_bigints`/`_floats` parity:
+    /// the dense per-pool Vecs grow in mint order, independently of
+    /// each other. A mixed mint sequence should leave each Vec dense
+    /// (no gaps) with one entry per same-kind mint.
+    #[test]
+    fn dense_pools_grow_independently_per_kind() {
+        let mut pool = ConstantPool::new();
+        let i0 = pool.get_or_insert(7);
+        let f0 = pool.get_or_insert_typed(0x4000_0000_0000_0000, Type::Float);
+        let i1 = pool.get_or_insert_typed(13, Type::Int);
+        let r0 = pool.get_or_insert_typed(0, Type::Ref);
+        let r1 = pool.get_or_insert_typed(0xdead_beef, Type::Ref);
+        assert_eq!(pool.bigints().len(), 2);
+        assert_eq!(pool.bigints()[0], (i0.raw(), 7));
+        assert_eq!(pool.bigints()[1], (i1.raw(), 13));
+        assert_eq!(pool.floats().len(), 1);
+        assert_eq!(pool.floats()[0], (f0.raw(), 0x4000_0000_0000_0000));
+        assert_eq!(pool.refs().len(), 2);
+        assert_eq!(pool.refs()[0], (r0.raw(), 0));
+        assert_eq!(pool.refs()[1], (r1.raw(), 0xdead_beef));
     }
 }
