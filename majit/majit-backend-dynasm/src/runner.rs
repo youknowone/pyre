@@ -658,6 +658,15 @@ pub struct DynasmBackend {
     /// leaked into executable memory (matches PyPy's `asmmemmgr` rooting
     /// the buffer for the CPU's lifetime).
     malloc_slowpath_fixed: Option<usize>,
+    /// `rpython/jit/backend/x86/assembler.py:344`
+    /// `self.propagate_exception_path` (set by
+    /// `_build_propagate_exception_path` at `setup_once`) parity.
+    /// Standalone trampoline that the malloc slowpath (and, in PyPy,
+    /// the stack check slowpath) JMPs to on OOM / propagate.  Built
+    /// lazily on first use and stored here so subsequent
+    /// `ensure_malloc_slowpath_fixed` / future `ensure_stack_check_slowpath`
+    /// calls share the same per-CPU entry point.
+    propagate_exception_path: Option<usize>,
 }
 
 impl DynasmBackend {
@@ -730,7 +739,27 @@ impl DynasmBackend {
             fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             malloc_slowpath_fixed: None,
+            propagate_exception_path: None,
         }
+    }
+
+    /// `rpython/jit/backend/x86/assembler.py:328
+    /// _build_propagate_exception_path` parity: materialise the
+    /// standalone propagate trampoline that
+    /// `_store_and_reset_exception`s, writes `jf_guard_exc` / `jf_descr`,
+    /// and tail-calls `_call_footer`.  The malloc slowpath (and, in
+    /// PyPy, the stack check slowpath) JMP into this single entry
+    /// point.  Materialised lazily; the address is then memoised on
+    /// the backend so every slowpath built on this CPU shares the
+    /// same propagate path (matches PyPy's `self.propagate_exception_path`
+    /// attribute).
+    pub(crate) fn ensure_propagate_exception_path(&mut self) -> usize {
+        if let Some(addr) = self.propagate_exception_path {
+            return addr;
+        }
+        let addr = crate::x86::assembler::build_propagate_exception_path(&self.descr_attachments);
+        self.propagate_exception_path = Some(addr);
+        addr
     }
 
     /// `rpython/jit/backend/x86/assembler.py:231 _build_malloc_slowpath`
@@ -740,11 +769,19 @@ impl DynasmBackend {
     /// helper, matching PyPy's `setup_once` semantics where the
     /// helper is built once per CPU and referenced as
     /// `self.malloc_slowpath` thereafter.
+    ///
+    /// Ensures the propagate trampoline exists first so the slowpath's
+    /// OOM branch can `JMP` to it (matches PyPy's `setup_once` ordering:
+    /// `_build_propagate_exception_path` then `_build_malloc_slowpath`).
     pub(crate) fn ensure_malloc_slowpath_fixed(&mut self) -> usize {
         if let Some(addr) = self.malloc_slowpath_fixed {
             return addr;
         }
-        let addr = crate::x86::assembler::build_malloc_slowpath_fixed(&self.descr_attachments);
+        let propagate_path = self.ensure_propagate_exception_path();
+        let addr = crate::x86::assembler::build_malloc_slowpath_fixed(
+            &self.descr_attachments,
+            propagate_path,
+        );
         self.malloc_slowpath_fixed = Some(addr);
         addr
     }
@@ -790,8 +827,8 @@ impl DynasmBackend {
         // `MetaInterp::new` / `MetaInterpStaticData.finish_setup`.
         // Backend-only tests that skip the metainterp call this to land
         // the same descrs the runtime classifier expects — and so that
-        // `ensure_malloc_slowpath_fixed` can bake a non-zero descr
-        // pointer into the slowpath trampoline (matching PyPy's
+        // `ensure_propagate_exception_path` can bake a non-zero descr
+        // pointer into the propagate trampoline (matching PyPy's
         // `setup_once` ordering, which builds trampolines after
         // `finish_setup` has installed every CPU descr).
         let void: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new());
@@ -803,8 +840,7 @@ impl DynasmBackend {
         // `compile.py:712 PropagateExceptionDescr` parity: backend-only
         // tests still need the same descr class identity that production
         // `MetaInterpStaticData.finish_setup` installs.
-        let propagate: majit_ir::DescrRef =
-            Arc::new(majit_backend::PropagateExceptionDescr::new());
+        let propagate: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
         <Self as Backend>::set_done_with_this_frame_descr_void(self, void);
         <Self as Backend>::set_done_with_this_frame_descr_int(self, int);
         <Self as Backend>::set_done_with_this_frame_descr_ref(self, r);
@@ -1698,10 +1734,12 @@ impl Backend for DynasmBackend {
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
         // x86/assembler.py:328 `_build_propagate_exception_path` parity:
         // PyPy bakes `propagate_exception_descr` into the per-CPU
-        // trampoline at setup time.  Pyre defers the bake to
-        // `ensure_malloc_slowpath_fixed`, which reads the descr pointer
-        // directly from `descr_attachments` and embeds it in the helper.
-        // Storing the descr Arc here is the only step needed.
+        // propagate trampoline at setup time.  Pyre defers the bake to
+        // `ensure_propagate_exception_path`, which reads the descr
+        // pointer directly from `descr_attachments` and embeds it in
+        // the helper.  Storing the descr Arc here is the only step
+        // needed; the malloc slowpath later tail-JMPs to that
+        // propagate trampoline so it does not read the descr itself.
         self.descr_attachments
             .write()
             .unwrap()

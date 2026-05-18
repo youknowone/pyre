@@ -139,10 +139,11 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
 }
 
 /// `x86/assembler.py:1130 _call_footer_shadowstack` parity (free-fn
-/// variant for use outside of an `Assembler386` borrow — see
-/// `build_malloc_slowpath_fixed`'s inline propagate path).  Subtracts
-/// `2 * WORD` from the shadow-stack top, undoing the
-/// `gen_shadowstack_header` push that the trace prologue emitted.
+/// variant for use outside of an `Assembler386` borrow — used by
+/// `emit_call_footer_raw`, which the standalone propagate / malloc
+/// slowpath trampolines reach for).  Subtracts `2 * WORD` from the
+/// shadow-stack top, undoing the `gen_shadowstack_header` push that
+/// the trace prologue emitted.
 pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
     let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -184,6 +185,77 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     dynasm!(asm ; .arch x64 ; ret);
 }
 
+/// `assembler.py:328 _build_propagate_exception_path` parity —
+/// pure builder.  Caching/ownership is the caller's responsibility:
+/// `DynasmBackend::ensure_propagate_exception_path` (`runner.rs`)
+/// stores the resulting address in the backend's
+/// `propagate_exception_path` field, matching PyPy's
+/// `self.propagate_exception_path` attribute on `Assembler386`.
+///
+/// **Calling convention (matches PyPy line 328-345):**
+/// - Entry: reached only via `JMP` (not `CALL`) from a slowpath that
+///   has already restored `rsp` to the trace body's alignment level
+///   (i.e. the same value the trace's `_call_header` left after its
+///   SUB).  `rbp` = jitframe (possibly reloaded after a GC move).
+///   No other register conventions are assumed: every callee-save
+///   was already restored by the slowpath's `_pop_all_regs_from_frame`,
+///   and the live trace-body values were spilled to the jitframe.
+/// - Exit: `_call_footer` semantics — restores callee-save GPRs
+///   from `[rsp+...]`, sets `rax = rbp` (jitframe pointer return),
+///   adds the prologue's SUB back, and `RET`s to the function that
+///   originally entered the trace (PyPy: the C JIT shim;
+///   pyre: the same role via `Asm::_call_header`/`_call_footer`).
+///
+/// `propagate_exception_descr` is read from `cpu_handle` and baked
+/// as an i64 immediate into `[rbp + JF_DESCR_OFS]`.  Caller must
+/// guarantee the descr is installed (`MetaInterp::finish_setup`,
+/// `pyjitpl.py:2283`) before invoking this builder; the build asserts
+/// otherwise.  PyPy itself would silently bake 0 in this case (and
+/// fail at `handle_fail` dispatch time); pyre prefers a build-time
+/// fail-fast for the same invariant.
+pub(crate) fn build_propagate_exception_path(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
+    let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
+    let propagate_descr = cpu_handle
+        .read()
+        .unwrap()
+        .descr_ptrs()
+        .propagate_exception_descr as i64;
+    assert!(
+        propagate_descr != 0,
+        "build_propagate_exception_path: cpu_handle.propagate_exception_descr \
+         must be installed (pyjitpl.py:2283) before the trampoline is built \
+         on this CPU"
+    );
+    // assembler.py:1826-1843 `_store_and_reset_exception(self.mc, eax)`:
+    // read pos_exc_value into RAX, clear both globals.  On real OOM
+    // pos_exc_value is typically already NULL — the propagate descr's
+    // `handle_fail` raises MemoryError directly — but mirror the
+    // structure regardless.
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    dynasm!(asm ; .arch x64
+        ; mov rax, QWORD exc_value_addr
+        // Use R11 (X86_64_SCRATCH_REG) so RCX is free for the descr.
+        ; mov r11, [rax]
+        ; mov QWORD [rax], 0
+        ; mov rax, QWORD exc_type_addr
+        ; mov QWORD [rax], 0
+        // assembler.py:335-337 — MOV [jf_guard_exc], pos_exc_value
+        ; mov [rbp + JF_GUARD_EXC_OFS], r11
+        // assembler.py:338-340 — MOV [jf_descr], propagate_descr
+        ; mov rcx, QWORD propagate_descr
+        ; mov [rbp + JF_DESCR_OFS], rcx
+    );
+    // assembler.py:342 `self._call_footer()` — restore callee-save,
+    // set rax = rbp, ADD rsp, prologue_size, RET.
+    emit_call_footer_raw(&mut asm);
+    let buffer = asm.finalize().expect("propagate_exception_path: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    // Process-lifetime mapping; PyPy roots through `asmmemmgr`.
+    std::mem::forget(buffer);
+    ptr
+}
+
 /// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
 /// pure builder.  Caching/ownership is the caller's responsibility:
 /// `DynasmBackend::ensure_malloc_slowpath_fixed` (`runner.rs`) stores
@@ -210,11 +282,21 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// already spilled any live value out of both before the call via
 /// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
 ///
-/// `propagate_exception_descr` is read from `cpu_handle` and baked
-/// as an i64 immediate in the OOM branch.  Caller must guarantee the
-/// descr is installed (`MetaInterp::finish_setup`, `pyjitpl.py:2283`)
-/// before invoking this builder; the build asserts otherwise.
-pub(crate) fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHandle) -> usize {
+/// On OOM (`rax == 0` after the helper call) the trampoline tail-jumps
+/// to `propagate_path` — the standalone `_build_propagate_exception_path`
+/// trampoline returned by `build_propagate_exception_path`.  Caller
+/// (`DynasmBackend::ensure_malloc_slowpath_fixed`) builds the propagate
+/// path first and threads its address here, matching PyPy's
+/// `setup_once` ordering.
+pub(crate) fn build_malloc_slowpath_fixed(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    propagate_path: usize,
+) -> usize {
+    // `cpu_handle` is still threaded through for symmetry with PyPy
+    // (where `_build_malloc_slowpath` reads several `self.cpu`-rooted
+    // attrs).  The propagate descr itself is now baked once into the
+    // standalone propagate trampoline, not re-baked here.
+    let _ = cpu_handle;
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
@@ -322,61 +404,31 @@ pub(crate) fn build_malloc_slowpath_fixed(cpu_handle: &crate::guard::CpuDescrHan
 
     // assembler.py:300-322 OOM propagate path — when
     // `dynasm_nursery_slowpath` returns NULL the underlying
-    // `libc::calloc` ran out of memory.  PyPy emits this exact branch
-    // inside `_build_malloc_slowpath` (TEST eax, eax; JZ propagate)
-    // and JMPs to the per-CPU `propagate_exception_path` which the
-    // setup-time builder materialised alongside the slowpath.
+    // `libc::calloc` ran out of memory.  PyPy emits the test+branch
+    // inside `_build_malloc_slowpath` and tail-JMPs to the standalone
+    // `propagate_exception_path` (line 322).  Pyre threads the
+    // propagate path's address in via `propagate_path` and follows
+    // the same structure: `ADD rsp, 8` to drop the trampoline's
+    // own CALL return address, then JMP to the propagate trampoline.
     //
-    // Pyre matches that lifetime: this trampoline is materialised once
-    // per `DynasmBackend` and stored in its `malloc_slowpath_fixed`
-    // field.  The descr pointer is read directly from the CPU's
-    // `descr_ptrs().propagate_exception_descr` and baked as a 64-bit
-    // immediate.  `compile_loop` always runs after
-    // `MetaInterp::finish_setup` installs the descr, so the build
-    // observes a non-zero pointer in production.  If a test harness
-    // builds the trampoline before any CPU has installed a descr,
-    // the build asserts — there is no fall-through "no-descr" path,
-    // matching PyPy's strict invariant.
-    let propagate_descr = cpu_handle
-        .read()
-        .unwrap()
-        .descr_ptrs()
-        .propagate_exception_descr as i64;
-    assert!(
-        propagate_descr != 0,
-        "build_malloc_slowpath_fixed: cpu_handle.propagate_exception_descr \
-         must be installed (pyjitpl.py:2283) before the first malloc \
-         trampoline build on this CPU"
-    );
-    let exc_value_addr = crate::jit_exc_value_addr() as i64;
-    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    // dynasm-rs has no direct rel32-JMP-to-absolute-imm encoding, so
+    // we materialise the 64-bit immediate into the scratch reg (R11,
+    // not in PyPy's ECX/EDX-clobber set) and `jmp r11`.  RBP/RCX/RDX
+    // values matter to the propagate path's `_store_and_reset_exception`
+    // + `_call_footer`, and R11 is dead by this point.
     let success = asm.new_dynamic_label();
+    let propagate_path_imm = propagate_path as i64;
     dynasm!(asm ; .arch x64
         ; test rax, rax
         ; jnz =>success
-        // assembler.py:1826-1843 `_store_and_reset_exception(self.mc, eax)`:
-        // read pos_exc_value into RAX, clear both globals.  On real
-        // OOM pos_exc_value is typically already NULL — the propagate
-        // descr's `handle_fail` raises MemoryError directly — but
-        // mirror the structure regardless.
-        ; mov rax, QWORD exc_value_addr
-        // Use R11 (X86_64_SCRATCH_REG) so RCX is free for the descr.
-        ; mov r11, [rax]
-        ; mov QWORD [rax], 0
-        ; mov rax, QWORD exc_type_addr
-        ; mov QWORD [rax], 0
-        // assembler.py:336-337 — MOV [jf_guard_exc], pos_exc_value
-        ; mov [rbp + JF_GUARD_EXC_OFS], r11
-        // assembler.py:339-340 — MOV [jf_descr], propagate_descr
-        ; mov rcx, QWORD propagate_descr
-        ; mov [rbp + JF_DESCR_OFS], rcx
         // assembler.py:321 `ADD esp, WORD` — pop the trampoline's
-        // own CALL return address so `_call_footer` sees rsp at the
-        // trace's body alignment (the same value the trace's
-        // `_call_header` left after its SUB).
+        // own CALL return address so `_call_footer` in the propagate
+        // trampoline sees rsp at the trace's body alignment (the
+        // same value the trace's `_call_header` left after its SUB).
         ; add rsp, 8
+        ; mov r11, QWORD propagate_path_imm
+        ; jmp r11
     );
-    emit_call_footer_raw(&mut asm);
 
     dynasm!(asm ; .arch x64 ; =>success);
     // assembler.py:304 `MOV_rr(ecx, eax)` — deliver the helper return
