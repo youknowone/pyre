@@ -399,7 +399,7 @@ impl UnrollOptimizer {
             opt_p1.runtime_boxes = ops
                 .iter()
                 .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.args.to_vec())
+                .map(|op| op.getarglist().to_vec())
                 .unwrap_or_default();
             // Slice 77b.B: hand opt_p1 the per-iter BoxRef pool that p1_iter
             // allocated (slice 77b.A). trace.get_iter() per-call
@@ -875,7 +875,7 @@ impl UnrollOptimizer {
                     "[jit] p2[{i}]: {:?} pos={:?} args={:?}",
                     op.opcode,
                     op.pos.get(),
-                    op.args
+                    op.getarglist()
                 );
             }
         }
@@ -1817,7 +1817,7 @@ impl ExportedState {
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
             visit(op.pos.get());
-            for &arg in &op.args {
+            for &arg in op.getarglist() {
                 visit(arg);
             }
             if let Some(fail_args) = op.getfailargs() {
@@ -3426,7 +3426,7 @@ impl OptUnroll {
                             .set(patch.rd_resume_position.get());
                     }
                     // Re-register guard constant args from preamble's constant pool.
-                    for &arg in &new_op.args {
+                    for &arg in new_op.getarglist() {
                         if let Some(&(val, tp)) = short_preamble.constants.get(&arg.raw()) {
                             let value = match tp {
                                 majit_ir::Type::Int => majit_ir::Value::Int(val),
@@ -4435,7 +4435,7 @@ fn assemble_peeled_trace_with_jump_args(
         majit_ir::vec_set::VecSet::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = op.clone();
-        let mut original_args = op.args.clone();
+        let mut original_args = op.getarglist_copy();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
             new_op.pos.set(mapped_pos);
         }
@@ -4566,7 +4566,7 @@ fn assemble_peeled_trace_with_jump_args(
                 })
                 .collect();
             let target_label_args: Vec<OpRef> = current_inner_label_index
-                .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
+                .and_then(|label_idx| result.get(label_idx).map(|op| op.getarglist().to_vec()))
                 .unwrap_or_else(|| full_label_args.clone());
             let target_base_len = if current_inner_label_index.is_some() {
                 original_args.len()
@@ -5277,9 +5277,9 @@ mod tests {
         assert_eq!(peeled_add.opcode, OpCode::IntAdd);
         assert_eq!(peeled_mul.opcode, OpCode::IntMul);
         // peeled_mul should reference peeled_add's position, not original op0.
-        assert_eq!(peeled_mul.args[0], peeled_add.pos.get());
+        assert_eq!(peeled_mul.arg(0), peeled_add.pos.get());
         // Second arg (input ref) should be unchanged.
-        assert_eq!(peeled_mul.args[1], OpRef::int_op(101));
+        assert_eq!(peeled_mul.arg(1), OpRef::int_op(101));
 
         // Original body:
         let body_add = &result[3];
@@ -5287,8 +5287,8 @@ mod tests {
         assert_eq!(body_add.opcode, OpCode::IntAdd);
         assert_eq!(body_mul.opcode, OpCode::IntMul);
         // body_mul should reference body_add's position.
-        assert_eq!(body_mul.args[0], body_add.pos.get());
-        assert_eq!(body_mul.args[1], OpRef::int_op(101));
+        assert_eq!(body_mul.arg(0), body_add.pos.get());
+        assert_eq!(body_mul.arg(1), OpRef::int_op(101));
     }
 
     #[test]
@@ -5303,12 +5303,12 @@ mod tests {
         let result = run_unroll_pass(&ops);
 
         // Peeled add should still reference v100 and v101.
-        assert_eq!(result[0].args[0], OpRef::int_op(100));
-        assert_eq!(result[0].args[1], OpRef::int_op(101));
+        assert_eq!(result[0].arg(0), OpRef::int_op(100));
+        assert_eq!(result[0].arg(1), OpRef::int_op(101));
 
         // Body add should also reference v100 and v101.
-        assert_eq!(result[2].args[0], OpRef::int_op(100));
-        assert_eq!(result[2].args[1], OpRef::int_op(101));
+        assert_eq!(result[2].arg(0), OpRef::int_op(100));
+        assert_eq!(result[2].arg(1), OpRef::int_op(101));
     }
 
     // ── Guard preservation ────────────────────────────────────────────
@@ -5396,7 +5396,7 @@ mod tests {
 
         let body_add_pos = result[2].pos.get();
         assert_eq!(
-            jump.args[0], body_add_pos,
+            jump.arg(0), body_add_pos,
             "Jump arg should reference body add, not original"
         );
     }
@@ -5574,21 +5574,21 @@ mod tests {
         let p0 = result[0].pos.get();
         let p1 = result[1].pos.get();
         let _p2 = result[2].pos.get();
-        assert_eq!(result[1].args[0], p0, "peeled v1 should ref peeled v0");
-        assert_eq!(result[2].args[0], p1, "peeled v2 should ref peeled v1");
-        assert_eq!(result[2].args[1], p0, "peeled v2 should ref peeled v0");
+        assert_eq!(result[1].arg(0), p0, "peeled v1 should ref peeled v0");
+        assert_eq!(result[2].arg(0), p1, "peeled v2 should ref peeled v1");
+        assert_eq!(result[2].arg(1), p0, "peeled v2 should ref peeled v0");
 
         // Body refs:
         let b0 = result[4].pos.get();
         let b1 = result[5].pos.get();
         let b2 = result[6].pos.get();
-        assert_eq!(result[5].args[0], b0, "body v1 should ref body v0");
-        assert_eq!(result[6].args[0], b1, "body v2 should ref body v1");
-        assert_eq!(result[6].args[1], b0, "body v2 should ref body v0");
+        assert_eq!(result[5].arg(0), b0, "body v1 should ref body v0");
+        assert_eq!(result[6].arg(0), b1, "body v2 should ref body v1");
+        assert_eq!(result[6].arg(1), b0, "body v2 should ref body v0");
 
         // Jump should reference body v2.
         let jump = &result[7];
-        assert_eq!(jump.args[0], b2, "Jump should ref body v2");
+        assert_eq!(jump.arg(0), b2, "Jump should ref body v2");
     }
 
     #[test]
@@ -6164,9 +6164,9 @@ mod tests {
         assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(10)]);
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
-        assert_eq!(combined[3].args[0], combined[1].pos.get());
+        assert_eq!(combined[3].arg(0), combined[1].pos.get());
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[1].pos.get());
+        assert_eq!(combined[4].arg(0), combined[1].pos.get());
     }
 
     #[test]
@@ -6211,12 +6211,12 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(11)]);
         assert_eq!(combined[2].opcode, OpCode::IntGe);
-        assert_eq!(combined[2].args[0], OpRef::int_op(11));
+        assert_eq!(combined[2].arg(0), OpRef::int_op(11));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_eq!(combined[3].args[0], OpRef::int_op(11));
+        assert_eq!(combined[3].arg(0), OpRef::int_op(11));
         assert_ne!(combined[3].pos.get(), OpRef::int_op(11));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[3].pos.get());
+        assert_eq!(combined[4].arg(0), combined[3].pos.get());
     }
 
     #[test]
@@ -6272,11 +6272,11 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args[1], OpRef::int_op(19));
+        assert_eq!(combined[2].arg(1), OpRef::int_op(19));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
         assert_ne!(combined[3].pos.get(), OpRef::int_op(19));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].args[0], combined[3].pos.get());
+        assert_eq!(combined[4].arg(0), combined[3].pos.get());
     }
 
     #[test]
@@ -6694,7 +6694,7 @@ mod tests {
         assert_ne!(combined[1].pos.get(), OpRef::int_op(2));
         assert_ne!(combined[1].pos.get(), OpRef::int_op(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args[0], combined[1].pos.get());
+        assert_eq!(combined[2].arg(0), combined[1].pos.get());
     }
 
     #[test]
@@ -6773,7 +6773,7 @@ mod tests {
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
-        assert_eq!(combined[1].args[0], OpRef::int_op(200));
+        assert_eq!(combined[1].arg(0), OpRef::int_op(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
             combined[2].args.as_slice(),

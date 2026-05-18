@@ -2935,7 +2935,7 @@ impl Optimization for OptRewrite {
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos.get()));
                     // rewrite.py:30-31: _callback records producer op
                     let call_opcode = OpCode::call_for_type(op.result_type());
-                    let mut producer = Op::new(call_opcode, &op.args);
+                    let mut producer = Op::new(call_opcode, op.getarglist());
                     producer.pos.set(op.pos.get());
                     if let Some(d) = op.getdescr() {
                         producer.setdescr(d);
@@ -2943,7 +2943,7 @@ impl Optimization for OptRewrite {
                     self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
-                let mut new_op = Op::new(call_opcode, &op.args);
+                let mut new_op = Op::new(call_opcode, op.getarglist());
                 new_op.pos.set(op.pos.get());
                 if let Some(d) = op.getdescr() {
                     new_op.setdescr(d);
@@ -4331,7 +4331,7 @@ mod tests {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallN);
                 // Should have args [func, arg1] (condition arg stripped)
-                assert_eq!(op.args.len(), 2);
+                assert_eq!(op.num_args(), 2);
                 assert_eq!(op.arg(0), OpRef::int_op(1));
                 assert_eq!(op.arg(1), OpRef::int_op(2));
             }
@@ -4392,7 +4392,7 @@ mod tests {
         match result {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
-                assert_eq!(op.args.len(), 2);
+                assert_eq!(op.num_args(), 2);
                 assert_eq!(op.arg(0), OpRef::int_op(1));
                 assert_eq!(op.arg(1), OpRef::int_op(2));
             }

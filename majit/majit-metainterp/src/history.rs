@@ -244,7 +244,7 @@ impl TreeLoop {
                 }
             }
             // history.py:579-581: each arg must be Const or in seen
-            for arg in &op.args {
+            for arg in op.getarglist() {
                 if arg.is_none() {
                     return false;
                 }
@@ -288,7 +288,7 @@ impl TreeLoop {
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
-                for arg in &op.args {
+                for arg in op.getarglist() {
                     if arg.is_none() || arg.is_constant() {
                         return false;
                     }
@@ -382,7 +382,7 @@ impl TreeLoop {
         // OpRef::NONE (resume data handles materialization). Only regular
         // op args seed escaped refs for prefix re-emission.
         for op in cut_ops {
-            for arg in &op.args {
+            for arg in op.getarglist() {
                 if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                     queue.push_back(*arg);
                 }
@@ -398,7 +398,7 @@ impl TreeLoop {
             }
             let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
             if let Some(op) = self.ops.get(op_idx) {
-                for arg in &op.args {
+                for arg in op.getarglist() {
                     if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                         queue.push_back(*arg);
                     }
@@ -1351,8 +1351,8 @@ mod tests {
         // Walk one op via TraceIterator.next() — opencoder.py:362-406.
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(2));
-        assert_eq!(r.args[0], iarg(0));
-        assert_eq!(r.args[1], iarg(1));
+        assert_eq!(r.arg(0), iarg(0));
+        assert_eq!(r.arg(1), iarg(1));
         assert_eq!(iter.pos, 1);
     }
 
@@ -1399,10 +1399,10 @@ mod tests {
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
-        assert_eq!(cut.ops[0].args[0], iarg(0)); // remapped from iarg(0)
-        assert_eq!(cut.ops[0].args[1], iarg(1)); // remapped from iarg(1)
+        assert_eq!(cut.ops[0].arg(0), iarg(0)); // remapped from iarg(0)
+        assert_eq!(cut.ops[0].arg(1), iarg(1)); // remapped from iarg(1)
         assert_eq!(cut.ops[1].opcode, OpCode::Jump);
-        assert_eq!(cut.ops[1].args[0], iop(2)); // remapped from iop(3) → new idx 2
+        assert_eq!(cut.ops[1].arg(0), iop(2)); // remapped from iop(3) → new idx 2
     }
 
     #[test]
@@ -1463,7 +1463,7 @@ mod tests {
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
-        assert_eq!(cut.ops[0].args[1], const_ref);
+        assert_eq!(cut.ops[0].arg(1), const_ref);
     }
 
     #[test]
@@ -1501,7 +1501,7 @@ mod tests {
         assert_eq!(cut.ops[2].opcode, OpCode::IntSub);
         assert_eq!(cut.ops[3].opcode, OpCode::Jump);
         // Verify remapping chain: v2's arg should reference re-emitted v1
-        assert_eq!(cut.ops[1].args[0], iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
+        assert_eq!(cut.ops[1].arg(0), iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -4368,7 +4368,7 @@ mod history_record_tests {
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.args.as_slice(), &args);
+        assert_eq!(op.getarglist(), &args);
         let descr_arc = op.getdescr().expect("call op must carry descr");
         let call_descr = descr_arc
             .as_call_descr()
@@ -4397,7 +4397,7 @@ mod history_record_tests {
 
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.args.as_slice(), &[frame]);
+        assert_eq!(op.getarglist(), &[frame]);
         let cd_arc = op.getdescr().expect("op must have descr");
         let call_descr = cd_arc
             .as_call_descr()

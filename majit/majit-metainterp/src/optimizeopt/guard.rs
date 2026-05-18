@@ -55,7 +55,7 @@ impl GuardKey {
     fn from_op(op: &Op) -> Self {
         GuardKey {
             opcode: op.opcode,
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         }
     }
 }
@@ -943,7 +943,7 @@ impl OptGuard {
                 // Fallback: seen as a previous GuardClass with same args
                 let class_key = GuardKey {
                     opcode: OpCode::GuardClass,
-                    args: op.args.to_vec(),
+                    args: op.getarglist().to_vec(),
                 };
                 self.seen.contains(&class_key)
             }

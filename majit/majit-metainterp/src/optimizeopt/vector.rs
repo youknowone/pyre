@@ -197,7 +197,7 @@ pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<u
             if chain.contains(&i) {
                 continue;
             }
-            for arg in &op.args {
+            for arg in op.getarglist() {
                 if current_refs.contains(arg) {
                     chain.push(i);
                     if !op.pos.get().is_none() {
@@ -426,7 +426,7 @@ impl VectorizingOptimizer {
                 // vector.py:451-453: left = pack.leftmost();
                 // args = lnode.getoperation().getarglist();
                 // if left not in args: continue
-                if !graph.nodes[l_user].op.args.contains(&left_opref) {
+                if !graph.nodes[l_user].op.getarglist().contains(&left_opref) {
                     continue;
                 }
                 let l_op = &graph.nodes[l_user].op;
@@ -448,7 +448,7 @@ impl VectorizingOptimizer {
     fn follow_use_defs(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_args = graph.nodes[left_idx].op.args.to_vec();
+        let left_args = graph.nodes[left_idx].op.getarglist().to_vec();
 
         // vector.py:429-430: for ldep in pack.leftmost(True).depends()
         let l_deps: Vec<usize> = graph.nodes[left_idx].deps.clone();
@@ -777,7 +777,7 @@ impl Optimization for VectorizingOptimizer {
             OpCode::Label => {
                 self.in_loop = true;
                 // schedule.py:669: save label inputargs for prepare()
-                self.label_args = op.args.to_vec();
+                self.label_args = op.getarglist().to_vec();
                 OptimizationResult::Emit(op.clone())
             }
             OpCode::Jump if self.in_loop => {

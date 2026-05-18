@@ -2990,19 +2990,19 @@ mod tests {
         // First IntAdd: result at fresh BoxInt(2), args translated via cache.
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(2));
-        assert_eq!(r1.args[0], iarg(0));
-        assert_eq!(r1.args[1], iarg(1));
+        assert_eq!(r1.arg(0), iarg(0));
+        assert_eq!(r1.arg(1), iarg(1));
 
         // Second IntAdd: result at fresh BoxInt(3); first arg references the
         // previous result (raw pos 2 → cached BoxInt(2)).
         let r2 = iter.next().unwrap();
         assert_eq!(r2.pos.get(), iop(3));
-        assert_eq!(r2.args[0], iop(2));
-        assert_eq!(r2.args[1], iarg(0));
+        assert_eq!(r2.arg(0), iop(2));
+        assert_eq!(r2.arg(1), iarg(0));
 
         // Finish is void: pos unchanged, arg cached → BoxInt(3).
         let finish = iter.next().unwrap();
-        assert_eq!(finish.args[0], iop(3));
+        assert_eq!(finish.arg(0), iop(3));
         assert!(iter.done());
     }
 
@@ -3052,12 +3052,12 @@ mod tests {
         }
         assert_eq!(p2.inputargs, vec![iarg(4), iarg(5)]);
         assert_eq!(p2_ops[0].pos.get(), iop(6));
-        assert_eq!(p2_ops[0].args[0], iarg(4));
-        assert_eq!(p2_ops[0].args[1], iarg(5));
+        assert_eq!(p2_ops[0].arg(0), iarg(4));
+        assert_eq!(p2_ops[0].arg(1), iarg(5));
         assert_eq!(p2_ops[1].pos.get(), iop(7));
-        assert_eq!(p2_ops[1].args[0], iop(6));
-        assert_eq!(p2_ops[1].args[1], iarg(4));
-        assert_eq!(p2_ops[2].args[0], iop(7));
+        assert_eq!(p2_ops[1].arg(0), iop(6));
+        assert_eq!(p2_ops[1].arg(1), iarg(4));
+        assert_eq!(p2_ops[2].arg(0), iop(7));
 
         // No Phase 1 OpRef equals any Phase 2 OpRef.
         let p1_positions: Vec<u32> = p1_ops
@@ -3084,8 +3084,8 @@ mod tests {
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(1));
-        assert_eq!(r.args[0], iarg(0));
-        assert_eq!(r.args[1], const_ref);
+        assert_eq!(r.arg(0), iarg(0));
+        assert_eq!(r.arg(1), const_ref);
     }
 
     #[test]
@@ -3120,8 +3120,8 @@ mod tests {
         // The next op references raw pos 1 as its first arg, so the
         // replaced value should flow through _untag → _get.
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.args[0], iop(999));
-        assert_eq!(r2.args[1], iarg(100));
+        assert_eq!(r2.arg(0), iop(999));
+        assert_eq!(r2.arg(1), iarg(100));
         // After writing raw pos 2, _index advances to 3.
         assert_eq!(iter._index, 3);
     }
@@ -3140,10 +3140,10 @@ mod tests {
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10, None);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(11));
-        assert_eq!(r1.args[0], iarg(10));
-        assert_eq!(r1.args[1], iarg(10));
+        assert_eq!(r1.arg(0), iarg(10));
+        assert_eq!(r1.arg(1), iarg(10));
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.args[0], iop(11));
+        assert_eq!(r2.arg(0), iop(11));
         let fa = r2.getfailargs().unwrap();
         assert_eq!(fa[0], iarg(10));
         assert_eq!(fa[1], iop(11));
@@ -3376,9 +3376,9 @@ mod tests {
         let fresh_i1 = it.inputargs[1];
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::IntAdd);
-        assert_eq!(op.args.len(), 2);
-        assert_eq!(op.args[0], fresh_i0);
-        assert_eq!(op.args[1], fresh_i1);
+        assert_eq!(op.num_args(), 2);
+        assert_eq!(op.arg(0), fresh_i0);
+        assert_eq!(op.arg(1), fresh_i1);
         assert!(it.done());
         assert!(it.next().is_none());
     }
@@ -3400,15 +3400,15 @@ mod tests {
         let fresh_i1 = it.inputargs[1];
         let add = it.next().expect("IntAdd");
         assert_eq!(add.opcode, OpCode::IntAdd);
-        assert_eq!(add.args[0], fresh_i0);
-        assert_eq!(add.args[1], fresh_i1);
+        assert_eq!(add.arg(0), fresh_i0);
+        assert_eq!(add.arg(1), fresh_i1);
         let mul = it.next().expect("IntMul");
         assert_eq!(mul.opcode, OpCode::IntMul);
         // The first arg of IntMul referenced the first op's result via
         // TAGBOX.  The iterator's `_cache` must map raw position 2 →
         // `add.pos` (the fresh OpRef emitted one `next()` ago).
-        assert_eq!(mul.args[0], add.pos.get());
-        assert_eq!(mul.args[1], fresh_i0);
+        assert_eq!(mul.arg(0), add.pos.get());
+        assert_eq!(mul.arg(1), fresh_i0);
         assert!(it.done());
     }
 
@@ -3477,10 +3477,10 @@ mod tests {
         let first = it.next().unwrap();
         let second = it.next().unwrap();
         drop(it);
-        assert!(pool.same_constant(first.args[1], second.args[0]));
-        assert_eq!(pool.get_value(first.args[1]), Some(majit_ir::Value::Int(7)));
+        assert!(pool.same_constant(first.arg(1), second.arg(0)));
+        assert_eq!(pool.get_value(first.arg(1)), Some(majit_ir::Value::Int(7)));
         assert_eq!(
-            pool.get_value(second.args[0]),
+            pool.get_value(second.arg(0)),
             Some(majit_ir::Value::Int(7))
         );
     }
@@ -4447,13 +4447,13 @@ mod tests {
         // assert l[1].opnum == rop.INT_ADD
         assert_eq!(l1.opcode, OpCode::IntAdd);
         // assert l[0].getarg(0) is i0; getarg(1) is i1
-        assert_eq!(l0.args[0], fresh_i0);
-        assert_eq!(l0.args[1], fresh_i1);
+        assert_eq!(l0.arg(0), fresh_i0);
+        assert_eq!(l0.arg(1), fresh_i1);
         // assert l[1].getarg(0) is l[0]
-        assert_eq!(l1.args[0], l0.pos.get());
+        assert_eq!(l1.arg(0), l0.pos.get());
         // assert l[1].getarg(1).getint() == 1 — pool-resolved constant.
         drop(it);
-        assert_eq!(pool.get_value(l1.args[1]), Some(majit_ir::Value::Int(1)));
+        assert_eq!(pool.get_value(l1.arg(1)), Some(majit_ir::Value::Int(1)));
     }
 
     /// test_opencoder.py:250 `test_constint_small` —

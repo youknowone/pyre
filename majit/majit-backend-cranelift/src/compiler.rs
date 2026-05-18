@@ -4074,7 +4074,7 @@ fn validate_oprefs_for_compile(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == majit_ir::OpCode::Label {
             // LABEL params are introduced at the label block.
-            for &arg in &op.args {
+            for &arg in op.getarglist() {
                 if !arg.is_none() {
                     seen.insert(arg.raw());
                 }
@@ -7995,7 +7995,7 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            for &arg in &op.args {
+            for &arg in op.getarglist() {
                 if arg.is_none() || declared_vars.contains(&arg.raw()) {
                     continue;
                 }
@@ -9704,7 +9704,7 @@ impl CraneliftBackend {
                     // optional virtualizable.  The descriptor's arg_types are
                     // the pre-rewrite CALL_ASSEMBLER shape and must not be
                     // compared with the rewritten op arity here.
-                    if op.args.is_empty() || op.num_args() > 2 {
+                    if op.num_args() == 0 || op.num_args() > 2 {
                         return Err(unsupported_semantics(
                             op.opcode,
                             "post-rewrite call-assembler must carry callee frame plus optional virtualizable",
@@ -13842,7 +13842,7 @@ fn collect_terminal_exit_layouts(
 
         if is_finish || is_jump {
             let exit_types =
-                infer_fail_arg_types(op.args.as_slice(), &type_index, &type_overrides, op_index)?;
+                infer_fail_arg_types(op.getarglist(), &type_index, &type_overrides, op_index)?;
             let force_token_slots: Vec<usize> = op.getarglist().iter()
                 .enumerate()
                 .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))

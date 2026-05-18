@@ -1675,7 +1675,7 @@ impl OptHeap {
         {
             return;
         }
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             self.escape_box(arg);
         }
     }

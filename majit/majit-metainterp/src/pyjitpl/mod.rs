@@ -696,7 +696,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
         .iter()
         .map(|op| {
             let mut hw = opref_high_water(op.pos.get());
-            for a in &op.args {
+            for a in op.getarglist() {
                 hw = hw.max(opref_high_water(*a));
             }
             if let Some(fa) = op.getfailargs() {
@@ -8206,7 +8206,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
@@ -8366,7 +8366,7 @@ impl<M: Clone> MetaInterp<M> {
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
                     op.opcode,
                     op.pos.get(),
-                    op.args,
+                    op.getarglist(),
                     op.descr
                 );
             }
@@ -8707,7 +8707,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
         let bridge_trace_data =
             TreeLoop::with_snapshots(bridge_inputargs.to_vec(), bridge_ops.to_vec(), Vec::new());
@@ -16268,10 +16268,10 @@ mod metainterp_static_data_tests {
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
         assert_eq!(op.pos.get(), opref);
-        assert_eq!(op.args.len(), 3);
-        assert_eq!(op.args[0], funcbox_ref);
-        assert_eq!(op.args[1], OpRef::int_op(1));
-        assert_eq!(op.args[2], OpRef::int_op(2));
+        assert_eq!(op.num_args(), 3);
+        assert_eq!(op.arg(0), funcbox_ref);
+        assert_eq!(op.arg(1), OpRef::int_op(1));
+        assert_eq!(op.arg(2), OpRef::int_op(2));
     }
 
     #[test]
@@ -16435,7 +16435,7 @@ mod metainterp_static_data_tests {
                 .iter()
                 .filter(|op| op.opcode == OpCode::GuardException);
             let op = matches.next().expect("GuardException must be recorded");
-            assert_eq!(op.args.len(), 1);
+            assert_eq!(op.num_args(), 1);
             let typeptr = ctx
                 .constants_get_value(op.arg(0))
                 .expect("typeptr constant");
@@ -16865,7 +16865,7 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::EnterPortalFrame);
         let op = matches.next().expect("EnterPortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
-        assert_eq!(op.args.len(), 2);
+        assert_eq!(op.num_args(), 2);
         let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         let unique_id = ctx
             .constants_get_value(op.arg(1))
@@ -16892,7 +16892,7 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::LeavePortalFrame);
         let op = matches.next().expect("LeavePortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
-        assert_eq!(op.args.len(), 1);
+        assert_eq!(op.num_args(), 1);
         let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         assert_eq!(jd_no, majit_ir::Value::Int(7));
     }
@@ -16931,15 +16931,15 @@ mod metainterp_static_data_tests {
             .expect("LeavePortalFrame must be recorded");
 
         assert_eq!(
-            ctx.constants_get_value(enter.args[0]),
+            ctx.constants_get_value(enter.arg(0)),
             Some(majit_ir::Value::Int(5))
         );
         assert_eq!(
-            ctx.constants_get_value(enter.args[1]),
+            ctx.constants_get_value(enter.arg(1)),
             Some(majit_ir::Value::Int(0xfeed))
         );
         assert_eq!(
-            ctx.constants_get_value(leave.args[0]),
+            ctx.constants_get_value(leave.arg(0)),
             Some(majit_ir::Value::Int(5))
         );
     }

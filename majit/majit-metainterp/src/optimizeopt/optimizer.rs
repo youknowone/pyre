@@ -450,7 +450,7 @@ impl Optimizer {
         if target.const_value().is_none() {
             return false;
         }
-        op.args.is_empty() || op.getarglist().iter().all(|arg| arg.is_none())
+        op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
     }
 
     fn import_virtual_state_value(
@@ -2703,7 +2703,7 @@ impl Optimizer {
                         entry.kind,
                         entry.op.pos.get(),
                         entry.op.opcode,
-                        entry.op.args,
+                        entry.op.getarglist(),
                         entry.op.getdescr().map(|d| d.index()),
                         entry.invented_name,
                         entry.same_as_source,
@@ -3189,7 +3189,7 @@ impl Optimizer {
         let pre_opt_jump_args: Vec<OpRef> = ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
+            .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
 
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
@@ -3798,7 +3798,7 @@ impl Optimizer {
                 "returns_bool op must have int result: {:?} pos={:?} args={:?}",
                 op.opcode,
                 op.pos.get(),
-                op.args
+                op.getarglist()
             );
             // Slice 0.5: returns_bool ops are constructed Int-typed
             // (asserted above) and `Op.type_ == Int` already provides the

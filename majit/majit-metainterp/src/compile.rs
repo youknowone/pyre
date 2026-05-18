@@ -1699,7 +1699,7 @@ pub(crate) fn normalize_closing_jump_args(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.args.clone())
+        .map(|op| op.getarglist_copy())
     else {
         return ops;
     };
@@ -2770,9 +2770,9 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
         assert_eq!(ops[1].args.as_slice(), &[ops[0].pos.get()]);
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[2].args[0], ops[1].pos.get());
+        assert_eq!(ops[2].arg(0), ops[1].pos.get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[3].args[0], ops[1].pos.get());
+        assert_eq!(ops[3].arg(0), ops[1].pos.get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4].args.as_slice(),

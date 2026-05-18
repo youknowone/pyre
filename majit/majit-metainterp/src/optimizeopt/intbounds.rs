@@ -1796,7 +1796,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntAdd, &op.args);
+            let mut new_op = Op::new(OpCode::IntAdd, op.getarglist());
             if let Some(d) = op.getdescr() {
                 new_op.setdescr(d);
             }
@@ -1833,7 +1833,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(arg1, ctx);
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntSub, &op.args);
+            let mut new_op = Op::new(OpCode::IntSub, op.getarglist());
             if let Some(d) = op.getdescr() {
                 new_op.setdescr(d);
             }
@@ -1857,7 +1857,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntMul, &op.args);
+            let mut new_op = Op::new(OpCode::IntMul, op.getarglist());
             if let Some(d) = op.getdescr() {
                 new_op.setdescr(d);
             }
@@ -2703,7 +2703,7 @@ impl OptIntBounds {
     /// Mirrors RPython's self.last_emitted_operation = op in Optimization.emit().
     fn record_emitted(&mut self, op: &Op) {
         self.last_emitted_opcode = Some(op.opcode);
-        self.last_emitted_args = op.args.to_vec();
+        self.last_emitted_args = op.getarglist().to_vec();
         self.last_emitted_ref = op.pos.get();
     }
 }

@@ -236,13 +236,13 @@ impl fmt::Display for TracePlanSummary<'_> {
 fn lower_op(op: &Op) -> LirOp {
     match op.opcode {
         OpCode::Label => LirOp::Label {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::Jump => LirOp::Jump {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::Finish => LirOp::Finish {
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         OpCode::IntAdd
         | OpCode::IntAddOvf
@@ -266,7 +266,7 @@ fn lower_op(op: &Op) -> LirOp {
             }
         }
         OpCode::IntNeg | OpCode::IntInvert | OpCode::IntIsTrue | OpCode::IntIsZero
-            if !op.args.is_empty() =>
+            if op.num_args() != 0 =>
         {
             LirOp::IntUnary {
                 kind: int_unary_kind(op.opcode),
@@ -304,7 +304,7 @@ fn lower_op(op: &Op) -> LirOp {
             offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            size: op.args.get(2).copied(),
+            size: op.getarglist().get(2).copied(),
         },
         OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
             if op.num_args() >= 5 =>
@@ -357,18 +357,18 @@ fn lower_op(op: &Op) -> LirOp {
         },
         opcode if opcode.is_guard() => LirOp::Guard {
             kind: guard_kind(opcode),
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
             fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
         },
         opcode if opcode.is_call() => LirOp::Call {
             opcode,
             dst: result_ref(op),
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
         },
         opcode => LirOp::Opcode {
             opcode,
             dst: result_ref(op),
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
             fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
         },
     }

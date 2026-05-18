@@ -4027,9 +4027,9 @@ mod tests {
         let rhs = OpRef::int_op(1);
         let op = Op::new(OpCode::IntAdd, &[lhs, rhs]);
         assert_eq!(op.opcode, OpCode::IntAdd);
-        assert_eq!(op.args.len(), 2);
-        assert_eq!(op.args[0], lhs);
-        assert_eq!(op.args[1], rhs);
+        assert_eq!(op.num_args(), 2);
+        assert_eq!(op.arg(0), lhs);
+        assert_eq!(op.arg(1), rhs);
         assert!(op.getdescr().is_none());
         assert!(op.getfailargs().is_none());
         assert_eq!(op.result_type(), Type::Int);

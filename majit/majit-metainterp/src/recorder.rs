@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(trace.num_ops(), 2); // IntAdd + Jump
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[1].opcode, OpCode::Jump);
-        assert_eq!(trace.ops[1].args[0], i1);
+        assert_eq!(trace.ops[1].arg(0), i1);
     }
 
     #[test]
@@ -823,12 +823,12 @@ mod tests {
         assert_eq!(trace.ops[2].opcode, OpCode::Jump);
 
         // First add uses input args i0, i1.
-        assert_eq!(trace.ops[0].args[0], i0);
-        assert_eq!(trace.ops[0].args[1], i1);
+        assert_eq!(trace.ops[0].arg(0), i0);
+        assert_eq!(trace.ops[0].arg(1), i1);
 
         // Second add references the result of first add and i0.
-        assert_eq!(trace.ops[1].args[0], add0);
-        assert_eq!(trace.ops[1].args[1], i0);
+        assert_eq!(trace.ops[1].arg(0), add0);
+        assert_eq!(trace.ops[1].arg(1), i0);
     }
 
     #[test]
@@ -865,8 +865,8 @@ mod tests {
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(trace.ops[0].pos.get(), iop(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
-        assert_eq!(trace.ops[1].args[0], add); // references the add result
-        assert_eq!(trace.ops[1].args[1], i0); // references the input arg
+        assert_eq!(trace.ops[1].arg(0), add); // references the add result
+        assert_eq!(trace.ops[1].arg(1), i0); // references the input arg
     }
 
     #[test]
@@ -947,8 +947,8 @@ mod tests {
         let jump = trace.ops.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(jump.args.len(), trace.num_inputargs());
-        assert_eq!(jump.args[0], add);
-        assert_eq!(jump.args[1], i1);
+        assert_eq!(jump.arg(0), add);
+        assert_eq!(jump.arg(1), i1);
     }
 
     #[test]
@@ -968,7 +968,7 @@ mod tests {
         let finish_op = trace.ops.last().unwrap();
         assert_eq!(finish_op.opcode, OpCode::Finish);
         assert_eq!(finish_op.args.len(), 1);
-        assert_eq!(finish_op.args[0], add);
+        assert_eq!(finish_op.arg(0), add);
         assert!(finish_op.has_descr());
     }
 
@@ -1125,8 +1125,8 @@ mod tests {
         rec.close_loop(&[add]);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].args[1], const_ref);
-        assert!(trace.ops[0].args[1].is_constant());
+        assert_eq!(trace.ops[0].arg(1), const_ref);
+        assert!(trace.ops[0].arg(1).is_constant());
     }
 
     #[test]
@@ -1143,8 +1143,8 @@ mod tests {
         let trace = rec.get_trace();
 
         // Both ops reference the same constant
-        assert_eq!(trace.ops[0].args[1], trace.ops[1].args[1]);
-        assert_eq!(trace.ops[0].args[1], const_ref);
+        assert_eq!(trace.ops[0].arg(1), trace.ops[1].arg(1));
+        assert_eq!(trace.ops[0].arg(1), const_ref);
     }
 
     #[test]
@@ -1191,7 +1191,7 @@ mod tests {
             assert_eq!(op.opcode, OpCode::IntAdd);
             if i > 0 {
                 // The previous IntAdd produced BoxInt(i) (offset by inputarg).
-                assert_eq!(op.args[0], iop(i as u32));
+                assert_eq!(op.arg(0), iop(i as u32));
             }
         }
     }
@@ -1339,8 +1339,8 @@ mod tests {
 
         assert_eq!(trace.num_ops(), 1); // Only Jump
         assert_eq!(trace.ops[0].opcode, OpCode::Jump);
-        assert_eq!(trace.ops[0].args[0], i0);
-        assert_eq!(trace.ops[0].args[1], i1);
+        assert_eq!(trace.ops[0].arg(0), i0);
+        assert_eq!(trace.ops[0].arg(1), i1);
     }
 
     #[test]

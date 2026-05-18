@@ -36,7 +36,7 @@ impl PureOpKey {
     fn from_op(op: &Op) -> Self {
         PureOpKey {
             opcode: op.opcode,
-            args: op.args.to_vec(),
+            args: op.getarglist().to_vec(),
             descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
@@ -551,7 +551,7 @@ impl OptPure {
             }
             // _same_args(known_op, op, 1, start_index):
             // entry.args is already known_op.args[1..], so compare from 0.
-            if Self::_same_args(&entry.args, &op.args, 0, start_index, ctx) {
+            if Self::_same_args(&entry.args, op.getarglist(), 0, start_index, ctx) {
                 return Some(entry.result);
             }
         }
@@ -785,7 +785,7 @@ impl OptPure {
             0
         };
         // pure.py:255: self._same_args(old_op, op, old_start_index, start_index)
-        Self::_same_args(old_op_args, &op.args, old_start_index, start_index, ctx)
+        Self::_same_args(old_op_args, op.getarglist(), old_start_index, start_index, ctx)
     }
 }
 
@@ -1043,7 +1043,7 @@ impl Optimization for OptPure {
                 if let Some(non_ovf) = non_ovf_opcode {
                     let non_ovf_key = PureOpKey {
                         opcode: non_ovf,
-                        args: postponed.args.to_vec(),
+                        args: postponed.getarglist().to_vec(),
                         descr_identity: None,
                     };
                     if let Some(cached_ref) = self.lookup_pure(&non_ovf_key, ctx) {

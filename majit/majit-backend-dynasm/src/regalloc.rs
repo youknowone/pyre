@@ -1816,7 +1816,7 @@ impl<'a> RegAlloc<'a> {
             return;
         }
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
+        self.final_jump_args = descr_id.map(|id| (id, op.getarglist().to_vec()));
         self.final_jump_op_position = (operations.len() - 1) as i32;
         let Some(descr) = op.getdescr() else {
             return;
@@ -1992,7 +1992,7 @@ impl<'a> RegAlloc<'a> {
     /// docstring + `majit-ir/src/op_type_index.rs:144-164` for the
     /// shared cranelift caller seeding gap rationale.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             if !arg.is_constant() && !arg.is_none() {
                 let tp = self.opref_type(arg).unwrap_or(Type::Int);
                 self.possibly_free_var(arg, tp);
@@ -2380,7 +2380,7 @@ impl<'a> RegAlloc<'a> {
 
     /// Free args and result of an op (x86/regalloc.py:308).
     fn _free_op_vars(&mut self, op: &Op) {
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             if !arg.is_constant() && !arg.is_none() {
                 let tp = self.tp(arg);
                 self.possibly_free_var(arg, tp);
@@ -4110,9 +4110,9 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:445 consider_finish
     fn consider_finish(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let locs = if !op.args.is_empty() {
+        let locs = if op.num_args() != 0 {
             let tp = self.tp(op.arg(0));
-            vec![self.make_sure_var_in_reg(op.args[0], tp, &[], None, false)]
+            vec![self.make_sure_var_in_reg(op.arg(0), tp, &[], None, false)]
         } else {
             vec![]
         };
@@ -4659,7 +4659,7 @@ impl<'a> RegAlloc<'a> {
         // GC_LOAD_INDEXED with all 5 operands, so the arity check is a
         // contract assert here.
         assert_eq!(
-            op.args.len(),
+            op.num_args(),
             5,
             "GC_LOAD_INDEXED must have 5 operands (ptr, idx, scale, offset, size)"
         );
@@ -5174,7 +5174,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // llsupport/regalloc.py:897: self.rm._sync_var_to_stack(op.getarg(k))
         // Force all register-held args to frame before before_call.
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             if arg.is_constant() {
                 continue;
             }
@@ -5213,7 +5213,7 @@ impl<'a> RegAlloc<'a> {
 
         // After before_call, all args are in Frame or Const — safe for calloc.
         let mut arglocs: Vec<Loc> = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             arglocs.push(self.loc_must_exist(arg, tp));
         }
@@ -5331,7 +5331,7 @@ impl<'a> RegAlloc<'a> {
         );
 
         let mut arglocs = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             arglocs.push(self.loc(arg, tp));
         }
@@ -5731,10 +5731,10 @@ impl<'a> RegAlloc<'a> {
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args = descr_id.map(|id| (id, op.args.to_vec()));
+        self.final_jump_args = descr_id.map(|id| (id, op.getarglist().to_vec()));
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             locs.push(self.loc_must_exist(arg, tp));
         }
@@ -5762,7 +5762,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:1360 consider_label
     fn consider_label(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let position = self.rm.position;
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             if self
                 .longevity
@@ -5774,7 +5774,7 @@ impl<'a> RegAlloc<'a> {
         }
 
         let mut locs = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
             match loc {
@@ -5917,7 +5917,7 @@ impl<'a> RegAlloc<'a> {
     /// load_effective_address: all args in regs
     fn consider_load_effective_address(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             locs.push(self.loc(arg, Type::Int));
         }
         let result_loc =
@@ -5987,7 +5987,7 @@ impl<'a> RegAlloc<'a> {
     /// Generic discard with N args
     fn consider_discard_nargs(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             let tp = self.tp(arg);
             locs.push(self.loc(arg, tp));
         }

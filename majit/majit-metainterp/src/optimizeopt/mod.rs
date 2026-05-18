@@ -8968,7 +8968,7 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops.len(), 1);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(
-            sp.ops[0].op.args.as_slice(),
+            sp.ops[0].op.getarglist(),
             &[OpRef::int_op(7), OpRef::int_op(8)]
         );
         assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));

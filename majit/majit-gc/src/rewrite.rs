@@ -3219,7 +3219,7 @@ mod tests {
             .find(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
             .unwrap();
         // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
-        assert_eq!(varsize.args[2], length_ref);
+        assert_eq!(varsize.arg(2), length_ref);
     }
 
     /// Constant-length oversized arrays: rewrite.py:573-584 routes these
@@ -3254,10 +3254,10 @@ mod tests {
             .position(|o| o.opcode == OpCode::CallR)
             .expect("constant-length oversize must emit CALL_R slow helper");
         let call = &result[call_idx];
-        assert_eq!(consts[&call.args[0].raw()], TEST_MALLOC_ARRAY_FN);
-        assert_eq!(consts[&call.args[1].raw()], 8);
-        assert_eq!(consts[&call.args[2].raw()], 5);
-        assert_eq!(call.args[3], len_ref);
+        assert_eq!(consts[&call.arg(0).raw()], TEST_MALLOC_ARRAY_FN);
+        assert_eq!(consts[&call.arg(1).raw()], 8);
+        assert_eq!(consts[&call.arg(2).raw()], 5);
+        assert_eq!(call.arg(3), len_ref);
         assert!(
             result
                 .get(call_idx + 1)
@@ -3287,7 +3287,7 @@ mod tests {
         // Expect: CondCallGcWb(obj), GcStore(obj, 0, val, itemsize)
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
-        assert_eq!(result[0].args[0], obj);
+        assert_eq!(result[0].arg(0), obj);
         assert_eq!(result[1].opcode, OpCode::GcStore);
     }
 
@@ -3535,14 +3535,14 @@ mod tests {
         // rewrite.py:893-895: combined size = round_up(24+8) + round_up(32+8) = 32 + 40 = 72
         let header = crate::header::GcHeader::SIZE as usize;
         let expected_size = round_up(24 + header) as i64 + round_up(32 + header) as i64;
-        assert_eq!(constants[&malloc.args[0].raw()], expected_size);
+        assert_eq!(constants[&malloc.arg(0).raw()], expected_size);
 
         let incr = result
             .iter()
             .find(|o| o.opcode == OpCode::NurseryPtrIncrement)
             .unwrap();
         // rewrite.py:898: ConstInt(previous_size) = round_up(24 + GcHeader::SIZE) = 32
-        assert_eq!(constants[&incr.args[1].raw()], round_up(24 + header) as i64);
+        assert_eq!(constants[&incr.arg(1).raw()], round_up(24 + header) as i64);
 
         // Both should have tid initialisation.
         let tid_stores: Vec<_> = result
@@ -3550,8 +3550,8 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
         assert_eq!(tid_stores.len(), 2);
-        assert_eq!(constants[&tid_stores[0].args[2].raw()], 1); // first type_id
-        assert_eq!(constants[&tid_stores[1].args[2].raw()], 2); // second type_id
+        assert_eq!(constants[&tid_stores[0].arg(2).raw()], 1); // first type_id
+        assert_eq!(constants[&tid_stores[1].arg(2).raw()], 2); // second type_id
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──
@@ -3698,7 +3698,7 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::IntLshift);
         assert_eq!(result[1].opcode, OpCode::CondCallGcWb);
-        assert_eq!(result[1].args[0], obj);
+        assert_eq!(result[1].arg(0), obj);
         assert_eq!(result[2].opcode, OpCode::GcStoreIndexed);
     }
 
@@ -3753,7 +3753,7 @@ mod tests {
         assert_eq!(first_alloc.pos.get(), OpRef::ref_op(2));
         assert_eq!(second_alloc.pos.get(), OpRef::ref_op(3));
         assert_eq!(finish.opcode, OpCode::Finish);
-        assert_eq!(finish.args[0], OpRef::ref_op(3));
+        assert_eq!(finish.arg(0), OpRef::ref_op(3));
         assert!(
             result
                 .iter()
@@ -3912,14 +3912,14 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::GuardValue)
             .expect("GuardValue replaces GuardAlwaysFails");
-        assert_eq!(gv.args[0], same.pos.get());
+        assert_eq!(gv.arg(0), same.pos.get());
         assert_eq!(
-            consts[&gv.args[1].raw()],
+            consts[&gv.arg(1).raw()],
             1,
             "GuardValue checks against ConstInt(1)",
         );
         assert_eq!(
-            consts[&same.args[0].raw()],
+            consts[&same.arg(0).raw()],
             0,
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
@@ -4006,7 +4006,7 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), 1, "ZERO_ARRAY stays in place per parity");
         assert_eq!(
-            out_consts[&zeros[0].args[2].raw()],
+            out_consts[&zeros[0].arg(2).raw()],
             0,
             "byte length must be 0"
         );
@@ -4051,10 +4051,10 @@ mod tests {
         assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
         // item_size = 4 (array_descr_int), so start_items=2 → 8 bytes,
         // length_items=2 → 8 bytes.
-        assert_eq!(out_consts[&zeros[0].args[1].raw()], 8, "byte start");
-        assert_eq!(out_consts[&zeros[0].args[2].raw()], 8, "byte length");
-        assert_eq!(out_consts[&zeros[0].args[3].raw()], 1, "scale arg(3) is 1");
-        assert_eq!(out_consts[&zeros[0].args[4].raw()], 1, "scale arg(4) is 1");
+        assert_eq!(out_consts[&zeros[0].arg(1).raw()], 8, "byte start");
+        assert_eq!(out_consts[&zeros[0].arg(2).raw()], 8, "byte length");
+        assert_eq!(out_consts[&zeros[0].arg(3).raw()], 1, "scale arg(3) is 1");
+        assert_eq!(out_consts[&zeros[0].arg(4).raw()], 1, "scale arg(4) is 1");
     }
 
     #[test]
@@ -4093,8 +4093,8 @@ mod tests {
             .find(|o| o.opcode == OpCode::ZeroArray)
             .unwrap();
         // No SETs, length=3 items × 4 bytes/item = 12 bytes.
-        assert_eq!(out_consts[&zero.args[1].raw()], 0, "byte start");
-        assert_eq!(out_consts[&zero.args[2].raw()], 12, "byte length");
+        assert_eq!(out_consts[&zero.arg(1).raw()], 0, "byte start");
+        assert_eq!(out_consts[&zero.arg(2).raw()], 12, "byte length");
     }
 
     #[test]
@@ -4142,8 +4142,8 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), 1, "rewrite.py:719 emits one ZERO_ARRAY");
         // start_items=1 → 4 bytes, length_items=3 → 12 bytes.
-        assert_eq!(out_consts[&zeros[0].args[1].raw()], 4, "byte start");
-        assert_eq!(out_consts[&zeros[0].args[2].raw()], 12, "byte length");
+        assert_eq!(out_consts[&zeros[0].arg(1).raw()], 4, "byte start");
+        assert_eq!(out_consts[&zeros[0].arg(2).raw()], 12, "byte length");
     }
 
     #[test]

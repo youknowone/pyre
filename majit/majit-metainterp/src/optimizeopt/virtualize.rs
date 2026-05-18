@@ -3607,14 +3607,14 @@ mod tests {
             .iter()
             .position(|op| {
                 op.opcode == OpCode::SetfieldGc
-                    && op.args.first().copied() == Some(OpRef::input_arg_ref(0))
+                    && op.getarglist().first().copied() == Some(OpRef::input_arg_ref(0))
             })
             .expect("escaping argument store must be emitted");
         let arg1_setfield_pos = result
             .iter()
             .position(|op| {
                 op.opcode == OpCode::SetfieldGc
-                    && op.args.first().copied() == Some(OpRef::input_arg_ref(1))
+                    && op.getarglist().first().copied() == Some(OpRef::input_arg_ref(1))
             })
             .expect("unrelated store must still be emitted by the final flush");
 

@@ -1856,7 +1856,7 @@ fn build_short_preamble_struct_from_ops(
         })
         };
     for op in ops {
-        for &arg in &op.args {
+        for &arg in op.getarglist() {
             if !defined_by_ops.contains(&arg) {
                 if let Some(&val) = loop_constants.get(&arg.raw()) {
                     constants.insert(arg.raw(), (val, const_type_for(arg)));
@@ -2177,7 +2177,7 @@ impl ExtendedShortPreambleBuilder {
         self.phase1_to_inputarg.clear();
         for entry in &short_preamble.ops {
             for &(arg_pos, label_idx) in &entry.arg_mapping {
-                if let Some(&phase1_ref) = entry.op.args.get(arg_pos) {
+                if let Some(&phase1_ref) = entry.op.getarglist().get(arg_pos) {
                     if let Some(&current_inputarg) = label_args.get(label_idx) {
                         if phase1_ref != current_inputarg {
                             self.phase1_to_inputarg.insert(phase1_ref, current_inputarg);
@@ -2210,7 +2210,7 @@ impl ExtendedShortPreambleBuilder {
             }
             // RPython use_box arg loop: insert missing deps before this op.
             // Recursive: deps of deps are also inserted (transitive closure).
-            for &arg in &op.args {
+            for &arg in op.getarglist() {
                 if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set, &pos_to_key) {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
@@ -3063,12 +3063,12 @@ mod tests {
 
         // Guard_true now checks bridge's v500 (was v100 → label arg 0)
         assert_eq!(instantiated[0].opcode, OpCode::GuardTrue);
-        assert_eq!(instantiated[0].args[0], OpRef::int_op(500));
+        assert_eq!(instantiated[0].arg(0), OpRef::int_op(500));
 
         // Guard_class now checks bridge's v501 against constant v200
         assert_eq!(instantiated[1].opcode, OpCode::GuardClass);
-        assert_eq!(instantiated[1].args[0], OpRef::int_op(501)); // remapped
-        assert_eq!(instantiated[1].args[1], OpRef::int_op(200)); // constant, unchanged
+        assert_eq!(instantiated[1].arg(0), OpRef::int_op(501)); // remapped
+        assert_eq!(instantiated[1].arg(1), OpRef::int_op(200)); // constant, unchanged
 
         // IntAdd with remapped args
         assert_eq!(instantiated[2].opcode, OpCode::IntAdd);

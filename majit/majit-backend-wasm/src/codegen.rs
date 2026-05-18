@@ -131,7 +131,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             max_var = op.pos.get().raw() + 1;
         }
         if op.opcode == OpCode::Label {
-            for &a in &op.args {
+            for &a in op.getarglist() {
                 if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > max_var {
                     max_var = a.raw() + 1;
                 }
@@ -142,7 +142,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             let fail_args: Vec<OpRef> = op
                 .getfailargs()
                 .map(|fa| fa.to_vec())
-                .unwrap_or_else(|| op.args.to_vec());
+                .unwrap_or_else(|| op.getarglist().to_vec());
             let fail_arg_types = op
                 .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
@@ -1232,7 +1232,7 @@ fn build_function(
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
     for op in ops {
         if op.opcode == OpCode::Label {
-            return op.args.clone().to_vec();
+            return op.getarglist().to_vec();
         }
     }
     Vec::new()
@@ -1335,7 +1335,7 @@ fn emit_guard_exit(
     let fail_args: Vec<OpRef> = op
         .getfailargs()
         .map(|fa| fa.to_vec())
-        .unwrap_or_else(|| op.args.to_vec());
+        .unwrap_or_else(|| op.getarglist().to_vec());
 
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;

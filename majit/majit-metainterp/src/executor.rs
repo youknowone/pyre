@@ -180,8 +180,8 @@ pub(crate) fn execute_one(
     match op.opcode {
         // ── Control flow ──
         OpCode::Label => OpResult::Void,
-        OpCode::Finish => OpResult::Finish(op.args.to_vec()),
-        OpCode::Jump => OpResult::Jump(op.args.to_vec()),
+        OpCode::Finish => OpResult::Finish(op.getarglist().to_vec()),
+        OpCode::Jump => OpResult::Jump(op.getarglist().to_vec()),
 
         // ── Integer arithmetic ──
         OpCode::IntAdd => {
