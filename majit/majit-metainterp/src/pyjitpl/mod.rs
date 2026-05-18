@@ -18050,11 +18050,7 @@ mod tests {
         ops: Vec<Op>,
         constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     ) {
-        let backend_constants: HashMap<u32, i64> = constants_typed
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
-        meta.backend.set_constants(backend_constants);
+        meta.backend.set_constants_pool(constants_typed.clone());
         let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
