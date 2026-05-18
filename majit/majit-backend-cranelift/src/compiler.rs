@@ -669,15 +669,7 @@ fn caller_prefix_recovery_layout(
     .prefixed_by(caller_prefix_layout)
 }
 
-fn wrap_call_assembler_deadframe_with_caller_prefix(
-    mut frame: DeadFrame,
-    trace_id: u64,
-    header_pc: u64,
-    source_guard: Option<(u64, u32)>,
-    input_types: &[Type],
-    inputs: &[i64],
-    caller_prefix_layout: Option<&ExitRecoveryLayout>,
-) -> DeadFrame {
+fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> DeadFrame {
     let Some(layout) = deadframe_layout(&frame) else {
         return frame;
     };
@@ -685,41 +677,26 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
         return frame;
     };
 
-    let caller_layout = caller_prefix_recovery_layout(
-        trace_id,
-        header_pc,
-        source_guard,
-        input_types,
-        inputs,
-        caller_prefix_layout,
-    );
-
-    // Slice X3-B dual-verify: the stack-top `CallAssemblerCallerContext`
-    // pushed by the dispatch function (`execute_with_inputs` /
-    // `execute_bridge` / `execute_registered_loop_target` /
-    // `execute_token_ints_raw`) must reconstruct the same caller_layout
-    // as the explicit parameters.  Slice X3-C drops the parameters and
-    // makes the stack the sole source; this assert protects the
-    // transition by catching producer/consumer divergence.
-    with_current_call_assembler_caller_context(|maybe_ctx| {
+    // Slice X3-C: the stack-top `CallAssemblerCallerContext` pushed by
+    // the dispatch function is the sole source for caller-prefix data
+    // assembly.  Slice X3-B's dual-verify proved the stack and the
+    // explicit parameters always agreed; the parameters are now gone.
+    // Slice X3-D will replace the overlay descr synthesis below with
+    // direct CallerContext routing through the deopt callback.
+    let caller_layout = with_current_call_assembler_caller_context(|maybe_ctx| {
         let ctx = maybe_ctx.expect(
-            "X3-B: CallAssemblerCallerContextGuard must be in scope at \
+            "X3-C: CallAssemblerCallerContextGuard must be in scope at \
              every wrap_call_assembler_deadframe_with_caller_prefix call \
              site",
         );
-        let from_stack = caller_prefix_recovery_layout(
+        caller_prefix_recovery_layout(
             ctx.trace_id,
             ctx.header_pc,
             ctx.source_guard,
             &ctx.input_types,
             &ctx.inputs,
             ctx.caller_prefix_layout.as_ref(),
-        );
-        assert_eq!(
-            from_stack, caller_layout,
-            "X3-B: CallAssemblerCallerContext stack-top must reconstruct \
-             the same caller_layout as the wrap parameters"
-        );
+        )
     });
 
     let recovery_layout = inner_recovery_layout.prefixed_by(Some(&caller_layout));
@@ -2867,15 +2844,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     &current_inputs,
                 ),
             );
-            return wrap_call_assembler_deadframe_with_caller_prefix(
-                frame,
-                target.trace_id,
-                target.header_pc,
-                None,
-                &target.inputarg_types,
-                &current_inputs,
-                target.caller_prefix_layout.as_ref(),
-            );
+            return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
 
         let fail_descr_arc =
@@ -7555,15 +7524,7 @@ impl CraneliftBackend {
                 let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
                     CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
                 );
-                return wrap_call_assembler_deadframe_with_caller_prefix(
-                    frame,
-                    compiled.trace_id,
-                    compiled.header_pc,
-                    None,
-                    &compiled.input_types,
-                    &cur_inputs,
-                    compiled.caller_prefix_layout.as_ref(),
-                );
+                return wrap_call_assembler_deadframe_with_caller_prefix(frame);
             }
 
             // llmodel.py:412-420 get_latest_descr: resolve fail_descr from
@@ -7669,15 +7630,7 @@ impl CraneliftBackend {
             let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
                 CallAssemblerCallerContext::from_bridge_data(bridge, bridge_inputs),
             );
-            return wrap_call_assembler_deadframe_with_caller_prefix(
-                frame,
-                bridge.trace_id,
-                bridge.header_pc,
-                Some(bridge.source_guard),
-                &bridge.input_types,
-                bridge_inputs,
-                bridge.caller_prefix_layout.as_ref(),
-            );
+            return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
 
         let fail_descr_arc =
@@ -14684,15 +14637,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
                     CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
                 );
-                let frame = wrap_call_assembler_deadframe_with_caller_prefix(
-                    frame,
-                    compiled.trace_id,
-                    compiled.header_pc,
-                    None,
-                    &compiled.input_types,
-                    &cur_inputs,
-                    compiled.caller_prefix_layout.as_ref(),
-                );
+                let frame = wrap_call_assembler_deadframe_with_caller_prefix(frame);
                 let descr_arc = self.get_latest_descr_arc(&frame);
                 let descr: &dyn FailDescr = descr_arc
                     .as_fail_descr()
