@@ -14478,13 +14478,23 @@ impl MetaInterpStaticData {
         }
     }
 
-    /// pyjitpl.py:2292-2303 `_setup_once` — guarded by
-    /// `globaldata.initialized` so it runs exactly once per CPU after
-    /// `finish_setup` has installed every descr (`pyjitpl.py:2255`,
-    /// `pyjitpl.py:2283`).  Dispatches `cpu.setup_once()`
-    /// (`pyjitpl.py:2297 self.cpu.setup_once()`), which is the call
-    /// that materialises the per-CPU malloc / propagate trampolines
-    /// in PyPy (`llsupport/assembler.py:97 setup_once`).
+    /// pyjitpl.py:2292-2303 `_setup_once` — narrow port.
+    ///
+    /// Guarded by `globaldata.initialized` so the body runs exactly
+    /// once per CPU after `finish_setup` has installed every descr
+    /// (`pyjitpl.py:2255`, `pyjitpl.py:2283`).
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy's `_setup_once` invokes four
+    /// lifecycle hooks in sequence — `profiler.start()`,
+    /// `cpu.setup_once()`, `jitlog.setup_once()`, and
+    /// `vector_ext.setup_once()` (with `debug_print` interleaved).
+    /// Pyre only dispatches `cpu.setup_once()` here because the
+    /// profiler / jitlog / vector_ext subsystems are not yet wired
+    /// in pyre; the other three hooks will be added as those
+    /// subsystems land.  `cpu.setup_once()`
+    /// (`pyjitpl.py:2297 self.cpu.setup_once()`) is the call that
+    /// materialises the per-CPU malloc / propagate trampolines in
+    /// PyPy (`llsupport/assembler.py:97 setup_once`).
     ///
     /// Pyre invokes this from the metainterp's back-edge entry
     /// `MetaInterp::bound_reached` (pyre analogue of
