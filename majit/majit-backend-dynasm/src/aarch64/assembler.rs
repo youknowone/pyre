@@ -491,6 +491,59 @@ impl<'a> AssemblerARM64<'a> {
     // Helper methods
     // ----------------------------------------------------------------
 
+    /// Emit the inline propagate-MemoryError sequence: if `reg_x` is
+    /// NULL, route through the `propagate_exception_descr` exit
+    /// (`_build_propagate_exception_path`, assembler.py:559-577 —
+    /// inlined per call site because pyre's dynasm backend doesn't
+    /// emit a separate trampoline on aarch64).
+    ///
+    /// Used by:
+    ///   * `OpCode::CheckMemoryError` (after the four CALL_R malloc
+    ///     helpers in `gen_call_malloc_gc`).
+    ///   * Each inline malloc-nursery slowpath site, where the helper
+    ///     (`dynasm_nursery_slowpath` / `_varsize` / `_jitframe`)
+    ///     returns x0 = 0 on real host OOM (calloc failure).  Before
+    ///     this hook the OOM null was stored straight into a typed
+    ///     Ref slot, corrupting subsequent generated stores.
+    ///
+    /// Skips emission when `propagate_exception_descr` is unattached
+    /// (unit tests that bypass `MetaInterp::finish_setup`).
+    fn emit_propagate_memory_error_if_null(&mut self, reg_x: u8) {
+        let propagate_descr = self.propagate_exception_descr_ptr();
+        if propagate_descr == 0 {
+            return;
+        }
+        let skip = self.mc.new_dynamic_label();
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        // x0 is freely clobberable on the propagate path: _call_footer
+        // (assembler.py:574) overwrites x0 with fp before returning,
+        // so any live value in x0 was already dead the moment we
+        // branched into the path.
+        dynasm!(self.mc ; .arch aarch64
+            ; cbnz X(reg_x), =>skip
+        );
+        // assembler.py:509-512 — load pos_exc_value into x0,
+        // then clear pos_exc_value.
+        self.emit_mov_imm64(16, exc_value_addr);
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x0, [x16]
+            ; str xzr, [x16]
+        );
+        // assembler.py:535-536 — clear pos_exception.
+        self.emit_mov_imm64(16, exc_type_addr);
+        dynasm!(self.mc ; .arch aarch64
+            ; str xzr, [x16]
+            // assembler.py:565 — store x0 → jf_guard_exc.
+            ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
+        );
+        // assembler.py:572-573 — store propagate_descr → jf_descr.
+        self.emit_mov_imm64(0, propagate_descr);
+        dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
+        self._call_footer();
+        dynasm!(self.mc ; .arch aarch64 ; =>skip);
+    }
+
     /// Frame-pointer-relative byte offset for a given slot index.
     /// Slots are absolute jf_frame indices, including the fixed
     /// JITFRAME-managed prefix. FIRST_ITEM_OFFSET accounts for the object
@@ -2810,6 +2863,12 @@ impl<'a> AssemblerARM64<'a> {
                     &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
                     true,
                 );
+                // `dynasm_nursery_slowpath_jitframe` falls back to
+                // `libc::calloc`, which returns NULL on real host OOM.
+                // Route through the propagate path before the fast/slow
+                // paths join so the null frame pointer never reaches the
+                // CALL_ASSEMBLER store sequence that follows.
+                self.emit_propagate_memory_error_if_null(0);
                 dynasm!(self.mc ; .arch aarch64 ; =>done);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -2854,6 +2913,12 @@ impl<'a> AssemblerARM64<'a> {
                 self.reload_frame_if_necessary();
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                // `dynasm_nursery_slowpath_varsize` returns x0 = 0 on
+                // real host OOM (calloc failure preserved as NULL per
+                // runner.rs).  Route through the propagate path before
+                // the result store so the null pointer never reaches
+                // subsequent typed stores.
+                self.emit_propagate_memory_error_if_null(0);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
                 }
@@ -2886,49 +2951,11 @@ impl<'a> AssemblerARM64<'a> {
             //   4. str x0, [fp, jf_descr]
             //   5. mov x0, fp + gen_func_epilog
             OpCode::CheckMemoryError => {
-                let propagate_descr = self.propagate_exception_descr_ptr();
-                if propagate_descr == 0 {
-                    // Unattached `propagate_exception_descr` — typical
-                    // for unit tests that bypass `MetaInterp::finish_setup`.
-                    // Skip the null-check; in production
-                    // (`pyjitpl.py:2283 self.cpu.propagate_exception_descr
-                    // = exc_descr`) the descr is always set before
-                    // `compile_loop` runs.
-                } else {
-                    let reg = match arglocs.first() {
-                        Some(Loc::Reg(r)) if !r.is_xmm => r.value,
-                        _ => panic!("CheckMemoryError arglocs[0] must be a non-xmm register"),
-                    };
-                    let skip = self.mc.new_dynamic_label();
-                    let exc_value_addr = crate::jit_exc_value_addr() as i64;
-                    let exc_type_addr = crate::jit_exc_type_addr() as i64;
-                    // x0 is freely clobberable on the propagate path:
-                    // _call_footer (assembler.py:574) overwrites x0 with fp
-                    // before returning, so any live value in x0 was already
-                    // dead the moment we branched into the path.
-                    dynasm!(self.mc ; .arch aarch64
-                        ; cbnz X(reg), =>skip
-                    );
-                    // assembler.py:509-512 — load pos_exc_value into x0.
-                    self.emit_mov_imm64(16, exc_value_addr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; ldr x0, [x16]
-                        // assembler.py:531-533 — clear pos_exc_value.
-                        ; str xzr, [x16]
-                    );
-                    // assembler.py:535-536 — clear pos_exception.
-                    self.emit_mov_imm64(16, exc_type_addr);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; str xzr, [x16]
-                        // assembler.py:565 — store x0 → jf_guard_exc.
-                        ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
-                    );
-                    // assembler.py:572-573 — store propagate_descr → jf_descr.
-                    self.emit_mov_imm64(0, propagate_descr);
-                    dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
-                    self._call_footer();
-                    dynasm!(self.mc ; .arch aarch64 ; =>skip);
-                }
+                let reg = match arglocs.first() {
+                    Some(Loc::Reg(r)) if !r.is_xmm => r.value,
+                    _ => panic!("CheckMemoryError arglocs[0] must be a non-xmm register"),
+                };
+                self.emit_propagate_memory_error_if_null(reg);
             }
             // aarch64/opassembler.py:912 _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
@@ -5781,6 +5808,11 @@ impl<'a> AssemblerARM64<'a> {
             ; ldp x12, x13, [x29, base_ofs_r + 12 * 8]
             ; ldp x19, x20, [x29, base_ofs_r + 14 * 8]
         );
+        // `dynasm_nursery_slowpath` returns x0 = 0 on real host OOM
+        // (calloc failure preserved as NULL per runner.rs).  Route
+        // through the propagate path before the fast-path join so the
+        // null pointer never reaches subsequent typed stores.
+        self.emit_propagate_memory_error_if_null(0);
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);
     }
