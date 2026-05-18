@@ -4550,8 +4550,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
@@ -5398,8 +5396,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
@@ -5942,8 +5938,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
@@ -6297,8 +6291,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend.set_constants(backend_constants);
@@ -8362,8 +8354,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
@@ -8922,8 +8912,6 @@ impl<M: Clone> MetaInterp<M> {
         // `set_constant_types` API consumes.
         let (backend_constants, backend_constant_types) =
             crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
-        let compiled_constants = backend_constants.clone();
-        let compiled_constant_types = backend_constant_types.clone();
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let bridge_trace_id = self.alloc_trace_id();
