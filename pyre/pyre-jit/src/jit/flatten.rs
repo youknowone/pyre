@@ -2214,35 +2214,93 @@ where
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
         // Pyre adaptation: emit `Insn::PcAnchor { py_pc }` +
-        // placeholder `-live-` marker pairs immediately after the
-        // block-entry Label, one pair per py_pc the bridge entry
-        // (`flatten_graph_with_walker_slots`) pre-seeded for this
-        // block.  Walker emits PcAnchor + `-live-` for EVERY Python
-        // PC in `0..num_pcs` (per-PC dispatch is pyre's runtime
-        // contract), and `pc_anchor_positions` asserts every PC has
-        // an anchor.  Canonical bulk-emits all anchors a block
-        // "owns" at block entry so canonical's output stays runtime-
-        // compatible without per-op PC tracking inside the canonical
-        // driver.  `filter_liveness_in_place` post-processes each
-        // placeholder per `live_marker_indices_by_pc`'s first-`-live-`
-        // scan between consecutive anchors (the scan range is 1 op
-        // because PcAnchor and `-live-` are emitted as consecutive
-        // pairs here).  Upstream RPython has no per-PC anchor
-        // concept; this is a pyre-only extension.
-        let py_pcs: Vec<usize> = self
-            .block_py_pcs
-            .iter()
-            .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
-            .collect();
+        // placeholder `-live-` marker pairs INTERLEAVED with the
+        // block's ops based on `op.offset` (= py_pc the walker
+        // recorded the op at).  Walker emits PcAnchor + `-live-`
+        // immediately before dispatching each PC's bytecode
+        // (`codewriter.rs::emit_mark_label_pc!` followed by
+        // `emit_live_placeholder!()`), so the `-live-` placeholder
+        // sits right before that PC's ops.  `compute_liveness`'s
+        // backward walk captures the alive register set AT that
+        // marker position; bulk-emitting all anchors at block entry
+        // (the previous behaviour) collapses every PC's marker to
+        // "block entry" and produces a single alive set shared
+        // across all PCs — wrong liveness for any PC after the
+        // first.  Per-op interleaving here reconstructs the walker's
+        // per-PC marker positions so `filter_liveness_in_place`'s
+        // post-pass populates each PC's `-live-` with the correct
+        // alive set.  Owned PCs without any matching op (sparse
+        // walker emissions for synthetic-only PCs) emit a trailing
+        // PA + L pair after the op loop so `pc_anchor_positions`'s
+        // assert that every PC has an anchor still holds.  Synthetic
+        // graph ops (`offset == -1`, e.g. `abort_permanent`,
+        // `emit_vsd!` int_copy / setfield_vable_i bookkeeping)
+        // attach to whichever PC was most recently anchored, matching
+        // walker's emit-where-encountered behaviour.  Upstream
+        // RPython has no per-PC anchor concept; this is a pyre-only
+        // extension required by per-PC runtime dispatch.
+        let owned_pcs_sorted: Vec<usize> = {
+            let mut v: Vec<usize> = self
+                .block_py_pcs
+                .iter()
+                .filter_map(|(b, pc)| if b == &block { Some(*pc) } else { None })
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
         let force_alive = self.live_force_alive_ops.clone();
-        for py_pc in py_pcs {
-            self.emitline(Insn::pc_anchor(py_pc));
-            self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
-        }
         let operations = block.borrow().operations.clone();
         let exits_len = block.borrow().exits.len();
         let exitswitch_is_last_exception = block.borrow().canraise();
+        let mut anchored_pcs: Vec<usize> = Vec::new();
+        let mut current_pc: Option<usize> = None;
         for op in &operations {
+            // Determine whether this op carries an owned-PC offset.
+            // `op.offset >= 0` filters out synthetic ops (offset=-1)
+            // which attach to the most recently anchored PC.  Ops
+            // whose offset isn't in `owned_pcs_sorted` (rare — a
+            // graph op recorded with a non-owned PC) also attach to
+            // the current PC.
+            let target_pc: Option<usize> = if op.offset >= 0 {
+                let off = op.offset as usize;
+                if owned_pcs_sorted.contains(&off) {
+                    Some(off)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(pc) = target_pc {
+                if Some(pc) != current_pc {
+                    // Emit anchors for all owned PCs at-or-before
+                    // `pc` that haven't been emitted yet.  Catches
+                    // "empty" PCs sitting between the previously
+                    // anchored PC and `pc` (PCs whose walker emit
+                    // contributed no real graph op) so every owned
+                    // PC ends up anchored in ascending order.
+                    for &p in &owned_pcs_sorted {
+                        if p <= pc && !anchored_pcs.contains(&p) {
+                            self.emitline(Insn::pc_anchor(p));
+                            self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+                            anchored_pcs.push(p);
+                        }
+                    }
+                    current_pc = Some(pc);
+                }
+            } else if current_pc.is_none() {
+                // Synthetic op precedes any real-PC op in this
+                // block.  Emit the first owned PC's anchor so the
+                // synthetic op attaches to it (matches walker's
+                // behaviour of always opening a block with PA + L).
+                if let Some(&first_pc) = owned_pcs_sorted.first() {
+                    self.emitline(Insn::pc_anchor(first_pc));
+                    self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+                    anchored_pcs.push(first_pc);
+                    current_pc = Some(first_pc);
+                }
+            }
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
             // exits; otherwise the rtyper-side guarantee that an
@@ -2261,6 +2319,21 @@ where
                 );
             }
             self.serialize_op(op);
+        }
+        // Emit anchors for any owned PCs that didn't appear in any
+        // op's `offset` (e.g. PCs whose walker emit produced only
+        // scaffold — PA + `-live-` — and no graph SpaceOp).
+        // `pc_anchor_positions` asserts every PC has an anchor; this
+        // tail emission satisfies that invariant.  These trailing
+        // anchors sit between the block's last op and `insert_exits`'s
+        // terminator emission — runtime entry into them would no-op
+        // through the terminator's goto / return because they carry
+        // no preceding ops in this block.
+        for &p in &owned_pcs_sorted {
+            if !anchored_pcs.contains(&p) {
+                self.emitline(Insn::pc_anchor(p));
+                self.emitline(Insn::op(OPNAME_LIVE.to_string(), force_alive.clone()));
+            }
         }
         self.insert_exits(&block, handling_ovf);
     }

@@ -495,8 +495,11 @@ pub(super) fn count_link_renamings_per_kind(
             let last_exc_value = link_borrow.last_exc_value;
             // Per-link per-kind (from, to) register pairs.  `[T; 3]`
             // indexed by `Kind::index()` per [[feedback-no-hashmap-ever]].
-            let mut per_kind: [(Vec<Register>, Vec<Register>); 3] =
-                [(Vec::new(), Vec::new()), (Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+            let mut per_kind: [(Vec<Register>, Vec<Register>); 3] = [
+                (Vec::new(), Vec::new()),
+                (Vec::new(), Vec::new()),
+                (Vec::new(), Vec::new()),
+            ];
             for (arg, inputarg) in link_borrow.args.iter().zip(target_inputargs.iter()) {
                 let Some(src_value) = arg.as_ref() else {
                     continue;
@@ -707,8 +710,7 @@ pub(super) fn allocate_registers(
     //   regallocs[kind] = perform_register_allocation(graph, kind)`.
     // `[RegAllocator; 3]` indexed by `Kind::index()` per
     // [[feedback-no-hashmap-ever]].
-    let mut allocators: [RegAllocator; 3] =
-        std::array::from_fn(|_| RegAllocator::new());
+    let mut allocators: [RegAllocator; 3] = std::array::from_fn(|_| RegAllocator::new());
     for &kind in &Kind::ALL {
         let mut external: Vec<u16> = Vec::new();
         if kind == Kind::Ref {
@@ -797,11 +799,7 @@ pub(super) fn allocate_registers(
 /// trace-side Python-local mirror) followed by the portal red args
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
-fn enforce_input_args(
-    allocators: &mut [RegAllocator; 3],
-    nlocals: usize,
-    inputs: &ExternalInputs,
-) {
+fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs: &ExternalInputs) {
     let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
     // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
