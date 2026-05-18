@@ -5727,6 +5727,11 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
+    // 2026-05-18 hypothesis test (reverted, no effect on nbody):
+    // mirroring `run_compiled_code`'s `write_bytes(gcref, 0, ITEM0_OFS)`
+    // header-clear by setting jf_gcmap / jf_descr / jf_guard_exc to 0
+    // before the tail call did NOT fix the nbody corruption — confirms
+    // the dispatch-path corruption is not from stale GC roots / descr.
     emit_call_footer_shadowstack(builder, ptr_type);
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
@@ -5854,20 +5859,14 @@ fn emit_guard_exit(
     //     `emit_return_call_common_sequence` (Tail conv aarch64) —
     //     unchanged between 0.130.2 and 0.131.1.
     //
-    // The dispatch helper itself (and the per-LABEL `ll_loop_code` +
-    // `label_block_id` address wiring) is committed and used by the
-    // wrapper+body split; only the call from `emit_guard_exit` stays
-    // gated.  The 2026-05-18 gate-flip probe with the per-LABEL gate
-    // *plus* fall-through for non-first LABELs still reproduced the
-    // nbody `-0.03513379910298962` corruption (vs. dynasm reference
-    // `-0.035132020348426815`), confirming the corruption is NOT
-    // inputarg-count mismatch — it's output/input slot remap.  The
-    // remaining work is option (ii): port PyPy's regalloc.py
-    // _consider_jump argloc-remap pass to cranelift so JUMP exits
-    // emit MOVs that shuffle source exit slots → target input slots
-    // before `return_call_indirect`.  Even with argloc remap, the
-    // cranelift 0.130/0.131 aarch64 Tail-conv ~12.5 bytes/take stack
-    // leak remains an upstream blocker for raise_catch / fannkuch.
+    // Gate stays off: 2026-05-18 second probe (jf_gcmap+jf_descr+
+    // jf_guard_exc clear before tail-call) still reproduces nbody_50k
+    // corruption `-0.03513214049650899` (vs. dynasm reference
+    // `-0.035132020348426815`).  Header-state staleness was not the
+    // cause; the dispatch path corruption mechanism remains undiagnosed.
+    // raise_catch / fannkuch continue to crash/hang via the cranelift
+    // 0.130/0.131 aarch64 Tail-conv stack leak (12.5 bytes/take),
+    // independent of any pyre-side fix.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
