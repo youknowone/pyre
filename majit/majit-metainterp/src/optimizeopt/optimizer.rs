@@ -271,69 +271,6 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-fn type_for_backend_constant(
-    raw_key: u32,
-    ops: &[Op],
-    constant_types: &std::collections::HashMap<u32, Type>,
-) -> Type {
-    // Use explicit constant_types first (from ConstantPool),
-    // then fall back to ops result_type, then Int.
-    //
-    // The `ops` fallback compares by raw u32 (not OpRef Eq) because
-    // `raw_key` came from a HashMap key and has no variant tag while
-    // production `op.pos` is a typed body variant (IntOp / RefOp / …).
-    // Variant-aware Eq would always miss; raw comparison restores
-    // pre-Phase-3 semantics for the rare path where constant_types is
-    // empty.
-    constant_types
-        .get(&raw_key)
-        .copied()
-        .or_else(|| {
-            ops.iter()
-                .find(|op| op.pos.get().raw() == raw_key)
-                .map(|op| op.result_type())
-        })
-        .unwrap_or(Type::Int)
-}
-
-fn value_for_backend_constant(raw: i64, tp: Type) -> majit_ir::Value {
-    match tp {
-        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
-        Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
-        Type::Int => majit_ir::Value::Int(raw),
-        // history.py:220 / 261 / 307: every Const Box pins a non-Void
-        // `.type`. There is no `ConstVoid` class upstream, so a Void
-        // here means the resolver lost the type and is silently
-        // retagging the value — refuse rather than mint a spurious
-        // ConstInt(raw).
-        Type::Void => panic!(
-            "value_from_backend_constant_bits_typed: raw={raw:?} resolved to Type::Void; \
-             no ConstVoid class upstream (history.py:220)"
-        ),
-    }
-}
-
-/// Reconstruct a typed `OpRef` (and resolved `Type`) from a
-/// backend-constants HashMap key.  The raw u32 distinguishes
-/// const-namespace (`CONST_BIT` set) from op-namespace; the type comes
-/// from `constant_types` first, then a raw-keyed lookup against `ops`.
-/// Produces typed body / const variants so the OpRef downstream of
-/// `seed_constant` carries the variant tag (history.py:220 /
-/// resoperation.py:567).
-fn opref_and_type_for_backend_constant(
-    raw_key: u32,
-    ops: &[Op],
-    constant_types: &std::collections::HashMap<u32, Type>,
-) -> (OpRef, Type) {
-    let tp = type_for_backend_constant(raw_key, ops, constant_types);
-    let opref = if OpRef::raw_is_constant(raw_key) {
-        OpRef::const_typed(OpRef::raw_const_index(raw_key), tp)
-    } else {
-        OpRef::op_typed(raw_key, tp)
-    };
-    (opref, tp)
-}
-
 fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
     let live_limit = ops
         .iter()
