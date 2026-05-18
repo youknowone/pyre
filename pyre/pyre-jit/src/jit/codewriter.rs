@@ -9098,9 +9098,7 @@ impl CodeWriter {
             // (INCLUDING `-live-` ops) positionally.  `byte_equivalent`'s
             // multiset match over non-`-live-` Insn::Op is necessary but
             // INSUFFICIENT for splice safety — runtime liveness depends
-            // on `-live-` operand lists (canonical's `live_force_alive_ops`
-            // is pre-seeded with portal red args, but other walker `-live-`
-            // operands may differ) AND on op position (the assembler
+            // on `-live-` operand lists AND on op position (the assembler
             // emits sequentially; reordering two compatible ops can shift
             // which registers are alive at each guard point).
             fn op_stream_full(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
