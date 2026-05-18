@@ -1220,34 +1220,6 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// Per-link counterpart to `block_names` for `Label(link)` /
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
-    /// Pyre-only side table mapping graph blocks to their Python PC.
-    /// When non-empty, `make_bytecode_block` emits an `Insn::PcAnchor
-    /// { py_pc }` immediately after the block-entry `Label` for blocks
-    /// present in this table, matching the walker's per-PC anchor
-    /// emission in `codewriter.rs::emit_mark_label_pc!`.  This makes
-    /// the canonical driver's output runtime-compatible with pyre's
-    /// `pc_anchor_positions` / `live_marker_indices_by_pc` lookups
-    /// without requiring runtime refactor.  Upstream RPython has no
-    /// per-PC anchor concept (RPython's runtime dispatch keys off the
-    /// recorded SpamBlock identity, not Python PC), so this is a pyre
-    /// adaptation layer.  Pre-seeded by the bridge entry
-    /// `flatten_graph_with_walker_slots`; empty for plain
-    /// `flatten_graph` test fixtures.
-    block_py_pcs: Vec<(BlockRef, usize)>,
-    /// Pyre-only force-alive Register operands threaded into every
-    /// `-live-` placeholder emitted by `make_bytecode_block` (matches
-    /// walker's `emit_live_placeholder!` macro at
-    /// `codewriter.rs::4329-4339`).  Walker keeps the portal red args
-    /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`)
-    /// alive across every PC by emitting their Register operands into
-    /// each per-PC `-live-` — `compute_liveness` then propagates them
-    /// backward into the alive set per `liveness.py:11-12`.  Without
-    /// the operands the bridge's `setup_bridge_sym` sees the portal
-    /// `ec` register missing from the guard point's live R-bank set,
-    /// crashing `bridge_registers_r[portal_ec_reg]` lookup.  Pre-
-    /// seeded by `flatten_graph_with_walker_slots` from codewriter's
-    /// `portal_frame_reg` / `portal_ec_reg`.
-    live_force_alive_ops: Vec<Operand>,
     next_label_id: usize,
     include_all_exc_links: bool,
     /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
@@ -1288,8 +1260,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1315,8 +1285,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -1347,8 +1315,6 @@ where
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
-            block_py_pcs: Vec::new(),
-            live_force_alive_ops: Vec::new(),
             next_label_id: 0,
             include_all_exc_links: false,
             cpu: None,
@@ -2637,8 +2603,6 @@ pub fn flatten_graph<'a>(
         &[],
         &[],
         &[],
-        &[],
-        &[],
         include_all_exc_links,
         cpu,
     )
@@ -2670,8 +2634,6 @@ pub fn flatten_graph_with_walker_slots<'a>(
     walker_slot_for_variable: &'a [Option<u16>],
     block_name_overrides: &[(super::flow::BlockRef, String)],
     link_name_overrides: &[(super::flow::LinkRef, String)],
-    block_py_pc_overrides: &[(super::flow::BlockRef, usize)],
-    live_force_alive_ops: &[Operand],
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
@@ -2766,22 +2728,6 @@ pub fn flatten_graph_with_walker_slots<'a>(
     for (link, name) in link_name_overrides {
         flattener.link_names.push((link.clone(), name.clone()));
     }
-    // Task #50 T6 epic slice 4b — pre-seed block_py_pcs so
-    // `make_bytecode_block` emits `Insn::PcAnchor { py_pc }` after
-    // each block's Label, matching walker's per-PC anchor.  Makes
-    // canonical's SSARepr stream runtime-compatible with pyre's
-    // `pc_anchor_positions` lookup — necessary precondition for the
-    // Phase 4 production splice.  Upstream RPython has no per-PC
-    // anchor; this is a pyre adaptation layer.
-    for (block, py_pc) in block_py_pc_overrides {
-        flattener.block_py_pcs.push((block.clone(), *py_pc));
-    }
-    // Phase 4 slice 2 — pre-seed live force-alive ops so canonical's
-    // per-PC `-live-` placeholders carry the portal red args matching
-    // walker's `emit_live_placeholder!` shape.  Without these, the
-    // bridge's `setup_bridge_sym` crashes at portal_ec_reg lookup
-    // (compute_liveness misses the unforced register).
-    flattener.live_force_alive_ops = live_force_alive_ops.to_vec();
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     // Drop the flattener so its closure-borrowed `audit_counters` Cell

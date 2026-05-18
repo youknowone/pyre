@@ -9047,69 +9047,12 @@ impl CodeWriter {
                     }
                 }
             }
-            // Task #50 T6 epic slice 4b/4d — derive `(BlockRef, py_pc)`
-            // pairs so canonical emits `Insn::PcAnchor { py_pc }` +
-            // `-live-` placeholder for EVERY Python PC, matching
-            // walker's per-PC anchor shape.  Walker emits PcAnchor +
-            // `-live-` for every py_pc in `0..num_instrs` (per-PC
-            // dispatch is pyre's runtime contract), and
-            // `pc_anchor_positions` asserts every PC has an anchor.
-            // For each py_pc, find the owning SpamBlock via the
-            // most-recent block-entry PC <= py_pc rule (walker's
-            // sequential dispatch behaviour — once it enters a block
-            // it stays there until a block-switch).  Canonical bulk-
-            // emits all anchors a block owns at block entry.
-            // Necessary precondition for the Phase 4 production
-            // splice: with per-PC PcAnchor + `-live-` present,
-            // canonical's SSARepr is runtime-compatible with pyre's
-            // `pc_anchor_positions` / `live_marker_indices_by_pc`
-            // lookups.
-            let mut sorted_entries: Vec<(&SpamBlockRef, usize)> = all_walker_blocks
-                .iter()
-                .filter_map(|s| s.framestate().map(|fs| (s, fs.next_offset)))
-                .collect();
-            // Stable sort preserves walker creation order for ties
-            // (supersede dead+live pair sharing the same entry pc —
-            // the live one's bytes win via dead-block's empty
-            // per_block_ssarepr).
-            sorted_entries.sort_by_key(|(_, pc)| *pc);
-            let mut block_py_pc_overrides: Vec<(super::flow::BlockRef, usize)> = Vec::new();
-            for py_pc in 0..code.instructions.len() {
-                // Most-recent entry <= py_pc owns this PC.
-                let owning = sorted_entries
-                    .iter()
-                    .rev()
-                    .find(|(_, entry_pc)| *entry_pc <= py_pc)
-                    .map(|(s, _)| s.block());
-                if let Some(block) = owning {
-                    block_py_pc_overrides.push((block, py_pc));
-                }
-            }
-            // Phase 4 slice 2 — derive force-alive operands matching
-            // walker's `emit_live_placeholder!` at codewriter.rs:4329.
-            // Portal red args (`reds=['frame', 'ec']`) must reach
-            // `compute_liveness` via per-PC `-live-` operands so the
-            // bridge's `setup_bridge_sym` finds them in the guard's
-            // live R-bank set.
-            let mut live_force_alive_ops: Vec<super::flatten::Operand> = Vec::new();
-            if portal_frame_reg != u16::MAX {
-                live_force_alive_ops.push(super::flatten::Operand::Register(
-                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_frame_reg),
-                ));
-            }
-            if portal_ec_reg != u16::MAX {
-                live_force_alive_ops.push(super::flatten::Operand::Register(
-                    super::flatten::Register::new(super::flatten::Kind::Ref, portal_ec_reg),
-                ));
-            }
             let canonical_ssarepr = super::flatten::flatten_graph_with_walker_slots(
                 &graph,
                 &mut _graph_regallocs,
                 &walker_slot_for_variable,
                 &block_name_overrides,
                 &link_name_overrides,
-                &block_py_pc_overrides,
-                &live_force_alive_ops,
                 true,
                 Some(self.cpu()),
             );
