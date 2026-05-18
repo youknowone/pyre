@@ -1069,16 +1069,7 @@ impl UnrollOptimizer {
             let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
                 crate::optimizeopt::vec_assoc::VecAssoc::new();
             for (&k, v) in consts_p1.iter() {
-                let c = match v {
-                    majit_ir::Value::Int(i) => majit_ir::Const::Int(*i),
-                    majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
-                    majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
-                    majit_ir::Value::Void => panic!(
-                        "import_state: Value::Void has no Const equivalent \
-                         (history.py:220/261/307 — no ConstVoid upstream)"
-                    ),
-                };
-                loop_constants.insert(k, c);
+                loop_constants.insert(k, v.to_const());
             }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
@@ -3131,15 +3122,7 @@ impl OptUnroll {
                                 majit_ir::Const,
                             > = crate::optimizeopt::vec_assoc::VecAssoc::new();
                             for (const_idx, val) in ctx.const_pool.iter() {
-                                let c = match val {
-                                    majit_ir::Value::Int(v) => majit_ir::Const::Int(*v),
-                                    majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
-                                    majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
-                                    majit_ir::Value::Void => panic!(
-                                        "build_short_preamble: Value::Void has no Const equivalent \
-                                         (history.py:220/261/307 — no ConstVoid upstream)"
-                                    ),
-                                };
+                                let c = val.to_const();
                                 let opref = OpRef::const_typed(const_idx, c.get_type());
                                 loop_constants.insert(opref.raw(), c);
                             }

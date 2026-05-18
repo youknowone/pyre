@@ -3382,27 +3382,12 @@ impl OptContext {
                 // captures the same shape so the legacy
                 // `(loop_constants: u32->i64, loop_constant_types:
                 // u32->Type)` parallel maps unify into a single
-                // `VecAssoc<u32, Const>`. The `Value::Void` arm has no
-                // corresponding `Const` variant (no `ConstVoid` upstream)
-                // and would indicate a bookkeeping bug; the
-                // `value_to_const` helper panics rather than silently
-                // synthesizing one.
-                let value_to_const = |val: &majit_ir::Value| -> majit_ir::Const {
-                    match val {
-                        majit_ir::Value::Int(v) => majit_ir::Const::Int(*v),
-                        majit_ir::Value::Float(f) => majit_ir::Const::Float(*f),
-                        majit_ir::Value::Ref(r) => majit_ir::Const::Ref(*r),
-                        majit_ir::Value::Void => panic!(
-                            "build_imported_short_preamble: Value::Void has no Const equivalent \
-                             (history.py:220/261/307 — no ConstVoid upstream)"
-                        ),
-                    }
-                };
+                // `VecAssoc<u32, Const>`.
                 let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
                     crate::optimizeopt::vec_assoc::VecAssoc::new();
                 for (i, val) in self.const_pool.iter() {
                     loop_constants
-                        .insert(Self::const_ref_for_value(i, val).raw(), value_to_const(val));
+                        .insert(Self::const_ref_for_value(i, val).raw(), val.to_const());
                 }
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -3418,7 +3403,7 @@ impl OptContext {
                     if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                         if let Some(val) = target.const_value() {
                             if !loop_constants.contains_key(&(idx as u32)) {
-                                loop_constants.insert(idx as u32, value_to_const(&val));
+                                loop_constants.insert(idx as u32, val.to_const());
                             }
                         }
                     }

@@ -129,6 +129,22 @@ impl Value {
             _ => panic!("expected Ref, got {:?}", self),
         }
     }
+
+    /// Project a `Value` into a `Const`.  Mirrors RPython where
+    /// `ConstInt`/`ConstFloat`/`ConstPtr` (history.py:220/261/307) are
+    /// the only concrete constant classes — there is no `ConstVoid`,
+    /// so `Value::Void` panics rather than fabricate one.
+    pub fn to_const(&self) -> Const {
+        match self {
+            Value::Int(v) => Const::Int(*v),
+            Value::Float(f) => Const::Float(*f),
+            Value::Ref(r) => Const::Ref(*r),
+            Value::Void => panic!(
+                "Value::to_const: Void has no Const equivalent \
+                 (history.py:220/261/307 — no ConstVoid upstream)"
+            ),
+        }
+    }
 }
 
 /// A constant value known at trace time.
