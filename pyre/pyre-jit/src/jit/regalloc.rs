@@ -987,7 +987,6 @@ impl RegAllocator {
             for insn in ssarepr.insns.iter().rev() {
                 let label_name = match insn {
                     Insn::Label(label) => Some(label.name.clone()),
-                    Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
                     _ => None,
                 };
                 if let Some(name) = label_name {
@@ -1003,7 +1002,7 @@ impl RegAllocator {
                     Insn::Unreachable => {
                         alive.clear();
                     }
-                    Insn::Label(_) | Insn::PcAnchor { .. } => unreachable!("handled above"),
+                    Insn::Label(_) => unreachable!("handled above"),
                     Insn::Op { args, result, .. } => {
                         // Defs: `'->' result` interferes with everything
                         // currently alive (regalloc.py:70-76).
@@ -1221,7 +1220,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &[Vec<u16>; 3]) {
                     rename_operand(op, rename);
                 }
             }
-            Insn::Label(_) | Insn::PcAnchor { .. } | Insn::Unreachable => {}
+            Insn::Label(_) | Insn::Unreachable => {}
         }
     }
 }

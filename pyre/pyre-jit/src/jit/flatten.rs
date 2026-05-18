@@ -234,21 +234,12 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
     TLabel::new(pc_label_name(py_pc))
 }
 
-/// Recover the Python PC index from a `Insn::PcAnchor` or from an
-/// `Insn::Label` whose name matches the `pc{N}` convention.  Returns
-/// `None` for any other Insn shape.  Consumed by the
-/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans plus the
-/// `strip_walker_block_boundary_goto` pass.
-///
-/// The dual recognition is transitional: T6 retires the `PcAnchor`
-/// variant in favor of `Insn::Label(Label::new(pc_label_name(N)))` so
-/// per-PC labels share the same surface shape as upstream-orthodox
-/// block / link / catch-landing labels.  All callers must reach the
-/// py_pc through this helper rather than pattern-matching on
-/// `PcAnchor` directly.
+/// Recover the Python PC index from an `Insn::Label` whose name matches
+/// the `pc{N}` convention.  Returns `None` for any other Insn shape.
+/// Consumed by the `pc_anchor_positions` / `live_marker_indices_by_pc`
+/// scans plus the `strip_walker_block_boundary_goto` pass.
 pub fn label_pc_index(insn: &Insn) -> Option<usize> {
     match insn {
-        Insn::PcAnchor { py_pc } => Some(*py_pc),
         Insn::Label(label) => label.name.strip_prefix("pc").and_then(|s| s.parse().ok()),
         _ => None,
     }
@@ -1105,19 +1096,14 @@ pub const OPNAME_LIVE: &str = "-live-";
 /// representation where `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
-    /// `(Label(name),)` — block-entry marker.
+    /// `(Label(name),)` — block-entry marker.  pyre's per-PC anchors
+    /// (the walker's per-Python-PC entry markers, a NEW-DEVIATION from
+    /// upstream PyPy that only resumes at `jit_merge_point` boundaries)
+    /// share this variant under the synthesized name `pc_label_name(N)`
+    /// so the runtime resolves both block entries and per-PC entries
+    /// through the same machinery.  Use `label_pc_index` to recover the
+    /// `py_pc` when needed.
     Label(Label),
-    /// pyre-only per-PC anchor marker emitted by the walker at every
-    /// Python PC entry.  Semantically equivalent to a block-entry
-    /// `Insn::Label` with the synthesized name `pc_label_name(py_pc)`,
-    /// but kept as a distinct variant so the runtime can structurally
-    /// distinguish "block entry per `flatten.py:116`" from "per-PC
-    /// anchor for any-PC resume (pyre's NEW-DEVIATION; upstream PyPy
-    /// only resumes at `jit_merge_point` boundaries)".  The assembler
-    /// records the byte position under `pc_label_name(py_pc)` in
-    /// `label_positions` so existing `TLabel("pc{N}")` branch targets
-    /// continue to resolve.
-    PcAnchor { py_pc: usize },
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
     /// set (`liveness.py:70`).
     Unreachable,

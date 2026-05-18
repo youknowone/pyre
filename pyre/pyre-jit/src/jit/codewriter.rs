@@ -785,14 +785,10 @@ fn strip_walker_block_boundary_goto(
             .find_map(|j| blocks[j].first().map(|first| (j, first)))
             .and_then(|(_, first)| match first {
                 super::flatten::Insn::Label(l) => Some(l.name.clone()),
-                super::flatten::Insn::PcAnchor { py_pc } => {
-                    Some(super::flatten::pc_label_name(*py_pc))
-                }
                 _ => None,
             });
         let first_label_for_diag = blocks[i].first().and_then(|insn| match insn {
             super::flatten::Insn::Label(l) => Some(l.name.clone()),
-            super::flatten::Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
             _ => None,
         });
         let block_insns = &mut blocks[i];
@@ -1196,8 +1192,7 @@ fn emit_link_renamings_into_block<F>(
             let mut pos = 0;
             for insn in insns.iter() {
                 match insn {
-                    super::flatten::Insn::Label(_)
-                    | super::flatten::Insn::PcAnchor { .. } => {
+                    super::flatten::Insn::Label(_) => {
                         pos += 1;
                     }
                     super::flatten::Insn::Op { opname, .. } if opname == "-live-" => {

@@ -80,14 +80,11 @@ fn _compute_liveness_must_continue(
 
         // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
         //
-        // Pyre's `Insn::PcAnchor { py_pc }` is the per-PC anchor variant
-        // synthesized by the walker; it shares Label's snapshot-and-merge
-        // semantic, keyed on `pc_label_name(py_pc)` so the resulting
-        // `label2alive` entry matches what `TLabel("pc{N}")` branches
-        // resolve to.
+        // Pyre's per-PC anchors share `Insn::Label` under the synthesized
+        // name `pc_label_name(py_pc)`, so the resulting `label2alive`
+        // entry matches what `TLabel("pc{N}")` branches resolve to.
         let label_name = match &insn {
             Insn::Label(label) => Some(label.name.clone()),
-            Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
             _ => None,
         };
         if let Some(name) = label_name {

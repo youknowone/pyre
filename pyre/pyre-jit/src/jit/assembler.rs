@@ -240,13 +240,6 @@ impl Assembler {
             Insn::Label(label) => {
                 mark_label_first_wins(state, &label.name);
             }
-            // pyre per-PC anchor — synthesizes the same byte-position
-            // recording as `Insn::Label(Label::new(pc_label_name(N)))`
-            // so `TLabel("pc{N}")` branches resolve identically.
-            Insn::PcAnchor { py_pc } => {
-                let name = super::flatten::pc_label_name(*py_pc);
-                mark_label_first_wins(state, &name);
-            }
             Insn::Op {
                 opname,
                 args,
