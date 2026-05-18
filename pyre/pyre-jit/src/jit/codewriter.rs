@@ -4031,7 +4031,7 @@ impl CodeWriter {
         // prepares to flip `flatten_graph(graph, regallocs)` as the
         // source of truth.
         macro_rules! emit_vsd {
-            ($depth:expr) => {
+            ($depth:expr, $py_pc:expr) => {
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
@@ -4039,12 +4039,16 @@ impl CodeWriter {
                     // in a matching `setfield_vable_i` op. Mirrors jtransform.py:844 +
                     // jtransform.py:925 so graph regalloc observes the
                     // liverange of the VSD-sync scratch.
-                    // Graph offsets for these synthetic shadow ops use -1
-                    // — they're emission-time bookkeeping, not tied to a
-                    // Python bytecode PC. `SpaceOperation.offset` is
-                    // advisory in regalloc (`regalloc.rs::make_dependencies`
-                    // doesn't read it); -1 simply distinguishes them from
-                    // real py_pc-anchored ops.
+                    //
+                    // Phase 4 endgame Slice F — record graph offset as the
+                    // walker's current py_pc.  Walker emits emit_vsd!
+                    // INLINE during each PC's handler; canonical
+                    // make_bytecode_block (flatten.rs:2258-2303) sorts ops
+                    // by op.offset for per-PC PcAnchor interleaving, and
+                    // offset=-1 routes synthetic ops to current_pc (the
+                    // last anchored PC), landing them in the wrong PC's
+                    // region when emit_vsd ran mid-stream.  Recording
+                    // py_pc anchors the synthetic to its actual owning PC.
                     let v_depth: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
@@ -4056,7 +4060,7 @@ impl CodeWriter {
                             VABLE_VALUESTACKDEPTH_FIELD_IDX,
                         ),
                         None,
-                        -1,
+                        ($py_pc) as i64,
                     );
                     emit_vable_setfield_int_const!(
                         portal_frame_reg,
@@ -5240,9 +5244,10 @@ impl CodeWriter {
         // reconstruction and the per-push cost is recovered only as the
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
-            ($depth:ident, $src:expr, $src_value:expr) => {{
+            ($depth:ident, $src:expr, $src_value:expr, $py_pc:expr) => {{
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
+                let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 emit_ref_copy!(stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
@@ -5266,7 +5271,7 @@ impl CodeWriter {
                             src_value.into(),
                         ),
                         None,
-                        -1,
+                        pushvalue_ref_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
                         portal_frame_reg,
@@ -5276,7 +5281,7 @@ impl CodeWriter {
                     );
                 }
                 $depth += 1;
-                emit_vsd!($depth);
+                emit_vsd!($depth, pushvalue_ref_py_pc);
             }};
         }
 
@@ -5297,8 +5302,9 @@ impl CodeWriter {
         // All current callers pass `PY_NULL`; the parameter is retained
         // for surface symmetry with `emit_pushvalue_ref!`.
         macro_rules! emit_pushvalue_ref_const {
-            ($depth:ident, $value:expr) => {{
+            ($depth:ident, $value:expr, $py_pc:expr) => {{
                 let value: i64 = $value;
+                let pushvalue_const_py_pc: i64 = ($py_pc) as i64;
                 debug_assert_eq!(
                     value,
                     pyre_object::PY_NULL as i64,
@@ -5318,7 +5324,7 @@ impl CodeWriter {
                             super::flow::Constant::none().into(),
                         ),
                         None,
-                        -1,
+                        pushvalue_const_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
                         portal_frame_reg,
@@ -5333,7 +5339,7 @@ impl CodeWriter {
                     emit_ref_const_copy!(stack_base + $depth, value);
                 }
                 $depth += 1;
-                emit_vsd!($depth);
+                emit_vsd!($depth, pushvalue_const_py_pc);
             }};
         }
 
@@ -5354,13 +5360,14 @@ impl CodeWriter {
         // assembler.py:109 null ref handling). flatten.rs:1163 lowers
         // it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
-            ($depth:ident) => {{
+            ($depth:ident, $py_pc:expr) => {{
                 // Do not change this to a plain `$depth -= 1` until the
                 // portal stack-depth model is fully aligned with PyPy's
                 // assert-on-underflow behavior.  The direct parity change
                 // makes `synth/comprehensions` crash on both dynasm and
                 // cranelift (`python3 pyre/check.py --synthetic-only
                 // --synthetic-pattern comprehensions.py`).
+                let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
                 if is_portal {
@@ -5376,7 +5383,7 @@ impl CodeWriter {
                             super::flow::Constant::none().into(),
                         ),
                         None,
-                        -1,
+                        popvalue_ref_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
                         portal_frame_reg,
@@ -5385,7 +5392,7 @@ impl CodeWriter {
                         pyre_object::PY_NULL as i64
                     );
                 }
-                emit_vsd!($depth);
+                emit_vsd!($depth, popvalue_ref_py_pc);
                 popped_reg
             }};
         }
@@ -5398,8 +5405,9 @@ impl CodeWriter {
         // `locals_cells_stack_w` slot mirrors the value loaded into the
         // stack-side SSA register.
         macro_rules! emit_load_fast_ref {
-            ($depth:ident, $reg:expr) => {{
+            ($depth:ident, $reg:expr, $py_pc:expr) => {{
                 let reg = $reg;
+                let load_fast_py_pc: i64 = ($py_pc) as i64;
                 if is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
@@ -5441,7 +5449,7 @@ impl CodeWriter {
                         "getarrayitem_vable_r",
                         vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
                         Kind::Ref,
-                        -1,
+                        load_fast_py_pc,
                     );
                     pair_walker_slot(
                         &mut walker_slot_for_variable,
@@ -5460,7 +5468,7 @@ impl CodeWriter {
                             loaded.clone().into(),
                         ),
                         None,
-                        -1,
+                        load_fast_py_pc,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
                         portal_frame_reg,
@@ -5470,7 +5478,7 @@ impl CodeWriter {
                     );
                     current_state.stack.push(loaded);
                     $depth += 1;
-                    emit_vsd!($depth);
+                    emit_vsd!($depth, load_fast_py_pc);
                 } else {
                     let loaded = current_state
                         .locals_w
@@ -5478,7 +5486,7 @@ impl CodeWriter {
                         .and_then(|value| value.clone())
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded.clone());
-                    emit_pushvalue_ref!($depth, reg, loaded);
+                    emit_pushvalue_ref!($depth, reg, loaded, load_fast_py_pc);
                 }
             }};
         }
@@ -5800,7 +5808,7 @@ impl CodeWriter {
                         Instruction::LoadFast { var_num }
                         | Instruction::LoadFastBorrow { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            emit_load_fast_ref!(current_depth, reg);
+                            emit_load_fast_ref!(current_depth, reg, py_pc);
                         }
 
                         // jtransform.py:1898 do_fixed_list_setitem vable case:
@@ -5811,7 +5819,7 @@ impl CodeWriter {
                         // in scope).
                         Instruction::StoreFast { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth);
+                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored = current_state
                                 .stack
                                 .pop()
@@ -5917,7 +5925,7 @@ impl CodeWriter {
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_state.stack.push(stack_value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::LoadConst { consti } => {
@@ -6027,7 +6035,7 @@ impl CodeWriter {
                             };
                             current_state.stack.push(value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // CPython super-instructions LOAD_FAST_LOAD_FAST /
@@ -6042,8 +6050,8 @@ impl CodeWriter {
                             let pair = var_nums.get(op_arg);
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
-                            emit_load_fast_ref!(current_depth, reg_a);
-                            emit_load_fast_ref!(current_depth, reg_b);
+                            emit_load_fast_ref!(current_depth, reg_a, py_pc);
+                            emit_load_fast_ref!(current_depth, reg_b, py_pc);
                         }
 
                         // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
@@ -6054,7 +6062,7 @@ impl CodeWriter {
                             let pair = var_nums.get(op_arg);
                             let store_reg = u32::from(pair.idx_1()) as u16;
                             let load_reg = u32::from(pair.idx_2()) as u16;
-                            let stored_reg = emit_popvalue_ref!(current_depth);
+                            let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored = current_state
                                 .stack
                                 .pop()
@@ -6174,7 +6182,7 @@ impl CodeWriter {
                                 );
                                 current_state.stack.push(loaded);
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                             } else {
                                 if let Some(slot) =
                                     current_state.locals_w.get_mut(store_reg as usize)
@@ -6187,7 +6195,7 @@ impl CodeWriter {
                                     .and_then(|value| value.clone())
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 current_state.stack.push(loaded.clone());
-                                emit_pushvalue_ref!(current_depth, load_reg, loaded);
+                                emit_pushvalue_ref!(current_depth, load_reg, loaded, py_pc);
                             }
                         }
 
@@ -6199,21 +6207,21 @@ impl CodeWriter {
                             // before the call executes; no write-back conflicts
                             // because ResKind::Void.
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let key_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             let key_reg = stack_base + current_depth;
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let obj_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             let obj_reg = stack_base + current_depth;
                             current_depth -= 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let stored_value = current_state
                                 .stack
                                 .pop()
@@ -6245,7 +6253,7 @@ impl CodeWriter {
                         }
 
                         Instruction::PopTop => {
-                            let _ = emit_popvalue_ref!(current_depth);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             // flowcontext.py:891 `self.popvalue()`; regalloc.py:
                             // discard = just decrement depth, no bytecode.
@@ -6253,7 +6261,7 @@ impl CodeWriter {
 
                         Instruction::PushNull => {
                             current_state.stack.push(null_stack_sentinel());
-                            emit_pushvalue_ref_const!(current_depth, pyre_object::PY_NULL as i64);
+                            emit_pushvalue_ref_const!(current_depth, pyre_object::PY_NULL as i64, py_pc);
                         }
 
                         // jtransform.py: rewrite_op_int_add etc.
@@ -6271,13 +6279,13 @@ impl CodeWriter {
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
                             // Pop rhs (blackhole will see vsd reflect this pop).
-                            let rhs_reg = emit_popvalue_ref!(current_depth);
+                            let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // Pop lhs.
-                            let lhs_reg = emit_popvalue_ref!(current_depth);
+                            let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = current_state
                                 .stack
                                 .pop()
@@ -6315,7 +6323,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
@@ -6323,12 +6331,12 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let op_val = compare_op_tag(op_kind);
-                            let rhs_reg = emit_popvalue_ref!(current_depth);
+                            let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let lhs_reg = emit_popvalue_ref!(current_depth);
+                            let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = current_state
                                 .stack
                                 .pop()
@@ -6364,7 +6372,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
@@ -6385,7 +6393,7 @@ impl CodeWriter {
                             // TOS), so there is no staging copy — mirrors upstream
                             // flatten.py:240-260 which feeds the Variable straight to
                             // `goto_if_not`.
-                            let cond_reg = emit_popvalue_ref!(current_depth);
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = current_state
                                 .stack
                                 .pop()
@@ -6496,7 +6504,7 @@ impl CodeWriter {
                             );
                             // A-slice 7: see PopJumpIfFalse — no obj_tmp0 staging
                             // needed; the residual call reads the popped stack slot.
-                            let cond_reg = emit_popvalue_ref!(current_depth);
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = current_state
                                 .stack
                                 .pop()
@@ -6619,7 +6627,7 @@ impl CodeWriter {
 
                         // flatten.py: int_return / ref_return
                         Instruction::ReturnValue => {
-                            let retval_reg = emit_popvalue_ref!(current_depth);
+                            let retval_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let retval = current_state
                                 .stack
                                 .pop()
@@ -6745,7 +6753,8 @@ impl CodeWriter {
                                 current_state.stack.push(null_stack_sentinel());
                                 emit_pushvalue_ref_const!(
                                     current_depth,
-                                    pyre_object::PY_NULL as i64
+                                    pyre_object::PY_NULL as i64,
+                                    py_pc
                                 );
                             }
                             current_state.stack.push(result_value.clone());
@@ -6755,7 +6764,7 @@ impl CodeWriter {
                             // `emit_ref_copy!(stack_base + current_depth, loaded_dst_reg)`
                             // inside `emit_pushvalue_ref!` is the identity copy
                             // elided by `emit_ref_copy!`'s `dst != src` guard.
-                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value);
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
                         }
 
                         // RPython jtransform.py: rewrite_op_direct_call →
@@ -6775,7 +6784,7 @@ impl CodeWriter {
                             let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(nargs);
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
-                                let arg_reg = emit_popvalue_ref!(current_depth);
+                                let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let arg_value = current_state
                                     .stack
                                     .pop()
@@ -6795,12 +6804,12 @@ impl CodeWriter {
                             let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
                             let arg_values: Vec<super::flow::FlowValue> =
                                 graph_arg_values_rev.iter().rev().cloned().collect();
-                            let callable_reg = emit_popvalue_ref!(current_depth);
+                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let _ = emit_popvalue_ref!(current_depth); // NULL (discard)
+                            let _ = emit_popvalue_ref!(current_depth, py_pc); // NULL (discard)
                             let _null_or_self = current_state
                                 .stack
                                 .pop()
@@ -6934,7 +6943,7 @@ impl CodeWriter {
                             }
                             current_state.stack.push(call_result_value);
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // Python 3.13: ToBool converts TOS to bool before branch.
@@ -6944,7 +6953,7 @@ impl CodeWriter {
 
                         // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                         Instruction::UnaryNegative => {
-                            let operand_reg = emit_popvalue_ref!(current_depth);
+                            let operand_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let operand_value = current_state
                                 .stack
                                 .pop()
@@ -7046,7 +7055,7 @@ impl CodeWriter {
                             }
                             current_state.stack.push(negated.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // JumpBackwardNoInterrupt reuses `backward_jump_target`:
@@ -7075,7 +7084,7 @@ impl CodeWriter {
                             let argc = count.get(op_arg) as usize;
                             if argc > 3 {
                                 for _ in 0..argc {
-                                    let _ = emit_popvalue_ref!(current_depth);
+                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
                                     let _ = current_state
                                         .stack
                                         .pop()
@@ -7084,13 +7093,13 @@ impl CodeWriter {
                                 emit_abort_permanent!();
                                 current_state.stack.push(fresh_ref_value(&mut graph));
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                                 continue;
                             }
                             let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
-                                let item_reg = emit_popvalue_ref!(current_depth);
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = current_state
                                     .stack
                                     .pop()
@@ -7152,7 +7161,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:
@@ -7168,7 +7177,7 @@ impl CodeWriter {
                                 BuildSliceArgCount::Three => 3usize,
                             };
                             let step_info = if raw_argc == 3 {
-                                let reg = emit_popvalue_ref!(current_depth);
+                                let reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let step_value = current_state
                                     .stack
                                     .pop()
@@ -7177,12 +7186,12 @@ impl CodeWriter {
                             } else {
                                 None
                             };
-                            let stop_reg = emit_popvalue_ref!(current_depth);
+                            let stop_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stop_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let start_reg = emit_popvalue_ref!(current_depth);
+                            let start_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let start_value = current_state
                                 .stack
                                 .pop()
@@ -7215,7 +7224,7 @@ impl CodeWriter {
                             );
                             current_state.stack.push(result_value.into());
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // pyopcode.py:690 RAISE_VARARGS: argc=0 reraise,
@@ -7239,7 +7248,7 @@ impl CodeWriter {
                                         .stack
                                         .pop()
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                    let cause_reg = emit_popvalue_ref!(current_depth);
+                                    let cause_reg = emit_popvalue_ref!(current_depth, py_pc);
                                     (
                                         super::flatten::Operand::Register(
                                             super::flatten::Register::new(
@@ -7282,7 +7291,7 @@ impl CodeWriter {
                                     .stack
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                let exc_reg = emit_popvalue_ref!(current_depth);
+                                let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
                                 // normalization + `set_cause` attachment.  Call ABI
                                 // reads inputs before writing the result; the
@@ -7358,7 +7367,7 @@ impl CodeWriter {
                             // the interpreter; pushing `None` for `prev` breaks
                             // nested exception state (pyopcode.py:786 saves the
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                            let exc_reg = emit_popvalue_ref!(current_depth);
+                            let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = current_state
                                 .stack
                                 .pop()
@@ -7437,9 +7446,9 @@ impl CodeWriter {
                             );
                             let prev_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(prev_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_prev, prev_value);
+                            emit_pushvalue_ref!(current_depth, scratch_prev, prev_value, py_pc);
                             current_state.stack.push(exc_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_exc, exc_value);
+                            emit_pushvalue_ref!(current_depth, scratch_exc, exc_value, py_pc);
                         }
 
                         Instruction::CheckExcMatch => {
@@ -7453,7 +7462,7 @@ impl CodeWriter {
                             // time, but pyre's shadow graph cannot observe the
                             // runtime exception type; the residual helper owns
                             // the check.
-                            let match_type_reg = emit_popvalue_ref!(current_depth);
+                            let match_type_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let match_type_value = current_state
                                 .stack
                                 .pop()
@@ -7515,7 +7524,7 @@ impl CodeWriter {
                             );
                             let result_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(result_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_match, result_value);
+                            emit_pushvalue_ref!(current_depth, scratch_match, result_value, py_pc);
                         }
 
                         Instruction::PopExcept => {
@@ -7528,7 +7537,7 @@ impl CodeWriter {
                             // `POP_EXCEPT` the outer handler's exception must be
                             // reinstated as the "current" one so a bare `raise`
                             // re-propagates it.
-                            let prev_reg = emit_popvalue_ref!(current_depth);
+                            let prev_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let prev_value = current_state
                                 .stack
                                 .pop()
@@ -7584,10 +7593,10 @@ impl CodeWriter {
                             let oparg_count = depth.get(op_arg) as usize;
                             if oparg_count >= 1 {
                                 // Discard lasti.
-                                let _ = emit_popvalue_ref!(current_depth);
+                                let _ = emit_popvalue_ref!(current_depth, py_pc);
                                 let _ = current_state.stack.pop();
                             }
-                            let exc_reg = emit_popvalue_ref!(current_depth);
+                            let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = current_state
                                 .stack
                                 .pop()
@@ -7604,7 +7613,7 @@ impl CodeWriter {
                             emit_abort_permanent!();
                             current_state.stack.push(fresh_ref_value(&mut graph));
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::Copy { i } => {
@@ -7615,7 +7624,8 @@ impl CodeWriter {
                                 emit_pushvalue_ref!(
                                     current_depth,
                                     stack_base + current_depth - 1,
-                                    duplicated
+                                    duplicated,
+                                    py_pc
                                 );
                             } else {
                                 // CPython COPY n (n>1): pushes PEEK(n) where
@@ -7636,7 +7646,7 @@ impl CodeWriter {
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 current_state.stack.push(src_value.clone());
                                 let src_reg = stack_base + current_depth.saturating_sub(d as u16);
-                                emit_pushvalue_ref!(current_depth, src_reg, src_value);
+                                emit_pushvalue_ref!(current_depth, src_reg, src_value, py_pc);
                             }
                         }
 
@@ -7650,7 +7660,7 @@ impl CodeWriter {
                             // codewriter time, so do not invent a graph op here.
                             emit_abort_permanent!();
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
                         Instruction::StoreName { .. } | Instruction::StoreGlobal { .. } => {
                             // flowcontext.py marks STORE_NAME unsupported, but the
@@ -7659,7 +7669,7 @@ impl CodeWriter {
                             emit_abort_permanent!();
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.
@@ -7674,13 +7684,13 @@ impl CodeWriter {
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let obj_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                             let stored_value = current_state
                                 .stack
                                 .pop()
@@ -7719,7 +7729,7 @@ impl CodeWriter {
                             if attr.is_method() {
                                 current_state.stack.push(null_stack_sentinel());
                                 current_depth += 1;
-                                emit_vsd!(current_depth);
+                                emit_vsd!(current_depth, py_pc);
                             }
                         }
 
@@ -7731,7 +7741,7 @@ impl CodeWriter {
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
                             for reg in [reg_a, reg_b] {
-                                let stored_reg = emit_popvalue_ref!(current_depth);
+                                let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let stored = current_state
                                     .stack
                                     .pop()
@@ -7795,7 +7805,7 @@ impl CodeWriter {
                             // push next item: net +1
                             emit_abort_permanent!();
                             current_depth += 1;
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         Instruction::EndFor => {
@@ -7807,7 +7817,7 @@ impl CodeWriter {
                         Instruction::PopIter => {
                             // pop iterator: net -1
                             current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth);
+                            emit_vsd!(current_depth, py_pc);
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
@@ -8558,7 +8568,7 @@ impl CodeWriter {
                         );
                     }
                     depth += 1;
-                    emit_vsd!(depth);
+                    emit_vsd!(depth, site.handler_py_pc);
                     exc_slot += 1;
                 }
                 // `flatten.py:336-347 generate_last_exc` emits
@@ -8637,7 +8647,7 @@ impl CodeWriter {
                 // `residual_call_*` (via `flatten_arg` Descr handling +
                 // per-shape variant routing) lands.
                 depth += 1;
-                emit_vsd!(depth);
+                emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
             }
         } // end outer drain loop (Phase 4 slice 4)
