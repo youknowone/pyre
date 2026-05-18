@@ -233,6 +233,28 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
     TLabel::new(pc_label_name(py_pc))
 }
 
+/// Upstream-orthodox per-block label naming.  `rpython/jit/codewriter/
+/// flatten.py:116` emits `Label(block)` once per `SpamBlock` using
+/// Python object identity as the implicit name.  Pyre serializes the
+/// block's `Rc` pointer to a stable per-run string for use in
+/// `Insn::Label` / `Operand::TLabel`.
+///
+/// Two distinct `BlockRef`s always produce distinct names within a
+/// single CodeWriter run (`Rc::as_ptr` is stable across clones); the
+/// name is not stable across runs, matching upstream's per-run object
+/// identity.  When pyre eventually migrates branch targets from the
+/// per-Python-PC `pc{N}` naming to upstream-orthodox block-identity,
+/// callers will route through this helper.
+pub fn block_label_name(block: &super::flow::BlockRef) -> String {
+    format!("block{}", block.as_ptr_addr())
+}
+
+/// Companion to [`block_label_name`] producing the matching `TLabel`
+/// branch target.
+pub fn block_tlabel(block: &super::flow::BlockRef) -> TLabel {
+    TLabel::new(block_label_name(block))
+}
+
 /// Recover the Python PC index from an `Insn::Label` whose name matches
 /// the `pc{N}` convention.  Returns `None` for any other Insn shape.
 /// Consumed by the `pc_anchor_positions` / `live_marker_indices_by_pc`
@@ -4217,6 +4239,21 @@ mod tests {
         }
         assert_eq!(label_pc_index(&Insn::Unreachable), None);
         assert_eq!(label_pc_index(&Insn::op("plain", vec![])), None);
+    }
+
+    #[test]
+    fn block_label_name_yields_distinct_per_block() {
+        use super::super::flow::Block;
+        let b1 = Block::shared(Vec::new());
+        let b2 = Block::shared(Vec::new());
+        let n1 = block_label_name(&b1);
+        let n2 = block_label_name(&b2);
+        assert_ne!(n1, n2, "distinct BlockRefs must produce distinct names");
+        // Same `Rc` cloned must round-trip.
+        let b1_again = b1.clone();
+        assert_eq!(block_label_name(&b1_again), n1);
+        // TLabel companion carries the same string.
+        assert_eq!(block_tlabel(&b1).name, n1);
     }
 
     #[test]

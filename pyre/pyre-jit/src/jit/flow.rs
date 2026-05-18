@@ -697,6 +697,17 @@ impl BlockRef {
         Rc::downgrade(&self.0)
     }
 
+    /// Numeric pointer identity for stable per-run naming.  Two
+    /// `BlockRef` clones of the same `Rc` produce the same value; two
+    /// `BlockRef`s constructed independently always produce distinct
+    /// values within a single CodeWriter run.  Used by
+    /// `flatten::block_label_name` to derive upstream-orthodox per-
+    /// block `Label(block)` names from the implicit Python object
+    /// identity `rpython/jit/codewriter/flatten.py:116` relies on.
+    pub fn as_ptr_addr(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     pub fn input_arity(&self) -> usize {
         self.borrow().inputargs.len()
     }
