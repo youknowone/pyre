@@ -3235,10 +3235,10 @@ mod tests {
         }
     }
 
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
+        let op = Op::new(opcode, args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
-        op
+        std::rc::Rc::new(op)
     }
 
     fn make_call_assembler_descr(
