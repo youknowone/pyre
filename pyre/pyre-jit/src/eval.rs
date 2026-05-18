@@ -1411,6 +1411,84 @@ thread_local! {
             &pyre_object::celldict::INT_MUTABLE_CELL_TYPE as *const _ as usize,
             w_int_mutable_cell_tid,
         );
+        // Per-`ExcKind` GC type ids.  The pre-registration loop at the
+        // top of this function mapped every exception PyType to a
+        // single `W_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
+        // the `W_ExceptionObject` payload size for allocation; the
+        // shared tid also meant `gc.subclass_range(any_exception_
+        // pytype)` returned the same range for every subclass, which
+        // collapses RPython's per-class `subclassrange_{min,max}`
+        // discrimination (rclass.py:167-174 `OBJECT.typeptr = specific
+        // class` + rclass.py:1133-1137 `ll_issubclass`).
+        //
+        // To restore per-class ranges without renumbering the post-31
+        // hardcoded tid constants (W_GENERATOR_GC_TYPE_ID = 32, …,
+        // PYTRACEBACK_GC_TYPE_ID = 43) or the W_MODULE_DICT /
+        // W_*MUTABLE_CELL tids registered above, register a fresh tid
+        // per `ExcKind` (except BaseException, which keeps
+        // `W_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
+        // Each new TypeInfo carries the W_ExceptionObject layout
+        // (size + GC ptr offsets) so allocation still works, and the
+        // correct `parent_typeid` so `freeze_types` builds the
+        // preorder subclass tree.  Then `register_vtable_for_type`
+        // overrides the earlier pytype → 31 mapping so
+        // `subclass_range(pytype)` resolves to the per-class range.
+        //
+        // Order is topological: each entry's `parent_kind` is already
+        // registered by the time the entry is reached.  `None` parent
+        // means "direct child of BaseException" — the parent_tid is
+        // `W_EXCEPTION_GC_TYPE_ID`.
+        use pyre_object::excobject::{
+            EXC_KIND_COUNT, ExcKind, W_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
+        };
+        let exc_hierarchy: &[(ExcKind, Option<ExcKind>)] = &[
+            (ExcKind::Exception, None),
+            (ExcKind::SystemExit, None),
+            (ExcKind::GeneratorExit, None),
+            (ExcKind::ArithmeticError, Some(ExcKind::Exception)),
+            (ExcKind::OverflowError, Some(ExcKind::ArithmeticError)),
+            (ExcKind::ZeroDivisionError, Some(ExcKind::ArithmeticError)),
+            (ExcKind::TypeError, Some(ExcKind::Exception)),
+            (ExcKind::ValueError, Some(ExcKind::Exception)),
+            (ExcKind::UnicodeDecodeError, Some(ExcKind::ValueError)),
+            (ExcKind::UnicodeEncodeError, Some(ExcKind::ValueError)),
+            (ExcKind::NameError, Some(ExcKind::Exception)),
+            (ExcKind::IndexError, Some(ExcKind::Exception)),
+            (ExcKind::KeyError, Some(ExcKind::Exception)),
+            (ExcKind::AttributeError, Some(ExcKind::Exception)),
+            (ExcKind::RuntimeError, Some(ExcKind::Exception)),
+            (ExcKind::NotImplementedError, Some(ExcKind::RuntimeError)),
+            (ExcKind::RecursionError, Some(ExcKind::RuntimeError)),
+            (ExcKind::StopIteration, Some(ExcKind::Exception)),
+            (ExcKind::ImportError, Some(ExcKind::Exception)),
+            (ExcKind::AssertionError, Some(ExcKind::Exception)),
+            (ExcKind::ReferenceError, Some(ExcKind::Exception)),
+            (ExcKind::OSError, Some(ExcKind::Exception)),
+            (ExcKind::FileNotFoundError, Some(ExcKind::OSError)),
+            (ExcKind::MemoryError, Some(ExcKind::Exception)),
+            (ExcKind::SystemError, Some(ExcKind::Exception)),
+        ];
+        // Per-kind tid lookup, seeded so BaseException resolves to
+        // `W_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
+        // it which is harmless because every reachable kind is
+        // assigned its own tid by the loop below.
+        let mut per_exc_tid: [u32; EXC_KIND_COUNT] =
+            [W_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
+        per_exc_tid[ExcKind::BaseException as u8 as usize] = w_exception_tid;
+        for (kind, parent_kind) in exc_hierarchy {
+            let parent_tid = parent_kind
+                .map(|p| per_exc_tid[p as u8 as usize])
+                .unwrap_or(W_EXCEPTION_GC_TYPE_ID);
+            let new_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+                std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
+                parent_tid,
+                W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+            ));
+            per_exc_tid[*kind as u8 as usize] = new_tid;
+            let pytype_ptr = exc_kind_to_pytype(*kind) as *const _ as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, new_tid);
+            pytype_to_tid.insert(pytype_ptr, new_tid);
+        }
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

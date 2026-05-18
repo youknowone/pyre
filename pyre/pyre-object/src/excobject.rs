@@ -256,7 +256,11 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 /// `PyType.instantiate` would let one test thread's write race ahead
 /// of another's, causing `exception_match` on thread A to compare
 /// against thread B's W_TypeObject identity — they'd never match.
-const EXC_KIND_COUNT: usize = (ExcKind::SystemError as u8 as usize) + 1;
+/// One slot per `ExcKind` variant.  Indexed by `kind as u8 as usize`,
+/// so `EXC_KIND_COUNT - 1` is the largest valid index.  Public so
+/// downstream crates (e.g. pyre-jit's GC init) can size per-kind
+/// arrays against the same authoritative bound.
+pub const EXC_KIND_COUNT: usize = (ExcKind::SystemError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
