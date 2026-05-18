@@ -6910,16 +6910,11 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        if let Some(recovery_layout) = patched_recovery_layout {
-            if let Some(compiled) = self.compiled_loops.get(&green_key) {
-                let _ = self.backend.update_fail_descr_recovery_layout(
-                    &compiled.token,
-                    trace_id,
-                    fail_index,
-                    recovery_layout,
-                );
-            }
-        }
+        // Slice X3-E: backend no longer caches a per-descr recovery layout;
+        // the metainterp's `StoredExitLayout.recovery_layout` (updated above)
+        // is the single canonical store consumed via
+        // `trace_layout_ref.recovery_layout` at deopt.
+        let _ = patched_recovery_layout;
     }
 
     /// Get the full static layout for a compiled exit in a specific trace.

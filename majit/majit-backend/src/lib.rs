@@ -1933,17 +1933,6 @@ pub trait Backend: Send {
         })
     }
 
-    /// Patch backend-owned recovery metadata for a specific compiled exit.
-    fn update_fail_descr_recovery_layout(
-        &mut self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _fail_index: u32,
-        _recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        false
-    }
-
     /// Force a frame identified by a `FORCE_TOKEN` result.
     fn force(&self, _force_token: GcRef) -> Option<DeadFrame> {
         None

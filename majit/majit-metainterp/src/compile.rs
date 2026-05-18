@@ -2135,25 +2135,25 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
-    backend: &mut dyn majit_backend::Backend,
-    token: &majit_backend::JitCellToken,
-    trace_id: u64,
+    _backend: &mut dyn majit_backend::Backend,
+    _token: &majit_backend::JitCellToken,
+    _trace_id: u64,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
 ) {
-    for (&fail_index, exit_layout) in exit_layouts.iter_mut() {
+    // Slice X3-E: backend no longer caches a per-descr recovery layout;
+    // the metainterp's `StoredExitLayout.recovery_layout` cache is the
+    // single canonical store, and `describe_deadframe` consumers fall
+    // back to `trace_layout_ref.recovery_layout` (the same path dynasm
+    // has used since Slice NN).  This pass keeps `StoredExitLayout`
+    // populated with the resume_layout-derived recovery so consumers
+    // see the patched virtuals/pending_fields.
+    for (_, exit_layout) in exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
             continue;
         };
         let recovery_layout = resume_layout
             .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_ref());
-        if backend.update_fail_descr_recovery_layout(
-            token,
-            trace_id,
-            fail_index,
-            recovery_layout.clone(),
-        ) {
-            exit_layout.recovery_layout = Some(recovery_layout);
-        }
+        exit_layout.recovery_layout = Some(recovery_layout);
     }
 }
 
@@ -2897,7 +2897,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
-        recovery_layout: UnsafeCell::new(None),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
@@ -2989,7 +2988,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
-        recovery_layout: UnsafeCell::new(None),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
         fail_count: AtomicU32::new(0),
@@ -3241,7 +3239,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
@@ -3499,7 +3496,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),
@@ -3741,7 +3737,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            recovery_layout: UnsafeCell::new(None),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
             fail_count: AtomicU32::new(0),

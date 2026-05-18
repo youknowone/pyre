@@ -1646,16 +1646,12 @@ pub fn register_recovery_layout(
     let _ = RECOVERY_LAYOUT_FN.set(f);
 }
 
-/// Dispatch helper used by `CraneliftFailDescr::recovery_layout_ref`
-/// to consult the on-demand layout callback (Path 1 Slice 1).
-/// Returns `None` if the callback hasn't been registered yet —
-/// callers fall back to the meta-side slot read until Slice 3
-/// deletes the slot.
-///
-/// Wired-up readers land in Slice 2; Slice 1 ships infrastructure
-/// only so the cross-crate plumbing can be reviewed independently
-/// of the read-site migration risk.
-#[allow(dead_code)]
+/// Dispatch helper consulted by `fail_descr_recovery_layout` (Slice
+/// X3-E).  Returns `None` if the callback hasn't been registered yet
+/// (cranelift in pure-backend tests without pyre-jit boot); production
+/// callers fall through to the metainterp's
+/// `trace_layout_ref.recovery_layout` fallback at
+/// `pyjitpl/mod.rs:6431`, matching dynasm parity.
 pub(crate) fn recovery_layout_via_callback(
     descr_addr: usize,
     caller_prefix: Option<&ExitRecoveryLayout>,
@@ -5972,29 +5968,19 @@ pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
     gc_map
 }
 
-/// Read the `recovery_layout` slot reached via downcast to
-/// `ResumeGuardDescr` (Slice OO-half precedent).  Chases
-/// `prev_descr` through `ResumeGuardCopiedDescr` so `compile.py:849
-/// ResumeGuardCopiedDescr.get_resumestorage(): return prev` parity is
-/// preserved.  Slice 7-Tβ14a: lifted off `CraneliftFailDescr` so the
-/// `DescrRef`-keyed `fail_descrs` storage can drive layout
-/// reconstruction directly.  Takes `&DescrRef` (not `&dyn FailDescr`)
-/// because `prev_descr()` returns a fresh Arc handle for the chase
-/// loop.
+/// Resolve the `ExitRecoveryLayout` for a fail descr via the on-demand
+/// callback (Slice X3-E).  The cranelift backend no longer caches a
+/// recovery layout — pyre-jit's
+/// `cranelift_recovery_layout_for_descr` reconstructs it from the
+/// metainterp's `StoredExitLayout.resume_layout` cache, matching
+/// dynasm's contract where `describe_deadframe` returns
+/// `recovery_layout: None` and consumers fall back to the metainterp's
+/// `trace_layout_ref.recovery_layout`.  Returns `None` when no
+/// callback is registered (test scaffolds without pyre-jit) or when
+/// the descr is synthetic (no `rd_loop_token_clt`).
 fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
-    let mut current: DescrRef = descr.clone();
-    loop {
-        if let Some(rgd) = current
-            .as_any()
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        {
-            return rgd.recovery_layout();
-        }
-        match current.prev_descr() {
-            Some(next) => current = next,
-            None => return None,
-        }
-    }
+    let addr = Arc::as_ptr(descr) as *const () as usize;
+    recovery_layout_via_callback(addr, None)
 }
 
 /// Read the per-trace `CompiledTraceInfo` from the meta-side
@@ -6137,32 +6123,6 @@ pub(crate) fn fail_descr_bridge_cache_addrs(fd: &dyn FailDescr) -> (usize, usize
 pub(crate) fn fail_descr_set_trace_info(fd: &dyn FailDescr, trace_info: CompiledTraceInfo) {
     let arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(trace_info);
     fd.set_trace_info_any(arc);
-}
-
-/// Write `recovery_layout` to the meta-side `ResumeGuardDescr` slot
-/// (Slice QQ-4).  Chases `prev_descr` through `ResumeGuardCopiedDescr`
-/// so `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return
-/// prev` parity is preserved (the chase is INTENTIONAL — see the
-/// reader-side `fail_descr_recovery_layout` for the same rationale).
-/// Silently no-ops for descrs without a `ResumeGuardDescr` reachable
-/// through the chase (synthetic FINISH `Done*` / external-JUMP
-/// `None`) — those descrs never reach the recovery_layout readers in
-/// production.  Slice 7-Tβ14c lift-off.
-pub(crate) fn fail_descr_set_recovery_layout(descr: &DescrRef, recovery_layout: ExitRecoveryLayout) {
-    let mut current: DescrRef = descr.clone();
-    loop {
-        if let Some(rgd) = current
-            .as_any()
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        {
-            rgd.set_recovery_layout(recovery_layout);
-            return;
-        }
-        match current.prev_descr() {
-            Some(next) => current = next,
-            None => return,
-        }
-    }
 }
 
 /// Read the external-JUMP target from the meta-side
@@ -6744,37 +6704,6 @@ fn identity_recovery_layout(
             .map(|layout| layout.pending_field_layouts.clone())
             .unwrap_or_default(),
     }
-}
-
-fn patch_fail_descr_recovery_layout(
-    fail_descrs: &[DescrRef],
-    trace_id: u64,
-    fail_index: u32,
-    recovery_layout: &ExitRecoveryLayout,
-) -> bool {
-    // Position-based lookup — see `find_fail_descr_in_fail_descrs` above
-    // for the invariant rationale.
-    if let Some(descr) = fail_descrs.get(fail_index as usize) {
-        if as_fd(descr).trace_id() == trace_id {
-            let descr_ref: DescrRef = descr.clone();
-            fail_descr_set_recovery_layout(&descr_ref, recovery_layout.clone());
-            return true;
-        }
-    }
-    for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref() {
-            if patch_fail_descr_recovery_layout(
-                &bridge.fail_descrs,
-                trace_id,
-                fail_index,
-                recovery_layout,
-            ) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn patch_terminal_exit_recovery_layout_in_vec(
@@ -13699,9 +13628,12 @@ fn collect_guards(
             // Slice 7-Tβ7 force_token_slots).
             as_fd(&descr).set_source_op_index(op_idx);
             as_fd(&descr).set_force_token_slots(force_token_slots);
-            if let Some(layout) = recovery_layout {
-                fail_descr_set_recovery_layout(&descr, layout);
-            }
+            // Slice X3-E: dropped the codegen-time recovery_layout stamp.
+            // Backend no longer caches an `ExitRecoveryLayout` per descr;
+            // `fail_descr_recovery_layout` reads on demand via
+            // `recovery_layout_via_callback` (metainterp's
+            // `compute_recovery_layout_for_descr`).
+            let _ = recovery_layout;
             if let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);
             }
@@ -14886,28 +14818,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_backend::FailDescrLayout> {
         deadframe_layout(frame)
-    }
-
-    fn update_fail_descr_recovery_layout(
-        &mut self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-        recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        let Some(compiled) = token
-            .compiled
-            .as_ref()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-        else {
-            return false;
-        };
-        patch_fail_descr_recovery_layout(
-            &compiled.fail_descrs,
-            trace_id,
-            fail_index,
-            &recovery_layout,
-        )
     }
 
     fn update_terminal_exit_recovery_layout(
@@ -16433,25 +16343,15 @@ mod tests {
             .expect("compiled layouts should exist");
         let layout = &layouts[0];
         assert_eq!(layout.source_op_index, Some(1));
-        let recovery = layout
-            .recovery_layout
-            .as_ref()
-            .expect("guard layout should include backend recovery layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(recovery.frames[0].trace_id, Some(76));
-        assert_eq!(recovery.frames[0].header_pc, Some(1234));
-        assert_eq!(recovery.frames[0].pc, 1234);
-        assert_eq!(
-            recovery.frames[0].slots,
-            vec![
-                majit_backend::ExitValueSourceLayout::ExitValue(0),
-                majit_backend::ExitValueSourceLayout::ExitValue(1),
-            ]
+        // Slice X3-E: backend no longer caches per-fail-descr recovery
+        // layouts.  Terminal exit layouts (sibling test below) still
+        // carry the recovery_layout because they live on
+        // `CompiledLoop.terminal_exit_layouts`, not on the descr.
+        assert!(
+            layout.recovery_layout.is_none(),
+            "Slice X3-E: per-fail-descr recovery_layout is metainterp-owned"
         );
-        assert_eq!(
-            recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Int])
-        );
+        assert_eq!(layout.fail_arg_types, vec![Type::Ref, Type::Int]);
     }
 
     #[test]
@@ -16773,7 +16673,9 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
+        // Slice X3-E: backend no longer caches recovery_layout; the source
+        // layout flows through `compile_bridge`'s explicit
+        // `caller_recovery_layout` parameter (QQ-7 contract).
 
         let bridge_fail_descr_arc = mk_test_resume_guard_descr(190, vec![Type::Int]);
         let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
@@ -16813,28 +16715,13 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("bridge guard layout should exist");
-        let guard_recovery = guard_layout
-            .recovery_layout
-            .as_ref()
-            .expect("bridge guard should carry backend recovery");
-        assert_eq!(guard_recovery.frames.len(), 2);
-        assert_eq!(guard_recovery.frames[0].trace_id, Some(10));
-        assert_eq!(guard_recovery.frames[0].header_pc, Some(900));
-        assert_eq!(guard_recovery.frames[0].source_guard, Some((9, 0)));
-        assert_eq!(guard_recovery.frames[1].trace_id, Some(191));
-        assert_eq!(guard_recovery.frames[1].header_pc, Some(2000));
-        assert_eq!(guard_recovery.frames[1].source_guard, Some((190, 0)));
-        assert_eq!(guard_recovery.frames[0].pc, 900);
-        assert_eq!(guard_recovery.frames[1].pc, 2000);
-        assert_eq!(guard_recovery.frames[0].slot_types, Some(vec![Type::Int]));
-        assert_eq!(guard_recovery.frames[1].slot_types, Some(vec![Type::Int]));
-        assert_eq!(
-            guard_recovery.virtual_layouts,
-            source_layout.virtual_layouts
-        );
-        assert_eq!(
-            guard_recovery.pending_field_layouts,
-            source_layout.pending_field_layouts
+        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned;
+        // the bridge's terminal exit (sibling assertion below) still
+        // composes the caller frames because that path lives on
+        // `CompiledLoop.terminal_exit_layouts`.
+        assert!(
+            guard_layout.recovery_layout.is_none(),
+            "Slice X3-E: bridge guard fail_descr recovery_layout is metainterp-owned"
         );
 
         let bridge_terminal_layouts = backend
@@ -16922,7 +16809,9 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout.clone()));
+        // Slice X3-E: backend no longer caches recovery_layout; layout flows
+        // through `compile_bridge`'s explicit `caller_recovery_layout`
+        // parameter below.
 
         let bridge_fail_descr_arc = mk_test_resume_guard_descr(290, vec![Type::Int]);
         let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
@@ -17007,12 +16896,9 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        assert!(backend.update_fail_descr_recovery_layout(
-            &token,
-            291,
-            0,
-            bridge_source_layout.clone()
-        ));
+        // Slice X3-E: backend no longer caches recovery_layout; the bridge
+        // source layout flows through the nested `compile_bridge`'s
+        // explicit `caller_recovery_layout` parameter below.
 
         let nested_bridge_fail_descr_arc = mk_test_resume_guard_descr(291, vec![Type::Int]);
         let nested_bridge_fail_descr = nested_bridge_fail_descr_arc.as_fail_descr().unwrap();
@@ -17046,33 +16932,10 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("nested bridge guard layout should exist");
-        let nested_guard_recovery = nested_guard_layout
-            .recovery_layout
-            .as_ref()
-            .expect("nested bridge guard should carry backend recovery");
-        assert_eq!(
-            nested_guard_recovery
-                .frames
-                .iter()
-                .map(|frame| frame.pc)
-                .collect::<Vec<_>>(),
-            vec![444, 3000]
-        );
-        assert_eq!(
-            nested_guard_recovery
-                .frames
-                .iter()
-                .map(|frame| frame.source_guard)
-                .collect::<Vec<_>>(),
-            vec![None, Some((291, 0))]
-        );
-        assert_eq!(
-            nested_guard_recovery.virtual_layouts,
-            bridge_source_layout.virtual_layouts
-        );
-        assert_eq!(
-            nested_guard_recovery.pending_field_layouts,
-            bridge_source_layout.pending_field_layouts
+        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        assert!(
+            nested_guard_layout.recovery_layout.is_none(),
+            "Slice X3-E: nested bridge guard fail_descr recovery_layout is metainterp-owned"
         );
 
         let nested_terminal_layouts = backend
@@ -17654,7 +17517,8 @@ mod tests {
             .expect("raw exit should expose backend layout");
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.source_op_index, Some(2));
-        assert!(layout.recovery_layout.is_some());
+        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        assert!(layout.recovery_layout.is_none());
         assert!(!jit_exc_is_pending());
     }
 
@@ -20185,7 +20049,8 @@ mod tests {
             .expect("raw exit should expose backend layout");
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.source_op_index, Some(3));
-        assert!(layout.recovery_layout.is_some());
+        // Slice X3-E: per-fail-descr recovery_layout is metainterp-owned.
+        assert!(layout.recovery_layout.is_none());
         assert_eq!(
             *may_force_void_values()
                 .lock()
@@ -22521,36 +22386,23 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // Guard fail_descrs (ResumeGuardDescr family upstream) must
-        // carry recovery_layout; FINISH `Done*` descrs do not have
-        // `rd_*` payload upstream (compile.py:624-647) so their
-        // recovery_layout slot is None after Slice QQ-4 removed the
-        // backend-local cell fallback.  Walk every layout and assert
-        // the guard subset has recovery_layout populated.
+        // Slice X3-E: backend no longer caches a per-descr recovery
+        // layout — `FailDescrLayout.recovery_layout` is None for every
+        // fail descr (matching dynasm parity).  The metainterp's
+        // `StoredExitLayout.recovery_layout` is the canonical store;
+        // consumers read it via `trace_layout_ref.recovery_layout`
+        // (`pyjitpl/mod.rs:6431`).
         let mut guard_layouts_seen = 0;
         for (idx, layout) in layouts.iter().enumerate() {
-            if layout.is_finish {
-                assert!(
-                    layout.recovery_layout.is_none(),
-                    "fail_descr[{idx}] is FINISH; recovery_layout must be None per PyPy parity"
-                );
-                continue;
-            }
             assert!(
-                layout.recovery_layout.is_some(),
-                "guard fail_descr[{idx}] should have recovery_layout"
+                layout.recovery_layout.is_none(),
+                "Slice X3-E: fail_descr[{idx}] recovery_layout must be None at the backend boundary"
             );
-            let recovery = layout.recovery_layout.as_ref().unwrap();
-            assert!(!recovery.frames.is_empty());
-            assert_eq!(recovery.frames[0].trace_id, Some(500));
-            assert_eq!(recovery.frames[0].header_pc, Some(2000));
-            assert!(recovery.frames[0].slot_types.is_some());
-            guard_layouts_seen += 1;
+            if !layout.is_finish {
+                guard_layouts_seen += 1;
+            }
         }
-        assert_eq!(
-            guard_layouts_seen, 2,
-            "expected 2 guards with recovery_layout"
-        );
+        assert_eq!(guard_layouts_seen, 2, "expected 2 guard layouts");
     }
 
     #[test]
@@ -22599,28 +22451,16 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // Guard layout
+        // Slice X3-E: per-fail-descr recovery_layout (and the derived
+        // frame_stack) is metainterp-owned; backend boundary reports
+        // None.  `fail_arg_types` still flows through `FailDescr` so the
+        // typed slot list remains observable.
         let guard_layout = &layouts[0];
-        let recovery = guard_layout
-            .recovery_layout
-            .as_ref()
-            .expect("guard should have recovery layout");
-        let frame = &recovery.frames[0];
-        let slot_types = frame
-            .slot_types
-            .as_ref()
-            .expect("slot_types should always be populated");
-        assert_eq!(slot_types, &[Type::Int, Type::Ref, Type::Float]);
-
-        // frame_stack should mirror recovery frames
-        let frame_stack = guard_layout
-            .frame_stack
-            .as_ref()
-            .expect("frame_stack should be populated from recovery_layout");
-        assert_eq!(frame_stack.len(), 1);
+        assert!(guard_layout.recovery_layout.is_none());
+        assert!(guard_layout.frame_stack.is_none());
         assert_eq!(
-            frame_stack[0].slot_types,
-            Some(vec![Type::Int, Type::Ref, Type::Float])
+            guard_layout.fail_arg_types,
+            vec![Type::Int, Type::Ref, Type::Float]
         );
     }
 
