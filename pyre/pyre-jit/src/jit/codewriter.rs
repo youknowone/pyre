@@ -931,168 +931,282 @@ fn walker_post_walk_insert_renamings_single_exit(
             }
         }
     }
-    for block_ref in reachable {
-        let block_borrow = block_ref.borrow();
-        if block_borrow.exits.len() != 1 {
-            continue;
-        }
-        let link_ref = block_borrow.exits[0].clone();
-        drop(block_borrow);
 
-        let link_borrow = link_ref.borrow();
-        let Some(target_ref) = link_borrow.target.clone() else {
-            continue;
-        };
-        let target_borrow = target_ref.borrow();
-        if link_borrow.args.len() != target_borrow.inputargs.len() {
-            continue;
-        }
-        // Skip blocks whose target is `returnblock`/`exceptblock`
-        // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
-        // RAISE handlers already emit `ref_return` / `raise` INLINE
-        // at the source block referencing the source stack-slot
-        // color (walker NEW-DEVIATION: upstream defers the return op
-        // to `make_return(target.inputargs)` AFTER insert_renamings
-        // copies link.args → target.inputargs).  Splicing a
-        // `ref_copy stack_color → target_inputarg_color` BEFORE
-        // walker's existing `ref_return stack_color` leaves walker's
-        // terminator reading the un-copied source slot and breaks
-        // SSA allocator coalescing on trivial return functions.
-        // Pyre-orthodox handling: the return-link insert_renamings
-        // is structurally absorbed into walker's inline emit until
-        // walker switches to deferred make_return.
-        if target_borrow.is_final && target_borrow.exits.is_empty() {
-            continue;
-        }
-
-        // `flatten.py:308-311` pair extraction.  Skip pairs whose
-        // src is `last_exception` / `last_exc_value` (they route
-        // through `generate_last_exc` separately, flatten.py:336-347).
-        let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
-        for (i, arg) in link_borrow.args.iter().enumerate() {
-            let Some(src_value) = arg.as_ref() else {
-                continue;
-            };
-            let Some(src_variable) = src_value.as_variable() else {
-                continue;
-            };
-            let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
-                continue;
-            };
-            if Some(src_variable) == link_borrow.last_exception
-                || Some(src_variable) == link_borrow.last_exc_value
-            {
-                continue;
-            }
-            let src_color = get_color(&src_variable);
-            let dst_color = get_color(&dst_variable);
-            let kind = dst_variable.kind.unwrap_or(Kind::Ref);
-            if src_color != dst_color {
-                pairs.push((src_color, dst_color, kind));
-            }
-        }
-        drop(target_borrow);
-        drop(link_borrow);
-
-        if pairs.is_empty() {
-            continue;
-        }
-        // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
-        pairs.sort_by_key(|(_, dst, _)| *dst);
-
-        // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
-        // `Kind::index()` per [[feedback-no-hashmap-ever]].
-        let mut renamings: [(Vec<u16>, Vec<u16>); 3] =
-            [(Vec::new(), Vec::new()), (Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
-        for (src, dst, kind) in pairs {
-            let bucket = &mut renamings[kind.index()];
-            bucket.0.push(src);
-            bucket.1.push(dst);
-        }
-
-        // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
-        let mut emitted: Vec<super::flatten::Insn> = Vec::new();
-        for &kind in &Kind::ALL {
-            let (frm, to) = &renamings[kind.index()];
-            if frm.is_empty() {
-                continue;
-            }
-            for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
-                match (src, dst) {
-                    (Some(src), Some(dst)) => {
-                        emitted.push(super::flatten::Insn::op_with_result(
-                            format!("{}_copy", kind.as_str()),
-                            vec![super::flatten::Operand::reg(kind, src)],
-                            super::flatten::Register::new(kind, dst),
-                        ));
-                    }
-                    (Some(src), None) => {
-                        emitted.push(super::flatten::Insn::op(
-                            format!("{}_push", kind.as_str()),
-                            vec![super::flatten::Operand::reg(kind, src)],
-                        ));
-                    }
-                    (None, Some(dst)) => {
-                        emitted.push(super::flatten::Insn::op_with_result(
-                            format!("{}_pop", kind.as_str()),
-                            Vec::new(),
-                            super::flatten::Register::new(kind, dst),
-                        ));
-                    }
-                    (None, None) => unreachable!(
-                        "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
-                    ),
+    // Pre-compute in-degree per reachable block (number of incoming
+    // links) to identify unique-predecessor targets for multi-exit
+    // insert_renamings.  Multi-predecessor targets (loop headers,
+    // merge points) need per-link trampoline blocks because canonical
+    // emits each link's renamings between `Label(link)` and
+    // `Label(target_block)`, but pyre's walker collapses link labels
+    // to the target's `pc{N}`, losing the per-edge distinction at
+    // the target's entry.  Splicing per-link renamings at a
+    // multi-predecessor target would mix the renamings of different
+    // edges, breaking semantics.
+    let mut in_degree: Vec<(super::flow::BlockRef, usize)> = Vec::new();
+    for b in &reachable {
+        for exit in &b.borrow().exits {
+            if let Some(t) = exit.borrow().target.clone() {
+                if let Some(entry) = in_degree.iter_mut().find(|(r, _)| r == &t) {
+                    entry.1 += 1;
+                } else {
+                    in_degree.push((t, 1));
                 }
             }
         }
-
-        if emitted.is_empty() {
-            continue;
-        }
-
-        // Locate the walker block matching this graph block, then
-        // splice the renamings into its per_block_ssarepr BEFORE the
-        // trailing terminator.  Block identity by `Rc::ptr_eq` via
-        // `BlockRef::PartialEq`.
-        let Some(spam) = all_walker_blocks
+    }
+    let in_degree_of = |b: &super::flow::BlockRef| -> usize {
+        in_degree
             .iter()
-            .find(|s| !s.dead() && s.block() == block_ref)
-        else {
+            .find(|(r, _)| r == b)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    };
+
+    // Single-exit blocks: splice each link's renamings into the
+    // source block's `per_block_ssarepr` BEFORE the terminator
+    // (matches `flatten.py:154 self.insert_renamings(link)` running
+    // before the recursive `make_bytecode_block(link.target)`).
+    for block_ref in &reachable {
+        if block_ref.borrow().exits.len() != 1 {
+            continue;
+        }
+        let link_ref = block_ref.borrow().exits[0].clone();
+        emit_link_renamings_into_block(
+            block_ref,
+            &link_ref,
+            &get_color,
+            all_walker_blocks,
+            SpliceSite::SourceBeforeTerminator,
+        );
+    }
+
+    // Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
+    // exit's renamings are per-edge.  Walker's goto_if_not / switch
+    // ends the source block; canonical emits each link's renamings
+    // between `Label(link)` and the target block's body.  For pyre,
+    // splice per-link renamings at the target's entry — but only
+    // when target has unique predecessor (otherwise multiple edges'
+    // renamings would collide at the same entry).  Multi-predecessor
+    // targets remain canonical_unmatched until walker grows distinct
+    // per-link labels (T6 epic) or per-link trampoline blocks.
+    for block_ref in &reachable {
+        let exits = block_ref.borrow().exits.clone();
+        if exits.len() < 2 {
+            continue;
+        }
+        for link_ref in exits {
+            let Some(target_ref) = link_ref.borrow().target.clone() else {
+                continue;
+            };
+            if in_degree_of(&target_ref) > 1 {
+                continue;
+            }
+            emit_link_renamings_into_block(
+                block_ref,
+                &link_ref,
+                &get_color,
+                all_walker_blocks,
+                SpliceSite::TargetAfterAnchor,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpliceSite {
+    /// Splice into source block's `per_block_ssarepr` BEFORE the
+    /// trailing terminator (goto / *_return).  Single-exit case.
+    SourceBeforeTerminator,
+    /// Splice into target block's `per_block_ssarepr` AFTER its
+    /// leading Label/PcAnchor/`-live-` scaffold.  Multi-exit case
+    /// with unique-predecessor target.
+    TargetAfterAnchor,
+}
+
+fn emit_link_renamings_into_block<F>(
+    source_block: &super::flow::BlockRef,
+    link_ref: &super::flow::LinkRef,
+    get_color: &F,
+    all_walker_blocks: &[SpamBlockRef],
+    site: SpliceSite,
+) where
+    F: Fn(&super::flow::Variable) -> u16,
+{
+    let link_borrow = link_ref.borrow();
+    let Some(target_ref) = link_borrow.target.clone() else {
+        return;
+    };
+    let target_borrow = target_ref.borrow();
+    if link_borrow.args.len() != target_borrow.inputargs.len() {
+        return;
+    }
+    // Skip blocks whose target is `returnblock`/`exceptblock`
+    // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
+    // RAISE handlers already emit `ref_return` / `raise` INLINE
+    // at the source block referencing the source stack-slot
+    // color (walker NEW-DEVIATION: upstream defers the return op
+    // to `make_return(target.inputargs)` AFTER insert_renamings
+    // copies link.args → target.inputargs).  Splicing a
+    // `ref_copy stack_color → target_inputarg_color` BEFORE
+    // walker's existing `ref_return stack_color` leaves walker's
+    // terminator reading the un-copied source slot and breaks
+    // SSA allocator coalescing on trivial return functions.
+    if target_borrow.is_final && target_borrow.exits.is_empty() {
+        return;
+    }
+
+    // `flatten.py:308-311` pair extraction.  Skip pairs whose
+    // src is `last_exception` / `last_exc_value` (they route
+    // through `generate_last_exc` separately, flatten.py:336-347).
+    let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
+    for (i, arg) in link_borrow.args.iter().enumerate() {
+        let Some(src_value) = arg.as_ref() else {
             continue;
         };
-        let mut spam_borrow = spam.0.borrow_mut();
-        let insns = &mut spam_borrow.per_block_ssarepr;
-        // Find the pre-terminator position: scan back past the
-        // optional `Unreachable` tail, then before the terminator
-        // op itself.  Walker terminators are `goto`, `*_return`,
-        // `raise`, `reraise`, `goto_if_not*`, `switch`.  Conditional
-        // terminators correspond to multi-exit blocks (filtered
-        // above) so we only expect unconditional shapes here.
-        let len = insns.len();
-        let mut insert_pos = len;
-        if len >= 1 && matches!(insns.last(), Some(super::flatten::Insn::Unreachable)) {
-            insert_pos = len - 1;
+        let Some(src_variable) = src_value.as_variable() else {
+            continue;
+        };
+        let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+            continue;
+        };
+        if Some(src_variable) == link_borrow.last_exception
+            || Some(src_variable) == link_borrow.last_exc_value
+        {
+            continue;
         }
-        if insert_pos >= 1 {
-            if let super::flatten::Insn::Op { opname, .. } = &insns[insert_pos - 1] {
-                let is_terminator = matches!(
-                    opname.as_str(),
-                    "goto"
-                        | "int_return"
-                        | "ref_return"
-                        | "float_return"
-                        | "void_return"
-                        | "raise"
-                        | "reraise"
-                );
-                if is_terminator {
-                    insert_pos -= 1;
+        let src_color = get_color(&src_variable);
+        let dst_color = get_color(&dst_variable);
+        let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+        if src_color != dst_color {
+            pairs.push((src_color, dst_color, kind));
+        }
+    }
+    drop(target_borrow);
+    drop(link_borrow);
+
+    if pairs.is_empty() {
+        return;
+    }
+    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+    pairs.sort_by_key(|(_, dst, _)| *dst);
+
+    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
+    // `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut renamings: [(Vec<u16>, Vec<u16>); 3] =
+        [(Vec::new(), Vec::new()), (Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+    for (src, dst, kind) in pairs {
+        let bucket = &mut renamings[kind.index()];
+        bucket.0.push(src);
+        bucket.1.push(dst);
+    }
+
+    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
+    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
+    for &kind in &Kind::ALL {
+        let (frm, to) = &renamings[kind.index()];
+        if frm.is_empty() {
+            continue;
+        }
+        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
+            match (src, dst) {
+                (Some(src), Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_copy", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                        super::flatten::Register::new(kind, dst),
+                    ));
                 }
+                (Some(src), None) => {
+                    emitted.push(super::flatten::Insn::op(
+                        format!("{}_push", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                    ));
+                }
+                (None, Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_pop", kind.as_str()),
+                        Vec::new(),
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (None, None) => unreachable!(
+                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
+                ),
             }
         }
-        for (offset, insn) in emitted.into_iter().enumerate() {
-            insns.insert(insert_pos + offset, insn);
+    }
+
+    if emitted.is_empty() {
+        return;
+    }
+
+    let splice_block = match site {
+        SpliceSite::SourceBeforeTerminator => source_block.clone(),
+        SpliceSite::TargetAfterAnchor => target_ref,
+    };
+    let Some(spam) = all_walker_blocks
+        .iter()
+        .find(|s| !s.dead() && s.block() == splice_block)
+    else {
+        return;
+    };
+    let mut spam_borrow = spam.0.borrow_mut();
+    let insns = &mut spam_borrow.per_block_ssarepr;
+    let insert_pos = match site {
+        SpliceSite::SourceBeforeTerminator => {
+            // Find the pre-terminator position: scan back past the
+            // optional `Unreachable` tail, then before the terminator
+            // op itself.  Walker terminators for single-exit blocks
+            // are `goto` / `*_return` / `raise` / `reraise`.
+            let len = insns.len();
+            let mut pos = len;
+            if len >= 1 && matches!(insns.last(), Some(super::flatten::Insn::Unreachable)) {
+                pos = len - 1;
+            }
+            if pos >= 1 {
+                if let super::flatten::Insn::Op { opname, .. } = &insns[pos - 1] {
+                    let is_terminator = matches!(
+                        opname.as_str(),
+                        "goto"
+                            | "int_return"
+                            | "ref_return"
+                            | "float_return"
+                            | "void_return"
+                            | "raise"
+                            | "reraise"
+                    );
+                    if is_terminator {
+                        pos -= 1;
+                    }
+                }
+            }
+            pos
         }
+        SpliceSite::TargetAfterAnchor => {
+            // Skip target's leading scaffold (Label / PcAnchor /
+            // `-live-`).  Renamings land between the anchor and the
+            // first semantic op so that runtime dispatch via
+            // `pc_anchor_positions[N]` lands on the anchor and then
+            // falls through into the renamings before any semantic
+            // op consumes the target.inputarg registers.
+            let mut pos = 0;
+            for insn in insns.iter() {
+                match insn {
+                    super::flatten::Insn::Label(_)
+                    | super::flatten::Insn::PcAnchor { .. } => {
+                        pos += 1;
+                    }
+                    super::flatten::Insn::Op { opname, .. } if opname == "-live-" => {
+                        pos += 1;
+                    }
+                    _ => break,
+                }
+            }
+            pos
+        }
+    };
+    for (offset, insn) in emitted.into_iter().enumerate() {
+        insns.insert(insert_pos + offset, insn);
     }
 }
 
