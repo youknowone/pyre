@@ -396,14 +396,14 @@ pub fn diff_recorded_ops(production: &[Op], shadow: &[Op]) -> Option<String> {
                 idx, p.opcode, s.opcode,
             ));
         }
-        if p.args.as_slice() != s.args.as_slice() {
+        if *p.getarglist() != *s.getarglist() {
             return Some(format!(
                 "shadow_walker: op[{}] ({:?}) args mismatch — \
                  production={:?}, shadow={:?}",
                 idx,
                 p.opcode,
-                p.args.as_slice(),
-                s.args.as_slice(),
+                &*p.getarglist(),
+                &*s.getarglist(),
             ));
         }
         match (p.getdescr(), s.getdescr()) {

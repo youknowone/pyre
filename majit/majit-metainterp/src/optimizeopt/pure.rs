@@ -551,7 +551,7 @@ impl OptPure {
             }
             // _same_args(known_op, op, 1, start_index):
             // entry.args is already known_op.args[1..], so compare from 0.
-            if Self::_same_args(&entry.args, op.getarglist(), 0, start_index, ctx) {
+            if Self::_same_args(&entry.args, &op.getarglist(), 0, start_index, ctx) {
                 return Some(entry.result);
             }
         }
@@ -785,7 +785,7 @@ impl OptPure {
             0
         };
         // pure.py:255: self._same_args(old_op, op, old_start_index, start_index)
-        Self::_same_args(old_op_args, op.getarglist(), old_start_index, start_index, ctx)
+        Self::_same_args(old_op_args, &op.getarglist(), old_start_index, start_index, ctx)
     }
 }
 
@@ -1153,7 +1153,7 @@ impl Optimization for OptPure {
                     if Self::optimize_call_pure_old(
                         op,
                         old_op.opcode,
-                        &old_op.args,
+                        &old_op.getarglist(),
                         old_descr_identity,
                         op_descr_identity,
                         start_index,
@@ -1547,7 +1547,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
-            result[0].args.as_slice(),
+            &*result[0].getarglist(),
             &[OpRef::int_op(0), OpRef::int_op(1)]
         );
     }

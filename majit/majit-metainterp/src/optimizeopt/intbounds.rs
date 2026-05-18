@@ -1796,10 +1796,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntAdd, op.getarglist());
-            if let Some(d) = op.getdescr() {
-                new_op.setdescr(d);
-            }
+            let new_op = op.copy_and_change(OpCode::IntAdd, None, None);
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1833,10 +1830,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(arg1, ctx);
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntSub, op.getarglist());
-            if let Some(d) = op.getdescr() {
-                new_op.setdescr(d);
-            }
+            let new_op = op.copy_and_change(OpCode::IntSub, None, None);
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1857,10 +1851,7 @@ impl OptIntBounds {
         let b1 = self.getintbound(op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
-            let mut new_op = Op::new(OpCode::IntMul, op.getarglist());
-            if let Some(d) = op.getdescr() {
-                new_op.setdescr(d);
-            }
+            let new_op = op.copy_and_change(OpCode::IntMul, None, None);
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -3104,7 +3095,7 @@ mod tests {
         // rewrite's `x + x → x << 1`) cannot collide with an input arg.
         let max_arg = ops
             .iter()
-            .flat_map(|op| op.getarglist().iter().copied())
+            .flat_map(|op| op.getarglist_copy())
             .filter(|r| !r.is_constant() && !r.is_none())
             .map(|r| r.raw())
             .max()

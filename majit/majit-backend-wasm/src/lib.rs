@@ -271,7 +271,7 @@ impl WasmBackend {
     /// Collect constants from ops (constant OpRefs that appear as args).
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
-            for &arg in op.getarglist() {
+            for &arg in op.getarglist().iter() {
                 if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
                     // Default to 0 if not already registered
                     self.constants.insert(arg.raw(), 0);

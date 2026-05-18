@@ -1785,7 +1785,7 @@ mod tests {
 
         assert_eq!(len_ref, last_op.pos.get());
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
-        assert_eq!(last_op.args.as_slice(), &[unicode_ref]);
+        assert_eq!(&*last_op.getarglist(), &[unicode_ref]);
     }
 
     // ── Test 7: Non-constant length NEWSTR passes through ──
@@ -2314,7 +2314,7 @@ mod tests {
             .back()
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
-        assert_eq!(strlen_op.args.as_slice(), &[arg2]);
+        assert_eq!(&*strlen_op.getarglist(), &[arg2]);
         assert_eq!(strlen_ref, strlen_op.pos.get());
 
         // Subsequent call must return the cached lgtop.
@@ -2358,7 +2358,7 @@ mod tests {
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(
-            strlen_op.args.as_slice(),
+            &*strlen_op.getarglist(),
             &[arg1],
             "STRLEN must use arg1 (op), not arg2 (info source)"
         );

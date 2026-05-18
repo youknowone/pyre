@@ -2315,7 +2315,7 @@ impl Optimizer {
         let pre_jump_resolved_args = last_op
             .as_ref()
             .filter(|op| op.opcode == OpCode::Jump)
-            .map(|jump_op| jump_op.args.clone());
+            .map(|jump_op| jump_op.getarglist_copy());
 
         // RPython optimizer.py:552-556 (_propagate_all_forward):
         //     if flush:
@@ -2710,7 +2710,7 @@ impl Optimizer {
                     );
                 }
             }
-            let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump.getarglist(), &mut ctx);
             // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
             // are the fresh per-iteration boxes from `trace.get_iter()`. They
             // live in this run's iteration namespace, not the original
@@ -2790,7 +2790,7 @@ impl Optimizer {
             let all_refs: Vec<OpRef> = ctx
                 .new_operations
                 .iter()
-                .flat_map(|op| op.getarglist().iter().copied())
+                .flat_map(|op| op.getarglist_copy())
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
@@ -3234,7 +3234,7 @@ impl Optimizer {
         }
 
         let terminal_jump = terminal_jump.unwrap();
-        let jump_args = terminal_jump.args.to_vec();
+        let jump_args = terminal_jump.getarglist().to_vec();
 
         // unroll.py:198-200: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
@@ -5124,7 +5124,7 @@ mod tests {
             .as_ref()
             .expect("skip_flush should preserve terminal jump");
         assert_eq!(terminal.opcode, OpCode::Jump);
-        assert_eq!(terminal.args.as_ref(), &[OpRef::int_op(2)]);
+        assert_eq!(&*terminal.getarglist(), &[OpRef::int_op(2)]);
     }
 
     #[test]

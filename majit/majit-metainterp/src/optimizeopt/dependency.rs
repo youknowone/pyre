@@ -84,7 +84,7 @@ fn side_effect_arguments(
         }
     } else {
         // dependency.py:232-240: generic side effect
-        for arg in op.getarglist() {
+        for arg in op.getarglist().iter() {
             // dependency.py:237: arg.is_constant() or arg.type == 'f' → not destroyed
             if arg.is_constant() || arg_type_of(*arg) == majit_ir::Type::Float {
                 result.push((*arg, None, false));
@@ -311,7 +311,7 @@ impl DependencyGraph {
             return;
         }
         // dependency.py:714-715: true dependencies on args
-        for arg in op.getarglist() {
+        for arg in op.getarglist().iter() {
             Self::depends_on_arg_static(tracker, *arg, guard_idx, &mut self.nodes);
         }
         // dependency.py:717: guard_argument_protection
@@ -345,7 +345,7 @@ impl DependencyGraph {
     fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
         let op = self.nodes[guard_idx].op.clone();
         // dependency.py:657-664: redefine non-constant, non-int, non-float args (pointers)
-        for arg in op.getarglist() {
+        for arg in op.getarglist().iter() {
             if arg.is_constant() || arg.is_none() {
                 continue;
             }

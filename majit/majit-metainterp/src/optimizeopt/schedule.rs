@@ -441,10 +441,10 @@ impl PackSet {
             .pos
             .get();
 
-        if left.args.get(other_index).copied() != Some(origin_left_pos) {
+        if left.getarglist().get(other_index).copied() != Some(origin_left_pos) {
             return None;
         }
-        if right.args.get(other_index).copied() != Some(origin_right_pos) {
+        if right.getarglist().get(other_index).copied() != Some(origin_right_pos) {
             return None;
         }
 
@@ -1422,7 +1422,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     };
 
     // schedule.py:335-336: build args list + prepare_arguments
-    let mut args = first_op.args.to_vec();
+    let mut args = first_op.getarglist().to_vec();
     prepare_arguments(state, pack, &mut args, ops);
 
     // schedule.py:337-338: VecOperation(left.vector, args, left, pack.numops())

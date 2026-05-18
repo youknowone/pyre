@@ -946,7 +946,7 @@ mod tests {
         let trace = rec.get_trace();
         let jump = trace.ops.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
-        assert_eq!(jump.args.len(), trace.num_inputargs());
+        assert_eq!(jump.num_args(), trace.num_inputargs());
         assert_eq!(jump.arg(0), add);
         assert_eq!(jump.arg(1), i1);
     }
@@ -967,7 +967,7 @@ mod tests {
 
         let finish_op = trace.ops.last().unwrap();
         assert_eq!(finish_op.opcode, OpCode::Finish);
-        assert_eq!(finish_op.args.len(), 1);
+        assert_eq!(finish_op.num_args(), 1);
         assert_eq!(finish_op.arg(0), add);
         assert!(finish_op.has_descr());
     }

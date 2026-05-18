@@ -926,12 +926,12 @@ impl UnrollOptimizer {
         // trusting the stale copy.
         let body_jump_args: Vec<OpRef> = body_terminal_op
             .as_ref()
-            .map(|jump| jump.args.to_vec())
+            .map(|jump| jump.getarglist().to_vec())
             .or_else(|| {
                 p2_ops
                     .iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|jump| jump.args.to_vec())
+                    .map(|jump| jump.getarglist().to_vec())
             })
             .unwrap_or_default();
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
@@ -1019,7 +1019,8 @@ impl UnrollOptimizer {
                             // (unroll.py:126-127) above.
                             continue;
                         }
-                        let arg_iter = op.getarglist().iter()
+                        let arg_list = op.getarglist_copy();
+                        let arg_iter = arg_list.iter()
                             .copied()
                             .chain(op.getfailargs().into_iter().flatten());
                         for arg in arg_iter {
@@ -1147,12 +1148,12 @@ impl UnrollOptimizer {
         let jump_to_self = {
             let body_jump_args: Vec<OpRef> = body_terminal_op
                 .as_ref()
-                .map(|jump| jump.args.to_vec())
+                .map(|jump| jump.getarglist().to_vec())
                 .or_else(|| {
                     body_ops
                         .iter()
                         .rfind(|o| o.opcode == OpCode::Jump)
-                        .map(|j| j.args.to_vec())
+                        .map(|j| j.getarglist().to_vec())
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
@@ -1817,7 +1818,7 @@ impl ExportedState {
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
             visit(op.pos.get());
-            for &arg in op.getarglist() {
+            for &arg in op.getarglist().iter() {
                 visit(arg);
             }
             if let Some(fail_args) = op.getfailargs() {
@@ -2725,7 +2726,7 @@ impl OptUnroll {
         // populated; without this snapshot, the import path silently
         // skips the short op.
         for (_, produced) in &state.short_boxes {
-            for &arg in &produced.preamble_op.args {
+            for &arg in produced.preamble_op.getarglist().iter() {
                 if !arg.is_constant() {
                     continue;
                 }
@@ -3426,7 +3427,7 @@ impl OptUnroll {
                             .set(patch.rd_resume_position.get());
                     }
                     // Re-register guard constant args from preamble's constant pool.
-                    for &arg in new_op.getarglist() {
+                    for &arg in new_op.getarglist().iter() {
                         if let Some(&(val, tp)) = short_preamble.constants.get(&arg.raw()) {
                             let value = match tp {
                                 majit_ir::Type::Int => majit_ir::Value::Int(val),
@@ -4270,7 +4271,8 @@ fn assemble_peeled_trace_with_jump_args(
             if op.opcode == OpCode::Jump {
                 continue;
             }
-            let all_refs = op.getarglist().iter()
+            let op_args = op.getarglist_copy();
+            let all_refs = op_args.iter()
                 .copied()
                 .chain(op.getfailargs().into_iter().flatten());
             for arg in all_refs {
@@ -4529,7 +4531,7 @@ fn assemble_peeled_trace_with_jump_args(
             // unroll.py:301 label_op.initarglist(label_op.getarglist() +
             //                                    sb.used_boxes)
             let mut extended_args: smallvec::SmallVec<[OpRef; 3]> =
-                new_op.getarglist().into();
+                new_op.getarglist_copy();
             for &source_arg in &extra_inner_sources {
                 // optimizer.py:614-625 freeze: do not follow ctx forwarding
                 // chains here; postprocess Const forwarding on body ops would
@@ -4627,7 +4629,7 @@ fn assemble_peeled_trace_with_jump_args(
         }
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
-            let label_args = &result[label_idx].args;
+            let label_args = result[label_idx].getarglist_copy();
             for arg in new_op.getarglist().iter()
                 .copied()
                 .chain(new_op.getfailargs().into_iter().flatten())
@@ -4645,11 +4647,13 @@ fn assemble_peeled_trace_with_jump_args(
             if !extra_live_args.is_empty() {
                 let existing: majit_ir::vec_set::VecSet<OpRef> =
                     result[label_idx].getarglist().iter().copied().collect();
-                result[label_idx].args.extend(
+                let mut new_args = result[label_idx].getarglist_copy();
+                new_args.extend(
                     extra_live_args
                         .into_iter()
                         .filter(|arg| !existing.contains(arg)),
                 );
+                result[label_idx].initarglist(new_args);
             }
         }
         // RPython parity: each guard in the assembled trace owns a
@@ -4807,7 +4811,7 @@ impl OptUnroll {
         // Emit Label between peeled and original body.
         // The Label's args match the Jump's args, forming the loop header.
         let label_pos = ctx.reserve_pos_typed(OpCode::Label.result_type());
-        let mut label_op = Op::new(OpCode::Label, &jump_op.args);
+        let mut label_op = Op::new(OpCode::Label, &jump_op.getarglist());
         label_op.pos.set(label_pos);
         ctx.emit(label_op);
 
@@ -5103,7 +5107,7 @@ mod tests {
         let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
-            result[1].args.as_slice(),
+            &*result[1].getarglist(),
             &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
@@ -5141,7 +5145,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::Jump);
-        assert_eq!(result[1].args.as_slice(), &[OpRef::int_op(2)]);
+        assert_eq!(&*result[1].getarglist(), &[OpRef::int_op(2)]);
         assert_eq!(
             result[1].getdescr().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
@@ -5413,9 +5417,9 @@ mod tests {
         let result = run_unroll_pass(&ops);
 
         let label = result.iter().find(|o| o.opcode == OpCode::Label).unwrap();
-        let jump_args = &ops.last().unwrap().args;
+        let jump_args = ops.last().unwrap().getarglist_copy();
         assert_eq!(
-            label.args.as_slice(),
+            &*label.getarglist(),
             jump_args.as_slice(),
             "Label args should match original Jump args"
         );
@@ -6161,7 +6165,7 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(10)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(10)]);
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
         assert_eq!(combined[3].arg(0), combined[1].pos.get());
@@ -6209,7 +6213,7 @@ mod tests {
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(11)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(11)]);
         assert_eq!(combined[2].opcode, OpCode::IntGe);
         assert_eq!(combined[2].arg(0), OpRef::int_op(11));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
@@ -6320,12 +6324,12 @@ mod tests {
 
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[OpRef::int_op(10), combined[1].pos.get()]
         );
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
-            combined[4].args.as_slice(),
+            &*combined[4].getarglist(),
             &[OpRef::int_op(10), combined[1].pos.get()]
         );
     }
@@ -6382,7 +6386,7 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(
-            combined[1].args.as_slice(),
+            &*combined[1].getarglist(),
             &[
                 OpRef::int_op(10),
                 OpRef::int_op(22),
@@ -6392,12 +6396,12 @@ mod tests {
         );
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[OpRef::void_op(857), OpRef::const_int(0)]
         );
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
-            combined[3].args.as_slice(),
+            &*combined[3].getarglist(),
             &[
                 OpRef::int_op(10),
                 OpRef::int_op(22),
@@ -6451,10 +6455,10 @@ mod tests {
             .expect("label");
         let label = &combined[label_idx];
         let extra_label_arg = label.arg(1);
-        assert_eq!(label.args.as_slice(), &[OpRef::int_op(10), extra_label_arg]);
+        assert_eq!(&*label.getarglist(), &[OpRef::int_op(10), extra_label_arg]);
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(body_getfield.args.as_slice(), &[extra_label_arg]);
+        assert_eq!(&*body_getfield.getarglist(), &[extra_label_arg]);
     }
 
     #[test]
@@ -6496,11 +6500,11 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(64)]
         );
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(64)]);
+        assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(64)]);
         assert_eq!(
             combined[1].getfailargs().expect("guard fail args").as_slice(),
             &[OpRef::int_op(64)]
@@ -6555,7 +6559,7 @@ mod tests {
         // must not derive a different arg contract by inspecting that descr.
         // The caller is responsible for constructing the preamble-shaped Jump.
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[
                 OpRef::int_op(100),
                 OpRef::int_op(101),
@@ -6600,7 +6604,7 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.args.as_slice(),
+            &*jump.getarglist(),
             &[OpRef::int_op(100), OpRef::int_op(101)]
         );
     }
@@ -6649,12 +6653,12 @@ mod tests {
                         == Some("LoopTargetDescr(1)".to_string())
             })
             .expect("body label");
-        assert_eq!(body_label.args.as_slice(), &[OpRef::int_op(10)]);
+        assert_eq!(&*body_label.getarglist(), &[OpRef::int_op(10)]);
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
-            jump.args.as_slice(),
+            &*jump.getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)]
         );
     }
@@ -6729,7 +6733,7 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(8)]
         );
     }
@@ -6769,14 +6773,14 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
-            combined[0].args.as_slice(),
+            &*combined[0].getarglist(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].arg(0), OpRef::int_op(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
-            combined[2].args.as_slice(),
+            &*combined[2].getarglist(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
     }
@@ -6806,7 +6810,7 @@ mod tests {
         assert_eq!(spliced[1].opcode, OpCode::GuardTrue);
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(
-            spliced[2].args.as_slice(),
+            &*spliced[2].getarglist(),
             &[OpRef::void_op(3), OpRef::int_op(4)]
         );
     }

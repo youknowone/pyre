@@ -105,12 +105,12 @@ impl VectorLoop {
         let label_args = self
             .label
             .as_ref()
-            .map(|l| l.args.clone())
+            .map(|l| l.getarglist_copy())
             .unwrap_or_default();
         let jump_args = self
             .jump
             .as_ref()
-            .map(|j| j.args.clone())
+            .map(|j| j.getarglist_copy())
             .unwrap_or_default();
 
         let prohibit = [
@@ -197,7 +197,7 @@ pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<u
             if chain.contains(&i) {
                 continue;
             }
-            for arg in op.getarglist() {
+            for arg in op.getarglist().iter() {
                 if current_refs.contains(arg) {
                     chain.push(i);
                     if !op.pos.get().is_none() {

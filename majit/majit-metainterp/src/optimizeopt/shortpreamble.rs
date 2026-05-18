@@ -774,7 +774,7 @@ impl ShortBoxes {
         let const_pending: Vec<PreambleOp> = std::mem::take(&mut self.const_short_boxes);
         for short_op in const_pending {
             let getfield_op = &short_op.op;
-            if getfield_op.args.is_empty() {
+            if getfield_op.num_args() == 0 {
                 continue;
             }
             let struct_arg = getfield_op.arg(0);
@@ -1740,7 +1740,7 @@ impl AbstractShortPreambleBuilderState {
             return preamble_op.clone();
         }
         // shortpreamble.py:383-396: iterate preamble_op args
-        for &arg in &preamble_op.args {
+        for &arg in preamble_op.getarglist().iter() {
             if self.short_results.contains(&arg)
                 || already_in_short.contains(&arg)
                 || self.short_inputargs.contains(&arg)
@@ -1856,7 +1856,7 @@ fn build_short_preamble_struct_from_ops(
         })
         };
     for op in ops {
-        for &arg in op.getarglist() {
+        for &arg in op.getarglist().iter() {
             if !defined_by_ops.contains(&arg) {
                 if let Some(&val) = loop_constants.get(&arg.raw()) {
                     constants.insert(arg.raw(), (val, const_type_for(arg)));
@@ -1954,7 +1954,7 @@ impl ShortPreambleBuilder {
         if !visiting.insert(result) {
             return None;
         }
-        for &arg in &produced.preamble_op.args {
+        for &arg in produced.preamble_op.getarglist().iter() {
             // RPython: isinstance(arg, Const) → skip
             if self.state.known_constants.contains(&arg) {
                 continue;
@@ -2210,7 +2210,7 @@ impl ExtendedShortPreambleBuilder {
             }
             // RPython use_box arg loop: insert missing deps before this op.
             // Recursive: deps of deps are also inserted (transitive closure).
-            for &arg in op.getarglist() {
+            for &arg in op.getarglist().iter() {
                 if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set, &pos_to_key) {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
@@ -2298,7 +2298,8 @@ impl ExtendedShortPreambleBuilder {
         }
         // Recurse into dep's own args first (transitive). If any sub-dep
         // can't be resolved, bail out — the dep cannot be safely emitted.
-        for &dep_arg in &dep_op.args {
+        let dep_op_args = dep_op.getarglist_copy();
+        for &dep_arg in dep_op_args.iter() {
             if !self.insert_dep_recursive(dep_arg, inputargs_set, constants_set, pos_to_key) {
                 return false;
             }
@@ -2320,7 +2321,7 @@ impl ExtendedShortPreambleBuilder {
         if !visiting.insert(result) {
             return None;
         }
-        for &arg in &produced.preamble_op.args {
+        for &arg in produced.preamble_op.getarglist().iter() {
             if self.known_constants.contains(&arg) {
                 continue;
             }
@@ -2467,7 +2468,7 @@ impl ExtendedShortPreambleBuilder {
         if !self.short_results.contains(&canonical) {
             let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
             // Add deps for each arg
-            for &arg in &preamble_op.args {
+            for &arg in preamble_op.getarglist().iter() {
                 if self.short_results.contains(&arg)
                     || self.short_inputargs.contains(&arg)
                     || self.known_constants.contains(&arg)
@@ -2612,7 +2613,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         None => return ShortPreamble::empty(), // No label = no peeling happened
     };
 
-    let label_args = &peeled_ops[label_pos].args;
+    let label_args = peeled_ops[label_pos].getarglist_copy();
     let label_arg_idx = |arg: &OpRef| -> Option<usize> { label_args.iter().position(|a| a == arg) };
 
     // shortpreamble.py: Collect guards AND pure operations from the preamble.
@@ -3286,7 +3287,7 @@ mod tests {
             .find(|(result, _)| *result == OpRef::int_op(20))
             .expect("missing produced pure op");
         assert_eq!(
-            pure.1.preamble_op.args.as_slice(),
+            &*pure.1.preamble_op.getarglist(),
             &[OpRef::int_op(10), OpRef::int_op(999)]
         );
     }
@@ -3430,7 +3431,7 @@ mod tests {
         assert_eq!(short[1].opcode, OpCode::IntAddOvf);
         assert_eq!(short[2].opcode, OpCode::GuardNoOverflow);
         assert_eq!(short[3].opcode, OpCode::Jump);
-        assert_eq!(short[3].args.as_slice(), &[OpRef::int_op(10)]);
+        assert_eq!(&*short[3].getarglist(), &[OpRef::int_op(10)]);
     }
 
     #[test]
@@ -3465,7 +3466,7 @@ mod tests {
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos.get(), alias_result);
-        assert_eq!(extra[0].args.as_slice(), &[OpRef::int_op(20)]);
+        assert_eq!(&*extra[0].getarglist(), &[OpRef::int_op(20)]);
     }
 
     #[test]
@@ -3491,7 +3492,7 @@ mod tests {
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos.get(), OpRef::int_op(41));
-        assert_eq!(extra[0].args.as_slice(), &[OpRef::int_op(14)]);
+        assert_eq!(&*extra[0].getarglist(), &[OpRef::int_op(14)]);
     }
 
     #[test]
@@ -3514,6 +3515,6 @@ mod tests {
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);
         assert_eq!(extra[0].pos.get(), OpRef::int_op(41));
-        assert_eq!(extra[0].args.as_slice(), &[OpRef::int_op(14)]);
+        assert_eq!(&*extra[0].getarglist(), &[OpRef::int_op(14)]);
     }
 }

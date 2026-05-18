@@ -3023,7 +3023,7 @@ mod tests {
             .expect("optimized loop should keep a jump");
 
         assert_eq!(opt.final_num_inputs(), 3);
-        assert_eq!(jump.args.len(), 3);
+        assert_eq!(jump.num_args(), 3);
     }
 
     // ── Tests ──

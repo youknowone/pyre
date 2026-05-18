@@ -696,7 +696,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
         .iter()
         .map(|op| {
             let mut hw = opref_high_water(op.pos.get());
-            for a in op.getarglist() {
+            for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(*a));
             }
             if let Some(fa) = op.getfailargs() {
@@ -17515,16 +17515,16 @@ mod tests {
         );
         assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
         assert_eq!(
-            prepared.ops[0].args.to_vec(),
+            prepared.ops[0].getarglist().to_vec(),
             vec![OpRef::input_arg_ref(11)]
         );
         assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
         assert_eq!(
-            prepared.ops[1].args.to_vec(),
+            prepared.ops[1].getarglist().to_vec(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_int(10)]
         );
         assert_eq!(
-            prepared.ops[2].args.to_vec(),
+            prepared.ops[2].getarglist().to_vec(),
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
         assert_eq!(

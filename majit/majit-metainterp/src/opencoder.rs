@@ -286,7 +286,7 @@ impl<'a> TraceIterator<'a> {
             .iter()
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
-                    .chain(op.getarglist().iter().copied())
+                    .chain(op.getarglist_copy())
                     .chain(op.getfailargs().into_iter().flatten())
             })
             .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -3174,15 +3174,15 @@ mod tests {
 
         let op0 = iter.next().unwrap();
         assert_eq!(op0.pos.get(), iop(104));
-        assert_eq!(op0.args.as_slice(), &[rarg(100)]);
+        assert_eq!(&*op0.getarglist(), &[rarg(100)]);
 
         let op1 = iter.next().unwrap();
-        assert_eq!(op1.args.as_slice(), &[iop(104), rarg(101)]);
+        assert_eq!(&*op1.getarglist(), &[iop(104), rarg(101)]);
         assert_eq!(op1.pos.get(), rop(105));
         assert_eq!(iter._cache[1], Some(rop(105)));
 
         let finish = iter.next().unwrap();
-        assert_eq!(finish.args.as_slice(), &[rop(105)]);
+        assert_eq!(&*finish.getarglist(), &[rop(105)]);
     }
 
     // Phase B1 intentionally drops `test_trace_record_buffer` and
@@ -4592,7 +4592,7 @@ mod tests {
         // the outer `i0, i1` identifiers to the cut's unpacked
         // inputargs; the pyre port keeps the names distinct.)
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(ops[0].args.as_slice(), &[fresh_add1, fresh_i1]);
+        assert_eq!(&*ops[0].getarglist(), &[fresh_add1, fresh_i1]);
         // Second op is the guard; third is the INT_SUB tail.
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
         assert_eq!(ops[2].opcode, OpCode::IntSub);

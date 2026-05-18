@@ -268,18 +268,23 @@ impl Op {
     }
 
     /// `resoperation.py:281 AbstractResOp.getarglist` parity — returns
-    /// a borrow into the operand vector.  Subclass mixins (`UnaryOp`,
+    /// a `Ref` view into the operand vector.  Subclass mixins (`UnaryOp`,
     /// `BinaryOp`, ..., `N_aryOp`) implement this differently; pyre
-    /// collapses them into a single SmallVec slot.
-    pub fn getarglist(&self) -> &[crate::resoperation::OpRef] {
-        &self.args
+    /// collapses them into a single SmallVec slot.  The `RefCell` borrow
+    /// guard is required because `args` is interior-mutable so that
+    /// `setarg` / `initarglist` can write through a shared `Op` reached
+    /// via `Rc<Op>` (RPython writes `op._args[i] = ...` on the same
+    /// Python object the trace list, optimizer state, and backend
+    /// observe).
+    pub fn getarglist(&self) -> std::cell::Ref<'_, [crate::resoperation::OpRef]> {
+        std::cell::Ref::map(self.args.borrow(), |a| a.as_slice())
     }
 
     /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` clone for the same effect.
     pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::resoperation::OpRef; 3]> {
-        self.args.clone()
+        self.args.borrow().clone()
     }
 
     /// `resoperation.py:277 AbstractResOp.initarglist` parity — bulk
@@ -293,16 +298,16 @@ impl Op {
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
     pub fn initarglist(
-        &mut self,
+        &self,
         args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>,
     ) {
-        self.args = args;
+        *self.args.borrow_mut() = args;
     }
 
     /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
     /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
     /// or `_args[i]`; pyre indexes the SmallVec directly.
-    pub fn setarg(&mut self, i: usize, box_: crate::resoperation::OpRef) {
-        self.args[i] = box_;
+    pub fn setarg(&self, i: usize, box_: crate::resoperation::OpRef) {
+        self.args.borrow_mut()[i] = box_;
     }
 }

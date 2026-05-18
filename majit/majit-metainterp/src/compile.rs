@@ -1917,7 +1917,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .iter()
         .flat_map(|op| {
             std::iter::once(op.pos.get())
-                .chain(op.getarglist().iter().copied())
+                .chain(op.getarglist_copy())
                 .chain(op.getfailargs().into_iter().flatten())
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
@@ -2711,18 +2711,18 @@ mod tests {
         let vable_field = ops[0].pos.get();
 
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
-        assert_eq!(ops[1].args.as_slice(), &[vable_field]);
+        assert_eq!(&*ops[1].getarglist(), &[vable_field]);
         let forwarded_same_as = ops[1].pos.get();
         assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
-            ops[2].args.as_slice(),
+            &*ops[2].getarglist(),
             &[OpRef::input_arg_ref(0), forwarded_same_as]
         );
 
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(ops[3].args.as_slice(), &[forwarded_same_as]);
+        assert_eq!(&*ops[3].getarglist(), &[forwarded_same_as]);
     }
 
     #[test]
@@ -2768,14 +2768,14 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
-        assert_eq!(ops[1].args.as_slice(), &[ops[0].pos.get()]);
+        assert_eq!(&*ops[1].getarglist(), &[ops[0].pos.get()]);
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
         assert_eq!(ops[2].arg(0), ops[1].pos.get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
         assert_eq!(ops[3].arg(0), ops[1].pos.get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
-            ops[4].args.as_slice(),
+            &*ops[4].getarglist(),
             &[OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
         );
     }

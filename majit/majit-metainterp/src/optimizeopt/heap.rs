@@ -1675,7 +1675,7 @@ impl OptHeap {
         {
             return;
         }
-        for &arg in op.getarglist() {
+        for &arg in op.getarglist().iter() {
             self.escape_box(arg);
         }
     }
@@ -2510,7 +2510,7 @@ impl OptHeap {
                 // heap.py:130-134 emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos.get();
-                    if lazy_op.args.iter().any(|&a| a == ppos) {
+                    if lazy_op.getarglist().iter().any(|&a| a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
                         }

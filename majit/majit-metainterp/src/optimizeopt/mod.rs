@@ -2471,7 +2471,7 @@ impl OptContext {
             match produced_op.kind {
                 PreambleOpKind::Pure => {
                     let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
-                    for &arg in &produced_op.preamble_op.args {
+                    for &arg in produced_op.preamble_op.getarglist().iter() {
                         let Some(resolved) =
                             resolve_arg(arg, self, &produced_results, &mut imported_constants)
                         else {
@@ -8968,7 +8968,7 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops.len(), 1);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(
-            sp.ops[0].op.getarglist(),
+            &*sp.ops[0].op.getarglist(),
             &[OpRef::int_op(7), OpRef::int_op(8)]
         );
         assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));

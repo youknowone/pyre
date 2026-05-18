@@ -2535,7 +2535,7 @@ impl<'a> AssemblerARM64<'a> {
                         Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
                     };
                     let arg_tp = op
-                        .args
+                        .getarglist()
                         .get(i)
                         .and_then(|arg| self.opref_type_at(*arg, Some(op_index)))
                         .unwrap_or(Type::Int);

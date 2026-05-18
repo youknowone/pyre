@@ -7370,7 +7370,7 @@ mod tests {
         let tree_loop = ctx.into_tree_loop();
         let op = tree_loop.ops.last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
-        assert_eq!(op.args[0], obj);
+        assert_eq!(op.arg(0), obj);
     }
 
     #[test]
@@ -7415,7 +7415,7 @@ mod tests {
             if op.opcode == OpCode::GuardNonnullClass {
                 saw_guard_nonnull_class = true;
             }
-            if op.opcode == OpCode::GetfieldGcPureI && op.args.as_slice() == &[int_obj] {
+            if op.opcode == OpCode::GetfieldGcPureI && (&*op.getarglist()) == &[int_obj] {
                 saw_pure_payload = true;
             }
         }
@@ -7986,8 +7986,8 @@ mod tests {
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
         ));
-        assert_ne!(call.args[0], lhs);
-        assert_ne!(call.args[1], rhs);
+        assert_ne!(call.arg(0), lhs);
+        assert_ne!(call.arg(1), rhs);
     }
 
     #[test]
@@ -8025,7 +8025,7 @@ mod tests {
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
         ));
-        assert_ne!(call.args.last().copied(), Some(arg));
+        assert_ne!(call.getarglist().last().copied(), Some(arg));
     }
 
     #[test]

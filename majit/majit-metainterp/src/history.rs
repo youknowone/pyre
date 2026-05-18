@@ -244,7 +244,7 @@ impl TreeLoop {
                 }
             }
             // history.py:579-581: each arg must be Const or in seen
-            for arg in op.getarglist() {
+            for arg in op.getarglist().iter() {
                 if arg.is_none() {
                     return false;
                 }
@@ -288,7 +288,7 @@ impl TreeLoop {
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
-                for arg in op.getarglist() {
+                for arg in op.getarglist().iter() {
                     if arg.is_none() || arg.is_constant() {
                         return false;
                     }
@@ -382,7 +382,7 @@ impl TreeLoop {
         // OpRef::NONE (resume data handles materialization). Only regular
         // op args seed escaped refs for prefix re-emission.
         for op in cut_ops {
-            for arg in op.getarglist() {
+            for arg in op.getarglist().iter() {
                 if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                     queue.push_back(*arg);
                 }
@@ -398,7 +398,7 @@ impl TreeLoop {
             }
             let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
             if let Some(op) = self.ops.get(op_idx) {
-                for arg in op.getarglist() {
+                for arg in op.getarglist().iter() {
                     if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                         queue.push_back(*arg);
                     }
@@ -4368,7 +4368,7 @@ mod history_record_tests {
         let _ = ctx.call_assembler_ref_typed(&token, &args, &[Type::Ref, Type::Float, Type::Int]);
         let op = take_single_call_op(ctx, &args);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.getarglist(), &args);
+        assert_eq!(&*op.getarglist(), &args);
         let descr_arc = op.getdescr().expect("call op must carry descr");
         let call_descr = descr_arc
             .as_call_descr()
@@ -4397,7 +4397,7 @@ mod history_record_tests {
 
         let op = take_single_call_op(ctx, &[frame]);
         assert_eq!(op.opcode, OpCode::CallAssemblerR);
-        assert_eq!(op.getarglist(), &[frame]);
+        assert_eq!(&*op.getarglist(), &[frame]);
         let cd_arc = op.getdescr().expect("op must have descr");
         let call_descr = cd_arc
             .as_call_descr()

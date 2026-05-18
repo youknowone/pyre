@@ -4074,7 +4074,7 @@ fn validate_oprefs_for_compile(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == majit_ir::OpCode::Label {
             // LABEL params are introduced at the label block.
-            for &arg in op.getarglist() {
+            for &arg in op.getarglist().iter() {
                 if !arg.is_none() {
                     seen.insert(arg.raw());
                 }
@@ -4486,7 +4486,7 @@ fn build_type_overrides(
             if label_arg.is_none() {
                 continue;
             }
-            let Some(&jump_arg) = jump_op.args.get(i) else {
+            let Some(&jump_arg) = jump_op.getarglist().get(i) else {
                 continue;
             };
             if jump_arg.is_none() {
@@ -5180,8 +5180,8 @@ fn ref_root_slots_with_future_regular_uses(
                     .iter()
                     .skip(position + 1)
                     .flat_map(|op| {
-                        op.getarglist().iter()
-                            .copied()
+                        op.getarglist_copy()
+                            .into_iter()
                             .chain(op.getfailargs().into_iter().flatten())
                     })
                     .any(|arg| arg.raw() == *var_idx)
@@ -7911,8 +7911,8 @@ impl CraneliftBackend {
                 eprintln!(
                     "[label-dump] idx={} args.len={} args={:?}",
                     li,
-                    ops[li].args.len(),
-                    ops[li].args
+                    ops[li].num_args(),
+                    &*ops[li].getarglist()
                 );
             }
         }
@@ -7995,7 +7995,7 @@ impl CraneliftBackend {
             if op.opcode != OpCode::Label {
                 continue;
             }
-            for &arg in op.getarglist() {
+            for &arg in op.getarglist().iter() {
                 if arg.is_none() || declared_vars.contains(&arg.raw()) {
                     continue;
                 }
@@ -13842,7 +13842,7 @@ fn collect_terminal_exit_layouts(
 
         if is_finish || is_jump {
             let exit_types =
-                infer_fail_arg_types(op.getarglist(), &type_index, &type_overrides, op_index)?;
+                infer_fail_arg_types(&op.getarglist(), &type_index, &type_overrides, op_index)?;
             let force_token_slots: Vec<usize> = op.getarglist().iter()
                 .enumerate()
                 .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))

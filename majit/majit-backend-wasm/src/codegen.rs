@@ -131,7 +131,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             max_var = op.pos.get().raw() + 1;
         }
         if op.opcode == OpCode::Label {
-            for &a in op.getarglist() {
+            for &a in op.getarglist().iter() {
                 if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > max_var {
                     max_var = a.raw() + 1;
                 }

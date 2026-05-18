@@ -2935,19 +2935,13 @@ impl Optimization for OptRewrite {
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos.get()));
                     // rewrite.py:30-31: _callback records producer op
                     let call_opcode = OpCode::call_for_type(op.result_type());
-                    let mut producer = Op::new(call_opcode, op.getarglist());
+                    let producer = op.copy_and_change(call_opcode, None, None);
                     producer.pos.set(op.pos.get());
-                    if let Some(d) = op.getdescr() {
-                        producer.setdescr(d);
-                    }
                     self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
-                let mut new_op = Op::new(call_opcode, op.getarglist());
+                let new_op = op.copy_and_change(call_opcode, None, None);
                 new_op.pos.set(op.pos.get());
-                if let Some(d) = op.getdescr() {
-                    new_op.setdescr(d);
-                }
                 ctx.last_op_removed = false;
                 OptimizationResult::Emit(new_op)
             }
