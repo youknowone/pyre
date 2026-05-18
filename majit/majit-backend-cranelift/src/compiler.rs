@@ -15558,10 +15558,10 @@ mod tests {
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use std::collections::HashMap;
 
-    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut o = Op::new(opcode, args);
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
+        let o = Op::new(opcode, args);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
-        o
+        std::rc::Rc::new(o)
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
@@ -15585,10 +15585,15 @@ mod tests {
         assert_eq!(unknown, None);
     }
 
-    fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
-        let mut o = Op::with_descr(opcode, args, descr);
+    fn mk_op_with_descr(
+        opcode: OpCode,
+        args: &[OpRef],
+        pos: u32,
+        descr: majit_ir::DescrRef,
+    ) -> majit_ir::OpRc {
+        let o = Op::with_descr(opcode, args, descr);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
-        o
+        std::rc::Rc::new(o)
     }
 
     /// Test helper: synthesise a `ResumeGuardDescr` with `trace_id`
@@ -15987,7 +15992,7 @@ mod tests {
 
     fn assert_compile_unsupported(
         inputargs: Vec<InputArg>,
-        ops: Vec<Op>,
+        ops: Vec<majit_ir::OpRc>,
         token_number: u64,
         opcode: OpCode,
         expected_detail: &str,
@@ -21881,23 +21886,24 @@ mod tests {
         // ref_!(Newstr,...))) — the str pointer references must use the
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(102), OpRef::int_op(201)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[str0, OpRef::int_op(103), OpRef::int_op(202)],
             ),
-            Op::new(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
-            Op::new(OpCode::Strlen, &[str0]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
+            op(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
+            op(OpCode::Strlen, &[str0]),
+            op(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
 
         let mut constants = HashMap::new();
@@ -21929,18 +21935,19 @@ mod tests {
         // pointers; both must reference back as Ref-typed OpRefs.
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Strsetitem,
                 &[src, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(
+            op(
                 OpCode::Strsetitem,
                 &[src, OpRef::int_op(102), OpRef::int_op(201)],
             ),
-            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Copystrcontent,
                 &[
                     src,
@@ -21950,8 +21957,8 @@ mod tests {
                     OpRef::int_op(100),
                 ],
             ),
-            Op::new(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(5)]),
+            op(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
+            op(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
 
         let mut constants = HashMap::new();
@@ -21979,15 +21986,16 @@ mod tests {
         // ref_!(...,Newunicode,...))) — references to the unicode
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
-            Op::new(
+            op(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            op(
                 OpCode::Unicodesetitem,
                 &[buf, OpRef::int_op(101), OpRef::int_op(200)],
             ),
-            Op::new(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
-            Op::new(OpCode::Unicodelen, &[buf]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
+            op(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
+            op(OpCode::Unicodelen, &[buf]),
+            op(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
 
         let mut constants = HashMap::new();
@@ -22009,15 +22017,16 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
-            Op::new(
+            op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
+            op(
                 OpCode::Strgetitem,
                 &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
-            Op::new(
+            op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
@@ -22051,15 +22060,16 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_ref(0)];
+        let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
-            Op::new(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
-            Op::new(
+            op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
+            op(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
+            op(
                 OpCode::Unicodegetitem,
                 &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
-            Op::new(
+            op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
@@ -22307,7 +22317,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         // Build a guard with explicit fail_args so we can inspect them.
-        let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+        let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_op.setfailargs(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
@@ -22320,7 +22330,7 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            guard_op,
+            std::rc::Rc::new(guard_op),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
@@ -22359,7 +22369,7 @@ mod tests {
         // Loop: i = i + 1; guard_not_invalidated; guard i < limit; jump
         let inputargs = vec![InputArg::new_int(0)];
 
-        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
         let ops = vec![
@@ -22369,7 +22379,7 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ), // i = i + 1
-            guard_inv, // guard_not_invalidated
+            std::rc::Rc::new(guard_inv), // guard_not_invalidated
             mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
@@ -22409,12 +22419,12 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
 
-        let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
+        let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard_inv,
+            std::rc::Rc::new(guard_inv),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_int(0)],
