@@ -1154,29 +1154,33 @@ fn emit_link_renamings_into_block<F>(
     let insns = &mut spam_borrow.per_block_ssarepr;
     let insert_pos = match site {
         SpliceSite::SourceBeforeTerminator => {
-            // Find the pre-terminator position: scan back past the
-            // optional `Unreachable` tail, then before the terminator
-            // op itself.  Walker terminators for single-exit blocks
-            // are `goto` / `*_return` / `raise` / `reraise`.
-            let len = insns.len();
-            let mut pos = len;
-            if len >= 1 && matches!(insns.last(), Some(super::flatten::Insn::Unreachable)) {
-                pos = len - 1;
-            }
-            if pos >= 1 {
-                if let super::flatten::Insn::Op { opname, .. } = &insns[pos - 1] {
-                    let is_terminator = matches!(
-                        opname.as_str(),
-                        "goto"
-                            | "int_return"
-                            | "ref_return"
-                            | "float_return"
-                            | "void_return"
-                            | "raise"
-                            | "reraise"
-                    );
-                    if is_terminator {
-                        pos -= 1;
+            // Scan backward from the END to find the terminator op,
+            // splicing immediately before it.  A walker SpamBlock can
+            // contain content from PCs AFTER its terminator (e.g. the
+            // next linear PC's leading `Label + PcAnchor + -live-`
+            // scaffold appended via supersede / fall-through when the
+            // same SpamBlock spans multiple Python PCs), so naive
+            // "check last insn" misses the terminator.  Canonical
+            // `flatten.py:154 insert_renamings(link)` runs immediately
+            // before `make_bytecode_block(link.target)`, which emits
+            // `goto Label(block)` when target is already in
+            // `seen_blocks` — that goto IS the terminator we must
+            // splice before.
+            let terminators = [
+                "goto",
+                "int_return",
+                "ref_return",
+                "float_return",
+                "void_return",
+                "raise",
+                "reraise",
+            ];
+            let mut pos = insns.len();
+            for (i, insn) in insns.iter().enumerate() {
+                if let super::flatten::Insn::Op { opname, .. } = insn {
+                    if terminators.contains(&opname.as_str()) {
+                        pos = i;
+                        break;
                     }
                 }
             }
@@ -4794,6 +4798,14 @@ impl CodeWriter {
             ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
+                // `flatten.py:259` — emit bare `-live-` (empty
+                // force_alive) IMMEDIATELY before the guard.  Canonical
+                // (`flatten.rs:1888`) does the same; the bare marker
+                // seeds the guard's liveness snapshot for blackhole
+                // reconstruction.  The per-PC `-live-` with portal red
+                // args lives at the START of each PC's emission, not
+                // here.
+                push_walker_emit(&current_block, Insn::live(Vec::new()));
                 let insn = Insn::op(
                     "goto_if_not",
                     vec![
@@ -4827,6 +4839,8 @@ impl CodeWriter {
             ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
+                // `flatten.py:259` bare `-live-` precedes the guard.
+                push_walker_emit(&current_block, Insn::live(Vec::new()));
                 let insn = Insn::op(
                     "goto_if_not_int_is_zero",
                     vec![
