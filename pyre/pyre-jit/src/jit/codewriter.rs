@@ -11170,7 +11170,7 @@ mod tests {
 
         crate::jit::liveness::remove_repeated_live(&mut ssarepr);
 
-        // Anchor positions: PcAnchor(0)@0, PcAnchor(1)@2.
+        // Anchor positions: Label(pc0)@0, Label(pc1)@2.
         assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 2]);
         // Per-PC `-live-` boundaries: live(R0) at index 1,
         // live(R1) at index 3.
