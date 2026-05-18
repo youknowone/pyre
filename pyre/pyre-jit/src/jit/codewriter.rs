@@ -716,6 +716,13 @@ impl SpamBlockRef {
     fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
         self.0.borrow().per_block_ssarepr.clone()
     }
+
+    /// Length of the per-block accumulator without cloning.  Used by
+    /// the T6.1 walker-time PC dispatch tracker to record per-PC
+    /// `-live-` marker positions at emit time.
+    fn per_block_ssarepr_len(&self) -> usize {
+        self.0.borrow().per_block_ssarepr.len()
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -3883,6 +3890,22 @@ impl CodeWriter {
             all_walker_blocks.push(start_block.clone());
             joinpoints.insert(0, vec![start_block]);
         }
+        // T6.1 walker-time PC live-marker tracker.  Records every
+        // `-live-` marker emitted at each Python PC as
+        // `(SpamBlockRef, offset_in_block)` so a drain-time resolver
+        // can pick the FIRST entry whose block is still live (matches
+        // `live_marker_indices_by_pc`'s first-wins-over-final-SSARepr
+        // semantics — supersede / `mark_dead` clears the per-block
+        // accumulator, so the canonical answer comes from the first
+        // entry in a *live* block).  Vec-of-Vec mirrors RPython's
+        // `flowcontext.py:42 SpamBlock` model where multiple
+        // SpamBlocks can record into the same py_pc through
+        // joinpoint candidates (`flowcontext.py:426 candidates =
+        // self.joinpoints.setdefault(...)`).  Populated at walker emit
+        // time so a future slice can stop emitting per-PC
+        // `Insn::Label("pc{N}")` while still resolving `pc_map`.
+        let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
+            vec![Vec::new(); num_instrs];
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
             HashMap::with_capacity(catch_sites.len());
         for site in &catch_sites {
@@ -5720,6 +5743,19 @@ impl CodeWriter {
                     }
 
                     emit_live_placeholder!();
+                    // T6.1: record the per-PC `-live-` marker position
+                    // at walker emit time.  `emit_live_placeholder!()`
+                    // pushed the `-live-` as the last insn in
+                    // `current_block.per_block_ssarepr`.  Record EVERY
+                    // emit (not just first) — `mark_dead` later may
+                    // clear the recorded block's accumulator, so the
+                    // drain-time resolver picks the first entry whose
+                    // block is still live, matching
+                    // `live_marker_indices_by_pc`'s scan over the final
+                    // SSARepr (which only contains live-block content).
+                    let offset = current_block.per_block_ssarepr_len() - 1;
+                    walker_pc_live_marker_pos[py_pc]
+                        .push((current_block.clone(), offset));
 
                     // Dead-code dispatch gate: `current_block` has already
                     // been closed by a previous terminator emit (`emit_goto!`,
@@ -8796,7 +8832,79 @@ impl CodeWriter {
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
+            // T6.1 Slice 2: resolve walker-tracked PC live-marker
+            // positions to absolute SSARepr indices using POST-STRIP
+            // prefix lengths.  Captured BEFORE strip mutates `blocks`
+            // so per-block offsets stay aligned — strip only truncates
+            // the trailing `goto + Unreachable` pair from a block tail,
+            // so the `-live-` marker positions (which never live in
+            // the tail) are invariant.  Picks the FIRST entry per PC
+            // whose block contributes non-empty content to the final
+            // SSARepr (matches `live_marker_indices_by_pc`'s scan).
+            let walker_tracked_pc_live_indices: Option<Vec<usize>> = {
+                let mut post_strip_lens: Vec<usize> = Vec::with_capacity(blocks.len());
+                for (i, b) in blocks.iter().enumerate() {
+                    let mut probe = vec![b.clone()];
+                    if i + 1 < blocks.len() {
+                        probe.push(blocks[i + 1].clone());
+                    } else {
+                        probe.push(Vec::new());
+                    }
+                    super::codewriter::strip_walker_block_boundary_goto(&mut probe);
+                    post_strip_lens.push(probe[0].len());
+                }
+                let mut post_strip_block_starts: Vec<usize> = Vec::with_capacity(blocks.len());
+                let mut running = 0usize;
+                for &len in &post_strip_lens {
+                    post_strip_block_starts.push(running);
+                    running += len;
+                }
+                let mut translated: Vec<usize> = Vec::with_capacity(walker_pc_live_marker_pos.len());
+                let mut all_resolved = true;
+                for py_pc_entries in &walker_pc_live_marker_pos {
+                    let resolved = py_pc_entries.iter().find_map(|(block_ref, offset)| {
+                        let block_pos = reordered.iter().position(|b| b == block_ref)?;
+                        // Skip if the block's post-strip contribution
+                        // is empty (mark_dead cleared per_block_ssarepr,
+                        // or strip removed the only content).
+                        if post_strip_lens[block_pos] == 0 {
+                            return None;
+                        }
+                        // Skip if the offset would land in the stripped
+                        // tail (offset >= post_strip_len).
+                        if *offset >= post_strip_lens[block_pos] {
+                            return None;
+                        }
+                        Some(post_strip_block_starts[block_pos] + offset)
+                    });
+                    match resolved {
+                        Some(idx) => translated.push(idx),
+                        None => {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
+                if all_resolved { Some(translated) } else { None }
+            };
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
+            // Parity check (debug-only): walker-time tracking must agree
+            // with the legacy SSARepr scan.  Failure here means a
+            // walker emit site pushed `-live-` without updating
+            // `walker_pc_live_marker_pos`, or first-wins disagreement.
+            #[cfg(debug_assertions)]
+            if let Some(walker_tracked) = walker_tracked_pc_live_indices.as_ref() {
+                if walker_tracked.len() == code.instructions.len() {
+                    let scanned =
+                        live_marker_indices_by_pc(&ssarepr, code.instructions.len());
+                    assert_eq!(
+                        walker_tracked, &scanned,
+                        "T6.1 walker-tracked PC live-marker positions diverge from \
+                         live_marker_indices_by_pc"
+                    );
+                }
+            }
+            let _ = walker_tracked_pc_live_indices;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
