@@ -428,6 +428,19 @@ impl FailDescr for ResumeGuardDescr {
             // `set_trace_info_any` / `set_trace_info`.  Bump the strong
             // count and reconstruct so the caller gets an owning Arc
             // without taking ownership from the cell.
+            //
+            // The `load` → `increment_strong_count` window is sound under
+            // pyre's single-JIT-thread invariant (RPython GIL parity):
+            // `set_trace_info_any` and `Drop::drop` only run on the JIT
+            // compiler thread.  Reads happen either from the same thread
+            // (codegen helpers like `fail_descr_trace_info`) or from JIT-
+            // baked code executed under the same GIL-equivalent
+            // serialization.  A re-publishing `set_trace_info_any` cannot
+            // interleave between this load and the strong-count bump,
+            // so the pointed-to `Arc` cannot be freed mid-protocol.  The
+            // atomic primitive exists so JIT-baked machine code can
+            // address the cell without a lock; cross-thread concurrency
+            // is not part of the invariant.
             unsafe {
                 Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
                 let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
@@ -588,6 +601,14 @@ impl ResumeGuardDescr {
     /// Read the per-trace `CompiledTraceInfo` (Slice 7-Tβ10).
     /// Returns an owned clone of the published value, or `None` when
     /// no trace info has been published.  Lock-free.
+    ///
+    /// The `load` → `increment_strong_count` window relies on pyre's
+    /// single-JIT-thread invariant (RPython GIL parity): no concurrent
+    /// `set_trace_info` / `Drop::drop` can interleave between the load
+    /// and the strong-count bump because all publishers run on the JIT
+    /// compiler thread and readers run under the same serialization.
+    /// The `AtomicPtr` exists so JIT-baked machine code can read the
+    /// cell without a mutex, not to support cross-thread publishing.
     pub fn trace_info(&self) -> Option<CompiledTraceInfo> {
         let ptr = self.trace_info.load(Ordering::Acquire);
         if ptr.is_null() {
@@ -596,6 +617,7 @@ impl ResumeGuardDescr {
             // Safety: `ptr` was produced by `Arc::into_raw(Arc::new(info))`
             // in `set_trace_info`; increment_strong_count + from_raw
             // yields an extra owning Arc the caller can deref + clone.
+            // Single-thread invariant above prevents UAF.
             unsafe {
                 Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
                 let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
