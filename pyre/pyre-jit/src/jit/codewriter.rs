@@ -8734,19 +8734,44 @@ impl CodeWriter {
                 &_graph_regallocs,
                 &all_walker_blocks,
             );
-            // RPython parity: `iterblocks` (`flowspace/model.py:55-77`)
-            // enumerates every reachable block including dead ones;
-            // the "no codegen" semantics ride on `block.operations`
-            // being the empty tuple after `mergeblock` cleared it
-            // (`flowcontext.py:455-457`).  Pyre mirrors that in
-            // `SpamBlockRef::mark_dead` by clearing
-            // `per_block_ssarepr` alongside the `dead` flag, so the
-            // unfiltered drain below yields zero insns from dead
-            // blocks while still preserving their position in walker-
-            // creation order (relevant for the supersede newblock's
-            // first-wins `pc_anchor_positions` lookup since the dead
-            // block's now-empty entry no longer competes).
-            let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
+            // Reorder all_walker_blocks per `graph.iterblocks()` DFS
+            // pre-order so the drain matches canonical `make_bytecode_block`
+            // (`flatten.py:107-156`) emission order.  Canonical recurses
+            // into each link's target immediately after emitting the
+            // source's body; iterblocks (`flowspace/model.py:55-77`)
+            // produces the same pre-order via explicit reversed-stack
+            // DFS.  Walker emits per-PC into pendingblocks queue order
+            // which diverges from DFS — block-boundary `goto pcX` ops
+            // whose target isn't the immediately-next walker block
+            // survive `strip_walker_block_boundary_goto` and produce
+            // walker_unmatched against canonical.  Post-walk reorder
+            // by DFS aligns the drain so the strip catches them.
+            //
+            // Dead supersede blocks have empty `per_block_ssarepr`
+            // (cleared by `mark_dead`), so their position in the order
+            // doesn't contribute insns; `pc_anchor_positions`
+            // first-wins remains stable.  Synthetic walker blocks
+            // (catch-landings, blocks not reachable in graph DFS)
+            // append in their original creation order after the
+            // DFS-matched prefix.
+            let dfs_blocks = graph.iterblocks();
+            let mut reordered: Vec<SpamBlockRef> =
+                Vec::with_capacity(all_walker_blocks.len());
+            let mut placed: Vec<bool> = vec![false; all_walker_blocks.len()];
+            for gb in &dfs_blocks {
+                for (idx, spam) in all_walker_blocks.iter().enumerate() {
+                    if !placed[idx] && spam.block() == *gb {
+                        reordered.push(spam.clone());
+                        placed[idx] = true;
+                    }
+                }
+            }
+            for (idx, spam) in all_walker_blocks.iter().enumerate() {
+                if !placed[idx] {
+                    reordered.push(spam.clone());
+                }
+            }
+            let mut blocks: Vec<Vec<super::flatten::Insn>> = reordered
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
@@ -9102,6 +9127,28 @@ impl CodeWriter {
                     })
                     .collect()
             }
+            // Stricter splice gate: compare the full Insn::Op stream
+            // (INCLUDING `-live-` ops) positionally.  `byte_equivalent`'s
+            // multiset match over non-`-live-` Insn::Op is necessary but
+            // INSUFFICIENT for splice safety — runtime liveness depends
+            // on `-live-` operand lists (canonical's `live_force_alive_ops`
+            // is pre-seeded with portal red args, but other walker `-live-`
+            // operands may differ) AND on op position (the assembler
+            // emits sequentially; reordering two compatible ops can shift
+            // which registers are alive at each guard point).
+            fn op_stream_full(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
+                ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|insn| match insn {
+                        super::flatten::Insn::Op { .. } => Some(format!("{insn:?}")),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            let walker_stream = op_stream_full(&ssarepr);
+            let canonical_stream = op_stream_full(&canonical_ssarepr);
+            let strict_sequence_match = walker_stream == canonical_stream;
             let walker_op_set = op_debug_strings(&ssarepr);
             let canonical_op_set = op_debug_strings(&canonical_ssarepr);
             let mut matched = 0usize;
@@ -9274,7 +9321,7 @@ impl CodeWriter {
             // canonical_unmatched divergence closes (separate
             // slices) or nbody/spectral_norm/nested_loop's walker
             // load-bearing ops are restructured.
-            if walker_unmatched == 0 && canonical_unmatched == 0 {
+            if walker_unmatched == 0 && canonical_unmatched == 0 && strict_sequence_match {
                 // Phase 4 slice 3 — PC coverage gate.  pyre's runtime
                 // dispatch (`pc_anchor_positions` at codewriter.rs:2585)
                 // asserts every Python PC has a `pc{N}` Label anchor.
