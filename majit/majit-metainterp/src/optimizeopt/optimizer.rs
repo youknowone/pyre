@@ -81,9 +81,6 @@ pub struct Optimizer {
     /// code depends on. After compilation, each dependency gets the loop's
     /// invalidation flag registered as a per-slot watcher.
     pub quasi_immutable_deps: Vec<(u64, u32)>,
-    /// Types of constant OpRefs from ConstantPool.constant_types.
-    /// Used to distinguish Ref constants from Int in guard fail_args.
-    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
@@ -1148,7 +1145,6 @@ impl Optimizer {
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),
-            constant_types: std::collections::HashMap::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
             runtime_boxes: Vec::new(),
@@ -2069,15 +2065,14 @@ impl Optimizer {
         // during optimization (rewrite.rs / simplify.rs). No synthetic
         // fallback — RPython relies solely on the actual GFC from tracing.
 
-        // RPython resume.py parity: pass snapshot_boxes and constant_types
-        // to OptContext so emit() can call store_final_boxes_in_guard inline
-        // at each guard emission (not post-assembly).
+        // RPython resume.py parity: pass snapshot_boxes to OptContext so
+        // emit() can call store_final_boxes_in_guard inline at each guard
+        // emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         ctx.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        ctx.constant_types = self.constant_types.clone();
 
         sanitize_backend_constants_for_ops(ops, constants);
         // Pre-populate known constants so passes can see them.
@@ -5004,7 +4999,6 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants = std::collections::HashMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
@@ -5042,7 +5036,6 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants = std::collections::HashMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result[0].pos.get(), OpRef::int_op(5));
@@ -5069,8 +5062,6 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
-        opt.constant_types.insert(0, Type::Int);
-        opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
@@ -5091,9 +5082,6 @@ mod tests {
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(0, Type::Int);
-        opt.constant_types.insert(1, Type::Int);
-        opt.constant_types.insert(3, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);

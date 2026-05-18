@@ -64,8 +64,6 @@ pub struct UnrollOptimizer {
     /// warmstate.py: max_retrace_guards parameter. If a compiled trace has
     /// more guards than this, retracing is permanently disabled.
     pub max_retrace_guards: u32,
-    /// Constant type hints from ConstantPool, propagated to inner Optimizer.
-    pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// compile.py:362: pre-imported ExportedState for compile_retrace.
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
@@ -144,7 +142,6 @@ impl UnrollOptimizer {
             short_preamble: None,
             target_tokens: Vec::new(),
             retraced_count: 0,
-            constant_types: std::collections::HashMap::new(),
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
             // Production callers (pyjitpl/mod.rs:4109,5170) override
@@ -346,7 +343,6 @@ impl UnrollOptimizer {
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
-            opt_p1.constant_types = self.constant_types.clone();
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.cls_of_box_fn = self.cls_of_box_fn;
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
@@ -610,7 +606,6 @@ impl UnrollOptimizer {
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
-        opt_p2.constant_types = self.constant_types.clone();
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cls_of_box_fn = self.cls_of_box_fn;
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
@@ -1542,11 +1537,6 @@ impl UnrollOptimizer {
             eprintln!("[jit] consts_p2: {:?}", sorted_consts);
         }
         *constants = consts_p2;
-        // Merge Phase 2 constant types back so build_guard_metadata
-        // can resolve Phase 2 allocated constants for rd_virtuals.
-        for (k, v) in &opt_p2.constant_types {
-            self.constant_types.entry(*k).or_insert(*v);
-        }
         (combined, p2_ni)
     }
 
@@ -3243,14 +3233,11 @@ impl OptUnroll {
             // `make_constant` early-returns on const-namespace OpRefs
             // (history.py:208 — Const.is_constant() == True), so
             // const_pool registration is the explicit seed below.
-            // Side-table type write keeps raw-u32 keyed readers in
-            // lockstep (optimizer.py:Const.type is intrinsic on the
-            // Box, history.py:220/261/307).
+            // history.py:220/261/307 — `Const.type` is intrinsic on the
+            // Box itself, so no parallel raw-u32 type side-table is
+            // needed (callers recover the type via `OpRef::ty()` or
+            // `Const::get_type()`).
             ctx.const_pool.entry_or_insert_with(idx, || value);
-            optimizer
-                .constant_types
-                .entry(typed_opref.raw())
-                .or_insert(tp);
         }
 
         let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =

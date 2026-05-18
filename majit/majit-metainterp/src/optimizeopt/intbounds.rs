@@ -4218,7 +4218,6 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);

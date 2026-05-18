@@ -3284,7 +3284,6 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
@@ -3743,7 +3742,6 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert_eq!(
             result.len(),
@@ -4439,8 +4437,6 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100u32, majit_ir::Value::Int(7));
         constants.insert(101u32, majit_ir::Value::Int(11));
-        opt.constant_types.insert(100, majit_ir::Type::Int);
-        opt.constant_types.insert(101, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: Vec<_> = result

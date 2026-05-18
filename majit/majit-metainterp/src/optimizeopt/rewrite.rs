@@ -4663,7 +4663,6 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -4687,7 +4686,6 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(-1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(
@@ -4713,7 +4711,6 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         // Float constant as Value::Float
         constants.insert(200u32, majit_ir::Value::Float(-1.0));
-        opt.constant_types.insert(200, majit_ir::Type::Float);
         // Need float constant support in ctx — skip for now, just test no crash
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(!result.is_empty());
@@ -4734,7 +4731,6 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
@@ -4757,7 +4753,6 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),

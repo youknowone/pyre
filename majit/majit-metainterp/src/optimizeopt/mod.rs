@@ -731,11 +731,6 @@ pub struct OptContext {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// ConstantPool type map, cloned from `Optimizer.constant_types` at
-    /// `transfer_state_to_context`. Carries the intrinsic
-    /// Const{Int,Float,Ptr} type per OpRef raw — used by short_preamble
-    /// + BoxEnv numbering paths.
-    pub constant_types: HashMap<u32, majit_ir::Type>,
     /// Inputarg types indexed by slot, mirroring `Optimizer.trace_inputarg_types`
     /// (recorder side `InputArg{Int,Ref,Float}.tp`). Slot `i` corresponds to
     /// `OpRef(inputarg_base + i)`. Populated in `setup_optimizations` so
@@ -1613,7 +1608,6 @@ impl OptContext {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            constant_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
@@ -1741,7 +1735,6 @@ impl OptContext {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            constant_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,

@@ -1847,7 +1847,6 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         constants.insert(100u32, majit_ir::Value::Int(0xCAFE)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(100, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1937,7 +1936,6 @@ mod tests {
         }
         let mut opt = Optimizer::new();
         for i in 0..20u32 {
-            opt.constant_types.insert(i + 100, majit_ir::Type::Int);
         }
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
@@ -1967,7 +1965,6 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         constants.insert(200u32, majit_ir::Value::Int(0xBEEF)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(200, majit_ir::Type::Int);
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -1995,8 +1992,6 @@ mod tests {
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2022,8 +2017,6 @@ mod tests {
         constants.insert(10_001u32, majit_ir::Value::Int(5));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 
@@ -2079,8 +2072,6 @@ mod tests {
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
         let mut opt = Optimizer::new();
-        opt.constant_types.insert(10_000, majit_ir::Type::Int);
-        opt.constant_types.insert(10_001, majit_ir::Type::Int);
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants(&ops, &mut constants);
 

@@ -4233,10 +4233,10 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: every Const Box pins its `.type`
-        // intrinsically, so the optimizer's seed-side `constant_types`
-        // table is just the per-entry type tag derived from `constants`.
-        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
+        // intrinsic attribute on the Box itself, so no raw-u32 type
+        // side-table propagation is needed; callers recover the type
+        // through `OpRef::ty()` / `Const::get_type()`.
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -4282,20 +4282,13 @@ impl<M: Clone> MetaInterp<M> {
                     {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
-                        simple_opt.constant_types = retry_constants
-                            .iter()
-                            .map(|(&k, v)| (k, v.get_type()))
-                            .collect();
-                        // history.py:_make_op parity — see the
-                        // function-entry compile path below.
+                        // history.py:220/261/307: `Const.type` /
+                        // `InputArg.type` are intrinsic on the box;
+                        // no raw-u32 type side-table propagation is
+                        // needed (callers read via `OpRef::ty()`).
                         let inputarg_types: Vec<majit_ir::Type> =
                             trace.inputargs.iter().map(|ia| ia.tp).collect();
                         simple_opt.trace_inputarg_types = inputarg_types.clone();
-                        for (i, &tp) in inputarg_types.iter().enumerate() {
-                            simple_opt
-                                .constant_types
-                                .insert(OpRef::input_arg_typed(i as u32, tp).raw(), tp);
-                        }
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -5289,9 +5282,8 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
-        // history.py:220 box.type parity: derive `constant_types` from
-        // the typed `Value` pool (each pool entry pins its box class).
-        unroll_opt.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
+        // history.py:220/261/307 — `Const.type` is intrinsic on the
+        // box; no raw-u32 type side-table propagation is needed.
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
@@ -5777,18 +5769,15 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
         let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
         optimizer.trace_inputarg_types = inputarg_types.clone();
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            optimizer
-                .constant_types
-                .insert(OpRef::input_arg_typed(i as u32, tp).raw(), tp);
-        }
+        // history.py:220/261/307 — `Const.type` / `InputArg.type` are
+        // intrinsic on the box itself; no raw-u32 type side-table
+        // propagation is needed.
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -5799,14 +5788,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: derive the optimizer's
-        // `constant_types` from the typed-`Value` pool (the box class is
-        // pinned on every `Value`). Then re-stamp inputarg slot types
-        // (op-position slots for fresh inputargs are not in `constants`).
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            optimizer.constant_types.insert(i as u32, tp);
-        }
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (mod.rs:2261) can properly populate
@@ -6194,15 +6175,12 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
-        // history.py InputArg.type parity: each `InputArg` already carries
-        // its type in the typed OpRef variant tag (`InputArg::opref()` calls
-        // `OpRef::input_arg_typed(idx, tp)` in majit-ir/src/value.rs:253).
-        // `opref_type` (optimizer/mod.rs:5016) reads `resolved.ty()` from the
-        // variant tag at priority-0 before consulting any side table, so the
-        // legacy `constant_types.insert(ia.opref().raw(), ia.tp)` writes
-        // were redundant for typed inputargs.
+        // history.py:220/261/307 — `Const.type` / `InputArg.type` are
+        // intrinsic on the box itself (recovered via `OpRef::ty()` from
+        // the typed variant tag), so no raw-u32 type side-table
+        // propagation is needed for either pooled constants or
+        // inputargs.
 
         let (
             snapshot_map,
@@ -6211,14 +6189,6 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // history.py:220 box.type parity: derive the optimizer's
-        // `constant_types` from the typed-`Value` pool (each `Value`
-        // pins its box class intrinsically).
-        optimizer.constant_types = constants.iter().map(|(&k, v)| (k, v.get_type())).collect();
-        // RPython Box.type parity: register inputarg types.
-        for ia in &trace.inputargs {
-            optimizer.constant_types.insert(ia.index, ia.tp);
-        }
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
@@ -8293,7 +8263,6 @@ impl<M: Clone> MetaInterp<M> {
                 (k, heap_value_for(tp, raw))
             })
             .collect();
-        optimizer.constant_types = constant_types.clone();
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
         // see optimizer.rs:5016 `opref_type` priority-0 variant-tag read.
@@ -8821,7 +8790,6 @@ impl<M: Clone> MetaInterp<M> {
                 (k, heap_value_for(tp, raw))
             })
             .collect();
-        optimizer.constant_types = constant_types.clone();
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
