@@ -2830,6 +2830,14 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // `pyjitpl.py:2889 self.staticdata._setup_once()` parity —
+        // PyPy's first `compile_and_run_once` per CPU dispatches the
+        // `globaldata.initialized`-gated `_setup_once` which calls
+        // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
+        // back-edge entry routes through `bound_reached`, so the
+        // gate fires here.  Idempotent.
+        self.staticdata._setup_once(&mut self.backend);
+
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -14452,6 +14460,26 @@ impl MetaInterpStaticData {
                 jd.build_portal_calldescr();
             }
         }
+    }
+
+    /// pyjitpl.py:2292-2303 `_setup_once` — guarded by
+    /// `globaldata.initialized` so it runs exactly once per CPU after
+    /// `finish_setup` has installed every descr (`pyjitpl.py:2255`,
+    /// `pyjitpl.py:2283`).  Dispatches `cpu.setup_once()`
+    /// (`pyjitpl.py:2297 self.cpu.setup_once()`), which is the call
+    /// that materialises the per-CPU malloc / propagate trampolines
+    /// in PyPy (`llsupport/assembler.py:97 setup_once`).
+    ///
+    /// Pyre invokes this from the metainterp's back-edge entry
+    /// `MetaInterp::bound_reached` (pyre analogue of
+    /// `pyjitpl.py:2889 compile_and_run_once`).
+    pub fn _setup_once(&self, backend: &mut BackendImpl) {
+        let mut gd = self.globaldata.lock().unwrap();
+        if gd.initialized {
+            return;
+        }
+        backend.setup_once();
+        gd.initialized = true;
     }
 
     /// pyjitpl.py:2305-2323 `get_name_from_address(addr)`.

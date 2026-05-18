@@ -77,4 +77,17 @@ impl X86CpuExt {
         self.malloc_slowpath_fixed = Some(addr);
         addr
     }
+
+    /// Read the post-`setup_once` malloc slowpath address.  Panics if
+    /// `Backend::setup_once` (`pyjitpl.py:2297` parity) has not been
+    /// called yet — PyPy's `globaldata.initialized` gate
+    /// (`pyjitpl.py:2292-2303`) guarantees the trampoline is built
+    /// before any `compile_loop`, so a `None` read here is a wire-up
+    /// bug, not a runtime condition.
+    pub(crate) fn malloc_slowpath_fixed(&self) -> usize {
+        self.malloc_slowpath_fixed.expect(
+            "Backend::setup_once must run before compile_loop reads malloc_slowpath_fixed \
+             (pyjitpl.py:2292-2303 `_setup_once` parity)",
+        )
+    }
 }

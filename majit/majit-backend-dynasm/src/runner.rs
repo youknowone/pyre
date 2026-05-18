@@ -797,6 +797,15 @@ impl DynasmBackend {
         <Self as Backend>::set_done_with_this_frame_descr_float(self, float);
         <Self as Backend>::set_exit_frame_with_exception_descr_ref(self, exit_exc);
         <Self as Backend>::set_propagate_exception_descr(self, propagate);
+        // `pyjitpl.py:2297 self.cpu.setup_once()` parity — production
+        // reaches `cpu.setup_once()` via `MetaInterpStaticData::_setup_once`
+        // (`pyjitpl.py:2292-2303`) on first JIT entry, AFTER every descr
+        // setter has run.  Backend-only tests bypass the metainterp gate,
+        // so call `setup_once` here directly once the descrs are in place
+        // — analogous to PyPy test helpers that explicitly call
+        // `cpu.setup_once()` after manual descr attachment (e.g.
+        // `rpython/jit/backend/ppc/test/test_regalloc_3.py:10`).
+        <Self as Backend>::setup_once(self);
     }
 
     /// Active vtable_offset for the assembler to consume during codegen.
@@ -1547,9 +1556,7 @@ impl Backend for DynasmBackend {
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_fixed = self
-            .arch_cpu_ext
-            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        let malloc_slowpath_fixed = self.arch_cpu_ext.malloc_slowpath_fixed();
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -1731,9 +1738,7 @@ impl Backend for DynasmBackend {
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_fixed = self
-            .arch_cpu_ext
-            .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        let malloc_slowpath_fixed = self.arch_cpu_ext.malloc_slowpath_fixed();
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -2994,7 +2999,28 @@ impl Backend for DynasmBackend {
         Self::try_find_descr(token, trace_id, fail_index).is_some()
     }
 
-    fn setup_once(&mut self) {}
+    /// `pyjitpl.py:2297 self.cpu.setup_once()` parity, dispatched by
+    /// `MetaInterpStaticData::_setup_once` under the
+    /// `globaldata.initialized` gate (`pyjitpl.py:2292-2303`).  All
+    /// per-CPU descrs (notably `propagate_exception_descr` via
+    /// `set_propagate_exception_descr`) must already be installed
+    /// when this runs; the helpers we materialise here bake those
+    /// descr pointers as immediates and assert non-zero on build.
+    ///
+    /// PyPy's `llsupport/assembler.py:97 setup_once` builds the
+    /// propagate trampoline + every `_build_malloc_slowpath` variant
+    /// (`fixed` / `varsize` / `str` / `unicode`).  Pyre's x86 path so
+    /// far implements only `fixed`; varsize/str/unicode are inlined
+    /// at the per-callsite emitter and remain to port.
+    fn setup_once(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.arch_cpu_ext
+                .ensure_propagate_exception_path(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        }
+    }
     fn finish_once(&mut self) {}
 }
 

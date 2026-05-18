@@ -2583,7 +2583,15 @@ pub trait Backend: Send {
         }
     }
 
-    /// model.py: setup_once() — called once when the backend is first used.
+    /// `model.py:34 AbstractCPU.setup_once` parity, called by
+    /// `pyjitpl.py:2297 self.cpu.setup_once()` inside
+    /// `MetaInterpStaticData._setup_once` (`pyjitpl.py:2292-2303`),
+    /// guarded by `globaldata.initialized` so it runs exactly once
+    /// per CPU after every descr setter has been called.  Backends
+    /// that need to materialise per-CPU trampolines (x86
+    /// `_build_propagate_exception_path` / `_build_malloc_slowpath`)
+    /// override this; default is no-op for backends without
+    /// setup-time work.
     fn setup_once(&mut self) {}
     /// model.py: finish_once() — called when the JIT shuts down.
     fn finish_once(&mut self) {}
