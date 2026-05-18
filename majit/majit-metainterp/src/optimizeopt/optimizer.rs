@@ -231,32 +231,10 @@ pub struct Optimizer {
     pub emitted_operations: std::collections::HashSet<OpRef>,
 }
 
-/// Lower a typed-`Value` constants pool back to the legacy
-/// `(HashMap<u32, i64>, HashMap<u32, Type>)` shape expected by the
-/// backend's `set_constants` / `set_constant_types` boundary.
-///
-/// history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
-/// `Box.type` at construction, so the lowering is total — every
-/// `Value` round-trips to a single `(i64, Type)` pair.
-pub(crate) fn lower_typed_constants_to_backend(
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
-) -> (
-    std::collections::HashMap<u32, i64>,
-    std::collections::HashMap<u32, Type>,
-) {
-    let mut bits = std::collections::HashMap::with_capacity(constants.len());
-    let mut types = std::collections::HashMap::with_capacity(constants.len());
-    for (&k, v) in constants {
-        let c = v.to_const();
-        bits.insert(k, c.as_raw_i64());
-        types.insert(k, c.get_type());
-    }
-    (bits, types)
-}
-
 /// Lower a typed-`Value` constants pool into the dense
 /// `VecAssoc<u32, Const>` shape consumed by pyre-side guard metadata
-/// builders and CompiledTrace storage.
+/// builders, CompiledTrace storage, and the backend's
+/// `set_constants_pool` boundary.
 ///
 /// history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
 /// constant classes — `Value::Void` panics rather than fabricate a
