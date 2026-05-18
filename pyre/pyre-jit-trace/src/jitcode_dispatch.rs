@@ -8248,9 +8248,10 @@ mod tests {
             let ops = wc.trace_ctx.ops();
             let last = ops.last().expect("ptr_nonzero must record one op");
             last_opcode = last.opcode;
-            last_args_len = last.args.len();
-            last_args0 = last.args[0];
-            last_args1 = last.args[1];
+            let args = last.getarglist();
+            last_args_len = args.len();
+            last_args0 = args[0];
+            last_args1 = args[1];
         }
         assert_eq!(last_opcode, majit_ir::OpCode::PtrNe);
         assert_eq!(last_args_len, 2);
@@ -8351,7 +8352,8 @@ mod tests {
         let (last_opcode, last_args0, last_args1, last_args_len) = {
             let ops = wc.trace_ctx.ops();
             let last = ops.last().expect("ref_guard_value must record one op");
-            (last.opcode, last.args[0], last.args[1], last.args.len())
+            let args = last.getarglist();
+            (last.opcode, args[0], args[1], args.len())
         };
         assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
         assert_eq!(last_args_len, 2);
@@ -10936,15 +10938,15 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
         assert_eq!(
-            last.args.as_slice(),
+            &*last.getarglist(),
             &[array, index],
             "GetarrayitemGcR args must be [array, index] read from r-bank",
         );
         assert!(std::sync::Arc::ptr_eq(
-            last.descr.as_ref().expect("must carry array descr"),
+            last.getdescr().as_ref().expect("must carry array descr"),
             &descr,
         ));
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
