@@ -9137,31 +9137,30 @@ impl CodeWriter {
             // `pc_anchor_positions` / `live_marker_indices_by_pc`
             // lookups consume it without modification.
             //
-            // Gate on `canonical_unmatched == 0` (canonical is subset
-            // of walker): swapping in canonical can only REMOVE ops
-            // walker had (the pyre-only scaffold).  All ops canonical
-            // emits also appear in walker, so the runtime semantics
-            // are preserved.  Graphs with `canonical_unmatched > 0`
-            // (fannkuch's 3 insert_renamings ref_copies) are skipped
-            // for now — those require canonical-side ops walker
-            // doesn't have, which would change runtime behavior in
-            // ways that need per-bench verification.
+            // Gate on `byte_equivalent` (walker_unmatched == 0 AND
+            // canonical_unmatched == 0): when both streams produce
+            // the same multiset of Insn::Op entries, the splice is
+            // semantics-preserving.  `canonical_unmatched == 0`
+            // alone is INSUFFICIENT — walker's extra (walker_unmatched
+            // > 0) ops carry load-bearing pyre-only side effects
+            // (vable depth tracking, stack-mirror updates, etc.)
+            // that nbody/spectral_norm/nested_loop need at runtime.
+            // Earlier Phase 4 endgame Step 0 confirmed: at
+            // canonical_unmatched=0 / walker_unmatched > 0, the
+            // splice can produce WRONG output (spectral_norm) or
+            // major perf regression (nbody 65×) — even though
+            // canonical is structurally a subset of walker.
             //
-            // ENV-GATE REASON: `-live-` args are just
-            // `force_alive` seeds at emit time; actual liveness is
-            // computed by `filter_liveness_in_place` from surrounding
-            // SSARepr ops.  Canonical's stream differs structurally
-            // (canonical insert_renamings ref_copy at link
-            // boundaries; walker emits inline ref_copy at
-            // pushvalue/popvalue) so filter_liveness produces
-            // different per-PC live sets.  Tests in
-            // `eval.rs::test_*_with_compiled_trace_jitcode` query
-            // liveness at specific PCs and fail when canonical's
-            // stream propagates.  Closing requires walker's
-            // ref_copy emission ordering to match canonical's
-            // post-walk insert_renamings — a structural walker
-            // refactor that's a multi-session epic.
-            if canonical_unmatched == 0 && std::env::var_os("PYRE_PHASE4_USE_CANONICAL").is_some() {
+            // With the walker post-walk `insert_renamings` helper
+            // landed (commit 160fd86481) and the return-target skip
+            // refinement (commit c66e9385e9), 9 of 14 production
+            // benches reach byte_equivalent=true and splice
+            // automatically; the remaining 5 stay on walker emit
+            // until either fannkuch/raise_catch_loop's
+            // canonical_unmatched divergence closes (separate
+            // slices) or nbody/spectral_norm/nested_loop's walker
+            // load-bearing ops are restructured.
+            if walker_unmatched == 0 && canonical_unmatched == 0 {
                 // Phase 4 slice 3 — PC coverage gate.  pyre's runtime
                 // dispatch (`pc_anchor_positions` at codewriter.rs:2585)
                 // asserts every Python PC has a `pc{N}` Label anchor.
