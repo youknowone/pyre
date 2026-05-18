@@ -619,9 +619,12 @@ pub(crate) struct CompiledEntry<M> {
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
     /// previous functions are kept here so external target_token JUMPs
-    /// can redirect to them via runtime trampoline.  Stored as
-    /// `Arc<JitCellToken>` for Slice 5.1 token-identity lift.
-    pub(crate) previous_tokens: Vec<std::sync::Arc<JitCellToken>>,
+    /// can redirect to them via runtime trampoline.  Slice X-G: stored
+    /// as `Weak<JitCellToken>` so `MemoryManager.alive_loops` remains the
+    /// sole strong owner (memmgr.py:73 parity).  `previous_tokens_upgraded`
+    /// is the readers' entry point — it upgrades and filters out dead
+    /// references.
+    pub(crate) previous_tokens: Vec<std::sync::Weak<JitCellToken>>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
     /// compilation starts allocating fresh boxes.
     ///
@@ -1343,10 +1346,10 @@ impl<M: Clone> MetaInterp<M> {
         _owning_key: u64,
         entry: CompiledEntry<M>,
         merged_traces: &mut HashMap<u64, CompiledTrace>,
-    ) -> Vec<Arc<JitCellToken>> {
+    ) -> Vec<std::sync::Weak<JitCellToken>> {
         let token = entry.token;
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
-        previous_tokens.push(Arc::clone(&token));
+        previous_tokens.push(Arc::downgrade(&token));
         previous_tokens.extend(entry.previous_tokens);
         for (tid, ct) in entry.traces {
             merged_traces.entry(tid).or_insert(ct);
@@ -1485,7 +1488,12 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.fail_index == fail_index)
                 })
         };
-        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(|t| lookup(t)))
+        lookup(&compiled.token).or_else(|| {
+            compiled
+                .previous_tokens
+                .iter()
+                .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
+        })
     }
 
     fn terminal_exit_layout_from_trace(
@@ -1522,7 +1530,12 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.op_index == op_index)
                 })
         };
-        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(|t| lookup(t)))
+        lookup(&compiled.token).or_else(|| {
+            compiled
+                .previous_tokens
+                .iter()
+                .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
+        })
     }
 
     fn compiled_exit_layout_from_backend(
@@ -4606,7 +4619,7 @@ impl<M: Clone> MetaInterp<M> {
 
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
-                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
@@ -5454,7 +5467,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
@@ -5951,7 +5964,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 {
-                    let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
+                    let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                     let mut ft = self
                         .compiled_loops
                         .get(&green_key)
@@ -6318,7 +6331,7 @@ impl<M: Clone> MetaInterp<M> {
                         terminal_exit_layouts,
                     },
                 );
-                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
@@ -7034,9 +7047,11 @@ impl<M: Clone> MetaInterp<M> {
                 }
             } else {
                 let before = entry.previous_tokens.len();
-                entry
-                    .previous_tokens
-                    .retain(|t| !std::sync::Arc::ptr_eq(t, &token));
+                entry.previous_tokens.retain(|weak| {
+                    weak.upgrade()
+                        .map(|t| !std::sync::Arc::ptr_eq(&t, &token))
+                        .unwrap_or(false)
+                });
                 if crate::majit_log_enabled() && entry.previous_tokens.len() < before {
                     eprintln!("[jit][memmgr] evicted previous token at key={}", gk);
                 }
@@ -7212,8 +7227,10 @@ impl<M: Clone> MetaInterp<M> {
                 return Some(std::sync::Arc::clone(&compiled.token));
             }
             for previous in &compiled.previous_tokens {
-                if previous.number == token_number {
-                    return Some(std::sync::Arc::clone(previous));
+                if let Some(prev) = previous.upgrade() {
+                    if prev.number == token_number {
+                        return Some(prev);
+                    }
                 }
             }
         }
@@ -7762,9 +7779,11 @@ impl<M: Clone> MetaInterp<M> {
             return Some((s, a));
         }
         for prev in &compiled.previous_tokens {
-            let (s, a) = self.backend.get_guard_status(prev, tid, fail_index);
-            if a != 0 {
-                return Some((s, a));
+            if let Some(prev) = prev.upgrade() {
+                let (s, a) = self.backend.get_guard_status(&prev, tid, fail_index);
+                if a != 0 {
+                    return Some((s, a));
+                }
             }
         }
         None
@@ -7846,11 +7865,13 @@ impl<M: Clone> MetaInterp<M> {
             return Some(descr);
         }
         for prev_token in &compiled.previous_tokens {
-            if let Some(descr) = self
-                .backend
-                .find_source_fail_descr(prev_token, trace_id, fail_index)
-            {
-                return Some(descr);
+            if let Some(prev) = prev_token.upgrade() {
+                if let Some(descr) =
+                    self.backend
+                        .find_source_fail_descr(&prev, trace_id, fail_index)
+                {
+                    return Some(descr);
+                }
             }
         }
         None
@@ -7885,9 +7906,14 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         compiled.previous_tokens.iter().any(|prev_token| {
-            self.backend
-                .compiled_bridge_fail_descr_layouts(prev_token, trace_id, fail_index)
-                .is_some()
+            prev_token
+                .upgrade()
+                .map(|prev| {
+                    self.backend
+                        .compiled_bridge_fail_descr_layouts(&prev, trace_id, fail_index)
+                        .is_some()
+                })
+                .unwrap_or(false)
         })
     }
 
@@ -8423,7 +8449,7 @@ impl<M: Clone> MetaInterp<M> {
                     .get(&original_green_key)
                     .map(|c| c.token.get_retraced_count())
                     .unwrap_or(0);
-                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
@@ -8861,7 +8887,16 @@ impl<M: Clone> MetaInterp<M> {
             // `previous_tokens` lets cranelift attach the bridge to retired
             // predecessor descrs whose machine code is still running (it
             // cannot patch in place); see `compile_bridge` trait doc.
-            let previous_tokens = &compiled.previous_tokens;
+            // Slice X-G: upgrade Weak refs to strong Arcs for the backend
+            // call; dead entries are filtered out.  The backend signature
+            // continues to take `&[Arc<JitCellToken>]` until a follow-up
+            // converts it to Weak.
+            let previous_tokens_strong: Vec<std::sync::Arc<JitCellToken>> = compiled
+                .previous_tokens
+                .iter()
+                .filter_map(|weak| weak.upgrade())
+                .collect();
+            let previous_tokens: &[std::sync::Arc<JitCellToken>] = &previous_tokens_strong;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] calling backend.compile_bridge: key={} guard={} ops={}",
@@ -17913,7 +17948,7 @@ mod tests {
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
-            entry.previous_tokens.push(old_token);
+            entry.previous_tokens.push(Arc::downgrade(&old_token));
             entry
                 .traces
                 .get_mut(&trace_id)
@@ -18137,7 +18172,7 @@ mod tests {
             let mut fresh_token = JitCellToken::new(9001);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
-            entry.previous_tokens.push(old_token);
+            entry.previous_tokens.push(Arc::downgrade(&old_token));
             entry
                 .traces
                 .get_mut(&trace_id)
@@ -18225,7 +18260,7 @@ mod tests {
             let mut fresh_token = JitCellToken::new(9002);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
-            entry.previous_tokens.push(old_token);
+            entry.previous_tokens.push(Arc::downgrade(&old_token));
             entry
                 .traces
                 .get_mut(&trace_id)
@@ -18315,7 +18350,7 @@ mod tests {
             let mut fresh_token = JitCellToken::new(9004);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
-            entry.previous_tokens.push(old_token);
+            entry.previous_tokens.push(Arc::downgrade(&old_token));
             entry
                 .traces
                 .get_mut(&trace_id)
