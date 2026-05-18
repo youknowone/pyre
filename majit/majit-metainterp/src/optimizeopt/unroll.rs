@@ -28,11 +28,11 @@ use crate::optimizeopt::{
 };
 use crate::resume::SnapshotBox;
 
-fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
+fn is_trace_constant_ref(opref: OpRef, constants: &majit_ir::VecAssoc<u32, majit_ir::Value>) -> bool {
     !opref.is_none() && constants.contains_key(&opref.raw())
 }
 
-fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, majit_ir::Value>) -> bool {
+fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::VecAssoc<u32, majit_ir::Value>) -> bool {
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
@@ -236,7 +236,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
@@ -253,7 +253,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> (Vec<Op>, usize) {
         self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
@@ -269,7 +269,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
@@ -290,7 +290,7 @@ impl UnrollOptimizer {
     pub fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
@@ -3950,7 +3950,7 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
@@ -4016,7 +4016,7 @@ fn assemble_peeled_trace_with_jump_args(
     inputarg_base: u32,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[OpRef],
@@ -5001,7 +5001,7 @@ mod tests {
                 .unwrap_or_default()
         });
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Basic peeling ─────────────────────────────────────────────────
@@ -5442,7 +5442,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -5559,8 +5559,8 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 2);
-        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
-            std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> =
+            majit_ir::VecAssoc::new();
         let (result, _) =
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
@@ -6108,7 +6108,7 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
@@ -6144,7 +6144,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(11)]),
         ];
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(2));
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
@@ -6207,7 +6207,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(19)]),
         ];
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(1));
 
         let combined = assemble_peeled_trace(
@@ -6267,7 +6267,7 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
@@ -6310,7 +6310,7 @@ mod tests {
                 ],
             ),
         ];
-        let constants = std::collections::HashMap::from([
+        let constants = majit_ir::VecAssoc::from([
             (OpRef::void_op(857).raw(), majit_ir::Value::Int(2)),
             (OpRef::const_int(0).raw(), majit_ir::Value::Int(2)),
         ]);
@@ -6394,7 +6394,7 @@ mod tests {
                 same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             None,
             None,
         );
@@ -6432,7 +6432,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(64)]),
         ];
         let constants =
-            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6496,7 +6496,7 @@ mod tests {
             5,
             false,
             &[],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             Some(start_descr),
             None,
         );
@@ -6546,7 +6546,7 @@ mod tests {
             2,
             false,
             &[],
-            &std::collections::HashMap::new(),
+            &majit_ir::VecAssoc::new(),
             Some(start_descr),
             Some(loop_descr),
         );
@@ -6579,7 +6579,7 @@ mod tests {
             },
         ];
         let constants =
-            std::collections::HashMap::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
+            majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), majit_ir::Value::Int(1))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6624,7 +6624,7 @@ mod tests {
             Op::new(OpCode::SetfieldGc, &[OpRef::ref_op(1), OpRef::int_op(0)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
-        let constants = std::collections::HashMap::from([
+        let constants = majit_ir::VecAssoc::from([
             (2_u32, majit_ir::Value::Int(606)),
             (4_u32, majit_ir::Value::Int(611)),
         ]);
@@ -6665,7 +6665,7 @@ mod tests {
         let const_extra = OpRef::const_int(7);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
         let constants =
-            std::collections::HashMap::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
+            majit_ir::VecAssoc::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
 
         let combined = assemble_peeled_trace(
             &[],
@@ -6696,7 +6696,7 @@ mod tests {
         // The assembler is therefore a passthrough for inputarg references
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(1));
         let p2_ops = vec![
             {

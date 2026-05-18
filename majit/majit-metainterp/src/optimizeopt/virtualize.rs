@@ -2562,7 +2562,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
@@ -2570,7 +2570,7 @@ mod tests {
         opt.trace_inputarg_types = vec![Type::Ref; 1024];
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
@@ -2585,7 +2585,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
@@ -2999,7 +2999,7 @@ mod tests {
             array_lengths: vec![1],
             vable_input_offset: 0,
         });
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
@@ -3282,7 +3282,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
@@ -3740,7 +3740,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert_eq!(
@@ -4328,7 +4328,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(2));
         ops[2].pos.set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
@@ -4434,7 +4434,7 @@ mod tests {
         }
 
         let mut opt = Optimizer::default_pipeline();
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(7));
         constants.insert(101u32, majit_ir::Value::Int(11));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);

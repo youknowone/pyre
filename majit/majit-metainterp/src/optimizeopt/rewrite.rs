@@ -4661,7 +4661,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(1));
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -4684,7 +4684,7 @@ mod tests {
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(-1));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
@@ -4708,7 +4708,7 @@ mod tests {
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         // Float constant as Value::Float
         constants.insert(200u32, majit_ir::Value::Float(-1.0));
         // Need float constant support in ctx — skip for now, just test no crash
@@ -4729,7 +4729,7 @@ mod tests {
         with_positions(&mut ops);
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(
@@ -4751,7 +4751,7 @@ mod tests {
         with_positions(&mut ops);
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert!(

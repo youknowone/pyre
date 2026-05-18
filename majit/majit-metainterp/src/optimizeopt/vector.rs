@@ -1109,7 +1109,7 @@ mod tests {
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1144,7 +1144,7 @@ mod tests {
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 

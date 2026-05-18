@@ -4037,7 +4037,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -6573,7 +6573,7 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         let len_count = result

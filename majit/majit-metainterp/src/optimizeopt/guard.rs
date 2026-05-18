@@ -1067,7 +1067,7 @@ mod tests {
         opt.add_pass(Box::new(OptGuard::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     // ── Redundant Guard Removal ─────────────────────────────────────────
@@ -1409,7 +1409,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         let guard_count = result
@@ -1472,7 +1472,7 @@ mod tests {
         // Pre-seed constant 1 for OpRef::int_op(200)
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;

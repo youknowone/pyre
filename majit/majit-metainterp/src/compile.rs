@@ -1687,7 +1687,7 @@ pub(crate) fn decode_values_with_layout(
 
 pub(crate) fn normalize_closing_jump_args(
     mut ops: Vec<Op>,
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<Op> {
     let Some(label_args) = ops
@@ -1790,7 +1790,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     num_red_args: usize,
     index_of_virtualizable: usize,
-    constants: &mut HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -2693,7 +2693,7 @@ mod tests {
             },
         ];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2752,7 +2752,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,

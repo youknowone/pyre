@@ -128,7 +128,7 @@ mod tests {
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -148,7 +148,7 @@ mod tests {
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -168,7 +168,7 @@ mod tests {
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -190,7 +190,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -214,7 +214,7 @@ mod tests {
             opt.add_pass(Box::new(OptEarlyForce::new()));
             let result = opt.optimize_with_constants_and_inputs(
                 &ops,
-                &mut std::collections::HashMap::new(),
+                &mut majit_ir::VecAssoc::new(),
                 1024,
             );
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
@@ -234,7 +234,7 @@ mod tests {
         opt.add_pass(Box::new(OptEarlyForce::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 

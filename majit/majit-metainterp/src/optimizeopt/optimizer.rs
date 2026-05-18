@@ -240,7 +240,7 @@ pub struct Optimizer {
 /// constant classes — `Value::Void` panics rather than fabricate a
 /// nonexistent `ConstVoid`.
 pub(crate) fn lower_typed_constants_to_const_pool(
-    constants: &std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) -> crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> {
     let mut pool = crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (&k, v) in constants {
@@ -267,7 +267,7 @@ fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
 
 pub(crate) fn sanitize_backend_constants_for_ops(
     ops: &[Op],
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -287,7 +287,7 @@ pub(crate) fn sanitize_backend_constants_for_ops(
 /// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(&ctx.new_operations);
 
@@ -310,7 +310,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
             continue;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
-        constants.entry(key).or_insert_with(|| value);
+        constants.entry_or_insert_with(key, || value);
     }
     for (const_idx, value) in ctx.const_pool.iter() {
         let key = OptContext::const_ref_for_value(const_idx, value).raw();
@@ -1808,7 +1808,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut std::collections::HashMap::new())
+        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1824,7 +1824,7 @@ impl Optimizer {
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -1840,7 +1840,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
@@ -1868,7 +1868,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -3067,7 +3067,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[Op],
-        constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -4322,7 +4322,7 @@ mod tests {
         let pool = vec![b0.clone()];
         opt.set_pending_box_pool(pool);
         let ops: Vec<Op> = Vec::new();
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
         // Pending pool drained.
         assert!(opt.pending_box_pool.is_empty());
@@ -4636,7 +4636,7 @@ mod tests {
         )];
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         assert_eq!(result.len(), 1);
@@ -4658,7 +4658,7 @@ mod tests {
         )];
         ops[0].pos.set(OpRef::int_op(2));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 2);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -4707,7 +4707,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
 
         let call_count = result
             .iter()
@@ -4841,7 +4841,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -4889,7 +4889,7 @@ mod tests {
         }
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
@@ -4914,7 +4914,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -4951,7 +4951,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -4976,7 +4976,7 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
@@ -4995,7 +4995,7 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
@@ -5019,7 +5019,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -5059,7 +5059,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         let ctx = OptContext::new(result.len());
@@ -5080,7 +5080,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 0);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -5124,7 +5124,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -5190,7 +5190,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -5238,7 +5238,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
@@ -5285,7 +5285,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(66));
         ops[1].pos.set(OpRef::void_op(67));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
@@ -5358,7 +5358,7 @@ mod tests {
 
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
         let guard = result
@@ -5422,7 +5422,7 @@ mod tests {
             &[OpRef::int_op(50)],
         ));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0);
 
         assert!(result.is_empty());
@@ -5740,7 +5740,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 

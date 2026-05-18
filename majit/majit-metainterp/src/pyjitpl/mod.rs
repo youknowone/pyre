@@ -334,7 +334,7 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut std::collections::HashMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -3812,7 +3812,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArg>,
         ops: &mut Vec<Op>,
-        constants: &mut HashMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
     ) {
@@ -5160,7 +5160,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
             // history.py:220 box.type parity: ConstantPool stores typed
             // `Value` intrinsically — the snapshot is the canonical shape.
-            let constants: HashMap<u32, majit_ir::Value> = ctx.constants.snapshot();
+            let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = ctx.constants.snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -5301,7 +5301,7 @@ impl<M: Clone> MetaInterp<M> {
         // `Const::to_value()` recovers the typed `Value` without a
         // parallel type lookup.
         for (k, c) in partial.constants {
-            constants.entry(k).or_insert_with(|| c.to_value());
+            constants.entry_or_insert_with(k, || c.to_value());
         }
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
@@ -8189,7 +8189,7 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
-        let mut constants: HashMap<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();
@@ -8701,7 +8701,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
-        let mut constants: HashMap<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();

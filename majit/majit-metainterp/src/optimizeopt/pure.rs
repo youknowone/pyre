@@ -1410,7 +1410,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1433,7 +1433,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1454,7 +1454,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1475,7 +1475,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1496,7 +1496,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1520,7 +1520,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1540,7 +1540,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1564,7 +1564,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1586,7 +1586,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1608,7 +1608,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1629,7 +1629,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1668,7 +1668,7 @@ mod tests {
         }));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1731,7 +1731,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1750,7 +1750,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1771,7 +1771,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1795,7 +1795,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1820,7 +1820,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1844,7 +1844,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(0xCAFE)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
@@ -1876,7 +1876,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -1901,7 +1901,7 @@ mod tests {
             opt.add_pass(Box::new(OptPure::new()));
             let result = opt.optimize_with_constants_and_inputs(
                 &ops,
-                &mut std::collections::HashMap::new(),
+                &mut majit_ir::VecAssoc::new(),
                 1024,
             );
 
@@ -1929,8 +1929,8 @@ mod tests {
         assign_positions(&mut ops);
 
         // Each func pointer must be a known constant for OptRewrite CSE.
-        let mut constants: std::collections::HashMap<u32, majit_ir::Value> =
-            std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> =
+            majit_ir::VecAssoc::new();
         for i in 0..20u32 {
             constants.insert(i + 100, majit_ir::Value::Int((i + 100) as i64));
         }
@@ -1962,7 +1962,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(0xBEEF)); // func pointer must be a known constant
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
@@ -1987,7 +1987,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
@@ -2012,7 +2012,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(5));
 
@@ -2042,7 +2042,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -2067,7 +2067,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(10_000u32, majit_ir::Value::Int(3));
         constants.insert(10_001u32, majit_ir::Value::Int(4));
 
@@ -2219,7 +2219,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -2679,7 +2679,7 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
-            &mut std::collections::HashMap::new(),
+            &mut majit_ir::VecAssoc::new(),
             1024,
         );
 
@@ -2700,7 +2700,7 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants = std::collections::HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(0xCAFE));
         constants.insert(OpRef::const_int(1).raw(), majit_ir::Value::Int(7));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);

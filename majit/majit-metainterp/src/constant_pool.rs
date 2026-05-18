@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use majit_gc::shadow_stack;
-use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_ir::{GcRef, OpRef, Type, Value, VecAssoc};
 
 /// Encode a typed `Value` to the raw `i64` shape used by the legacy
 /// backend boundary (`set_constants(HashMap<u32, i64>)`).
@@ -56,7 +56,7 @@ fn value_to_raw_bits(value: &Value) -> i64 {
 /// serialization dedup (`resume.py:148-181 large_ints`/`refs`) is a
 /// separate concern that lives in `resume.rs`.
 ///
-/// Storage shape: `HashMap<u32, Value>` mirrors RPython where each
+/// Storage shape: `VecAssoc<u32, Value>` mirrors RPython where each
 /// `ConstInt/ConstFloat/ConstPtr` Box carries `.type` intrinsically
 /// (history.py:220/261/307). The legacy split `(HashMap<u32, i64>,
 /// HashMap<u32, Type>)` is retired — type rides on the `Value` variant
@@ -69,7 +69,7 @@ fn value_to_raw_bits(value: &Value) -> i64 {
 pub struct ConstantPool {
     /// Keyed by OpRef.0 (tagged constant value, i.e. index | CONST_BIT).
     /// `Value` carries type intrinsically (history.py:220 box.type).
-    constants: HashMap<u32, Value>,
+    constants: VecAssoc<u32, Value>,
     /// Zero-based counter for allocating new constant indices.
     next_const_idx: u32,
     /// gcreftracer.py parity: (OpRef key, shadow stack index) for each
@@ -102,7 +102,7 @@ pub struct ConstantPool {
 impl ConstantPool {
     pub fn new() -> Self {
         ConstantPool {
-            constants: HashMap::new(),
+            constants: VecAssoc::new(),
             next_const_idx: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: shadow_stack::depth(),
@@ -333,19 +333,19 @@ impl ConstantPool {
             .collect()
     }
 
-    /// Consume the pool, returning the canonical typed `HashMap<u32,
+    /// Consume the pool, returning the canonical typed `VecAssoc<u32,
     /// Value>` — matching RPython's `Const(value)` Box model where
     /// `ConstInt/ConstFloat/ConstPtr` (history.py:220/261/307) carry
     /// their value as a typed instance attribute.
-    pub fn into_inner_typed(mut self) -> HashMap<u32, Value> {
+    pub fn into_inner_typed(mut self) -> VecAssoc<u32, Value> {
         self.refresh_from_gc();
         let constants = std::mem::take(&mut self.constants);
         self.release_roots();
         constants
     }
 
-    /// Get a mutable reference to the inner constants map (typed).
-    pub fn as_mut(&mut self) -> &mut HashMap<u32, Value> {
+    /// Get a mutable reference to the inner constants pool (typed).
+    pub fn as_mut(&mut self) -> &mut VecAssoc<u32, Value> {
         &mut self.constants
     }
 
@@ -357,8 +357,8 @@ impl ConstantPool {
         self.next_const_idx = self.next_const_idx.max(raw_idx + 1);
     }
 
-    /// Get a shared reference to the inner constants map (typed).
-    pub fn as_ref(&self) -> &HashMap<u32, Value> {
+    /// Get a shared reference to the inner constants pool (typed).
+    pub fn as_ref(&self) -> &VecAssoc<u32, Value> {
         &self.constants
     }
 
@@ -368,10 +368,10 @@ impl ConstantPool {
         self.constants.get(&opref.raw()).map(value_to_raw_bits)
     }
 
-    /// Clone the constants map without consuming the pool, returning
-    /// the typed `Value` shape. Refreshes from GC first to pick up
-    /// moved Ref pointers.
-    pub fn snapshot(&mut self) -> HashMap<u32, Value> {
+    /// Clone the constants pool without consuming it, returning the
+    /// typed `Value` shape. Refreshes from GC first to pick up moved
+    /// Ref pointers.
+    pub fn snapshot(&mut self) -> VecAssoc<u32, Value> {
         self.refresh_from_gc();
         self.constants.clone()
     }
