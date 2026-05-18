@@ -86,11 +86,13 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 /// RPython resume.py:389-452 parity: guard metadata sees only the
 /// Box.type values available at the guard's numbering point, not later
 /// operations in the same trace. `value_types` is the incremental
-/// guard-point map maintained by `build_guard_metadata`.
-fn fail_arg_type(
-    opref: &OpRef,
-    value_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, Type>,
-) -> Type {
+/// guard-point map maintained by `build_guard_metadata`, stored as a
+/// `vecset::VecMap<u32, Type>` keyed by `OpRef::raw()` (no-HashMap rule;
+/// sparse OpRef keys made a dense `Vec<Option<Type>>` allocate and zero
+/// the full [0..max_opref) range per call — triggered macOS large-malloc
+/// mmap on every guard emission. VecMap allocates proportional to live
+/// entries only — see task #149 fannkuch sys-time).
+fn fail_arg_type(opref: &OpRef, value_types: &vecset::VecMap<u32, Type>) -> Type {
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
@@ -409,13 +411,16 @@ pub(crate) fn build_guard_metadata(
     // Mirror main's incremental walk: maintain `value_types` seeded
     // from inputargs + constants, then insert each op's result type
     // before consulting it.
-    let mut value_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, Type> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    // `vecset::VecMap<u32, Type>` keyed by `OpRef::raw()` (no-HashMap rule).
+    // Sparse OpRef keys would make a dense `Vec<Option<Type>>` allocate
+    // and zero the full [0..max_opref) range per call (large traces hit
+    // macOS large-malloc mmap path — see task #149 fannkuch sys-time).
+    let mut value_types: vecset::VecMap<u32, Type> = vecset::VecMap::new();
     for arg in inputargs.iter() {
         value_types.insert(arg.index, arg.tp);
     }
     for (&idx, c) in constants.iter() {
-        if !value_types.contains_key(&idx) {
+        if value_types.get(&idx).is_none() {
             value_types.insert(idx, c.get_type());
         }
     }
