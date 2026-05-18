@@ -2420,8 +2420,7 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
     }
 
     fn ll_loop_code(&self) -> usize {
-        self.ll_loop_code
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.ll_loop_code.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn set_ll_loop_code(&self, loop_code: usize) {

@@ -129,7 +129,6 @@ pub(crate) fn drop_bridge_payload(ptr: *mut ()) {
     }
 }
 
-
 // ── JitFrameDeadFrame (llmodel.py deadframe-as-jitframe parity) ─────
 
 /// RPython llmodel.py parity: the deadframe IS the JitFrame.

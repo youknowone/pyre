@@ -15,8 +15,8 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
 
@@ -3879,9 +3879,7 @@ impl Drop for ResumeGuardCopiedDescr {
         // `ResumeGuardDescr::drop`.  Swap-to-null first so a concurrent
         // reader either bumps the strong count on the live pointer or
         // observes null.
-        let ptr = self
-            .trace_info
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !ptr.is_null() {
             // Safety: produced by `Arc::into_raw(Arc::new(info))` in
             // `set_trace_info_any`.

@@ -87,7 +87,7 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
-use crate::guard::{drop_bridge_payload, BridgeData, JitFrameDeadFrame};
+use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
 //
@@ -2095,9 +2095,7 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
     }
 }
 
-fn actual_call_assembler_target_result_kind(
-    fail_descrs: &[DescrRef],
-) -> Result<u64, BackendError> {
+fn actual_call_assembler_target_result_kind(fail_descrs: &[DescrRef]) -> Result<u64, BackendError> {
     let finish_descr = fail_descrs
         .iter()
         .find(|descr| as_fd(descr).is_finish())
@@ -2453,7 +2451,11 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
         .iter()
         .find(|d| as_fd(d).is_finish() && !as_fd(d).is_exit_frame_with_exception())
         .map(|d| {
-            let result_type = as_fd(d).fail_arg_types().first().copied().unwrap_or(Type::Void);
+            let result_type = as_fd(d)
+                .fail_arg_types()
+                .first()
+                .copied()
+                .unwrap_or(Type::Void);
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
         })
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
@@ -2617,9 +2619,11 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // `register_fail_descrs` for this lookup to succeed.
     let fail_descr = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
         .with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|reg| reg.lock().ok().and_then(|m| m.get(&(jf_force_descr as usize)).cloned()))
+            cell.borrow().as_ref().and_then(|reg| {
+                reg.lock()
+                    .ok()
+                    .and_then(|m| m.get(&(jf_force_descr as usize)).cloned())
+            })
         })
         .expect(
             "force_token_to_dead_frame: jf_force_descr address not in \
@@ -2753,10 +2757,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // Bridges carry their own `BridgeData.source_guard` and never
             // reach this `execute_registered_loop_target` path.
             let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
-                CallAssemblerCallerContext::from_registered_loop_target(
-                    target,
-                    &current_inputs,
-                ),
+                CallAssemblerCallerContext::from_registered_loop_target(target, &current_inputs),
             );
             return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
@@ -2996,13 +2997,11 @@ fn call_assembler_guard_failure_inner(
     // (post-14e) or the backend wrapper pointer (legacy paths).
     let fail_descr_owned = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
         .with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .and_then(|reg| {
-                    reg.lock()
-                        .ok()
-                        .and_then(|m| m.get(&(fail_descr_ptr as usize)).cloned())
-                })
+            cell.borrow().as_ref().and_then(|reg| {
+                reg.lock()
+                    .ok()
+                    .and_then(|m| m.get(&(fail_descr_ptr as usize)).cloned())
+            })
         })
         .expect(
             "call_assembler helper: fail_descr_ptr not registered in \
@@ -3513,10 +3512,7 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
 /// - Must run on the JIT thread that owns `CRANELIFT_ACTIVE_GC` /
 ///   `CRANELIFT_JITFRAME_TYPE_ID` thread-locals.
 #[inline(never)]
-pub unsafe extern "C" fn cranelift_realloc_frame(
-    old_jf: *mut i64,
-    new_depth: usize,
-) -> *mut i64 {
+pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: usize) -> *mut i64 {
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
     let new_total = header_words + new_depth;
     let new_bytes = new_total * 8;
@@ -3560,11 +3556,7 @@ pub unsafe extern "C" fn cranelift_realloc_frame(
         // jitframe.py:54-56 — copy fixed header (jf_frame_info,
         // jf_descr, jf_force_descr, jf_gcmap, jf_savedata,
         // jf_guard_exc, jf_forward).
-        std::ptr::copy_nonoverlapping(
-            old_jf as *const u8,
-            new_jf as *mut u8,
-            JF_FRAME_OFS,
-        );
+        std::ptr::copy_nonoverlapping(old_jf as *const u8, new_jf as *mut u8, JF_FRAME_OFS);
         // jitframe.py:84 — jf_frame's `length` word.
         *((new_base + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = new_depth;
 
@@ -3583,9 +3575,7 @@ pub unsafe extern "C" fn cranelift_realloc_frame(
     }
 
     if majit_log_enabled() {
-        eprintln!(
-            "[cranelift][realloc-frame] old={old_jf:p} new={new_jf:p} new_depth={new_depth}"
-        );
+        eprintln!("[cranelift][realloc-frame] old={old_jf:p} new={new_jf:p} new_depth={new_depth}");
     }
 
     new_jf
@@ -4334,8 +4324,7 @@ fn expected_call_assembler_result_kind(
                 })?;
             let finish_fd = as_fd(finish_descr);
             Ok(
-                if finish_fd.fail_arg_types() == [Type::Ref]
-                    && finish_fd.force_token_slots() == [0]
+                if finish_fd.fail_arg_types() == [Type::Ref] && finish_fd.force_token_slots() == [0]
                 {
                     CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF
                 } else {
@@ -5706,9 +5695,7 @@ fn emit_attached_loop_dispatch(
     // the host loop re-enter the right wrapper via `execute_token`.
     // Once cranelift's body-entry `br_table` per-LABEL dispatch lands,
     // this gate can be relaxed.
-    let lbid_ptr = builder
-        .ins()
-        .iconst(ptr_type, label_block_id_addr as i64);
+    let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
     let lbid = builder
         .ins()
         .load(cl_types::I32, MemFlags::trusted(), lbid_ptr, 0);
@@ -5727,21 +5714,19 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
-    // 2026-05-18 hypothesis tests (all reverted, no effect on nbody_50k
-    // corruption `-0.03513214049650899` vs. dynasm reference
-    // `-0.035132020348426815`):
-    //   - probe 1: per-LABEL gate on `label_block_id == 0` to skip
-    //     non-first-LABEL targets that mismatch preamble inputarg count
-    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc before tail
-    //     call to mirror `run_compiled_code`'s header zero step
-    //     (compiler.rs:6418)
-    //   - probe 3: zero source body's ref_root area to prevent target
-    //     body's post-GC ref reload from reading source's stale writes
-    // All three ruled out as the corruption source.  Deeper diagnosis
-    // requires empirical instrumentation comparing jf_frame state
-    // byte-by-byte between wrapper-direct entry and tail-call entry
-    // for the same (source, target) pair, plus inspection of the
-    // generated machine code's stack-slot reuse pattern.
+    // 2026-05-18 hypothesis tests (all reverted, none affect nbody_50k
+    // corruption -0.03513214049650899 vs. dynasm -0.035132020348426815):
+    //   - probe 1: per-LABEL `label_block_id == 0` gate
+    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc
+    //   - probe 3: zero source body's ref_root area
+    //   - probe 4: always-on frame-realloc check at main-loop prologue
+    //   - probe 5: wholesale zero of entire jf_frame tail beyond inputs
+    // The corruption is NOT in jf_frame heap state.  Both
+    // `return_call_indirect` and `call_indirect + return` transit
+    // cranelift's aarch64 Tail-conv function entry/exit lowering and
+    // both corrupt, pointing at the documented ~12.5 bytes/take SP
+    // leak in `emit_return_call_common_sequence` as the same root
+    // cause.  Pyre-side workarounds are exhausted.
     emit_call_footer_shadowstack(builder, ptr_type);
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
@@ -5869,10 +5854,22 @@ fn emit_guard_exit(
     //     `emit_return_call_common_sequence` (Tail conv aarch64) —
     //     unchanged between 0.130.2 and 0.131.1.
     //
-    // Gate stays off — 4 hypotheses tested + ruled out (per-LABEL,
-    // jf_gcmap/jf_descr clear, ref_root zero, main-loop frame-realloc).
-    // Next diagnostic step requires runtime instrumentation comparing
-    // wrapper-direct vs tail-call entry byte-by-byte.
+    // Gate stays off — 5 hypotheses tested + ruled out:
+    //   - probe 1: per-LABEL `label_block_id == 0` gate
+    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc
+    //   - probe 3: zero source body's ref_root area
+    //   - probe 4: always-on frame-realloc check at main-loop prologue
+    //   - probe 5: wholesale zero of entire jf_frame tail beyond inputs
+    // None affect the deterministic nbody_50k corruption
+    // (-0.03513214049650899 vs. dynasm -0.035132020348426815),
+    // confirming the corruption is NOT in jf_frame heap state.
+    // Empirical conclusion: source is the cranelift aarch64 Tail-conv
+    // lowering itself (consistent with the documented ~12.5 bytes/take
+    // SP leak in `emit_return_call_common_sequence`).  Both
+    // `return_call_indirect` and `call_indirect + return` shapes
+    // corrupt because both transit cranelift's aarch64 Tail-conv
+    // function entry/exit lowering.  Pyre-side workarounds cannot
+    // address upstream stack-frame accounting defects.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
@@ -5883,9 +5880,8 @@ fn emit_guard_exit(
         emit_attached_bridge_dispatch(
             builder,
             jf_ptr,
-            info.bridge_cache_addrs.expect(
-                "can_have_bridge=true GuardInfo must carry bridge_cache_addrs",
-            ),
+            info.bridge_cache_addrs
+                .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
             ptr_type,
             call_conv,
         );
@@ -5948,9 +5944,8 @@ fn emit_guard_exit(
         emit_attached_bridge_dispatch(
             builder,
             jf_ptr,
-            info.bridge_cache_addrs.expect(
-                "can_have_bridge=true GuardInfo must carry bridge_cache_addrs",
-            ),
+            info.bridge_cache_addrs
+                .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
             ptr_type,
             call_conv,
         );
@@ -6239,7 +6234,10 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
         let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
-                return Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id));
+                return Some(build_per_trace_layouts(
+                    &bridge.fail_descrs,
+                    bridge.trace_id,
+                ));
             }
             if let Some(layouts) =
                 find_trace_fail_descr_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
@@ -6327,10 +6325,7 @@ fn find_fail_descr_in_fail_descrs(
     None
 }
 
-fn find_fail_descr_by_ptr(
-    fail_descrs: &[DescrRef],
-    descr_ptr: usize,
-) -> Option<DescrRef> {
+fn find_fail_descr_by_ptr(fail_descrs: &[DescrRef], descr_ptr: usize) -> Option<DescrRef> {
     for descr in fail_descrs {
         // `history.py:125` identity: the JIT-baked `jf_descr` pointer
         // is the metainterp `AbstractFailDescr` Arc's data pointer.
@@ -7788,8 +7783,8 @@ impl CraneliftBackend {
         // discriminator (`compile_bridge` is the only do_compile caller
         // that supplies it; `compile_loop` passes `None`).
         let mut jf_ptr = if source_guard.is_some() {
-            let expected_size = (precompute_max_output_slots(inputargs, ops)
-                + ref_root_slots.len()) as i64;
+            let expected_size =
+                (precompute_max_output_slots(inputargs, ops) + ref_root_slots.len()) as i64;
             // jitframe.py:84 — `jf_frame.length` is the count of `Signed`
             // payload slots after the length word.  aarch64/assembler.py:935
             // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
@@ -7824,10 +7819,9 @@ impl CraneliftBackend {
             // the new GC-nursery jitframe pointer with header copied,
             // items copied + zeroed in old, jf_forward threaded
             // (compiler.rs:3407 body).
-            let realloc_addr = builder.ins().iconst(
-                ptr_type,
-                cranelift_realloc_frame as *const () as i64,
-            );
+            let realloc_addr = builder
+                .ins()
+                .iconst(ptr_type, cranelift_realloc_frame as *const () as i64);
             let mut realloc_sig = Signature::new(call_conv);
             realloc_sig.params.push(AbiParam::new(ptr_type));
             realloc_sig.params.push(AbiParam::new(cl_types::I64));
@@ -12877,7 +12871,10 @@ impl CraneliftBackend {
             self.func_ctx = wrapper_ctx;
         }
         let mut wrapper_compile_ctx = Context::for_function(wrapper_func);
-        if let Err(e) = self.module.define_function(entry_id, &mut wrapper_compile_ctx) {
+        if let Err(e) = self
+            .module
+            .define_function(entry_id, &mut wrapper_compile_ctx)
+        {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit][clif-error] wrapper {e}\nCLIF IR:\n{}",
@@ -13961,8 +13958,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
                     continue;
                 }
-                fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
-                    as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                fd.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+                );
             }
         }
 
@@ -14161,8 +14159,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 continue;
             }
             if let Some(clt) = clt_arc.as_ref() {
-                fd.set_rd_loop_token_clt(std::sync::Arc::clone(clt)
-                    as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                fd.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+                );
             }
         }
         {
@@ -14187,7 +14186,10 @@ impl majit_backend::Backend for CraneliftBackend {
             // the `execute_bridge` entry marshaling path; derive it from
             // the compiled fail_descrs' is_external_jump flag rather than
             // re-scanning ops + mutating descrs after the fact.
-            let loop_reentry = compiled.fail_descrs.iter().any(|d| as_fd(d).is_external_jump());
+            let loop_reentry = compiled
+                .fail_descrs
+                .iter()
+                .any(|d| as_fd(d).is_external_jump());
             fail_descr_attach_bridge(
                 as_fd(sd),
                 BridgeData {
@@ -14230,22 +14232,22 @@ impl majit_backend::Backend for CraneliftBackend {
                                 fail_descr_attach_bridge(
                                     as_fd(&prev_descr),
                                     BridgeData {
-                                    trace_id: b.trace_id,
-                                    input_types: b.input_types.clone(),
-                                    header_pc: b.header_pc,
-                                    source_guard: b.source_guard,
-                                    caller_prefix_layout: b.caller_prefix_layout.clone(),
-                                    code_ptr: b.code_ptr,
-                                    fail_descrs: b.fail_descrs.clone(),
-                                    num_inputs: b.num_inputs,
-                                    num_ref_roots: b.num_ref_roots,
-                                    max_output_slots: b.max_output_slots,
+                                        trace_id: b.trace_id,
+                                        input_types: b.input_types.clone(),
+                                        header_pc: b.header_pc,
+                                        source_guard: b.source_guard,
+                                        caller_prefix_layout: b.caller_prefix_layout.clone(),
+                                        code_ptr: b.code_ptr,
+                                        fail_descrs: b.fail_descrs.clone(),
+                                        num_inputs: b.num_inputs,
+                                        num_ref_roots: b.num_ref_roots,
+                                        max_output_slots: b.max_output_slots,
 
-                                    terminal_exit_layouts: UnsafeCell::new(
-                                        unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                                    ),
-                                    loop_reentry: b.loop_reentry,
-                                    invalidated_arc: b.invalidated_arc.clone(),
+                                        terminal_exit_layouts: UnsafeCell::new(
+                                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                                        ),
+                                        loop_reentry: b.loop_reentry,
+                                        invalidated_arc: b.invalidated_arc.clone(),
                                     },
                                 );
                             }
@@ -14313,8 +14315,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     // `is_finish() == false`.  Gate on the canonical
                     // `ResumeDescr` family instead.
                     let fd = as_fd(descr);
-                    if (fd.is_resume_guard() || fd.is_resume_guard_copied())
-                        && fd.get_status() == 0
+                    if (fd.is_resume_guard() || fd.is_resume_guard_copied()) && fd.get_status() == 0
                     {
                         fd.store_hash(hash);
                     }
@@ -14782,7 +14783,10 @@ impl majit_backend::Backend for CraneliftBackend {
         )?;
         let bridge = fail_descr_bridge_ref(as_fd(&source_descr));
         let bridge = bridge.as_ref()?;
-        Some(build_per_trace_layouts(&bridge.fail_descrs, bridge.trace_id))
+        Some(build_per_trace_layouts(
+            &bridge.fail_descrs,
+            bridge.trace_id,
+        ))
     }
 
     fn compiled_bridge_descr_arc(
@@ -14957,16 +14961,13 @@ impl majit_backend::Backend for CraneliftBackend {
             .fail_descr_registry
             .lock()
             .expect("fail_descr_registry mutex poisoned");
-        registry
-            .get(&descr_addr)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
+        registry.get(&descr_addr).cloned().unwrap_or_else(|| {
+            panic!(
+                "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
                      fail_descr_registry — every emitted FailDescr must be strongly \
                      registered"
-                )
-            }) as majit_ir::DescrRef
+            )
+        }) as majit_ir::DescrRef
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {

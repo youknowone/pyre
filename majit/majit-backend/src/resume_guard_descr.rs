@@ -12,8 +12,8 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
@@ -668,11 +668,7 @@ impl ResumeGuardDescr {
     /// owned `Arc`.  The cleanup function is registered once
     /// (idempotent) and invoked by `Drop` on any payload still in the
     /// cell at descr teardown.
-    pub fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: fn(*mut ()),
-    ) -> *mut () {
+    pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
