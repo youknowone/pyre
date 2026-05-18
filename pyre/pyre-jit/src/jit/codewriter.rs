@@ -3035,15 +3035,33 @@ fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec
 }
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Map py_pc → anchor insn_idx via `Insn::Label("pc{N}")` entries.
-    // Reuses `pc_anchor_positions`'s first-wins semantics; the documented
-    // pyre-vs-RPython label-keying difference there applies here too.
-    // Position-indexed `Vec<usize>` matches the no-HashMap invariant
-    // (memory `feedback-no-hashmap-ever`).
-    let positions = pc_anchor_positions(ssarepr, num_pcs);
+    let anchors = pc_anchor_positions(ssarepr, num_pcs);
+    live_marker_indices_from_anchors(ssarepr, &anchors)
+}
+
+/// Resolve per-PC `-live-` marker positions given a `pc_to_anchor_idx`
+/// vector mapping each py_pc to its anchor insn index in `ssarepr`.
+///
+/// Splitting the anchor-lookup phase from the live-scan phase lets the
+/// anchor source be swapped (e.g. T6.1 walker-time tracking) without
+/// duplicating the scan logic.
+///
+/// First-wins for the `-live-` marker per anchor pair matches
+/// `flatten.py:107`'s one-`-live-`-per-block invariant filtered through
+/// pyre's NEW-DEVIATION sibling-joinpoint duplicates: RPython emits one
+/// `-live-` per block-entry; pyre's PC-sequential walker can emit
+/// multiple when sibling joinpoint blocks share a py_pc.  The first
+/// marker matches the runtime's actual liveness window via the
+/// first-wins anchor; subsequent duplicates belong to sibling blocks
+/// reachable through fall-through after the first anchor.
+fn live_marker_indices_from_anchors(
+    ssarepr: &super::flatten::SSARepr,
+    pc_to_anchor_idx: &[usize],
+) -> Vec<usize> {
+    let num_pcs = pc_to_anchor_idx.len();
     // Sort (anchor_idx, py_pc) by anchor_idx to compute scan boundaries
     // for the per-anchor `-live-` lookup.
-    let mut anchors: Vec<(usize, usize)> = positions
+    let mut anchors: Vec<(usize, usize)> = pc_to_anchor_idx
         .iter()
         .enumerate()
         .map(|(py_pc, &insn_idx)| (insn_idx, py_pc))
@@ -3076,7 +3094,7 @@ fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) 
         }
         live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
             panic!(
-                "live_marker_indices_by_pc: missing -live- marker for py_pc {} in range {}..{}",
+                "live_marker_indices_from_anchors: missing -live- marker for py_pc {} in range {}..{}",
                 py_pc,
                 anchor_idx + 1,
                 end
