@@ -649,9 +649,9 @@ pub struct DynasmBackend {
     /// Next header PC (green key).
     next_header_pc: u64,
     /// Constants for the next compilation.
-    constants: std::collections::HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// Constant type annotations for GC rewriter.
-    constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -702,8 +702,8 @@ impl DynasmBackend {
     /// Legacy test-only entry point.  Production code routes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
-    /// `HashMap<u32, i64>` literals by hand.
-    pub fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
+    /// `VecAssoc<u32, i64>` literals by hand.
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
         self.constants = constants;
     }
 
@@ -711,7 +711,7 @@ impl DynasmBackend {
     /// above; production callers route through `set_constants_pool`.
     pub fn set_constant_types(
         &mut self,
-        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+        constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) {
         self.constant_types = constant_types;
     }
@@ -776,8 +776,8 @@ impl DynasmBackend {
         DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: std::collections::HashMap::new(),
-            constant_types: std::collections::HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
@@ -923,10 +923,11 @@ impl DynasmBackend {
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
     fn gc_rewriter(
         &self,
-        constant_types: &std::collections::HashMap<u32, majit_ir::Type>,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) -> Option<majit_gc::rewrite::GcRewriterImpl> {
         with_dynasm_active_gc(|gc| {
-            let ct = constant_types.clone();
+            let ct: std::collections::HashMap<u32, majit_ir::Type> =
+                constant_types.iter().map(|(&k, &t)| (k, t)).collect();
             majit_gc::rewrite::GcRewriterImpl {
                 nursery_free_addr: gc.nursery_free_addr(),
                 nursery_top_addr: gc.nursery_top_addr(),
@@ -1055,15 +1056,19 @@ impl DynasmBackend {
         // `constant_types_with_inputargs` build at compiler.rs:7042.
         let mut constant_types = self.constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types.entry(ia.index).or_insert(ia.tp);
+            constant_types.entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
-            let constants = &self.constants;
+            let constants_hm: std::collections::HashMap<u32, i64> = self
+                .constants
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect();
             let (result, new_constants, new_constant_types) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+                rewriter.rewrite_for_gc_with_constants(&normalized, &constants_hm);
             for (k, v) in new_constants {
-                self.constants.entry(k).or_insert(v);
+                self.constants.entry_or_insert_with(k, || v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -1071,7 +1076,7 @@ impl DynasmBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry(k).or_insert(tp);
+                self.constant_types.entry_or_insert_with(k, || tp);
             }
             result
         } else {
@@ -1164,7 +1169,7 @@ impl DynasmBackend {
     fn collect_classptr_typeid_table(
         &self,
         ops: &[Op],
-        constants: &std::collections::HashMap<u32, i64>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> std::collections::HashMap<i64, u32> {
         let mut table = std::collections::HashMap::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
@@ -1198,7 +1203,7 @@ impl DynasmBackend {
     fn collect_classptr_subclass_range_table(
         &self,
         ops: &[Op],
-        constants: &std::collections::HashMap<u32, i64>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
     ) -> std::collections::HashMap<i64, (i64, i64)> {
         let mut table = std::collections::HashMap::new();
         if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
@@ -1622,12 +1627,12 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants = std::mem::take(&mut self.constants);
-        let constant_types = std::mem::take(&mut self.constant_types);
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let constants_va = std::mem::take(&mut self.constants);
+        let constant_types_va = std::mem::take(&mut self.constant_types);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants_va);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants_va);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
@@ -1644,10 +1649,14 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        let constants_hm: std::collections::HashMap<u32, i64> =
+            constants_va.into_iter().collect();
+        let constant_types_hm: std::collections::HashMap<u32, majit_ir::Type> =
+            constant_types_va.into_iter().collect();
         let mut asm = Asm::new(
             trace_id,
             header_pc,
-            constants,
+            constants_hm,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1659,7 +1668,7 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types);
+        asm.set_constant_types(constant_types_hm);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop()?;
 
@@ -1733,8 +1742,6 @@ impl Backend for DynasmBackend {
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
         self.constants.clear();
         self.constant_types.clear();
-        self.constants.reserve(constants.len());
-        self.constant_types.reserve(constants.len());
         for (&k, c) in constants.iter() {
             self.constants.insert(k, c.as_raw_i64());
             self.constant_types.insert(k, c.get_type());
@@ -1826,20 +1833,20 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants = std::mem::take(&mut self.constants);
-        let constant_types = std::mem::take(&mut self.constant_types);
+        let constants_va = std::mem::take(&mut self.constants);
+        let constant_types_va = std::mem::take(&mut self.constant_types);
         if crate::majit_log_enabled() && trace_id == 2 {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
                 fail_descr.fail_index_per_trace(),
-                majit_ir::format_trace(&prepared_ops, &constants)
+                majit_ir::format_trace(&prepared_ops, &constants_va)
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants_va);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants_va);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
@@ -1856,10 +1863,14 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        let constants_hm: std::collections::HashMap<u32, i64> =
+            constants_va.into_iter().collect();
+        let constant_types_hm: std::collections::HashMap<u32, majit_ir::Type> =
+            constant_types_va.into_iter().collect();
         let mut asm = Asm::new(
             trace_id,
             0,
-            constants,
+            constants_hm,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1871,7 +1882,7 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types);
+        asm.set_constant_types(constant_types_hm);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);
@@ -3464,7 +3475,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3536,7 +3547,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3615,7 +3626,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(24));
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3705,7 +3716,7 @@ mod tests {
         let payload = gc.alloc_with_type(payload_tid, 16);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 264_i64);
         consts.insert(10001, 256_i64);
         consts.insert(10002, 8_i64);
@@ -3803,7 +3814,7 @@ mod tests {
         let mut backend = make_call_assembler_backend();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -3846,7 +3857,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -3893,7 +3904,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -3940,7 +3951,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3991,7 +4002,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4040,7 +4051,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4176,7 +4187,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4225,7 +4236,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
@@ -4280,7 +4291,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 2);
         backend.set_constants(constants);
@@ -4351,7 +4362,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let mut bridge_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
         bridge_getfield.setdescr(field_descr);
         let bridge_ops = vec![
@@ -4405,7 +4416,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4432,7 +4443,7 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(bridge_constants);
         let mut bridge_value = mk_op(
@@ -4495,7 +4506,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4529,7 +4540,7 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
@@ -4587,7 +4598,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4642,7 +4653,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(200, return_ref_passthrough as usize as i64);
         backend.set_constants(constants);
 
@@ -4707,7 +4718,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(201, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4763,7 +4774,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -4804,7 +4815,7 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_consts = HashMap::new();
+        let mut caller_consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         caller_consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -4848,7 +4859,7 @@ mod tests {
         install_call_assembler_test_layout();
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4914,7 +4925,7 @@ mod tests {
         install_call_assembler_test_layout();
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4975,7 +4986,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -4991,7 +5002,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
 
@@ -5040,7 +5051,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(205, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5081,7 +5092,7 @@ mod tests {
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(
             206,
             alloc_marked_ref_collecting as *const () as usize as i64,
