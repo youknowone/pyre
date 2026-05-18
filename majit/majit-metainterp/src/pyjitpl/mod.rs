@@ -4921,15 +4921,9 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        let (mut constants, mut constant_types) = {
-            // history.py:220 box.type parity: ConstantPool stores typed
-            // `Value` intrinsically — the snapshot is already the
-            // canonical shape; the legacy `constant_types` view is a
-            // pure projection used by the bridge entry path.
-            let typed = ctx.constants.snapshot();
-            let types = ctx.constants.constant_types_snapshot();
-            (typed, types)
-        };
+        // history.py:220 box.type parity: ConstantPool stores typed
+        // `Value` intrinsically — the snapshot is the canonical shape.
+        let mut constants = ctx.constants.snapshot();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -4939,23 +4933,10 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_boxes,
             snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
-        // Re-sync legacy `constant_types` view: snapshot_map_from_trace_snapshots
-        // may have minted fresh ConstInt/ConstFloat/ConstPtr entries.
-        for (&k, v) in &constants {
-            constant_types.entry(k).or_insert_with(|| v.get_type());
-        }
-        // Lower back to the legacy `i64` pool for the bridge compilation
-        // helpers below (compile_bridge / compile_entry_bridge consume the
-        // legacy backend shape directly).
-        let constants: HashMap<u32, i64> = constants
-            .iter()
-            .map(|(&k, v)| {
-                (
-                    k,
-                    crate::optimizeopt::optimizer::value_to_backend_constant_bits(v),
-                )
-            })
-            .collect();
+        // Lower the typed `Value` pool to the dense `VecAssoc<u32, Const>`
+        // shape the bridge compilation helpers consume.
+        let bridge_constants =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.cut_trace(cut_at);
@@ -5027,8 +5008,7 @@ impl<M: Clone> MetaInterp<M> {
                     fail_descr,
                     &bridge_ops,
                     &bridge_inputargs,
-                    constants,
-                    constant_types,
+                    bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
@@ -5058,8 +5038,7 @@ impl<M: Clone> MetaInterp<M> {
                     entry_meta,
                     &bridge_ops,
                     &bridge_inputargs,
-                    constants,
-                    constant_types,
+                    bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
@@ -8166,8 +8145,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        constants: HashMap<u32, i64>,
-        constant_types: HashMap<u32, Type>,
+        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -8239,15 +8217,9 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
-        let mut constants: HashMap<u32, majit_ir::Value> = constants
+        let mut constants: HashMap<u32, majit_ir::Value> = bridge_constants
             .iter()
-            .map(|(&k, &raw)| {
-                let tp = constant_types
-                    .get(&k)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                (k, heap_value_for(tp, raw))
-            })
+            .map(|(&k, c)| (k, c.to_value()))
             .collect();
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
@@ -8552,8 +8524,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        constants: HashMap<u32, i64>,
-        constant_types: HashMap<u32, Type>,
+        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -8762,15 +8733,9 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
-        let mut constants: HashMap<u32, majit_ir::Value> = constants
+        let mut constants: HashMap<u32, majit_ir::Value> = bridge_constants
             .iter()
-            .map(|(&k, &raw)| {
-                let tp = constant_types
-                    .get(&k)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                (k, heap_value_for(tp, raw))
-            })
+            .map(|(&k, c)| (k, c.to_value()))
             .collect();
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
