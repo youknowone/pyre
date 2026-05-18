@@ -17943,7 +17943,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18075,9 +18081,13 @@ mod tests {
         green_key: u64,
         inputargs: &[InputArg],
         ops: Vec<Op>,
-        constants: HashMap<u32, i64>,
+        constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
     ) {
-        meta.backend.set_constants(constants.clone());
+        let backend_constants: HashMap<u32, i64> = constants_typed
+            .iter()
+            .map(|(&k, c)| (k, c.as_raw_i64()))
+            .collect();
+        meta.backend.set_constants(backend_constants);
         let mut token = JitCellToken::new(green_key + 1000);
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
@@ -18117,11 +18127,6 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
-        for (&k, &v) in &constants {
-            constants_typed.insert(k, majit_ir::Const::Int(v));
-        }
         let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
@@ -18188,7 +18193,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18266,7 +18277,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18357,7 +18374,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            green_key,
+            &inputargs,
+            ops,
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
@@ -18453,10 +18476,11 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         constants.insert(
             100,
-            maybe_force_and_return_void as *const () as usize as i64,
+            majit_ir::Const::Int(maybe_force_and_return_void as *const () as usize as i64),
         );
         attach_procedure_to_interp_entry(meta, green_key, &inputargs, ops, constants);
     }
@@ -19462,9 +19486,10 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants = HashMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 0);
+        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        constants.insert(100, majit_ir::Const::Int(1));
+        constants.insert(101, majit_ir::Const::Int(0));
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
