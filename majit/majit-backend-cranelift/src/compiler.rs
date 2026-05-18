@@ -5854,11 +5854,20 @@ fn emit_guard_exit(
     //     `emit_return_call_common_sequence` (Tail conv aarch64) —
     //     unchanged between 0.130.2 and 0.131.1.
     //
-    // The dispatch helper itself (and the per-LABEL `ll_loop_code`
-    // address wiring) is committed and used by the wrapper+body
-    // split; only the call from `emit_guard_exit` stays gated until
-    // the upstream tail-call accounting bug is fixed or pyre's
-    // argloc remap lands.
+    // The dispatch helper itself (and the per-LABEL `ll_loop_code` +
+    // `label_block_id` address wiring) is committed and used by the
+    // wrapper+body split; only the call from `emit_guard_exit` stays
+    // gated.  The 2026-05-18 gate-flip probe with the per-LABEL gate
+    // *plus* fall-through for non-first LABELs still reproduced the
+    // nbody `-0.03513379910298962` corruption (vs. dynasm reference
+    // `-0.035132020348426815`), confirming the corruption is NOT
+    // inputarg-count mismatch — it's output/input slot remap.  The
+    // remaining work is option (ii): port PyPy's regalloc.py
+    // _consider_jump argloc-remap pass to cranelift so JUMP exits
+    // emit MOVs that shuffle source exit slots → target input slots
+    // before `return_call_indirect`.  Even with argloc remap, the
+    // cranelift 0.130/0.131 aarch64 Tail-conv ~12.5 bytes/take stack
+    // leak remains an upstream blocker for raise_catch / fannkuch.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
