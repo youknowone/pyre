@@ -746,8 +746,10 @@ pub struct PartialTrace {
     pub(crate) ops: Vec<Op>,
     /// Inputargs from the partial trace.
     pub(crate) inputargs: Vec<InputArg>,
-    /// Constants from the partial trace.
-    pub(crate) constants: HashMap<u32, i64>,
+    /// Typed constants from the partial trace.  `Const` (history.py:220/261/307)
+    /// carries both value and type, so the merge in `compile_retrace`
+    /// no longer needs a parallel `constant_types` lookup.
+    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
 }
 
 /// The meta-tracing JIT engine.
@@ -5068,7 +5070,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         ops: Vec<Op>,
         inputargs: Vec<InputArg>,
-        constants: HashMap<u32, i64>,
+        constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
         exported_state: crate::optimizeopt::unroll::ExportedState,
     ) {
         if crate::majit_log_enabled() {
@@ -5143,7 +5145,6 @@ impl<M: Clone> MetaInterp<M> {
             orig_vable_ptr_retrace,
             loop_jitcell_token,
             mut constants,
-            mut constant_types,
             trace,
             call_pure_results,
         ) = {
@@ -5164,11 +5165,8 @@ impl<M: Clone> MetaInterp<M> {
             let orig_vable_ptr_retrace =
                 self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
             // history.py:220 box.type parity: ConstantPool stores typed
-            // `Value` intrinsically — the snapshot is already the
-            // canonical shape; the legacy `constant_types` view is a
-            // pure projection used by `apply_partial_trace_into`.
+            // `Value` intrinsically — the snapshot is the canonical shape.
             let constants: HashMap<u32, majit_ir::Value> = ctx.constants.snapshot();
-            let constant_types = ctx.constants.constant_types_snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -5204,7 +5202,6 @@ impl<M: Clone> MetaInterp<M> {
                 orig_vable_ptr_retrace,
                 loop_jitcell_token,
                 constants,
-                constant_types,
                 trace,
                 call_pure_results,
             )
@@ -5305,16 +5302,12 @@ impl<M: Clone> MetaInterp<M> {
         // ops (JUMP excluded), matching RPython's partial_trace.operations.
         let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
-        // Merge constants from partial trace with new constants. The
-        // partial trace was serialized in the legacy backend `i64` shape;
-        // promote each entry to a typed `Value` via its companion type
-        // tag (constant_types) — history.py:220 box.type parity.
-        for (k, v) in partial.constants {
-            let tp = constant_types
-                .get(&k)
-                .copied()
-                .unwrap_or(majit_ir::Type::Int);
-            constants.entry(k).or_insert_with(|| heap_value_for(tp, v));
+        // Merge constants from partial trace with new constants.  Partial
+        // trace stores `Const` (history.py:220/261/307) intrinsically, so
+        // `Const::to_value()` recovers the typed `Value` without a
+        // parallel type lookup.
+        for (k, c) in partial.constants {
+            constants.entry(k).or_insert_with(|| c.to_value());
         }
 
         // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
@@ -8303,15 +8296,16 @@ impl<M: Clone> MetaInterp<M> {
                         InputArg::from_type(tp, opref.raw())
                     })
                     .collect();
-                // retrace_needed serializes the legacy `i64` shape into
-                // PartialTrace; lower the typed pool back at the boundary.
-                let (retrace_bits, _retrace_types) =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+                // PartialTrace now stores the typed `Const` pool directly;
+                // `compile_retrace`'s merge reads `Const::to_value()` without
+                // a parallel type lookup.
+                let retrace_constants =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    retrace_bits,
+                    retrace_constants,
                     es,
                 );
             }
@@ -8853,15 +8847,16 @@ impl<M: Clone> MetaInterp<M> {
                             InputArg::from_type(tp, opref.raw())
                         })
                         .collect();
-                // retrace_needed serializes the legacy `i64` shape into
-                // PartialTrace; lower the typed pool back at the boundary.
-                let (retrace_bits, _retrace_types) =
-                    crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
+                // PartialTrace now stores the typed `Const` pool directly;
+                // `compile_retrace`'s merge reads `Const::to_value()` without
+                // a parallel type lookup.
+                let retrace_constants =
+                    crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
                 self.retrace_needed(
                     green_key,
                     optimized_ops.clone(),
                     renamed_inputargs,
-                    retrace_bits,
+                    retrace_constants,
                     es,
                 );
             }
