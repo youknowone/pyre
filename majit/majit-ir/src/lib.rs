@@ -44,3 +44,5 @@ pub use value::{
     StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot, set_str_resolver,
     set_unicode_resolver,
 };
+pub use vec_assoc::VecAssoc;
+pub use vec_set::VecSet;
