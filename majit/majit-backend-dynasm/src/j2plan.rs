@@ -256,13 +256,13 @@ fn lower_op(op: &Op) -> LirOp {
         | OpCode::IntLshift
         | OpCode::IntRshift
         | OpCode::UintRshift
-            if op.args.len() >= 2 =>
+            if op.num_args() >= 2 =>
         {
             LirOp::IntBin {
                 kind: int_bin_kind(op.opcode),
                 dst: op.pos.get(),
-                lhs: op.args[0],
-                rhs: op.args[1],
+                lhs: op.arg(0),
+                rhs: op.arg(1),
             }
         }
         OpCode::IntNeg | OpCode::IntInvert | OpCode::IntIsTrue | OpCode::IntIsZero
@@ -271,7 +271,7 @@ fn lower_op(op: &Op) -> LirOp {
             LirOp::IntUnary {
                 kind: int_unary_kind(op.opcode),
                 dst: op.pos.get(),
-                arg: op.args[0],
+                arg: op.arg(0),
             }
         }
         OpCode::IntLt
@@ -288,71 +288,71 @@ fn lower_op(op: &Op) -> LirOp {
         | OpCode::PtrNe
         | OpCode::InstancePtrEq
         | OpCode::InstancePtrNe
-            if op.args.len() >= 2 =>
+            if op.num_args() >= 2 =>
         {
             LirOp::IntCmp {
                 kind: int_cmp_kind(op.opcode),
                 dst: op.pos.get(),
-                lhs: op.args[0],
-                rhs: op.args[1],
+                lhs: op.arg(0),
+                rhs: op.arg(1),
             }
         }
-        OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF if op.args.len() >= 2 => LirOp::Load {
+        OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF if op.num_args() >= 2 => LirOp::Load {
             kind: LoadKind::Gc,
             dst: op.pos.get(),
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
             size: op.args.get(2).copied(),
         },
         OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
-            if op.args.len() >= 5 =>
+            if op.num_args() >= 5 =>
         {
             LirOp::Load {
                 kind: LoadKind::GcIndexed,
                 dst: op.pos.get(),
-                base: op.args[0],
-                offset: Some(op.args[3]),
-                index: Some(op.args[1]),
-                scale: Some(op.args[2]),
-                size: Some(op.args[4]),
+                base: op.arg(0),
+                offset: Some(op.arg(3)),
+                index: Some(op.arg(1)),
+                scale: Some(op.arg(2)),
+                size: Some(op.arg(4)),
             }
         }
-        OpCode::RawLoadI | OpCode::RawLoadF if op.args.len() >= 2 => LirOp::Load {
+        OpCode::RawLoadI | OpCode::RawLoadF if op.num_args() >= 2 => LirOp::Load {
             kind: LoadKind::Raw,
             dst: op.pos.get(),
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
             size: None,
         },
-        OpCode::GcStore if op.args.len() >= 4 => LirOp::Store {
+        OpCode::GcStore if op.num_args() >= 4 => LirOp::Store {
             kind: StoreKind::Gc,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            value: op.args[2],
-            size: Some(op.args[3]),
+            value: op.arg(2),
+            size: Some(op.arg(3)),
         },
-        OpCode::GcStoreIndexed if op.args.len() >= 6 => LirOp::Store {
+        OpCode::GcStoreIndexed if op.num_args() >= 6 => LirOp::Store {
             kind: StoreKind::GcIndexed,
-            base: op.args[0],
-            offset: Some(op.args[4]),
-            index: Some(op.args[1]),
-            scale: Some(op.args[3]),
-            value: op.args[2],
-            size: Some(op.args[5]),
+            base: op.arg(0),
+            offset: Some(op.arg(4)),
+            index: Some(op.arg(1)),
+            scale: Some(op.arg(3)),
+            value: op.arg(2),
+            size: Some(op.arg(5)),
         },
-        OpCode::RawStore if op.args.len() >= 3 => LirOp::Store {
+        OpCode::RawStore if op.num_args() >= 3 => LirOp::Store {
             kind: StoreKind::Raw,
-            base: op.args[0],
-            offset: Some(op.args[1]),
+            base: op.arg(0),
+            offset: Some(op.arg(1)),
             index: None,
             scale: None,
-            value: op.args[2],
+            value: op.arg(2),
             size: None,
         },
         opcode if opcode.is_guard() => LirOp::Guard {

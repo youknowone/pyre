@@ -565,12 +565,12 @@ fn normalize_root_loop_entry_contract(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Jump);
-    let jump_arg_count = last_jump.map(|op| op.args.len()).unwrap_or(0);
+    let jump_arg_count = last_jump.map(|op| op.num_args()).unwrap_or(0);
     let label_op = optimized_ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label);
-    let label_arg_count = label_op.map(|op| op.args.len()).unwrap_or(0);
+    let label_arg_count = label_op.map(|op| op.num_args()).unwrap_or(0);
     let label_descr_index = label_op
         .and_then(|op| op.getdescr())
         .map(|descr| descr.index());
@@ -7227,9 +7227,7 @@ impl<M: Clone> MetaInterp<M> {
                         .is_some_and(|descr| descr.index() == target_descr.index())
             }) {
                 return Some(
-                    label
-                        .args
-                        .iter()
+                    label.getarglist().iter()
                         .map(|arg| {
                             type_index
                                 .opref_type_at(*arg, label_index)
@@ -16439,7 +16437,7 @@ mod metainterp_static_data_tests {
             let op = matches.next().expect("GuardException must be recorded");
             assert_eq!(op.args.len(), 1);
             let typeptr = ctx
-                .constants_get_value(op.args[0])
+                .constants_get_value(op.arg(0))
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
             op.pos.get()
@@ -16716,7 +16714,7 @@ mod metainterp_static_data_tests {
             .find(|op| op.opcode == OpCode::GuardException)
             .expect("GuardException must be recorded");
         let typeptr = ctx
-            .constants_get_value(op.args[0])
+            .constants_get_value(op.arg(0))
             .expect("typeptr constant");
         assert_eq!(typeptr, majit_ir::Value::Int(0xcafef00d));
     }
@@ -16868,9 +16866,9 @@ mod metainterp_static_data_tests {
         let op = matches.next().expect("EnterPortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
         assert_eq!(op.args.len(), 2);
-        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         let unique_id = ctx
-            .constants_get_value(op.args[1])
+            .constants_get_value(op.arg(1))
             .expect("unique_id constant");
         assert_eq!(jd_no, majit_ir::Value::Int(3));
         assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
@@ -16895,7 +16893,7 @@ mod metainterp_static_data_tests {
         let op = matches.next().expect("LeavePortalFrame must be recorded");
         assert!(matches.next().is_none(), "expected exactly one record");
         assert_eq!(op.args.len(), 1);
-        let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
+        let jd_no = ctx.constants_get_value(op.arg(0)).expect("jd_no constant");
         assert_eq!(jd_no, majit_ir::Value::Int(7));
     }
 

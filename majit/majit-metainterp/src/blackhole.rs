@@ -247,7 +247,7 @@ pub fn blackhole_execute_full(
         .unwrap_or(0);
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.raw()).collect())
+        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -323,117 +323,117 @@ fn execute_one_with_memory(
     match op.opcode {
         // Memory access ops with real backend
         OpCode::GcLoadI => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GcLoadR => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GcLoadF => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::GcStore => {
-            let base = values.resolve(op.args[0]);
-            let offset = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
+            let base = values.resolve(op.arg(0));
+            let offset = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
         OpCode::GcLoadIndexedI => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_i(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedR => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_r(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedF => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let scale = values.resolve(op.args[2]);
-            let offset = values.resolve(op.args[3]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let scale = values.resolve(op.arg(2));
+            let offset = values.resolve(op.arg(3));
             OpResult::Value(memory.gc_load_indexed_f(base, index, scale, offset))
         }
         OpCode::GcStoreIndexed => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
-            let scale = values.resolve(op.args[3]);
-            let offset = values.resolve(op.args[4]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
+            let scale = values.resolve(op.arg(3));
+            let offset = values.resolve(op.arg(4));
             memory.gc_store_indexed(base, index, scale, offset, value);
             OpResult::Void
         }
         OpCode::ArraylenGc => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             OpResult::Value(memory.arraylen(base))
         }
         OpCode::Strlen | OpCode::Unicodelen => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             OpResult::Value(memory.strlen(base))
         }
         // ── Field access via descr offset ──
         OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
-            let base = values.resolve(op.args[0]);
+            let base = values.resolve(op.arg(0));
             let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let base = values.resolve(op.args[0]);
-            let value = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let value = values.resolve(op.arg(1));
             let offset = op.with_field_descr(|f| f.offset() as i64).unwrap_or(0);
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
         // ── Array access via descr ──
         OpCode::GetarrayitemGcI | OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcPureI => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
                 .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
                 .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
                 .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
                 .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
             let (item_size, base_ofs) = op
                 .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
                 .unwrap_or((1, 0));
             OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
         }
         OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-            let base = values.resolve(op.args[0]);
-            let index = values.resolve(op.args[1]);
-            let value = values.resolve(op.args[2]);
+            let base = values.resolve(op.arg(0));
+            let index = values.resolve(op.arg(1));
+            let value = values.resolve(op.arg(2));
             let (item_size, base_ofs) = op
                 .with_array_descr(|a| (a.item_size() as i64, a.base_size() as i64))
                 .unwrap_or((1, 0));
@@ -446,13 +446,13 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceI
         | OpCode::CallReleaseGilI
         | OpCode::CallLoopinvariantI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR | OpCode::CallLoopinvariantR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallF
@@ -460,8 +460,8 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceF
         | OpCode::CallReleaseGilF
         | OpCode::CallLoopinvariantF => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallN
@@ -469,47 +469,47 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceN
         | OpCode::CallReleaseGilN
         | OpCode::CallLoopinvariantN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CallAssembler — delegate to call dispatch
         OpCode::CallAssemblerI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallAssemblerR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallAssemblerF => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallAssemblerN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CondCallValue — delegate to call dispatch
         OpCode::CondCallValueI => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CondCallValueR => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CondCallN => {
-            let func = values.resolve(op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
+            let func = values.resolve(op.arg(0));
+            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
@@ -614,7 +614,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
     // Label's args define the loop's inputargs (their OpRef positions).
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.raw()).collect())
+        .map(|op| op.getarglist().iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -637,7 +637,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 if call_assembler_fn.is_some() && op.opcode.is_call_assembler() =>
             {
                 let ca_fn = call_assembler_fn.unwrap();
-                let frame_ptr = tv.resolve(op.args[0]);
+                let frame_ptr = tv.resolve(op.arg(0));
                 let result = ca_fn(frame_ptr);
                 if !op.pos.get().is_none() {
                     tv.set(op.pos.get().raw(), result);

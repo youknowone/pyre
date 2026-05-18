@@ -2701,7 +2701,7 @@ impl Optimization for OptRewrite {
                 }
                 if let Some(c) = ctx.get_constant_int(op.arg(0)) {
                     if c != 0 {
-                        let mut call_op = Op::new(OpCode::CallN, &op.args[1..]);
+                        let mut call_op = Op::new(OpCode::CallN, &op.getarglist()[1..]);
                         call_op.pos.set(op.pos.get());
                         if let Some(d) = op.getdescr() {
                             call_op.setdescr(d);
@@ -2730,7 +2730,7 @@ impl Optimization for OptRewrite {
                     } else {
                         OpCode::CallPureR
                     };
-                    let mut call_op = Op::new(call_opcode, &op.args[1..]);
+                    let mut call_op = Op::new(call_opcode, &op.getarglist()[1..]);
                     call_op.pos.set(op.pos.get());
                     if let Some(d) = op.getdescr() {
                         call_op.setdescr(d);

@@ -210,9 +210,9 @@ impl WasmBackend {
             if matches!(
                 op.opcode,
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
-            ) && op.args.len() >= 2
+            ) && op.num_args() >= 2
             {
-                if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
+                if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -255,8 +255,8 @@ impl WasmBackend {
             // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
             // for every constant GuardSubclass arg1.
             for op in ops {
-                if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
-                    if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
+                if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
+                    if let Some(&classptr) = self.constants.get(&op.arg(1).raw()) {
                         if let Some(range) = gc.subclass_range(classptr as usize) {
                             info.subclass_ranges.insert(classptr, range);
                         }

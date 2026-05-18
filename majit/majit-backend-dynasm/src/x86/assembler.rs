@@ -5340,15 +5340,14 @@ impl<'a> Assembler386<'a> {
         }
         if let Some(ts) = op.get_fail_arg_types() {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.args.len()
+                op.num_args()
             } else {
                 op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
                 ts.to_vec()
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.args
-                    .iter()
+                op.getarglist().iter()
                     .map(|opref| {
                         self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
                             panic!(
@@ -5496,10 +5495,10 @@ impl<'a> Assembler386<'a> {
     fn genop_label(&mut self, op: &Op) {
         // Emit preamble→canonical copies BEFORE the label.
         // Two-pass push/pop: safely handles slot overlaps.
-        let n_label = op.args.len();
+        let n_label = op.num_args();
         // Pass 1: push source values
         for i in 0..n_label {
-            let arg_ref = op.args[i];
+            let arg_ref = op.arg(i);
             if arg_ref.is_none() {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + dst]);
@@ -5533,12 +5532,12 @@ impl<'a> Assembler386<'a> {
         }
 
         // Remap: Label's arg[i] → canonical slot i
-        for (i, &arg_ref) in op.args.iter().enumerate() {
+        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
             if !arg_ref.is_none() {
                 self.opref_to_slot.insert(arg_ref, i);
             }
         }
-        self.next_slot = self.next_slot.max(op.args.len());
+        self.next_slot = self.next_slot.max(op.num_args());
     }
 
     /// jump.py:66 _move: emit a single slot-to-slot or const-to-slot move.
@@ -5562,9 +5561,9 @@ impl<'a> Assembler386<'a> {
     fn genop_jump(&mut self, op: &Op) {
         // Build src→dst move list.
         // Each entry: (src_offset_or_const, dst_offset, is_const, const_val)
-        let n = op.args.len();
+        let n = op.num_args();
         let mut moves: Vec<(i32, i32, bool, i64)> = Vec::with_capacity(n);
-        for (i, &arg_ref) in op.args.iter().enumerate() {
+        for (i, &arg_ref) in op.getarglist().iter().enumerate() {
             let dst = Self::slot_offset(i);
             match self.resolve_opref(arg_ref) {
                 ResolvedArg::Slot(src) => moves.push((src, dst, false, 0)),
@@ -5673,7 +5672,7 @@ impl<'a> Assembler386<'a> {
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();
+        let finish_refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
             if explicit.len() == finish_refs.len() {
                 explicit.to_vec()
@@ -6760,7 +6759,7 @@ impl<'a> Assembler386<'a> {
             return;
         }
 
-        let num_args = op.args.len();
+        let num_args = op.num_args();
         let num_expanded_items = expansion
             .map(|exp| 1 + exp.scalar_fields.len() + exp.num_array_items)
             .unwrap_or(num_args);

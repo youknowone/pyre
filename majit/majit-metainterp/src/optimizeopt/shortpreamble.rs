@@ -140,8 +140,8 @@ impl ShortPreamble {
             // Remap arguments: replace label arg indices with bridge's concrete refs
             for (arg_pos, label_idx) in &entry.arg_mapping {
                 if let Some(bridge_ref) = bridge_args.get(*label_idx) {
-                    if *arg_pos < op.args.len() {
-                        op.args[*arg_pos] = *bridge_ref;
+                    if *arg_pos < op.num_args() {
+                        op.setarg(*arg_pos, *bridge_ref);
                     }
                 }
             }
@@ -268,7 +268,7 @@ impl CollectedShortPreambleBuilder {
             .into_iter()
             .map(|op| {
                 let mut arg_mapping = Vec::new();
-                for (arg_pos, arg_ref) in op.args.iter().enumerate() {
+                for (arg_pos, arg_ref) in op.getarglist().iter().enumerate() {
                     if let Some(label_idx) = label_args.iter().position(|a| a == arg_ref) {
                         arg_mapping.push((arg_pos, label_idx));
                     }
@@ -387,9 +387,7 @@ impl PreambleOp {
                 //       opnum = op.getopnum()
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
-                    .op
-                    .args
-                    .iter()
+                    .op.getarglist().iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
@@ -411,9 +409,7 @@ impl PreambleOp {
                 //   opnum = OpHelpers.call_loopinvariant_for_descr(op.getdescr())
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
-                    .op
-                    .args
-                    .iter()
+                    .op.getarglist().iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
                 let opnum = match self.op.opcode {
@@ -787,7 +783,7 @@ impl ShortBoxes {
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
             let mut new_args = vec![preamble_arg];
-            new_args.extend_from_slice(&getfield_op.args[1..]);
+            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
             let mut new_op = Op::with_descr(
                 getfield_op.opcode,
                 &new_args,
@@ -975,7 +971,7 @@ impl CollectedExtendedShortPreambleBuilder {
             .into_iter()
             .map(|preamble_op| {
                 let mut arg_mapping = Vec::new();
-                for (arg_pos, arg_ref) in preamble_op.op.args.iter().enumerate() {
+                for (arg_pos, arg_ref) in preamble_op.op.getarglist().iter().enumerate() {
                     if let Some(label_idx) = label_args.iter().position(|a| a == arg_ref) {
                         arg_mapping.push((arg_pos, label_idx));
                     }
@@ -1326,9 +1322,7 @@ impl ProducedShortOp {
         // SAME_AS body op's `op.type_` once it lands in
         // `new_operations`.
         let args = self
-            .preamble_op
-            .args
-            .iter()
+            .preamble_op.getarglist().iter()
             .map(|&arg| {
                 classify_short_arg(
                     ctx,
@@ -1813,9 +1807,7 @@ fn build_short_preamble_struct_from_ops(
         .iter()
         .cloned()
         .map(|op| {
-            let arg_mapping = op
-                .args
-                .iter()
+            let arg_mapping = op.getarglist().iter()
                 .enumerate()
                 .filter_map(|(arg_pos, arg_ref)| {
                     inputarg_idx(arg_ref).map(|label_idx| (arg_pos, label_idx))
@@ -2634,9 +2626,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         if op.opcode.is_guard_overflow() && idx > 0 {
             let ovf_op = &peeled_ops[idx - 1];
             if ovf_op.opcode.is_ovf() && included_positions.insert(ovf_op.pos.get()) {
-                let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op
-                    .args
-                    .iter()
+                let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op.getarglist().iter()
                     .enumerate()
                     .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
                     .collect();
@@ -2666,9 +2656,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             continue;
         }
 
-        let arg_mapping: Vec<(usize, usize)> = op
-            .args
-            .iter()
+        let arg_mapping: Vec<(usize, usize)> = op.getarglist().iter()
             .enumerate()
             .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
             .collect();

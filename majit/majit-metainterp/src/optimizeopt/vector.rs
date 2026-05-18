@@ -271,8 +271,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
 /// for a scalar op, respecting seen/invariant/accumulation state.
 fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut VecSet<OpRef>) {
     // schedule.py:702-706: unpack immediate-use args
-    for j in 0..op.args.len() {
-        let arg = op.args[j];
+    for j in 0..op.num_args() {
+        let arg = op.arg(j);
         if arg.is_constant() || seen.contains(&arg) {
             continue; // schedule.py:719: already seen
         }
@@ -286,7 +286,7 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ve
             let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
             state.renamer.start_renaming(arg, unpacked);
             seen.insert(unpacked);
-            op.args[j] = unpacked;
+            op.setarg(j, unpacked);
         }
     }
     // schedule.py:708-716: unpack guard failargs
@@ -601,8 +601,8 @@ impl VectorizingOptimizer {
             }
             // schedule.py:998: getleftmostseed = leftmost.getarg(position)
             let pos = pack.position.max(0) as usize;
-            let seed = if pos < first_op.args.len() {
-                first_op.args[pos]
+            let seed = if pos < first_op.num_args() {
+                first_op.arg(pos)
             } else {
                 OpRef::NONE
             };

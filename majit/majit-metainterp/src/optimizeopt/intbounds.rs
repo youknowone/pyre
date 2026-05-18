@@ -3104,7 +3104,7 @@ mod tests {
         // rewrite's `x + x → x << 1`) cannot collide with an input arg.
         let max_arg = ops
             .iter()
-            .flat_map(|op| op.args.iter().copied())
+            .flat_map(|op| op.getarglist().iter().copied())
             .filter(|r| !r.is_constant() && !r.is_none())
             .map(|r| r.raw())
             .max()

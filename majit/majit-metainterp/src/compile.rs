@@ -485,22 +485,20 @@ pub(crate) fn build_guard_metadata(
             // `cpu.get_*_value(deadframe, 0)` keyed by the descr
             // class, not by per-arg inference.
             if let Some(types) = descr_types {
-                if types.len() == op.args.len() {
+                if types.len() == op.num_args() {
                     types.to_vec()
                 } else {
                     // Arity mismatch (synthetic test ops without a
                     // type-shaped descr): reconstruct per-arg from the
                     // incremental `value_types`. Production FINISH always
                     // matches the descr arity.
-                    op.args
-                        .iter()
+                    op.getarglist().iter()
                         .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                         .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.args
-                    .iter()
+                op.getarglist().iter()
                     .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                     .collect()
             }
@@ -1558,18 +1556,14 @@ pub(crate) fn infer_terminal_exit_layout(
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
     let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
-    let exit_types: Vec<Type> = op
-        .args
-        .iter()
+    let exit_types: Vec<Type> = op.getarglist().iter()
         .map(|opref| {
             type_index
                 .opref_type_at(*opref, op_index)
                 .unwrap_or(Type::Int)
         })
         .collect();
-    let force_token_slots: Vec<usize> = op
-        .args
-        .iter()
+    let force_token_slots: Vec<usize> = op.getarglist().iter()
         .enumerate()
         .filter_map(|(slot, opref)| {
             type_index
@@ -1864,8 +1858,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         let mut emitted = op.clone();
         let mut replaced = false;
 
-        for i in 0..op.args.len() {
-            let orig_arg = op.args[i];
+        for i in 0..op.num_args() {
+            let orig_arg = op.arg(i);
             let arg = get_local_box_replacement(forwarding, orig_arg);
             if orig_arg != arg {
                 if !replaced {
@@ -1881,7 +1875,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                     }
                     replaced = true;
                 }
-                emitted.args[i] = arg;
+                emitted.setarg(i, arg);
             }
         }
 
@@ -1923,7 +1917,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .iter()
         .flat_map(|op| {
             std::iter::once(op.pos.get())
-                .chain(op.args.iter().copied())
+                .chain(op.getarglist().iter().copied())
                 .chain(op.getfailargs().into_iter().flatten())
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))

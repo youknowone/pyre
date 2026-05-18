@@ -286,7 +286,7 @@ impl<'a> TraceIterator<'a> {
             .iter()
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
-                    .chain(op.args.iter().copied())
+                    .chain(op.getarglist().iter().copied())
                     .chain(op.getfailargs().into_iter().flatten())
             })
             .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -3447,7 +3447,7 @@ mod tests {
         );
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::IntAdd);
-        let const_arg = op.args[1];
+        let const_arg = op.arg(1);
         assert!(const_arg.is_constant());
         // The pool entry for the TAGINT arg must round-trip to 42 (Int).
         drop(it);
@@ -3659,7 +3659,7 @@ mod tests {
             Some(&mut pool),
         );
         let op = it.next().expect("one op");
-        let const_arg = op.args[1];
+        let const_arg = op.arg(1);
         drop(it);
         assert_eq!(pool.get_value(const_arg), Some(majit_ir::Value::Int(-7)));
     }

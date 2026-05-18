@@ -144,7 +144,7 @@ impl RegisterHints {
 
     /// reghint.py:43-45 consider_int_neg / consider_int_invert.
     fn consider_int_neg(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
-        longevity.try_use_same_register(op.args[0], op.pos.get());
+        longevity.try_use_same_register(op.arg(0), op.pos.get());
     }
 
     /// reghint.py:47-62 `_consider_binop_part`.
@@ -155,8 +155,8 @@ impl RegisterHints {
         position: i32,
         symm: bool,
     ) {
-        let mut x = op.args[0];
-        let mut y = op.args[1];
+        let mut x = op.arg(0);
+        let mut y = op.arg(1);
 
         // For symmetrical operations, if y won't be used after the
         // current operation finishes, but x will be, then swap the
@@ -190,7 +190,7 @@ impl RegisterHints {
 
     /// reghint.py:79-84 `consider_int_add`.
     fn consider_int_add(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let y = op.args[1];
+        let y = op.arg(1);
         if let Some(val) = self.get_const_int(y) {
             if fits_in_32bits(val) {
                 // nothing to be hinted
@@ -202,7 +202,7 @@ impl RegisterHints {
 
     /// reghint.py:88-93 `consider_int_sub`.
     fn consider_int_sub(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let y = op.args[1];
+        let y = op.arg(1);
         if let Some(val) = self.get_const_int(y) {
             if fits_in_32bits(-val) {
                 return;
@@ -213,7 +213,7 @@ impl RegisterHints {
 
     /// reghint.py:95-98 `_consider_float_op`.
     fn _consider_float_op(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
-        let x = op.args[0];
+        let x = op.arg(0);
         if !x.is_constant() {
             longevity.try_use_same_register(x, op.pos.get());
         }
@@ -226,8 +226,8 @@ impl RegisterHints {
     /// Fix `ecx` for `y` at this position, and bias the result to
     /// share with `x` via try_use_same_register.
     fn consider_int_lshift(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let x = op.args[0];
-        let y = op.args[1];
+        let x = op.arg(0);
+        let y = op.arg(1);
         if !y.is_constant() {
             longevity.fixed_register(position, ECX, Some(y));
         }
@@ -289,7 +289,7 @@ impl RegisterHints {
             return;
         };
         let gc_level = compute_gc_level(calldescr, guard_not_forced);
-        let args = &op.args[first_arg_index..];
+        let args = &op.arg(first_arg_index..);
         let argtypes = calldescr.arg_types();
         self.hint(longevity, position, args, argtypes, gc_level);
     }

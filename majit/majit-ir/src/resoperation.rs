@@ -1300,7 +1300,7 @@ impl std::fmt::Display for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.opcode.is_guard() {
             write!(f, "{:?}(", self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -1320,7 +1320,7 @@ impl std::fmt::Display for Op {
             Ok(())
         } else if self.result_type() != Type::Void {
             write!(f, "v{} = {:?}(", self.pos.get().raw(), self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -1329,7 +1329,7 @@ impl std::fmt::Display for Op {
             write!(f, ")")
         } else {
             write!(f, "{:?}(", self.opcode)?;
-            for (i, arg) in self.args.iter().enumerate() {
+            for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
@@ -1361,7 +1361,7 @@ pub fn format_trace<V: std::fmt::Debug>(
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
         }
-        for (i, arg) in op.args.iter().enumerate() {
+        for (i, arg) in op.getarglist().iter().enumerate() {
             if i > 0 {
                 write!(out, ", ").unwrap();
             }

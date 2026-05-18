@@ -2601,7 +2601,7 @@ impl GcRewriterImpl {
 
         // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
         // per-arg itemsize from getarraydescr_for_frame(arg.type).
-        let arglist: Vec<OpRef> = op.args.iter().map(|&a| st.resolve(a)).collect();
+        let arglist: Vec<OpRef> = op.getarglist().iter().map(|&a| st.resolve(a)).collect();
         let index_list = &callee_locs._ll_initial_locs;
         for (i, &arg) in arglist.iter().enumerate() {
             // rewrite.py:675-677 — descr = cpu.getarraydescr_for_frame(arg.type);
@@ -3167,17 +3167,17 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         // rewrite.py:474-484 parity: size arg is ConstInt(descr.size + GcHeader::SIZE).
-        let size_val = constants[&result[0].args[0].raw()];
+        let size_val = constants[&result[0].arg(0).raw()];
         assert_eq!(size_val, (32 + crate::header::GcHeader::SIZE) as i64);
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
-        let tid_val = constants[&result[1].args[2].raw()];
+        let tid_val = constants[&result[1].arg(2).raw()];
         assert_eq!(tid_val, 7); // type_id = 7
         // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
         // bits) into a single u64.  gen_initialize_tid must emit a
         // 4-byte store so that the runtime-set flags
         // (collector.rs:449 alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
         // oldgen-promoted allocs) survive the type id stamp.
-        let store_size = constants[&result[1].args[3].raw()];
+        let store_size = constants[&result[1].arg(3).raw()];
         assert_eq!(
             store_size, 4,
             "gen_initialize_tid must emit a 4-byte store (type id half) so \
@@ -3442,8 +3442,8 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             // skip the tid header store (ofs=0, value=type_id, itemsize=4).
-            .filter(|o| consts.get(&o.args[2].raw()).copied() == Some(0))
-            .map(|o| consts[&o.args[1].raw()])
+            .filter(|o| consts.get(&o.arg(2).raw()).copied() == Some(0))
+            .map(|o| consts[&o.arg(1).raw()])
             .collect();
         seen_offsets.sort();
         assert_eq!(
@@ -3480,8 +3480,8 @@ mod tests {
         let null_offsets: Vec<i64> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
-            .filter(|o| consts.get(&o.args[2].raw()).copied() == Some(0))
-            .map(|o| consts[&o.args[1].raw()])
+            .filter(|o| consts.get(&o.arg(2).raw()).copied() == Some(0))
+            .map(|o| consts[&o.arg(1).raw()])
             .collect();
         assert_eq!(
             null_offsets,
@@ -3659,10 +3659,10 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         assert_eq!(result[1].opcode, OpCode::GcStore);
-        let tid_ref = result[1].args[2];
+        let tid_ref = result[1].arg(2);
         assert_eq!(constants[&tid_ref.raw()], 3);
         assert_eq!(result[2].opcode, OpCode::GcStore);
-        let vtable_ref = result[2].args[2];
+        let vtable_ref = result[2].arg(2);
         assert_eq!(constants[&vtable_ref.raw()], 0xDEAD_i64);
     }
 
@@ -3880,7 +3880,7 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::SameAsI)
             .expect("SAME_AS_I must be emitted for GUARD_FALSE merge");
-        let const_ref = same.args[0];
+        let const_ref = same.arg(0);
         assert_eq!(
             consts[&const_ref.raw()],
             1,

@@ -1531,7 +1531,7 @@ impl OptHeap {
         // heap.py:497-500: flag_value = self.getintbound(op.getarg(4))
         //   if not flag_value.is_constant(): return False
         //   flag = flag_value.get_constant_int()
-        if op.args.len() < 5 {
+        if op.num_args() < 5 {
             return false;
         }
         let flag = match ctx.get_constant_int_or_bound(op.arg(4)) {
@@ -1659,19 +1659,19 @@ impl OptHeap {
             .unwrap_or(false);
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
-            && op.args.len() >= 6
-            && ctx.is_constant(op.args[3])
-            && ctx.is_constant(op.args[4])
-            && ctx.is_constant(op.args[5])
+            && op.num_args() >= 6
+            && ctx.is_constant(op.arg(3))
+            && ctx.is_constant(op.arg(4))
+            && ctx.is_constant(op.arg(5))
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
-            && op.args.len() >= 5
-            && ctx.is_constant(op.args[2])
-            && ctx.is_constant(op.args[3])
-            && ctx.is_constant(op.args[4])
+            && op.num_args() >= 5
+            && ctx.is_constant(op.arg(2))
+            && ctx.is_constant(op.arg(3))
+            && ctx.is_constant(op.arg(4))
         {
             return;
         }
@@ -1682,9 +1682,7 @@ impl OptHeap {
 
     fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<OpRef> {
         let mut owners = Vec::new();
-        let mut stack: Vec<OpRef> = op
-            .args
-            .iter()
+        let mut stack: Vec<OpRef> = op.getarglist().iter()
             .map(|arg| ctx.get_box_replacement(*arg))
             .collect();
         while let Some(owner) = stack.pop() {
@@ -1706,7 +1704,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) {
         let needs_postponed = self.postponed_op.as_ref().map_or(false, |postponed| {
-            op.args.iter().any(|arg| *arg == postponed.pos.get())
+            op.getarglist().iter().any(|arg| *arg == postponed.pos.get())
         });
         if needs_postponed {
             if let Some(p) = self.postponed_op.take() {
@@ -2081,7 +2079,7 @@ impl OptHeap {
                 }
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos.get();
-                    if lazy_op.args.iter().any(|a| *a == ppos) {
+                    if lazy_op.getarglist().iter().any(|a| *a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
                         }
@@ -2369,7 +2367,7 @@ impl OptHeap {
                 // heap.py:130-134 emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
                     let ppos = postponed.pos.get();
-                    if lazy_op.args.iter().any(|a| *a == ppos) {
+                    if lazy_op.getarglist().iter().any(|a| *a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
                         }
@@ -2627,7 +2625,7 @@ impl OptHeap {
                     }
                     if let Some(ref postponed) = self.postponed_op {
                         let ppos = postponed.pos.get();
-                        if lazy_op.args.iter().any(|a| *a == ppos) {
+                        if lazy_op.getarglist().iter().any(|a| *a == ppos) {
                             if let Some(p) = self.postponed_op.take() {
                                 ctx.emit_extra(ctx.current_pass_idx, p);
                             }
@@ -2887,17 +2885,17 @@ impl OptHeap {
                     self.mark_escaped_varargs(op, ctx);
                     self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
 
-                    let dest_ref = if op.args.len() > 2 {
+                    let dest_ref = if op.num_args() > 2 {
                         op.arg(2)
                     } else {
                         OpRef::NONE
                     };
-                    let dest_start = if op.args.len() > 4 {
+                    let dest_start = if op.num_args() > 4 {
                         ctx.get_constant_int(op.arg(4))
                     } else {
                         None
                     };
-                    let length = if op.args.len() > 5 {
+                    let length = if op.num_args() > 5 {
                         ctx.get_constant_int(op.arg(5))
                     } else {
                         None
@@ -3147,7 +3145,7 @@ impl OptHeap {
                         Some(Self::field_effect_index(&descr)),
                         Some(Self::field_cache_identity(&descr)),
                     )
-                } else if op.args.len() > 1 {
+                } else if op.num_args() > 1 {
                     let idx = ctx.get_constant_int(op.arg(1)).map(|v| v as u32);
                     (idx, idx.map(|v| v as usize))
                 } else {

@@ -450,7 +450,7 @@ impl Optimizer {
         if target.const_value().is_none() {
             return false;
         }
-        op.args.is_empty() || op.args.iter().all(|arg| arg.is_none())
+        op.args.is_empty() || op.getarglist().iter().all(|arg| arg.is_none())
     }
 
     fn import_virtual_state_value(
@@ -2347,9 +2347,7 @@ impl Optimizer {
             // force_box materializes the virtual to preserve Ref type.
             let inputarg_types = self.trace_inputarg_types.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
-            let resolved_args: Vec<OpRef> = terminal_op
-                .args
-                .iter()
+            let resolved_args: Vec<OpRef> = terminal_op.getarglist().iter()
                 .map(|&arg| ctx.get_box_replacement(arg))
                 .collect();
             for &resolved in &resolved_args {
@@ -2472,7 +2470,7 @@ impl Optimizer {
             // — VS captured AFTER force + flush.
             let original_jump_args = pre_jump_resolved_args.clone()
                 .unwrap_or_else(|| {
-                    jump.args.iter()
+                    jump.getarglist().iter()
                         .map(|&a| ctx.get_box_replacement(a))
                         .collect()
                 });
@@ -2792,7 +2790,7 @@ impl Optimizer {
             let all_refs: Vec<OpRef> = ctx
                 .new_operations
                 .iter()
-                .flat_map(|op| op.args.iter().copied())
+                .flat_map(|op| op.getarglist().iter().copied())
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
@@ -3715,7 +3713,7 @@ impl Optimizer {
         // optimizer.py:623-625: force_box on every arg unconditionally.
         for i in 0..op.num_args() {
             let arg = ctx.get_box_replacement(op.arg(i));
-            op.args[i] = self.force_box(arg, ctx);
+            op.setarg(i, self.force_box(arg, ctx));
         }
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
         // Pyre defers the fold into JitStatsCounters via update_counters

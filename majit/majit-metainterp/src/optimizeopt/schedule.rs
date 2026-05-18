@@ -366,7 +366,7 @@ impl PackSet {
                 OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
             ))
             && packed.num_args() >= 2
-            && packed.args[1] == inquestion.pos.get()
+            && packed.arg(1) == inquestion.pos.get()
         {
             return true;
         }
@@ -475,7 +475,7 @@ impl PackSet {
     /// vector.py:820-824: getaccumulator_variable — find which arg of right
     /// is the result of left (the accumulator variable).
     fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
-        for (i, arg) in right.args.iter().enumerate() {
+        for (i, arg) in right.getarglist().iter().enumerate() {
             if *arg == left.pos.get() {
                 return (Some(*arg), i as i32);
             }
@@ -571,7 +571,7 @@ impl GuardAnalysis {
             if !op.opcode.is_guard() {
                 continue;
             }
-            let all_invariant = op.args.iter().all(|arg| !body_results.contains(arg));
+            let all_invariant = op.getarglist().iter().all(|arg| !body_results.contains(arg));
             if all_invariant {
                 hoistable.push(i);
             } else {
@@ -869,10 +869,10 @@ impl VecScheduleState {
     ) {
         for (i, &member_idx) in pack.members.iter().enumerate() {
             let op = &ops[member_idx];
-            if index >= op.args.len() {
+            if index >= op.num_args() {
                 break;
             }
-            let arg = op.args[index];
+            let arg = op.arg(index);
             self.setvector_of_box(arg, i, vecbox);
         }
     }
@@ -1072,8 +1072,8 @@ fn assemble_scattered_values(
         .iter()
         .map(|&m| {
             let op = &ops[m];
-            if index < op.args.len() {
-                op.args[index]
+            if index < op.num_args() {
+                op.arg(index)
             } else {
                 args[index]
             }
@@ -1302,7 +1302,7 @@ fn expand(
     // schedule.py:539-543: check if all pack members have the same arg at `index`
     let all_same = pack.members.iter().all(|&m| {
         let op = &ops[m];
-        index < op.args.len() && op.args[index] == arg
+        index < op.num_args() && op.arg(index) == arg
     });
 
     // schedule.py:551: get vecinfo from left op for bytesize/signed
@@ -1344,8 +1344,8 @@ fn expand(
         .iter()
         .map(|&m| {
             let op = &ops[m];
-            if index < op.args.len() {
-                op.args[index]
+            if index < op.num_args() {
+                op.arg(index)
             } else {
                 arg
             }

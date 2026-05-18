@@ -68,16 +68,16 @@ fn side_effect_arguments(
     if op.opcode.is_complex_modify() {
         // dependency.py:218-230: known complex modification patterns
         if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
-            if obj_idx < op.args.len() {
-                if cell_idx >= 0 && (cell_idx as usize) < op.args.len() {
-                    result.push((op.args[obj_idx], Some(op.args[cell_idx as usize]), true));
-                    for j in (cell_idx as usize + 1)..op.args.len() {
-                        result.push((op.args[j], None, false));
+            if obj_idx < op.num_args() {
+                if cell_idx >= 0 && (cell_idx as usize) < op.num_args() {
+                    result.push((op.arg(obj_idx), Some(op.arg(cell_idx as usize)), true));
+                    for j in (cell_idx as usize + 1)..op.num_args() {
+                        result.push((op.arg(j), None, false));
                     }
                 } else {
-                    result.push((op.args[obj_idx], None, true));
-                    for j in (obj_idx + 1)..op.args.len() {
-                        result.push((op.args[j], None, false));
+                    result.push((op.arg(obj_idx), None, true));
+                    for j in (obj_idx + 1)..op.num_args() {
+                        result.push((op.arg(j), None, false));
                     }
                 }
             }
@@ -405,11 +405,11 @@ impl DependencyGraph {
             // dependency.py:742-751: LOAD_COMPLEX_OBJ dispatch
             // (opnum, complex_obj_arg_idx, index_arg_idx)
             let (cobj_idx, index_idx) = load_complex_obj_args(op.opcode);
-            if cobj_idx < op.args.len() {
-                let cobj = op.args[cobj_idx];
-                if index_idx >= 0 && (index_idx as usize) < op.args.len() {
+            if cobj_idx < op.num_args() {
+                let cobj = op.arg(cobj_idx);
+                if index_idx >= 0 && (index_idx as usize) < op.num_args() {
                     // dependency.py:747-748: argcell-aware depends_on
-                    let index_var = op.args[index_idx as usize];
+                    let index_var = op.arg(index_idx as usize);
                     Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
                     Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
                 } else {
@@ -1121,8 +1121,8 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
         let result = op.pos.get();
-        let a0 = op.args[0];
-        let a1 = op.args[1];
+        let a0 = op.arg(0);
+        let a1 = op.arg(1);
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1161,8 +1161,8 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
         let result = op.pos.get();
-        let a0 = op.args[0];
-        let a1 = op.args[1];
+        let a0 = op.arg(0);
+        let a1 = op.arg(1);
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1191,11 +1191,11 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:950-975: inspect array access ops.
     /// Only creates MemoryRef for primitive array accesses (dependency.py:954).
     fn inspect_array_access(&mut self, op: &Op, node_idx: usize, raw_access: bool) {
-        if op.args.len() < 2 {
+        if op.num_args() < 2 {
             return;
         }
-        let array = op.args[0];
-        let index = op.args[1];
+        let array = op.arg(0);
+        let index = op.arg(1);
         let idx_var = self.get_or_create(index);
         if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()

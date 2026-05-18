@@ -47,7 +47,7 @@ impl PureOpKey {
     fn from_call_op(op: &Op, start_index: usize) -> Self {
         PureOpKey {
             opcode: OpCode::call_pure_for_type(op.result_type()),
-            args: op.args[start_index..].to_vec(),
+            args: op.getarglist()[start_index..].to_vec(),
             descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
@@ -581,17 +581,15 @@ impl OptPure {
             if entry.descr_identity != descr_identity {
                 continue;
             }
-            if entry.args.len() != op.args.len() {
+            if entry.args.len() != op.num_args() {
                 continue;
             }
             // pure.py:62 lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
             // Both stored and query are walked through the forwarding chain
             // (the caller already walks the query at lookup; the stored arg
             // is walked here line-by-line per pure.py:62, :72-73).
-            let args_match = entry
-                .args
-                .iter()
-                .zip(op.args.iter())
+            let args_match = entry.args.iter()
+                .zip(op.getarglist().iter())
                 .all(|(&stored, &query)| {
                     let s = ctx.get_box_replacement(stored);
                     let q = ctx.get_box_replacement(query);
@@ -630,12 +628,12 @@ impl OptPure {
             if entry.descr.as_ref().map(majit_ir::descr::descr_identity) != descr_identity {
                 continue;
             }
-            if entry.args.len() != op.args.len() {
+            if entry.args.len() != op.num_args() {
                 continue;
             }
             // same_box: identity for non-constants, same_constant for constants.
             let mut args_match = true;
-            for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
+            for (expected, &arg) in entry.args.iter().zip(op.getarglist().iter()) {
                 match expected {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
                         if arg != *expected_ref {
@@ -1062,7 +1060,7 @@ impl Optimization for OptPure {
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
                     let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.args[i] = self.force_box(arg, ctx);
+                    postponed.setarg(i, self.force_box(arg, ctx));
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
@@ -1072,7 +1070,7 @@ impl Optimization for OptPure {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
                     let arg = ctx.get_box_replacement(postponed.arg(i));
-                    postponed.args[i] = self.force_box(arg, ctx);
+                    postponed.setarg(i, self.force_box(arg, ctx));
                 }
                 ctx.emit(postponed);
             }
@@ -1094,7 +1092,7 @@ impl Optimization for OptPure {
             if op.num_args() >= 2 {
                 self.known_result_call_pure.push(KnownResultEntry {
                     descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
-                    args: op.args[1..].to_vec(),
+                    args: op.getarglist()[1..].to_vec(),
                     result: op.arg(0),
                 });
             }
@@ -1296,9 +1294,7 @@ impl Optimization for OptPure {
                     continue;
                 }
             }
-            let imported_args = entry
-                .args
-                .iter()
+            let imported_args = entry.args.iter()
                 .map(|a| match a {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(r) => *r,
                     crate::optimizeopt::ImportedShortPureArg::Const(_v, source) => *source,
@@ -1310,9 +1306,7 @@ impl Optimization for OptPure {
                 imported_op.setdescr(d);
             }
             self.short_preamble_pure_ops.push(imported_op);
-            let resolved_args: Vec<OpRef> = entry
-                .args
-                .iter()
+            let resolved_args: Vec<OpRef> = entry.args.iter()
                 .map(|a| match a {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(r) => *r,
                     crate::optimizeopt::ImportedShortPureArg::Const(_v, source) => {

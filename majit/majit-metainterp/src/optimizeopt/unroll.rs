@@ -1019,9 +1019,7 @@ impl UnrollOptimizer {
                             // (unroll.py:126-127) above.
                             continue;
                         }
-                        let arg_iter = op
-                            .args
-                            .iter()
+                        let arg_iter = op.getarglist().iter()
                             .copied()
                             .chain(op.getfailargs().into_iter().flatten());
                         for arg in arg_iter {
@@ -1453,7 +1451,7 @@ impl UnrollOptimizer {
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
             if std::env::var_os("MAJIT_LOG").is_some() {
-                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.args.len()).unwrap_or(0);
+                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
                     body_jump_arity, preamble_arity, exported_renamed_inputargs,
@@ -1597,7 +1595,7 @@ fn closing_loop_contract_arity(ops: &[Op], fallback: usize) -> usize {
     ops.iter()
         .rev()
         .find_map(|op| match op.opcode {
-            OpCode::Label | OpCode::Jump => Some(op.args.len()),
+            OpCode::Label | OpCode::Jump => Some(op.num_args()),
             _ => None,
         })
         .unwrap_or(fallback)
@@ -3014,9 +3012,7 @@ impl OptUnroll {
                 let rd_resume_position = patch.rd_resume_position.get();
                 for mut guard_op in emitted {
                     if std::env::var_os("MAJIT_LOG_JTET").is_some() {
-                        let arg_values: Vec<_> = guard_op
-                            .args
-                            .iter()
+                        let arg_values: Vec<_> = guard_op.getarglist().iter()
                             .map(|&arg| (arg, ctx.get_constant(arg)))
                             .collect();
                         eprintln!(
@@ -4222,7 +4218,7 @@ fn assemble_peeled_trace_with_jump_args(
         if is_trace_runtime_ref(op.pos.get(), constants) {
             max_pos = max_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        for &arg in op.args.iter() {
+        for &arg in op.getarglist().iter() {
             if is_trace_runtime_ref(arg, constants) {
                 max_pos = max_pos.max(arg.raw().saturating_add(1));
             }
@@ -4274,9 +4270,7 @@ fn assemble_peeled_trace_with_jump_args(
             if op.opcode == OpCode::Jump {
                 continue;
             }
-            let all_refs = op
-                .args
-                .iter()
+            let all_refs = op.getarglist().iter()
                 .copied()
                 .chain(op.getfailargs().into_iter().flatten());
             for arg in all_refs {
@@ -4491,9 +4485,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
-                for arg in later_op
-                    .args
-                    .iter()
+                for arg in later_op.getarglist().iter()
                     .copied()
                     .chain(later_op.getfailargs().into_iter().flatten())
                 {
@@ -4564,9 +4556,7 @@ fn assemble_peeled_trace_with_jump_args(
             // force_box / send_extra_operation rewrites. Body args reference
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
-            let mapped_base_args: Vec<OpRef> = new_op
-                .args
-                .iter()
+            let mapped_base_args: Vec<OpRef> = new_op.getarglist().iter()
                 .map(|&arg| {
                     if jump_to_self {
                         return arg;
@@ -4638,9 +4628,7 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
             let label_args = &result[label_idx].args;
-            for arg in new_op
-                .args
-                .iter()
+            for arg in new_op.getarglist().iter()
                 .copied()
                 .chain(new_op.getfailargs().into_iter().flatten())
             {
@@ -4656,7 +4644,7 @@ fn assemble_peeled_trace_with_jump_args(
             }
             if !extra_live_args.is_empty() {
                 let existing: majit_ir::vec_set::VecSet<OpRef> =
-                    result[label_idx].args.iter().copied().collect();
+                    result[label_idx].getarglist().iter().copied().collect();
                 result[label_idx].args.extend(
                     extra_live_args
                         .into_iter()
@@ -6462,7 +6450,7 @@ mod tests {
             .position(|op| op.opcode == OpCode::Label)
             .expect("label");
         let label = &combined[label_idx];
-        let extra_label_arg = label.args[1];
+        let extra_label_arg = label.arg(1);
         assert_eq!(label.args.as_slice(), &[OpRef::int_op(10), extra_label_arg]);
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);

@@ -46,9 +46,7 @@ fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumberi
 }
 
 fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
-    let args = op
-        .args
-        .iter()
+    let args = op.getarglist().iter()
         .map(|&arg| render_arg(arg, constants, vars))
         .collect::<Vec<_>>()
         .join(", ");

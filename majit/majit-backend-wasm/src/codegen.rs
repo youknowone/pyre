@@ -270,7 +270,7 @@ fn build_function(
 
             OpCode::Jump => {
                 let label_args = find_label_args(ops);
-                for (i, &jump_arg) in op.args.iter().enumerate() {
+                for (i, &jump_arg) in op.getarglist().iter().enumerate() {
                     if i < label_args.len() {
                         let target_local = 1 + label_args[i].raw();
                         emit_resolve(&mut sink, constants, jump_arg);
@@ -797,7 +797,7 @@ fn build_function(
             // header, not at `obj[0]`.
             OpCode::GuardGcType => {
                 let _ = classptr_to_typeid; // typeid is already an immediate
-                if op.args.len() >= 2 {
+                if op.num_args() >= 2 {
                     emit_resolve(&mut sink, constants, op.arg(0));
                     // header address = obj - GcHeader::SIZE
                     sink.i64_const(GcHeader::SIZE as i64);
@@ -1096,7 +1096,7 @@ fn build_function(
 
                 // args[0] = func_ptr, args[1..] = call arguments
                 let func_ptr_ref = op.arg(0);
-                let call_args = &op.args[1..];
+                let call_args = &op.getarglist()[1..];
 
                 // Store func_ptr to call area
                 sink.local_get(0);

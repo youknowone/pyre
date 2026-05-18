@@ -2470,7 +2470,7 @@ impl OptContext {
             };
             match produced_op.kind {
                 PreambleOpKind::Pure => {
-                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.args.len());
+                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.num_args());
                     for &arg in &produced_op.preamble_op.args {
                         let Some(resolved) =
                             resolve_arg(arg, self, &produced_results, &mut imported_constants)
@@ -2819,7 +2819,7 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for &arg in preamble_op.args.iter() {
+        for &arg in preamble_op.getarglist().iter() {
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
                 continue;

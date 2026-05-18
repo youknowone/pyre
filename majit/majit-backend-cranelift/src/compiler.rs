@@ -4482,7 +4482,7 @@ fn build_type_overrides(
         };
         let label_op = &ops[label_idx];
         let jump_op = &ops[*jump_idx];
-        for (i, &label_arg) in label_op.args.iter().enumerate() {
+        for (i, &label_arg) in label_op.getarglist().iter().enumerate() {
             if label_arg.is_none() {
                 continue;
             }
@@ -4550,10 +4550,10 @@ fn build_ref_root_slots(
     if let Some((jump_idx, jump)) = ops
         .iter()
         .enumerate()
-        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.args.len() == inputargs.len())
+        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.num_args() == inputargs.len())
     {
         let num_inputs = inputargs.len();
-        for (i, &arg) in jump.args.iter().enumerate() {
+        for (i, &arg) in jump.getarglist().iter().enumerate() {
             if i >= num_inputs {
                 break;
             }
@@ -4595,9 +4595,7 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: HashSet<u32> = HashSet::new();
     for op in ops.iter() {
-        for &arg in op
-            .args
-            .iter()
+        for &arg in op.getarglist().iter()
             .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
         {
             if inputarg_oprefs.contains(&arg.raw()) {
@@ -5182,8 +5180,7 @@ fn ref_root_slots_with_future_regular_uses(
                     .iter()
                     .skip(position + 1)
                     .flat_map(|op| {
-                        op.args
-                            .iter()
+                        op.getarglist().iter()
                             .copied()
                             .chain(op.getfailargs().into_iter().flatten())
                     })
@@ -7724,9 +7721,7 @@ impl CraneliftBackend {
         let longevity: HashMap<u32, usize> = {
             let mut m: HashMap<u32, usize> = HashMap::new();
             for (i, op) in ops.iter().enumerate() {
-                for &arg in op
-                    .args
-                    .iter()
+                for &arg in op.getarglist().iter()
                     .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
                 {
                     let idx = arg.raw();
@@ -7908,7 +7903,7 @@ impl CraneliftBackend {
         // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
         let label_arity_by_descr: HashMap<u32, usize> = label_indices
             .iter()
-            .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].args.len())))
+            .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].num_args())))
             .collect();
 
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
@@ -7973,9 +7968,7 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for &arg in op
-                .args
-                .iter()
+            for &arg in op.getarglist().iter()
                 .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
             {
                 if !arg.is_none()
@@ -8016,12 +8009,12 @@ impl CraneliftBackend {
 
         // Compute loop_param_count early so legacy vars are included.
         let loop_param_count = if let Some(&li) = label_indices.last() {
-            ops[li].args.len()
+            ops[li].num_args()
         } else {
             ops.iter()
                 .rev()
                 .find(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.args.len())
+                .map(|op| op.num_args())
                 .unwrap_or(num_inputs)
         };
 
@@ -8155,7 +8148,7 @@ impl CraneliftBackend {
         let mut label_blocks_by_descr = HashMap::new();
         for &label_idx in &label_indices {
             let block = builder.create_block();
-            for _ in 0..ops[label_idx].args.len() {
+            for _ in 0..ops[label_idx].num_args() {
                 builder.append_block_param(block, cl_types::I64);
             }
             if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
@@ -8226,7 +8219,7 @@ impl CraneliftBackend {
 
                 // Continue with preamble label block for var binding
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
                         builder.def_var(var(arg_ref.raw()), param);
@@ -8247,7 +8240,7 @@ impl CraneliftBackend {
                 let vals: Vec<CValue> = entry_input_vals.clone();
                 builder.ins().jump(entry_label_block, &block_args(&vals));
                 builder.switch_to_block(entry_label_block);
-                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
                     if !arg_ref.is_none() {
                         builder.def_var(var(arg_ref.raw()), param);
@@ -8315,15 +8308,13 @@ impl CraneliftBackend {
                         .map(|prev| prev.opcode == OpCode::Jump || prev.opcode == OpCode::Finish)
                         .unwrap_or(false);
                     if !prev_terminated {
-                        let vals: Vec<CValue> = ops[op_idx]
-                            .args
-                            .iter()
+                        let vals: Vec<CValue> = ops[op_idx].getarglist().iter()
                             .map(|&r| resolve_opref(&mut builder, &constants, r))
                             .collect();
                         builder.ins().jump(*label_block, &block_args(&vals));
                     }
                     builder.switch_to_block(*label_block);
-                    for (i, &arg_ref) in ops[op_idx].args.iter().enumerate() {
+                    for (i, &arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
                         let param = builder.block_params(*label_block)[i];
                         if !arg_ref.is_none() && !constants.contains_key(&arg_ref.raw()) {
                             builder.def_var(var(arg_ref.raw()), param);
@@ -9144,7 +9135,7 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -9207,8 +9198,8 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let obj_ptr = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let expected_tid = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let obj_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let expected_tid = resolve_opref(&mut builder, &constants, op.arg(1));
 
                     // Load header word from obj_ptr - GcHeader::SIZE
                     let hdr_addr = builder.ins().iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
@@ -9285,7 +9276,7 @@ impl CraneliftBackend {
                          installed a TYPE_INFO layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
                     // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
                     // majit's GC header sits at `obj - GcHeader::SIZE`
                     // (see the GuardGcType arm above); the typeid occupies
@@ -9398,12 +9389,12 @@ impl CraneliftBackend {
                          installed a TYPE_INFO / rclass.CLASSTYPE layout)"
                     );
 
-                    let loc_object = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let loc_object = resolve_opref(&mut builder, &constants, op.arg(0));
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
                     //   so arg1 must be an immediate class pointer.
                     let loc_check_against_class = constants
-                        .get(&op.args[1].raw())
+                        .get(&op.arg(1).raw())
                         .copied()
                         .unwrap_or_else(|| {
                             panic!(
@@ -9556,8 +9547,8 @@ impl CraneliftBackend {
                     // x86/assembler.py:1845-1850 _restore_exception:
                     //   MOV [pos_exc_value], excvalloc
                     //   MOV [pos_exception], exctploc
-                    let exc_type = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let value = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let exc_type = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let value = resolve_opref(&mut builder, &constants, op.arg(1));
                     let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     builder
@@ -9572,7 +9563,7 @@ impl CraneliftBackend {
                     // — emit `is_null?` branch into the propagate path (a tail
                     // that mirrors `_build_propagate_exception_path`,
                     // x86/assembler.py:328-345 / aarch64/assembler.py:559-577).
-                    let ptr_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let ptr_val = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
                     let propagate_block = builder.create_block();
@@ -9663,7 +9654,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         op.arg(0),
-                        &op.args[1..],
+                        &op.getarglist()[1..],
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -9713,7 +9704,7 @@ impl CraneliftBackend {
                     // optional virtualizable.  The descriptor's arg_types are
                     // the pre-rewrite CALL_ASSEMBLER shape and must not be
                     // compared with the rewritten op arity here.
-                    if op.args.is_empty() || op.args.len() > 2 {
+                    if op.args.is_empty() || op.num_args() > 2 {
                         return Err(unsupported_semantics(
                             op.opcode,
                             "post-rewrite call-assembler must carry callee frame plus optional virtualizable",
@@ -9768,7 +9759,7 @@ impl CraneliftBackend {
                             3,
                         ));
                         let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                        let frame_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let frame_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.ins().store(
                             MemFlags::trusted(),
                             frame_val,
@@ -9829,7 +9820,7 @@ impl CraneliftBackend {
                             } else if let Some(&(_, arg_idx)) =
                                 expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
                             {
-                                let val = resolve_opref(&mut builder, &constants, op.args[arg_idx]);
+                                let val = resolve_opref(&mut builder, &constants, op.arg(arg_idx));
                                 builder.ins().stack_store(val, args_slot, ofs);
                             } else {
                                 let val = builder.ins().load(
@@ -9847,7 +9838,7 @@ impl CraneliftBackend {
                                 .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
                         (args_ptr, args_data_ptr)
                     } else {
-                        let args_ptr = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let args_ptr = resolve_opref(&mut builder, &constants, op.arg(0));
                         let args_data_ptr =
                             builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                         (args_ptr, args_data_ptr)
@@ -10286,7 +10277,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &constants,
                         op.arg(0),
-                        &op.args[1..],
+                        &op.getarglist()[1..],
                         call_descr,
                         call_conv,
                         ptr_type,
@@ -10409,8 +10400,8 @@ impl CraneliftBackend {
                         func_ptr_raw
                     };
 
-                    let mut args: Vec<CValue> = Vec::with_capacity(op.args.len() - 2);
-                    for (i, &arg_ref) in op.args[2..].iter().enumerate() {
+                    let mut args: Vec<CValue> = Vec::with_capacity(op.num_args() - 2);
+                    for (i, &arg_ref) in op.getarglist()[2..].iter().enumerate() {
                         let raw = resolve_opref(&mut builder, &constants, arg_ref);
                         if i < arg_types.len() && arg_types[i] == Type::Float {
                             args.push(builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw));
@@ -10484,7 +10475,7 @@ impl CraneliftBackend {
                                 &mut builder,
                                 &constants,
                                 op.arg(1),
-                                &op.args[2..],
+                                &op.getarglist()[2..],
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -10539,7 +10530,7 @@ impl CraneliftBackend {
                                 &mut builder,
                                 &constants,
                                 op.arg(1),
-                                &op.args[2..],
+                                &op.getarglist()[2..],
                                 call_descr,
                                 call_conv,
                                 ptr_type,
@@ -11150,7 +11141,7 @@ impl CraneliftBackend {
                 OpCode::GcStore => {
                     // rewrite.py:140-158 emit_gc_store_or_indexed parity.
                     // 4-arg form: GC_STORE(base, ConstInt(offset), value, ConstInt(size))
-                    if op.args.len() >= 4 {
+                    if op.num_args() >= 4 {
                         let item_size = resolve_constant_i64(
                             &constants,
                             &known_values,
@@ -11737,9 +11728,7 @@ impl CraneliftBackend {
 
                 // ── Control flow ──
                 OpCode::Jump => {
-                    let vals: Vec<CValue> = op
-                        .args
-                        .iter()
+                    let vals: Vec<CValue> = op.getarglist().iter()
                         .map(|&r| resolve_opref(&mut builder, &constants, r))
                         .collect();
                     // Resolve target: try descr-based lookup first, then
@@ -11756,7 +11745,7 @@ impl CraneliftBackend {
                         label_arity_by_descr
                             .get(&d.index())
                             .copied()
-                            .is_some_and(|arity| arity == op.args.len())
+                            .is_some_and(|arity| arity == op.num_args())
                     });
                     let target_block = if local_target_arity_matches {
                         op.getdescr()
@@ -11916,7 +11905,7 @@ impl CraneliftBackend {
                 // materializes it by returning the underlying object reference.
                 // args[0] = the real object, args[1] = vref_id
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
-                    let obj = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let obj = resolve_opref(&mut builder, &constants, op.arg(0));
                     builder.def_var(var(vi), obj);
                     if op.opcode == OpCode::VirtualRefR {
                         let cur_jf = builder.use_var(jf_ptr_var);
@@ -11936,7 +11925,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardTrue => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
@@ -11968,7 +11957,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardFalse => {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
@@ -12013,14 +12002,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
@@ -12033,8 +12022,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
                             OpCode::VecIntSub => builder.ins().isub(a, b),
@@ -12059,14 +12048,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_float(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let result = match op.opcode {
                             OpCode::VecFloatAdd => builder.ins().fadd(a, b),
@@ -12077,8 +12066,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                         let fresult = match op.opcode {
@@ -12102,12 +12091,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let result = builder.ins().fneg(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fneg(fa);
                         let result = builder
@@ -12124,12 +12113,12 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let result = builder.ins().fabs(a);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                         let fresult = builder.ins().fabs(fa);
                         let result = builder
@@ -12147,14 +12136,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[1],
+                            op.arg(1),
                         );
                         let xored = builder.ins().bxor(a, b);
                         // Result is declared as F64X2, bitcast from I64X2
@@ -12163,8 +12152,8 @@ impl CraneliftBackend {
                             .bitcast(cl_types::F64X2, MemFlags::new(), xored);
                         builder.def_var(var(vi), result);
                     } else {
-                        let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let b = resolve_opref(&mut builder, &constants, op.arg(1));
                         let result = builder.ins().bxor(a, b);
                         builder.def_var(var(vi), result);
                     }
@@ -12173,8 +12162,8 @@ impl CraneliftBackend {
                 // ── Vector comparison/test operations ──
                 // These always produce scalar results (I64), not vectors.
                 OpCode::VecFloatEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::Equal, fa, fb);
@@ -12183,8 +12172,8 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecFloatNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::NotEqual, fa, fb);
@@ -12193,7 +12182,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntIsTrue => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
@@ -12201,16 +12190,16 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntEq => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let cmp = builder.ins().icmp(IntCC::Equal, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecIntNe => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
-                    let b = resolve_opref(&mut builder, &constants, op.args[1]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
+                    let b = resolve_opref(&mut builder, &constants, op.arg(1));
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
@@ -12218,21 +12207,21 @@ impl CraneliftBackend {
 
                 OpCode::VecIntSignext => {
                     // Sign-extend a narrower integer value to i64
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     builder.def_var(var(vi), a); // already i64
                 }
 
                 // ── Vector cast operations ──
                 // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let result = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecCastIntToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let result = builder
                         .ins()
@@ -12241,7 +12230,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastFloatToSinglefloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
                     let result = builder
@@ -12252,7 +12241,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastSinglefloatToFloat => {
-                    let a = resolve_opref(&mut builder, &constants, op.args[0]);
+                    let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
                     let f32val = builder
                         .ins()
@@ -12296,14 +12285,14 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
-                        let lane = constants.get(&op.args[2].raw()).copied().unwrap_or(0) as u8;
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
+                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12317,18 +12306,18 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(1));
                         let scalar_f =
                             builder
                                 .ins()
                                 .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
-                        let lane = constants.get(&op.args[2].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(2).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[1]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(1));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12341,13 +12330,13 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let lane = constants.get(&op.args[1].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12360,9 +12349,9 @@ impl CraneliftBackend {
                             &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
-                            op.args[0],
+                            op.arg(0),
                         );
-                        let lane = constants.get(&op.args[1].raw()).copied().unwrap_or(0) as u8;
+                        let lane = constants.get(&op.arg(1).raw()).copied().unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
                         let result =
                             builder
@@ -12370,7 +12359,7 @@ impl CraneliftBackend {
                                 .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let vec_val = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let vec_val = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), vec_val);
                     }
                 }
@@ -12378,11 +12367,11 @@ impl CraneliftBackend {
                 OpCode::VecExpandI => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar to all lanes
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         let result = builder.ins().splat(cl_types::I64X2, scalar);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12390,7 +12379,7 @@ impl CraneliftBackend {
                 OpCode::VecExpandF => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar f64 to all lanes
-                        let scalar_i = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar_i = resolve_opref(&mut builder, &constants, op.arg(0));
                         let scalar_f =
                             builder
                                 .ins()
@@ -12398,7 +12387,7 @@ impl CraneliftBackend {
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
-                        let scalar = resolve_opref(&mut builder, &constants, op.args[0]);
+                        let scalar = resolve_opref(&mut builder, &constants, op.arg(0));
                         builder.def_var(var(vi), scalar);
                     }
                 }
@@ -12407,9 +12396,9 @@ impl CraneliftBackend {
                 OpCode::VecLoadI | OpCode::VecLoadF => {
                     if USE_NATIVE_SIMD {
                         // Load 128 bits (2x i64 or 2x f64) from memory
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 1 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 1 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12422,9 +12411,9 @@ impl CraneliftBackend {
                         let result = builder.ins().load(load_type, MemFlags::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 1 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 1 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -12440,13 +12429,13 @@ impl CraneliftBackend {
                 OpCode::VecStore => {
                     if USE_NATIVE_SIMD {
                         // Store 128 bits to memory
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 2 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 2 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
-                        let value_ref = op.args[op.args.len() - 1];
+                        let value_ref = op.arg(op.num_args() - 1);
                         let value = if vec_oprefs.contains(&value_ref.raw()) {
                             builder.use_var(var(value_ref.raw()))
                         } else {
@@ -12455,14 +12444,14 @@ impl CraneliftBackend {
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     } else {
-                        let base = resolve_opref(&mut builder, &constants, op.args[0]);
-                        let offset_val = if op.args.len() > 2 {
-                            resolve_opref(&mut builder, &constants, op.args[1])
+                        let base = resolve_opref(&mut builder, &constants, op.arg(0));
+                        let offset_val = if op.num_args() > 2 {
+                            resolve_opref(&mut builder, &constants, op.arg(1))
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
                         let value =
-                            resolve_opref(&mut builder, &constants, op.args[op.args.len() - 1]);
+                            resolve_opref(&mut builder, &constants, op.arg(op.num_args() - 1));
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlags::trusted(), value, addr, 0);
                     }
@@ -13105,7 +13094,7 @@ fn collect_guards(
     let label_arity_by_descr: HashMap<u32, usize> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.args.len())))
+        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
         .collect();
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -13118,7 +13107,7 @@ fn collect_guards(
                 .getdescr()
                 .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
                     None => true,
-                    Some(&arity) => arity != op.args.len(),
+                    Some(&arity) => arity != op.num_args(),
                 });
 
         if !is_guard && !is_finish && !is_external_jump {
@@ -13128,7 +13117,7 @@ fn collect_guards(
         let fail_index = fail_descrs.len() as u32;
 
         let (fail_arg_refs, fail_arg_types) = if is_finish || is_external_jump {
-            let refs: Vec<OpRef> = op.args.iter().copied().collect();
+            let refs: Vec<OpRef> = op.getarglist().iter().copied().collect();
             // Use the descriptor's explicit types for FINISH args — these are
             // set by the tracer and represent the caller's view of the return
             // type, which may differ from the op's inferred type (e.g. New
@@ -13854,9 +13843,7 @@ fn collect_terminal_exit_layouts(
         if is_finish || is_jump {
             let exit_types =
                 infer_fail_arg_types(op.args.as_slice(), &type_index, &type_overrides, op_index)?;
-            let force_token_slots: Vec<usize> = op
-                .args
-                .iter()
+            let force_token_slots: Vec<usize> = op.getarglist().iter()
                 .enumerate()
                 .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
                 .collect();
