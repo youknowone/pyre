@@ -9169,7 +9169,8 @@ impl CodeWriter {
                 eprintln!(
                     "[phase3-canonical-flatten] graph={:?} walker_insns={} canonical_insns={} \
                      delta_insns={:+} walker_ops={} canonical_ops={} delta_ops={:+} \
-                     byte_equivalent={} walker_unmatched={} canonical_unmatched={}",
+                     byte_equivalent={} walker_unmatched={} canonical_unmatched={} \
+                     strict_sequence_match={} walker_stream_len={} canonical_stream_len={}",
                     code.obj_name.as_str(),
                     ssarepr.insns.len(),
                     canonical_ssarepr.insns.len(),
@@ -9180,6 +9181,33 @@ impl CodeWriter {
                     byte_equivalent,
                     walker_unmatched,
                     canonical_unmatched,
+                    strict_sequence_match,
+                    walker_stream.len(),
+                    canonical_stream.len(),
+                );
+            }
+            if std::env::var_os("PYRE_PHASE3_STRICT_DIFF").is_some() && !strict_sequence_match {
+                // Position-by-position diff over the full Insn::Op stream.
+                let max = walker_stream.len().max(canonical_stream.len());
+                let mut diff_count = 0usize;
+                for i in 0..max {
+                    if walker_stream.get(i) != canonical_stream.get(i) {
+                        diff_count += 1;
+                        if diff_count <= 4 {
+                            eprintln!(
+                                "[phase3-strict-diff] graph={:?} pos={} walker={:?} canonical={:?}",
+                                code.obj_name.as_str(),
+                                i,
+                                walker_stream.get(i),
+                                canonical_stream.get(i),
+                            );
+                        }
+                    }
+                }
+                eprintln!(
+                    "[phase3-strict-diff] graph={:?} total_diffs={}",
+                    code.obj_name.as_str(),
+                    diff_count,
                 );
             }
             if std::env::var_os("PYRE_PHASE3_BYTE_DIFF_SAMPLES").is_some() && !byte_equivalent {
