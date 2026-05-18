@@ -947,6 +947,23 @@ fn walker_post_walk_insert_renamings_single_exit(
         if link_borrow.args.len() != target_borrow.inputargs.len() {
             continue;
         }
+        // Skip blocks whose target is `returnblock`/`exceptblock`
+        // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
+        // RAISE handlers already emit `ref_return` / `raise` INLINE
+        // at the source block referencing the source stack-slot
+        // color (walker NEW-DEVIATION: upstream defers the return op
+        // to `make_return(target.inputargs)` AFTER insert_renamings
+        // copies link.args → target.inputargs).  Splicing a
+        // `ref_copy stack_color → target_inputarg_color` BEFORE
+        // walker's existing `ref_return stack_color` leaves walker's
+        // terminator reading the un-copied source slot and breaks
+        // SSA allocator coalescing on trivial return functions.
+        // Pyre-orthodox handling: the return-link insert_renamings
+        // is structurally absorbed into walker's inline emit until
+        // walker switches to deferred make_return.
+        if target_borrow.is_final && target_borrow.exits.is_empty() {
+            continue;
+        }
 
         // `flatten.py:308-311` pair extraction.  Skip pairs whose
         // src is `last_exception` / `last_exc_value` (they route
