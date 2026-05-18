@@ -2438,14 +2438,16 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int(0)];
+    let op = |oc, args: &[OpRef]| std::rc::Rc::new(Op::new(oc, args));
+    let op_d = |oc, args: &[OpRef], d| std::rc::Rc::new(Op::with_descr(oc, args, d));
     let mut callee_ops = vec![
-        Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
-        Op::new(
+        op(OpCode::Label, &[OpRef::input_arg_int(0)]),
+        op(
             OpCode::IntGt,
             &[OpRef::input_arg_int(0), OpRef::const_int(0)],
         ),
-        Op::with_descr(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
-        Op::with_descr(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
+        op_d(OpCode::GuardTrue, &[OpRef::int_op(1)], make_descr(0)),
+        op_d(OpCode::Finish, &[OpRef::input_arg_int(0)], make_descr(1)),
     ];
     assign_positions(&mut callee_ops, 0);
 
