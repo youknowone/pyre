@@ -5126,17 +5126,27 @@ impl CodeWriter {
             }};
         }
 
-        // jtransform.py:1898 `do_fixed_list_setitem` vable case +
-        // post-store reg_N mirror. STORE_FAST and its super-inst
-        // relatives (StoreFastLoadFast, StoreFastStoreFast) all
-        // perform the same dual-write pair: when the frame is
-        // portal-virtualizable, write `stored_reg` into the vable
-        // array slot for the local; in every case, `ref_copy` it
-        // into reg_N so super-inst consumers reading reg_N directly
-        // (LoadFastLoadFast / LoadFastBorrowLoadFastBorrow) see the
-        // post-store value. The reg==vable invariant established
-        // here is the foundation for the LFLF vable flip — see
-        // memo super_inst_candidate1_probe_scope_2026_04_23.
+        // `pypy/interpreter/pyframe.py:?? STORE_FAST` lowers
+        // `self.locals_cells_stack_w[varindex] = w_newvalue` to a
+        // single `setarrayitem_vable_r` via `jtransform.py:1898
+        // do_fixed_list_setitem` (vable branch).  Upstream's local
+        // model is the virtualizable array — there is NO separate
+        // local register that mirrors the array slot.  LOAD_FAST
+        // reads via `getarrayitem_vable_r` from the same array
+        // (`jtransform.py:1877 do_fixed_list_getitem`), so the
+        // mirror is redundant on portal frames where push/pop
+        // routes through the array.
+        //
+        // Non-portal frames have no vable; the inline `ref_copy`
+        // is their only stack-maintenance mechanism and LOAD_FAST
+        // (`codewriter.rs:5094-5101 else branch`) reads
+        // Reg(Ref, reg) directly.  Keep the mirror for those.
+        //
+        // Phase 4 endgame slice: dropping the portal mirror is the
+        // first step in retiring walker's raw-register local model.
+        // Subsequent slices will retire the equivalent push-side
+        // `emit_ref_copy!` in `emit_pushvalue_ref!` and the various
+        // CALL / catch-landing inline ref_copies.
         macro_rules! emit_store_local_with_mirror {
             ($reg:expr, $stored_reg:expr) => {{
                 let reg = $reg;
@@ -5148,8 +5158,9 @@ impl CodeWriter {
                         local_to_vable_slot(reg as usize) as i64,
                         stored_reg
                     );
+                } else {
+                    emit_ref_copy!(reg, stored_reg);
                 }
-                emit_ref_copy!(reg, stored_reg);
             }};
         }
 
