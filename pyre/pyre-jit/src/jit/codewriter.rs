@@ -853,6 +853,232 @@ fn fresh_variable_for_state(
     }
 }
 
+/// Phase 4 endgame — walker post-walk insert_renamings.
+///
+/// `rpython/jit/codewriter/flatten.py:306-334 insert_renamings` runs
+/// after each `make_link` call and emits `<kind>_copy/_push/_pop` ops
+/// for every link arg → target inputarg pair whose post-regalloc
+/// colors differ.  Pyre's walker emits SSARepr inline per Python PC
+/// (NEW-DEVIATION from upstream's recursive `make_bytecode_block`
+/// DFS) and never runs `insert_renamings` itself, so links whose
+/// link.arg / target.inputarg map to different walker slots have
+/// no equivalent walker emission.  Canonical's `flatten_graph_with_walker_slots`
+/// DOES run `insert_renamings` (it inherits flatten.py:306 verbatim),
+/// producing ref_copies that canonical-side has but walker-side
+/// lacks → `canonical_unmatched > 0` and the splice gate blocks
+/// production splice.
+///
+/// This helper closes the gap by running the same renaming logic
+/// post-walk for blocks with EXACTLY ONE exit (the simple
+/// unconditional-jump case).  Multi-exit blocks (POP_JUMP_IF_*,
+/// canraise dispatch) are NOT handled here — those require
+/// per-link positional injection between source-block terminator
+/// and each target-block Label, which is structurally a separate
+/// slice.
+///
+/// Emissions are appended to the source block's
+/// `per_block_ssarepr` BEFORE the terminator (the trailing
+/// `Op{goto/...}` + `Unreachable` pair, or a *_return).  This
+/// matches `flatten.py:154 self.insert_renamings(link)` which
+/// runs BEFORE the recursive `make_bytecode_block(link.target)`
+/// (which itself ends the source block at `goto TLabel(block)`
+/// when target is in `seen_blocks`).
+fn walker_post_walk_insert_renamings_single_exit(
+    graph: &super::flow::FunctionGraph,
+    walker_slot_for_variable: &[Option<u16>],
+    regallocs: &[super::regalloc::GraphAllocationResult; 3],
+    all_walker_blocks: &[SpamBlockRef],
+) {
+    // Variable → walker slot resolver, identical to canonical's
+    // `get_register` closure in `flatten_graph_with_walker_slots`
+    // (flatten.rs:2758-2776).  Bridge first, then graph regalloc
+    // fallback.  Shared regalloc instance (computed once outside)
+    // guarantees same colors as canonical → byte-equivalent renamings.
+    let get_color = |variable: &super::flow::Variable| -> u16 {
+        if let Some(Some(slot)) = walker_slot_for_variable
+            .get(variable.id.0 as usize)
+            .copied()
+        {
+            return slot;
+        }
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        regallocs[kind.index()]
+            .coloring
+            .get(&variable.id)
+            .copied()
+            .unwrap_or(u16::MAX)
+    };
+
+    // Reachability DFS from startblock — matches canonical's
+    // `generate_ssa_form` recursive descent (flatten.py:103-104).
+    // `graph.iterblocks()` may include unreachable / pyre-walker-only
+    // blocks (supersede candidates that canonical doesn't visit via
+    // `seen_blocks`); processing them would emit ref_copies for
+    // Variables canonical never sees.
+    let mut reachable: Vec<super::flow::BlockRef> = Vec::new();
+    let mut stack: Vec<super::flow::BlockRef> = vec![graph.startblock.clone()];
+    while let Some(b) = stack.pop() {
+        if reachable.iter().any(|r| r == &b) {
+            continue;
+        }
+        if b.borrow().dead {
+            continue;
+        }
+        reachable.push(b.clone());
+        for exit in &b.borrow().exits {
+            if let Some(target) = exit.borrow().target.clone() {
+                stack.push(target);
+            }
+        }
+    }
+    for block_ref in reachable {
+        let block_borrow = block_ref.borrow();
+        if block_borrow.exits.len() != 1 {
+            continue;
+        }
+        let link_ref = block_borrow.exits[0].clone();
+        drop(block_borrow);
+
+        let link_borrow = link_ref.borrow();
+        let Some(target_ref) = link_borrow.target.clone() else {
+            continue;
+        };
+        let target_borrow = target_ref.borrow();
+        if link_borrow.args.len() != target_borrow.inputargs.len() {
+            continue;
+        }
+
+        // `flatten.py:308-311` pair extraction.  Skip pairs whose
+        // src is `last_exception` / `last_exc_value` (they route
+        // through `generate_last_exc` separately, flatten.py:336-347).
+        let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
+        for (i, arg) in link_borrow.args.iter().enumerate() {
+            let Some(src_value) = arg.as_ref() else {
+                continue;
+            };
+            let Some(src_variable) = src_value.as_variable() else {
+                continue;
+            };
+            let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+                continue;
+            };
+            if Some(src_variable) == link_borrow.last_exception
+                || Some(src_variable) == link_borrow.last_exc_value
+            {
+                continue;
+            }
+            let src_color = get_color(&src_variable);
+            let dst_color = get_color(&dst_variable);
+            let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+            if src_color != dst_color {
+                pairs.push((src_color, dst_color, kind));
+            }
+        }
+        drop(target_borrow);
+        drop(link_borrow);
+
+        if pairs.is_empty() {
+            continue;
+        }
+        // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+        pairs.sort_by_key(|(_, dst, _)| *dst);
+
+        // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
+        // `Kind::index()` per [[feedback-no-hashmap-ever]].
+        let mut renamings: [(Vec<u16>, Vec<u16>); 3] =
+            [(Vec::new(), Vec::new()), (Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+        for (src, dst, kind) in pairs {
+            let bucket = &mut renamings[kind.index()];
+            bucket.0.push(src);
+            bucket.1.push(dst);
+        }
+
+        // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
+        let mut emitted: Vec<super::flatten::Insn> = Vec::new();
+        for &kind in &Kind::ALL {
+            let (frm, to) = &renamings[kind.index()];
+            if frm.is_empty() {
+                continue;
+            }
+            for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
+                match (src, dst) {
+                    (Some(src), Some(dst)) => {
+                        emitted.push(super::flatten::Insn::op_with_result(
+                            format!("{}_copy", kind.as_str()),
+                            vec![super::flatten::Operand::reg(kind, src)],
+                            super::flatten::Register::new(kind, dst),
+                        ));
+                    }
+                    (Some(src), None) => {
+                        emitted.push(super::flatten::Insn::op(
+                            format!("{}_push", kind.as_str()),
+                            vec![super::flatten::Operand::reg(kind, src)],
+                        ));
+                    }
+                    (None, Some(dst)) => {
+                        emitted.push(super::flatten::Insn::op_with_result(
+                            format!("{}_pop", kind.as_str()),
+                            Vec::new(),
+                            super::flatten::Register::new(kind, dst),
+                        ));
+                    }
+                    (None, None) => unreachable!(
+                        "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
+                    ),
+                }
+            }
+        }
+
+        if emitted.is_empty() {
+            continue;
+        }
+
+        // Locate the walker block matching this graph block, then
+        // splice the renamings into its per_block_ssarepr BEFORE the
+        // trailing terminator.  Block identity by `Rc::ptr_eq` via
+        // `BlockRef::PartialEq`.
+        let Some(spam) = all_walker_blocks
+            .iter()
+            .find(|s| !s.dead() && s.block() == block_ref)
+        else {
+            continue;
+        };
+        let mut spam_borrow = spam.0.borrow_mut();
+        let insns = &mut spam_borrow.per_block_ssarepr;
+        // Find the pre-terminator position: scan back past the
+        // optional `Unreachable` tail, then before the terminator
+        // op itself.  Walker terminators are `goto`, `*_return`,
+        // `raise`, `reraise`, `goto_if_not*`, `switch`.  Conditional
+        // terminators correspond to multi-exit blocks (filtered
+        // above) so we only expect unconditional shapes here.
+        let len = insns.len();
+        let mut insert_pos = len;
+        if len >= 1 && matches!(insns.last(), Some(super::flatten::Insn::Unreachable)) {
+            insert_pos = len - 1;
+        }
+        if insert_pos >= 1 {
+            if let super::flatten::Insn::Op { opname, .. } = &insns[insert_pos - 1] {
+                let is_terminator = matches!(
+                    opname.as_str(),
+                    "goto"
+                        | "int_return"
+                        | "ref_return"
+                        | "float_return"
+                        | "void_return"
+                        | "raise"
+                        | "reraise"
+                );
+                if is_terminator {
+                    insert_pos -= 1;
+                }
+            }
+        }
+        for (offset, insn) in emitted.into_iter().enumerate() {
+            insns.insert(insert_pos + offset, insn);
+        }
+    }
+}
+
 fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
     append_exit_tagged(block, link, "append_exit");
 }
@@ -8327,7 +8553,56 @@ impl CodeWriter {
         // make_link` skips the goto outright via recursive descent +
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
+        // Phase 4 endgame: compute graph regallocs ONCE pre-drain so
+        // walker insert_renamings + canonical pass share identical
+        // colors (HashMap iteration order non-determinism between two
+        // separate regalloc calls would otherwise diverge bridge-
+        // fallback Variables' colors, breaking byte_equivalent).
+        let mut _graph_regallocs =
+            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
+        // Phase 4 endgame — seed `walker_slot_for_variable` with block
+        // inputarg slots BEFORE the helper below reads it.  The same
+        // pairing pass also runs downstream around line 8852 (idempotent
+        // via `pair_walker_slot_if_absent`) but canonical's
+        // `insert_renamings` color resolution needs the bridge entries
+        // present at the moment the walker-side helper computes them, so
+        // both sides see identical Register destinations.  Mirrors the
+        // upstream contract where `flatten_graph` sees the post-walker
+        // graph in its terminal state — pyre's pre-drain helper does the
+        // same.
+        for spam in &all_walker_blocks {
+            let Some(state) = spam.framestate() else {
+                continue;
+            };
+            for (idx, value) in state.mergeable().iter().enumerate() {
+                if let Some(super::flow::FlowValue::Variable(v)) = value {
+                    if let Some(slot) = state.mergeable_index_to_slot(idx) {
+                        pair_walker_slot_if_absent(
+                            &mut walker_slot_for_variable,
+                            Some(v.clone()),
+                            slot,
+                        );
+                    }
+                }
+            }
+        }
         {
+            // Phase 4 endgame — walker post-walk insert_renamings.
+            // Run BEFORE the per-block drain so the splice positions
+            // land in the per_block_ssarepr accumulators.  Mirrors
+            // `flatten.py:154 self.insert_renamings(link)` for the
+            // simple unconditional single-exit case (loop back-edges,
+            // straight-line forward jumps).  Multi-exit blocks
+            // (POP_JUMP_IF_*, canraise) require per-link positional
+            // injection between source-block terminator and each
+            // target-block Label — separate future slice.
+            walker_post_walk_insert_renamings_single_exit(
+                &graph,
+                &walker_slot_for_variable,
+                &_graph_regallocs,
+                &all_walker_blocks,
+            );
             // RPython parity: `iterblocks` (`flowspace/model.py:55-77`)
             // enumerates every reachable block including dead ones;
             // the "no codegen" semantics ride on `block.operations`
@@ -8410,9 +8685,11 @@ impl CodeWriter {
         // graph-side allocator unconditionally first surfaces any
         // graph topology that the allocator can't process before any
         // downstream code reads from it.
-        let mut _graph_regallocs =
-            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
+        //
+        // Phase 4 endgame: `_graph_regallocs` is now computed earlier
+        // (pre-drain) so walker insert_renamings shares the same
+        // colors as canonical's pass below.  The duplicate compute is
+        // retired; we reuse the shared instance.
 
         // Env-gated invocation of the canonical
         // `flatten_graph(graph, regallocs, _include_all_exc_links, cpu)`
@@ -8535,37 +8812,11 @@ impl CodeWriter {
             // walker non-orthodoxy that needs porting per the same
             // pattern as Slices 4-8.
             //
-            // Post-walk pairing pass.  Walker per-PC emits seed
-            // `walker_slot_for_variable` for Variables it directly
-            // produces (HLOp results, push/pop slot writes).  Block
-            // INPUTARGS — the Variables in `block.inputargs` set by
-            // `initialize_spam_block` / `make_next_block` / `mergeblock`
-            // from `state.getvariables()` — are NOT seeded by per-PC
-            // emits.  Without the pairing here, canonical
-            // `insert_renamings` would resolve inputarg destinations
-            // via graph regalloc fallback, producing Register indices
-            // that diverge from the walker's slot-numbered destinations.
-            // Walk every block's FrameState `mergeable()` and pair each
-            // Variable with its `mergeable_index_to_slot()` (locals at
-            // `0..nlocals`, stack at `nlocals..nlocals+stackdepth`).
-            // The last_exception pair / portal_extras tail returns
-            // `None` from `mergeable_index_to_slot` and is skipped.
-            for spam in &all_walker_blocks {
-                let Some(state) = spam.framestate() else {
-                    continue;
-                };
-                for (idx, value) in state.mergeable().iter().enumerate() {
-                    if let Some(super::flow::FlowValue::Variable(v)) = value {
-                        if let Some(slot) = state.mergeable_index_to_slot(idx) {
-                            pair_walker_slot_if_absent(
-                                &mut walker_slot_for_variable,
-                                Some(v.clone()),
-                                slot,
-                            );
-                        }
-                    }
-                }
-            }
+            // Post-walk pairing pass: moved earlier (pre-drain) so the
+            // walker-side `walker_post_walk_insert_renamings_single_exit`
+            // helper sees identical bridge slots to canonical's
+            // `insert_renamings` color resolution.  Both passes are
+            // idempotent via `pair_walker_slot_if_absent`.
             // Task #50 T6 epic slice 1 — derive (BlockRef, pc{N}) name
             // overrides from `all_walker_blocks` and pass to canonical
             // so its `Label(block)` / `tlabel_for_block(target)` emit
