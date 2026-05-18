@@ -2890,7 +2890,8 @@ impl<M: Clone> MetaInterp<M> {
         // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
         // back-edge entry routes through `bound_reached`, so the
         // gate fires here.  Idempotent.
-        self.staticdata._setup_once(&mut self.backend);
+        self.staticdata
+            ._setup_once(&mut self.backend, &mut self.warm_state);
 
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
@@ -13806,6 +13807,14 @@ pub struct MetaInterpStaticData {
     /// bump.  Each fetch_add is `Relaxed` — counters have no causal
     /// dependency on each other.
     pub profiler: crate::jitprof::JitProfiler,
+    /// pyjitpl.py:2217 `self.jit_starting_line = 'JIT starting (%s)' %
+    /// backendmodule`.  RPython captures the backend module name (eg.
+    /// `'x86'`, `'aarch64'`) at MetaInterp construction and
+    /// `_setup_once` `debug_print`s it once on the first warmup.
+    /// Pyre fills this in `register_backend_name` (called by
+    /// whichever crate brings up the backend) so it travels with the
+    /// staticdata Arc.
+    pub jit_starting_line: String,
 }
 
 /// pyjitpl.py:2357-2373 `class MetaInterpGlobalData`.
@@ -14478,34 +14487,82 @@ impl MetaInterpStaticData {
         }
     }
 
-    /// pyjitpl.py:2292-2303 `_setup_once` — narrow port.
+    /// pyjitpl.py:2292-2303 `_setup_once`.
     ///
-    /// Guarded by `globaldata.initialized` so the body runs exactly
-    /// once per CPU after `finish_setup` has installed every descr
-    /// (`pyjitpl.py:2255`, `pyjitpl.py:2283`).
+    /// PyPy:
+    /// ```python
+    /// def _setup_once(self):
+    ///     if not self.globaldata.initialized:
+    ///         self.jitlog.setup_once()
+    ///         debug_print(self.jit_starting_line)
+    ///         self.cpu.setup_once()
+    ///         if self.cpu.vector_ext:
+    ///             self.cpu.vector_ext.setup_once(self.cpu.assembler)
+    ///         if not self.profiler.initialized:
+    ///             self.profiler.start()
+    ///             self.profiler.initialized = True
+    ///         self.globaldata.initialized = True
+    /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: PyPy's `_setup_once` invokes four
-    /// lifecycle hooks in sequence — `profiler.start()`,
-    /// `cpu.setup_once()`, `jitlog.setup_once()`, and
-    /// `vector_ext.setup_once()` (with `debug_print` interleaved).
-    /// Pyre only dispatches `cpu.setup_once()` here because the
-    /// profiler / jitlog / vector_ext subsystems are not yet wired
-    /// in pyre; the other three hooks will be added as those
-    /// subsystems land.  `cpu.setup_once()`
-    /// (`pyjitpl.py:2297 self.cpu.setup_once()`) is the call that
-    /// materialises the per-CPU malloc / propagate trampolines in
-    /// PyPy (`llsupport/assembler.py:97 setup_once`).
+    /// Each hook is dispatched in the same order:
+    ///
+    /// 1. `jitlog.setup_once()` — `setup_once_jitlog` walks the
+    ///    registered jitdrivers and forces each `WarmEnterState`'s
+    ///    `Logger::from_env` to materialise (pyre adapts PyPy's
+    ///    single staticdata-owned `JitLogger` into a per-jitdriver
+    ///    `Logger`).
+    /// 2. `debug_print(self.jit_starting_line)` — prints to stderr
+    ///    when `MAJIT_LOG` is set, matching PyPy's `PYPYLOG`-gated
+    ///    `debug_print`.  `jit_starting_line` is filled in here
+    ///    from `backend.backend_name()` if `register_backend_name`
+    ///    has not been called explicitly.
+    /// 3. `cpu.setup_once()` — backends materialise per-CPU
+    ///    trampolines (x86 `_build_propagate_exception_path` /
+    ///    `_build_malloc_slowpath`).
+    /// 4. `cpu.vector_ext.setup_once(cpu.assembler)` — pyre dispatches
+    ///    through the `Backend::vector_ext_setup_once` trait hook;
+    ///    every current backend is a no-op (no `vector_ext`), but
+    ///    the call site is in place for when a backend grows one.
+    /// 5. `profiler.start()` — flips the profiler `initialized` flag.
     ///
     /// Pyre invokes this from the metainterp's back-edge entry
     /// `MetaInterp::bound_reached` (pyre analogue of
     /// `pyjitpl.py:2889 compile_and_run_once`).
-    pub fn _setup_once(&self, backend: &mut BackendImpl) {
+    pub fn _setup_once(
+        &self,
+        backend: &mut BackendImpl,
+        warm_state: &mut crate::warmstate::WarmEnterState,
+    ) {
         let mut gd = self.globaldata.lock().unwrap();
         if gd.initialized {
             return;
         }
+        warm_state.ensure_jitlog_initialised();
+        self.debug_print_jit_starting_line(backend.backend_name());
         backend.setup_once();
+        backend.vector_ext_setup_once();
+        self.profiler.start();
         gd.initialized = true;
+    }
+
+    /// pyjitpl.py:2296 `debug_print(self.jit_starting_line)` parity.
+    ///
+    /// RPython's `debug_print` fires only when `PYPYLOG` is set; the
+    /// pyre equivalent gates on `MAJIT_LOG` (the env var the rest of
+    /// the backend already reads).  Caller passes `backend_name()`
+    /// so the line reads `JIT starting (x86)` etc. on first
+    /// `_setup_once` — matches PyPy's `'JIT starting (%s)' %
+    /// backendmodule` (pyjitpl.py:2217).
+    fn debug_print_jit_starting_line(&self, backend_name: &'static str) {
+        if !crate::majit_log_enabled() {
+            return;
+        }
+        let line = if self.jit_starting_line.is_empty() {
+            format!("JIT starting ({backend_name})")
+        } else {
+            self.jit_starting_line.clone()
+        };
+        eprintln!("[majit] {line}");
     }
 
     /// pyjitpl.py:2305-2323 `get_name_from_address(addr)`.

@@ -12,7 +12,7 @@
 //! relationship between any two counter updates, and we only ever publish
 //! totals via [`JitProfiler::snapshot`] which itself is `Relaxed`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
 
@@ -93,9 +93,31 @@ pub struct JitProfiler {
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
     /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
     pub calls: AtomicUsize,
+    /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
+    /// self.profiler.initialized: self.profiler.start(); ...
+    /// initialized = True`.  Pyre carries the flag on the profiler
+    /// itself (instead of on `MetaInterpStaticData.globaldata`) so
+    /// `start()` is self-contained and idempotent without needing the
+    /// staticdata mutex.
+    pub initialized: AtomicBool,
 }
 
 impl JitProfiler {
+    /// jitprof.py:55-61 `Profiler.start`.  Idempotent because the
+    /// `initialized` flag is the canonical "has start ever run?"
+    /// signal (pyjitpl.py:2300-2302).
+    ///
+    /// Returns whether `start()` actually ran the initialisation
+    /// (`false` if `initialized` was already set).  Counters / calls
+    /// are not reset here — pyre creates the profiler via
+    /// `Default::default()` which already zeros every slot, and
+    /// post-`start()` resets would discard counts accumulated by
+    /// out-of-band callers (eg. tests that count_ops before
+    /// `_setup_once`).
+    pub fn start(&self) -> bool {
+        !self.initialized.swap(true, Ordering::AcqRel)
+    }
+
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
     ///
     /// ```python

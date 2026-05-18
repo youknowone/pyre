@@ -291,6 +291,10 @@ impl WasmBackend {
 unsafe impl Send for WasmBackend {}
 
 impl majit_backend::Backend for WasmBackend {
+    fn backend_name(&self) -> &'static str {
+        "wasm"
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],

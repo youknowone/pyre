@@ -2581,6 +2581,28 @@ pub trait Backend: Send {
     /// override this; default is no-op for backends without
     /// setup-time work.
     fn setup_once(&mut self) {}
+
+    /// `backend/x86/vector_ext.py:55 setup_once(asm)` parity, called
+    /// by `pyjitpl.py:2298-2299
+    /// `if self.cpu.vector_ext: self.cpu.vector_ext.setup_once(...)`
+    /// inside `MetaInterpStaticData._setup_once`.  Backends with a
+    /// vector extension override this; pyre's x86 / aarch64 / wasm /
+    /// cranelift backends have no vector_ext today (the optimizeopt
+    /// vector pass has no runtime setup hook yet), so the default
+    /// no-op is the honest port.
+    fn vector_ext_setup_once(&mut self) {}
+
+    /// pyjitpl.py:2215-2217 `backendmodule = self.cpu.__module__
+    /// .split('.')[-2]` parity — backend identifier used in
+    /// `self.jit_starting_line = 'JIT starting (%s)' % backendmodule`
+    /// (`pyjitpl.py:2296` `debug_print(self.jit_starting_line)`).
+    /// RPython derives it by reflection on the CPU module path;
+    /// pyre returns a literal because the backend struct already
+    /// knows its own name at compile time.
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// model.py: finish_once() — called when the JIT shuts down.
     fn finish_once(&mut self) {}
 

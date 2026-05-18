@@ -13938,6 +13938,10 @@ fn collect_terminal_exit_layouts(
 // ---------------------------------------------------------------------------
 
 impl majit_backend::Backend for CraneliftBackend {
+    fn backend_name(&self) -> &'static str {
+        "cranelift"
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],

@@ -84,6 +84,10 @@ impl SyntheticCpu {
 }
 
 impl crate::Backend for SyntheticCpu {
+    fn backend_name(&self) -> &'static str {
+        "synthetic"
+    }
+
     /// `rpython/jit/backend/model.py:79-91` declares `compile_loop` on every
     /// `AbstractCPU`.  SyntheticCpu does not produce native code; this method
     /// must never be reached.

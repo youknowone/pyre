@@ -3126,6 +3126,24 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_fixed(&self.descr_attachments);
         }
     }
+
+    /// `backend/<arch>/__init__.py` parity — pyre's dynasm backend
+    /// spans x86 and aarch64; the active target_arch picks the name.
+    fn backend_name(&self) -> &'static str {
+        #[cfg(target_arch = "x86_64")]
+        {
+            "x86"
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64"
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            "dynasm"
+        }
+    }
+
     fn finish_once(&mut self) {}
 }
 
