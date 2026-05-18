@@ -1501,6 +1501,27 @@ pub trait Backend: Send {
     /// Register constant OpRef → `Type` annotations.
     fn set_constant_types(&mut self, _constant_types: std::collections::HashMap<u32, Type>) {}
 
+    /// Unified typed-constant pool — registers OpRef → `Const` for the
+    /// next `compile_loop` / `compile_bridge` call.  `Const` carries
+    /// both value and `Type` (history.py:220/261/307 ConstInt/Float/Ptr
+    /// `.type` parity), retiring the two-call `(set_constants,
+    /// set_constant_types)` shape.
+    ///
+    /// Default routes through the legacy pair so existing backends
+    /// continue to work without override.  Backends that consume the
+    /// typed pool natively override this method and stop overriding the
+    /// legacy pair.
+    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, Const>) {
+        let mut bits = std::collections::HashMap::with_capacity(constants.len());
+        let mut types = std::collections::HashMap::with_capacity(constants.len());
+        for (&k, c) in constants.iter() {
+            bits.insert(k, c.as_raw_i64());
+            types.insert(k, c.get_type());
+        }
+        self.set_constants(bits);
+        self.set_constant_types(types);
+    }
+
     /// Force the next `compile_loop` / `compile_bridge` call to stamp
     /// this trace id on exits.
     fn set_next_trace_id(&mut self, _trace_id: u64) {}
