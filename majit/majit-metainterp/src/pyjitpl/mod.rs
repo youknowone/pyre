@@ -4546,15 +4546,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -5362,15 +5357,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_retrace,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -5904,15 +5894,10 @@ impl<M: Clone> MetaInterp<M> {
             orig_vable_ptr,
         );
 
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -6257,15 +6242,10 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_simple,
         );
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8314,11 +8294,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
@@ -8339,8 +8314,8 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -8866,11 +8841,6 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
-        // Backend boundary: lower typed `Value` pool to the legacy
-        // `(i64, Type)` pair the backend's `set_constants` /
-        // `set_constant_types` API consumes.
-        let (backend_constants, backend_constant_types) =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&constants);
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let bridge_trace_id = self.alloc_trace_id();
@@ -8880,8 +8850,8 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        self.backend.set_constants(backend_constants);
-        self.backend.set_constant_types(backend_constant_types);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
         // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /

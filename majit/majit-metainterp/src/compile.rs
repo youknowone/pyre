@@ -2427,29 +2427,22 @@ pub fn compile_tmp_callback(
     // are minted via `OpRef::const_typed` so each one is a Const{Int,
     // Float,Ptr} (history.py:220/261/307).
     const CONST_BASE: u32 = 10_000;
-    let mut constants: HashMap<u32, i64> = HashMap::new();
-    let mut constant_types: HashMap<u32, Type> = HashMap::new();
+    let mut constants: majit_ir::VecAssoc<u32, majit_ir::Const> = majit_ir::VecAssoc::new();
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)).
     let funcbox_ref = OpRef::const_int(CONST_BASE);
-    constants.insert(funcbox_ref.raw(), jitdriver_sd.portal_runner_adr);
-    // Lockstep with backend `set_constant_types`: raw-u32 keyed readers
-    // (regalloc fail_args, GC rewrite) need the side table.
-    constant_types.insert(funcbox_ref.raw(), Type::Int);
+    constants.insert(funcbox_ref.raw(), majit_ir::Const::Int(jitdriver_sd.portal_runner_adr));
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
     for (i, gb) in greenboxes.iter().enumerate() {
-        let (raw, tp) = match *gb {
-            Value::Int(v) => (v, Type::Int),
-            Value::Ref(r) => (r.0 as i64, Type::Ref),
-            Value::Float(f) => (f.to_bits() as i64, Type::Float),
+        let (c, tp) = match *gb {
+            Value::Int(v) => (majit_ir::Const::Int(v), Type::Int),
+            Value::Ref(r) => (majit_ir::Const::Ref(r), Type::Ref),
+            Value::Float(f) => (majit_ir::Const::Float(f), Type::Float),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
         let g_ref = OpRef::const_typed(CONST_BASE + 1 + i as u32, tp);
-        constants.insert(g_ref.raw(), raw);
-        // Lockstep with backend `set_constant_types`: raw-u32 keyed
-        // readers (regalloc fail_args, GC rewrite) need the side table.
-        constant_types.insert(g_ref.raw(), tp);
+        constants.insert(g_ref.raw(), c);
         callargs.push(g_ref);
     }
     // Red args — inputargs occupy contiguous low OpRefs. Use
@@ -2517,8 +2510,7 @@ pub fn compile_tmp_callback(
     //
     // `compile.py:1146` `cpu.compile_loop(inputargs, operations, jitcell_token,
     // log=False)`.
-    backend.set_constants(constants);
-    backend.set_constant_types(constant_types);
+    backend.set_constants_pool(constants);
     backend.compile_loop(
         &inputargs,
         &operations,
