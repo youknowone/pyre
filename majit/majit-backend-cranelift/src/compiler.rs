@@ -5673,7 +5673,6 @@ fn emit_attached_loop_dispatch(
     jf_ptr: CValue,
     ll_loop_code_addr: usize,
     ptr_type: cranelift_codegen::ir::Type,
-    call_conv: cranelift_codegen::isa::CallConv,
 ) {
     let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
     let entry = builder
@@ -5696,13 +5695,15 @@ fn emit_attached_loop_dispatch(
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
     emit_call_footer_shadowstack(builder, ptr_type);
-    // `call_conv` here is the body's Tail conv (callers pass
-    // `body_call_conv`).  Both this body and the target body were
-    // compiled with `CallConv::Tail`, so `return_call_indirect`
-    // replaces the current frame with the callee's — the cranelift
-    // analogue of `assembler.py:2456-2462 closing_jump`'s raw
-    // `JMP imm(target)`.
-    let mut target_sig = Signature::new(call_conv);
+    // Both this body and the target body were compiled with
+    // `CallConv::Tail`, so `return_call_indirect` replaces the current
+    // frame with the callee's — the cranelift analogue of
+    // `assembler.py:2456-2462 closing_jump`'s raw `JMP imm(target)`.
+    // The host call_conv (`apple_aarch64`) cannot speak tail calls;
+    // hard-code `Tail` here so this matches the body's signature
+    // regardless of which call_conv the enclosing emit_guard_exit
+    // received for its non-tail helper calls.
+    let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     target_sig.params.push(AbiParam::new(ptr_type));
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
@@ -5798,25 +5799,33 @@ fn emit_guard_exit(
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
 
-    // `assembler.py:2456-2462 closing_jump` parity is staged but not
-    // yet enabled at this call site.  `emit_attached_loop_dispatch`
-    // tail-calls the target body via `return_call_indirect` (the
-    // cranelift analogue of `JMP imm(target)`), but enabling it
-    // empirically leaks ~12 bytes of OS stack per fired tail call on
-    // aarch64 — `raise_catch_loop` (1M iterations) hits the 768 KiB
-    // budget after exactly 61315 tail calls (`MAJIT_X2_PROBE` shows
-    // dispatch_takes=61315 then RecursionError; 768 KiB / 61315 ≈ 12.5
-    // bytes/take).  The call-indirect+return variant leaks the full
-    // frame per call (~35 bytes/take, crashes at 300k iters / 22k
-    // takes).  Both variants also corrupt `nbody` to
-    // `-0.03513379910298962` vs the dynasm reference
-    // `-0.035132020348426815`.  Cranelift 0.130.2 aarch64's
-    // gen_clobber_save/_restore + emit_return_call_common_sequence
-    // look symmetric per inspection, so the leak source is internal
-    // to cranelift's Tail conv handling on aarch64.  Slice X2-step4b
-    // (task #116) documents the diagnosis; until cranelift addresses
-    // the leak the host-loop dispatch handles external JUMPs the
-    // legacy way.  See `project_cranelift_wrapper_body_tail_leak.md`.
+    // `assembler.py:2456-2462 closing_jump` parity is wired through
+    // `emit_attached_loop_dispatch` but the call site stays gated.
+    // Enabling it has two independent failure modes on cranelift
+    // 0.130 *and* 0.131 aarch64 (re-verified after 0.131 upgrade
+    // attempt 2026-05-18):
+    //
+    //   - `nbody` produces `-0.03513214049650899` instead of the
+    //     dynasm-reference `-0.035132020348426815` (8th-decimal
+    //     divergence — meaningful, not ULP).  Hypothesis per
+    //     `project_cranelift_wrapper_body_tail_leak.md`: target
+    //     body's prologue reads jf_frame slots (ref-root area,
+    //     force-token slots, gcmap) that source `emit_guard_exit`
+    //     doesn't refresh at the in-code tail call.  Surfaced
+    //     before the orthodox argloc remap (task #114 option (ii))
+    //     lands; bench-only since lib/integration tests don't
+    //     exercise long enough traces to expose the slot mismatch.
+    //
+    //   - raise_catch_loop / fannkuch crash or time out via the
+    //     ~12.5 bytes/take stack leak inside cranelift's
+    //     `emit_return_call_common_sequence` (Tail conv aarch64) —
+    //     unchanged between 0.130.2 and 0.131.1.
+    //
+    // The dispatch helper itself (and the per-LABEL `ll_loop_code`
+    // address wiring) is committed and used by the wrapper+body
+    // split; only the call from `emit_guard_exit` stays gated until
+    // the upstream tail-call accounting bug is fixed or pyre's
+    // argloc remap lands.
     let _ = info.external_jump_ll_loop_code_addr;
 
     if info.can_have_bridge && !info.must_save_exception {
@@ -15496,17 +15505,6 @@ mod tests {
         extra_info: EffectInfo,
     }
 
-    #[derive(Debug)]
-    struct TestLabelDescr {
-        idx: u32,
-    }
-
-    impl Descr for TestLabelDescr {
-        fn index(&self) -> u32 {
-            self.idx
-        }
-    }
-
     impl Descr for TestCallDescr {
         fn as_call_descr(&self) -> Option<&dyn CallDescr> {
             Some(self)
@@ -15553,7 +15551,14 @@ mod tests {
     }
 
     fn make_label_descr(idx: u32) -> majit_ir::DescrRef {
-        Arc::new(TestLabelDescr { idx })
+        // Use the real `BasicLoopTargetDescr` so backend tests exercise
+        // the `LoopTargetDescr` impl that production traces would carry
+        // (`as_loop_target_descr` → `Some`, `ll_loop_code` slot lookup).
+        // Production code routes external JUMPs through
+        // `external_jump_ll_loop_code_addr`; a bare `TestLabelDescr`
+        // (which lacks the trait impl) would mask the in-code dispatch
+        // wiring in `emit_guard_exit`.
+        majit_ir::make_loop_target_descr(idx as u64, false)
     }
 
     extern "C" fn collect_nursery_via_runtime(_runtime_id: i64) -> i64 {
@@ -20747,6 +20752,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Slice X2 dispatch site gated off: enabling `emit_attached_loop_dispatch` triggers cranelift 0.130/0.131 aarch64 Tail-conv leak + jf_frame-slot corruption (project_cranelift_wrapper_body_tail_leak.md). Test passes the moment the gate at compiler.rs `emit_guard_exit` flips on."]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1500_260);
