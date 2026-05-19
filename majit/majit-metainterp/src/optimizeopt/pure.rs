@@ -840,7 +840,10 @@ impl OptPure {
             };
             arg_consts.push(const_value);
         }
-        self.call_pure_results.get(&arg_consts).cloned()
+        self.call_pure_results
+            .iter()
+            .find(|(k, _)| k.as_slice() == arg_consts.as_slice())
+            .map(|(_, v)| v.clone())
     }
 }
 
