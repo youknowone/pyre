@@ -3000,23 +3000,16 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since T6.1 Slice 6 retired per-PC label emission",
         );
-    let mut protected_per_pc_live: Vec<bool> = vec![false; ssarepr.insns.len()];
-    for &idx in walker_tracked {
-        if let Some(slot) = protected_per_pc_live.get_mut(idx) {
-            *slot = true;
-        }
-    }
-    let remap = super::liveness::compute_liveness_with_remap(
-        ssarepr,
-        Some(protected_per_pc_live.as_slice()),
-    );
+    // Run `compute_liveness` + `remove_repeated_live` and resolve each
+    // Python PC's `-live-` marker to its POST-merge SSARepr index.
+    // The protection bitmap + remap plumbing is internal to
+    // `liveness.rs` — `liveness.rs`'s public API (`compute_liveness`,
+    // `remove_repeated_live`) now matches upstream `liveness.py`
+    // exactly; this bridge is the sole pyre NEW-DEVIATION entry,
+    // slated for retirement in Task #124.B/C.
+    let live_markers = super::liveness::compute_liveness_with_pc_anchors(ssarepr, walker_tracked);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
-    // Walker-tracked indices are captured in the
-    // PRE-`remove_repeated_live` ssarepr; translate through the
-    // remap to land on the corresponding NEW index after the merge
-    // pass.
-    let live_markers: Vec<usize> = walker_tracked.iter().map(|&old| remap[old]).collect();
     let live_markers_out = live_markers.clone();
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
