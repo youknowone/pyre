@@ -4632,7 +4632,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     trace_info.as_ref(),
                 );
-                compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
                     token.as_ref(),
@@ -5484,7 +5484,7 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     trace_info.as_ref(),
                 );
-                compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
                     token.as_ref(),
@@ -5978,7 +5978,7 @@ impl<M: Clone> MetaInterp<M> {
                     &trace.inputargs,
                     trace_info.as_ref(),
                 );
-                compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
                     token.as_ref(),
@@ -6341,7 +6341,7 @@ impl<M: Clone> MetaInterp<M> {
                     &trace.inputargs,
                     trace_info.as_ref(),
                 );
-                compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
                     token.as_ref(),
@@ -8438,7 +8438,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_inputargs,
                     trace_info.as_ref(),
                 );
-                compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
                     token.as_ref(),
@@ -9062,7 +9062,7 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         bridge_trace_info.as_ref(),
                     );
-                    compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                    compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                     compile::patch_backend_terminal_recovery_layouts_for_trace(
                         &mut self.backend,
                         source_jct.as_ref(),
@@ -18118,7 +18118,7 @@ mod tests {
             inputargs,
             trace_info.as_ref(),
         );
-        compile::patch_backend_guard_recovery_layouts_for_trace(&mut exit_layouts);
+        compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
         compile::patch_backend_terminal_recovery_layouts_for_trace(
             &mut meta.backend,
             &token,

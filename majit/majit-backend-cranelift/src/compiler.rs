@@ -635,7 +635,7 @@ fn caller_prefix_recovery_layout(
             pc: header_pc,
             // Placeholder: this caller-prefix identity layout is replaced by
             // the resume_layout-derived layout via
-            // `compile::patch_backend_guard_recovery_layouts_for_trace`
+            // `compile::patch_guard_recovery_layouts_for_trace`
             // (compile.rs:1596) before any guard can fire. The
             // resume_layout carries the authoritative jitcode_index
             // threaded from `Snapshot::single_frame`.
@@ -6736,7 +6736,7 @@ fn identity_recovery_layout(
         pc: guard_resume_pc.unwrap_or(header_pc),
         // Placeholder: this backend-side identity layout is produced at
         // compile time, then replaced by the resume_layout-derived layout
-        // via `compile::patch_backend_guard_recovery_layouts_for_trace`
+        // via `compile::patch_guard_recovery_layouts_for_trace`
         // (compile.rs:1596). The guard-exit rd_numb path at compiler.rs
         // ~11035 additionally overwrites `frame.jitcode_index` with the
         // topmost rd_numb frame, covering guards whose resume_layout is

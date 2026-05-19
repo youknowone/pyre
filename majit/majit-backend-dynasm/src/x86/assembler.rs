@@ -4808,7 +4808,7 @@ impl<'a> Assembler386<'a> {
         // (kept until source_op_index is removed from FailDescrLayout per
         // PyPy parity); recovery_layout is no longer cached on the backend —
         // the metainterp's `StoredExitLayout.recovery_layout`
-        // (populated by `patch_backend_guard_recovery_layouts_for_trace` from
+        // (populated by `patch_guard_recovery_layouts_for_trace` from
         // the resume snapshot per `resume.py:450-488`) is the canonical store.
         crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`

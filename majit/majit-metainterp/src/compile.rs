@@ -1043,7 +1043,7 @@ pub(crate) fn build_guard_metadata(
             // Every guard has at minimum an identity mapping from
             // fail_args → frame slots, with exit_types as slot_types.
             // `jitcode_index: 0` is a placeholder for the no-rd_numb
-            // path — `patch_backend_guard_recovery_layouts_for_trace`
+            // path — `patch_guard_recovery_layouts_for_trace`
             // (compile.rs:1596) overwrites this with the resume_layout
             // derived from `Snapshot::single_frame(jitcode_index, pc, ...)`.
             // The outermost-frame rule at eval.rs:3938-3951 means a
@@ -2134,7 +2134,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
     }
 }
 
-pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
+pub(crate) fn patch_guard_recovery_layouts_for_trace(
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the

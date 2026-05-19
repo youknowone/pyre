@@ -3509,7 +3509,7 @@ impl<'a> AssemblerARM64<'a> {
         // Slice KK/NN: source_op_index uses SOURCE_OP_INDEX_TABLE (kept
         // pending source_op_index removal); recovery_layout caching is
         // removed — the metainterp's `StoredExitLayout.recovery_layout`
-        // (populated by `patch_backend_guard_recovery_layouts_for_trace`)
+        // (populated by `patch_guard_recovery_layouts_for_trace`)
         // is the canonical store per `resume.py:450-488`.
         crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`

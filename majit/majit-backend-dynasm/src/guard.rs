@@ -81,7 +81,7 @@ pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
 // code (`resume.py:450-488`) decodes recovery on demand from
 // `rd_numb / rd_consts / rd_virtuals / rd_pendingfields`.  Pyre's
 // metainterp `StoredExitLayout.recovery_layout` (populated by
-// `compile.rs::patch_backend_guard_recovery_layouts_for_trace` from
+// `compile.rs::patch_guard_recovery_layouts_for_trace` from
 // the resume snapshot) is the canonical store; the backend no longer
 // caches.  At deopt, `FailDescrLayout.recovery_layout` is `None` and
 // `pyjitpl/mod.rs:6322` falls back to `trace_layout_ref.recovery_layout`
