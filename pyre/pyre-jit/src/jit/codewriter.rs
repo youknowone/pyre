@@ -3122,12 +3122,23 @@ fn filter_liveness_in_place(
     stack_slot_color_map: &[u16],
     portal_frame_reg: u16,
     portal_ec_reg: u16,
+    walker_tracked_pc_live_indices: Option<&[usize]>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
-    let live_markers = live_marker_indices_by_pc(ssarepr, code.instructions.len());
+    // T6.1 Slice 3 production: prefer walker-tracked positions over the
+    // SSARepr scan when available; falls back to scan for callers that
+    // don't thread the side-table (test fixtures).  Both sources agree
+    // post-`remove_repeated_live` (per the parity assertion at
+    // `pc_map` computation site).
+    let live_markers: Vec<usize> = match walker_tracked_pc_live_indices {
+        Some(walker_tracked) if walker_tracked.len() == code.instructions.len() => {
+            walker_tracked.to_vec()
+        }
+        _ => live_marker_indices_by_pc(ssarepr, code.instructions.len()),
+    };
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
@@ -9721,6 +9732,7 @@ impl CodeWriter {
             &stack_slot_color_map,
             portal_frame_reg,
             portal_ec_reg,
+            walker_tracked_pc_live_indices_out.as_deref(),
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
@@ -11466,6 +11478,7 @@ mod tests {
             &stack_slot_color_map,
             u16::MAX,
             u16::MAX,
+            None,
         );
 
         let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
