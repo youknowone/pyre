@@ -9728,23 +9728,33 @@ impl CodeWriter {
         // op_live`). `remove_repeated_live` may move that marker away
         // from the per-PC `Label("pcN")` anchor, so record the final
         // per-PC live-marker positions here instead of the label indices.
-        let pc_map = live_marker_indices_by_pc(&ssarepr, num_instrs);
-        // T6.1 post-`remove_repeated_live` parity: walker-tracked
-        // positions must remain valid after `filter_liveness_in_place`'s
-        // internal `remove_repeated_live` pass.  Pyre's per-PC carveout
-        // (`liveness.rs:292-296` breaks merge runs on `pc{N}` labels)
-        // guarantees per-PC `-live-` markers survive unmerged, so
-        // walker positions are stable.  Asserts that contract here so a
-        // future change to the carveout (Slice 6) gets caught.  Outer
-        // `if let` is required because `walker_tracked_pc_live_indices_out`
-        // can be `None` when a recording-site invariant breaks.
+        //
+        // T6.1 Slice 3 production switch: prefer the walker-tracked
+        // side-table over the SSARepr scan.  The walker records every
+        // per-PC `-live-` position at emit time (see
+        // `walker_pc_live_marker_pos`) and the resolver picks the first
+        // live block per py_pc, matching `live_marker_indices_by_pc`'s
+        // first-takes semantics.  Pyre's per-PC label carveout in
+        // `remove_repeated_live` (`liveness.rs:292-296`) keeps those
+        // positions stable through liveness filtering — guarded by the
+        // post-remove parity assertion below.  Falls back to the scan
+        // if the resolver couldn't translate (e.g. a recording-site
+        // invariant broke), so an unexpected walker miss surfaces
+        // through the assertion rather than corrupt pc_map indices.
+        let pc_map = match walker_tracked_pc_live_indices_out.as_ref() {
+            Some(walker_tracked) if walker_tracked.len() == num_instrs => {
+                walker_tracked.clone()
+            }
+            _ => live_marker_indices_by_pc(&ssarepr, num_instrs),
+        };
         #[cfg(debug_assertions)]
         if let Some(walker_tracked) = walker_tracked_pc_live_indices_out.as_ref() {
             if walker_tracked.len() == num_instrs {
+                let scanned = live_marker_indices_by_pc(&ssarepr, num_instrs);
                 assert_eq!(
-                    walker_tracked, &pc_map,
+                    walker_tracked, &scanned,
                     "T6.1 walker-tracked PC live-marker positions diverge \
-                     from pc_map post-`remove_repeated_live`"
+                     from live_marker_indices_by_pc post-`remove_repeated_live`"
                 );
             }
         }
