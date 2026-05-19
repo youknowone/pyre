@@ -13057,9 +13057,9 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| {
-            op.descr
+            op.getdescr()
                 .as_ref()
-                .map(|d| (majit_ir::descr_identity(d), op.args.len()))
+                .map(|d| (majit_ir::descr_identity(d), op.num_args()))
         })
         .collect();
     let num_inputs = inputargs.len();
@@ -13068,22 +13068,22 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = op.opcode == OpCode::Jump
-            && op.descr.as_ref().map_or(false, |d| {
+            && op.getdescr().as_ref().map_or(false, |d| {
                 let id = majit_ir::descr_identity(d);
                 match label_arity_by_descr
                     .iter()
                     .find(|(label_id, _)| *label_id == id)
                 {
                     None => true,
-                    Some(&(_, arity)) => arity != op.args.len(),
+                    Some(&(_, arity)) => arity != op.num_args(),
                 }
             });
         if !is_guard && !is_finish && !is_external_jump {
             continue;
         }
         let n = if is_finish || is_external_jump {
-            op.args.len()
-        } else if let Some(ref fa) = op.fail_args {
+            op.num_args()
+        } else if let Some(fa) = op.getfailargs() {
             fa.len()
         } else {
             num_inputs
@@ -13603,7 +13603,8 @@ fn collect_guards(
         } else {
             None
         };
-        let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+        let descr_arc = op.getdescr();
+        let accum_info = if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
             // lives on the metainterp `AbstractFailDescr`; backend reads
             // forward through `meta_descr` so no local copy is needed.
@@ -13636,8 +13637,7 @@ fn collect_guards(
             //
             // `is_exit_frame_with_exception` vs DoneWithThisFrame
             // routing mirrors lines 12992-13001 below.
-            let is_exit_exc = op
-                .descr
+            let is_exit_exc = descr_arc
                 .as_ref()
                 .and_then(|d| d.as_fail_descr())
                 .map(|fd| FailDescr::is_exit_frame_with_exception(fd))
@@ -13670,7 +13670,7 @@ fn collect_guards(
                 // meta-side slots for `force_token_slots` (Slice 7-Tβ7)
                 // and `external_jump_target` (Slice 7-Tβ8) are reachable.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
-            } else if let Some(d) = op.descr.clone() {
+            } else if let Some(d) = op.getdescr() {
                 // Preserve `op.descr` identity for every guard that carries
                 // one — including non-Resume FailDescrs (PropagateExceptionDescr
                 // attached to GUARD_NO_EXCEPTION by `compile_tmp_callback`
@@ -13813,7 +13813,7 @@ fn collect_guards(
         // whose inputarg layout differs (`assembler.py:990-993` per-
         // LABEL `_ll_loop_code` parity gate).
         let external_jump_ll_loop_code_addr = if is_external_jump {
-            op.descr
+            op.getdescr()
                 .as_ref()
                 .and_then(|d| d.as_loop_target_descr())
                 .map(|ltd| {
