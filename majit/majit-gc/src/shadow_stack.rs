@@ -140,8 +140,8 @@ pub fn register_libc_jitframe_tracer(tracer: LibcJitframeTracer) {
 // set the visitor cannot tell a libc-alloc'd jitframe from an
 // unrelated foreign pointer that happens to sit on the shadow stack.
 thread_local! {
-    static LIBC_JF_REGISTRY: RefCell<std::collections::HashSet<usize>> =
-        RefCell::new(std::collections::HashSet::new());
+    static LIBC_JF_REGISTRY: RefCell<majit_ir::VecSet<usize>> =
+        RefCell::new(majit_ir::VecSet::new());
 }
 
 /// Register a libc-allocated jitframe payload address. Must be called

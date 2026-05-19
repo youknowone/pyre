@@ -6,9 +6,7 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
-use std::collections::{HashMap, HashSet};
-
-use majit_ir::GcRef;
+use majit_ir::{GcRef, VecAssoc, VecSet};
 
 use crate::GcAllocator;
 use crate::flags;
@@ -214,14 +212,14 @@ pub struct MiniMarkGC {
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
-    pinned_objects: HashSet<usize>,
+    pinned_objects: VecSet<usize>,
     /// Registry of compiled code regions for GC root scanning.
     pub compiled_code_registry: CompiledCodeRegistry,
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
     /// independently of any translator pipeline.
-    vtable_to_type_id: HashMap<usize, u32>,
+    vtable_to_type_id: VecAssoc<usize, u32>,
     /// `gc.py:603-622 _setup_guard_is_object` instance state.
     /// `_infobits_offset` is the byte offset of `infobits` inside
     /// `TYPE_INFO`; `_infobits_offset_plus` is the additional offset
@@ -267,9 +265,9 @@ impl MiniMarkGC {
             last_major_bytes: 0,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
-            pinned_objects: HashSet::new(),
+            pinned_objects: VecSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
-            vtable_to_type_id: HashMap::new(),
+            vtable_to_type_id: VecAssoc::new(),
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
             _T_IS_RPYTHON_INSTANCE_BYTE: 0,
@@ -3514,7 +3512,7 @@ mod tests {
         // Write nursery objects into scattered array positions and trigger
         // card-marking write barriers.
         let write_indices: Vec<usize> = vec![0, 1, 5, 64, 127, 128, 200, 255, 256, 400, 511];
-        let mut expected_cards: HashSet<usize> = HashSet::new();
+        let mut expected_cards: Vec<usize> = Vec::new();
         let mut nursery_objs: Vec<(usize, GcRef)> = Vec::new();
 
         for &idx in &write_indices {
@@ -3529,13 +3527,17 @@ mod tests {
             }
             // Write barrier with card marking.
             gc.do_write_barrier_card(arr, idx, DEFAULT_CARD_PAGE_SHIFT);
-            expected_cards.insert(idx >> DEFAULT_CARD_PAGE_SHIFT);
+            let card = idx >> DEFAULT_CARD_PAGE_SHIFT;
+            if !expected_cards.contains(&card) {
+                expected_cards.push(card);
+            }
             nursery_objs.push((idx, obj));
         }
 
         // Verify the correct cards are dirty.
-        let dirty = gc.dirty_cards(arr);
-        let dirty_set: HashSet<usize> = dirty.into_iter().collect();
+        let mut dirty_set: Vec<usize> = gc.dirty_cards(arr);
+        dirty_set.sort();
+        expected_cards.sort();
         assert_eq!(
             dirty_set, expected_cards,
             "dirty card set should match expected cards"
