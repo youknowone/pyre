@@ -398,6 +398,13 @@ pub enum PyErrorKind {
     UnicodeError,
     UnicodeDecodeError,
     UnicodeEncodeError,
+    /// `pypy/module/exceptions/interp_exceptions.py:426
+    /// W_UnicodeTranslateError` — subclass of UnicodeError.
+    /// Identity-only port: dedicated PyErrorKind / ExcKind / PyType
+    /// so render_exception preserves the class.  W_UnicodeTranslateError's
+    /// 5-arg `(object, start, end, reason)` `__init__` and custom
+    /// `__str__` are TODO.
+    UnicodeTranslateError,
 }
 
 impl PyError {
@@ -627,6 +634,7 @@ impl PyError {
             PyErrorKind::UnicodeError => ExcKind::UnicodeError,
             PyErrorKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
             PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
+            PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
         }
     }
 
@@ -678,6 +686,9 @@ impl PyError {
             ExcKind::UnicodeError => PyErrorKind::UnicodeError,
             ExcKind::UnicodeDecodeError => PyErrorKind::UnicodeDecodeError,
             ExcKind::UnicodeEncodeError => PyErrorKind::UnicodeEncodeError,
+            // `pypy/module/exceptions/interp_exceptions.py:426`
+            // W_UnicodeTranslateError — subclass of UnicodeError.
+            ExcKind::UnicodeTranslateError => PyErrorKind::UnicodeTranslateError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
             ExcKind::MemoryError => PyErrorKind::MemoryError,
             ExcKind::SystemError => PyErrorKind::SystemError,

@@ -515,7 +515,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         "UnicodeTranslateError",
         make_exc_type(
             "UnicodeTranslateError",
-            exc_unicode_error_new,
+            exc_unicode_translate_error_new,
             unicode_error,
         ),
     );
@@ -1359,6 +1359,10 @@ exc_constructor!(
     exc_unicode_encode_error,
     pyre_object::excobject::ExcKind::UnicodeEncodeError
 );
+exc_constructor!(
+    exc_unicode_translate_error,
+    pyre_object::excobject::ExcKind::UnicodeTranslateError
+);
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
@@ -1400,6 +1404,7 @@ exc_new_wrapper!(exc_lookup_error_new, exc_lookup_error);
 exc_new_wrapper!(exc_unicode_error_new, exc_unicode_error);
 exc_new_wrapper!(exc_unicode_decode_error_new, exc_unicode_decode_error);
 exc_new_wrapper!(exc_unicode_encode_error_new, exc_unicode_encode_error);
+exc_new_wrapper!(exc_unicode_translate_error_new, exc_unicode_translate_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 fn make_exc_type(

@@ -784,14 +784,21 @@ fn strip_walker_block_boundary_goto(
         // entry in `all_walker_blocks` is the now-empty dead block,
         // not the supersede newblock that holds the matching
         // `Label(pcN)` first insn.
-        // T6.1 Slice 4: block-entry emits both `Label("block{addr}")`
-        // (RPython-orthodox) and `Label("pcN")` (per-PC anchor) at the
-        // first PC of the block.  The strip's `goto Label("pcN")`
-        // target may match the SECOND leading label of the next block,
-        // not the first — so scan the entire leading-label cluster
-        // rather than just `first()`.
+        // `rpython/jit/codewriter/flatten.py:106-155 make_link` falls
+        // through to the IMMEDIATE next emitted block by recursive
+        // descent — never hops over an intervening block.  So compare
+        // only against the leading-label cluster of the IMMEDIATE next
+        // non-empty block.  Empty blocks (dead / superseded SpamBlocks
+        // whose `mark_dead` cleared their `per_block_ssarepr` per
+        // `flowspace/flowcontext.py:455-457`) emit nothing, so scan
+        // past them to find the first block that contributes content.
+        // Leading-label CLUSTER (not just `first()`) because earlier
+        // T6.1 slices emitted multiple leading labels per block
+        // (e.g. `Label("block{addr}")` + `Label("pcN")`); the goto may
+        // target any one of them.
         let next_label_names: Vec<String> = (i + 1..n)
-            .flat_map(|j| {
+            .find(|&j| !blocks[j].is_empty())
+            .map(|j| {
                 blocks[j]
                     .iter()
                     .take_while(|insn| matches!(insn, super::flatten::Insn::Label(_)))
@@ -801,7 +808,7 @@ fn strip_walker_block_boundary_goto(
                     })
                     .collect::<Vec<_>>()
             })
-            .collect();
+            .unwrap_or_default();
         let block_insns = &mut blocks[i];
         let len = block_insns.len();
         let strip_tail = if len >= 2 {
@@ -8752,8 +8759,14 @@ impl CodeWriter {
                 // block) but only measure the resulting length here.
                 let post_strip_lens: Vec<usize> = (0..blocks.len())
                     .map(|i| {
+                        // Mirror `strip_walker_block_boundary_goto`'s
+                        // IMMEDIATE-next-non-empty-block rule per
+                        // `flatten.py:106-155 make_link` recursive
+                        // descent — fall-through never hops over an
+                        // intervening non-empty block.
                         let next_label_names: Vec<String> = (i + 1..blocks.len())
-                            .flat_map(|j| {
+                            .find(|&j| !blocks[j].is_empty())
+                            .map(|j| {
                                 blocks[j]
                                     .iter()
                                     .take_while(|insn| {
@@ -8765,7 +8778,7 @@ impl CodeWriter {
                                     })
                                     .collect::<Vec<_>>()
                             })
-                            .collect();
+                            .unwrap_or_default();
                         let len = blocks[i].len();
                         let strip_tail = if len >= 2 {
                             match (&blocks[i][len - 2], &blocks[i][len - 1]) {
@@ -9622,6 +9635,81 @@ mod tests {
             4,
             "goto/--- must remain when target != next block's label",
         );
+    }
+
+    /// `rpython/jit/codewriter/flatten.py:106-155 make_link` falls
+    /// through only when the IMMEDIATE next emitted block is the
+    /// link's target; it never hops over an intervening non-empty
+    /// block.  Lock in that no-hop semantics: with A -> [unrelated B]
+    /// -> C and A's goto targeting C's label, the goto must remain
+    /// (not strip).  Empty intervening blocks (dead supersede) DO
+    /// get skipped because `mark_dead` clears their accumulator
+    /// per `flowspace/flowcontext.py:455-457`.
+    #[test]
+    fn strip_walker_block_boundary_goto_does_not_hop_over_intervening_block() {
+        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
+
+        let target_name = "block_target_c".to_string();
+        let intervening_name = "block_intervening_b".to_string();
+        let goto_c = Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(target_name.clone()))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto_c, Insn::Unreachable];
+        let block_b = vec![
+            Insn::Label(FlatLabel::new(intervening_name)),
+            Insn::live(Vec::new()),
+        ];
+        let block_c = vec![
+            Insn::Label(FlatLabel::new(target_name)),
+            Insn::live(Vec::new()),
+        ];
+        let mut blocks = vec![block_a, block_b, block_c];
+        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
+        assert_eq!(
+            drained.len(),
+            7,
+            "strip must NOT hop over intervening non-empty block B to match C's label, got {drained:?}",
+        );
+        assert!(
+            matches!(&drained[1], Insn::Op { opname, .. } if opname == "goto"),
+            "goto must remain after non-strip drain, got {:?}",
+            drained[1],
+        );
+        assert!(matches!(drained[2], Insn::Unreachable));
+    }
+
+    /// Empty intervening blocks (dead supersede whose `mark_dead`
+    /// cleared `per_block_ssarepr` per `flowspace/flowcontext.py:455-457`)
+    /// must be skipped when finding the immediate next emitted block —
+    /// they contribute no insns to the final stream, so RPython's
+    /// recursive descent effectively sees the next non-empty block as
+    /// the fall-through target.
+    #[test]
+    fn strip_walker_block_boundary_goto_skips_empty_intervening_blocks() {
+        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
+
+        let target_name = "block_target_c".to_string();
+        let goto_c = Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(target_name.clone()))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto_c, Insn::Unreachable];
+        let block_b: Vec<Insn> = Vec::new();
+        let block_c = vec![
+            Insn::Label(FlatLabel::new(target_name)),
+            Insn::live(Vec::new()),
+        ];
+        let mut blocks = vec![block_a, block_b, block_c];
+        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
+        assert_eq!(
+            drained.len(),
+            3,
+            "strip must fold through empty B to match C, got {drained:?}",
+        );
+        assert!(matches!(&drained[0], Insn::Op { opname, .. } if opname == "-live-"));
+        assert!(matches!(&drained[1], Insn::Label(_)));
+        assert!(matches!(&drained[2], Insn::Op { opname, .. } if opname == "-live-"));
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {

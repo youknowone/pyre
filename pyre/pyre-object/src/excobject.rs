@@ -39,6 +39,15 @@ pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeDecodeError");
 pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeEncodeError");
+/// PyPy `pypy/module/exceptions/interp_exceptions.py:426
+/// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
+/// W_UnicodeError, ...)` — subclass of UnicodeError.  Identity-only
+/// port (dedicated PyType + ExcKind for isinstance / `ob_type`
+/// discrimination); the 5-arg `(object, start, end, reason)` init
+/// signature and custom `__str__` formatting on the W_UnicodeTranslateError
+/// class itself are not yet ported.
+pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("UnicodeTranslateError");
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
 pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
 pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
@@ -86,6 +95,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
+        ExcKind::UnicodeTranslateError => &EXC_UNICODE_TRANSLATE_ERROR_TYPE,
     }
 }
 
@@ -146,6 +156,13 @@ pub enum ExcKind {
     /// — intermediate parent for UnicodeDecodeError and
     /// UnicodeEncodeError.
     UnicodeError = 27,
+    /// `pypy/module/exceptions/interp_exceptions.py:426
+    /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
+    /// W_UnicodeError, ...)`.  Identity-only port: a dedicated kind so
+    /// `ob_type` and `isinstance` discriminate it correctly; the 5-arg
+    /// `(object, start, end, reason)` `__init__` and custom `__str__`
+    /// remain TODO (W_UnicodeTranslateError class-level work).
+    UnicodeTranslateError = 28,
 }
 
 /// Layout: `[ob_header | kind: ExcKind | message: *mut String | args_w: PyObjectRef]`
@@ -281,7 +298,7 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::UnicodeError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::UnicodeTranslateError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -585,6 +602,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::SystemError => "SystemError",
         ExcKind::LookupError => "LookupError",
         ExcKind::UnicodeError => "UnicodeError",
+        ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
     }
 }
 
@@ -625,12 +643,16 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
                 | ExcKind::UnicodeError
                 | ExcKind::UnicodeDecodeError
                 | ExcKind::UnicodeEncodeError
+                | ExcKind::UnicodeTranslateError
         );
     }
     if type_name == "UnicodeError" {
         return matches!(
             kind,
-            ExcKind::UnicodeError | ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError
+            ExcKind::UnicodeError
+                | ExcKind::UnicodeDecodeError
+                | ExcKind::UnicodeEncodeError
+                | ExcKind::UnicodeTranslateError
         );
     }
     // LookupError is the intermediate parent of IndexError and KeyError
@@ -688,6 +710,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "SystemError" => Some(ExcKind::SystemError),
         "LookupError" => Some(ExcKind::LookupError),
         "UnicodeError" => Some(ExcKind::UnicodeError),
+        "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
         _ => None,
     }
 }

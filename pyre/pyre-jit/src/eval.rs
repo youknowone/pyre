@@ -1075,7 +1075,7 @@ thread_local! {
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
         // default which would underallocate `W_ExceptionObject`.
-        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::UnicodeError as u8) {
+        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::UnicodeTranslateError as u8) {
             // Round-trip the byte through the enum so we don't depend
             // on unsafe transmute; every value in [0, UnicodeError] is
             // a valid `ExcKind` variant by construction.
@@ -1108,6 +1108,7 @@ thread_local! {
                 25 => pyre_object::excobject::ExcKind::SystemError,
                 26 => pyre_object::excobject::ExcKind::LookupError,
                 27 => pyre_object::excobject::ExcKind::UnicodeError,
+                28 => pyre_object::excobject::ExcKind::UnicodeTranslateError,
                 _ => unreachable!(),
             };
             let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
@@ -1578,6 +1579,10 @@ thread_local! {
             (ExcKind::UnicodeError, Some(ExcKind::ValueError)),
             (ExcKind::UnicodeDecodeError, Some(ExcKind::UnicodeError)),
             (ExcKind::UnicodeEncodeError, Some(ExcKind::UnicodeError)),
+            // `pypy/module/exceptions/interp_exceptions.py:426
+            // W_UnicodeTranslateError = _new_exception(...,
+            // W_UnicodeError, ...)`.
+            (ExcKind::UnicodeTranslateError, Some(ExcKind::UnicodeError)),
             (ExcKind::NameError, Some(ExcKind::Exception)),
             // `pypy/module/exceptions/interp_exceptions.py:474
             // W_LookupError = _new_exception('LookupError',
