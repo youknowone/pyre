@@ -1907,7 +1907,18 @@ pub trait FailDescr: Descr {
     /// Backends may override this to distinguish rooted refs from opaque
     /// handles that reuse `Type::Ref`, such as FORCE_TOKEN values.
     fn is_gc_ref_slot(&self, slot: usize) -> bool {
-        matches!(self.fail_arg_types().get(slot), Some(Type::Ref))
+        if !matches!(self.fail_arg_types().get(slot), Some(Type::Ref)) {
+            return false;
+        }
+        // Exclude force-token positions: their Type::Ref typing is
+        // synthetic — they carry opaque virtualizable handles (FORCE_TOKEN
+        // op output), not real GC pointers.  The retired
+        // `CraneliftFailDescr` wrapper performed this exclusion explicitly
+        // before computing `fail_descr_gc_map`; the metainterp
+        // `ResumeGuardDescr` now owns the slot list directly, so the
+        // exclusion moves to this trait default and is inherited by every
+        // Resume-family impl that overrides `force_token_slots()`.
+        !self.force_token_slots().contains(&slot)
     }
 
     /// Exit slot indices that carry opaque force-token handles.
