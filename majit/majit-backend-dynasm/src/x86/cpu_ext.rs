@@ -97,22 +97,19 @@ impl X86CpuExt {
         addr
     }
 
-    /// Drop cached trampolines that bake `propagate_exception_descr`
-    /// as an immediate.  Called from
-    /// `DynasmBackend::set_propagate_exception_descr` whenever the
-    /// attached descr `Arc` is replaced (test harnesses that re-mint
-    /// the descr per setup), so the next
-    /// `ensure_propagate_exception_path` / `ensure_malloc_slowpath_fixed`
-    /// rebuilds against the new pointer instead of routing OOM exits
-    /// through a stale baked descr.
-    ///
-    /// Both addresses must clear together: `build_malloc_slowpath_fixed`
-    /// bakes the propagate-path entry as an immediate, so a fresh
-    /// propagate path requires a fresh malloc slowpath too.
-    pub(crate) fn invalidate_propagate_dependent(&mut self) {
-        self.malloc_slowpath_fixed = None;
-        self._malloc_slowpath_fixed_buffer = None;
-        self.propagate_exception_path = None;
-        self._propagate_exception_path_buffer = None;
+    /// Whether either trampoline that bakes `propagate_exception_descr`
+    /// as an immediate has already been materialised.  Used by
+    /// `DynasmBackend::set_propagate_exception_descr` to refuse a
+    /// non-identical `Arc` swap after the bake: such a swap would
+    /// leave previously-compiled loops/bridges (whose `JMP` immediates
+    /// point at this buffer's RX pages and whose helpers carry the
+    /// old descr pointer) referencing a now-orphaned descr.  PyPy
+    /// attaches `propagate_exception_descr` once before
+    /// `cpu.setup_once()` and never replaces it
+    /// (`pyjitpl.py:2273-2283` precedes `pyjitpl.py:2292-2303`); pyre
+    /// upholds the same invariant by panicking instead of dropping
+    /// the buffer.
+    pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
+        self.malloc_slowpath_fixed.is_some() || self.propagate_exception_path.is_some()
     }
 }

@@ -1785,32 +1785,37 @@ impl Backend for DynasmBackend {
         // during init (`attach_descrs_to_cpu`, `register_jitdriver_sd`,
         // and `attach_default_test_descrs` for backend-only tests).
         // The common case is the *same* `Arc<Descr>` arriving twice —
-        // idempotent, no observable effect.  Tests that mint a fresh
-        // `PropagateExceptionDescr` on every call also reach this
-        // setter, so a non-identical `Arc` is allowed to overwrite the
-        // previous attachment.
+        // idempotent, no observable effect — so a pointer-equal
+        // `Arc` returns immediately.
         //
-        // When the `Arc` actually changes after the per-CPU propagate
-        // / malloc trampolines have been built, those trampolines
-        // still carry the *previous* descr pointer baked as an
-        // immediate; OOM exits would write the stale pointer into
-        // `jf_descr` and miss the propagate-exception dispatch.
-        // Invalidate the dependent caches so the next
-        // `ensure_propagate_exception_path` /
-        // `ensure_malloc_slowpath_fixed` rebuilds against the new
-        // descr pointer.
+        // PyPy's lifecycle binds `propagate_exception_descr` before
+        // `cpu.setup_once()` (`pyjitpl.py:2273-2283` precedes
+        // `pyjitpl.py:2292-2303`) and never swaps it afterwards.
+        // Pyre upholds the same invariant: a *different* `Arc`
+        // arriving after the propagate / malloc trampolines have
+        // already baked the previous descr pointer would leave
+        // already-compiled loops/bridges writing the orphaned pointer
+        // into `jf_descr` on OOM, missing the propagate-exception
+        // dispatch.  Rather than patch the baked immediates (PyPy
+        // never does so), refuse the swap with a clear assert.  The
+        // pre-bake path (no trampoline yet) keeps overwriting freely
+        // — the next `ensure_*_path` will bake the fresh pointer.
+        let mut attachments = self.descr_attachments.write().unwrap();
+        if attachments
+            .propagate_exception_descr
+            .as_ref()
+            .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
         {
-            let mut attachments = self.descr_attachments.write().unwrap();
-            if attachments
-                .propagate_exception_descr
-                .as_ref()
-                .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
-            {
-                return;
-            }
-            attachments.propagate_exception_descr = Some(descr);
+            return;
         }
-        self.arch_cpu_ext.invalidate_propagate_dependent();
+        assert!(
+            !self.arch_cpu_ext.has_propagate_dependent_caches(),
+            "set_propagate_exception_descr called with a fresh Arc after \
+             per-CPU propagate/malloc trampolines have already baked the \
+             previous descr pointer; bind propagate_exception_descr once \
+             before backend.setup_once() (pyjitpl.py:2273-2283 ordering)"
+        );
+        attachments.propagate_exception_descr = Some(descr);
     }
 
     fn compile_bridge(
