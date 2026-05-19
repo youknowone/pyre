@@ -899,7 +899,6 @@ fn walker_post_walk_insert_renamings_single_exit(
     walker_slot_for_variable: &[Option<u16>],
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
     all_walker_blocks: &[SpamBlockRef],
-    walker_pc_anchor_pos: &mut [Vec<(SpamBlockRef, usize)>],
     walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
 ) {
     // Variable → walker slot resolver, identical to canonical's
@@ -992,7 +991,6 @@ fn walker_post_walk_insert_renamings_single_exit(
             SpliceSite::SourceBeforeTerminator,
         ) {
             shift_walker_pc_tracked_offsets(
-                walker_pc_anchor_pos,
                 walker_pc_live_marker_pos,
                 &shift,
             );
@@ -1028,7 +1026,6 @@ fn walker_post_walk_insert_renamings_single_exit(
                 SpliceSite::TargetAfterAnchor,
             ) {
                 shift_walker_pc_tracked_offsets(
-                    walker_pc_anchor_pos,
                     walker_pc_live_marker_pos,
                     &shift,
                 );
@@ -1044,7 +1041,6 @@ fn walker_post_walk_insert_renamings_single_exit(
 /// forward by the insertion stays consistent with the post-splice
 /// `per_block_ssarepr` layout.
 fn shift_walker_pc_tracked_offsets(
-    walker_pc_anchor_pos: &mut [Vec<(SpamBlockRef, usize)>],
     walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
     shift: &SpliceShift,
 ) {
@@ -1053,13 +1049,6 @@ fn shift_walker_pc_tracked_offsets(
         insert_pos,
         count,
     } = shift;
-    for entries in walker_pc_anchor_pos.iter_mut() {
-        for (block, offset) in entries.iter_mut() {
-            if block == block_ref && *offset >= *insert_pos {
-                *offset += *count;
-            }
-        }
-    }
     for entries in walker_pc_live_marker_pos.iter_mut() {
         for (block, offset) in entries.iter_mut() {
             if block == block_ref && *offset >= *insert_pos {
@@ -4028,8 +4017,6 @@ impl CodeWriter {
         // self.joinpoints.setdefault(...)`).  Populated at walker
         // emit time so a future slice can stop emitting per-PC
         // `Insn::Label("pc{N}")` while still resolving `pc_map`.
-        let mut walker_pc_anchor_pos: Vec<Vec<(SpamBlockRef, usize)>> =
-            vec![Vec::new(); num_instrs];
         let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
             vec![Vec::new(); num_instrs];
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
@@ -8962,7 +8949,6 @@ impl CodeWriter {
                 &walker_slot_for_variable,
                 &_graph_regallocs,
                 &all_walker_blocks,
-                &mut walker_pc_anchor_pos,
                 &mut walker_pc_live_marker_pos,
             );
             // Reorder all_walker_blocks per `graph.iterblocks()` DFS
@@ -9015,7 +9001,7 @@ impl CodeWriter {
             // the tail) are invariant.  Picks the FIRST entry per PC
             // whose block contributes non-empty content to the final
             // SSARepr (matches `live_marker_indices_by_pc`'s scan).
-            let walker_tracked_pc_indices: (Option<Vec<usize>>, Option<Vec<usize>>) = {
+            let walker_tracked_pc_indices: Option<Vec<usize>> = {
                 // Compute each block's post-strip length without invoking
                 // `strip_walker_block_boundary_goto` directly: that helper
                 // moves block insns into its return value (via
@@ -9090,9 +9076,7 @@ impl CodeWriter {
                         }
                         Some(translated)
                     };
-                let live = resolve_walker_pc(&walker_pc_live_marker_pos);
-                let anchors = resolve_walker_pc(&walker_pc_anchor_pos);
-                (anchors, live)
+                resolve_walker_pc(&walker_pc_live_marker_pos)
             };
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
             // Parity check (debug-only): walker-time tracking must agree
@@ -9106,7 +9090,7 @@ impl CodeWriter {
             // truth for per-PC positions; downstream consumers
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
-            walker_tracked_pc_live_indices_out = walker_tracked_pc_indices.1;
+            walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
