@@ -766,9 +766,10 @@ impl Optimizer {
         let mut installed_heads: majit_ir::vec_set::VecSet<OpRef> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            if !installed_heads.insert(entry.head) {
+            if installed_heads.contains(&entry.head) {
                 continue;
             }
+            installed_heads.insert(entry.head);
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",
