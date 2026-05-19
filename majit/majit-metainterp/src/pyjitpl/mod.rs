@@ -1000,7 +1000,9 @@ pub struct MetaInterp<M: Clone> {
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
-    /// even when Phase 2 raises InvalidLoop.
+    /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
+    /// are added on InvalidLoop and removed when the next retrace succeeds,
+    /// so the active set is bounded by the count of in-flight retraces.
     pending_preamble_tokens:
         crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
@@ -5004,7 +5006,11 @@ impl<M: Clone> MetaInterp<M> {
                         if compiled.front_target_tokens.is_empty() {
                             compiled.front_target_tokens = unroll_opt.target_tokens.clone();
                         }
-                    } else {
+                    } else if !self
+                        .pending_preamble_tokens
+                        .iter()
+                        .any(|(k, _)| *k == green_key)
+                    {
                         self.pending_preamble_tokens
                             .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
