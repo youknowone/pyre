@@ -621,6 +621,23 @@ impl ArrayCacheSubMap {
         }
     }
 
+    fn const_get(&self, index: i64) -> Option<&ArrayCachedItem> {
+        self.const_indexes.get(&index)
+    }
+
+    fn const_get_mut(&mut self, index: i64) -> Option<&mut ArrayCachedItem> {
+        self.const_indexes.get_mut(&index)
+    }
+
+    fn const_keys(&self) -> Vec<i64> {
+        self.const_indexes.keys().copied().collect()
+    }
+
+    fn const_get_or_new(&mut self, index: i64) -> &mut ArrayCachedItem {
+        self.const_indexes
+            .entry_or_insert_with(index, || ArrayCachedItem::new(index))
+    }
+
     /// heap.py:305-306 clear_varindex
     fn clear_varindex(&mut self) {
         self.cached_varindex_triples = None;
@@ -668,7 +685,7 @@ impl ArrayCacheSubMap {
     /// The parent step is inlined here because Rust forbids the
     /// back-pointer that PyPy uses on `ArrayCachedItem.parent`.
     fn invalidate_index(&mut self, index: i64, ctx: &mut OptContext) {
-        if let Some(cai) = self.const_indexes.get_mut(&index) {
+        if let Some(cai) = self.const_get_mut(index) {
             cai.invalidate(ctx);
         }
         self.clear_varindex();
@@ -948,9 +965,7 @@ impl OptHeap {
     /// heap.py:409-415 arrayitem_cache(descr, index)
     /// → submap[descr].const_indexes[index] (or insert).
     fn arrayitem_cache(&mut self, descr: &DescrRef, index: i64) -> &mut ArrayCachedItem {
-        self.arrayitem_submap(&descr)
-            .const_indexes
-            .entry_or_insert_with(index, || ArrayCachedItem::new(index))
+        self.arrayitem_submap(descr).const_get_or_new(index)
     }
 
     fn get_cached_array_submap(&self, descr_idx: u32) -> Option<&ArrayCacheSubMap> {
@@ -970,7 +985,7 @@ impl OptHeap {
 
     fn invalidate_arrayitem_cache(&mut self, descr_idx: u32, index: i64, ctx: &mut OptContext) {
         if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
-            if let Some(cai) = submap.const_indexes.get_mut(&index) {
+            if let Some(cai) = submap.const_get_mut(index) {
                 cai.invalidate(ctx);
             }
         }
@@ -985,10 +1000,7 @@ impl OptHeap {
     ) {
         let Some(descr) = descr else {
             if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
-                submap
-                    .const_indexes
-                    .entry_or_insert_with(index, || ArrayCachedItem::new(index))
-                    .register_info(array);
+                submap.const_get_or_new(index).register_info(array);
             }
             return;
         };
@@ -1081,7 +1093,7 @@ impl OptHeap {
             .cached_arrayitems
             .iter()
             .map(|(idx, descr, submap)| {
-                let mut indexes: Vec<i64> = submap.const_indexes.keys().copied().collect();
+                let mut indexes: Vec<i64> = submap.const_keys();
                 indexes.sort();
                 (*idx, descr.clone(), indexes)
             })
@@ -1205,10 +1217,10 @@ impl OptHeap {
                 submap
                     .const_indexes
                     .iter_mut()
-                    .filter_map(move |(&index, cai)| {
+                    .filter_map(move |(index, cai)| {
                         cai.lazy_set
                             .take()
-                            .map(|(obj, op)| (*descr_idx, index, obj, op))
+                            .map(|(obj, op)| (*descr_idx, *index, obj, op))
                     })
             })
             .collect();
@@ -1290,12 +1302,12 @@ impl OptHeap {
                 continue;
             }
             let indexes: Vec<i64> = match self.get_cached_array_submap(descr_idx) {
-                Some(submap) => submap.const_indexes.keys().copied().collect(),
+                Some(submap) => submap.const_keys(),
                 None => continue,
             };
             for index in indexes {
                 if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
-                    if let Some(cai) = submap.const_indexes.get_mut(&index) {
+                    if let Some(cai) = submap.const_get_mut(index) {
                         cai.invalidate(ctx);
                     }
                     // heap.py:266 self.parent.clear_varindex()
@@ -1329,7 +1341,7 @@ impl OptHeap {
             .collect();
         for descr_idx in descr_idxs {
             let indexes: Vec<i64> = match self.get_cached_array_submap(descr_idx) {
-                Some(submap) => submap.const_indexes.keys().copied().collect(),
+                Some(submap) => submap.const_keys(),
                 None => continue,
             };
             for index in indexes {
@@ -1342,7 +1354,7 @@ impl OptHeap {
                 }
                 if let Some(cai) = self
                     .get_cached_array_submap_mut(descr_idx)
-                    .and_then(|s| s.const_indexes.get_mut(&index))
+                    .and_then(|s| s.const_get_mut(index))
                 {
                     cai.cached_structs.retain(|obj| *obj != dest_ref);
                 }
@@ -1641,7 +1653,7 @@ impl OptHeap {
             let mut index_entries: Vec<_> = submap
                 .const_indexes
                 .iter_mut()
-                .map(|(&index, cai)| (index, cai))
+                .map(|(index, cai)| (*index, cai))
                 .collect();
             sort_array_index_entries_untranslated(&mut index_entries);
             for (index, cai) in index_entries {
@@ -1772,7 +1784,7 @@ impl OptHeap {
                 continue;
             }
             let indexes: Vec<i64> = match self.get_cached_array_submap(descr_idx) {
-                Some(submap) => submap.const_indexes.keys().copied().collect(),
+                Some(submap) => submap.const_keys(),
                 None => continue,
             };
             for index in indexes {
@@ -2024,7 +2036,7 @@ impl OptHeap {
 
         // Check quasi-immutable cache: if this field was marked by
         // QUASIIMMUT_FIELD, the value is stable (guarded by GUARD_NOT_INVALIDATED).
-        if let Some(&qi_cached) = self.quasi_immut_cache.get(&key) {
+        if let Some(qi_cached) = self.quasi_immut_cache.get(&key).copied() {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
                 let qi_cached = ctx.get_box_replacement(qi_cached);
@@ -2238,7 +2250,7 @@ impl OptHeap {
         // heap.py:123 op = self._lazy_set
         let lazy_data = self
             .get_cached_array_submap_mut(descr_idx)
-            .and_then(|s| s.const_indexes.get_mut(&const_index))
+            .and_then(|s| s.const_get_mut(const_index))
             .and_then(|cai| cai.lazy_set.take());
         match lazy_data {
             Some((lazy_obj, mut lazy_op)) => {
@@ -2303,7 +2315,7 @@ impl OptHeap {
         //                  self.force_lazy_set(optheap, op.getdescr())
         let needs_force = self
             .get_cached_array_submap(descr_idx)
-            .and_then(|s| s.const_indexes.get(&const_index))
+            .and_then(|s| s.const_get(const_index))
             .map_or(false, |cai| cai.possible_aliasing(array));
         if needs_force {
             // heap.py:122-145 force_lazy_set(self, optheap, descr) [can_cache=True]
@@ -2445,7 +2457,7 @@ impl OptHeap {
             let mut force_lazy_arr = false;
             if let Some(cai) = self
                 .get_cached_array_submap(descr_idx)
-                .and_then(|s| s.const_indexes.get(&const_index))
+                .and_then(|s| s.const_get(const_index))
             {
                 if let Some((lazy_obj, lazy_op)) = &cai.lazy_set {
                     if *lazy_obj == array {
@@ -2519,7 +2531,7 @@ impl OptHeap {
             if force_lazy_arr {
                 let lazy_data = self
                     .get_cached_array_submap_mut(descr_idx)
-                    .and_then(|s| s.const_indexes.get_mut(&const_index))
+                    .and_then(|s| s.const_get_mut(const_index))
                     .and_then(|cai| cai.lazy_set.take());
                 if let Some((_lazy_obj, mut lazy_op)) = lazy_data {
                     if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
@@ -2574,7 +2586,7 @@ impl OptHeap {
             }
             if let Some(cai) = self
                 .get_cached_array_submap(descr_idx)
-                .and_then(|s| s.const_indexes.get(&const_index))
+                .and_then(|s| s.const_get(const_index))
             {
                 if let Some(entry) = cai._getfield(array, &op.getdescr().unwrap(), ctx) {
                     match entry {
@@ -3062,7 +3074,8 @@ impl OptHeap {
                     }
                 }
                 if let Some(key) = cache_field_key {
-                    self.quasi_immut_cache.insert((obj, key), OpRef::NONE);
+                    let full_key = (obj, key);
+                    self.quasi_immut_cache.insert(full_key, OpRef::NONE);
                 }
                 OptimizationResult::Remove
             }
@@ -3279,7 +3292,7 @@ impl Optimization for OptHeap {
         //         for index, d in submap.const_indexes.items():
         //             d.produce_potential_short_preamble_ops(self.optimizer, sb, descr, index)
         for (_, descr, submap) in &self.cached_arrayitems {
-            for cai in submap.const_indexes.values() {
+            for (_, cai) in &submap.const_indexes {
                 cai.produce_potential_short_preamble_ops(sb, &descr, ctx);
             }
         }
@@ -4310,7 +4323,7 @@ mod tests {
         // _lazy_set holds the pending op; PtrInfo is NOT yet written.
         let cai = pass
             .get_cached_array_submap(d.index())
-            .and_then(|s| s.const_indexes.get(&3))
+            .and_then(|s| s.const_get(3))
             .expect("ArrayCachedItem must exist");
         assert!(
             cai.lazy_set.is_some(),
