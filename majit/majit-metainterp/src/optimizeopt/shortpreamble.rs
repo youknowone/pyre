@@ -548,7 +548,7 @@ impl ShortBoxes {
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.short_inputargs.contains(&opref)
             || self.known_constants.contains(&opref)
-            || self.potential_ops.contains_key(&opref)
+            || self.potential_ops.iter().any(|(k, _)| *k == opref)
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
@@ -662,7 +662,7 @@ impl ShortBoxes {
         if self.known_constants.contains(&opref) {
             return Some(opref);
         }
-        if self.potential_ops.contains_key(&opref) {
+        if self.potential_ops.iter().any(|(k, _)| *k == opref) {
             return self
                 .materialize_one(ctx, opref)
                 .map(|produced| produced.preamble_op.pos.get());
