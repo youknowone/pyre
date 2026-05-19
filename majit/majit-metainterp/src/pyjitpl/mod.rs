@@ -639,6 +639,47 @@ pub(crate) struct CompiledEntry<M> {
     /// `previous_tokens_upgraded` is the readers' entry point — it upgrades
     /// and filters out dead references.  The remaining warmstate-side strong
     /// owner is documented on `BaseJitCell::loop_token`.
+    ///
+    /// # `compile_bridge` use & weak-drop safety
+    ///
+    /// Cranelift's `compile_bridge` (`compiler.rs:14248`) iterates
+    /// `previous_tokens` to attach the freshly-compiled bridge to
+    /// matching `(trace_id, fail_index_per_trace)` fail_descrs in
+    /// retired predecessor tokens whose machine code may still be
+    /// reachable — cranelift cannot patch code in place, so every
+    /// predecessor that still has running code AND carries the same
+    /// source guard needs its descr's bridge slot installed too.
+    ///
+    /// "Still reachable" is what determines whether a Weak that fails
+    /// to upgrade is a safety problem.  A predecessor `T_prev` is
+    /// reachable only if something holds an `Arc<JitCellToken>` to it:
+    ///
+    /// 1. `MemoryManager.alive_loops` (the canonical strong owner).
+    /// 2. `JitCellToken.keepalive_tokens` on a *jumper* loop
+    ///    (`history.py:449 _keepalive_jitcell_tokens` parity) — pyre
+    ///    pushes Arcs into this set via `record_jump_to` when a
+    ///    cross-loop jump is emitted, mirroring RPython.
+    /// 3. `warmstate::BaseJitCell::loop_token` for the current
+    ///    install_token at the cell's green_key.
+    /// 4. The active call stack while `execute_token_*` runs.
+    ///
+    /// If none of the above hold `T_prev`, `T_prev`'s `Arc` drops, its
+    /// `compiled_loop_token` Arc drops, and the asmmemmgr blocks are
+    /// released — the machine code is gone.  In that case
+    /// `filter_map(Weak::upgrade)` correctly skips `T_prev`: there is
+    /// no live machine code for the bridge slot to be installed onto.
+    ///
+    /// The case CodeRabbit PR #68 review flagged
+    /// (`pullrequestreview-4318361750`) is the gap between "alive_loops
+    /// evicted `T_prev`" and "`T_prev`'s code freed": with `Arc` strong
+    /// ownership previously held by `compiled_loops`, that gap was
+    /// effectively zero because `compiled_loops` extended the lifetime
+    /// past alive_loops eviction.  After Slice X-G the gap is real but
+    /// bounded — pyre's single-thread JIT means `T_prev`'s code can be
+    /// "reachable" only while a frame is on the stack (case 4), and
+    /// that frame's caller holds the Arc via the executor's
+    /// `&Arc<JitCellToken>` parameter.  No two `compile_bridge` calls
+    /// interleave with `try_to_free_some_loops` on the same thread.
     pub(crate) previous_tokens: Vec<std::sync::Weak<JitCellToken>>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
     /// compilation starts allocating fresh boxes.
