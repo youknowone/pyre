@@ -1708,17 +1708,15 @@ impl<S: JitState> JitDriver<S> {
                     // returns the green_key; the actual `Arc<JitCellToken>`
                     // is the `token` field of the freshly-installed
                     // `CompiledEntry` in `self.compiled_loops`.
-                    let install_token = std::sync::Arc::clone(
-                        &self
-                            .meta
-                            .compiled_loops
-                            .get(&green_key)
-                            .expect(
-                                "compile_simple_loop returned Some(green_key) ⇒ \
-                                 compiled_loops has the new CompiledEntry",
-                            )
-                            .token,
-                    );
+                    let install_token = self
+                        .meta
+                        .compiled_loops
+                        .get(&green_key)
+                        .expect(
+                            "compile_simple_loop returned Some(green_key) ⇒ \
+                             compiled_loops has the new CompiledEntry",
+                        )
+                        .live_token();
                     // `warmstate.py:339-348` redirect+record_jump_to chain
                     // routed through MetaInterp's caller-side helper.
                     self.meta
