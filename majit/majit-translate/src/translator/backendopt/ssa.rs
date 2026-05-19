@@ -771,6 +771,58 @@ mod tests {
     }
 
     #[test]
+    fn ssi_to_ssa_rename_propagates_into_op_args_and_link_args() {
+        // ssi_to_ssa's rename mechanism is purely Rc::clone identity on
+        // VariableInner._name / _nr.  Cover every storage shape that
+        // holds the same Rc handle — inputargs, op args, op result,
+        // link args — so a future deep-copy of Variable cannot silently
+        // break the propagation by only updating one storage class.
+        let v_in = Variable::new();
+        let v_mid = Variable::new();
+        let v_in_for_op = v_in.clone();
+        let op_result = Variable::new();
+        let start_block_op = SpaceOperation::new(
+            "same_as",
+            vec![Hlvalue::Variable(v_in_for_op.clone())],
+            Hlvalue::Variable(op_result.clone()),
+        );
+        let start = Block::shared(vec![Hlvalue::Variable(v_in.clone())]);
+        start.borrow_mut().operations.push(start_block_op);
+        let middle = Block::shared(vec![Hlvalue::Variable(v_mid.clone())]);
+
+        let graph = mk_graph_start_to_block("rename_op_args", start.clone());
+        let returnblock = graph.returnblock.clone();
+        let l1 = Link::new(
+            vec![Hlvalue::Variable(v_in.clone())],
+            Some(middle.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![l1]);
+        let l2 = Link::new(
+            vec![Hlvalue::Variable(v_mid.clone())],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        middle.closeblock(vec![l2]);
+
+        ssi_to_ssa(&graph);
+
+        let mid_prefix = match &middle.borrow().inputargs[0] {
+            Hlvalue::Variable(v) => v.name_prefix().to_string(),
+            _ => unreachable!(),
+        };
+        // Same Rc-shared cell, so the op-arg observation goes through
+        // the same `_name` slot the rename mutated.
+        let op_arg_prefix = v_in_for_op.name_prefix().to_string();
+        assert_eq!(
+            op_arg_prefix, mid_prefix,
+            "op-arg Variable must observe ssi_to_ssa rename through Rc-shared identity",
+        );
+    }
+
+    #[test]
     fn merge_identical_phi_nodes_unifies_two_equal_phis() {
         // A block receives (via two incoming links) the same
         // Constant(1) into two different input slots. The two input
