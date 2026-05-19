@@ -448,7 +448,12 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     finish_op.pos.set(OpRef::void_op(4));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
-    let ops = to_rc(vec![guard_gc_type, guard_is_object, guard_subclass, finish_op]);
+    let ops = to_rc(vec![
+        guard_gc_type,
+        guard_is_object,
+        guard_subclass,
+        finish_op,
+    ]);
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 

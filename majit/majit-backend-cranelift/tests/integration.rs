@@ -2452,7 +2452,10 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     assign_positions(&mut callee_ops, 0);
 
     let mut backend = CraneliftBackend::new();
-    backend.set_constants(majit_ir::VecAssoc::from([(OpRef::const_int(0).raw(), 10i64)]));
+    backend.set_constants(majit_ir::VecAssoc::from([(
+        OpRef::const_int(0).raw(),
+        10i64,
+    )]));
 
     backend.set_next_trace_id(920);
     backend.set_next_header_pc(3000);

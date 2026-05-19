@@ -12,7 +12,7 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{DescrRef, GcRef, Op, OpRc, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
@@ -2259,7 +2259,9 @@ impl Optimizer {
             // force_box materializes the virtual to preserve Ref type.
             let inputarg_types = self.trace_inputarg_types.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
-            let resolved_args: Vec<OpRef> = terminal_op.getarglist().iter()
+            let resolved_args: Vec<OpRef> = terminal_op
+                .getarglist()
+                .iter()
                 .map(|&arg| ctx.get_box_replacement(arg))
                 .collect();
             for &resolved in &resolved_args {
@@ -4634,11 +4636,8 @@ mod tests {
             OpCode::IntAdd,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -4887,11 +4886,8 @@ mod tests {
             op.pos
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -5057,11 +5053,8 @@ mod tests {
         }
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -5356,11 +5349,8 @@ mod tests {
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -5738,11 +5728,8 @@ mod tests {
             vec![OpRef::int_op(100), OpRef::int_op(101)]
         });
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         let guard = result
             .iter()

@@ -18,7 +18,7 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
-use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, OpTypeIndex, Type, descr_identity};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -3798,7 +3798,12 @@ impl<'a> RegAlloc<'a> {
                     return false;
                 }
             }
-        } else if next_op.getarglist().iter().skip(1).any(|a| a.raw() == result.raw()) {
+        } else if next_op
+            .getarglist()
+            .iter()
+            .skip(1)
+            .any(|a| a.raw() == result.raw())
+        {
             return false;
         }
         true
@@ -6076,7 +6081,7 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
     use std::collections::HashMap;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
@@ -6297,7 +6302,12 @@ mod tests {
         let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
         let ops = vec![store];
 
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         ra.j2_ops[0] = crate::j2plan::LirOp::Finish { args: vec![i0] };
 
@@ -6345,7 +6355,12 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::IntUnary {
@@ -6390,7 +6405,12 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::Guard {
@@ -6515,7 +6535,12 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::Opcode {
@@ -6548,7 +6573,12 @@ mod tests {
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
         let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
 
-        let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), majit_ir::VecAssoc::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(
+            majit_ir::VecAssoc::new(),
+            majit_ir::VecAssoc::new(),
+            &inputargs,
+            &ops,
+        );
         ra.prepare_loop();
         let output = ra.walk_operations();
 

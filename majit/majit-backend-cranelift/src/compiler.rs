@@ -4595,9 +4595,13 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: HashSet<u32> = HashSet::new();
     for op in ops.iter() {
-        for &arg in op.getarglist().iter()
-            .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
-        {
+        for &arg in op.getarglist().iter().chain(
+            op.getfailargs()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .iter(),
+        ) {
             if inputarg_oprefs.contains(&arg.raw()) {
                 used_inputargs.insert(arg.raw());
             }
@@ -7244,7 +7248,10 @@ impl CraneliftBackend {
     // below so `compile_tmp_callback` and other backend-agnostic
     // consumers can reach them through `&mut dyn Backend`.
 
-    fn gc_rewriter(&self, constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
+    fn gc_rewriter(
+        &self,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
+    ) -> Option<GcRewriterImpl> {
         let ct = constant_types.clone();
         with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
@@ -7380,8 +7387,7 @@ impl CraneliftBackend {
         // values that ops reference, regardless of namespace.
         let mut constant_types_with_inputargs = constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types_with_inputargs
-                .entry_or_insert_with(ia.index, || ia.tp);
+            constant_types_with_inputargs.entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
             let (result, new_constants, new_constant_types) =
@@ -7734,9 +7740,13 @@ impl CraneliftBackend {
         let longevity: HashMap<u32, usize> = {
             let mut m: HashMap<u32, usize> = HashMap::new();
             for (i, op) in ops.iter().enumerate() {
-                for &arg in op.getarglist().iter()
-                    .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
-                {
+                for &arg in op.getarglist().iter().chain(
+                    op.getfailargs()
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .iter(),
+                ) {
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
                         m.entry(idx)
@@ -7981,9 +7991,13 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for &arg in op.getarglist().iter()
-                .chain(op.getfailargs().into_iter().flatten().collect::<Vec<_>>().iter())
-            {
+            for &arg in op.getarglist().iter().chain(
+                op.getfailargs()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .iter(),
+            ) {
                 if !arg.is_none()
                     && !declared_vars.contains(&arg.raw())
                     && !constants.contains_key(&arg.raw())
@@ -8321,7 +8335,9 @@ impl CraneliftBackend {
                         .map(|prev| prev.opcode == OpCode::Jump || prev.opcode == OpCode::Finish)
                         .unwrap_or(false);
                     if !prev_terminated {
-                        let vals: Vec<CValue> = ops[op_idx].getarglist().iter()
+                        let vals: Vec<CValue> = ops[op_idx]
+                            .getarglist()
+                            .iter()
                             .map(|&r| resolve_opref(&mut builder, &constants, r))
                             .collect();
                         builder.ins().jump(*label_block, &block_args(&vals));
@@ -9406,10 +9422,8 @@ impl CraneliftBackend {
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
                     //   so arg1 must be an immediate class pointer.
-                    let loc_check_against_class = constants
-                        .get(&op.arg(1).raw())
-                        .copied()
-                        .unwrap_or_else(|| {
+                    let loc_check_against_class =
+                        constants.get(&op.arg(1).raw()).copied().unwrap_or_else(|| {
                             panic!(
                                 "x86/assembler.py:1971 vtable_ptr = \
                                  loc_check_against_class.getint(): \
@@ -11741,7 +11755,9 @@ impl CraneliftBackend {
 
                 // ── Control flow ──
                 OpCode::Jump => {
-                    let vals: Vec<CValue> = op.getarglist().iter()
+                    let vals: Vec<CValue> = op
+                        .getarglist()
+                        .iter()
                         .map(|&r| resolve_opref(&mut builder, &constants, r))
                         .collect();
                     // Resolve target: try descr-based lookup first, then
@@ -13856,7 +13872,9 @@ fn collect_terminal_exit_layouts(
         if is_finish || is_jump {
             let exit_types =
                 infer_fail_arg_types(&op.getarglist(), &type_index, &type_overrides, op_index)?;
-            let force_token_slots: Vec<usize> = op.getarglist().iter()
+            let force_token_slots: Vec<usize> = op
+                .getarglist()
+                .iter()
                 .enumerate()
                 .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
                 .collect();

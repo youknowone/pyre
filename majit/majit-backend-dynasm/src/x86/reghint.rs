@@ -7,8 +7,7 @@
 use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
-use majit_ir::{Op, OpRc, OpCode, OpRef, Type};
-use std::collections::HashMap;
+use majit_ir::{Op, OpCode, OpRc, OpRef, Type, VecAssoc};
 
 /// regalloc.py:26-28.
 pub const SAVE_DEFAULT_REGS: u8 = 0;
@@ -24,7 +23,7 @@ pub struct RegisterHints {
     /// Box object; pyre's `OpRef` is a flat `u32` so constant values
     /// are looked up through this map.  Structural equivalent of
     /// `isinstance(arg, ConstInt) and arg.value`.
-    constants: HashMap<u32, i64>,
+    constants: VecAssoc<u32, i64>,
 }
 
 impl RegisterHints {
@@ -33,7 +32,7 @@ impl RegisterHints {
         _save_around_call_regs_xmm: Vec<RegLoc>,
         all_regs_gpr: Vec<RegLoc>,
         all_regs_xmm: Vec<RegLoc>,
-        constants: HashMap<u32, i64>,
+        constants: VecAssoc<u32, i64>,
     ) -> Self {
         RegisterHints {
             save_around_call_regs_gpr,
@@ -289,7 +288,8 @@ impl RegisterHints {
             return;
         };
         let gc_level = compute_gc_level(calldescr, guard_not_forced);
-        let args = &op.arg(first_arg_index..);
+        let arglist = op.getarglist();
+        let args = &arglist[first_arg_index..];
         let argtypes = calldescr.arg_types();
         self.hint(longevity, position, args, argtypes, gc_level);
     }

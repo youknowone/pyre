@@ -3,7 +3,7 @@
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
-use majit_ir::{Op, OpRc, OpCode, OpRef, Value};
+use majit_ir::{Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};

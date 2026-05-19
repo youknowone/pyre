@@ -32,7 +32,7 @@
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpRc, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;
@@ -388,7 +388,9 @@ impl PreambleOp {
                 //       opnum = op.getopnum()
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
-                    .op.getarglist().iter()
+                    .op
+                    .getarglist()
+                    .iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
@@ -410,7 +412,9 @@ impl PreambleOp {
                 //   opnum = OpHelpers.call_loopinvariant_for_descr(op.getdescr())
                 //   return ProducedShortOp(self, op.copy_and_change(opnum, args=arglist))
                 let args = self
-                    .op.getarglist().iter()
+                    .op
+                    .getarglist()
+                    .iter()
                     .map(|&arg| sb.produce_arg(ctx, arg))
                     .collect::<Option<smallvec::SmallVec<[OpRef; 3]>>>()?;
                 let opnum = match self.op.opcode {
@@ -1323,7 +1327,9 @@ impl ProducedShortOp {
         // SAME_AS body op's `op.type_` once it lands in
         // `new_operations`.
         let args = self
-            .preamble_op.getarglist().iter()
+            .preamble_op
+            .getarglist()
+            .iter()
             .map(|&arg| {
                 classify_short_arg(
                     ctx,
@@ -1807,7 +1813,9 @@ fn build_short_preamble_struct_from_ops(
         .iter()
         .cloned()
         .map(|op| {
-            let arg_mapping = op.getarglist().iter()
+            let arg_mapping = op
+                .getarglist()
+                .iter()
                 .enumerate()
                 .filter_map(|(arg_pos, arg_ref)| {
                     inputarg_idx(arg_ref).map(|label_idx| (arg_pos, label_idx))
@@ -2612,7 +2620,9 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         if op.opcode.is_guard_overflow() && idx > 0 {
             let ovf_op = &peeled_ops[idx - 1];
             if ovf_op.opcode.is_ovf() && included_positions.insert(ovf_op.pos.get()) {
-                let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op.getarglist().iter()
+                let ovf_arg_mapping: Vec<(usize, usize)> = ovf_op
+                    .getarglist()
+                    .iter()
                     .enumerate()
                     .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
                     .collect();
@@ -2642,7 +2652,9 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             continue;
         }
 
-        let arg_mapping: Vec<(usize, usize)> = op.getarglist().iter()
+        let arg_mapping: Vec<(usize, usize)> = op
+            .getarglist()
+            .iter()
             .enumerate()
             .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
             .collect();
@@ -2800,18 +2812,13 @@ pub fn build_short_preamble_from_exported_boxes(
 ) -> ShortPreamble {
     let produced =
         produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
-    build_short_preamble_from_produced_boxes(
-        label_args,
-        short_inputargs,
-        &produced,
-        loop_constants,
-    )
+    build_short_preamble_from_produced_boxes(label_args, short_inputargs, &produced, loop_constants)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpRc, OpCode, OpRef};
+    use majit_ir::{Op, OpCode, OpRc, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {

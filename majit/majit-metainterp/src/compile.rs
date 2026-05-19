@@ -492,13 +492,15 @@ pub(crate) fn build_guard_metadata(
                     // type-shaped descr): reconstruct per-arg from the
                     // incremental `value_types`. Production FINISH always
                     // matches the descr arity.
-                    op.getarglist().iter()
+                    op.getarglist()
+                        .iter()
                         .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                         .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist().iter()
+                op.getarglist()
+                    .iter()
                     .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                     .collect()
             }
@@ -1555,14 +1557,18 @@ pub(crate) fn infer_terminal_exit_layout(
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
     let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
-    let exit_types: Vec<Type> = op.getarglist().iter()
+    let exit_types: Vec<Type> = op
+        .getarglist()
+        .iter()
         .map(|opref| {
             type_index
                 .opref_type_at(*opref, op_index)
                 .unwrap_or(Type::Int)
         })
         .collect();
-    let force_token_slots: Vec<usize> = op.getarglist().iter()
+    let force_token_slots: Vec<usize> = op
+        .getarglist()
+        .iter()
         .enumerate()
         .filter_map(|(slot, opref)| {
             type_index
@@ -1656,13 +1662,7 @@ pub(crate) fn terminal_exit_layout_for_trace(
             return Some(layout.public(owning_key, trace_id, fail_index));
         }
     }
-    infer_terminal_exit_layout(
-        &trace.inputargs,
-        &trace.ops,
-        owning_key,
-        trace_id,
-        op_index,
-    )
+    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
 
 pub(crate) fn decode_values_with_layout(
@@ -2430,7 +2430,10 @@ pub fn compile_tmp_callback(
     let mut constants: majit_ir::VecAssoc<u32, majit_ir::Const> = majit_ir::VecAssoc::new();
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)).
     let funcbox_ref = OpRef::const_int(CONST_BASE);
-    constants.insert(funcbox_ref.raw(), majit_ir::Const::Int(jitdriver_sd.portal_runner_adr));
+    constants.insert(
+        funcbox_ref.raw(),
+        majit_ir::Const::Int(jitdriver_sd.portal_runner_adr),
+    );
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
@@ -2596,13 +2599,12 @@ mod tests {
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(
-                &inputargs,
-                &[guard],
-                8,
-                &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            );
+        let (_resume_data, exit_layouts) = build_guard_metadata(
+            &inputargs,
+            &[guard],
+            8,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2652,13 +2654,12 @@ mod tests {
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(
-                &inputargs,
-                &[guard],
-                0,
-                &crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            );
+        let (_resume_data, exit_layouts) = build_guard_metadata(
+            &inputargs,
+            &[guard],
+            0,
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        );
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(

@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals)]
 
-use majit_ir::{EffectInfo, OopSpecIndex, Op, OpRc, OpCode, OpRef, Value};
+use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{
     PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
@@ -757,7 +757,9 @@ impl OptString {
 
     fn force_args_if_virtual(&mut self, op: &Op, ctx: &mut OptContext) {
         // Collect refs first to avoid borrow issues.
-        let args: Vec<OpRef> = op.getarglist().iter()
+        let args: Vec<OpRef> = op
+            .getarglist()
+            .iter()
             .map(|a| ctx.get_box_replacement(*a))
             .collect();
         for arg in args {

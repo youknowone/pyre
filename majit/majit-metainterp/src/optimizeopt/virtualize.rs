@@ -8,7 +8,7 @@
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpRc, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
@@ -501,7 +501,12 @@ impl OptVirtualize {
         // pure-cache key so the reverse ARRAYLEN→size fold doesn't
         // collide across distinct array types.
         if let Some(descr) = op.getdescr() {
-            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, op.pos.get(), size_ref, descr);
+            ctx.register_pure_from_args1_with_descr(
+                OpCode::ArraylenGc,
+                op.pos.get(),
+                size_ref,
+                descr,
+            );
         } else {
             ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos.get(), size_ref);
         }

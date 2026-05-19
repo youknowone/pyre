@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, Op, OpRc, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
@@ -28,11 +28,17 @@ use crate::optimizeopt::{
 };
 use crate::resume::SnapshotBox;
 
-fn is_trace_constant_ref(opref: OpRef, constants: &majit_ir::VecAssoc<u32, majit_ir::Value>) -> bool {
+fn is_trace_constant_ref(
+    opref: OpRef,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+) -> bool {
     !opref.is_none() && constants.contains_key(&opref.raw())
 }
 
-fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::VecAssoc<u32, majit_ir::Value>) -> bool {
+fn is_trace_runtime_ref(
+    opref: OpRef,
+    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+) -> bool {
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
@@ -1024,7 +1030,8 @@ impl UnrollOptimizer {
                             continue;
                         }
                         let arg_list = op.getarglist_copy();
-                        let arg_iter = arg_list.iter()
+                        let arg_iter = arg_list
+                            .iter()
                             .copied()
                             .chain(op.getfailargs().into_iter().flatten());
                         for arg in arg_iter {
@@ -3000,7 +3007,9 @@ impl OptUnroll {
                 let rd_resume_position = patch.rd_resume_position.get();
                 for mut guard_op in emitted {
                     if std::env::var_os("MAJIT_LOG_JTET").is_some() {
-                        let arg_values: Vec<_> = guard_op.getarglist().iter()
+                        let arg_values: Vec<_> = guard_op
+                            .getarglist()
+                            .iter()
                             .map(|&arg| (arg, ctx.get_constant(arg)))
                             .collect();
                         eprintln!(
@@ -4228,7 +4237,8 @@ fn assemble_peeled_trace_with_jump_args(
                 continue;
             }
             let op_args = op.getarglist_copy();
-            let all_refs = op_args.iter()
+            let all_refs = op_args
+                .iter()
                 .copied()
                 .chain(op.getfailargs().into_iter().flatten());
             for arg in all_refs {
@@ -4443,7 +4453,9 @@ fn assemble_peeled_trace_with_jump_args(
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
-                for arg in later_op.getarglist().iter()
+                for arg in later_op
+                    .getarglist()
+                    .iter()
                     .copied()
                     .chain(later_op.getfailargs().into_iter().flatten())
                 {
@@ -4486,8 +4498,7 @@ fn assemble_peeled_trace_with_jump_args(
             // RPython-parity behavior for Box-keyed live-in sets.
             // unroll.py:301 label_op.initarglist(label_op.getarglist() +
             //                                    sb.used_boxes)
-            let mut extended_args: smallvec::SmallVec<[OpRef; 3]> =
-                new_op.getarglist_copy();
+            let mut extended_args: smallvec::SmallVec<[OpRef; 3]> = new_op.getarglist_copy();
             for &source_arg in &extra_inner_sources {
                 // optimizer.py:614-625 freeze: do not follow ctx forwarding
                 // chains here; postprocess Const forwarding on body ops would
@@ -4514,7 +4525,9 @@ fn assemble_peeled_trace_with_jump_args(
             // force_box / send_extra_operation rewrites. Body args reference
             // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
             // remap those positional refs to start_label_args[i].
-            let mapped_base_args: Vec<OpRef> = new_op.getarglist().iter()
+            let mapped_base_args: Vec<OpRef> = new_op
+                .getarglist()
+                .iter()
                 .map(|&arg| {
                     if jump_to_self {
                         return arg;
@@ -4586,7 +4599,9 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(label_idx) = current_inner_label_index {
             let mut extra_live_args = Vec::new();
             let label_args = result[label_idx].getarglist_copy();
-            for arg in new_op.getarglist().iter()
+            for arg in new_op
+                .getarglist()
+                .iter()
                 .copied()
                 .chain(new_op.getfailargs().into_iter().flatten())
             {
@@ -5356,7 +5371,8 @@ mod tests {
 
         let body_add_pos = result[2].pos.get();
         assert_eq!(
-            jump.arg(0), body_add_pos,
+            jump.arg(0),
+            body_add_pos,
             "Jump arg should reference body add, not original"
         );
     }
@@ -5446,11 +5462,8 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -5565,8 +5578,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 2);
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> =
-            majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let (result, _) =
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
@@ -6462,7 +6474,10 @@ mod tests {
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
         assert_eq!(&*combined[1].getarglist(), &[OpRef::int_op(64)]);
         assert_eq!(
-            combined[1].getfailargs().expect("guard fail args").as_slice(),
+            combined[1]
+                .getfailargs()
+                .expect("guard fail args")
+                .as_slice(),
             &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);
@@ -6670,8 +6685,7 @@ mod tests {
         // `label_arg.is_constant()` predicate.
         let const_extra = OpRef::const_int(7);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
-        let constants =
-            majit_ir::VecAssoc::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
+        let constants = majit_ir::VecAssoc::from([(const_extra.raw(), majit_ir::Value::Int(606))]);
 
         let combined = assemble_peeled_trace(
             &[],

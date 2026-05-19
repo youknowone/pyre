@@ -10,7 +10,7 @@ use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
 };
-use majit_ir::{GcRef, Op, OpRc, OpCode, VecAssoc};
+use majit_ir::{GcRef, Op, OpCode, OpRc, VecAssoc};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -446,12 +446,18 @@ fn execute_one_with_memory(
         | OpCode::CallReleaseGilI
         | OpCode::CallLoopinvariantI => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR | OpCode::CallLoopinvariantR => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallF
@@ -460,7 +466,10 @@ fn execute_one_with_memory(
         | OpCode::CallReleaseGilF
         | OpCode::CallLoopinvariantF => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallN
@@ -469,46 +478,70 @@ fn execute_one_with_memory(
         | OpCode::CallReleaseGilN
         | OpCode::CallLoopinvariantN => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CallAssembler — delegate to call dispatch
         OpCode::CallAssemblerI => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallAssemblerR => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallAssemblerF => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallAssemblerN => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CondCallValue — delegate to call dispatch
         OpCode::CondCallValueI => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CondCallValueR => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CondCallN => {
             let func = values.resolve(op.arg(0));
-            let args: Vec<i64> = op.getarglist()[1..].iter().map(|&r| values.resolve(r)).collect();
+            let args: Vec<i64> = op.getarglist()[1..]
+                .iter()
+                .map(|&r| values.resolve(r))
+                .collect();
             memory.call_n(func, &args);
             OpResult::Void
         }

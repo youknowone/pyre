@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef};
 
 /// A lowered dynasm-backend operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -626,7 +626,7 @@ fn add_refs(live: &mut Vec<OpRef>, args: &[OpRef]) {
 
 #[cfg(test)]
 mod tests {
-    use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 

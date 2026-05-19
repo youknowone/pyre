@@ -36,7 +36,7 @@ pub mod vstring;
 use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpRc, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 use std::collections::{HashMap, VecDeque};
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
@@ -3002,7 +3002,9 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
-        exported_infos: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>>,
+        exported_infos: Option<
+            &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
+        >,
     ) {
         let op = self.get_box_replacement(op);
         // unroll.py:55: if op.get_forwarded() is not None: return
@@ -3354,8 +3356,10 @@ impl OptContext {
             // path has no values to seed (the optimizer's
             // `make_constant` chain populates the producer's known
             // constants directly), so an empty `loop_constants` suffices.
-            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                u32,
+                majit_ir::Const,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
             builder.build_short_preamble_struct(&empty_loop_constants)
         })
     }
@@ -3383,11 +3387,12 @@ impl OptContext {
                 // `(loop_constants: u32->i64, loop_constant_types:
                 // u32->Type)` parallel maps unify into a single
                 // `VecAssoc<u32, Const>`.
-                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-                    crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<
+                    u32,
+                    majit_ir::Const,
+                > = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 for (i, val) in self.const_pool.iter() {
-                    loop_constants
-                        .insert(Self::const_ref_for_value(i, val).raw(), val.to_const());
+                    loop_constants.insert(Self::const_ref_for_value(i, val).raw(), val.to_const());
                 }
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -8411,7 +8416,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{Descr, DescrRef, GcRef, Op, OpRc, OpCode, OpRef, SizeDescr, Type, Value};
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRc, OpRef, SizeDescr, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -8896,7 +8901,7 @@ mod intbound_invariant_tests {
 #[cfg(test)]
 mod imported_short_preamble_fallback_tests {
     use super::*;
-    use majit_ir::{Op, OpRc, OpCode, OpRef};
+    use majit_ir::{Op, OpCode, OpRc, OpRef};
 
     #[test]
     fn force_op_from_preamble_replays_pop_without_builder_lookup() {

@@ -149,9 +149,7 @@ impl Op {
     /// fail_args almost always fits inline (≤3 entries).  Owned return
     /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
     /// `.into_iter().flatten()` or `.iter()` patterns.
-    pub fn getfailargs(
-        &self,
-    ) -> Option<smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
+    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::resoperation::OpRef; 3]>> {
         self.fail_args.borrow().clone()
     }
 
@@ -297,10 +295,7 @@ impl Op {
     ///  sb.used_boxes)` extends the LABEL arg list when finishing the
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
-    pub fn initarglist(
-        &self,
-        args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>,
-    ) {
+    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
         *self.args.borrow_mut() = args;
     }
 

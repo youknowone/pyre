@@ -17,7 +17,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::BackendError;
-use majit_ir::{FailDescr, InputArg, Op, OpRc, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
+use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -3964,7 +3964,8 @@ impl<'a> AssemblerARM64<'a> {
             if ts.len() == expected_len {
                 ts.to_vec()
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.getarglist().iter()
+                op.getarglist()
+                    .iter()
                     .map(|opref| {
                         self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
                             panic!(

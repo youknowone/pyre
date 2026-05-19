@@ -45,7 +45,9 @@ fn render_arg(arg: OpRef, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumber
 }
 
 fn render_op(op: &Op, constants: &VecAssoc<u32, i64>, vars: &mut VarRenumbering) -> String {
-    let args = op.getarglist().iter()
+    let args = op
+        .getarglist()
+        .iter()
         .map(|&arg| render_arg(arg, constants, vars))
         .collect::<Vec<_>>()
         .join(", ");
@@ -129,7 +131,10 @@ mod tests {
     use crate::{TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
 
-    fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, VecAssoc<u32, i64>) {
+    fn finish_trace_ctx(
+        mut ctx: TraceCtx,
+        finish_args: &[OpRef],
+    ) -> (TreeLoop, VecAssoc<u32, i64>) {
         ctx.finish(finish_args, make_fail_descr(finish_args.len()));
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();

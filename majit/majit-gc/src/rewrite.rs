@@ -10,9 +10,9 @@
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
-use majit_ir::{VecAssoc, VecSet};
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
+use majit_ir::{VecAssoc, VecSet};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 

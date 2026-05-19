@@ -3485,10 +3485,7 @@ mod tests {
         drop(it);
         assert!(pool.same_constant(first.arg(1), second.arg(0)));
         assert_eq!(pool.get_value(first.arg(1)), Some(majit_ir::Value::Int(7)));
-        assert_eq!(
-            pool.get_value(second.arg(0)),
-            Some(majit_ir::Value::Int(7))
-        );
+        assert_eq!(pool.get_value(second.arg(0)), Some(majit_ir::Value::Int(7)));
     }
 
     /// M4 step 3: guard opcode decode — the decoded Op's `descr` is

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::{InputArg, Op, OpRc, OpCode, OpRef, Type};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
     ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,
@@ -1238,7 +1238,11 @@ fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
     Vec::new()
 }
 
-fn emit_resolve(sink: &mut InstructionSink<'_>, constants: &majit_ir::VecAssoc<u32, i64>, opref: OpRef) {
+fn emit_resolve(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    opref: OpRef,
+) {
     if opref.is_constant() {
         let val = constants.get(&opref.raw()).copied().unwrap_or(0);
         sink.i64_const(val);
@@ -1267,7 +1271,11 @@ fn array_len_offset_from_descr(_op: &Op) -> u64 {
 
 /// Compute array element address: base + base_size + index * item_size.
 /// Leaves i32 address on the wasm stack.
-fn emit_array_addr(sink: &mut InstructionSink<'_>, constants: &majit_ir::VecAssoc<u32, i64>, op: &Op) {
+fn emit_array_addr(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    op: &Op,
+) {
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
         .unwrap_or((16, 8));
@@ -1532,7 +1540,12 @@ fn emit_float_cmp(
     sink.local_set(1 + vi);
 }
 
-fn emit_cmp(sink: &mut InstructionSink<'_>, constants: &majit_ir::VecAssoc<u32, i64>, op: &Op, cmpop: CmpOp) {
+fn emit_cmp(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    op: &Op,
+    cmpop: CmpOp,
+) {
     let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
         return;

@@ -33,7 +33,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpRc, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -4560,8 +4560,10 @@ impl<M: Clone> MetaInterp<M> {
         // Wrap optimizer-output `Vec<Op>` into `Vec<OpRc>` for the
         // backend's `&[OpRc]` boundary (history.py:528 ResOperation
         // identity at trace level).
-        let compiled_ops_rc: Vec<majit_ir::OpRc> =
-            compiled_ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        let compiled_ops_rc: Vec<majit_ir::OpRc> = compiled_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend.compile_loop(
                 &inputargs,
@@ -7175,7 +7177,9 @@ impl<M: Clone> MetaInterp<M> {
                         .is_some_and(|descr| descr.index() == target_descr.index())
             }) {
                 return Some(
-                    label.getarglist().iter()
+                    label
+                        .getarglist()
+                        .iter()
                         .map(|arg| {
                             type_index
                                 .opref_type_at(*arg, label_index)
@@ -17284,7 +17288,7 @@ mod tests {
         set_savedata_ref_on_deadframe,
     };
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
-    use majit_ir::{DescrRef, InputArg, Op, OpRc, OpCode, OpRef, Type, Value};
+    use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {

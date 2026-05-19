@@ -5,9 +5,7 @@ pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{
-    AbstractInfo, DescrRef, ForwardableValue, GcRef, Op, OpCode, OpRef, Type, Value,
-};
+use majit_ir::{AbstractInfo, DescrRef, ForwardableValue, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()

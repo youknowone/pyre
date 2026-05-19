@@ -36,7 +36,7 @@
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
 use majit_ir::vec_set::VecSet;
-use majit_ir::{DescrRef, Op, OpRc, OpCode, OpRef};
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::dependency::IndexVar;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -1407,11 +1407,8 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)

@@ -5,7 +5,7 @@
 /// Propagates integer bounds information through the trace. When a guard tests
 /// a condition that is already known true from integer bounds, the guard can be
 /// removed. It also narrows bounds after guards and arithmetic operations.
-use majit_ir::{Op, OpRc, OpCode, OpRef, Value};
+use majit_ir::{Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};

@@ -680,7 +680,8 @@ pub(crate) fn execute_one(
         | OpCode::GetfieldGcPureR
         | OpCode::GetfieldGcPureF => OpResult::Value(0),
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let resolved_args: Vec<i64> = op.getarglist().iter().map(|&r| values.resolve(r)).collect();
+            let resolved_args: Vec<i64> =
+                op.getarglist().iter().map(|&r| values.resolve(r)).collect();
             if let (Some(&obj_ptr), Some(&value)) = (resolved_args.first(), resolved_args.get(1)) {
                 let __descr_arc = op.getdescr();
                 if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_field_descr()) {

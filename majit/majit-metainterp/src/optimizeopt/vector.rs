@@ -31,7 +31,7 @@
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
 use majit_ir::vec_set::VecSet;
-use majit_ir::{Op, OpRc, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -858,7 +858,7 @@ fn is_float_opcode(opcode: OpCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpRc, OpCode, OpRef};
+    use majit_ir::{Op, OpCode, OpRc, OpRef};
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -1107,11 +1107,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // No loop to vectorize, ops should pass through
         // (pre-label ops are buffered but emitted when we hit non-Label)
@@ -1142,11 +1139,8 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
 
         // Should still have Label and Jump
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));

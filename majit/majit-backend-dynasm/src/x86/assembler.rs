@@ -17,9 +17,7 @@ use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
-use majit_ir::{
-    FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
-};
+use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -77,12 +75,6 @@ enum AbiArgPlacement {
     Gpr(u8),
     Xmm(u8),
     Stack(i32),
-}
-
-fn loop_target_descr(op: &Op) -> Option<&dyn LoopTargetDescr> {
-    op.descr
-        .as_deref()
-        .and_then(majit_ir::Descr::as_loop_target_descr)
 }
 
 /// `x86/assembler.py:254 _push_all_regs_to_frame` parity — free-fn
@@ -469,7 +461,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
 /// the underlying allocation address of the `Arc<dyn Descr>` so two
 /// distinct TargetToken descriptors are never confused.
 fn loop_target_id(op: &Op) -> Option<usize> {
-    op.getdescr().map(majit_ir::descr_identity)
+    op.getdescr().as_ref().map(majit_ir::descr_identity)
 }
 
 fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
@@ -3594,7 +3586,8 @@ impl<'a> Assembler386<'a> {
             }
             // ── Control flow ──
             OpCode::Jump => {
-                let jump_descr = loop_target_descr(op);
+                let descr_arc = op.getdescr();
+                let jump_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 let target_arglocs = jump_descr
                     .map(|descr| {
                         descr
@@ -3777,7 +3770,8 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
-                let label_descr = loop_target_descr(op);
+                let descr_arc = op.getdescr();
+                let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 if crate::majit_log_enabled() {
                     eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
                 }
@@ -3791,10 +3785,10 @@ impl<'a> Assembler386<'a> {
                             .collect(),
                     );
                     descr.set_ll_loop_code(self.mc.offset().0);
-                    if let Some(id) = loop_target_id(op) {
+                    if let Some(id) = descr_arc.as_ref().map(majit_ir::descr_identity) {
                         self.target_tokens_currently_compiling.insert(id, label);
                     }
-                    if let Some(descr_ref) = op.getdescr() {
+                    if let Some(descr_ref) = descr_arc.as_ref() {
                         self.compiled_target_tokens.push(descr_ref.clone());
                     }
                 }
@@ -4681,7 +4675,8 @@ impl<'a> Assembler386<'a> {
         // (`compile.rs:232`) used to do this after backend codegen with
         // the same sequential counter; doing it here lets readers consume
         // the canonical metainterp identity before metadata builds.
-        if let Some(d) = op.descr.as_ref() {
+        let descr_arc = op.getdescr();
+        if let Some(d) = descr_arc.as_ref() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -4691,7 +4686,7 @@ impl<'a> Assembler386<'a> {
         }
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
-        } else if let Some(d) = op.descr.clone() {
+        } else if let Some(d) = descr_arc {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
             // directly; per-trace fail_index / trace_id were stamped above.
@@ -5324,8 +5319,9 @@ impl<'a> Assembler386<'a> {
                     return descr_types;
                 }
             }
-            let __descr_arc = op.getdescr();
-        } else if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
+        }
+        let descr_arc = op.getdescr();
+        if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // Step A (43c64ee0bb) installs op.descr = ResumeGuardDescr
             // with post-numbering fail_arg_types via
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
@@ -5347,7 +5343,8 @@ impl<'a> Assembler386<'a> {
             if ts.len() == expected_len {
                 ts.to_vec()
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-                op.getarglist().iter()
+                op.getarglist()
+                    .iter()
                     .map(|opref| {
                         self.opref_type_at(*opref, op_index).unwrap_or_else(|| {
                             panic!(
@@ -5447,7 +5444,8 @@ impl<'a> Assembler386<'a> {
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
-        if let Some(d) = next_op.descr.as_ref() {
+        let descr_arc = next_op.getdescr();
+        if let Some(d) = descr_arc.as_ref() {
             if d.is_resume_guard() || d.is_resume_guard_copied() {
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
@@ -5455,7 +5453,7 @@ impl<'a> Assembler386<'a> {
                 }
             }
         }
-        let descr: majit_ir::DescrRef = if let Some(d) = next_op.descr.clone() {
+        let descr: majit_ir::DescrRef = if let Some(d) = descr_arc {
             let _unused = fail_arg_types;
             d
         } else {
@@ -5521,12 +5519,13 @@ impl<'a> Assembler386<'a> {
         // Bind the LABEL — JUMP targets here (after the copies).
         let label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; =>label);
-        if let Some(descr) = loop_target_descr(op) {
+        let descr_arc = op.getdescr();
+        if let Some(descr) = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr()) {
             descr.set_ll_loop_code(self.mc.offset().0);
-            if let Some(id) = loop_target_id(op) {
+            if let Some(id) = descr_arc.as_ref().map(majit_ir::descr_identity) {
                 self.target_tokens_currently_compiling.insert(id, label);
             }
-            if let Some(descr_ref) = op.getdescr() {
+            if let Some(descr_ref) = descr_arc.as_ref() {
                 self.compiled_target_tokens.push(descr_ref.clone());
             }
         }
@@ -5647,9 +5646,12 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        let jump_descr = loop_target_descr(op);
-        if let Some(label) =
-            loop_target_id(op).and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
+        let descr_arc = op.getdescr();
+        let jump_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
+        if let Some(label) = descr_arc
+            .as_ref()
+            .map(majit_ir::descr_identity)
+            .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
         {
             // Same-buffer jump (loop body)
             dynasm!(self.mc ; .arch x64 ; jmp =>label);
@@ -6387,8 +6389,9 @@ impl<'a> Assembler386<'a> {
     /// ARRAYLEN_GC: result = array.length
     /// The length field location comes from the ArrayDescr's len_descr().
     fn genop_arraylen(&mut self, op: &Op) {
-        let len_offset = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let len_offset = descr_arc
+            .as_ref()
             .and_then(|d| d.as_array_descr())
             .and_then(|ad| ad.len_descr())
             .map(|ld| ld.offset() as i32)
@@ -6423,8 +6426,9 @@ impl<'a> Assembler386<'a> {
     fn emit_call(&mut self, op: &Op, func_arg: usize) {
         let arg_count = op.num_args();
         let call_arg_count = arg_count.saturating_sub(func_arg + 1);
-        let arg_types = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let arg_types = descr_arc
+            .as_ref()
             .and_then(|descr| descr.as_call_descr())
             .map(|descr| descr.arg_types().to_vec())
             .filter(|types| types.len() == call_arg_count)
@@ -6478,8 +6482,9 @@ impl<'a> Assembler386<'a> {
     fn emit_call_from_arglocs(&mut self, op: &Op, arglocs: &[Loc], func_index: usize) {
         let arg_count = arglocs.len();
         let call_arg_count = arg_count.saturating_sub(func_index + 1);
-        let arg_types = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let arg_types = descr_arc
+            .as_ref()
             .and_then(|descr| descr.as_call_descr())
             .map(|descr| descr.arg_types().to_vec())
             .filter(|types| types.len() == call_arg_count)
@@ -6639,8 +6644,8 @@ impl<'a> Assembler386<'a> {
                 .expect("call_assembler missing rewritten jitframe arg");
             let vable_loc = arglocs.get(1).copied();
 
-            let target_addr: Option<usize> = op
-                .getdescr()
+            let target_addr: Option<usize> = __descr_arc_call_descr
+                .as_ref()
                 .and_then(|d| d.as_call_descr())
                 .and_then(|cd| cd.call_target_token())
                 .and_then(|token| self.call_assembler_targets.get(&token).copied())
@@ -6888,8 +6893,9 @@ impl<'a> Assembler386<'a> {
 
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
         // Resolve target address from descr.call_target_token() or self_entry_label.
-        let target_addr: Option<usize> = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let target_addr: Option<usize> = descr_arc
+            .as_ref()
             .and_then(|d| d.as_call_descr())
             .and_then(|cd| cd.call_target_token())
             .and_then(|token| self.call_assembler_targets.get(&token).copied());
@@ -7811,8 +7817,9 @@ impl<'a> Assembler386<'a> {
 
     /// GETINTERIORFIELD_GC_I/R/F: load field from array-of-structs element.
     fn genop_getinteriorfield(&mut self, op: &Op) {
-        let (base_size, item_size, field_offset, field_size) = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let (base_size, item_size, field_offset, field_size) = descr_arc
+            .as_ref()
             .and_then(|d| d.as_interior_field_descr())
             .map(|id| {
                 let ad = id.array_descr();
@@ -7844,8 +7851,9 @@ impl<'a> Assembler386<'a> {
 
     /// SETINTERIORFIELD_GC/RAW: write field in array-of-structs element.
     fn genop_discard_setinteriorfield(&mut self, op: &Op) {
-        let (base_size, item_size, field_offset, field_size) = op
-            .getdescr()
+        let descr_arc = op.getdescr();
+        let (base_size, item_size, field_offset, field_size) = descr_arc
+            .as_ref()
             .and_then(|d| d.as_interior_field_descr())
             .map(|id| {
                 let ad = id.array_descr();

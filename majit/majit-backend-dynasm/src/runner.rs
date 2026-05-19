@@ -709,10 +709,7 @@ impl DynasmBackend {
 
     /// Legacy test-only entry point — counterpart to `set_constants`
     /// above; production callers route through `set_constants_pool`.
-    pub fn set_constant_types(
-        &mut self,
-        constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
-    ) {
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
         self.constant_types = constant_types;
     }
 

@@ -3,7 +3,7 @@
 //! Mirrors RPython's `schedule.py` and `costmodel.py`: pack groups,
 //! pack sets, accumulation tracking, guard analysis, and cost models.
 
-use majit_ir::{Op, OpRc, OpCode, OpRef, Type};
+use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
 use crate::optimizeopt::dependency::DependencyGraph;
 
@@ -571,7 +571,10 @@ impl GuardAnalysis {
             if !op.opcode.is_guard() {
                 continue;
             }
-            let all_invariant = op.getarglist().iter().all(|arg| !body_results.contains(arg));
+            let all_invariant = op
+                .getarglist()
+                .iter()
+                .all(|arg| !body_results.contains(arg));
             if all_invariant {
                 hoistable.push(i);
             } else {

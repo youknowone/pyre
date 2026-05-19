@@ -1682,7 +1682,9 @@ impl OptHeap {
 
     fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<OpRef> {
         let mut owners = Vec::new();
-        let mut stack: Vec<OpRef> = op.getarglist().iter()
+        let mut stack: Vec<OpRef> = op
+            .getarglist()
+            .iter()
             .map(|arg| ctx.get_box_replacement(*arg))
             .collect();
         while let Some(owner) = stack.pop() {
@@ -1704,7 +1706,9 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) {
         let needs_postponed = self.postponed_op.as_ref().map_or(false, |postponed| {
-            op.getarglist().iter().any(|arg| *arg == postponed.pos.get())
+            op.getarglist()
+                .iter()
+                .any(|arg| *arg == postponed.pos.get())
         });
         if needs_postponed {
             if let Some(p) = self.postponed_op.take() {
@@ -6571,11 +6575,8 @@ mod tests {
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        );
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)

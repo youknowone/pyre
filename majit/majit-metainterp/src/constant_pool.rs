@@ -371,7 +371,6 @@ impl ConstantPool {
         self.refresh_from_gc();
         self.constants.clone()
     }
-
 }
 
 impl Default for ConstantPool {
