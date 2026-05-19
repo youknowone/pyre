@@ -103,56 +103,43 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // trait path also reaches. Anything still carrying a
     // `residual_call_*` wrapper without a matching trait-side record
     // panics under `MAJIT_SHADOW_WALKER=1`.
-    matches!(
-        instruction,
-        Instruction::Nop
-            | Instruction::ExtendedArg
-            | Instruction::Resume { .. }
-            | Instruction::Cache
-            | Instruction::NotTaken
-            // M4.PoC.2: PopTop arm body is `inline_call_r_r/dR>r` into
-            // the `pop_value` sub-jitcode, followed by the standard
-            // `live/catch_exception/goto/reraise/ref_return/live/raise/
-            // ref_return` shoulder.  See
-            // `pop_top_jitcode_op_sequence_matches_expected_shape` test
-            // for the locked-in OUTER arm shape.
-            //
-            // 2026-05-21 (Task #165): the outer arm is clean, but its
-            // `inline_call_r_r` recurses 4 levels deep into Rust helper
-            // bodies (`pop_value` → checked_sub → field access).  At
-            // depth 4, `getfield_gc_i` reads ref reg 0 (the Python
-            // local being popped); when the local is a small Python
-            // int the slot-keyed shadow holds `ConcreteValue::Int(n)`
-            // and `box_value(obj)` returns `Value::Int(n)` — not
-            // `Value::Ref(struct_ptr)`, so `field_sanity_load` skips
-            // and the result OpRef gets no `set_opref_concrete`
-            // stamp.  The downstream `int_le` + `goto_if_not/iL`
-            // (`pop_value`'s `checked_sub` bound check) then surfaces
-            // `GotoIfNotValueNotConcrete` on raise_catch_loop +
-            // synth/set_membership.  Other benches' PopTop sites
-            // happen to pop non-int Refs and survive.  Real fix
-            // requires the walker to translate small-int unboxed
-            // concretes into the heap-pointer view the codewriter
-            // expects (or to short-circuit `getfield_gc_i` on Int
-            // concretes via a different path).  Tracked as Task #165.
-            | Instruction::PopTop
-    )
-    // LoadFastCheck was experimentally added to this allow-list under
-    // Task #48 T4 (2026-05-22) because Task #75's Int-bank concrete
-    // shadow makes the outer arm's `int_lt/ii>i` + `goto_if_not/iL`
-    // bounds check folding match `dispatch_switch_id`'s concrete read.
-    // Reverted because the outer arm recurses through `inline_call_r_r
-    // → varnames.get` and `inline_call_ir_r → opcode_load_fast_checked`,
-    // so a deep `getfield_gc_i` against an unboxed-Int-Ref local
-    // surfaces `GotoIfNotValueNotConcrete` the same way PopTop does on
-    // raise_catch_loop + synth/set_membership.  `shadow_validate_pre`
-    // always enters at the top-level Python opcode dispatch and the
-    // recursion happens inside the outer arm itself — no context
-    // guard at this layer can skip just the deep case.  Re-enabling
-    // is gated on Task #165 / #167 finishing the unboxed-Int-Ref
-    // heap-pointer view; until then, the allow-list assertion
-    // (panic on walker↔trait mismatch under MAJIT_SHADOW_WALKER=1)
-    // would be stronger than the implemented parity.
+    // Phase 5.A (issue #73, 2026-05-20): the Nop family of 5 zero-op
+    // opcodes has been production-flipped to walker dispatch via
+    // `production_walker_handles` in trace_opcode.rs.  Shadow validation
+    // is now moot for those because there is no parallel trait dispatch
+    // to compare against — the walker IS production.  PopTop remains
+    // shadow-blocked by the structural limit (non-elidable pop_value)
+    // and gets production-flipped in Phase 5.B once the
+    // `check_is_elidable` gate drops.  See
+    // `[[project-issue73-phase5-design]]` for the cutover sequencing.
+    //
+    // 2026-05-21 (Task #165): PopTop's outer arm is clean, but its
+    // `inline_call_r_r` recurses 4 levels deep into Rust helper bodies
+    // (`pop_value` → checked_sub → field access).  At depth 4,
+    // `getfield_gc_i` reads ref reg 0 (the Python local being popped);
+    // when the local is a small Python int the slot-keyed shadow holds
+    // `ConcreteValue::Int(n)` and `box_value(obj)` returns
+    // `Value::Int(n)` — not `Value::Ref(struct_ptr)`, so
+    // `field_sanity_load` skips and the result OpRef gets no
+    // `set_opref_concrete` stamp.  The downstream `int_le` +
+    // `goto_if_not/iL` (`pop_value`'s `checked_sub` bound check) then
+    // surfaces `GotoIfNotValueNotConcrete` on raise_catch_loop +
+    // synth/set_membership.  Other benches' PopTop sites happen to pop
+    // non-int Refs and survive.  Real fix requires the walker to
+    // translate small-int unboxed concretes into the heap-pointer view
+    // the codewriter expects (or to short-circuit `getfield_gc_i` on
+    // Int concretes via a different path).  Tracked as Task #165.
+    matches!(instruction, Instruction::PopTop)
+    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
+    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
+    // codewriter-emitted LoadFastCheck arm body contains a
+    // `goto_if_not/iL` whose value lives in the Int register bank;
+    // walker `dispatch_goto_if_not` falls into the strict-mode
+    // fail-loud path because `concrete_registers_i` doesn't exist.
+    // Blocker is the Int-bank concrete shadow plumbing — see
+    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
+    // for the Int-bank shadow" section.  Allow-list expansion past
+    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it
@@ -508,27 +495,16 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_is_in_shadow_allow_list() {
-        // PopTop blocker history (all closed):
-        //   1. (#73) sub-walk `registers_i` undersized at the callee
-        //      constant-pool slot — `RegisterOutOfRange { pc: 14, reg:
-        //      1, len: 1, bank: "i" }`.  Fixed by sizing each sub-walk
-        //      bank to `num_regs_and_consts_X` and pre-populating the
-        //      constant window via `TraceCtx::const_{int,ref,float}`
-        //      (RPython `pyjitpl.py:98-119 MIFrame.copy_constants`).
-        //   2. (#74) walker had no `goto_if_not/iL` handler —
-        //      `UnsupportedOpname { pc: 21, key: "goto_if_not/iL" }`.
-        //      Ported from `pyjitpl.py:511-526 opimpl_goto_if_not`
-        //      with concrete read via `TraceCtx::concrete_of_opref`
-        //      mirroring `switch/id`.
-        //
-        // PopTop arm body is `inline_call_r_r/dR>r` into the
-        // `pop_value` sub-jitcode, followed by the standard
-        // `live/catch_exception/goto/reraise/ref_return/live/raise/
-        // ref_return` shoulder. No `goto_if_not/iL` (which would
-        // need Int-bank concrete shadow — task #75), so the LoadFast
-        // blocker doesn't apply here.
-        assert!(opname_in_shadow_allow_list(&Instruction::PopTop));
+    fn shadow_allow_list_is_empty_after_phase5a() {
+        // Phase 5.A (issue #73, 2026-05-20) production-flipped the Nop
+        // family to walker dispatch; PopTop is structurally blocked from
+        // shadow validation (non-elidable pop_value) and gets production-
+        // flipped in Phase 5.B.  The shadow allow-list is intentionally
+        // empty: `opname_in_shadow_allow_list` is now a vestigial gate
+        // until Phase 6 retires the shadow_walker module entirely.  See
+        // `[[project-issue73-phase5-design]]`.
+        assert!(!opname_in_shadow_allow_list(&Instruction::Nop));
+        assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 
     #[test]

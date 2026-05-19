@@ -6377,6 +6377,132 @@ impl MIFrame {
         trace_step_result_to_action(self, result)
     }
 
+    /// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
+    /// each opcode through `staticdata.opcode_implementations[opnum]`,
+    /// which is the jitcode-bytecode interpreter (the only dispatch path
+    /// upstream).  Pyre's transient deviation is the dual trait/walker
+    /// dispatch pair: `pyre_interpreter::execute_opcode_step` runs the
+    /// trait-driven Python-opcode interpreter while
+    /// `jitcode_dispatch::dispatch_via_miframe` walks the codewriter-
+    /// emitted jitcode arm.  Phase 5 retires the trait path opcode-by-
+    /// opcode; this helper is the per-opcode walker entry that production
+    /// dispatch (`trace_code_step` / `trace_code_step_inline`) calls for
+    /// allow-listed instructions.
+    ///
+    /// `is_top_level=false` so the arm's `ref_return/r` terminator
+    /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
+    /// `Finish` (the outer Python frame's `Finish` is owned by the
+    /// trace_opcode dispatch's higher-level Return/Yield/CloseLoop
+    /// handling, not the per-opcode arm).
+    pub(crate) fn dispatch_via_walker_for_opcode(
+        &mut self,
+        instruction: &Instruction,
+    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
+        let jitcode = crate::jitcode_runtime::jitcode_for_instruction(instruction)
+            .unwrap_or_else(|| {
+                panic!(
+                    "dispatch_via_walker_for_opcode: production-walker allow-listed \
+                     instruction has no codewriter arm: {:?}",
+                    instruction,
+                )
+            });
+
+        let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+            let sd = self.ctx().metainterp_sd();
+            let void = sd
+                .done_with_this_frame_descr_void
+                .clone()
+                .expect("done_with_this_frame_descr_void must be wired before production walker");
+            let int = sd
+                .done_with_this_frame_descr_int
+                .clone()
+                .expect("done_with_this_frame_descr_int must be wired before production walker");
+            let ref_ = sd
+                .done_with_this_frame_descr_ref
+                .clone()
+                .expect("done_with_this_frame_descr_ref must be wired before production walker");
+            let float = sd
+                .done_with_this_frame_descr_float
+                .clone()
+                .expect("done_with_this_frame_descr_float must be wired before production walker");
+            let exc = sd
+                .exit_frame_with_exception_descr_ref
+                .clone()
+                .expect(
+                    "exit_frame_with_exception_descr_ref must be wired before production walker",
+                );
+            (void, int, ref_, float, exc)
+        };
+
+        let sub_jitcode_lookup =
+            |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+                let all = crate::jitcode_runtime::all_jitcodes();
+                all.get(idx)
+                    .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                        code: jc.code.as_slice(),
+                        num_regs_r: jc.num_regs_r() as usize,
+                        num_regs_i: jc.num_regs_i() as usize,
+                        num_regs_f: jc.num_regs_f() as usize,
+                        constants_i: jc.constants_i.as_slice(),
+                        constants_r: jc.constants_r.as_slice(),
+                        constants_f: jc.constants_f.as_slice(),
+                    })
+            };
+
+        // PyPy `pyjitpl.py:171-200 MIFrame.__init__` + `setup_call(argboxes)`
+        // analog: derive per-bank num_regs + constants from the codewriter-
+        // emitted arm jitcode, and supply the MIFrame self ptr as the
+        // implicit `handler = self` argbox at `R[0]_r`.
+        let top_num_regs_r = jitcode.num_regs_r() as usize;
+        let top_num_regs_i = jitcode.num_regs_i() as usize;
+        let top_num_regs_f = jitcode.num_regs_f() as usize;
+        let top_constants_r = jitcode.constants_r.as_slice();
+        let top_constants_i = jitcode.constants_i.as_slice();
+        let top_constants_f = jitcode.constants_f.as_slice();
+        let miframe_ptr = self as *mut MIFrame as i64;
+        let miframe_argbox = self.ctx().const_ref(miframe_ptr);
+        let argboxes_r = [miframe_argbox];
+
+        let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
+            self,
+            jitcode.code.as_slice(),
+            0,
+            crate::jitcode_runtime::all_descr_refs(),
+            &sub_jitcode_lookup,
+            done_ref,
+            done_int,
+            done_float,
+            done_void,
+            exit_exc_ref,
+            false,
+            top_num_regs_r,
+            top_num_regs_i,
+            top_num_regs_f,
+            top_constants_r,
+            top_constants_i,
+            top_constants_f,
+            &argboxes_r,
+            &[],
+            &[],
+        );
+
+        use crate::jitcode_dispatch::DispatchOutcome;
+        match walk_result {
+            Ok((DispatchOutcome::SubReturn { .. }, _)) => {
+                Ok(pyre_interpreter::StepResult::Continue)
+            }
+            Ok((outcome, _)) => panic!(
+                "dispatch_via_walker_for_opcode: unexpected {:?} outcome for {:?}; \
+                 production-walker allow-list expansion must add a mapping arm",
+                outcome, instruction,
+            ),
+            Err(e) => panic!(
+                "dispatch_via_walker_for_opcode: walker failure {:?} for {:?}",
+                e, instruction,
+            ),
+        }
+    }
+
     pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
             if majit_metainterp::majit_log_enabled() {
@@ -6487,15 +6613,19 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                let shadow_outcome =
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                if result.is_ok() {
-                    if let Some(outcome) = shadow_outcome {
-                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                if production_walker_handles(&instruction) {
+                    self.dispatch_via_walker_for_opcode(&instruction)
+                } else {
+                    let shadow_outcome =
+                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                    if result.is_ok() {
+                        if let Some(outcome) = shadow_outcome {
+                            crate::shadow_walker::shadow_validate_post(self, outcome);
+                        }
                     }
+                    result
                 }
-                result
             }
         };
         // Clear pre-opcode snapshot immediately after opcode execution.
@@ -7019,15 +7149,19 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                let shadow_outcome =
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                if result.is_ok() {
-                    if let Some(outcome) = shadow_outcome {
-                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                if production_walker_handles(&instruction) {
+                    self.dispatch_via_walker_for_opcode(&instruction)
+                } else {
+                    let shadow_outcome =
+                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                    if result.is_ok() {
+                        if let Some(outcome) = shadow_outcome {
+                            crate::shadow_walker::shadow_validate_post(self, outcome);
+                        }
                     }
+                    result
                 }
-                result
             }
         };
         if needs_pre_opcode_snapshot {
@@ -7188,6 +7322,38 @@ unsafe fn trace_check_exc_match_against(
         return false;
     };
     pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
+}
+
+/// Production-walker allow-list for issue #73 Phase 5 cutover.
+///
+/// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
+/// every opcode through the single jitcode-bytecode path; there is no
+/// dual trait/walker split upstream.  This predicate names the Python
+/// instructions for which pyre has already retired the trait dispatch
+/// — for those, `trace_code_step{,_inline}` route directly through
+/// `MIFrame::dispatch_via_walker_for_opcode` and the trait path is
+/// dead code at runtime (Phase 6 removes the trait impl once every
+/// opcode is in this set).
+///
+/// Phase 5.A initial set: the Nop family of 5 zero-op opcodes
+/// (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`).  All share
+/// arm bytes `ref_return/r r0` (decode via `dump_nop_arm_bytes`) —
+/// walker emits zero IR ops and `SubReturn`s with `r0`'s contents; the
+/// trait dispatch returns `Ok(StepResult::Continue)` with zero op
+/// emission.  Walker ≡ trait for this batch by construction.
+///
+/// Subsequent Phase 5 batches (5.B PopTop + drop `check_is_elidable`
+/// gate, 5.C..N per-opcode batches) grow this set until it covers every
+/// Python opcode, at which point Phase 6 deletes the trait infra.
+fn production_walker_handles(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::Nop
+            | Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Cache
+            | Instruction::NotTaken
+    )
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
