@@ -6189,6 +6189,9 @@ pub(crate) fn fail_descr_bridge_cache_addrs(fd: &dyn FailDescr) -> (usize, usize
 /// (synthetic singletons that never carry per-trace metadata).  Slice
 /// 7-Tβ14c lift-off.
 pub(crate) fn fail_descr_set_trace_info(fd: &dyn FailDescr, trace_info: CompiledTraceInfo) {
+    if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
+        return;
+    }
     let arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(trace_info);
     fd.set_trace_info_any(arc);
 }
@@ -12988,8 +12991,7 @@ impl CraneliftBackend {
             }
             if let Some(descr_ref) = op.descr.as_ref() {
                 if let Some(target) = descr_ref.as_loop_target_descr() {
-                    target.set_ll_loop_code(body_ptr as usize);
-                    target.set_label_block_id(label_block_id);
+                    target.set_dispatch_target(body_ptr as usize, label_block_id);
                 }
                 register_loop_target(descr_ref, entry.clone());
             }

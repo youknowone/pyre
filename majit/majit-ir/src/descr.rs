@@ -1165,6 +1165,19 @@ pub trait LoopTargetDescr: Descr {
         );
     }
 
+    /// Publish `(ll_loop_code, label_block_id)` as one coherent dispatch
+    /// target.  Readers gate on `ll_loop_code != 0` (Acquire) and then
+    /// read `label_block_id` via baked address, so `label_block_id` MUST
+    /// become visible before `ll_loop_code` is non-zero — otherwise a
+    /// reader can observe the new code pointer alongside the stale
+    /// initial `label_block_id = 0` and route into the wrong block.
+    /// Default impl stores `label_block_id` first, then `ll_loop_code`,
+    /// matching the readiness ordering.
+    fn set_dispatch_target(&self, loop_code: usize, block_id: u32) {
+        self.set_label_block_id(block_id);
+        self.set_ll_loop_code(loop_code);
+    }
+
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
