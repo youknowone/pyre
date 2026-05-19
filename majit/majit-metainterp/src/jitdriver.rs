@@ -3550,14 +3550,17 @@ impl<S: JitState> JitDriver<S> {
         // position and traces forward from there.
         let mut trace_meta = state.build_meta(resume_pc, env);
 
-        let fail_arg_count = self
-            .meta
-            .fail_arg_count_for(green_key, trace_id, fail_index);
+        // `compile.py:855` `_attrs_` parity: bridge inputarg count is the
+        // length of the source descr's `fail_arg_types`.  Read directly
+        // from `descr_fd` (the Arc already in scope) — no `(green_key,
+        // trace_id, fail_index)` reverse lookup.
+        let fail_arg_count = descr_fd.fail_arg_types().len();
         let Some(frontend_fail_values) = raw_fail_values.get(..fail_arg_count) else {
             return false;
         };
 
         let retrace = match self.meta.start_retrace_from_guard(
+            descr_arc.clone(),
             green_key,
             trace_id,
             fail_index,
@@ -3691,6 +3694,13 @@ impl<S: JitState> JitDriver<S> {
                 trace_id,
                 fail_index,
                 code_ptr,
+                // `pyjitpl.py:2890` `handle_guard_failure(self,
+                // resumedescr, deadframe)` parity: thread the source
+                // descr Arc obtained from `cpu.get_latest_descr`
+                // through the bridge session so `compile_trace_inner`
+                // reads it directly (no `(trace_id, fail_index)`
+                // reverse lookup).
+                source_descr: descr_arc.clone(),
             });
         // RPython pyjitpl.py:2908 — bridge traces start with empty
         // current_merge_points (no loop header to match against).

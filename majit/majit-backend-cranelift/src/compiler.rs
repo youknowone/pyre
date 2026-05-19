@@ -6627,18 +6627,18 @@ fn run_compiled_code_inner(
         } else {
             (0u32, None)
         }
-    } else if let Some((metainterp_finish, cl_singleton)) =
+    } else if let Some((metainterp_finish, _cl_singleton)) =
         match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
-        // `pyjitpl.py:2222` match — the metainterp-side
-        // `Arc<DoneWithThisFrameDescr*>` was written into jf_descr at
-        // FINISH emission.  Its `fail_index()` on `MetaFailDescr`
-        // semantics is u32::MAX (finish marker), which `run_compiled_code`
-        // consumers rely on.  Return the cranelift-side singleton as
-        // `direct_descr` so downstream `bridge_ref()` / `fail_arg_types`
-        // access keeps the same type as the non-metainterp path.
-        let _ = metainterp_finish;
-        (u32::MAX, Some(cl_singleton))
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity:
+        // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
+        // address (compiler.rs:13778 baking).  Return that *exact* Arc
+        // so the consumer sees the same identity `compile.py:618-672`
+        // attached on the cpu — not the process-global fallback static.
+        // Both are `Arc<DoneWithThisFrameDescrInt>` after Slice 7-Tβ14f
+        // (no wrapper) so the trait-method dispatch is identical; only
+        // the Arc identity differs, and PyPy parity demands they match.
+        (u32::MAX, Some(metainterp_finish))
     } else {
         // Slice 7-Tβ14e: `jf_descr_raw` is the metainterp
         // `AbstractFailDescr` Arc's data pointer.  Resolve via the
@@ -14834,38 +14834,6 @@ impl majit_backend::Backend for CraneliftBackend {
             &bridge.fail_descrs,
             bridge.trace_id,
         ))
-    }
-
-    fn compiled_bridge_descr_arc(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Arc<dyn majit_ir::Descr>> {
-        let original_compiled = original_token
-            .compiled
-            .as_ref()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        let source_descr = find_fail_descr_in_fail_descrs(
-            &original_compiled.fail_descrs,
-            source_trace_id,
-            source_fail_index,
-        )?;
-        Some(source_descr)
-    }
-
-    fn find_source_fail_descr(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Arc<dyn majit_ir::Descr>> {
-        let compiled = token
-            .compiled
-            .as_ref()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        let descr = find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)?;
-        Some(descr as Arc<dyn majit_ir::Descr>)
     }
 
     fn compiled_trace_fail_descr_layouts(

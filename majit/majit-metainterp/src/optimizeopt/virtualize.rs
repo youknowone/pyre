@@ -69,8 +69,8 @@ pub struct VirtualizableConfig {
 /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE, not stored as
 /// a tracked field. Indices are dense (0-based), matching RPython's
 /// `heaptracker.all_fielddescrs()` which excludes typeptr.
-const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0;
-const VREF_FORCED_FIELD_INDEX: u32 = 1;
+pub(crate) const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0;
+pub(crate) const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
@@ -1387,7 +1387,7 @@ impl OptVirtualize {
     /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
     /// the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_descr: DescrRef = Arc::new(VRefSizeDescr);
+        let vref_descr: DescrRef = vref_size_descr();
 
         // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = Op::new(OpCode::ForceToken, &[]);
@@ -2050,15 +2050,61 @@ impl FieldDescr for VRefFieldDescr {
     }
 
     fn get_parent_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(VRefSizeDescr))
+        Some(vref_size_descr())
     }
 }
+
+/// `virtualref.py:40-42` parity: process-static Arc cache for the
+/// `descr_virtual_token` / `descr_forced` field descrs.  PyPy stores
+/// these on `VirtualRefInfo` (one instance per `cpu`); pyre's single
+/// `MetaInterp` per process collapses to the same identity by caching
+/// at module level.  Every `make_vref_field_descr(VREF_*)` call and
+/// every `VREF_ALL_FIELDDESCRS` index returns the same Arc — the
+/// `Arc::ptr_eq` identity `history.py:125` demands for `descr is
+/// other_descr` comparisons.
+static VREF_DESCR_VIRTUAL_TOKEN: std::sync::LazyLock<Arc<VRefFieldDescr>> =
+    std::sync::LazyLock::new(|| build_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
+
+static VREF_DESCR_FORCED: std::sync::LazyLock<Arc<VRefFieldDescr>> =
+    std::sync::LazyLock::new(|| build_vref_field_descr(VREF_FORCED_FIELD_INDEX));
+
+/// `virtualref.py:32-33` parity: process-static Arc cache for the
+/// `descr = cpu.sizeof(JIT_VIRTUAL_REF)` slot.
+static VREF_SIZE_DESCR: std::sync::LazyLock<Arc<VRefSizeDescr>> =
+    std::sync::LazyLock::new(|| Arc::new(VRefSizeDescr));
 
 fn make_vref_field_descr(index: u32) -> DescrRef {
     make_vref_field_descr_typed(index)
 }
 
+/// `virtualref.py:40-42` parity helper for `VirtualRefInfo::new()`:
+/// returns the same cached `DescrRef` `make_vref_field_descr` hands
+/// out, so the descrs stored on `VirtualRefInfo.descr_virtual_token`
+/// / `descr_forced` share identity with the Arcs the
+/// `optimize_virtual_ref_finish` emit sites stamp onto SETFIELD_GC
+/// ops.  Without this shared identity, `Arc::ptr_eq` checks (e.g.
+/// the heap pass's stale-set canonicalization) would split into two
+/// equivalence classes per field.
+pub(crate) fn make_vref_field_descr_pub(index: u32) -> DescrRef {
+    make_vref_field_descr_typed(index)
+}
+
 fn make_vref_field_descr_typed(index: u32) -> Arc<VRefFieldDescr> {
+    match index {
+        VREF_VIRTUAL_TOKEN_FIELD_INDEX => VREF_DESCR_VIRTUAL_TOKEN.clone(),
+        VREF_FORCED_FIELD_INDEX => VREF_DESCR_FORCED.clone(),
+        _ => panic!("invalid JitVirtualRef field slot {index}"),
+    }
+}
+
+pub(crate) fn vref_size_descr() -> DescrRef {
+    VREF_SIZE_DESCR.clone() as DescrRef
+}
+
+/// One-shot constructor used only by the `LazyLock` initializers above
+/// — never call this directly; always go through
+/// `make_vref_field_descr_typed` so cached identity is preserved.
+fn build_vref_field_descr(index: u32) -> Arc<VRefFieldDescr> {
     let (offset, field_type) = match index {
         // `virtualref.py:17` registers `virtual_token` and `forced` both
         // as `llmemory.GCREF` slots; the rtyper writes them through

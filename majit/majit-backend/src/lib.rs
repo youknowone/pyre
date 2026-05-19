@@ -1793,56 +1793,6 @@ pub trait Backend: Send {
         None
     }
 
-    /// `cpu.get_latest_descr(deadframe)` parity for the bridge-source path.
-    ///
-    /// `pyjitpl/mod.rs::bridge_source_descr` looks up the failed guard's
-    /// descr through the metainterp trace ops (`trace.exit_layouts.descr`,
-    /// or a `trace.ops` walk via `descr.fail_index()` match), the
-    /// line-by-line port of `op.getdescr()` at `compile.py:184`.  When the metainterp side cannot produce the
-    /// descr (synthetic / cut-tentative ops, post-retrace stale traces),
-    /// the backend still owns the live `Arc<dyn Descr>` that pyre's
-    /// runtime guard-failure helpers received as `descr_addr`.  This
-    /// method returns that backend-side identity so the metainterp can
-    /// fall back to it without panicking.
-    ///
-    /// Returns `None` for backends that don't own a `(token, trace_id,
-    /// fail_index)`-keyed descr store — bare-backend tests use that
-    /// default; the production cranelift / dynasm impls override.
-    ///
-    /// PyPy parity: under the unified ResumeGuardDescr identity the two
-    /// paths return the same object, so the fallback is observationally
-    /// identical to the metainterp lookup.  After Slice 7-Tα7 the
-    /// dynasm backend hands back `ResumeGuardDescr` directly; the
-    /// cranelift backend still upcasts `Arc<CraneliftFailDescr>` →
-    /// `Arc<dyn Descr>` until the parallel Phase 7-Tβ collapse.
-    fn compiled_bridge_descr_arc(
-        &self,
-        _original_token: &JitCellToken,
-        _source_trace_id: u64,
-        _source_fail_index: u32,
-    ) -> Option<Arc<dyn Descr>> {
-        None
-    }
-
-    /// `history.py:125` `cpu.get_latest_descr(deadframe)` parity — return
-    /// the source `FailDescr` Arc keyed by `(token, trace_id, fail_index)`
-    /// **without** gating on whether a bridge has already been compiled
-    /// for it.  `compiled_bridge_descr_arc` answers "does the bridge exist
-    /// and what's its source descr"; this answers "what descr would a
-    /// bridge for this guard be compiled from", which is the form a
-    /// pre-compile lookup (`bridge_source_descr`) needs.
-    ///
-    /// Returns `None` for backends without a token-keyed descr store
-    /// (bare-backend tests).  Production dynasm / cranelift override.
-    fn find_source_fail_descr(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _fail_index: u32,
-    ) -> Option<Arc<dyn Descr>> {
-        None
-    }
-
     /// Inspect static exit layouts for any compiled trace owned by this token.
     ///
     /// This is the trace-id keyed counterpart to the root/bridge-specific

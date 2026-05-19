@@ -186,16 +186,23 @@ pub fn token_tracing_rescall() -> *mut u8 {
 /// When code outside the JIT tries to access the virtual object, the
 /// reference is "forced" -- the virtual object is materialized on the heap.
 ///
-/// RPython's `VirtualRefInfo` (`virtualref.py:11-42`) caches the live
-/// `descr_virtual_token` / `descr_forced` / `descr` Arcs via
-/// `cpu.fielddescrof(JIT_VIRTUAL_REF, ...)` / `cpu.sizeof(...)`.  Pyre
-/// constructs those descriptors on demand at the SETFIELD_GC emit sites
-/// in `optimize_virtual_ref_finish` (`optimizeopt/virtualize.rs:1521/
-/// 1528`) via `make_vref_field_descr(...)`; caching them on this struct
-/// for identity stability is a follow-up parity item.
+/// `virtualref.py:32-42` parity: `descr` / `descr_virtual_token` /
+/// `descr_forced` hold the live `cpu.sizeof(JIT_VIRTUAL_REF)` and
+/// `cpu.fielddescrof(JIT_VIRTUAL_REF, 'virtual_token' | 'forced')`
+/// Arcs.  Pyre's underlying generators (`vref_size_descr()` /
+/// `make_vref_field_descr_typed(...)`) cache the Arc identity at
+/// module level so every read of these fields returns the same Arc
+/// that the optimizer-emit sites stamp into `op.descr`
+/// (`virtualize.rs:1520 / 1527`) — `Arc::ptr_eq` parity with
+/// `history.py:125 cpu.get_latest_descr() is op.getdescr()`.
 #[derive(Debug, Clone)]
 pub struct VirtualRefInfo {
-    _private: (),
+    /// `virtualref.py:32-33` `self.descr = cpu.sizeof(JIT_VIRTUAL_REF, ...)`
+    pub descr: majit_ir::DescrRef,
+    /// `virtualref.py:40-41` `self.descr_virtual_token = cpu.fielddescrof(..., 'virtual_token')`
+    pub descr_virtual_token: majit_ir::DescrRef,
+    /// `virtualref.py:42`    `self.descr_forced        = cpu.fielddescrof(..., 'forced')`
+    pub descr_forced: majit_ir::DescrRef,
 }
 
 impl Default for VirtualRefInfo {
@@ -248,7 +255,15 @@ impl crate::resume::VRefInfo for VirtualRefInfo {
 impl VirtualRefInfo {
     /// Create a VirtualRefInfo.
     pub fn new() -> Self {
-        VirtualRefInfo { _private: () }
+        use crate::optimizeopt::virtualize::{
+            VREF_FORCED_FIELD_INDEX, VREF_VIRTUAL_TOKEN_FIELD_INDEX, make_vref_field_descr_pub,
+            vref_size_descr,
+        };
+        VirtualRefInfo {
+            descr: vref_size_descr(),
+            descr_virtual_token: make_vref_field_descr_pub(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
+            descr_forced: make_vref_field_descr_pub(VREF_FORCED_FIELD_INDEX),
+        }
     }
 
     /// `virtualref.py:157-177 force_virtual(inst)` — force a virtual

@@ -275,7 +275,7 @@ impl StoredExitLayout {
         // entries set `op_arg_types_for_jump`.  Hitting this branch
         // means a synthetic test fixture skipped both populators or a
         // builder regressed — flag it loudly in debug builds so it
-        // does not silently mask a stale `fail_arg_count_for=0`.
+        // does not silently mask a missing fail_arg_types population.
         debug_assert!(
             false,
             "resolve_exit_types: both descr.fail_arg_types() and op_arg_types_for_jump are missing — every production layout builder must populate one of them",
@@ -829,40 +829,45 @@ fn default_issubclass(typeptr: i64, bounding_class: i64) -> bool {
 ///
 /// Bridge-origin descriptor carried from `start_retrace_from_guard`
 /// through `compile_trace_finish`.  RPython stores the equivalent on
-/// `self.resumekey` + the active `MetaInterp` history; pyre aggregates
-/// the four identifying fields into one value so the finish-compile
-/// helpers can dispatch to the bridge branch without cross-component
-/// tuple plumbing.
+/// `self.resumekey` (`pyjitpl.py:2890 handle_guard_failure(self,
+/// resumedescr, deadframe)`) — the descr Arc itself is the canonical
+/// bridge-source identity.  Pyre carries the same Arc in
+/// `source_descr`; `(trace_id, fail_index)` remain only as pyre-side
+/// indices for per-trace fail_descr arrays and the not-yet-retired
+/// `(green_key, trace_id, fail_index)` lookup helpers.
 ///
 /// `code_ptr` is the code address for the bridge's green key, enabling
 /// any PC to map back to a green key via the same hash function used by
 /// `make_green_key`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BridgeTraceInfo {
     pub green_key: u64,
     pub trace_id: u64,
     pub fail_index: u32,
     pub code_ptr: usize,
+    /// `pyjitpl.py:2890` `resumedescr` parity: the descr Arc returned
+    /// by `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
+    /// same Arc the optimizer stamped on `op.descr` and the same Arc
+    /// `compile.py:719 _trace_and_compile_from_bridge` threads as
+    /// `self`.  Carried explicitly so the bridge-compile path reads
+    /// the source Arc directly.
+    pub source_descr: std::sync::Arc<dyn majit_ir::Descr>,
 }
 
 /// pyjitpl.py `MetaInterp` tracing-session context.
 ///
-/// Owns the per-session state that RPython carries through
-/// `self.history`, `self.resumekey`, and the callbacks on `self`: the
-/// frontend `M` metadata snapshot taken at trace start, and — when
-/// tracing a bridge — the origin descriptor needed to thread
-/// `compile_trace(self, self.resumekey, ...)` through the bridge
-/// branch.  `clear_trace_session` takes this field back out on
-/// abort / finish so the next trace starts from `None`.
+/// Owns the frontend metadata snapshot RPython carries through
+/// `self.history` for the duration of a single trace.  Bridge origin
+/// state lives independently on `MetaInterp.bridge_info` so the
+/// bridge-resume entry can populate it without requiring an active
+/// session (`pyjitpl.py:2890` `handle_guard_failure` is called with
+/// `self.resumekey` set before the trace's `self.history` exists).
 pub struct ActiveTraceSession<M: Clone> {
     /// Frontend state snapshot captured at `force_start_tracing` /
     /// `bound_reached` / `on_back_edge_typed` / bridge resume.  Held
     /// by MetaInterp so the finish-compile helpers can consume it
     /// without requiring the JitDriver to mediate.
     pub trace_meta: M,
-    /// `Some(BridgeTraceInfo)` when the session is a bridge retrace
-    /// (populated by `set_bridge_trace_info`).  `None` for root traces.
-    pub bridge: Option<BridgeTraceInfo>,
 }
 
 pub struct MetaInterp<M: Clone> {
@@ -1153,6 +1158,14 @@ pub struct MetaInterp<M: Clone> {
     /// directly on `MetaInterp`.  Single source of truth; the JitDriver
     /// reads this via accessors and never duplicates it.
     pub(crate) active_trace_session: Option<ActiveTraceSession<M>>,
+    /// `pyjitpl.py:2890` `self.resumekey` parity: bridge-origin descr
+    /// Arc + indexing tuple, populated by `start_retrace_from_guard`
+    /// when entering a bridge trace and consumed by the bridge close
+    /// path.  Kept outside `ActiveTraceSession` because the bridge
+    /// entry installs `self.resumekey` *before* the trace's
+    /// `self.history` exists (RPython places resumekey on `MetaInterp`
+    /// directly, not on the history object).
+    pub(crate) bridge_info: Option<BridgeTraceInfo>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -1877,6 +1890,7 @@ impl<M: Clone> MetaInterp<M> {
             box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
+            bridge_info: None,
         };
         // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
         // now that both sides of the pair exist, publish the
@@ -2035,38 +2049,37 @@ impl<M: Clone> MetaInterp<M> {
             self.active_trace_session.is_none(),
             "begin_trace_session called while a trace session is already active",
         );
-        self.active_trace_session = Some(ActiveTraceSession {
-            trace_meta,
-            bridge: None,
-        });
+        self.active_trace_session = Some(ActiveTraceSession { trace_meta });
     }
 
-    /// Attach bridge-origin metadata to the active session.  Called
-    /// once during `start_retrace_from_guard` after
-    /// `begin_trace_session` has installed the frontend meta.
+    /// Attach bridge-origin metadata.  Called once at bridge entry
+    /// (`pyjitpl.py:2890` `handle_guard_failure` sets `self.resumekey`).
     pub fn set_bridge_trace_info(&mut self, bridge: BridgeTraceInfo) {
-        let slot = self
-            .active_trace_session
-            .as_mut()
-            .expect("set_bridge_trace_info called with no active trace session");
-        slot.bridge = Some(bridge);
+        self.bridge_info = Some(bridge);
     }
 
-    /// Bridge-origin descriptor for the active session, if any.
-    /// Returns `None` for root traces and when no session is active.
-    pub fn bridge_info(&self) -> Option<BridgeTraceInfo> {
-        self.active_trace_session.as_ref().and_then(|s| s.bridge)
+    /// Bridge-origin descriptor, if currently in a bridge trace.
+    /// Returns `None` for root traces.
+    ///
+    /// Borrow form — callers that only read scalar fields use this so
+    /// the `source_descr` Arc is not cloned on every access.  Callers
+    /// that need an owned copy use [`Self::bridge_info_cloned`].
+    pub fn bridge_info(&self) -> Option<&BridgeTraceInfo> {
+        self.bridge_info.as_ref()
     }
 
-    /// Consume the bridge-origin descriptor while keeping the active
-    /// session's frontend meta in place.  Used by `CloseLoop` /
+    /// Owned clone of the bridge-origin descriptor.  One `Arc::clone`
+    /// per call (the `source_descr` field).
+    pub fn bridge_info_cloned(&self) -> Option<BridgeTraceInfo> {
+        self.bridge_info.clone()
+    }
+
+    /// Consume the bridge-origin descriptor.  Used by `CloseLoop` /
     /// `CloseLoopWithArgs` branches that drive `compile_trace_finish`
     /// from the bridge identity yet fall through to run `compile_loop`
     /// on the remainder of the trace.  Returns `None` for root traces.
     pub fn take_bridge_info(&mut self) -> Option<BridgeTraceInfo> {
-        self.active_trace_session
-            .as_mut()
-            .and_then(|s| s.bridge.take())
+        self.bridge_info.take()
     }
 
     /// Read-only access to the frontend trace metadata for callers
@@ -2085,9 +2098,12 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Drop the active session without consuming the meta, matching
     /// the abort / cleanup path used when tracing aborts before
-    /// finish.
+    /// finish.  Also clears `bridge_info` — `pyjitpl.py:3105`
+    /// `_finish_off_the_metainterp` resets `self.resumekey` together
+    /// with the trace's history.
     pub fn clear_trace_session(&mut self) {
         self.active_trace_session = None;
+        self.bridge_info = None;
     }
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
@@ -5093,23 +5109,19 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     };
                 }
-                let descr_arc = {
-                    let compiled = match self.compiled_loops.get(&origin_key) {
-                        Some(c) => c,
-                        None => return CompileOutcome::Cancelled,
-                    };
-                    match self.bridge_source_descr(compiled, trace_id, fail_index) {
-                        Some(d) => d,
-                        None => {
-                            if crate::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] bridge_source_descr({}, {}) = None → Cancelled",
-                                    trace_id, fail_index
-                                );
-                            }
-                            return CompileOutcome::Cancelled;
-                        }
-                    }
+                // `pyjitpl.py:2890` `handle_guard_failure(self,
+                // resumedescr, deadframe)` parity: the source descr Arc
+                // is `self.resumekey` (== the descr
+                // `cpu.get_latest_descr(deadframe)` returned).  Pyre
+                // carries it on `BridgeTraceInfo.source_descr`
+                // (populated by `start_retrace_from_guard`).  No
+                // `(trace_id, fail_index)` reverse lookup.
+                if !self.compiled_loops.contains_key(&origin_key) {
+                    return CompileOutcome::Cancelled;
+                }
+                let descr_arc = match self.bridge_info() {
+                    Some(b) => b.source_descr.clone(),
+                    None => return CompileOutcome::Cancelled,
                 };
                 let fail_descr = descr_arc
                     .as_fail_descr()
@@ -7173,17 +7185,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Get the number of fail_arg_types for a guard.
-    /// Returns 0 if not found. Used to adjust bridge tracing state.
-    pub fn fail_arg_count_for(&self, green_key: u64, trace_id: u64, fail_index: u32) -> usize {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return 0;
-        };
-        self.bridge_source_descr(compiled, trace_id, fail_index)
-            .and_then(|d| d.as_fail_descr().map(|fd| fd.fail_arg_types().len()))
-            .unwrap_or(0)
-    }
-
     /// `warmstate.py:339-348 attach_procedure_to_interp` parity.
     ///
     /// ```python
@@ -7912,82 +7913,6 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.done_compiling_descr(descr_addr);
     }
 
-    /// Resolve the source ResumeGuardDescr Arc the optimizer stamped onto
-    /// the originating guard op (`op.descr`).  Returns the metainterp
-    /// `Arc<dyn Descr>` directly: after Sessions 6.5/6.6 stamped
-    /// `trace_id` and `fail_index_per_trace` onto the descr itself,
-    /// callers no longer need a `(trace_id, fail_index)` capturing
-    /// proxy — they consume the Arc and reach the per-trace key via
-    /// `descr.as_fail_descr()?.fail_index_per_trace()`.  RPython parity:
-    /// `cpu.get_latest_descr()` returns the same `ResumeGuardDescr` the
-    /// metainterp stamped (`history.py:125`); `op.getdescr()` /
-    /// `compile.py:184` is the equivalent path.
-    ///
-    /// Synthetic / FINISH exits whose `exit_layouts` entry holds a
-    /// non-`ResumeGuard*` descr legitimately produce `None`; the strict
-    /// `compile.py:800 assert resumekey_original_loop_token is not None`
-    /// is enforced at `compile_bridge` entry instead.
-    pub(crate) fn bridge_source_descr(
-        &self,
-        compiled: &CompiledEntry<M>,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<std::sync::Arc<dyn majit_ir::Descr>> {
-        // `compile.py:184` `op.getdescr()` — primary path: the metainterp
-        // ResumeGuardDescr Arc the optimizer stamped onto the originating
-        // guard op.  `build_guard_metadata` (compile.rs:984) clones that
-        // same Arc onto `StoredExitLayout.descr` keyed by per-trace
-        // `fail_index`, so reading through `exit_layouts` returns the
-        // identical Arc identity without walking the trace.ops Vec.
-        // Restrict to `ResumeGuard*`-family (compile.rs:294 predicate
-        // parity) — `_DoneWithThisFrameDescr` / `ExitFrameWithExceptionDescrRef`
-        // entries on FINISH ops share the same `fail_index` counter but
-        // are not bridge sources.  Under unified ResumeGuardDescr identity
-        // (PyPy parity) `cpu.get_latest_descr()` returns the same object
-        // (`history.py:125`).
-        if let Some(trace) = Self::trace_for_exit(compiled, trace_id).map(|(_, t)| t) {
-            if let Some(descr) = trace
-                .exit_layouts
-                .get(&fail_index)
-                .and_then(|layout| layout.descr.clone())
-                .filter(|d| d.is_resume_guard() || d.is_resume_guard_copied())
-            {
-                return Some(descr.clone());
-            }
-        }
-        // `history.py:125` / `warmspot.py:1022` `cpu.get_latest_descr
-        // (deadframe)` parity: when `op.descr` is unavailable on the
-        // primary path (post-retrace exit_layouts eviction, synthetic /
-        // cut-tentative ops) the backend still owns the live FailDescr
-        // Arc via its per-token `fail_descrs` vec — same identity pyre's
-        // runtime guard-failure helpers received as `descr_addr` and the
-        // same identity PyPy's deadframe carries.  Walk the current
-        // token first, then `previous_tokens`.  `find_source_fail_descr`
-        // returns the source descr unconditionally — the bridge-existence
-        // check is only relevant to `bridge_was_compiled`, which is a
-        // separate question.  The full Unified-Descr identity flip
-        // (jf_descr embedding the meta Arc address) is the structural fix
-        // that lets this fallback retire; until then it covers
-        // exit_layouts eviction.
-        if let Some(descr) = compiled.live_token().and_then(|token| {
-            self.backend
-                .find_source_fail_descr(&token, trace_id, fail_index)
-        }) {
-            return Some(descr);
-        }
-        for prev_token in &compiled.previous_tokens {
-            if let Some(prev) = prev_token.upgrade() {
-                if let Some(descr) = self
-                    .backend
-                    .find_source_fail_descr(&prev, trace_id, fail_index)
-                {
-                    return Some(descr);
-                }
-            }
-        }
-        None
-    }
-
     /// Check whether a bridge was actually compiled and attached for a guard.
     /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
     /// compilation from trace abort (RPython pyjitpl.py:2906-2907 parity).
@@ -8084,20 +8009,6 @@ impl<M: Clone> MetaInterp<M> {
 }
 
 impl<M: Clone> MetaInterp<M> {
-    /// Obtain the source ResumeGuardDescr Arc for a guard identified by
-    /// green_key, trace_id, and fail_index. Used by call_assembler bridge
-    /// callbacks that need to pass a FailDescr to compile_bridge —
-    /// callers reach the FailDescr surface via `as_fail_descr()`.
-    pub fn get_fail_descr_for_bridge(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<std::sync::Arc<dyn majit_ir::Descr>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        self.bridge_source_descr(compiled, trace_id, fail_index)
-    }
-
     fn recovery_slot_types_from_exit_types_and_layout(
         exit_types: &[Type],
         recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
@@ -9190,8 +9101,13 @@ impl<M: Clone> MetaInterp<M> {
     /// Initialize bridge tracing from a guard failure point.
     /// Returns (success, is_exception_guard) so the caller can emit
     /// SAVE_EXC_CLASS + SAVE_EXCEPTION ops for exception bridges.
+    /// `pyjitpl.py:2890` `handle_guard_failure(self, resumedescr,
+    /// deadframe)` parity: `descr_arc` is the source guard descr Arc
+    /// (the value `cpu.get_latest_descr(deadframe)` returned) carried
+    /// through as `self.resumekey`.
     pub fn start_retrace_from_guard(
         &mut self,
+        descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
@@ -9206,10 +9122,6 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let norm_tid = trace_id;
-        let descr_arc = match self.bridge_source_descr(compiled, trace_id, fail_index) {
-            Some(arc) => arc,
-            None => return None,
-        };
         let fail_descr = descr_arc
             .as_fail_descr()
             .expect("bridge source op.descr must implement FailDescr");
@@ -9301,9 +9213,28 @@ impl<M: Clone> MetaInterp<M> {
             .get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)
             .and_then(|layout| layout.storage);
 
+        let fail_types = bridge_input_types.to_vec();
+
+        // `pyjitpl.py:2890` `handle_guard_failure(self, resumedescr,
+        // deadframe)` parity: stash `self.resumekey` on MetaInterp so
+        // every downstream lookup (bridge close, compile_trace_inner,
+        // ...) reads the source descr Arc directly instead of doing
+        // a `(trace_id, fail_index)` reverse lookup.  `code_ptr` is
+        // populated by `start_bridge_tracing` (the production-path
+        // wrapper); test-only entries leave it as 0 — only the
+        // `green_key_from_code_ptr` recompute on `CloseLoopWithArgs`
+        // depends on it, and tests do not exercise that branch.
+        self.set_bridge_trace_info(BridgeTraceInfo {
+            green_key,
+            trace_id,
+            fail_index,
+            code_ptr: 0,
+            source_descr: descr_arc,
+        });
+
         Some(BridgeRetraceResult {
             is_exception_guard,
-            fail_types: bridge_input_types.to_vec(),
+            fail_types,
             storage,
         })
     }
@@ -10359,12 +10290,33 @@ impl<M: Clone> MetaInterp<M> {
     /// `live_values` are the concrete values at the guard failure point.
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
-    pub fn start_retrace(&mut self, green_key: u64, _fail_index: u32, live_values: &[i64]) -> bool {
+    pub fn start_retrace(&mut self, green_key: u64, fail_index: u32, live_values: &[i64]) -> bool {
         let Some(root_trace_id) = self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
         else {
             return false;
         };
-        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
+        // Test-only entry: look up the source descr Arc from the
+        // compiled trace's exit_layouts (the production path obtains
+        // it from `cpu.get_latest_descr(deadframe)` and threads it
+        // through `start_bridge_tracing`).
+        let descr_arc = {
+            let Some(compiled) = self.compiled_loops.get(&green_key) else {
+                return false;
+            };
+            let Some(trace) = Self::trace_for_exit(compiled, root_trace_id).map(|(_, t)| t) else {
+                return false;
+            };
+            match trace
+                .exit_layouts
+                .get(&fail_index)
+                .and_then(|layout| layout.descr.clone())
+                .filter(|d| d.is_resume_guard() || d.is_resume_guard_copied())
+            {
+                Some(arc) => arc,
+                None => return false,
+            }
+        };
+        self.start_retrace_from_guard(descr_arc, green_key, root_trace_id, fail_index, live_values)
             .is_some()
     }
 
@@ -18504,13 +18456,6 @@ mod tests {
             meta.get_exit_types(green_key, trace_id, fail_index),
             Some(vec![Type::Int])
         );
-        let descr_arc = meta
-            .get_fail_descr_for_bridge(green_key, trace_id, fail_index)
-            .expect("bridge fail descr should search previous tokens too");
-        let fail_descr = descr_arc
-            .as_fail_descr()
-            .expect("bridge source op.descr must implement FailDescr");
-        assert_eq!(fail_descr.fail_arg_types(), &[Type::Int]);
     }
 
     // `guard_fail_descr_proxy_trusts_empty_backend_fail_arg_types`
@@ -18650,12 +18595,20 @@ mod tests {
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
 
-        let (trace_id, fail_index) = {
+        let (trace_id, fail_index, descr_arc) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
             let trace_id = entry.root_trace_id;
             let trace = entry.traces.get(&trace_id).expect("compiled trace");
             let fail_index = guard_fail_index(trace);
-            (trace_id, fail_index)
+            // Capture source descr Arc BEFORE evicting `exit_layouts`.
+            // Production path: `cpu.get_latest_descr(deadframe)` returns
+            // the same Arc independently of `exit_layouts`.
+            let descr_arc = trace
+                .exit_layouts
+                .get(&fail_index)
+                .and_then(|layout| layout.descr.clone())
+                .expect("test fixture guard should carry a ResumeGuardDescr");
+            (trace_id, fail_index, descr_arc)
         };
 
         let mut writer = crate::resumecode::Writer::new(4);
@@ -18694,7 +18647,7 @@ mod tests {
         };
 
         let retrace = meta
-            .start_retrace_from_guard(green_key, trace_id, fail_index, &[42])
+            .start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, &[42])
             .expect("retrace should use previous token backend resume data");
 
         assert_eq!(retrace.fail_types, vec![Type::Int]);

@@ -1432,14 +1432,12 @@ impl DynasmBackend {
         // Query-style miss tolerance: when `token.compiled` is absent
         // (e.g. a freshly issued JitCellToken whose backend code has
         // not been attached, or one rotated into `previous_tokens`),
-        // probing callers like `compiled_bridge_descr_arc` /
-        // `compiled_bridge_fail_descr_layouts` must observe `None`
-        // instead of a panic. Cranelift's counterpart at
-        // `compiler.rs:13955-13958` (`token.compiled.as_ref().and_then
-        // (|c| c.downcast_ref::<CompiledLoop>())?`) follows the same
-        // contract; pyre's `bridge_source_descr`
-        // (`pyjitpl/mod.rs:7743-7757`) walks `compiled.token` then
-        // each `previous_tokens[*]`, depending on `None` to advance.
+        // probing callers like `compiled_bridge_fail_descr_layouts`
+        // must observe `None` instead of a panic.  Cranelift's
+        // counterpart at `compiler.rs:13955-13958`
+        // (`token.compiled.as_ref().and_then(|c|
+        // c.downcast_ref::<CompiledLoop>())?`) follows the same
+        // contract.
         let compiled = token
             .compiled
             .as_ref()?
@@ -3081,32 +3079,6 @@ impl Backend for DynasmBackend {
             }
         }
         None
-    }
-
-    fn compiled_bridge_descr_arc(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Arc<dyn majit_ir::Descr>> {
-        // Trait contract (majit-backend/lib.rs:1797-1816): identity
-        // recovery for `bridge_source_descr` when the metainterp side
-        // cannot produce the descr (synthetic / cut-tentative ops,
-        // post-retrace stale traces).  Whether a bridge is currently
-        // attached is irrelevant — the bridge-compilation path needs
-        // the source descr identity regardless.  Matches cranelift's
-        // `compiled_bridge_descr_arc` (compiler.rs:14290), which does
-        // not gate on bridge attachment either.
-        Self::try_find_descr(original_token, source_trace_id, source_fail_index)
-    }
-
-    fn find_source_fail_descr(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Arc<dyn majit_ir::Descr>> {
-        Self::try_find_descr(token, trace_id, fail_index)
     }
 
     /// `pyjitpl.py:2297 self.cpu.setup_once()` parity, dispatched by
