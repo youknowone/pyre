@@ -121,10 +121,13 @@ impl std::fmt::Debug for BridgeData {
 /// by `ResumeGuardDescr::drop` on any payload still in the cell at
 /// descr teardown; reconstructs the owning `Arc<BridgeData>` so its
 /// `Drop` runs.
-pub(crate) fn drop_bridge_payload(ptr: *mut ()) {
+///
+/// # Safety
+/// `ptr` must be null or come from `Arc::into_raw` applied to an
+/// `Arc<BridgeData>` that the caller hands ownership of to this
+/// function.  Any other origin is undefined behavior.
+pub(crate) unsafe fn drop_bridge_payload(ptr: *mut ()) {
     if !ptr.is_null() {
-        // Safety: produced by `Arc::into_raw(Arc::new(bridge))` in
-        // `attach_bridge`; reclaim ownership and drop.
         unsafe { drop(Arc::from_raw(ptr as *const BridgeData)) };
     }
 }

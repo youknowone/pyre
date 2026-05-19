@@ -222,7 +222,7 @@ pub struct ResumeGuardDescr {
     /// final non-null payload so the published `Arc<BridgeData>` is
     /// reclaimed by the owning crate.  `OnceLock` so the registration
     /// is idempotent across re-attach.
-    pub bridge_dispatch_drop_fn: OnceLock<fn(*mut ())>,
+    pub bridge_dispatch_drop_fn: OnceLock<unsafe fn(*mut ())>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -478,7 +478,11 @@ impl FailDescr for ResumeGuardDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.bridge_dispatch_cell.load(Ordering::Acquire)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
@@ -690,7 +694,11 @@ impl ResumeGuardDescr {
     /// owned `Arc`.  The cleanup function is registered once
     /// (idempotent) and invoked by `Drop` on any payload still in the
     /// cell at descr teardown.
-    pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    pub fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
@@ -716,7 +724,11 @@ impl Drop for ResumeGuardDescr {
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !bridge_ptr.is_null() {
             if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
-                drop_fn(bridge_ptr);
+                // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
+                // alongside the payload at `bridge_ptr`; the publisher's
+                // safety contract is that the function reclaims a value of
+                // the same shape the publisher published.
+                unsafe { drop_fn(bridge_ptr) };
             }
             // else: payload published with no cleanup registered — a
             // backend bug.  Leaks rather than risks reading the wrong

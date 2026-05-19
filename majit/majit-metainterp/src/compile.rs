@@ -3208,7 +3208,11 @@ impl FailDescr for ResumeAtPositionDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
 }
@@ -3465,7 +3469,11 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
 }
@@ -3706,7 +3714,11 @@ impl FailDescr for ResumeGuardExcDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
 }
@@ -3862,7 +3874,7 @@ pub struct ResumeGuardCopiedDescr {
     /// Registered by the backend on first `bridge_dispatch_swap`;
     /// invoked by `Drop` on the surviving payload to reclaim the
     /// published `Arc<BridgeData>` without knowing its concrete type.
-    bridge_dispatch_drop_fn: std::sync::OnceLock<fn(*mut ())>,
+    bridge_dispatch_drop_fn: std::sync::OnceLock<unsafe fn(*mut ())>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3889,7 +3901,11 @@ impl Drop for ResumeGuardCopiedDescr {
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !bridge_ptr.is_null() {
             if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
-                drop_fn(bridge_ptr);
+                // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
+                // alongside the payload at `bridge_ptr`; the publisher
+                // contracts to hand the cleanup function a payload of the
+                // same shape it published.
+                unsafe { drop_fn(bridge_ptr) };
             }
             // else: payload published with no cleanup registered — a
             // backend bug.  Leaks rather than risking the wrong type.
@@ -4193,7 +4209,11 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.bridge_dispatch_cell.load(Ordering::Acquire)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
@@ -4394,7 +4414,11 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.inner.bridge_dispatch_load()
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         self.inner.bridge_dispatch_swap(new_ptr, drop_fn)
     }
 }
@@ -4823,7 +4847,11 @@ impl FailDescr for CompileLoopVersionDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: fn(*mut ())) -> *mut () {
+    fn bridge_dispatch_swap(
+        &self,
+        new_ptr: *mut (),
+        drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
 }

@@ -2002,7 +2002,15 @@ pub trait FailDescr: Descr {
     /// swaps `new_ptr` in and registers `drop_fn` for cleanup at
     /// descr teardown.  Returns the previous payload so the caller
     /// can reclaim.  Default returns null (no slot).
-    fn bridge_dispatch_swap(&self, _new_ptr: *mut (), _drop_fn: fn(*mut ())) -> *mut () {
+    ///
+    /// `drop_fn` is `unsafe fn` because it reconstructs an `Arc` from
+    /// the raw pointer the caller published; the contract between the
+    /// publisher and `drop_fn` is unsafe by construction.
+    fn bridge_dispatch_swap(
+        &self,
+        _new_ptr: *mut (),
+        _drop_fn: unsafe fn(*mut ()),
+    ) -> *mut () {
         std::ptr::null_mut()
     }
 
