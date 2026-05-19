@@ -1583,7 +1583,7 @@ fn make_next_block(
 fn mergeblock(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
-    joinpoints: &mut HashMap<usize, Vec<SpamBlockRef>>,
+    joinpoints: &mut Vec<Vec<SpamBlockRef>>,
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
@@ -1591,7 +1591,7 @@ fn mergeblock(
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
-    let candidates = joinpoints.entry(next_offset).or_default();
+    let candidates = &mut joinpoints[next_offset];
     for index in 0..candidates.len() {
         let block = candidates[index].clone();
         let block_state = block
@@ -2512,7 +2512,7 @@ fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
 /// `collect_link_slot_pairs` to produce per-link coalesce pairs in
 /// the production walker path.
 fn collect_block_states(
-    joinpoints: &HashMap<usize, Vec<SpamBlockRef>>,
+    joinpoints: &[Vec<SpamBlockRef>],
     catch_landing_blocks: &HashMap<u16, SpamBlockRef>,
 ) -> HashMap<super::flow::BlockRef, FrameState> {
     let mut map = HashMap::new();
@@ -2521,7 +2521,7 @@ fn collect_block_states(
             map.insert(entry.block(), state);
         }
     };
-    for candidates in joinpoints.values() {
+    for candidates in joinpoints.iter() {
         for entry in candidates {
             absorb(entry);
         }
@@ -3777,7 +3777,7 @@ impl CodeWriter {
         // upstream non-orthodoxy by adding unused inputargs to non-
         // portal graphs).
         let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
-        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
+        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); num_instrs];
         // snapshot the walker's `currentstate` at
         // every terminator emission so `collect_link_slot_pairs` can
         // translate link-arg Variables to SSARepr register slots via
@@ -3798,7 +3798,9 @@ impl CodeWriter {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
             all_walker_blocks.push(start_block.clone());
-            joinpoints.insert(0, vec![start_block]);
+            if !joinpoints.is_empty() {
+                joinpoints[0] = vec![start_block];
+            }
         }
         // Walker-time PC dispatch tracker.  Records every per-PC
         // `-live-` marker as `(SpamBlockRef, offset_in_block)` so a
@@ -3838,7 +3840,7 @@ impl CodeWriter {
         // emissions that precede the first `emit_mark_label_pc!`
         // belong to it.
         let mut current_block: SpamBlockRef = joinpoints
-            .get(&0)
+            .first()
             .and_then(|blocks| blocks.first().cloned())
             .unwrap_or_else(|| {
                 let synthetic =
@@ -4504,7 +4506,7 @@ impl CodeWriter {
                     }
                     merged
                 } else if let Some(target) = joinpoints
-                    .get(&py_pc)
+                    .get(py_pc)
                     .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
                     .cloned()
                 {
@@ -10606,9 +10608,9 @@ mod tests {
         let b_ref = SpamBlockRef::new(block_b.clone(), Some(state_b.clone()));
         let landing_ref = SpamBlockRef::new(block_landing.clone(), None);
 
-        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
-        joinpoints.insert(0, vec![a_ref.clone()]);
-        joinpoints.insert(2, vec![b_ref.clone()]);
+        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 3];
+        joinpoints[0] = vec![a_ref.clone()];
+        joinpoints[2] = vec![b_ref.clone()];
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> = HashMap::new();
         // Catch landings have framestate = None and MUST be skipped.
         catch_landing_blocks.insert(7, landing_ref);
@@ -10652,18 +10654,12 @@ mod tests {
         let next_state =
             FrameState::new(vec![Some(next_arg.into())], Vec::new(), None, Vec::new(), 0);
 
-        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
-        joinpoints.insert(
-            0,
-            vec![SpamBlockRef::new(
-                graph.startblock.clone(),
-                Some(start_state.clone()),
-            )],
-        );
-        joinpoints.insert(
-            1,
-            vec![SpamBlockRef::new(next.clone(), Some(next_state.clone()))],
-        );
+        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 2];
+        joinpoints[0] = vec![SpamBlockRef::new(
+            graph.startblock.clone(),
+            Some(start_state.clone()),
+        )];
+        joinpoints[1] = vec![SpamBlockRef::new(next.clone(), Some(next_state.clone()))];
         let catch_landing_blocks = HashMap::new();
 
         let block_entry_states = collect_block_states(&joinpoints, &catch_landing_blocks);
@@ -11496,8 +11492,8 @@ mod tests {
             graph.new_block(target_state.getvariables()),
             Some(target_state),
         );
-        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
-        joinpoints.insert(1, vec![target_block.clone()]);
+        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 2];
+        joinpoints[1] = vec![target_block.clone()];
         let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
@@ -11516,7 +11512,7 @@ mod tests {
 
         assert_eq!(merged, target_block);
         assert_eq!(
-            joinpoints.get(&1).and_then(|b| b.first()),
+            joinpoints.get(1).and_then(|b| b.first()),
             Some(&target_block)
         );
         // flowcontext.py:438-441 match-success returns without touching
@@ -11564,8 +11560,8 @@ mod tests {
             graph.new_block(existing_state.getvariables()),
             Some(existing_state),
         );
-        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
-        joinpoints.insert(2, vec![existing_block.clone()]);
+        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 3];
+        joinpoints[2] = vec![existing_block.clone()];
         let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
@@ -11598,7 +11594,7 @@ mod tests {
             Some(2),
             "pending block's framestate.next_offset must carry the merge PC"
         );
-        assert_eq!(joinpoints.get(&2).and_then(|b| b.first()), Some(&merged));
+        assert_eq!(joinpoints.get(2).and_then(|b| b.first()), Some(&merged));
         let merged_state = merged
             .framestate()
             .expect("merged block should keep framestate");
