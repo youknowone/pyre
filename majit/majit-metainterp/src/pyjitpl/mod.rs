@@ -1843,11 +1843,30 @@ impl<M: Clone> MetaInterp<M> {
         // onto the backend so FINISH fast-path pointer identity works
         // against the same `Arc` the metainterp reads back.
         let MetaInterp {
-            ref staticdata,
+            ref mut staticdata,
             ref mut backend,
             ..
         } = this;
         staticdata.attach_descrs_to_cpu(backend);
+        // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()`
+        // — PyPy creates this in `finish_setup_descrs_for_jitdrivers`
+        // (which runs from `warmspot.py:289`), before any
+        // `cpu.setup_once()`.  Pyre's back-edge / function-entry trace
+        // starts both gate through `_setup_once`, which materialises
+        // the per-CPU propagate trampoline; the trampoline reads
+        // `propagate_exception_descr` from the CPU.  Eagerly create
+        // and attach the descr here so the lifecycle holds for
+        // callers that construct a `MetaInterp` without running the
+        // full `register_jitdriver_sd` path (notably the test
+        // harness).  `finish_setup_descrs_for_jitdrivers` re-uses the
+        // existing `Arc` by identity, so a later
+        // `register_jitdriver_sd` call sees the same descr — no
+        // duplicate, no swap.
+        let sd_mut = std::sync::Arc::get_mut(staticdata).expect(
+            "MetaInterp::new: staticdata Arc must still have refcount 1 \
+             at construction time",
+        );
+        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
         this
     }
 
@@ -2757,6 +2776,17 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // pyjitpl.py:2884 `compile_and_run_once` invokes `_setup_once`
+        // before every trace start.  pyre routes back-edge traces
+        // through `bound_reached`, but function-entry traces enter
+        // here, so the same gate must fire to materialise per-CPU
+        // trampolines (`cpu.setup_once`), profiler `start`, and the
+        // jitlog header before the first trace records anything.
+        // Idempotent — `globaldata.initialized` short-circuits after
+        // the first call.
+        self.staticdata
+            ._setup_once(&mut self.backend, &mut self.warm_state);
+
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -13811,9 +13841,14 @@ pub struct MetaInterpStaticData {
     /// backendmodule`.  RPython captures the backend module name (eg.
     /// `'x86'`, `'aarch64'`) at MetaInterp construction and
     /// `_setup_once` `debug_print`s it once on the first warmup.
-    /// Pyre fills this in `register_backend_name` (called by
-    /// whichever crate brings up the backend) so it travels with the
-    /// staticdata Arc.
+    ///
+    /// Pyre defaults this to the empty string; the first `_setup_once`
+    /// then formats `'JIT starting ({backend_name})'` from
+    /// `Backend::backend_name()` via `debug_print_jit_starting_line`.
+    /// Embedders that want a host-specific banner can assign a
+    /// non-empty string to this field before `_setup_once` fires;
+    /// `debug_print_jit_starting_line` prefers the stored line over
+    /// the backend-name fallback.
     pub jit_starting_line: String,
 }
 
@@ -14513,9 +14548,10 @@ impl MetaInterpStaticData {
     ///    `Logger`).
     /// 2. `debug_print(self.jit_starting_line)` — prints to stderr
     ///    when `MAJIT_LOG` is set, matching PyPy's `PYPYLOG`-gated
-    ///    `debug_print`.  `jit_starting_line` is filled in here
-    ///    from `backend.backend_name()` if `register_backend_name`
-    ///    has not been called explicitly.
+    ///    `debug_print`.  When `jit_starting_line` is empty (the
+    ///    default), `debug_print_jit_starting_line` formats one from
+    ///    `backend.backend_name()`; embedders may pre-assign a custom
+    ///    banner string instead.
     /// 3. `cpu.setup_once()` — backends materialise per-CPU
     ///    trampolines (x86 `_build_propagate_exception_path` /
     ///    `_build_malloc_slowpath`).
