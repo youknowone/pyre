@@ -99,10 +99,6 @@ fn _compute_liveness_must_continue(
         let insn = ssarepr.insns[i].clone();
 
         // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
-        //
-        // Pyre's per-PC anchors share `Insn::Label` under the synthesized
-        // name `pc_label_name(py_pc)`, so the resulting `label2alive`
-        // entry matches what `TLabel("pc{N}")` branches resolve to.
         let label_name = match &insn {
             Insn::Label(label) => Some(label.name.clone()),
             _ => None,
@@ -278,11 +274,10 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
 /// `remove_repeated_live` with an optional bitmap of SSARepr positions
 /// whose `-live-` markers must NOT be folded into a preceding run.
 ///
-/// Used by T6.1's per-PC anchor retirement: walker tracks each
-/// per-PC `-live-` position and passes it in so the merge breaks at
-/// the same boundaries that `Label("pcN")` used to provide via the
-/// `label_pc_index` carveout below.  Once Slice 6 retires per-PC
-/// label emission, the carveout fires solely via `protected_per_pc_live`.
+/// Used by the walker's per-PC dispatch: walker tracks each per-PC
+/// `-live-` position and passes it in so the merge breaks at every
+/// Python PC boundary, preserving each PC's distinct `-live-` marker
+/// for `pc_map` resolution.
 pub fn remove_repeated_live_with_protected(
     ssarepr: &mut SSARepr,
     protected_per_pc_live: Option<&[bool]>,
@@ -333,17 +328,13 @@ pub fn remove_repeated_live_with_remap(
 
         // `liveness.py:97-106` inner loop.
         //
-        // T6.1 Slice 7: `protected_per_pc_live[i]` breaks the merge
-        // at walker-recorded per-PC `-live-` positions so each
-        // Python PC retains its own `-live-` marker (pyre's
-        // walker-tracked side-table populates the bitmap;
-        // `filter_liveness_in_place` is the sole production caller
-        // and always supplies it).  The earlier `label_pc_index`
-        // label-name carveout that paired with the per-PC
-        // `Insn::Label("pc{N}")` emission is gone — Slice 6 retired
-        // the per-PC label emission and Slice 7 retired the scan
-        // helpers.  Block-identity / catch-landing / link-target
-        // labels keep merging per upstream `liveness.py:99-100`.
+        // `protected_per_pc_live[i]` breaks the merge at walker-recorded
+        // per-PC `-live-` positions so each Python PC retains its own
+        // `-live-` marker (the walker-tracked side-table populates the
+        // bitmap; `filter_liveness_in_place` is the sole production
+        // caller and always supplies it).  Block-identity /
+        // catch-landing / link-target labels keep merging per upstream
+        // `liveness.py:99-100`.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {

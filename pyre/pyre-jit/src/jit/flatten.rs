@@ -1080,13 +1080,10 @@ pub const OPNAME_LIVE: &str = "-live-";
 /// representation where `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
-    /// `(Label(name),)` — block-entry marker.  pyre's per-PC anchors
-    /// (the walker's per-Python-PC entry markers, a NEW-DEVIATION from
-    /// upstream PyPy that only resumes at `jit_merge_point` boundaries)
-    /// share this variant under the synthesized name `pc_label_name(N)`
-    /// so the runtime resolves both block entries and per-PC entries
-    /// through the same machinery.  Use `label_pc_index` to recover the
-    /// `py_pc` when needed.
+    /// `(Label(name),)` — block-entry marker.  Names are produced via
+    /// `block_label_name(&block)` (Rc-pointer-based), matching upstream
+    /// `flatten.py:116 self.emitline(Label(block))` per-SpamBlock
+    /// emission.
     Label(Label),
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
     /// set (`liveness.py:70`).

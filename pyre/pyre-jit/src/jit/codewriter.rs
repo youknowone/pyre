@@ -760,12 +760,10 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
-/// The next-block label is recognised as `Insn::Label(L)`, covering
-/// both upstream-orthodox block / link / catch-landing labels
-/// (`flatten.py:116 self.emit(Label(block))`) and pyre's per-PC anchors
-/// (synthesized name `pc_label_name(py_pc)`).  The matching
-/// `goto TLabel(...)` carries the same name, so a single string-key
-/// match suffices.
+/// The next-block label is recognised as `Insn::Label(L)`, matching
+/// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
+/// catch-landing labels.  The corresponding `goto TLabel(...)` carries
+/// the same name, so a single string-key match suffices.
 ///
 /// **Mutates** each block's `Vec<Insn>` in place to drop the strip
 /// tail; appends moved (not cloned) into the output `Vec`.
@@ -839,20 +837,15 @@ fn fresh_variable_for_state(
     }
 }
 
-/// Phase 4 endgame — walker post-walk insert_renamings.
+/// Walker post-walk `insert_renamings` — port of
+/// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
-/// `rpython/jit/codewriter/flatten.py:306-334 insert_renamings` runs
-/// after each `make_link` call and emits `<kind>_copy/_push/_pop` ops
-/// for every link arg → target inputarg pair whose post-regalloc
-/// colors differ.  Pyre's walker emits SSARepr inline per Python PC
-/// (NEW-DEVIATION from upstream's recursive `make_bytecode_block`
-/// DFS) and never runs `insert_renamings` itself, so links whose
-/// link.arg / target.inputarg map to different walker slots have
-/// no equivalent walker emission.  Canonical's `flatten_graph_with_walker_slots`
-/// DOES run `insert_renamings` (it inherits flatten.py:306 verbatim),
-/// producing ref_copies that canonical-side has but walker-side
-/// lacks → `canonical_unmatched > 0` and the splice gate blocks
-/// production splice.
+/// `flatten.py:306-334 insert_renamings` runs after each `make_link`
+/// call and emits `<kind>_copy/_push/_pop` ops for every link arg →
+/// target inputarg pair whose post-regalloc colors differ.  Pyre's
+/// walker emits SSARepr inline per Python PC and never runs
+/// `insert_renamings` itself, so links whose link.arg / target.inputarg
+/// map to different walker slots have no equivalent walker emission.
 ///
 /// This helper closes the gap by running the same renaming logic
 /// post-walk for blocks with EXACTLY ONE exit (the simple
@@ -876,11 +869,10 @@ fn walker_post_walk_insert_renamings_single_exit(
     all_walker_blocks: &[SpamBlockRef],
     walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
 ) {
-    // Variable → walker slot resolver, identical to canonical's
-    // `get_register` closure in `flatten_graph_with_walker_slots`
-    // (flatten.rs:2758-2776).  Bridge first, then graph regalloc
-    // fallback.  Shared regalloc instance (computed once outside)
-    // guarantees same colors as canonical → byte-equivalent renamings.
+    // Variable → walker slot resolver: bridge first, then graph
+    // regalloc fallback.  Shared regalloc instance (computed once
+    // outside) guarantees same colors as the canonical driver →
+    // byte-equivalent renamings.
     let get_color = |variable: &super::flow::Variable| -> u16 {
         if let Some(Some(slot)) = walker_slot_for_variable
             .get(variable.id.0 as usize)
@@ -1217,11 +1209,11 @@ where
         }
         SpliceSite::TargetAfterAnchor => {
             // Skip target's leading scaffold (Label / `-live-`).
-            // Renamings land between the anchor and the
-            // first semantic op so that runtime dispatch via
-            // `pc_anchor_positions[N]` lands on the anchor and then
-            // falls through into the renamings before any semantic
-            // op consumes the target.inputarg registers.
+            // Renamings land between the entry label and the first
+            // semantic op so that runtime dispatch into the target
+            // lands on the label, falls through the `-live-`
+            // placeholder, then through the renamings before any
+            // semantic op consumes the target.inputarg registers.
             let mut pos = 0;
             for insn in insns.iter() {
                 match insn {
@@ -3533,13 +3525,15 @@ impl CodeWriter {
         // See `pyre/pyre-jit/src/jit/B6_CODEWRITER_PIPELINE_PLAN.md`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
-        // Phase 4 production-flip bridge: each entry maps a graph
-        // `Variable.id` to the SSARepr slot the walker assigned when
-        // emitting the dual-write.  `flatten::flatten_graph_with_walker_slots`
-        // consults it so the canonical-emitted Register matches the walker
-        // slot, enabling per-graph byte-equivalence before the production
-        // splice.  Synthetic graph-only Variables (no walker counterpart)
-        // leave their entry as `None` and fall back to graph regalloc.
+        // Walker slot bridge: each entry maps a graph `Variable.id`
+        // to the SSARepr slot the walker assigned when emitting the
+        // dual-write.  `walker_post_walk_insert_renamings_single_exit`
+        // consults it so post-walk `insert_renamings` emits `<kind>_copy`
+        // ops against the same walker slots the surrounding inline emits
+        // wrote, matching `flatten.py:306-334` color-resolution semantics
+        // under shared regalloc.  Synthetic graph-only Variables (no
+        // walker counterpart) leave their entry as `None` and fall back
+        // to graph regalloc.
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
         // Seed the bridge with the portal `(frame, ec)` red Variables —
         // upstream `jtransform.py:840` threads `frame` (and `ec`) as the
@@ -3798,21 +3792,20 @@ impl CodeWriter {
             all_walker_blocks.push(start_block.clone());
             joinpoints.insert(0, vec![start_block]);
         }
-        // T6.1 walker-time PC dispatch tracker.  Records every
-        // (anchor, `-live-`) marker pair emitted at each Python PC as
-        // `(SpamBlockRef, offset_in_block)` so a drain-time resolver
-        // can pick the FIRST entry whose block is still live (matches
-        // `pc_anchor_positions` / `live_marker_indices_by_pc`'s
-        // first-wins-over-final-SSARepr semantics — supersede /
-        // `mark_dead` clears the per-block accumulator, so the
-        // canonical answer comes from the first entry in a *live*
-        // block).  Vec-of-Vec mirrors RPython's `flowcontext.py:42
-        // SpamBlock` model where multiple SpamBlocks can record into
-        // the same py_pc through joinpoint candidates
+        // Walker-time PC dispatch tracker.  Records every per-PC
+        // `-live-` marker as `(SpamBlockRef, offset_in_block)` so a
+        // drain-time resolver can pick the FIRST entry whose block
+        // contributes non-empty content to the final SSARepr
+        // (supersede / `mark_dead` clears the per-block accumulator,
+        // so the canonical answer comes from the first entry in a
+        // *live* block).  Vec-of-Vec mirrors `flowcontext.py:42
+        // SpamBlock` where multiple SpamBlocks can record into the
+        // same py_pc through joinpoint candidates
         // (`flowcontext.py:426 candidates =
         // self.joinpoints.setdefault(...)`).  Populated at walker
-        // emit time so a future slice can stop emitting per-PC
-        // `Insn::Label("pc{N}")` while still resolving `pc_map`.
+        // emit time so the runtime can resolve `pc_map` from
+        // walker-tracked positions, without per-PC `Insn::Label`
+        // anchors in the final SSARepr (T6.1 Slice 6).
         let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
             vec![Vec::new(); num_instrs];
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
@@ -3895,14 +3888,12 @@ impl CodeWriter {
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         // Upstream `build_flow` relies on `block.dead` alone
         // (`flowcontext.py:404 if not block.dead: record_block(block)`).
-        // Pyre matched this in Phase A.4: the per-PC `emitted_pc_starts`
-        // skip is retired; supersede may re-walk a PC under widened
-        // framestate, producing duplicate `Label("pcN")` + `-live-`
-        // pairs.  Both `pc_anchor_positions` and
-        // `live_marker_indices_by_pc` use first-wins / last-takes
-        // semantics so the runtime canonical bytes are the dead
-        // block's emit; the supersede newblock's re-walk emit is
-        // unreachable via pcN labels.
+        // Pyre matches this: supersede may re-walk a PC under widened
+        // framestate, producing duplicate `-live-` markers.
+        // `walker_pc_live_marker_pos` uses first-live-wins resolution
+        // so the runtime canonical bytes are the dead block's emit;
+        // the supersede newblock's re-walk emit is unreachable
+        // through the resolved `pc_map`.
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -4551,10 +4542,9 @@ impl CodeWriter {
                     // terminator emit (`emit_goto!`, `emit_ref_return!`,
                     // `emit_raise!`, `emit_reraise!`, POP_JUMP_IF) and
                     // no joinpoint exists at `py_pc`, this arm still
-                    // returns `current_block` so the per-PC anchor
-                    // (`Insn::Label("pc{N}")`) + `-live-` are emitted
-                    // for pyre's per-PC dispatch invariants
-                    // (`pc_anchor_positions`).  The
+                    // returns `current_block` so the per-PC `-live-`
+                    // marker is emitted for pyre's per-PC dispatch
+                    // invariant (`walker_pc_live_marker_pos`).  The
                     // `block_closed_by_terminator` gate after
                     // `emit_live_placeholder!()` then suppresses op
                     // dispatch into the closed block — mirroring
@@ -4626,18 +4616,11 @@ impl CodeWriter {
                     block_switch_pending = true;
                 } else {
                     // No switch — same block continues at py_pc.
-                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` emission
-                    // retires here.  Pyre's runtime `pc_map` is now sourced
-                    // from the `walker_pc_live_marker_pos` side-table (see
-                    // `walker_tracked_pc_live_indices` at drain time), so
-                    // we no longer need a per-PC anchor in the SSARepr to
-                    // serve runtime PC dispatch.  This matches upstream
-                    // `rpython/jit/codewriter/flatten.py:116` which only
-                    // emits one `Label(block)` per FunctionGraph block.
-                    // `walker_pc_anchor_pos` is kept for the debug parity
-                    // assertion in `pc_anchor_positions` callers but is
-                    // no longer populated; resolver-side `None` from an
-                    // empty record vector keeps the assertion off.
+                    // Pyre's runtime `pc_map` is sourced from the
+                    // `walker_pc_live_marker_pos` side-table at drain
+                    // time (see `walker_tracked_pc_live_indices`), so
+                    // we emit only one `Label(block)` per FunctionGraph
+                    // block matching `flatten.py:116`.
                     needs_fallthrough = true;
                 }
             }};
@@ -5515,12 +5498,11 @@ impl CodeWriter {
                 let start_pc = pending_state.next_offset;
                 // Phase A.4 mirrors upstream's `flowcontext.py:404 if not
                 // block.dead: record_block(block)` identity-only check.
-                // Supersede re-walks under widened framestate produce
-                // duplicate `Label("pcN")` + `-live-` pairs in ssarepr;
-                // `pc_anchor_positions` (first-wins) and
-                // `live_marker_indices_by_pc` (last-takes) keep the
-                // original dead block's bytes canonical for `pcN`
-                // dispatch.
+                // Supersede re-walks under widened framestate may
+                // produce duplicate `-live-` markers for a Python PC;
+                // the walker-tracked `walker_pc_live_marker_pos`
+                // first-live-wins resolver picks the original dead
+                // block's marker as canonical for `pc_map`.
                 current_block = pending_block;
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
@@ -5529,18 +5511,13 @@ impl CodeWriter {
                 // start of every new block iteration so a previous
                 // block's queued switch doesn't bleed into this one.
                 block_switch_pending = false;
-                // T6.1 Slice 4: block-entry `Label(block)` per
-                // `rpython/jit/codewriter/flatten.py:116
-                // self.emitline(Label(block))`.  Emitted at the moment a
-                // freshly-popped block becomes `current_block`,
+                // Block-entry `Label(block)` per `flatten.py:116
+                // self.emitline(Label(block))`.  Emitted at the moment
+                // a freshly-popped block becomes `current_block`,
                 // mirroring upstream's recursive `make_bytecode_block`
-                // top.  Coexists with the per-PC `Label("pcN")` that
-                // `emit_mark_label_pc!` pushes shortly after — both
-                // label families remain valid branch targets until
-                // Slices 5 + 6 retire the per-PC labels.  Skipped when
-                // the per-block accumulator already contains content
-                // (mergeblock candidate joins emit into the block
-                // before the pop in some flows).
+                // top.  Skipped when the per-block accumulator already
+                // contains content (mergeblock candidate joins emit
+                // into the block before the pop in some flows).
                 if current_block.per_block_ssarepr_len() == 0 {
                     push_walker_emit(
                         &current_block,
@@ -5601,24 +5578,13 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    // `emit_mark_label_pc!` just pushed
-                    // `Insn::Label(Label::new("pc{N}"))` into the current
-                    // block's per-block accumulator (see the same-block
-                    // arm at codewriter.rs ~3957).  The per-PC label is
-                    // pyre's per-Python-PC anchor — a NEW-DEVIATION from
-                    // upstream RPython, whose `flatten.py` only emits
-                    // `Label(block)` at block entry (`flatten.py:116`)
-                    // because RPython's runtime has no per-PC dispatch
-                    // concept.  Pyre's blackhole / bridge dispatch
-                    // resolves resume PCs through `pc_anchor_positions`
-                    // (codewriter.rs:2427) + `live_marker_indices_by_pc`,
-                    // both of which scan for `Label("pc{N}")` entries via
-                    // `label_pc_index`, so the per-PC anchor must stay
-                    // alongside the upstream-orthodox block Labels until
-                    // the dispatcher is refactored to look up by block
-                    // identity instead of py_pc.  `remove_repeated_live`
-                    // breaks its merge run on per-PC labels so each PC
-                    // keeps its own `-live-` marker.
+                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")`
+                    // emission retired.  The walker emits one
+                    // block-identity `Label(block)` at block entry
+                    // (`flatten.py:116` parity) and tracks each
+                    // Python PC's `-live-` marker position in
+                    // `walker_pc_live_marker_pos` for `pc_map`
+                    // population at finalize time.
                     depth_at_pc[py_pc] = current_depth;
 
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
@@ -5692,16 +5658,15 @@ impl CodeWriter {
                     }
 
                     emit_live_placeholder!();
-                    // T6.1: record the per-PC `-live-` marker position
-                    // at walker emit time.  `emit_live_placeholder!()`
+                    // Record the per-PC `-live-` marker position at
+                    // walker emit time.  `emit_live_placeholder!()`
                     // pushed the `-live-` as the last insn in
                     // `current_block.per_block_ssarepr`.  Record EVERY
                     // emit (not just first) — `mark_dead` later may
                     // clear the recorded block's accumulator, so the
                     // drain-time resolver picks the first entry whose
-                    // block is still live, matching
-                    // `live_marker_indices_by_pc`'s scan over the final
-                    // SSARepr (which only contains live-block content).
+                    // block contributes non-empty content to the
+                    // final SSARepr.
                     let offset = current_block.per_block_ssarepr_len() - 1;
                     walker_pc_live_marker_pos[py_pc]
                         .push((current_block.clone(), offset));
@@ -5711,14 +5676,12 @@ impl CodeWriter {
                     // `emit_ref_return!`, `emit_raise!`, `emit_reraise!`,
                     // POP_JUMP_IF) that appended a normal-flow / bool /
                     // raise / return exit, and no joinpoint exists at
-                    // `py_pc`.  The per-PC `Insn::Label("pc{N}")` +
-                    // `-live-` have been emitted to satisfy pyre's
-                    // per-PC dispatch invariants
-                    // (`pc_anchor_positions`, `live_marker_indices_by_pc`),
-                    // but dispatching the op would append more SpaceOps and
-                    // potentially more exits (orphan `(None,None)` link) to
-                    // the closed block.  Upstream
-                    // `rpython/flowspace/flowcontext.py:407-475` never
+                    // `py_pc`.  The per-PC `-live-` has been emitted to
+                    // satisfy pyre's per-PC dispatch invariant
+                    // (`walker_pc_live_marker_pos`), but dispatching the
+                    // op would append more SpaceOps and potentially more
+                    // exits (orphan `(None,None)` link) to the closed
+                    // block.  Upstream `flowcontext.py:407-475` never
                     // reaches dead-code PCs because `StopFlowing` from
                     // `closeblock` pops the next pending block; pyre's
                     // PC-sequential walker scans through but skips dispatch.
@@ -5978,22 +5941,13 @@ impl CodeWriter {
                             // about to consume its result Variable.
                             //
                             // Walker emits the inline `residual_call_ir_r`
-                            // (line 5424) unconditionally for every
-                            // LoadConst regardless of constant shape — the
-                            // runtime must materialize the value into the
-                            // dst_slot register either way.  The graph
-                            // dual-write must mirror that emit so the
-                            // canonical `flatten_graph` driver sees the
-                            // same residual_call_ir_r count.  Previously
-                            // skipped for "recognised Ref" constants (None
-                            // / Bool / Str) under the rationale that
-                            // upstream `jtransform.py` inlines the
-                            // constant; but pyre's pipeline doesn't run
-                            // that inlining pass, so skipping the
-                            // dual-write while still emitting inline
-                            // created a structural divergence visible via
-                            // `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
-                            // (residual_call_ir_r walker > canonical).
+                            // unconditionally for every LoadConst regardless
+                            // of constant shape — the runtime must
+                            // materialize the value into the dst_slot
+                            // register either way.  The graph dual-write
+                            // mirrors that emit so the canonical
+                            // `flatten_graph` driver sees the same
+                            // residual_call_ir_r count.
                             let value = if let Some(pycode_var) = pycode_graph_var {
                                 let loaded = record_residual_call_graph_op(
                                     &mut graph,
@@ -6923,14 +6877,11 @@ impl CodeWriter {
                                     ),
                                 );
                                 // Graph-side residual_call_r_r dual-write
-                                // retired (2026-05-17) — replaced by canonical
-                                // driver's `lower_simple_call_hlop_to_insn`
-                                // arm which lowers the `simple_call` HLOp
+                                // retired — replaced by canonical driver's
+                                // `lower_simple_call_hlop_to_insn` arm
+                                // which lowers the `simple_call` HLOp
                                 // recorded above into the same
-                                // `residual_call_r_r` Insn shape.  Keeping
-                                // both produced a double-emission (visible
-                                // via `PYRE_PHASE3_CANONICAL_OPNAME_DIFF=1`
-                                // as `residual_call_r_r delta=+1`).  Matches
+                                // `residual_call_r_r` Insn shape.  Matches
                                 // upstream RPython where `simple_call` IS the
                                 // graph form and `residual_call_r_r` only
                                 // appears post-flatten.
@@ -8670,44 +8621,33 @@ impl CodeWriter {
         // Drain per-block accumulators into ssarepr.insns in
         // walker-block-creation order.  Mirrors `codewriter.py:53
         // flatten_graph(graph, regallocs, cpu)` shape — block-by-block
-        // emit, no PC interleaving.  Walker-creation order is canonical
-        // because Phase A.4's first-wins `pc_anchor_positions` semantics
-        // depend on the dead block's emit landing before its supersede
-        // newblock's re-walked duplicate.
+        // emit, no PC interleaving.
         //
         // Peel-off optimisation: at every block-switch boundary the
-        // walker emits a defensive `goto TLabel("pcN") + Unreachable`
+        // walker emits a defensive `goto TLabel(block) + Unreachable`
         // pair (the eventual drain order is not known at yield time
         // since `pendingblocks` is mixed push_front / push_back).  This
         // pass strips the pair when the next block actually opens with
-        // a per-PC anchor for the SAME N — turning a runtime no-op
-        // branch into implicit fall-through.  Pyre's per-PC anchor is
-        // `Insn::Label(Label::new("pc{N}"))` (NEW-DEVIATION from
-        // upstream; RPython's per-block `Label(block)` has no per-PC
-        // concept); `strip_walker_block_boundary_goto` resolves both
-        // upstream-orthodox block labels and pyre's per-PC labels
-        // through their shared name key.  Upstream `flatten.py:106-155
+        // a `Label` matching the goto target — turning a runtime no-op
+        // branch into implicit fall-through.  Upstream `flatten.py:106-155
         // make_link` skips the goto outright via recursive descent +
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
-        // Phase 4 endgame: compute graph regallocs ONCE pre-drain so
-        // walker insert_renamings + canonical pass share identical
-        // colors (HashMap iteration order non-determinism between two
+        //
+        // Compute graph regallocs ONCE pre-drain so walker
+        // insert_renamings and any downstream consumer share identical
+        // colors (HashMap iteration non-determinism between two
         // separate regalloc calls would otherwise diverge bridge-
-        // fallback Variables' colors, breaking byte_equivalent).
+        // fallback Variables' colors).
         let mut _graph_regallocs =
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
-        // Phase 4 endgame — seed `walker_slot_for_variable` with block
-        // inputarg slots BEFORE the helper below reads it.  The same
-        // pairing pass also runs downstream around line 8852 (idempotent
-        // via `pair_walker_slot_if_absent`) but canonical's
+        // Seed `walker_slot_for_variable` with block inputarg slots
+        // BEFORE `walker_post_walk_insert_renamings_single_exit` reads
+        // it.  The same pairing pass also runs downstream (idempotent
+        // via `pair_walker_slot_if_absent`), but the post-walk
         // `insert_renamings` color resolution needs the bridge entries
-        // present at the moment the walker-side helper computes them, so
-        // both sides see identical Register destinations.  Mirrors the
-        // upstream contract where `flatten_graph` sees the post-walker
-        // graph in its terminal state — pyre's pre-drain helper does the
-        // same.
+        // present at the moment the helper runs.
         for spam in &all_walker_blocks {
             let Some(state) = spam.framestate() else {
                 continue;
@@ -8724,11 +8664,11 @@ impl CodeWriter {
                 }
             }
         }
-        // T6.1: walker-tracked PC live-marker positions exposed to the
-        // post-drain pc_map computation.  Populated inside the drain
-        // block below; consumed at the `live_marker_indices_by_pc`
-        // call site to validate (and eventually replace) the
-        // SSARepr-scan source for `pc_map`.
+        // Walker-tracked per-PC `-live-` marker positions exposed to
+        // the post-drain `pc_map` computation.  Populated inside the
+        // drain block below; consumed by `filter_liveness_in_place`
+        // (translated through the `remove_repeated_live` remap) as the
+        // sole source for `pc_map`.
         let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
         {
             // Phase 4 endgame — walker post-walk insert_renamings.
@@ -8762,8 +8702,7 @@ impl CodeWriter {
             //
             // Dead supersede blocks have empty `per_block_ssarepr`
             // (cleared by `mark_dead`), so their position in the order
-            // doesn't contribute insns; `pc_anchor_positions`
-            // first-wins remains stable.  Synthetic walker blocks
+            // doesn't contribute insns.  Synthetic walker blocks
             // (catch-landings, blocks not reachable in graph DFS)
             // append in their original creation order after the
             // DFS-matched prefix.
@@ -8788,15 +8727,14 @@ impl CodeWriter {
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
-            // T6.1 Slice 2: resolve walker-tracked PC live-marker
-            // positions to absolute SSARepr indices using POST-STRIP
-            // prefix lengths.  Captured BEFORE strip mutates `blocks`
-            // so per-block offsets stay aligned — strip only truncates
-            // the trailing `goto + Unreachable` pair from a block tail,
-            // so the `-live-` marker positions (which never live in
-            // the tail) are invariant.  Picks the FIRST entry per PC
-            // whose block contributes non-empty content to the final
-            // SSARepr (matches `live_marker_indices_by_pc`'s scan).
+            // Resolve walker-tracked PC live-marker positions to
+            // absolute SSARepr indices using POST-STRIP prefix lengths.
+            // Captured BEFORE strip mutates `blocks` so per-block
+            // offsets stay aligned — strip only truncates the trailing
+            // `goto + Unreachable` pair from a block tail, so the
+            // `-live-` marker positions (which never live in the tail)
+            // are invariant.  Picks the FIRST entry per PC whose block
+            // contributes non-empty content to the final SSARepr.
             let walker_tracked_pc_indices: Option<Vec<usize>> = {
                 // Compute each block's post-strip length without invoking
                 // `strip_walker_block_boundary_goto` directly: that helper
@@ -8875,15 +8813,8 @@ impl CodeWriter {
                 resolve_walker_pc(&walker_pc_live_marker_pos)
             };
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
-            // Parity check (debug-only): walker-time tracking must agree
-            // with the legacy SSARepr scan.  Failure here means a
-            // walker emit site pushed `-live-` / `pc_anchor` without
-            // updating `walker_pc_*_pos`, or first-wins disagreement.
-            // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` emission has
-            // been retired, so the scan-based `pc_anchor_positions` /
-            // `live_marker_indices_by_pc` sources no longer apply here.
-            // The walker-tracked side-tables are now the sole source of
-            // truth for per-PC positions; downstream consumers
+            // Walker-tracked per-PC `-live-` positions are the sole
+            // source of truth for `pc_map`; downstream consumers
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
@@ -9039,25 +8970,14 @@ impl CodeWriter {
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
-        // op_live`). `remove_repeated_live` may move that marker away
-        // from the per-PC `Label("pcN")` anchor, so record the final
-        // per-PC live-marker positions here instead of the label indices.
-        //
-        // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` is no longer
-        // emitted, so `live_marker_indices_by_pc` (which scans for the
-        // anchor labels) no longer applies in production.  The
-        // walker-tracked side-table — translated through the
-        // `remove_repeated_live` remap by `filter_liveness_in_place` —
-        // is the sole source of per-PC `-live-` positions; assert that
-        // it is present, otherwise the runtime `pc_map` would be
-        // undefined.  The scan-based fallback survives only inside
-        // test fixtures that manually emit per-PC labels and call
-        // `live_marker_indices_by_pc` directly (see codewriter.rs tests
-        // around line 11566).
+        // op_live`).  The walker-tracked `walker_pc_live_marker_pos`
+        // side-table — translated through the `remove_repeated_live`
+        // remap by `filter_liveness_in_place` — is the sole source of
+        // per-PC `-live-` positions; assert one entry per Python PC.
         assert_eq!(
             post_remove_live_indices.len(),
             num_instrs,
-            "T6.1: filter_liveness_in_place must return one entry per Python PC; \
+            "filter_liveness_in_place must return one entry per Python PC; \
              walker-tracked side-table was unavailable"
         );
         let pc_map = post_remove_live_indices.clone();
