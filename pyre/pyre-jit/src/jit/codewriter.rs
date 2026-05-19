@@ -3049,8 +3049,6 @@ fn register_helper_fn_pointers(
 /// `Label("pcN")` + `-live-` pair per Python PC, including dead
 /// bytecodes that never execute, whereas upstream RPython only
 /// flattens reachable flow-graph blocks.
-use super::flatten::label_pc_index;
-
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
@@ -9488,56 +9486,18 @@ impl CodeWriter {
             // canonical_unmatched divergence closes (separate
             // slices) or nbody/spectral_norm/nested_loop's walker
             // load-bearing ops are restructured.
-            if walker_unmatched == 0 && canonical_unmatched == 0 && strict_sequence_match {
-                // Phase 4 slice 3 — PC coverage gate.  pyre's runtime
-                // dispatch (`pc_anchor_positions` at codewriter.rs:2585)
-                // asserts every Python PC has a `pc{N}` Label anchor.
-                // Canonical only emits anchors for blocks it visits via
-                // `make_bytecode_block` DFS; canraise blocks without
-                // trailing `-live-` early-return after the normal link
-                // (`flatten.py:206-217`), skipping catch-link target
-                // blocks and dropping their per-PC labels.  raise_catch_loop
-                // hits this — 68 of 97 PCs missing.  Skip splice when
-                // canonical's anchors don't cover every py_pc; walker
-                // emit remains the production path for those graphs.
-                // Setting `include_all_exc_links=true` would route through
-                // the catch links but exposes walker non-orthodoxy
-                // (7-arg empty-exits final blocks pyre's walker emits at
-                // catch landings); those need separate structural
-                // walker work to retire.
-                let num_pcs = code.instructions.len();
-                let mut emitted_pcs: Vec<usize> = Vec::new();
-                for insn in &canonical_ssarepr.insns {
-                    if let Some(pc) = label_pc_index(insn) {
-                        if !emitted_pcs.contains(&pc) {
-                            emitted_pcs.push(pc);
-                        }
-                    }
-                }
-                let pc_coverage_complete = (0..num_pcs).all(|pc| emitted_pcs.contains(&pc));
-                if !pc_coverage_complete {
-                    if phase3_diag_on {
-                        eprintln!(
-                            "[phase4-production-splice-skip] graph={:?} \
-                             emitted_pcs={} num_pcs={} (canraise / catch-link \
-                             skip — walker emit retained)",
-                            code.obj_name.as_str(),
-                            emitted_pcs.len(),
-                            num_pcs,
-                        );
-                    }
-                } else {
-                    if phase3_diag_on {
-                        eprintln!(
-                            "[phase4-production-splice] graph={:?} walker_insns={} → canonical_insns={}",
-                            code.obj_name.as_str(),
-                            ssarepr.insns.len(),
-                            canonical_ssarepr.insns.len(),
-                        );
-                    }
-                    ssarepr.insns = canonical_ssarepr.insns;
-                }
-            }
+            // T6.1 Slice 7: the production splice path that swapped
+            // walker's `ssarepr.insns` with `canonical_ssarepr.insns`
+            // when byte_equivalent / strict_sequence_match / pc_coverage_complete
+            // all held has been retired.  Since Slice 6 stopped walker
+            // emitting per-PC `Insn::Label("pc{N}")`, the walker SSARepr
+            // is the production path for `pc_map` (sourced from the
+            // walker-tracked side-table) and `filter_liveness_in_place`
+            // requires the walker SSARepr position layout; a canonical
+            // splice would invalidate the walker-tracked indices.
+            // The canonical probe still runs to produce
+            // `[phase3-canonical-flatten]` diagnostic logs but no
+            // longer modifies production output.
         }
 
         // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
