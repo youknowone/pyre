@@ -127,7 +127,7 @@ fn wasm_gc_owns_object(addr: usize) -> bool {
 pub struct WasmBackend {
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
 }
@@ -136,7 +136,7 @@ impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
             trace_counter: 0,
-            constants: HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
             vtable_offset: None,
         }
     }
@@ -360,7 +360,6 @@ impl majit_backend::Backend for WasmBackend {
 
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
         self.constants.clear();
-        self.constants.reserve(constants.len());
         for (&k, c) in constants.iter() {
             self.constants.insert(k, c.as_raw_i64());
         }
