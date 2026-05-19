@@ -804,17 +804,10 @@ fn strip_walker_block_boundary_goto(
                     .collect::<Vec<_>>()
             })
             .collect();
-        let first_label_for_diag = blocks[i].first().and_then(|insn| match insn {
-            super::flatten::Insn::Label(l) => Some(l.name.clone()),
-            _ => None,
-        });
         let block_insns = &mut blocks[i];
         let len = block_insns.len();
-        let (strip_tail, goto_target_for_diag) = if len >= 2 {
-            match (
-                &block_insns[len - 2],
-                &block_insns[len - 1],
-            ) {
+        let strip_tail = if len >= 2 {
+            match (&block_insns[len - 2], &block_insns[len - 1]) {
                 (
                     super::flatten::Insn::Op { opname, args, .. },
                     super::flatten::Insn::Unreachable,
@@ -823,31 +816,13 @@ fn strip_walker_block_boundary_goto(
                     && matches!(&args[0], Operand::TLabel(target)
                         if next_label_names.iter().any(|n| n == &target.name)) =>
                 {
-                    (2, None)
+                    2
                 }
-                (
-                    super::flatten::Insn::Op { opname, args, .. },
-                    super::flatten::Insn::Unreachable,
-                ) if opname == "goto" && args.len() == 1 => {
-                    let target = match &args[0] {
-                        Operand::TLabel(t) => Some(t.name.clone()),
-                        _ => None,
-                    };
-                    (0, target)
-                }
-                _ => (0, None),
+                _ => 0,
             }
         } else {
-            (0, None)
+            0
         };
-        if std::env::var_os("PYRE_PHASE3_STRIP_DIAG").is_some() {
-            if let Some(target) = goto_target_for_diag {
-                eprintln!(
-                    "[phase3-strip-no-match] block_index={} block_first={:?} goto_target={} next_labels={:?}",
-                    i, first_label_for_diag, target, next_label_names,
-                );
-            }
-        }
         block_insns.truncate(len - strip_tail);
         drained.append(block_insns);
     }
@@ -1281,37 +1256,10 @@ fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
 fn append_exit_tagged(
     block: &super::flow::BlockRef,
     link: super::flow::LinkRef,
-    tag: &'static str,
+    _tag: &'static str,
 ) {
     link.borrow_mut().prevblock = Some(block.downgrade());
     block.borrow_mut().exits.push(link.clone());
-    if std::env::var_os("PYRE_PHASE3_APPEND_EXIT_DIAG").is_some() {
-        let target_addr = link
-            .borrow()
-            .target
-            .as_ref()
-            .map(|t| format!("{:p}", &*t.borrow() as *const _))
-            .unwrap_or_else(|| "<none>".to_string());
-        let b = block.borrow();
-        let exits_summary: Vec<String> = b
-            .exits
-            .iter()
-            .map(|l| {
-                let lb = l.borrow();
-                format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
-            })
-            .collect();
-        eprintln!(
-            "[phase3-append-exit] tag={tag} block_addr={:p} → target_addr={} \
-             ops={} exits_now={} exitswitch={:?} shape={:?}",
-            &*b as *const _,
-            target_addr,
-            b.operations.len(),
-            b.exits.len(),
-            b.exitswitch,
-            exits_summary,
-        );
-    }
 }
 
 /// atomically append `link` to `block.exits` and
@@ -1632,16 +1580,6 @@ fn mergeblock(
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
-    if std::env::var_os("PYRE_PHASE3_MERGEBLOCK_DIAG").is_some() {
-        eprintln!(
-            "[phase3-mergeblock] next_offset={} current_block_addr={:p} \
-             current_block_exits={} candidates_at_offset={}",
-            next_offset,
-            &*currentblock.block().borrow() as *const _,
-            currentblock.block().borrow().exits.len(),
-            joinpoints.get(&next_offset).map_or(0, |v| v.len()),
-        );
-    }
     let candidates = joinpoints.entry(next_offset).or_default();
     for index in 0..candidates.len() {
         let block = candidates[index].clone();
@@ -1712,33 +1650,10 @@ fn mergeblock(
         //     self.pendingblocks.append(newblock)
         //
         // Phase A.4 matches upstream: the supersede newblock IS
-        // re-walked under widened inputargs.  Its emit appends a
-        // duplicate `Label("pcN")` + `-live-` pair to ssarepr.insns,
-        // but `pc_anchor_positions` (first-wins) and
-        // `live_marker_indices_by_pc` (last-takes) ensure the
-        // original dead block's bytes remain the runtime canonical
-        // emission for `pcN`.  The supersede re-walk's bytes are
-        // unreachable via pcN labels.
-        if std::env::var_os("PYRE_PHASE3_SUPERSEDE_DIAG").is_some() {
-            let dead_exits_summary: Vec<String> = block
-                .block()
-                .borrow()
-                .exits
-                .iter()
-                .map(|l| {
-                    let lb = l.borrow();
-                    format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
-                })
-                .collect();
-            eprintln!(
-                "[phase3-supersede] at next_offset={} dead_exits_before={} \
-                 dead_shape={:?} dead_exitswitch={:?}",
-                next_offset,
-                block.block().borrow().exits.len(),
-                dead_exits_summary,
-                block.block().borrow().exitswitch,
-            );
-        }
+        // re-walked under widened inputargs.  The dead block's
+        // walker accumulator is cleared by `mark_dead`, so the
+        // drain skips it and only the newblock's bytes reach the
+        // final SSARepr.
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
