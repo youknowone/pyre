@@ -1178,7 +1178,7 @@ fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
 /// I64X2 if needed). If it's a constant, splats it to fill all lanes.
 fn resolve_opref_vec_int(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     vec_oprefs: &HashSet<u32>,
     vec_float_oprefs: &HashSet<u32>,
     opref: OpRef,
@@ -1205,7 +1205,7 @@ fn resolve_opref_vec_int(
 /// bitcast to F64X2 if needed. If scalar, bitcast to f64 then splat.
 fn resolve_opref_vec_float(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     vec_oprefs: &HashSet<u32>,
     vec_float_oprefs: &HashSet<u32>,
     opref: OpRef,
@@ -3805,7 +3805,7 @@ fn opref_is_op_result_var(opref: OpRef) -> bool {
 
 fn resolve_opref(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     opref: OpRef,
 ) -> CValue {
     // RPython parity (`llgraph/runner.py:1124, 1177`): both op args and
@@ -3864,7 +3864,7 @@ fn resolve_opref(
 
 fn resolve_binop(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     op: &Op,
 ) -> (CValue, CValue) {
     let a = resolve_opref(builder, constants, op.arg(0));
@@ -3874,7 +3874,7 @@ fn resolve_binop(
 
 fn emit_icmp(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     cc: IntCC,
     op: &Op,
     vi: u32,
@@ -3887,7 +3887,7 @@ fn emit_icmp(
 
 fn emit_fcmp(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     cc: FloatCC,
     op: &Op,
     vi: u32,
@@ -4056,7 +4056,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 fn validate_oprefs_for_compile(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
@@ -4695,7 +4695,7 @@ fn inject_builtin_string_descrs(ops: &mut [Op]) {
 
 fn resolve_opref_or_imm(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     opref: OpRef,
 ) -> CValue {
@@ -4720,7 +4720,7 @@ fn resolve_opref_or_imm(
 
 fn resolve_failarg_opref(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &HashSet<u32>,
@@ -4740,7 +4740,7 @@ fn resolve_failarg_opref(
 }
 
 fn resolve_constant_i64(
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     opcode: OpCode,
     opref: OpRef,
@@ -4761,7 +4761,7 @@ fn resolve_constant_i64(
     Ok(opref.raw() as i64)
 }
 
-fn resolve_rewriter_immediate_i64(constants: &HashMap<u32, i64>, opref: OpRef) -> i64 {
+fn resolve_rewriter_immediate_i64(constants: &majit_ir::VecAssoc<u32, i64>, opref: OpRef) -> i64 {
     constants.get(&opref.raw()).copied().unwrap_or_else(|| {
         if opref.is_constant() {
             opref.const_index() as i64
@@ -4895,7 +4895,7 @@ fn emit_store_to_addr(
 
 fn emit_dynamic_offset_addr(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     known_values: &HashSet<u32>,
     base_arg: OpRef,
     offset_arg: OpRef,
@@ -4907,7 +4907,7 @@ fn emit_dynamic_offset_addr(
 
 fn emit_scaled_index_addr(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     base_arg: OpRef,
     index_arg: OpRef,
     scale: i64,
@@ -5422,7 +5422,7 @@ fn emit_collecting_gc_call(
 
 fn emit_indirect_call_from_parts(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
@@ -5777,7 +5777,7 @@ fn emit_attached_loop_dispatch(
 ///   3. _call_footer
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
-    constants: &HashMap<u32, i64>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
     jf_ptr: CValue,
     info: &GuardInfo,
     ref_root_slots: &[(u32, usize)],
@@ -6910,11 +6910,11 @@ fn resolve_fail_arg_types(
 pub struct CraneliftBackend {
     module: JITModule,
     func_ctx: FunctionBuilderContext,
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// rewrite.py:930 parity — type annotations for constant OpRefs.
     /// Set by `set_constant_types` before each compile call; used by
     /// the GC rewriter to check `v.type == 'r'` on constant values.
-    constant_types: HashMap<u32, majit_ir::Type>,
+    constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>,
     /// compile.py: self.metainterp_sd.callinfocollection — used by
     /// recovery_layout building for VStr/VUni Concat/Slice func ptr
     /// lookups (resume.py:1143-1188).
@@ -6948,13 +6948,13 @@ impl CraneliftBackend {
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
     /// `HashMap<u32, i64>` literals by hand.
-    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
         self.constants = constants;
     }
 
     /// Legacy test-only entry point — counterpart to `set_constants`
     /// above; production callers route through `set_constants_pool`.
-    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
         self.constant_types = constant_types;
     }
 
@@ -7113,8 +7113,8 @@ impl CraneliftBackend {
         CraneliftBackend {
             module,
             func_ctx,
-            constants: HashMap::new(),
-            constant_types: HashMap::new(),
+            constants: majit_ir::VecAssoc::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -7244,8 +7244,9 @@ impl CraneliftBackend {
     // below so `compile_tmp_callback` and other backend-agnostic
     // consumers can reach them through `&mut dyn Backend`.
 
-    fn gc_rewriter(&self, constant_types: &HashMap<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
-        let ct = constant_types.clone();
+    fn gc_rewriter(&self, constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
+        let ct: HashMap<u32, majit_ir::Type> =
+            constant_types.iter().map(|(&k, &t)| (k, t)).collect();
         with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
             nursery_top_addr: gc.nursery_top_addr(),
@@ -7362,8 +7363,8 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        constants: &HashMap<u32, i64>,
-        constant_types: &HashMap<u32, majit_ir::Type>,
+        constants: &majit_ir::VecAssoc<u32, i64>,
+        constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
@@ -7381,15 +7382,16 @@ impl CraneliftBackend {
         let mut constant_types_with_inputargs = constant_types.clone();
         for ia in inputargs.iter() {
             constant_types_with_inputargs
-                .entry(ia.index)
-                .or_insert(ia.tp);
+                .entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
+            let constants_hm: HashMap<u32, i64> =
+                constants.iter().map(|(&k, &v)| (k, v)).collect();
             let (result, new_constants, new_constant_types) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+                rewriter.rewrite_for_gc_with_constants(&normalized, &constants_hm);
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
-                self.constants.entry(k).or_insert(v);
+                self.constants.entry_or_insert_with(k, || v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -7397,7 +7399,7 @@ impl CraneliftBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry(k).or_insert(tp);
+                self.constant_types.entry_or_insert_with(k, || tp);
             }
             result
         } else {
@@ -10876,7 +10878,7 @@ impl CraneliftBackend {
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
-                    let rw = self.gc_rewriter(&HashMap::new());
+                    let rw = self.gc_rewriter(&majit_ir::VecAssoc::new());
                     let wb_byteofs = rw
                         .as_ref()
                         .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
@@ -13091,8 +13093,8 @@ fn collect_guards(
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
-    constants: &HashMap<u32, i64>,
-    constant_types: &HashMap<u32, Type>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    constant_types: &majit_ir::VecAssoc<u32, Type>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
@@ -13837,7 +13839,7 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
-    constant_types: &HashMap<u32, Type>,
+    constant_types: &majit_ir::VecAssoc<u32, Type>,
     force_tokens: &HashSet<u32>,
     trace_id: u64,
     header_pc: u64,
@@ -13986,8 +13988,6 @@ impl majit_backend::Backend for CraneliftBackend {
     fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
         self.constants.clear();
         self.constant_types.clear();
-        self.constants.reserve(constants.len());
-        self.constant_types.reserve(constants.len());
         for (&k, c) in constants.iter() {
             self.constants.insert(k, c.as_raw_i64());
             self.constant_types.insert(k, c.get_type());
@@ -16042,7 +16042,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
@@ -16358,7 +16358,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0i64);
         constants.insert(101, 1i64);
         backend.set_constants(constants);
@@ -17116,7 +17116,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 0i64);
         backend.set_constants(constants);
@@ -17203,7 +17203,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_two as *const () as i64);
         backend.set_constants(constants);
 
@@ -17243,7 +17243,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, multiply as *const () as i64);
         backend.set_constants(constants);
 
@@ -17287,7 +17287,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, increment_counter as *const () as i64);
         backend.set_constants(constants);
 
@@ -17328,7 +17328,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_doubles as *const () as i64);
         backend.set_constants(constants);
 
@@ -17363,7 +17363,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, add_one as *const () as i64);
         constants.insert(101, 100i64);
         backend.set_constants(constants);
@@ -17431,7 +17431,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, log_char as *const () as i64);
         constants.insert(101, 32);
         constants.insert(102, log_num as *const () as i64);
@@ -17475,7 +17475,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
@@ -17523,7 +17523,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
         backend.set_constants(constants);
@@ -17568,7 +17568,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17619,7 +17619,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17683,7 +17683,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x3333);
         constants.insert(103, 0);
@@ -17746,7 +17746,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         backend.set_constants(constants);
 
@@ -17853,7 +17853,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, set_value as *const () as i64);
         backend.set_constants(constants);
 
@@ -17906,7 +17906,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, set_value2 as *const () as i64);
         backend.set_constants(constants);
 
@@ -17947,7 +17947,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, compute as *const () as i64);
         backend.set_constants(constants);
 
@@ -17987,7 +17987,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, compute2 as *const () as i64);
         backend.set_constants(constants);
 
@@ -18016,7 +18016,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         backend.set_constants(constants);
 
@@ -18101,7 +18101,7 @@ mod tests {
         ];
 
         // Test: value matches -> guard passes, reaches Finish
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 42i64);
         backend.set_constants(constants);
 
@@ -18114,7 +18114,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 42);
 
         // Test: value doesn't match -> guard fails
-        let mut constants2 = HashMap::new();
+        let mut constants2: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants2.insert(100, 42i64);
         backend.set_constants(constants2);
 
@@ -18757,7 +18757,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0xCAFE_BABEu64 as i64);
         backend.set_constants(constants);
 
@@ -19156,7 +19156,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, -4);
         backend.set_constants(constants);
@@ -19198,7 +19198,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 8);
         constants.insert(101, 16);
         constants.insert(102, 8);
@@ -19242,7 +19242,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 8);
         constants.insert(101, 8);
         backend.set_constants(constants);
@@ -19303,7 +19303,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 8);
         constants.insert(102, 4);
@@ -19343,7 +19343,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0);
         backend.set_constants(constants);
 
@@ -19388,7 +19388,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         backend.set_constants(constants);
 
@@ -19437,7 +19437,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         constants.insert(101, 8);
         backend.set_constants(constants);
@@ -19574,7 +19574,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0i64); // guard: x > 0
         constants.insert(101, 2i64); // x * 2
         backend.set_constants(constants);
@@ -19600,7 +19600,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(100, 100i64);
         backend.set_constants(bridge_constants);
 
@@ -19751,7 +19751,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(100, 1000i64);
         backend.set_constants(bridge_constants);
 
@@ -19918,7 +19918,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 8);
         constants.insert(102, 1);
@@ -19979,7 +19979,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 4);
         constants.insert(101, 4);
         backend.set_constants(constants);
@@ -20074,7 +20074,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_void as *const () as usize as i64,
@@ -20150,7 +20150,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_void as *const () as usize as i64,
@@ -20223,7 +20223,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_int_isolated as *const () as usize as i64,
@@ -20281,7 +20281,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -20352,7 +20352,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::float_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             maybe_force_and_return_float as *const () as usize as i64,
@@ -20400,7 +20400,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut callee_constants = HashMap::new();
+        let mut callee_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         callee_constants.insert(100, 2);
         backend.set_constants(callee_constants);
 
@@ -20420,7 +20420,7 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
 
         let mut caller_token = JitCellToken::new(1500_201);
         backend
@@ -20502,14 +20502,14 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
@@ -20546,7 +20546,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
@@ -20596,7 +20596,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 10);
         backend.set_constants(constants);
         let err = backend
@@ -20672,7 +20672,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -20717,7 +20717,7 @@ mod tests {
         assert_eq!(failed_descr.fail_index(), guard_fd.fail_index());
         assert_eq!(guard_fd.fail_count(), 1);
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -20754,7 +20754,7 @@ mod tests {
         {
             let mut backend = CraneliftBackend::new();
             let inputargs = vec![InputArg::new_int(0)];
-            let mut constants = HashMap::new();
+            let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
             constants.insert(100, 1);
             constants.insert(101, 0);
             backend.set_constants(constants);
@@ -20787,7 +20787,7 @@ mod tests {
             let failed = backend.execute_token(&token, &[Value::Int(0)]);
             let guard_descr = get_latest_descr_from_deadframe(&failed)
                 .expect("base-case guard should produce a valid descr");
-            backend.set_constants(HashMap::new());
+            backend.set_constants(majit_ir::VecAssoc::new());
             let bridge_ops = vec![
                 mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
                 mk_op(
@@ -20832,14 +20832,14 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 7);
         backend.set_constants(constants);
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &mut deferred_target)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&caller, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 12);
     }
@@ -20898,7 +20898,7 @@ mod tests {
             ),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -20911,7 +20911,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -20932,7 +20932,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -20972,7 +20972,7 @@ mod tests {
             ),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -20985,7 +20985,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         bridge_constants.insert(102, 1);
         backend.set_constants(bridge_constants);
@@ -21008,7 +21008,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21055,7 +21055,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
 
@@ -21075,7 +21075,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(101, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21110,7 +21110,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Ref(GcRef(0)), Value::Int(77), Value::Ref(old_ref)],
@@ -21163,7 +21163,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         root_constants.insert(101, 10);
         backend.set_constants(root_constants);
@@ -21177,7 +21177,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(102, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21198,7 +21198,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21262,7 +21262,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants = HashMap::new();
+        let mut root_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         root_constants.insert(100, 0);
         root_constants.insert(101, 10);
         root_constants.insert(102, 20);
@@ -21277,7 +21277,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants = HashMap::new();
+        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         bridge_constants.insert(103, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
@@ -21298,7 +21298,7 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
-        backend.set_constants(HashMap::new());
+        backend.set_constants(majit_ir::VecAssoc::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -21355,7 +21355,7 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         backend.set_constants(constants);
 
@@ -21433,7 +21433,7 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=32(size), 10001=-8(tid_ofs), 10002=7(tid),
         // 10003=8(word), 10004=0(vtable_ofs), 10005=0xDEAD(vtable)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 7_i64);
@@ -21483,7 +21483,7 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=56(total_size), 10001=-8(tid_ofs), 10002=1(tid1),
         // 10003=8(word), 10004=24(incr), 10005=2(tid2)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 56_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -21545,7 +21545,7 @@ mod tests {
     fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
         // Constants: 10000=0(len_ofs), 10001=8(size), 10002=0(kind), 10003=8(itemsize)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, 0_i64);
         consts.insert(10001, 8_i64);
         consts.insert(10002, 0_i64); // FLAG_ARRAY
@@ -21592,7 +21592,7 @@ mod tests {
     #[test]
     fn test_gc_call_malloc_array_helper_with_configured_runtime() {
         let mut backend = make_gc_backend();
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, gc_malloc_array_helper as *const () as i64);
         consts.insert(10001, 8_i64);
         consts.insert(10002, 7_i64);
@@ -21709,7 +21709,7 @@ mod tests {
         //   p2 = call_malloc_nursery(size)  # this overflows
         //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
         //   finish(p2, descr=finaldescr)
-        let mut consts = HashMap::new();
+        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         consts.insert(10000, alloc_size as i64);
         backend.set_constants(consts);
         let size_arg = OpRef::int_op(10000);
@@ -21794,7 +21794,7 @@ mod tests {
         ];
 
         let mut token = JitCellToken::new(1505_1);
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 111);
         constants.insert(101, 222);
         backend.set_constants(constants);
@@ -21863,7 +21863,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 777);
         backend.set_constants(constants);
 
@@ -21912,7 +21912,7 @@ mod tests {
             op(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 3);
         constants.insert(101, 0);
         constants.insert(102, 1);
@@ -21967,7 +21967,7 @@ mod tests {
             op(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 2);
         constants.insert(101, 0);
         constants.insert(102, 1);
@@ -22004,7 +22004,7 @@ mod tests {
             op(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         constants.insert(200, 0x2603);
@@ -22038,7 +22038,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1);
         backend.set_constants(constants);
 
@@ -22081,7 +22081,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 0);
         backend.set_constants(constants);
 
@@ -22136,7 +22136,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             collect_nursery_via_runtime as *const () as usize as i64,
@@ -22193,7 +22193,7 @@ mod tests {
             ),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(
             100,
             collect_nursery_via_runtime_void as *const () as usize as i64,
@@ -22391,7 +22391,7 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 1i64);
         constants.insert(101, 1_000_000i64);
         backend.set_constants(constants);
@@ -22598,7 +22598,7 @@ mod tests {
     #[test]
     fn test_all_opcodes_covered_in_backend() {
         let mut backend = CraneliftBackend::new();
-        let mut constants = HashMap::new();
+        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
         constants.insert(100, 42i64);
         constants.insert(101, 7i64);
         backend.set_constants(constants);
