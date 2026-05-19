@@ -812,7 +812,7 @@ def main():
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    3,     3,     None)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     10)
-        chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    2)
+        chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    1.5,     None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
         chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)

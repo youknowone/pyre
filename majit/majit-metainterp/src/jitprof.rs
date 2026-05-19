@@ -95,30 +95,21 @@ pub struct JitProfiler {
     pub calls: AtomicUsize,
     /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
     /// self.profiler.initialized: self.profiler.start(); ...
-    /// initialized = True`.  Pyre carries the flag on the profiler
-    /// itself (instead of on `MetaInterpStaticData.globaldata`) so
-    /// `start()` is self-contained and idempotent without needing the
-    /// staticdata mutex.
+    /// initialized = True`.  RPython keeps this flag separate from
+    /// `Profiler.start()`: `start()` always resets counters, while
+    /// `_setup_once` decides whether to call it.
     pub initialized: AtomicBool,
 }
 
 impl JitProfiler {
-    /// jitprof.py:55-61 `Profiler.start`.  Idempotent because the
-    /// `initialized` flag is the canonical "has start ever run?"
-    /// signal (pyjitpl.py:2300-2302).
+    /// jitprof.py:55-61 `Profiler.start`.
     ///
-    /// Returns whether `start()` actually ran the initialisation
-    /// (`false` if `initialized` was already set).  On the first
-    /// real call every counter is zeroed to match upstream's
-    /// `self.counters = [0] * ncounters; self.calls = 0` reset
-    /// (jitprof.py:63-64).  Out-of-band counts accumulated before
-    /// `_setup_once` (e.g. fixture-driven `count_ops` calls) are
-    /// discarded by design — the canonical "session start" moment
-    /// is when `_setup_once` flips `initialized`.
-    pub fn start(&self) -> bool {
-        if self.initialized.swap(true, Ordering::AcqRel) {
-            return false;
-        }
+    /// Not idempotent by design: upstream `Profiler.start()` resets
+    /// `self.counters` and `self.calls` every time it is called.  The
+    /// one-shot guard lives at the caller (`pyjitpl.py:2300-2302`
+    /// `_setup_once`: `if not self.profiler.initialized: ...`), not
+    /// inside `start()`.
+    pub fn start(&self) {
         for field in [
             &self.tracing,
             &self.backend,
@@ -146,7 +137,6 @@ impl JitProfiler {
         ] {
             field.store(0, Ordering::Relaxed);
         }
-        true
     }
 
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.

@@ -936,18 +936,6 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
-        // `pyjitpl.py:2273-2283 finish_setup_descrs_for_jitdrivers` —
-        // production `JitDriver` consumers reach this via
-        // `register_descriptor` (called from the macro-emitted
-        // `__JitMeta::install_canonical_liveness`).  `with_descriptor`
-        // skips registration on purpose (it is a "pre-built descriptor"
-        // shortcut used by integration tests and `with_declarative`),
-        // so the propagate-exception descr would otherwise stay
-        // unattached and the first `backend.compile_loop` would build
-        // a per-CPU trampoline against a NULL descr pointer
-        // (`x86/assembler.rs:238`).  The call is idempotent — a later
-        // `register_descriptor` re-uses the same `Arc` by identity.
-        driver.meta.finish_setup_descrs_for_jitdrivers();
         // warmstate.py:564 `_green_args_spec` carries lltype TYPE per
         // green arg, including `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
         // distinct from generic Ptr.  `JitDriverVar.green_type` is the
@@ -968,6 +956,15 @@ impl<S: JitState> JitDriver<S> {
             name: "primary".to_string(),
             schema: greens,
         });
+        // PyPy's `finish_setup` (`pyjitpl.py:2273-2283`) wires
+        // `portal_finishtoken` / `propagate_exc_descr` after the driver
+        // is present in `metainterp_sd.jitdrivers_sd`.  Register the
+        // pre-built descriptor now so the existing
+        // `register_jitdriver_sd` tail call performs that wiring on the
+        // actual jitdriver slot, not just on the CPU-global propagate
+        // descr.  Later macro-emitted `ensure_descriptor_registered`
+        // calls are idempotent because the descriptor now has an index.
+        driver.ensure_descriptor_registered();
         driver
     }
 
@@ -4223,6 +4220,7 @@ mod tests {
     #[test]
     fn jit_merge_point_only_drives_active_trace() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 123u64;
         let mut state = TypedRestoreState {
             live_values: vec![1],
@@ -4267,6 +4265,7 @@ mod tests {
     #[test]
     fn blackhole_jump_reports_via_blackhole_even_with_typed_restore_values() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 9u64;
 
         assert!(matches!(
@@ -4311,6 +4310,7 @@ mod tests {
     #[test]
     fn run_compiled_detailed_keyed_uses_typed_live_inputs() {
         let mut driver = JitDriver::<TypedInputState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 11u64;
         // Input 0 is Int (used as GuardFalse condition); inputs 1/2 are
         // Ref/Float so the typed restore path still exercises mixed types.
@@ -4371,6 +4371,7 @@ mod tests {
     #[test]
     fn blackhole_fallback_uses_typed_live_inputs() {
         let mut driver = JitDriver::<TypedInputState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 12u64;
         // Input 0 is Int (used as GuardFalse condition); inputs 1/2 are
         // Ref/Float so the typed restore path still exercises mixed types.
@@ -4438,6 +4439,7 @@ mod tests {
         // counter.py: compute_threshold(1) = 1.0/(1-0.001) ≈ 1.001
         // First tick adds ≈1.001 to 0.0, reaching ≥1.0 immediately.
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 500u64;
         assert!(matches!(
             driver.meta.on_back_edge(key, &[]),
@@ -4448,6 +4450,7 @@ mod tests {
     #[test]
     fn test_set_param_threshold() {
         let mut driver = JitDriver::<TypedRestoreState>::new(10);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         // Initially threshold is 10 — not hot after 2 ticks.
         let key = 100u64;
         assert!(matches!(
@@ -4476,6 +4479,7 @@ mod tests {
     #[test]
     fn test_get_stats_after_compile() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 300u64;
 
         // Stats should be zero initially.
@@ -4520,6 +4524,7 @@ mod tests {
     #[test]
     fn test_set_param_unknown_ignored() {
         let mut driver = JitDriver::<TypedRestoreState>::new(5);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         // Unknown params should not panic or cause any side effects.
         driver.set_param("nonexistent_param", 999);
         driver.set_param("", 0);
@@ -4593,6 +4598,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         driver.set_on_compile_loop(move |green_key, ops_before, ops_after| {
@@ -4641,6 +4647,7 @@ mod tests {
     #[test]
     fn test_hook_get_stats_matches_real_compile_count() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
 
         // Initially zero.
         let stats = driver.get_stats();
@@ -4680,6 +4687,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         driver.meta.set_on_compile_bridge(move |gk, fi, nops| {
@@ -4762,6 +4770,7 @@ mod tests {
     #[test]
     fn test_start_bridge_tracing_skips_non_traceable_state() {
         let mut driver = JitDriver::<NonTraceableState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 404u64;
         assert!(matches!(
             driver.meta.on_back_edge(green_key, &[0]),
@@ -4803,6 +4812,7 @@ mod tests {
     #[test]
     fn test_multi_entry_point_registration() {
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
 
         // Initially no entry points.
         assert!(driver.entry_points().is_empty());
@@ -4838,6 +4848,7 @@ mod tests {
         // from any entry point, since they share the same MetaInterp and
         // compiled loop table (keyed by green_key, not by entry point name).
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         driver.register_entry_point("func_a", &[Type::Int]);
         driver.register_entry_point("func_b", &[Type::Int]);
 
@@ -4927,6 +4938,7 @@ mod tests {
         let expected = asm.all_liveness().to_vec();
 
         let mut driver = JitDriver::<TypedRestoreState>::new(0);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         driver.install_canonical_liveness(&asm);
 
         assert_eq!(driver.meta.staticdata.liveness_info, expected);

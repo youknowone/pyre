@@ -53,6 +53,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     // the live wire.
 
     let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -109,6 +110,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
 #[test]
 fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
     let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_dead_beef;
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -159,6 +161,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
     assert_eq!(trace_target, __majit_call_target_int_bit_count as *const (),);
 
     let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_0bad_cafe_dead_beef;
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -199,6 +202,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
 #[test]
 fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
     let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
