@@ -13661,26 +13661,20 @@ fn collect_guards(
                 // and `external_jump_target` (Slice 7-Tβ8) are reachable.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
             } else if let Some(d) = op.descr.clone() {
-                // When `op.descr` is a `ResumeGuardDescr` (the common
-                // case post-`store_final_boxes_in_guard`), use it
-                // directly.  Non-Resume meta descrs
-                // (PropagateExceptionDescr backing GUARD_NO_EXCEPTION
-                // in `compile_tmp_callback`,
-                // ExitFrameWithExceptionDescrRef, etc.) carry no
-                // ResumeGuardDescr-shaped slots — synthesise an empty
-                // ResumeGuardDescr so the meta-side bridge caches
-                // (Slice 7-Tβ11) baked into
-                // `emit_attached_bridge_dispatch` resolve to a valid
-                // heap-pinned cell that always reads 0.  No bridge is
-                // ever attached to these guards (PyPy's `_assemble_op`
-                // skips bridge logic for non-Resume descrs), so the
-                // cells stay 0 and the dispatch falls through to the
-                // deadframe path.
-                if d.is_resume_guard() || d.is_resume_guard_copied() {
-                    d
-                } else {
-                    majit_backend::make_resume_guard_descr_typed(fail_arg_types.clone())
-                }
+                // Preserve `op.descr` identity for every guard that carries
+                // one — including non-Resume FailDescrs (PropagateExceptionDescr
+                // attached to GUARD_NO_EXCEPTION by `compile_tmp_callback`
+                // at `compile.py:1092`, ExitFrameWithExceptionDescrRef, etc.).
+                // PropagateExceptionDescr.handle_fail (`compile.py:1138`)
+                // raises ExitFrameWithExceptionRef; replacing the identity
+                // here would route the failure through the generic resume
+                // dispatcher instead and silently swallow the exception
+                // propagation.  Bridge dispatch is gated below
+                // (`can_have_bridge` restricted to Resume-family) so
+                // `emit_attached_bridge_dispatch` never runs for non-Resume
+                // descrs — mirroring `_assemble_op` which skips bridge
+                // logic for them.
+                d
             } else {
                 // Guard ops without an explicit op.descr (test
                 // scaffolding bypassing the tracer/optimizer that
@@ -13779,7 +13773,15 @@ fn collect_guards(
         // dispatch emitter cannot recover the cell owner from that
         // pointer alone — we hand it the cache addresses directly via
         // GuardInfo.
-        let bridge_cache_addrs = if is_guard {
+        //
+        // Restricted to Resume-family descrs: `_assemble_op` skips
+        // bridge logic for non-Resume FailDescrs (PropagateExceptionDescr
+        // and friends never get a bridge attached), and only
+        // ResumeGuardDescr / ResumeGuardCopiedDescr carry the per-emission
+        // bridge_cache cells `fail_descr_bridge_cache_addrs` reads.
+        let can_have_bridge =
+            is_guard && (descr.is_resume_guard() || descr.is_resume_guard_copied());
+        let bridge_cache_addrs = if can_have_bridge {
             Some(fail_descr_bridge_cache_addrs(as_fd(&descr)))
         } else {
             None
@@ -13818,7 +13820,7 @@ fn collect_guards(
         );
         guard_infos.push(GuardInfo {
             fail_index,
-            can_have_bridge: is_guard,
+            can_have_bridge,
             fail_arg_refs,
             must_save_exception,
             gcmap,
