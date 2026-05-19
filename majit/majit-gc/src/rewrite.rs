@@ -9,10 +9,8 @@
 /// - SETFIELD_GC with a Ref-typed value -> COND_CALL_GC_WB + SETFIELD_GC
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
-use std::collections::{BTreeMap, HashMap, HashSet};
-
 use majit_ir::Type;
-use majit_ir::VecAssoc;
+use majit_ir::{VecAssoc, VecSet};
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 
@@ -352,15 +350,15 @@ struct RewriteState {
     /// whose write barrier has already been emitted (freshly allocated
     /// objects, or objects we already issued a WB for). Cleared whenever
     /// we emit an operation that can trigger a collection or on LABEL.
-    wb_applied: HashSet<OpRef>,
+    wb_applied: VecSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result OpRefs.
-    forwarding: HashMap<OpRef, OpRef>,
+    forwarding: VecAssoc<OpRef, OpRef>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
     /// constant length operand (rewrite.py:551). Cleared on LABEL
     /// (rewrite.py:1005) and emitting_an_operation_that_can_collect.
-    known_lengths: HashMap<OpRef, usize>,
+    known_lengths: VecAssoc<OpRef, usize>,
 
     // ── Pending zero tracking ──
     /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
@@ -368,17 +366,17 @@ struct RewriteState {
     pending_zeros: Vec<PendingZero>,
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
-    initialized_indices: HashMap<OpRef, HashSet<usize>>,
+    initialized_indices: VecAssoc<OpRef, VecSet<usize>>,
     /// rewrite.py:61 `_delayed_zero_setfields = {}`.
     ///
-    /// Map from base OpRef → {byte-offset: ()} of zero-init
-    /// SETFIELD_GC stores deferred by `clear_gc_fields`.  An explicit
-    /// SETFIELD_GC that overwrites the same offset removes the entry
-    /// via `consider_setfield_gc` (rewrite.py:506-512); anything still
+    /// Map from base OpRef → set of byte-offsets of zero-init SETFIELD_GC
+    /// stores deferred by `clear_gc_fields`.  An explicit SETFIELD_GC
+    /// that overwrites the same offset removes the entry via
+    /// `consider_setfield_gc` (rewrite.py:506-512); anything still
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
-    _delayed_zero_setfields: HashMap<OpRef, BTreeMap<i64, ()>>,
+    _delayed_zero_setfields: VecAssoc<OpRef, VecSet<i64>>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -393,7 +391,7 @@ struct RewriteState {
     /// ported.  The parity skeleton is kept here so the structural
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
-    _constant_additions: HashMap<OpRef, (OpRef, i64)>,
+    _constant_additions: VecAssoc<OpRef, (OpRef, i64)>,
     /// Next constant index for `OpRef::from_const`. Shares the
     /// constant-namespace with the tracer's ConstantPool; initialized in
     /// `with_constants` from the passed-in map so newly emitted constants
@@ -408,7 +406,7 @@ struct RewriteState {
     /// input op list. The main dispatch loop checks for a substitution
     /// at iteration `i` and swaps the rewritten op in place of the
     /// original (rewrite.py:366-367).
-    changed_ops: HashMap<usize, Op>,
+    changed_ops: VecAssoc<usize, Op>,
 
     /// rewrite.py:96-99 `get_box_replacement` — source→replacement mapping
     /// for ops that `transform_to_gc_load` has forwarded to a lowered
@@ -419,7 +417,7 @@ struct RewriteState {
     /// keyed by the main-loop iteration index (stashed in
     /// `current_i`) and consumed by `emit_maybe_forwarded` when the
     /// outer dispatch reaches the op's emission site.
-    forwarded_ops: HashMap<usize, Op>,
+    forwarded_ops: VecAssoc<usize, Op>,
     /// Current main-loop iteration index, set by the outer dispatch
     /// before invoking `transform_to_gc_load` / `handle_*` helpers.
     /// Read by `set_forwarded` / `emit_maybe_forwarded` to key the
@@ -439,16 +437,16 @@ impl RewriteState {
             pending_malloc_total: 0,
             previous_size: 0,
             last_malloced_ref: OpRef::NONE,
-            wb_applied: HashSet::new(),
-            forwarding: HashMap::new(),
-            known_lengths: HashMap::new(),
+            wb_applied: VecSet::new(),
+            forwarding: VecAssoc::new(),
+            known_lengths: VecAssoc::new(),
             pending_zeros: Vec::new(),
-            initialized_indices: HashMap::new(),
-            _delayed_zero_setfields: HashMap::new(),
-            _constant_additions: HashMap::new(),
+            initialized_indices: VecAssoc::new(),
+            _delayed_zero_setfields: VecAssoc::new(),
+            _constant_additions: VecAssoc::new(),
             next_const_idx: 0,
-            changed_ops: HashMap::new(),
-            forwarded_ops: HashMap::new(),
+            changed_ops: VecAssoc::new(),
+            forwarded_ops: VecAssoc::new(),
             current_i: 0,
         }
     }
@@ -709,9 +707,9 @@ impl RewriteState {
     /// rewrite.py:84-91 `delayed_zero_setfields(op)` — get-or-create the
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
-    fn delayed_zero_setfields(&mut self, r: OpRef) -> &mut BTreeMap<i64, ()> {
+    fn delayed_zero_setfields(&mut self, r: OpRef) -> &mut VecSet<i64> {
         let key = self.resolve(r);
-        self._delayed_zero_setfields.entry(key).or_default()
+        self._delayed_zero_setfields.entry_or_default(key)
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
@@ -723,8 +721,7 @@ impl RewriteState {
             .any(|pz| pz.array_ref == array_ref)
         {
             self.initialized_indices
-                .entry(array_ref)
-                .or_default()
+                .entry_or_default(array_ref)
                 .insert(index);
         }
     }
@@ -778,7 +775,7 @@ impl RewriteState {
         // directly.
         let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
         for (ptr, entries) in pending_zsf {
-            for ofs in entries.keys().copied() {
+            for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
                 let word_ref = self.const_int(8);
@@ -973,7 +970,7 @@ impl GcRewriterImpl {
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(result);
         for fd in descr.gc_fielddescrs() {
-            entries.insert(fd.offset() as i64, ());
+            entries.insert(fd.offset() as i64);
         }
     }
 
