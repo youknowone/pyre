@@ -495,14 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn shadow_allow_list_is_empty_after_phase5a() {
-        // Phase 5.A (issue #73, 2026-05-20) production-flipped the Nop
-        // family to walker dispatch; PopTop is structurally blocked from
-        // shadow validation (non-elidable pop_value) and gets production-
-        // flipped in Phase 5.B.  The shadow allow-list is intentionally
-        // empty: `opname_in_shadow_allow_list` is now a vestigial gate
-        // until Phase 6 retires the shadow_walker module entirely.  See
-        // `[[project-issue73-phase5-design]]`.
+    fn shadow_allow_list_is_empty_pending_structural_epic() {
+        // Phase 5.A production-flipped the Nop family — they no longer
+        // belong in the shadow allow-list.  PopTop and the rest of the
+        // Python opcodes are blocked by the per-jitcode register-bank
+        // structural mismatch documented in `opname_in_shadow_allow_list`;
+        // shadow validation cannot meaningfully run against arm-local
+        // r0=frame semantics until MIFrame restructuring lands.  Until
+        // then the allow-list stays empty.
         assert!(!opname_in_shadow_allow_list(&Instruction::Nop));
         assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
     }

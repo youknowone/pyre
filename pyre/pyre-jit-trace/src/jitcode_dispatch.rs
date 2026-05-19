@@ -7398,6 +7398,81 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_pop_value_sub_jitcode_bytes() {
+        let target_idx: usize = std::env::var("DUMP_JITCODE_IDX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(358);
+        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
+        let all = all_jitcodes();
+        if target_idx >= all.len() {
+            eprintln!("no jitcode {target_idx} (len={})", all.len());
+            return;
+        }
+        let jc = &all[target_idx];
+        let code = jc.code.as_slice();
+        eprintln!(
+            "sub-jitcode (idx {target_idx}): name={} num_regs_r={} num_regs_i={} num_regs_f={} constants_r={} constants_i={} code_len={}",
+            jc.name,
+            jc.num_regs_r(),
+            jc.num_regs_i(),
+            jc.num_regs_f(),
+            jc.constants_r.len(),
+            jc.constants_i.len(),
+            code.len(),
+        );
+        eprintln!("constants_i = {:#x?}", jc.constants_i);
+        eprintln!("constants_r = {:#x?}", jc.constants_r);
+        eprintln!("Raw bytes: {:02x?}", code);
+        let descrs = all_descrs();
+        for op in decoded_ops(code) {
+            let operand_bytes = &code[op.pc + 1..op.next_pc];
+            eprintln!(
+                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                op.pc, op.next_pc, op.key, operand_bytes,
+            );
+            let mut cursor = 0usize;
+            let mut chars = op.argcodes.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'L' => cursor += 2,
+                    'd' | 'j' => {
+                        if cursor + 1 < operand_bytes.len() {
+                            let idx = u16::from_le_bytes([
+                                operand_bytes[cursor],
+                                operand_bytes[cursor + 1],
+                            ]) as usize;
+                            let info = descrs
+                                .get(idx)
+                                .map(|d| format!("{:?}", d))
+                                .unwrap_or_else(|| "<oor>".to_string());
+                            eprintln!("      descr[{idx}] = {info}");
+                            cursor += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    'I' | 'R' | 'F' => {
+                        if cursor < operand_bytes.len() {
+                            let n = operand_bytes[cursor] as usize;
+                            cursor += 1 + n;
+                        } else {
+                            break;
+                        }
+                    }
+                    '>' => {
+                        chars.next();
+                        cursor += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_pop_top_arm_bytes() {
         use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
         let jc = jitcode_for_instruction(&Instruction::PopTop)
