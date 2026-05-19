@@ -4842,22 +4842,20 @@ impl CodeWriter {
                     }
                     block_switch_pending = true;
                 } else {
-                    // No switch — same block continues at py_pc.  Just
-                    // mark the Label so post-walk dispatch resolves
-                    // `pcN` to this position.  No goto / fallthrough
-                    // bookkeeping needed because `current_block`
-                    // doesn't change.
+                    // No switch — same block continues at py_pc.
+                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` emission
+                    // retires here.  Pyre's runtime `pc_map` is now sourced
+                    // from the `walker_pc_live_marker_pos` side-table (see
+                    // `walker_tracked_pc_live_indices` at drain time), so
+                    // we no longer need a per-PC anchor in the SSARepr to
+                    // serve runtime PC dispatch.  This matches upstream
+                    // `rpython/jit/codewriter/flatten.py:116` which only
+                    // emits one `Label(block)` per FunctionGraph block.
+                    // `walker_pc_anchor_pos` is kept for the debug parity
+                    // assertion in `pc_anchor_positions` callers but is
+                    // no longer populated; resolver-side `None` from an
+                    // empty record vector keeps the assertion off.
                     needs_fallthrough = true;
-                    push_walker_emit(&current_block, Insn::pc_anchor(py_pc));
-                    // T6.1 Slice 3: record the per-PC anchor position at
-                    // walker emit time, mirroring the live-marker tracker.
-                    // Drain-time resolver picks the first entry whose
-                    // block contributes non-empty content to the final
-                    // SSARepr, matching `pc_anchor_positions`' first-wins
-                    // scan.
-                    let anchor_offset = current_block.per_block_ssarepr_len() - 1;
-                    walker_pc_anchor_pos[py_pc]
-                        .push((current_block.clone(), anchor_offset));
                 }
             }};
         }
@@ -9101,33 +9099,13 @@ impl CodeWriter {
             // with the legacy SSARepr scan.  Failure here means a
             // walker emit site pushed `-live-` / `pc_anchor` without
             // updating `walker_pc_*_pos`, or first-wins disagreement.
-            #[cfg(debug_assertions)]
-            {
-                let (walker_tracked_pc_anchor_indices, walker_tracked_pc_live_indices) =
-                    &walker_tracked_pc_indices;
-                if let Some(walker_tracked) = walker_tracked_pc_anchor_indices.as_ref() {
-                    if walker_tracked.len() == code.instructions.len() {
-                        let scanned =
-                            pc_anchor_positions(&ssarepr, code.instructions.len());
-                        assert_eq!(
-                            walker_tracked, &scanned,
-                            "T6.1 walker-tracked PC anchor positions diverge from \
-                             pc_anchor_positions"
-                        );
-                    }
-                }
-                if let Some(walker_tracked) = walker_tracked_pc_live_indices.as_ref() {
-                    if walker_tracked.len() == code.instructions.len() {
-                        let scanned =
-                            live_marker_indices_by_pc(&ssarepr, code.instructions.len());
-                        assert_eq!(
-                            walker_tracked, &scanned,
-                            "T6.1 walker-tracked PC live-marker positions diverge from \
-                             live_marker_indices_by_pc"
-                        );
-                    }
-                }
-            }
+            // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` emission has
+            // been retired, so the scan-based `pc_anchor_positions` /
+            // `live_marker_indices_by_pc` sources no longer apply here.
+            // The walker-tracked side-tables are now the sole source of
+            // truth for per-PC positions; downstream consumers
+            // (`filter_liveness_in_place`, `pc_map`) translate them
+            // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices.1;
         }
 
@@ -9856,26 +9834,24 @@ impl CodeWriter {
         // from the per-PC `Label("pcN")` anchor, so record the final
         // per-PC live-marker positions here instead of the label indices.
         //
-        // T6.1 Slice 3 production switch: `filter_liveness_in_place`
-        // returns the post-`remove_repeated_live` per-PC `-live-`
-        // positions (computed from the walker-tracked PRE-merge
-        // positions via the merge pass's remap), which is the
-        // authoritative source for `pc_map`.  Falls back to the scan
-        // when walker tracking is unavailable (test fixtures).
-        let pc_map = if post_remove_live_indices.len() == num_instrs {
-            post_remove_live_indices.clone()
-        } else {
-            live_marker_indices_by_pc(&ssarepr, num_instrs)
-        };
-        #[cfg(debug_assertions)]
-        if post_remove_live_indices.len() == num_instrs {
-            let scanned = live_marker_indices_by_pc(&ssarepr, num_instrs);
-            assert_eq!(
-                post_remove_live_indices, scanned,
-                "T6.1 walker-tracked PC live-marker positions diverge \
-                 from live_marker_indices_by_pc post-`remove_repeated_live`"
-            );
-        }
+        // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")` is no longer
+        // emitted, so `live_marker_indices_by_pc` (which scans for the
+        // anchor labels) no longer applies in production.  The
+        // walker-tracked side-table — translated through the
+        // `remove_repeated_live` remap by `filter_liveness_in_place` —
+        // is the sole source of per-PC `-live-` positions; assert that
+        // it is present, otherwise the runtime `pc_map` would be
+        // undefined.  The scan-based fallback survives only inside
+        // test fixtures that manually emit per-PC labels and call
+        // `live_marker_indices_by_pc` directly (see codewriter.rs tests
+        // around line 11566).
+        assert_eq!(
+            post_remove_live_indices.len(),
+            num_instrs,
+            "T6.1: filter_liveness_in_place must return one entry per Python PC; \
+             walker-tracked side-table was unavailable"
+        );
+        let pc_map = post_remove_live_indices.clone();
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
