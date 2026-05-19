@@ -1666,6 +1666,132 @@ pub fn dispatch_via_miframe(
     result
 }
 
+/// Issue #73 Phase 5.B orthodox entry: walk a per-opcode arm jitcode with
+/// **fresh per-jitcode register banks** sized to the entry jitcode's
+/// declared `num_regs_<i|r|f>() + len(constants_<i|r|f>)`, with `r0`
+/// pre-seeded to the live PyFrame OpRef (`sym.frame`).
+///
+/// RPython line-by-line parity:
+///
+/// * Allocation + constant copy: `MIFrame.setup(jitcode)` at
+///   `pyjitpl.py:74-91` calls `copy_constants` for each of the three
+///   register banks, producing fresh per-frame lists of length
+///   `num_regs_X + len(constants_X)`.  `allocate_callee_register_banks`
+///   below ports that shape (`pyjitpl.py:97-119 copy_constants`).
+/// * `r0 = frame`: every per-opcode arm body the codewriter emits
+///   treats register 0 as the implicit PyFrame argument (verified for
+///   the PopTop arm — `inline_call_r_r/dR>r [r0]` invokes the
+///   `pop_value` sub-jitcode with `r0` = caller's r0).  This matches
+///   RPython's convention where the topmost call site provides the
+///   PyFrame as the first argument to the jitdriver's portal jitcode
+///   (`call.py:148 portal_runner`).  The concrete frame address comes
+///   from `MIFrame.concrete_frame_addr`, populated by the production
+///   tracer at `trace_opcode.rs:768`.
+///
+/// The semantic frame mirror (`sym.registers_r`) and the per-jitcode
+/// arm-local banks are now distinct universes: this entry no longer
+/// aliases `sym.registers_r` as the walker's `registers_r`.  Closes
+/// the structural blocker documented in
+/// `project_issue73_phase5_design.md` for opcodes whose arm uses
+/// `r0 = frame`.
+///
+/// `last_exc_value` / `last_exc_box` / `class_of_last_exc_is_const`
+/// writeback to `sym` mirrors `dispatch_via_miframe` byte-for-byte —
+/// the symbolic exception state survives across per-opcode dispatches
+/// at the production tracer's contract.
+pub fn dispatch_via_miframe_at_opcode_entry<'a>(
+    miframe: &mut crate::state::MIFrame,
+    entry_jitcode: &'static majit_translate::jitcode::JitCode,
+    descr_refs: &'a [DescrRef],
+    sub_jitcode_lookup: &'a SubJitCodeLookup,
+    done_with_this_frame_descr_ref: DescrRef,
+    done_with_this_frame_descr_int: DescrRef,
+    done_with_this_frame_descr_float: DescrRef,
+    done_with_this_frame_descr_void: DescrRef,
+    exit_frame_with_exception_descr_ref: DescrRef,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let ctx_ptr = miframe.ctx;
+    let sym_ptr = miframe.sym;
+    let concrete_frame_addr = miframe.concrete_frame_addr;
+    // SAFETY: both pointers were initialized at MIFrame construction
+    // time and outlive this call (parity with dispatch_via_miframe).
+    let trace_ctx = unsafe { &mut *ctx_ptr };
+    let sym = unsafe { &mut *sym_ptr };
+
+    let initial_last_exc_value = if sym.last_exc_box.is_none() {
+        None
+    } else {
+        Some(sym.last_exc_box)
+    };
+    let initial_last_exc_value_concrete = if sym.last_exc_value.is_null() {
+        ConcreteValue::Null
+    } else {
+        ConcreteValue::Ref(sym.last_exc_value)
+    };
+    let frame_opref = sym.frame;
+
+    // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
+    // `copy_constants(registers, constants, num_regs_X, ConstClass)`.
+    // `allocate_callee_register_banks` ports this for sub-jitcode
+    // entries; reuse it here for the per-opcode entry too, sharing the
+    // exact byte-shape: registers `[0..num_regs_X)` are zero/None, the
+    // constants pool occupies `[num_regs_X..num_regs_X+len(constants))`.
+    let body = SubJitCodeBody {
+        code: entry_jitcode.code.as_slice(),
+        num_regs_r: entry_jitcode.num_regs_r(),
+        num_regs_i: entry_jitcode.num_regs_i(),
+        num_regs_f: entry_jitcode.num_regs_f(),
+        constants_i: entry_jitcode.constants_i.as_slice(),
+        constants_r: entry_jitcode.constants_r.as_slice(),
+        constants_f: entry_jitcode.constants_f.as_slice(),
+    };
+    let (mut regs_r, mut regs_i, mut regs_f, mut concrete_r, mut concrete_i) =
+        allocate_callee_register_banks(&body, trace_ctx);
+
+    // r0 = frame OpRef.  Mirror RPython's portal-runner contract where
+    // the topmost frame's `registers_r[0]` carries the PyFrame argument.
+    // Skeleton arms with `num_regs_r() == 0` (no Ref bank, e.g. trivial
+    // pass-through opcodes) simply skip the seed.
+    if entry_jitcode.num_regs_r() > 0 {
+        regs_r[0] = frame_opref;
+        concrete_r[0] = if concrete_frame_addr != 0 {
+            ConcreteValue::Ref(concrete_frame_addr as pyre_object::PyObjectRef)
+        } else {
+            ConcreteValue::Null
+        };
+    }
+
+    let result = {
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            concrete_registers_r: &mut concrete_r,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs,
+            trace_ctx,
+            done_with_this_frame_descr_ref,
+            done_with_this_frame_descr_int,
+            done_with_this_frame_descr_float,
+            done_with_this_frame_descr_void,
+            exit_frame_with_exception_descr_ref,
+            is_top_level: false,
+            sub_jitcode_lookup,
+            last_exc_value: initial_last_exc_value,
+            last_exc_value_concrete: initial_last_exc_value_concrete,
+        };
+        let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
+        let final_last_exc = wc.last_exc_value;
+        drop(wc);
+        if let Some(exc) = final_last_exc {
+            sym.last_exc_box = exc;
+            sym.class_of_last_exc_is_const = true;
+        }
+        outcome
+    };
+    result
+}
+
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
 /// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///

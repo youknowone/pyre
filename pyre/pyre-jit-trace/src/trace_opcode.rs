@@ -6469,24 +6469,20 @@ impl MIFrame {
                     })
             };
 
-        // PyPy `pyjitpl.py:171-200 MIFrame.__init__` + `setup_call(argboxes)`
-        // analog: derive per-bank num_regs + constants from the codewriter-
-        // emitted arm jitcode, and supply the MIFrame self ptr as the
-        // implicit `handler = self` argbox at `R[0]_r`.
-        let top_num_regs_r = jitcode.num_regs_r() as usize;
-        let top_num_regs_i = jitcode.num_regs_i() as usize;
-        let top_num_regs_f = jitcode.num_regs_f() as usize;
-        let top_constants_r = jitcode.constants_r.as_slice();
-        let top_constants_i = jitcode.constants_i.as_slice();
-        let top_constants_f = jitcode.constants_f.as_slice();
-        let miframe_ptr = self as *mut MIFrame as i64;
-        let miframe_argbox = self.ctx().const_ref(miframe_ptr);
-        let argboxes_r = [miframe_argbox];
-
-        let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
+        // Issue #73 Phase 5.B: per-opcode arm entry allocates fresh
+        // per-jitcode register banks and seeds r0 = sym.frame.  This
+        // matches RPython MIFrame.setup (`pyjitpl.py:74-91`) and breaks
+        // the prior alias of sym.registers_r (semantic frame mirror)
+        // into the walker's r0..rN — the structural blocker documented
+        // in `project_issue73_phase5_design.md`.  `jitcode_for_instruction`
+        // returns an Arc<JitCode> over the registry's `'static`
+        // collection; the leak below upgrades the borrow to `'static`
+        // for the duration of this call.
+        let entry_jitcode: &'static majit_translate::jitcode::JitCode =
+            unsafe { &*(jitcode.as_ref() as *const majit_translate::jitcode::JitCode) };
+        let walk_result = crate::jitcode_dispatch::dispatch_via_miframe_at_opcode_entry(
             self,
-            jitcode.code.as_slice(),
-            0,
+            entry_jitcode,
             crate::jitcode_runtime::all_descr_refs(),
             &sub_jitcode_lookup,
             done_ref,
@@ -6494,16 +6490,6 @@ impl MIFrame {
             done_float,
             done_void,
             exit_exc_ref,
-            false,
-            top_num_regs_r,
-            top_num_regs_i,
-            top_num_regs_f,
-            top_constants_r,
-            top_constants_i,
-            top_constants_f,
-            &argboxes_r,
-            &[],
-            &[],
         );
 
         use crate::jitcode_dispatch::DispatchOutcome;
@@ -7366,6 +7352,19 @@ unsafe fn trace_check_exc_match_against(
 /// gate, 5.C..N per-opcode batches) grow this set until it covers every
 /// Python opcode, at which point Phase 6 deletes the trait infra.
 fn production_walker_handles(instruction: &Instruction) -> bool {
+    // Issue #73 Phase 5.B landed `dispatch_via_miframe_at_opcode_entry`
+    // (the orthodox MIFrame.setup parity: fresh per-jitcode register
+    // banks + r0 = sym.frame).  PopTop now reaches its sub-jitcode body
+    // (`pop_value`, idx 358) without the r0-mismatch panic but still
+    // surfaces a deeper concrete-propagation gap: `nlocals` (idx 121)
+    // and `valuestackdepth` reads route through `residual_call_r_<i,r>`
+    // helpers whose `EffectInfo` doesn't yet classify the read as
+    // `MayNotForce`/elidable, so the callee's result concrete is `Null`
+    // and downstream `int_le` → `goto_if_not` panics with
+    // `GotoIfNotValueNotConcrete`.  Closing that gap is the Phase 3
+    // expansion (oopspec / EffectInfo recognition per helper) — keep
+    // PopTop out of the allow-list until those helpers carry the
+    // matching `OopSpecKind` tag.
     matches!(
         instruction,
         Instruction::Nop
