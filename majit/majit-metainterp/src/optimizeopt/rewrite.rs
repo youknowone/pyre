@@ -2448,7 +2448,7 @@ impl OptRewrite {
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         let key = (inverse_opcode, arg0, arg1);
-        let &cached_ref = self.bool_result_cache.get(&key)?;
+        let cached_ref = self.bool_result_cache.get(&key).copied()?;
         // rewrite.py:60-65: b = self.getintbound(oldop)
         // First try direct constant (fast path)
         if let Some(val) = ctx.get_constant_int(cached_ref) {
@@ -3190,7 +3190,11 @@ impl Optimization for OptRewrite {
                         .iter()
                         .find(|(k, _)| *k == func_val)
                     {
-                        if !self.loop_invariant_results.contains_key(&func_val) {
+                        if !self
+                            .loop_invariant_results
+                            .iter()
+                            .any(|(k, _)| *k == func_val)
+                        {
                             // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
                             // `produce_loop_invariant` installs
                             // `make_equal_to(source, result_opref)`, so the source
@@ -3447,7 +3451,7 @@ impl Optimization for OptRewrite {
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
         _ctx: &mut OptContext,
     ) {
-        for op in self.loop_invariant_producer.values() {
+        for (_, op) in &self.loop_invariant_producer {
             sb.add_loopinvariant_op(op.clone());
         }
     }
@@ -3456,9 +3460,9 @@ impl Optimization for OptRewrite {
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
             .iter()
-            .filter_map(|(&func_ptr, entry)| match entry {
-                LoopInvariantEntry::Direct(r) => Some((func_ptr, *r)),
-                LoopInvariantEntry::Preamble(pop) => Some((func_ptr, pop.op)),
+            .filter_map(|(func_ptr, entry)| match entry {
+                LoopInvariantEntry::Direct(r) => Some((*func_ptr, *r)),
+                LoopInvariantEntry::Preamble(pop) => Some((*func_ptr, pop.op)),
             })
             .collect()
     }
