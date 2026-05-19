@@ -282,7 +282,7 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ve
             if state.invariant_vector_vars.contains(&vec_ref) {
                 continue; // schedule.py:723-724: invariant_vector_vars
             }
-            if state.accumulation.contains_key(&arg) {
+            if state.accumulation.iter().any(|(k, _)| *k == arg) {
                 continue; // schedule.py:725-726
             }
             let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
@@ -299,7 +299,7 @@ fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut Ve
                     continue;
                 }
                 if let Some((pos, vec_ref)) = state.getvector_of_box(*arg) {
-                    if state.accumulation.contains_key(arg) {
+                    if state.accumulation.iter().any(|(k, _)| *k == *arg) {
                         continue;
                     }
                     let unpacked = unpack_from_vector(state, vec_ref, pos, 1);

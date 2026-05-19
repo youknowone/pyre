@@ -1185,14 +1185,16 @@ impl VecScheduleState {
             // schedule.py:617-618: filter by index match AND possible.get(vecop, True)
             let candidates: Vec<OpRef> = expansions
                 .iter()
-                .filter(|&&(vecop, idx)| idx == i as i32 && *possible.get(&vecop).unwrap_or(&true))
+                .filter(|&&(vecop, idx)| {
+                    idx == i as i32
+                        && possible.get(&vecop).copied().unwrap_or(true)
+                })
                 .map(|&(vecop, _)| vecop)
                 .collect();
             // schedule.py:620-623: invalidate vecops NOT in this position's candidates
-            let keys: Vec<OpRef> = possible.keys().cloned().collect();
-            for key in keys {
-                if !candidates.contains(&key) {
-                    possible.insert(key, false);
+            for (k, v) in possible.iter_mut() {
+                if !candidates.contains(k) {
+                    *v = false;
                 }
             }
             // schedule.py:625: mark surviving candidates as valid
