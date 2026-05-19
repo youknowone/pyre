@@ -2080,23 +2080,6 @@ where
         }
     }
 
-    /// `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
-    /// rotate startblock inputarg colors so each kind's inputargs occupy
-    /// the canonical `0..n-1` slots, swapping any current allocation
-    /// into the inputarg's target slot.  Upstream stores `regallocs` as
-    /// `self.regallocs`; pyre threads it through the call because the
-    /// `get_register` closure already encapsulates regallocs access for
-    /// the rest of the flatten pass.  The two-callsite shape is a
-    /// pre-Phase-4 adaptation; once the walker stops computing
-    /// regallocs externally, both reduce to one canonical call.
-    pub fn enforce_input_args(
-        &mut self,
-        graph: &super::flow::FunctionGraph,
-        regallocs: &mut [super::regalloc::GraphAllocationResult; 3],
-    ) {
-        super::regalloc::enforce_input_args_simulation(graph, regallocs);
-    }
-
     /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
     /// reset `seen_blocks` and recurse from `graph.startblock`.  Upstream
     /// stores `graph` as `self.graph`; pyre threads it through because
@@ -2521,7 +2504,7 @@ pub fn flatten_graph<'a>(
     // `regallocs` on `self.regallocs` and the method mutates it
     // in place; pyre's `get_register` closure (constructed below)
     // captures `&regallocs`, so the swap runs BEFORE the closure exists.
-    super::regalloc::enforce_input_args_simulation(graph, regallocs);
+    super::regalloc::enforce_input_args_graph(graph, regallocs);
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));

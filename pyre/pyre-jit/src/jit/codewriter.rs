@@ -8652,7 +8652,7 @@ impl CodeWriter {
         // fallback Variables' colors).
         let mut _graph_regallocs =
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
+        super::regalloc::enforce_input_args_graph(&graph, &mut _graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
         // BEFORE `walker_post_walk_insert_renamings` reads
         // it.  The same pairing pass also runs downstream (idempotent
@@ -8888,7 +8888,7 @@ impl CodeWriter {
         );
         // Phase 3 (b) Slice 1: run graph-side
         // `perform_graph_register_allocation_all_kinds` +
-        // `enforce_input_args_simulation` post-walker on every
+        // `enforce_input_args_graph` post-walker on every
         // production graph, matching upstream `codewriter.py:44-46`'s
         // pre-flatten regalloc step.  The result is not consumed yet —
         // Slice 2 will build the `(Kind, slot) → color` bridge map that

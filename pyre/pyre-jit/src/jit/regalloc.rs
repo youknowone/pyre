@@ -369,7 +369,10 @@ pub fn perform_graph_register_allocation_all_kinds(
     ]
 }
 
-/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`.
+/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
+/// at the graph level (sibling to the SSA-side private
+/// `enforce_input_args` further down that handles per-RegAllocator
+/// swapcolors).
 ///
 /// Walks the startblock's inputargs in source order; for each inputarg
 /// of kind `K` whose current color in `regallocs[K]` does not equal
@@ -380,14 +383,13 @@ pub fn perform_graph_register_allocation_all_kinds(
 /// Upstream `flatten_graph` runs this immediately after
 /// `regallocs[kind] = perform_register_allocation(graph, kind)` and
 /// before `generate_ssa_form` walks links, so every downstream
-/// observer sees the post-swap coloring. Pyre's pipeline currently
-/// bypasses `flatten_graph`; callers that want
-/// `count_link_renamings_per_kind` (or any future graph-driven
-/// `*_copy` emitter) to match what `flatten_graph` would produce must
-/// run this simulation explicitly first.
-///
-/// Tracks the production-wiring follow-up in Task #214.
-pub fn enforce_input_args_simulation(
+/// observer sees the post-swap coloring.  Pyre's canonical
+/// `flatten_graph` entry (`flatten.rs::flatten_graph`) and the
+/// walker-side post-walk path both call this free function rather
+/// than a `GraphFlattener` method: pyre's `get_register` closure
+/// captures `&regallocs` immutably, so the `&mut regallocs`
+/// swap must run BEFORE the closure is constructed.
+pub fn enforce_input_args_graph(
     graph: &FlowGraph,
     regallocs: &mut [GraphAllocationResult; 3],
 ) {
@@ -415,7 +417,7 @@ pub fn enforce_input_args_simulation(
         }
         assert!(
             curcol > realcol,
-            "enforce_input_args_simulation: inputarg color {} must be >= realcol {} \
+            "enforce_input_args_graph: inputarg color {} must be >= realcol {} \
              (regalloc.py invariant)",
             curcol,
             realcol,
@@ -461,7 +463,7 @@ pub(super) fn count_link_renamings_per_kind(
     // `0, 1, 2, …` per kind before `generate_ssa_form` walks links.
     // Callers that want this probe's output to match
     // `flatten_graph`'s post-swap reality should invoke
-    // `enforce_input_args_simulation(graph, &mut regallocs)` first;
+    // `enforce_input_args_graph(graph, &mut regallocs)` first;
     // otherwise the per-link step count is a lower bound, since the
     // swap can shift inputarg colors and re-introduce previously
     // coalesced renamings. Production wiring is Task #214.
@@ -1393,10 +1395,10 @@ mod tests {
     }
 
     /// `flatten.py:88-100 enforce_input_args` parity at the graph
-    /// allocator level: after the simulation, every kind's startblock
+    /// allocator level: after the swap, every kind's startblock
     /// inputargs occupy colors `0, 1, 2, …` in source order.
     #[test]
-    fn enforce_input_args_simulation_normalises_graph_inputarg_colors() {
+    fn enforce_input_args_graph_normalises_inputarg_colors() {
         // 2 Ref inputargs + 1 Int inputarg, all live across an op
         // that defines fresh Variables of each kind so the chordal
         // coloring has to place every node on its own color.
@@ -1421,24 +1423,24 @@ mod tests {
         ]);
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
-        enforce_input_args_simulation(&graph, &mut regallocs);
+        enforce_input_args_graph(&graph, &mut regallocs);
 
         let ref_colors = &regallocs[Kind::Ref.index()].coloring;
         let int_colors = &regallocs[Kind::Int.index()].coloring;
         assert_eq!(
             ref_colors.get(&a.id).copied(),
             Some(0),
-            "first Ref inputarg must occupy color 0 post-simulation"
+            "first Ref inputarg must occupy color 0 post-enforce_input_args"
         );
         assert_eq!(
             ref_colors.get(&b.id).copied(),
             Some(1),
-            "second Ref inputarg must occupy color 1 post-simulation"
+            "second Ref inputarg must occupy color 1 post-enforce_input_args"
         );
         assert_eq!(
             int_colors.get(&i.id).copied(),
             Some(0),
-            "first Int inputarg must occupy color 0 post-simulation"
+            "first Int inputarg must occupy color 0 post-enforce_input_args"
         );
     }
 
