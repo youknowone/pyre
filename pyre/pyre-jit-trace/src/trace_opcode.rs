@@ -7351,20 +7351,16 @@ unsafe fn trace_check_exc_match_against(
 /// Subsequent Phase 5 batches (5.B PopTop + drop `check_is_elidable`
 /// gate, 5.C..N per-opcode batches) grow this set until it covers every
 /// Python opcode, at which point Phase 6 deletes the trait infra.
+///
+/// PopTop is intentionally NOT in this set yet despite the Phase 5.B
+/// infra (`dispatch_via_miframe_at_opcode_entry`) landing.  Its sub-jitcode
+/// (`pop_value` idx 358 → `nlocals` idx 121) issues two `residual_call`s
+/// whose `CallDescr.EffectInfo` still reads `extraeffect: CanRaise`
+/// because the codewriter-side analysis (`call.py:292-299 getcalldescr`
+/// + `_canraise`) has no callee_path entry for the call sites' resolved
+/// `CallTarget`.  Recognising the targets as elidable is the next slice
+/// (issue #73 Phase 3 expansion: helper-by-helper EffectInfo recognition).
 fn production_walker_handles(instruction: &Instruction) -> bool {
-    // Issue #73 Phase 5.B landed `dispatch_via_miframe_at_opcode_entry`
-    // (the orthodox MIFrame.setup parity: fresh per-jitcode register
-    // banks + r0 = sym.frame).  PopTop now reaches its sub-jitcode body
-    // (`pop_value`, idx 358) without the r0-mismatch panic but still
-    // surfaces a deeper concrete-propagation gap: `nlocals` (idx 121)
-    // and `valuestackdepth` reads route through `residual_call_r_<i,r>`
-    // helpers whose `EffectInfo` doesn't yet classify the read as
-    // `MayNotForce`/elidable, so the callee's result concrete is `Null`
-    // and downstream `int_le` → `goto_if_not` panics with
-    // `GotoIfNotValueNotConcrete`.  Closing that gap is the Phase 3
-    // expansion (oopspec / EffectInfo recognition per helper) — keep
-    // PopTop out of the allow-list until those helpers carry the
-    // matching `OopSpecKind` tag.
     matches!(
         instruction,
         Instruction::Nop

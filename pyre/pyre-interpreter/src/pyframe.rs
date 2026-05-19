@@ -335,6 +335,13 @@ impl PyFrame {
 ///
 /// PyPy: `frame.pycode` gives `PyCode` which IS the code object.
 /// pyre: W_CodeObject wraps a raw CodeObject — this extracts it.
+///
+/// `@jit.elidable` (`rlib/jit.py:13`): deterministic, no allocation,
+/// no raise — pure pointer cast through `w_code_get_ptr`.
+/// Mapped to `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`) so the
+/// metainterp can execute it at trace time and the walker can read
+/// the concrete result back into the Ref bank.
+#[majit_macros::elidable_cannot_raise]
 #[inline]
 pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
     unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
@@ -1118,6 +1125,10 @@ impl PyFrame {
     }
 
     /// Number of local variable slots (from code object).
+    ///
+    /// `@jit.elidable`: read-only access to `varnames.len()`, no
+    /// allocation, no raise.  `EF_ELIDABLE_CANNOT_RAISE` parity.
+    #[majit_macros::elidable_cannot_raise]
     #[inline]
     pub fn nlocals(&self) -> usize {
         unsafe { (&*pyframe_get_pycode(self)).varnames.len() }
