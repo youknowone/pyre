@@ -848,21 +848,19 @@ fn fresh_variable_for_state(
 /// map to different walker slots have no equivalent walker emission.
 ///
 /// This helper closes the gap by running the same renaming logic
-/// post-walk for blocks with EXACTLY ONE exit (the simple
-/// unconditional-jump case).  Multi-exit blocks (POP_JUMP_IF_*,
-/// canraise dispatch) are NOT handled here — those require
-/// per-link positional injection between source-block terminator
-/// and each target-block Label, which is structurally a separate
-/// slice.
-///
-/// Emissions are appended to the source block's
-/// `per_block_ssarepr` BEFORE the terminator (the trailing
-/// `Op{goto/...}` + `Unreachable` pair, or a *_return).  This
-/// matches `flatten.py:154 self.insert_renamings(link)` which
-/// runs BEFORE the recursive `make_bytecode_block(link.target)`
-/// (which itself ends the source block at `goto TLabel(block)`
-/// when target is in `seen_blocks`).
-fn walker_post_walk_insert_renamings_single_exit(
+/// post-walk:
+///   * Single-exit blocks: splice the link's renamings into the
+///     source block's `per_block_ssarepr` BEFORE the terminator
+///     (matches `flatten.py:154 self.insert_renamings(link)` which
+///     runs BEFORE the recursive `make_bytecode_block(link.target)`).
+///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
+///     exit's renamings are per-edge.  Walker's `goto_if_not` /
+///     `switch` ends the source block; we splice per-link renamings
+///     at the target's entry — but only when the target has a unique
+///     predecessor (otherwise multiple edges' renamings would collide
+///     at the same entry).  Multi-predecessor targets need per-link
+///     trampoline blocks to fully match upstream.
+fn walker_post_walk_insert_renamings(
     graph: &super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
@@ -3515,19 +3513,15 @@ impl CodeWriter {
         // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
         let mut assembler = SSAReprEmitter::new();
         assembler.set_name(code.obj_name.to_string());
-        // grow an `SSARepr` alongside the direct
-        // `JitCodeBuilder` calls. Currently only a handful of handlers
-        // (`ref_return` below) dual-emit an `Insn::Op`; the remaining
-        // bytecode handlers still route through the builder only. When
-        // every handler has been converted, `ssarepr` becomes the
-        // authoritative input to `jit::assembler::Assembler::assemble`
-        // (Phase 3c switchover) and the direct builder calls disappear.
-        // See `pyre/pyre-jit/src/jit/B6_CODEWRITER_PIPELINE_PLAN.md`.
+        // Grow an `SSARepr` per-block via `push_walker_emit`; at drain
+        // time the per-block accumulators concatenate into
+        // `ssarepr.insns` which feeds
+        // `jit::assembler::Assembler::assemble`.
         let mut ssarepr = SSARepr::new(code.obj_name.to_string());
 
         // Walker slot bridge: each entry maps a graph `Variable.id`
         // to the SSARepr slot the walker assigned when emitting the
-        // dual-write.  `walker_post_walk_insert_renamings_single_exit`
+        // dual-write.  `walker_post_walk_insert_renamings`
         // consults it so post-walk `insert_renamings` emits `<kind>_copy`
         // ops against the same walker slots the surrounding inline emits
         // wrote, matching `flatten.py:306-334` color-resolution semantics
@@ -8643,7 +8637,7 @@ impl CodeWriter {
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
-        // BEFORE `walker_post_walk_insert_renamings_single_exit` reads
+        // BEFORE `walker_post_walk_insert_renamings` reads
         // it.  The same pairing pass also runs downstream (idempotent
         // via `pair_walker_slot_if_absent`), but the post-walk
         // `insert_renamings` color resolution needs the bridge entries
@@ -8680,7 +8674,7 @@ impl CodeWriter {
             // (POP_JUMP_IF_*, canraise) require per-link positional
             // injection between source-block terminator and each
             // target-block Label — separate future slice.
-            walker_post_walk_insert_renamings_single_exit(
+            walker_post_walk_insert_renamings(
                 &graph,
                 &walker_slot_for_variable,
                 &_graph_regallocs,
