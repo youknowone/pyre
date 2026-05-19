@@ -507,31 +507,45 @@ impl GuardStrengthenOpt {
         if key.is_none() {
             return;
         }
-        let others = self.strongest_guards.entry_or_insert_with(key, Vec::new);
-        if !others.is_empty() {
-            let mut replaced = false;
-            for i in 0..others.len() {
-                if guard.implies(&others[i], None) {
-                    // guard.py:204-210: strengthened
-                    let old = others[i].clone();
-                    self.guards.insert(guard.index, None); // mark new as 'do not emit'
-                    let mut new_guard = guard.clone();
-                    new_guard.inhert_attributes(&old);
-                    self.guards.insert(old.index, Some(new_guard.clone()));
-                    others[i] = new_guard;
-                    replaced = true;
-                } else if others[i].implies(&guard, None) {
-                    // guard.py:211-215: implied
-                    self.guards.insert(guard.index, None);
-                    replaced = true;
-                }
+        // Determine the strengthening interactions before mutating `self.guards`
+        // (we can't hold &mut on self.strongest_guards while passing &mut guards).
+        let mut updates: Vec<(usize, Option<Guard>)> = Vec::new();
+        let mut new_strongest: Vec<Guard> = self
+            .strongest_guards
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut replaced = false;
+        for slot in new_strongest.iter_mut() {
+            if guard.implies(slot, None) {
+                // guard.py:204-210: strengthened
+                updates.push((guard.index, None));
+                let mut new_guard = guard.clone();
+                new_guard.inhert_attributes(slot);
+                updates.push((slot.index, Some(new_guard.clone())));
+                *slot = new_guard;
+                replaced = true;
+            } else if slot.implies(&guard, None) {
+                // guard.py:211-215: implied
+                updates.push((guard.index, None));
+                replaced = true;
             }
-            if !replaced {
-                others.push(guard);
-            }
-        } else {
-            others.push(guard);
         }
+        if !replaced {
+            new_strongest.push(guard);
+        }
+        self.strongest_guards.insert(key, new_strongest);
+        for (idx, val) in updates {
+            Self::set_guard(&mut self.guards, idx, val);
+        }
+    }
+
+    fn set_guard(
+        guards: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, Option<Guard>>,
+        idx: usize,
+        val: Option<Guard>,
+    ) {
+        guards.insert(idx, val);
     }
 
     /// guard.py:221-249: eliminate_guards(loop)
