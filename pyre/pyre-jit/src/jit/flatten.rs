@@ -208,31 +208,6 @@ impl TLabel {
     }
 }
 
-/// pyre-only naming convention for the per-Python-PC anchor label that
-/// the walker emits at every PC entry.  Upstream RPython's `flatten.py`
-/// emits exactly one `Label(block)` per SpamBlock; the JIT resumes only
-/// at `jit_merge_point` boundaries (loop headers + guard fail bounce
-/// points) so per-PC anchors are unnecessary.  Pyre's runtime instead
-/// resumes at arbitrary Python PCs (blackhole bridge-resume, inline
-/// call tracing), which requires a per-PC byte-offset table populated
-/// from anchor positions in the assembled JitCode.
-///
-/// All five emit / branch sites that materialise the `pc{N}` naming
-/// route through these helpers so the convention is single-sourced.
-/// Renaming the marker shape only requires changing these two
-/// functions plus the runtime consumers (`pc_anchor_positions` /
-/// `live_marker_indices_by_pc`).
-pub fn pc_label_name(py_pc: usize) -> String {
-    format!("pc{py_pc}")
-}
-
-/// Companion to [`pc_label_name`] producing the matching `TLabel`
-/// branch target.  Walker `goto Label("pc{N}")` callsites build the
-/// target via this helper.
-pub fn pc_tlabel(py_pc: usize) -> TLabel {
-    TLabel::new(pc_label_name(py_pc))
-}
-
 /// Upstream-orthodox per-block label naming.  `rpython/jit/codewriter/
 /// flatten.py:116` emits `Label(block)` once per `SpamBlock` using
 /// Python object identity as the implicit name.  Pyre serializes the
@@ -242,9 +217,8 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
 /// Two distinct `BlockRef`s always produce distinct names within a
 /// single CodeWriter run (`Rc::as_ptr` is stable across clones); the
 /// name is not stable across runs, matching upstream's per-run object
-/// identity.  When pyre eventually migrates branch targets from the
-/// per-Python-PC `pc{N}` naming to upstream-orthodox block-identity,
-/// callers will route through this helper.
+/// identity.  All walker block-identity label emits and branch target
+/// constructions route through this helper.
 pub fn block_label_name(block: &super::flow::BlockRef) -> String {
     format!("block{}", block.as_ptr_addr())
 }
@@ -253,17 +227,6 @@ pub fn block_label_name(block: &super::flow::BlockRef) -> String {
 /// branch target.
 pub fn block_tlabel(block: &super::flow::BlockRef) -> TLabel {
     TLabel::new(block_label_name(block))
-}
-
-/// Recover the Python PC index from an `Insn::Label` whose name matches
-/// the `pc{N}` convention.  Returns `None` for any other Insn shape.
-/// Consumed by the `pc_anchor_positions` / `live_marker_indices_by_pc`
-/// scans plus the `strip_walker_block_boundary_goto` pass.
-pub fn label_pc_index(insn: &Insn) -> Option<usize> {
-    match insn {
-        Insn::Label(label) => label.name.strip_prefix("pc").and_then(|s| s.parse().ok()),
-        _ => None,
-    }
 }
 
 /// `flatten.py:28-33` `class Register(object)`.
@@ -2600,46 +2563,6 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    flatten_graph_with_walker_slots(
-        graph,
-        regallocs,
-        &[],
-        &[],
-        &[],
-        include_all_exc_links,
-        cpu,
-    )
-}
-
-/// Phase 4 bridge: `walker_slot_for_variable[var.id]` overrides the
-/// graph regalloc color so production can splice canonical Insns into
-/// the walker's SSARepr without Register-index mismatch.  Synthetic
-/// graph-only Variables (e.g. `last_exception` from
-/// `attach_catch_exception_edge`) have no entry and fall back to
-/// `regallocs[kind].getcolor(v)` per `flatten.py:382-391`.
-///
-/// Task #50 T6 epic slice 1 — `block_name_overrides` pre-seeds the
-/// flattener's `block_names` map so canonical's `Label(block)` /
-/// `tlabel_for_block(target)` emit walker-compatible `pc{N}` names
-/// (where N = block's FrameState `next_offset` = entry Python PC)
-/// instead of the default sequential `block{N}` scheme.  Walker emits
-/// `Label("pcN")` per Python PC (its per-PC dispatch convention);
-/// without the override canonical and walker disagree on every branch
-/// target label name even though they reference the same target
-/// block.  Pre-seeded overrides are first-wins per
-/// `label_name_for_block`'s lookup logic — entries not in the
-/// override list fall back to the `block{N}` default (used for blocks
-/// the walker created but never assigned a `pcN` to, e.g. the implicit
-/// graph startblock when its py_pc has no per-PC anchor).
-pub fn flatten_graph_with_walker_slots<'a>(
-    graph: &super::flow::FunctionGraph,
-    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
-    walker_slot_for_variable: &'a [Option<u16>],
-    block_name_overrides: &[(super::flow::BlockRef, String)],
-    link_name_overrides: &[(super::flow::LinkRef, String)],
-    include_all_exc_links: bool,
-    cpu: Option<&'a super::cpu::Cpu>,
-) -> SSARepr {
     // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
     // `regallocs` on `self.regallocs` and the method mutates it
     // in place; pyre's `get_register` closure (constructed below)
@@ -2649,31 +2572,9 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)`, prepended with the Phase 4
-    // bridge lookup documented on `flatten_graph_with_walker_slots`.
-    //
-    // Phase 4 endgame Step 0 — coverage audit.  Counts paired (walker
-    // bridge hit) vs fallback (graph regalloc) lookups so we can
-    // quantify how much of the canonical-vs-walker color divergence is
-    // attributable to incomplete `pair_walker_slot` coverage vs
-    // structural walker NEW-DEVIATION.  Env-gated via
-    // `PYRE_PHASE4_GET_REGISTER_AUDIT=1` so production stays silent.
-    // Counters are mutated via interior mutability (`Cell`) so the
-    // closure remains `FnMut` and matches `GraphFlattener`'s trait
-    // bound.  Drained after `generate_ssa_form` returns.
-    let audit_counters = std::cell::Cell::new((0u32, 0u32));
+    // `flatten.py:382-391 getcolor(v)`.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
-        let walker_slot = walker_slot_for_variable
-            .get(variable.id.0 as usize)
-            .copied()
-            .flatten();
-        let (paired, fallback) = audit_counters.get();
-        if let Some(slot) = walker_slot {
-            audit_counters.set((paired + 1, fallback));
-            return Register::new(kind, slot);
-        }
-        audit_counters.set((paired, fallback + 1));
         let color = regallocs[kind.index()]
             .coloring
             .get(&variable.id)
@@ -2704,55 +2605,8 @@ pub fn flatten_graph_with_walker_slots<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
-    // Task #50 T6 epic slice 1 — pre-seed block_names with walker's
-    // `pc{N}` naming so `Label(block)` / `tlabel_for_block(target)`
-    // resolve to walker-compatible names.  Overrides land first in the
-    // Vec; `label_name_for_block` does a linear scan and returns the
-    // first matching entry, so subsequent default `block{N}` insertions
-    // for blocks not in the override list keep their fallback names.
-    for (block, name) in block_name_overrides {
-        flattener.block_names.push((block.clone(), name.clone()));
-    }
-    // Task #50 T6 epic slice 2 — pre-seed link_names with names that
-    // ALIAS the link to its target block's `pc{N}`.  Walker emits no
-    // separate link landing — its `goto_if_not Reg TLabel("pcN")`
-    // jumps directly to the target block's per-PC anchor.  Canonical
-    // emits `goto_if_not Reg TLabel(link_name)` + `Label(link_name)` +
-    // (optional renamings) + recursive `make_bytecode_block(target)`
-    // which emits `Label(target_block_name)`.  With the alias both
-    // canonical Label entries carry the same name string; the runtime's
-    // `pc_anchor_positions` first-wins resolves `pcN` to the link
-    // landing byte position, which then either no-ops (empty
-    // renamings) or runs the renamings before falling through to the
-    // target block's body.  Insn-level byte_equivalent improves
-    // because `TLabel` operand strings now match between walker and
-    // canonical.  Functionality-preserving — extra Label("pcN") emits
-    // are filtered by `count_real_ops` (Label is scaffold).
-    for (link, name) in link_name_overrides {
-        flattener.link_names.push((link.clone(), name.clone()));
-    }
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
-    // Drop the flattener so its closure-borrowed `audit_counters` Cell
-    // is freed before we read it.  Without the explicit drop the borrow
-    // checker keeps `flattener` (and its captured `get_register`) alive
-    // until the end of the function, which is fine for `Cell::get` (no
-    // exclusive borrow required), but the explicit drop documents the
-    // ownership transition.
-    drop(flattener);
-    if std::env::var_os("PYRE_PHASE4_GET_REGISTER_AUDIT").is_some() {
-        let (paired, fallback) = audit_counters.get();
-        let total = paired + fallback;
-        let paired_pct = if total > 0 {
-            (paired as f64) * 100.0 / (total as f64)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[phase4-get-register-audit] graph={:?} paired={} fallback={} total={} paired_pct={:.1}",
-            graph.name, paired, fallback, total, paired_pct,
-        );
-    }
     ssarepr
 }
 
@@ -4204,34 +4058,6 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
 mod tests {
     use super::*;
     use crate::jit::flow::{FlowListOfKind, VariableId};
-
-    #[test]
-    fn pc_label_name_round_trips_through_label_pc_index() {
-        for py_pc in [0usize, 1, 42, 99, 123_456] {
-            assert_eq!(pc_label_name(py_pc), format!("pc{py_pc}"));
-            let insn = Insn::Label(Label::new(pc_label_name(py_pc)));
-            assert_eq!(
-                label_pc_index(&insn),
-                Some(py_pc),
-                "round-trip py_pc={py_pc}"
-            );
-        }
-    }
-
-    #[test]
-    fn label_pc_index_rejects_non_anchor_insns() {
-        // Block / link / catch-landing labels must be rejected — only
-        // labels with the `pc{N}` naming convention return Some(py_pc).
-        for name in ["block0", "block42", "link1", "catch_landing_3"] {
-            assert_eq!(
-                label_pc_index(&Insn::Label(Label::new(name))),
-                None,
-                "label_pc_index must reject Label({name:?})"
-            );
-        }
-        assert_eq!(label_pc_index(&Insn::Unreachable), None);
-        assert_eq!(label_pc_index(&Insn::op("plain", vec![])), None);
-    }
 
     #[test]
     fn block_label_name_yields_distinct_per_block() {

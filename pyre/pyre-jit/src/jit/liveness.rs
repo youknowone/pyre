@@ -333,22 +333,17 @@ pub fn remove_repeated_live_with_remap(
 
         // `liveness.py:97-106` inner loop.
         //
-        // Task #227.5 item 6: pyre emits `Label("pc{N}")` at every
-        // Python PC entry as a per-PC anchor (pyre-specific
-        // construct; upstream RPython has no per-PC Labels — only
-        // block-entry Labels).  `remove_repeated_live` must NOT
-        // merge `-live-` runs across `Label("pc{N}")` boundaries —
-        // otherwise consecutive per-PC live markers collapse into
-        // one and `live_marker_indices_by_pc` loses the per-PC
-        // mapping.  Other Labels (catch_landing, link-target) keep
-        // merging per upstream `liveness.py:99-100`.  This carveout
-        // is the necessary structural adaptation for pyre's per-PC
-        // Label model.
-        //
-        // T6.1 Slice 6 prep: `protected_per_pc_live[i]` provides the
-        // same break behaviour position-by-position so the carveout
-        // survives after per-PC label emission retires.  Both
-        // mechanisms coexist while the transition is in flight.
+        // T6.1 Slice 7: `protected_per_pc_live[i]` breaks the merge
+        // at walker-recorded per-PC `-live-` positions so each
+        // Python PC retains its own `-live-` marker (pyre's
+        // walker-tracked side-table populates the bitmap;
+        // `filter_liveness_in_place` is the sole production caller
+        // and always supplies it).  The earlier `label_pc_index`
+        // label-name carveout that paired with the per-PC
+        // `Insn::Label("pc{N}")` emission is gone — Slice 6 retired
+        // the per-PC label emission and Slice 7 retired the scan
+        // helpers.  Block-identity / catch-landing / link-target
+        // labels keep merging per upstream `liveness.py:99-100`.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
@@ -358,11 +353,6 @@ pub fn remove_repeated_live_with_remap(
                 live_old_positions.push(i);
                 lives.push(next);
                 i += 1;
-            } else if super::flatten::label_pc_index(&next).is_some() {
-                // Per-PC anchor `Insn::Label(Label::new(pc_label_name(N)))`
-                // — break out of the merge so `live_marker_indices_by_pc`
-                // can find one `-live-` marker per anchor.
-                break;
             } else if matches!(next, Insn::Label(_)) {
                 label_old_positions.push(i);
                 labels.push(next);
