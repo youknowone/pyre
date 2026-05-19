@@ -3051,119 +3051,6 @@ fn register_helper_fn_pointers(
 /// flattens reachable flow-graph blocks.
 use super::flatten::label_pc_index;
 
-fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Per-PC anchor positions are resolved from `Insn::Label` entries
-    // whose name matches `pc{N}` (recognised via `label_pc_index`).
-    //
-    // Pyre vs RPython label keying (structural difference): RPython uses
-    // `Label(block)` per SpamBlock object (`flatten.py:116
-    // self.emitline(Label(block))`), so two SpamBlocks reaching the same
-    // Python PC carry distinct Label values. Pyre keys labels by Python
-    // PC (`pc{N}` via `pc_label_name`), so two alive SpamBlocks both
-    // joining at PC N emit `Insn::Label(Label::new("pc{N}"))` independently
-    // — both can survive R5's dead-block filter when neither is superseded.
-    //
-    // The runtime resolves `pc{N}` to the FIRST anchor in the drained
-    // stream (first-wins below). Subsequent alive duplicates belong to
-    // sibling joinpoint blocks that are reachable from the first anchor
-    // via fall-through inside the walker's PC-sequential emission, so
-    // the first anchor is the canonical entry point per pyre's runtime
-    // dispatch contract. Eliminating duplicates entirely requires
-    // switching pyre's label key from `pc{N}` to block-identity (the
-    // Task #227 walker restructure), at which point this first-wins
-    // semantics retires.
-    let mut positions = vec![usize::MAX; num_pcs];
-    for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
-        if let Some(py_pc) = label_pc_index(insn) {
-            assert!(
-                py_pc < num_pcs,
-                "pc_anchor_positions: Label pc{py_pc} out of range {num_pcs}"
-            );
-            if positions[py_pc] == usize::MAX {
-                positions[py_pc] = insn_idx;
-            }
-        }
-    }
-    for py_pc in 0..num_pcs {
-        assert_ne!(
-            positions[py_pc],
-            usize::MAX,
-            "pc_anchor_positions: missing Label('pc{py_pc}') for py_pc {py_pc}"
-        );
-    }
-    positions
-}
-
-fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    let anchors = pc_anchor_positions(ssarepr, num_pcs);
-    live_marker_indices_from_anchors(ssarepr, &anchors)
-}
-
-/// Resolve per-PC `-live-` marker positions given a `pc_to_anchor_idx`
-/// vector mapping each py_pc to its anchor insn index in `ssarepr`.
-///
-/// Splitting the anchor-lookup phase from the live-scan phase lets the
-/// anchor source be swapped (e.g. T6.1 walker-time tracking) without
-/// duplicating the scan logic.
-///
-/// First-wins for the `-live-` marker per anchor pair matches
-/// `flatten.py:107`'s one-`-live-`-per-block invariant filtered through
-/// pyre's NEW-DEVIATION sibling-joinpoint duplicates: RPython emits one
-/// `-live-` per block-entry; pyre's PC-sequential walker can emit
-/// multiple when sibling joinpoint blocks share a py_pc.  The first
-/// marker matches the runtime's actual liveness window via the
-/// first-wins anchor; subsequent duplicates belong to sibling blocks
-/// reachable through fall-through after the first anchor.
-fn live_marker_indices_from_anchors(
-    ssarepr: &super::flatten::SSARepr,
-    pc_to_anchor_idx: &[usize],
-) -> Vec<usize> {
-    let num_pcs = pc_to_anchor_idx.len();
-    // Sort (anchor_idx, py_pc) by anchor_idx to compute scan boundaries
-    // for the per-anchor `-live-` lookup.
-    let mut anchors: Vec<(usize, usize)> = pc_to_anchor_idx
-        .iter()
-        .enumerate()
-        .map(|(py_pc, &insn_idx)| (insn_idx, py_pc))
-        .collect();
-    anchors.sort_by_key(|(insn_idx, _)| *insn_idx);
-    let mut live_indices = vec![usize::MAX; num_pcs];
-    for (anchor_pos, (anchor_idx, py_pc)) in anchors.iter().enumerate() {
-        let end = anchors
-            .get(anchor_pos + 1)
-            .map(|(next_idx, _)| *next_idx)
-            .unwrap_or(ssarepr.insns.len());
-        // Take the LAST -live- marker per anchor pair.
-        // jtransform.py:1708-1712 emits two -live- ops around
-        // jit_merge_point: op3 before (for inlined short preambles)
-        // and op2 after (for do_recursive_call / guard resume).
-        // Pyre's pc_map and filter_liveness_in_place must resolve
-        // to op2 (after jit_merge_point) so that blackhole guard-
-        // failure resume lands past the merge point — otherwise the
-        // blackhole immediately hits bhimpl_jit_merge_point →
-        // ContinueRunningNormally.  Last-wins picks op2.
-        //
-        // For non-merge-point PCs and sibling joinpoint blocks
-        // at the same py_pc, only one -live- exists per anchor
-        // range so first/last are equivalent.
-        let mut live_idx: Option<usize> = None;
-        for insn_idx in (anchor_idx + 1)..end {
-            if ssarepr.insns[insn_idx].is_live() {
-                live_idx = Some(insn_idx);
-            }
-        }
-        live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
-            panic!(
-                "live_marker_indices_from_anchors: missing -live- marker for py_pc {} in range {}..{}",
-                py_pc,
-                anchor_idx + 1,
-                end
-            )
-        });
-    }
-    live_indices
-}
-
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
@@ -3175,41 +3062,37 @@ fn filter_liveness_in_place(
     walker_tracked_pc_live_indices: Option<&[usize]>,
 ) -> Vec<usize> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
-    // T6.1 Slice 6 prep: thread a protected-position bitmap into the
-    // liveness pass so per-PC `-live-` markers don't merge.  Built
-    // from the walker-tracked indices (one entry per Python PC) so
-    // every per-PC `-live-` carries a stable position through
-    // `remove_repeated_live`.  Falls back to the label-based carveout
-    // for callers that don't thread the side-table.
-    let protected_per_pc_live: Option<Vec<bool>> = walker_tracked_pc_live_indices
+    // Walker-tracked positions are required: per-PC `-live-` markers
+    // need an explicit protection bitmap so `remove_repeated_live`
+    // doesn't merge across PCs, and the post-merge `live_markers`
+    // vector is built by translating the walker-tracked positions
+    // through the `remove_repeated_live` remap.  The walker's
+    // `walker_pc_live_marker_pos` side-table is the authoritative
+    // source since T6.1 Slice 6 retired the per-PC `Insn::Label`
+    // emission.
+    let walker_tracked = walker_tracked_pc_live_indices
         .filter(|walker_tracked| walker_tracked.len() == code.instructions.len())
-        .map(|walker_tracked| {
-            let mut bitmap = vec![false; ssarepr.insns.len()];
-            for &idx in walker_tracked {
-                if let Some(slot) = bitmap.get_mut(idx) {
-                    *slot = true;
-                }
-            }
-            bitmap
-        });
+        .expect(
+            "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
+             entry per Python PC since T6.1 Slice 6 retired per-PC label emission",
+        );
+    let mut protected_per_pc_live: Vec<bool> = vec![false; ssarepr.insns.len()];
+    for &idx in walker_tracked {
+        if let Some(slot) = protected_per_pc_live.get_mut(idx) {
+            *slot = true;
+        }
+    }
     let remap = super::liveness::compute_liveness_with_remap(
         ssarepr,
-        protected_per_pc_live.as_deref(),
+        Some(protected_per_pc_live.as_slice()),
     );
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
-    // T6.1 Slice 3 production: prefer walker-tracked positions over the
-    // SSARepr scan when available; falls back to scan for callers that
-    // don't thread the side-table (test fixtures).  Walker-tracked
-    // indices are captured in the PRE-`remove_repeated_live` ssarepr;
-    // translate through the remap to land on the corresponding NEW
-    // index after the merge pass.
-    let live_markers: Vec<usize> = match walker_tracked_pc_live_indices {
-        Some(walker_tracked) if walker_tracked.len() == code.instructions.len() => {
-            walker_tracked.iter().map(|&old| remap[old]).collect()
-        }
-        _ => live_marker_indices_by_pc(ssarepr, code.instructions.len()),
-    };
+    // Walker-tracked indices are captured in the
+    // PRE-`remove_repeated_live` ssarepr; translate through the
+    // remap to land on the corresponding NEW index after the merge
+    // pass.
+    let live_markers: Vec<usize> = walker_tracked.iter().map(|&old| remap[old]).collect();
     let live_markers_out = live_markers.clone();
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
@@ -10430,63 +10313,52 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// R4 regression test: tail-strip pass must recognise the per-PC
-    /// anchor `Insn::Label(Label::new(pc_label_name(N)))` the walker
-    /// emits at PC block boundaries.  The strip recogniser matches
-    /// on `label_pc_index`.
+    /// Tail-strip pass folds a `goto + Unreachable` tail into the
+    /// following block when the goto's target name matches a leading
+    /// `Insn::Label` in that block.
     #[test]
-    fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
-        use super::super::flatten::{Insn, Operand, label_pc_index, pc_label_name, pc_tlabel};
+    fn strip_walker_block_boundary_goto_folds_matching_label_tails() {
+        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
 
-        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(7))]);
-        let trailing_unreachable = Insn::Unreachable;
-        let block_a = vec![
+        let target_name = "block_target_7".to_string();
+        let goto = Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(target_name.clone()))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
+        let block_b = vec![
+            Insn::Label(FlatLabel::new(target_name.clone())),
             Insn::live(Vec::new()),
-            goto.clone(),
-            trailing_unreachable.clone(),
         ];
-        let block_b = vec![Insn::pc_anchor(7), Insn::live(Vec::new())];
         let mut blocks = vec![block_a, block_b];
 
         let drained = super::strip_walker_block_boundary_goto(&mut blocks);
 
-        // Block A's goto + Unreachable were stripped; block B's per-PC
-        // anchor opens the fall-through directly.
         assert_eq!(
             drained.len(),
             3,
-            "expected [live, pc-anchor, live] after strip, got {drained:?}",
+            "expected [live, label, live] after strip, got {drained:?}",
         );
         assert!(matches!(drained[0], Insn::Op { ref opname, .. } if opname == "-live-"));
-        assert_eq!(label_pc_index(&drained[1]), Some(7));
+        assert!(matches!(&drained[1], Insn::Label(l) if l.name == target_name));
         assert!(matches!(drained[2], Insn::Op { ref opname, .. } if opname == "-live-"));
 
         // The strip should NOT fire when the goto target doesn't
-        // match the next block's anchor.
-        let goto_to_99 = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(99))]);
-        let block_a = vec![Insn::live(Vec::new()), goto_to_99, Insn::Unreachable];
-        let block_b = vec![Insn::pc_anchor(7)];
+        // match the next block's label.
+        let other_name = "block_other_99".to_string();
+        let goto_to_other = Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(other_name))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto_to_other, Insn::Unreachable];
+        let block_b = vec![Insn::Label(FlatLabel::new(target_name))];
         let mut blocks = vec![block_a, block_b];
         let drained = super::strip_walker_block_boundary_goto(&mut blocks);
         assert_eq!(
             drained.len(),
             4,
-            "goto/--- must remain when target != next block's per-PC anchor",
+            "goto/--- must remain when target != next block's label",
         );
-
-        // Sanity for the upstream-orthodox `Insn::Label` shape — strip
-        // still works (R4 doesn't regress the Label case).
-        use super::super::flatten::Label as FlatLabel;
-        let label_name = pc_label_name(11);
-        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(11))]);
-        let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
-        let block_b = vec![
-            Insn::Label(FlatLabel::new(label_name)),
-            Insn::live(Vec::new()),
-        ];
-        let mut blocks = vec![block_a, block_b];
-        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
-        assert_eq!(drained.len(), 3, "Insn::Label strip path must also fire");
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
@@ -11459,63 +11331,6 @@ mod tests {
     }
 
     #[test]
-    fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
-        let mut ssarepr = SSARepr::new("t");
-        ssarepr.insns.push(Insn::pc_anchor(0));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                0,
-            ))]));
-        // The per-PC anchor is a merge boundary in
-        // `remove_repeated_live`, so each PC keeps its own `-live-`
-        // marker without cross-PC merge-then-reorder.  The anchor scan
-        // resolves each PC anchor at its label position; the live
-        // marker for each PC stays at its pre-merge position.
-        ssarepr.insns.push(Insn::pc_anchor(1));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                1,
-            ))]));
-
-        crate::jit::liveness::remove_repeated_live(&mut ssarepr);
-
-        // Anchor positions: Label(pc0)@0, Label(pc1)@2.
-        assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 2]);
-        // Per-PC `-live-` boundaries: live(R0) at index 1,
-        // live(R1) at index 3.
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 3]);
-    }
-
-    #[test]
-    fn live_marker_indices_by_pc_last_wins_for_two_live_per_anchor() {
-        // jtransform.py:1708-1712 emits two -live- around jit_merge_point:
-        //   op3 (-live-) → op1 (jit_merge_point) → op2 (-live-)
-        // last-wins must resolve to op2 so blackhole resume lands past jmp.
-        let mut ssarepr = SSARepr::new("t");
-        // PC 0: single -live- (no merge point)
-        ssarepr.insns.push(Insn::pc_anchor(0));
-        ssarepr
-            .insns
-            .push(Insn::live(vec![Operand::Register(Register::new(
-                Kind::Ref,
-                0,
-            ))]));
-        // PC 1: two -live- (merge point PC) — op3 at idx 3, op2 at idx 5
-        ssarepr.insns.push(Insn::pc_anchor(1));
-        ssarepr.insns.push(Insn::live(vec![])); // op3 (before jmp)
-        ssarepr
-            .insns
-            .push(Insn::op("jit_merge_point", vec![Operand::ConstInt(0)]));
-        ssarepr.insns.push(Insn::live(vec![])); // op2 (after jmp)
-
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 5]);
-    }
-
-    #[test]
     fn filter_liveness_drops_non_lv_live_colors_from_live_r() {
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
@@ -11523,9 +11338,14 @@ mod tests {
             .find(|&py_pc| live_vars.is_reachable(py_pc))
             .expect("compiled code must have a reachable pc");
 
+        // One `-live-` marker per Python PC, recorded in walker-
+        // tracked indices.  filter_liveness_in_place protects each
+        // recorded position from the `remove_repeated_live` merge.
         let mut ssarepr = SSARepr::new("t");
-        for py_pc in 0..code.instructions.len() {
-            ssarepr.insns.push(Insn::pc_anchor(py_pc));
+        let mut walker_tracked_pc_live_indices: Vec<usize> =
+            Vec::with_capacity(code.instructions.len());
+        for _py_pc in 0..code.instructions.len() {
+            walker_tracked_pc_live_indices.push(ssarepr.insns.len());
             ssarepr.insns.push(Insn::live(vec![
                 Operand::Register(Register::new(Kind::Ref, 0)),
                 Operand::Register(Register::new(Kind::Ref, 7)),
@@ -11536,7 +11356,7 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        filter_liveness_in_place(
+        let post_remove_live_indices = filter_liveness_in_place(
             &mut ssarepr,
             &code,
             &depth_at_pc,
@@ -11544,10 +11364,10 @@ mod tests {
             &stack_slot_color_map,
             u16::MAX,
             u16::MAX,
-            None,
+            Some(&walker_tracked_pc_live_indices),
         );
 
-        let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
+        let live_idx = post_remove_live_indices[reachable_pc];
         let live_args = ssarepr.insns[live_idx]
             .live_args()
             .expect("reachable pc must keep a -live- marker");

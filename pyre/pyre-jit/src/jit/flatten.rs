@@ -1169,14 +1169,6 @@ impl Insn {
         }
     }
 
-    /// pyre-only per-PC anchor for `py_pc`.  Walker emits one per
-    /// Python PC entry as `Insn::Label(Label::new(pc_label_name(py_pc)))`;
-    /// the runtime resolves `pc{N}` jumps via the same machinery as any
-    /// other `Label`.  Use `label_pc_index` to recover the py_pc.
-    pub fn pc_anchor(py_pc: usize) -> Self {
-        Insn::Label(Label::new(pc_label_name(py_pc)))
-    }
-
     /// `true` iff this instruction is a `-live-` marker.
     pub fn is_live(&self) -> bool {
         matches!(self, Insn::Op { opname, .. } if opname == OPNAME_LIVE)
@@ -4214,10 +4206,10 @@ mod tests {
     use crate::jit::flow::{FlowListOfKind, VariableId};
 
     #[test]
-    fn pc_anchor_round_trip_matches_py_pc() {
+    fn pc_label_name_round_trips_through_label_pc_index() {
         for py_pc in [0usize, 1, 42, 99, 123_456] {
             assert_eq!(pc_label_name(py_pc), format!("pc{py_pc}"));
-            let insn = Insn::pc_anchor(py_pc);
+            let insn = Insn::Label(Label::new(pc_label_name(py_pc)));
             assert_eq!(
                 label_pc_index(&insn),
                 Some(py_pc),
