@@ -643,18 +643,16 @@ pub(crate) struct CompiledEntry<M> {
 }
 
 impl<M> CompiledEntry<M> {
-    /// Slice X-G: upgrade the `token` Weak to a strong `Arc<JitCellToken>`,
-    /// panicking if the strong owner (`MemoryManager.alive_loops`) has
-    /// already dropped it.  Almost every reader of `CompiledEntry` runs
-    /// while the entry is still live; the panic surfaces the rare
-    /// out-of-order eviction so callers can audit, rather than silently
-    /// returning `None`.  Eviction-aware paths bypass this helper and
-    /// call `self.token.upgrade()` directly.
-    pub(crate) fn live_token(&self) -> std::sync::Arc<JitCellToken> {
-        self.token.upgrade().expect(
-            "CompiledEntry.token: backing Arc already dropped — \
-             MemoryManager.alive_loops must outlive compiled_loops entries",
-        )
+    /// Slice X-G: upgrade the `token` Weak to a strong `Arc<JitCellToken>`.
+    /// Returns `None` when the strong owner (`MemoryManager.alive_loops`)
+    /// has already dropped it — `memmgr.py:73` parity means alive_loops
+    /// pruning can run between trace insertions, so a `compiled_loops`
+    /// entry that has not yet been swept can race with eviction.
+    /// Callers MUST handle the dead-token case explicitly (return
+    /// `None`, skip iteration, fall back to non-JIT, etc.) rather than
+    /// crashing the runtime on a legitimate eviction.
+    pub(crate) fn live_token(&self) -> Option<std::sync::Arc<JitCellToken>> {
+        self.token.upgrade()
     }
 }
 
@@ -1504,12 +1502,16 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.fail_index == fail_index)
                 })
         };
-        lookup(&compiled.live_token()).or_else(|| {
-            compiled
-                .previous_tokens
-                .iter()
-                .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
-        })
+        compiled
+            .live_token()
+            .as_deref()
+            .and_then(lookup)
+            .or_else(|| {
+                compiled
+                    .previous_tokens
+                    .iter()
+                    .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
+            })
     }
 
     fn terminal_exit_layout_from_trace(
@@ -1546,12 +1548,16 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.op_index == op_index)
                 })
         };
-        lookup(&compiled.live_token()).or_else(|| {
-            compiled
-                .previous_tokens
-                .iter()
-                .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
-        })
+        compiled
+            .live_token()
+            .as_deref()
+            .and_then(lookup)
+            .or_else(|| {
+                compiled
+                    .previous_tokens
+                    .iter()
+                    .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
+            })
     }
 
     fn compiled_exit_layout_from_backend(
@@ -1656,9 +1662,10 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 Vec::new()
             };
-        if let Some(backend_layouts) = self
-            .backend
-            .compiled_trace_fail_descr_layouts(&compiled.live_token(), trace_id)
+        if let Some(backend_layouts) = compiled
+            .live_token()
+            .as_deref()
+            .and_then(|token| self.backend.compiled_trace_fail_descr_layouts(token, trace_id))
         {
             let mut merged = HashMap::new();
             for layout in exit_layouts.drain(..) {
@@ -1709,9 +1716,10 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 Vec::new()
             };
-        if let Some(backend_layouts) = self
-            .backend
-            .compiled_trace_terminal_exit_layouts(&compiled.live_token(), trace_id)
+        if let Some(backend_layouts) = compiled
+            .live_token()
+            .as_deref()
+            .and_then(|token| self.backend.compiled_trace_terminal_exit_layouts(token, trace_id))
         {
             let mut merged = HashMap::new();
             for layout in terminal_exit_layouts.drain(..) {
@@ -4045,7 +4053,8 @@ impl<M: Clone> MetaInterp<M> {
         let prior_retraced_count_early = self
             .compiled_loops
             .get(&green_key)
-            .map(|compiled| compiled.live_token().get_retraced_count())
+            .and_then(|compiled| compiled.live_token())
+            .map(|token| token.get_retraced_count())
             .unwrap_or(0);
         if prior_retraced_count_early == u32::MAX && !prior_front_target_tokens_early.is_empty() {
             if crate::majit_log_enabled() {
@@ -4670,8 +4679,9 @@ impl<M: Clone> MetaInterp<M> {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
-                    self.backend
-                        .migrate_bridges(&old_entry.live_token(), token.as_ref());
+                    if let Some(old_tok) = old_entry.live_token() {
+                        self.backend.migrate_bridges(&old_tok, token.as_ref());
+                    }
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
@@ -5105,7 +5115,7 @@ impl<M: Clone> MetaInterp<M> {
             let Some(token) = self
                 .compiled_loops
                 .get(&green_key)
-                .map(|compiled| compiled.live_token())
+                .and_then(|compiled| compiled.live_token())
             else {
                 return false;
             };
@@ -5232,7 +5242,8 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retraced_count = self
             .compiled_loops
             .get(&green_key)
-            .map(|compiled| compiled.live_token().get_retraced_count())
+            .and_then(|compiled| compiled.live_token())
+            .map(|token| token.get_retraced_count())
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
@@ -5513,8 +5524,9 @@ impl<M: Clone> MetaInterp<M> {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
-                    self.backend
-                        .migrate_bridges(&old_entry.live_token(), token.as_ref());
+                    if let Some(old_tok) = old_entry.live_token() {
+                        self.backend.migrate_bridges(&old_tok, token.as_ref());
+                    }
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
@@ -6009,7 +6021,8 @@ impl<M: Clone> MetaInterp<M> {
                     let rc = self
                         .compiled_loops
                         .get(&green_key)
-                        .map(|c| c.live_token().get_retraced_count())
+                        .and_then(|c| c.live_token())
+                        .map(|tok| tok.get_retraced_count())
                         .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
@@ -6446,11 +6459,10 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<RawCompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let token = compiled.live_token()?;
 
         Self::prepare_compiled_run_io();
-        let result = self
-            .backend
-            .execute_token_raw(&compiled.live_token(), live_values);
+        let result = self.backend.execute_token_raw(&token, live_values);
         Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
@@ -6568,11 +6580,10 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[i64],
     ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let token = compiled.live_token()?;
 
         Self::prepare_compiled_run_io();
-        let frame = self
-            .backend
-            .execute_token_ints(&compiled.live_token(), live_values);
+        let frame = self.backend.execute_token_ints(&token, live_values);
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
         let descr: &dyn majit_ir::FailDescr = descr_arc
@@ -6725,11 +6736,10 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
+        let token = compiled.live_token()?;
 
         Self::prepare_compiled_run_io();
-        let frame = self
-            .backend
-            .execute_token(&compiled.live_token(), live_values);
+        let frame = self.backend.execute_token(&token, live_values);
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -6920,13 +6930,12 @@ impl<M: Clone> MetaInterp<M> {
         // `trace_id == 0` would be a sentinel-misuse bug, not a valid
         // input.  RPython has no `0 → root_trace_id` fallback because
         // it dispatches by descr object identity, not numeric trace id.
-        let Some((trace_id, trace_info)) = self.compiled_loops.get(&green_key).map(|compiled| {
-            (
-                trace_id,
-                self.backend
-                    .compiled_trace_info(&compiled.live_token(), trace_id),
-            )
-        }) else {
+        let Some((trace_id, trace_info)) = self
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|compiled| compiled.live_token())
+            .map(|token| (trace_id, self.backend.compiled_trace_info(&token, trace_id)))
+        else {
             return;
         };
         let mut patched_recovery_layout = None;
@@ -7815,11 +7824,11 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<(u64, usize)> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let tid = trace_id;
-        let (s, a) = self
-            .backend
-            .get_guard_status(&compiled.live_token(), tid, fail_index);
-        if a != 0 {
-            return Some((s, a));
+        if let Some(token) = compiled.live_token() {
+            let (s, a) = self.backend.get_guard_status(&token, tid, fail_index);
+            if a != 0 {
+                return Some((s, a));
+            }
         }
         for prev in &compiled.previous_tokens {
             if let Some(prev) = prev.upgrade() {
@@ -7901,10 +7910,10 @@ impl<M: Clone> MetaInterp<M> {
         // (jf_descr embedding the meta Arc address) is the structural fix
         // that lets this fallback retire; until then it covers
         // exit_layouts eviction.
-        if let Some(descr) =
+        if let Some(descr) = compiled.live_token().and_then(|token| {
             self.backend
-                .find_source_fail_descr(&compiled.live_token(), trace_id, fail_index)
-        {
+                .find_source_fail_descr(&token, trace_id, fail_index)
+        }) {
             return Some(descr);
         }
         for prev_token in &compiled.previous_tokens {
@@ -8184,7 +8193,9 @@ impl<M: Clone> MetaInterp<M> {
         // decode (resume.py:1245-1282).
         let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            let tok = compiled.live_token();
+            let Some(tok) = compiled.live_token() else {
+                return false;
+            };
             (
                 tok.get_retraced_count(),
                 tok.inputarg_types.len(),
@@ -8299,8 +8310,11 @@ impl<M: Clone> MetaInterp<M> {
         // RPython-orthodox: unroll.py replay uses Const args directly;
         // no cross-trace constant pool merge step.
         if retrace_requested {
-            if let Some(compiled) = self.compiled_loops.get(&green_key) {
-                let tok = compiled.live_token();
+            if let Some(tok) = self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| compiled.live_token())
+            {
                 tok.set_retraced_count(tok.get_retraced_count() + 1);
             }
             if let Some(es) = optimizer.exported_loop_state.take() {
@@ -8485,14 +8499,16 @@ impl<M: Clone> MetaInterp<M> {
                 let retraced_count = self
                     .compiled_loops
                     .get(&original_green_key)
-                    .map(|c| c.live_token().get_retraced_count())
+                    .and_then(|c| c.live_token())
+                    .map(|tok| tok.get_retraced_count())
                     .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                    self.backend
-                        .migrate_bridges(&old_entry.live_token(), token.as_ref());
+                    if let Some(old_tok) = old_entry.live_token() {
+                        self.backend.migrate_bridges(&old_tok, token.as_ref());
+                    }
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
@@ -8673,7 +8689,9 @@ impl<M: Clone> MetaInterp<M> {
                     cls_of_box: self.cls_of_box,
                 })
             });
-            let tok = compiled.live_token();
+            let Some(tok) = compiled.live_token() else {
+                return false;
+            };
             (
                 tok.get_retraced_count(),
                 tok.inputarg_types.len(),
@@ -8834,8 +8852,11 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
-            if let Some(compiled) = self.compiled_loops.get(&green_key) {
-                let tok = compiled.live_token();
+            if let Some(tok) = self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| compiled.live_token())
+            {
                 tok.set_retraced_count(tok.get_retraced_count() + 1);
             }
             let exported = optimizer.exported_loop_state.take();

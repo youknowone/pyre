@@ -1718,9 +1718,14 @@ impl<S: JitState> JitDriver<S> {
                         )
                         .live_token();
                     // `warmstate.py:339-348` redirect+record_jump_to chain
-                    // routed through MetaInterp's caller-side helper.
-                    self.meta
-                        .attach_procedure_with_redirect(green_key, install_token);
+                    // routed through MetaInterp's caller-side helper.  Skip
+                    // the redirect when MemoryManager has already evicted
+                    // the freshly-installed token (rare; eviction is
+                    // independent of this insertion path).
+                    if let Some(install_token) = install_token {
+                        self.meta
+                            .attach_procedure_with_redirect(green_key, install_token);
+                    }
                 }
                 // Blackhole transition: clear all driver tracing state.
                 self.sym = None;
