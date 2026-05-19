@@ -849,8 +849,9 @@ impl OptGuard {
                 // guard.py: record the known class for subsumption checks.
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
-                        self.known_classes
-                            .insert(op.arg(0), majit_ir::GcRef(class_val as usize));
+                        let val = majit_ir::GcRef(class_val as usize);
+                        let key = op.arg(0);
+                        self.known_classes.insert(key, val);
                     }
                 }
             }
@@ -869,14 +870,14 @@ impl OptGuard {
                 if self.truthy_values.contains(&op.arg(0)) {
                     return true;
                 }
-                if let Some(&c) = self.known_constants.get(&op.arg(0)) {
+                if let Some(c) = self.known_constants.get(&op.arg(0)).copied() {
                     return c != 0;
                 }
                 false
             }
             OpCode::GuardFalse => {
                 // Subsumed if value is a known zero constant.
-                if let Some(&c) = self.known_constants.get(&op.arg(0)) {
+                if let Some(c) = self.known_constants.get(&op.arg(0)).copied() {
                     return c == 0;
                 }
                 false
@@ -889,7 +890,7 @@ impl OptGuard {
             // rewrite.py: optimize_GUARD_CLASS — if the class is already
             // known for this value, and it matches, remove the guard.
             OpCode::GuardClass if op.num_args() >= 2 => {
-                if let Some(&known_class) = self.known_classes.get(&op.arg(0)) {
+                if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
                     if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                         return known_class.0 as i64 == expected;
                     }
@@ -908,7 +909,7 @@ impl OptGuard {
             // guard.py: GUARD_VALUE subsumed if value is already known to be
             // that exact constant from a previous GuardValue.
             OpCode::GuardValue if op.num_args() >= 2 => {
-                if let Some(&known) = self.known_constants.get(&op.arg(0)) {
+                if let Some(known) = self.known_constants.get(&op.arg(0)).copied() {
                     if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                         return known == expected;
                     }
@@ -927,7 +928,7 @@ impl OptGuard {
                     return false;
                 }
                 // Check class via guard pass state
-                if let Some(&known_class) = self.known_classes.get(&op.arg(0)) {
+                if let Some(known_class) = self.known_classes.get(&op.arg(0)).copied() {
                     if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                         return known_class.0 as i64 == expected;
                     }
