@@ -633,7 +633,11 @@ pub(crate) fn build_guard_metadata(
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
                 for frame in frames.iter() {
-                    builder.push_frame(frame.jitcode_index, frame.pc as u64);
+                    builder.push_frame(
+                        frame.jitcode_index,
+                        frame.pc as u64,
+                        frame.jitcode_pc as u64,
+                    );
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
                         add_slot(&mut builder, slot_idx, val);
@@ -642,7 +646,10 @@ pub(crate) fn build_guard_metadata(
                 }
             } else {
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
-                builder.push_frame(0, pc);
+                // Phase 7b: no jitcode_pc available in the no-rd_numb fallback;
+                // resume readers tolerate 0 and fall through to the legacy
+                // `PyJitCode::resume_jitcode_pc_for` lookup.
+                builder.push_frame(0, pc, 0);
                 let num_slots = op
                     .getfailargs()
                     .map(|fa| fa.len())
@@ -739,6 +746,7 @@ pub(crate) fn build_guard_metadata(
                                     header_pc: Some(frame.pc as u64),
                                     source_guard: None,
                                     pc: frame.pc as u64,
+                                    jitcode_pc: frame.jitcode_pc as u64,
                                     jitcode_index: frame.jitcode_index,
                                     slots,
                                     slot_types: Some(slot_types),
@@ -1080,6 +1088,7 @@ pub(crate) fn build_guard_metadata(
                     header_pc: Some(pc),
                     source_guard: None,
                     pc,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots,
                     slot_types: Some(exit_types.clone()),
@@ -2587,6 +2596,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
+                jitcode_pc: 0,
                 boxes: vec![OpRef::input_arg_int(1).into()],
             }],
         };

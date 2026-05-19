@@ -633,6 +633,11 @@ pub struct ExitFrameLayout {
     pub source_guard: Option<(u64, u32)>,
     /// Interpreter program counter for the frame.
     pub pc: u64,
+    /// JitCode byte offset paired with `pc` (issue #73 Phase 7b).  RPython
+    /// has no analog — there `pc` is already the JitCode position.  Pyre
+    /// stores both because the tracer records Python bytecode PCs but
+    /// resume entry points need JitCode offsets.
+    pub jitcode_pc: u64,
     /// resume.py:250 `jitcode_index` — index into
     /// `MetaInterpStaticData.jitcodes` identifying the code this frame is
     /// running. Required so multi-frame inline snapshots can be decoded
@@ -653,6 +658,7 @@ impl ExitFrameLayout {
             header_pc: self.header_pc,
             source_guard: self.source_guard,
             pc: self.pc,
+            jitcode_pc: self.jitcode_pc,
             jitcode_index: self.jitcode_index,
             slots: self
                 .slots

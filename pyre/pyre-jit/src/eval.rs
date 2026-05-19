@@ -6116,18 +6116,31 @@ fn build_resumed_frames(
             // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
-        // Pre-translate py_pc → jitcode_pc when the writer can resolve
-        // the pyjitcode + pc_map entry.  Mirrors upstream
-        // `blackhole.py:1712 setposition(miframe.jitcode, miframe.pc)`
-        // shape where the JitCode PC is what reaches the resume site.
-        // Pseudo-instruction adjustment (Cache / ExtendedArg / NotTaken
-        // backtracking, `call_jit.rs:793-803`) still runs at read time
-        // because it depends on the raw `py_pc` and the live code
-        // object — pre-applying it here would require duplicating the
-        // adjustment loop, so the cache stores the unadjusted lookup
-        // and falls through to the read-time path when the adjusted
-        // py_pc differs.
-        let jitcode_pc = if !w_code.is_null() {
+        // Issue #73 Phase 7b: read the JitCode PC directly off the
+        // decoded snapshot frame (`frame.jitcode_pc`) instead of
+        // repeating the runtime `PyJitCode::resume_jitcode_pc_for(py_pc)`
+        // lookup.  The encoder (`ResumeDataLoopMemo::number` →
+        // `rd_numb`) writes both `py_pc` and `jitcode_pc` per frame and
+        // the decoder (`rebuild_from_numbering` in majit-ir) returns
+        // both via `RebuiltFrame`, so this site can consume the paired
+        // value with no additional translation.
+        //
+        // `0` carries the "miss / unknown" sentinel coming from
+        // segmented-driver guards and other paths where the writer had
+        // no `PyJitCode` to consult — fall back to the legacy lookup
+        // there so resume continues to function when the cache is
+        // genuinely absent (the byte-equal `0` of a real entry-point
+        // jitcode collides with this sentinel; readers tolerate the
+        // false negative because the legacy lookup returns the same 0).
+        //
+        // Pseudo-instruction adjustment (Cache / ExtendedArg /
+        // NotTaken backtracking, `call_jit.rs:793-803`) still runs at
+        // read time off the unadjusted `py_pc`; resume_in_blackhole
+        // falls back to the read-time `resume_jitcode_pc_for` lookup
+        // when py_pc shifts after that adjustment.
+        let jitcode_pc = if frame.jitcode_pc != 0 {
+            Some(frame.jitcode_pc as usize)
+        } else if !w_code.is_null() {
             pyre_jit_trace::state::pyjitcode_for_code(w_code)
                 .and_then(|pjc| pjc.resume_jitcode_pc_for(py_pc))
         } else {

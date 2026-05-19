@@ -675,8 +675,10 @@ fn caller_prefix_recovery_layout(
             // the resume_layout-derived layout via
             // `compile::patch_guard_recovery_layouts_for_trace`
             // (compile.rs:1596) before any guard can fire. The
-            // resume_layout carries the authoritative jitcode_index
-            // threaded from `Snapshot::single_frame`.
+            // resume_layout carries the authoritative jitcode_index +
+            // jitcode_pc threaded from `Snapshot::single_frame` (the
+            // 0 placeholder is overwritten there).
+            jitcode_pc: 0,
             jitcode_index: 0,
             slots: slot_types
                 .iter()
@@ -6829,7 +6831,9 @@ fn identity_recovery_layout(
         // ~11035 additionally overwrites `frame.jitcode_index` with the
         // topmost rd_numb frame, covering guards whose resume_layout is
         // absent. `Snapshot::single_frame(jitcode_index, pc, ...)` is the
-        // upstream source of truth.
+        // upstream source of truth.  jitcode_pc shares the same patch-up
+        // protocol (issue #73 Phase 7b).
+        jitcode_pc: 0,
         jitcode_index: 0,
         slots: (0..slot_types.len())
             .map(ExitValueSourceLayout::ExitValue)
@@ -16605,7 +16609,8 @@ mod tests {
                 header_pc: None,
                 source_guard: None,
                 pc: 4242,
-                jitcode_index: 0,
+                jitcode_pc: 0,
+                    jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::Constant(99)],
                 slot_types: Some(vec![Type::Int]),
             }],
@@ -16753,6 +16758,7 @@ mod tests {
                     header_pc: Some(900),
                     source_guard: Some((9, 0)),
                     pc: 900,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
@@ -16762,6 +16768,7 @@ mod tests {
                     header_pc: Some(1000),
                     source_guard: None,
                     pc: 1000,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
@@ -16892,6 +16899,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 900,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
@@ -16901,6 +16909,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 1000,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
@@ -16976,6 +16985,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 444,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
@@ -16985,6 +16995,7 @@ mod tests {
                     header_pc: None,
                     source_guard: Some((290, 0)),
                     pc: 2000,
+                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),

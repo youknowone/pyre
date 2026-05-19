@@ -111,6 +111,12 @@ pub struct ResumeFrameLayoutSummary {
     /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
     pub jitcode_index: i32,
     pub pc: u64,
+    /// JitCode byte offset paired with `pc` (issue #73 Phase 7b).
+    /// RPython has no analog: there `pc` already names the JitCode
+    /// position.  Pyre traces Python bytecode so the writer-side stores
+    /// both coordinates and downstream backends pick whichever the
+    /// resume entry point needs.
+    pub jitcode_pc: u64,
     pub slot_sources: Vec<ResumeValueKind>,
     pub slot_layouts: Vec<ResumeValueLayoutSummary>,
     pub slot_types: Option<Vec<Type>>,
@@ -300,7 +306,20 @@ pub enum RebuiltValue {
 #[derive(Debug, Clone)]
 pub struct RebuiltFrame {
     pub jitcode_index: i32,
+    /// resume.py:250 `pc` — RPython carries the JitCode byte offset
+    /// here; pyre's deviation populates this with the Python bytecode
+    /// PC because pyre traces Python bytecode rather than JitCode.  See
+    /// `[[project-issue73-phase5-design]]`.
     pub pc: i32,
+    /// JitCode byte offset paired with `pc` (issue #73 Phase 7b).
+    /// Encoded via `from_semantic` / `encode_shared` next to `pc`;
+    /// decoded by [`rebuild_from_numbering`] alongside `pc`.  Pyre's
+    /// resume readers consume this directly instead of repeating the
+    /// runtime `PyJitCode::resume_jitcode_pc_for` lookup.  RPython has
+    /// no analog — there `pc` is already the JitCode offset — so this
+    /// slot is structurally pyre-specific until Phase 9 retires
+    /// `pc_map`.
+    pub jitcode_pc: i32,
     pub values: Vec<RebuiltValue>,
 }
 
@@ -417,10 +436,23 @@ pub fn rebuild_from_numbering(
 
     // resume.py:1049-1055: frame section — jitcode_index, pc, [tagged_values...].
     // RPython uses consume_one_section → enumerate_vars(liveness) to split frames.
+    //
+    // Issue #73 Phase 7b: pyre pairs each `pc` with a `jitcode_pc` so
+    // the resume reader can `setposition(jitcode, jitcode_pc)` without
+    // the runtime `pc_map[py_pc]` lookup.  The encoded layout is now
+    // `jitcode_index, pc, jitcode_pc, [tagged_values...]` per frame —
+    // exactly one additional varint slot ahead of the existing
+    // value-tag stream.  RPython has no analog; this matches the
+    // additive shape recorded on `recorder::SnapshotFrame.jitcode_pc`.
     let mut frames = Vec::new();
     while reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
         let pc = if reader.has_more() && reader.items_read < total_size as usize {
+            reader.next_item()
+        } else {
+            0
+        };
+        let jitcode_pc = if reader.has_more() && reader.items_read < total_size as usize {
             reader.next_item()
         } else {
             0
@@ -448,6 +480,7 @@ pub fn rebuild_from_numbering(
         frames.push(RebuiltFrame {
             jitcode_index,
             pc,
+            jitcode_pc,
             values,
         });
     }

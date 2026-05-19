@@ -8803,6 +8803,7 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
+                jitcode_pc: 0,
                 values: vec![
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
