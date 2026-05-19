@@ -4840,7 +4840,7 @@ mod tests {
 
         // Roundtrip with liveness-based closure.
         let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
-        let frame_count = |jitcode_index: i32, _pc: i32| -> usize {
+        let frame_count = |jitcode_index: i32, _pc: i32, _jitcode_pc: i32| -> usize {
             match jitcode_index {
                 0 => 2, // Frame 0 has 2 boxes
                 1 => 2, // Frame 1 has 2 boxes

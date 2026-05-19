@@ -6863,10 +6863,19 @@ mod tests {
         code: &pyre_interpreter::CodeObject,
         regs: &[u32],
     ) -> (usize, Vec<u32>) {
+        // Phase 8: this helper walks every Python PC; the corresponding
+        // JitCode PC requires the runtime pc_map lookup that the new
+        // jitcode_pc-first API was meant to replace.  Pass 0 here so
+        // the lookup falls back to `pc_map[py_pc]` — the helper is only
+        // used by test fixtures that don't carry a snapshot's
+        // jitcode_pc.
         let live_by_pc: Vec<(usize, Vec<u32>)> = (0..code.instructions.len())
             .map(|pc| {
-                let live =
-                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
+                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
+                    jitcode_index,
+                    pc as i32,
+                    0,
+                );
                 (pc, live)
             })
             .collect();
@@ -7055,13 +7064,15 @@ mod tests {
         let color_a: u32 = (*local_color_map.get(0).expect("color for local a")).into();
         let color_b: u32 = (*local_color_map.get(1).expect("color for local b")).into();
         let color_c: u32 = (*local_color_map.get(2).expect("color for local c")).into();
+        // Test scan over py_pc range — pc_map fallback (jitcode_pc=0).
         let resume_pc = (0..code.instructions.len())
             .find(|&pc| {
-                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
+                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32, 0)
                     .contains(&color_i)
             })
             .expect("compiled liveness should expose local i at some Python PC");
-        let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
+        let live_regs =
+            trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32, 0);
         assert!(
             live_regs.contains(&color_i),
             "selected resume pc must decode the raw-int local slot"

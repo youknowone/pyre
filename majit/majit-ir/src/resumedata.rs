@@ -20,12 +20,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static FRAME_VALUE_COUNT_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the global frame_value_count callback.
-pub fn set_frame_value_count_fn(f: fn(i32, i32) -> usize) {
+///
+/// Signature: `(jitcode_index, py_pc, jitcode_pc) -> count`.  Issue #73
+/// Phase 8 added `jitcode_pc` (paired with `py_pc` in the snapshot) so
+/// the resume reader can index `get_live_vars_info` directly without
+/// looking up `pc_map[py_pc]`.  `py_pc` stays in the signature only for
+/// the pyre-only portal-bridge fallback (`PyJitCodeMetadata.depth_at_py_pc`),
+/// which remains py_pc-keyed pending its own NEW-DEVIATION retirement.
+pub fn set_frame_value_count_fn(f: fn(i32, i32, i32) -> usize) {
     FRAME_VALUE_COUNT_FN.store(f as usize, Ordering::Relaxed);
 }
 
 /// Get the registered frame_value_count callback (if any).
-pub fn get_frame_value_count_fn() -> Option<fn(i32, i32) -> usize> {
+pub fn get_frame_value_count_fn() -> Option<fn(i32, i32, i32) -> usize> {
     let p = FRAME_VALUE_COUNT_FN.load(Ordering::Relaxed);
     if p == 0 {
         None
@@ -395,7 +402,7 @@ pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[Const],
     fail_arg_types: &[Type],
-    frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
+    frame_value_count: Option<&dyn Fn(i32, i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
@@ -458,8 +465,10 @@ pub fn rebuild_from_numbering(
             0
         };
         let box_count = if let Some(f) = &frame_value_count {
-            // RPython parity: liveness-driven frame boundary.
-            f(jitcode_index, pc)
+            // RPython parity: liveness-driven frame boundary.  Phase 8
+            // passes both py_pc and jitcode_pc; the canonical path keys
+            // on jitcode_pc, the portal-bridge fallback keys on py_pc.
+            f(jitcode_index, pc, jitcode_pc)
         } else {
             // Single-frame fallback: consume all remaining items.
             (total_size as usize).saturating_sub(reader.items_read)
