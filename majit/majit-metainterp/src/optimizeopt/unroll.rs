@@ -1052,9 +1052,10 @@ impl UnrollOptimizer {
                             if !is_trace_runtime_ref(arg, &consts_p2) {
                                 continue;
                             }
-                            if !visited_force.insert(arg) {
+                            if visited_force.contains(&arg) {
                                 continue;
                             }
+                            visited_force.insert(arg);
                             let resolved = final_ctx.get_box_replacement(arg);
                             let needs_force = final_ctx
                                 .potential_extra_ops
@@ -1174,7 +1175,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used = majit_ir::vec_set::VecSet::new();
+                let mut seen_used: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .chain(initial_sp.used_boxes.iter())
@@ -1184,7 +1185,8 @@ impl UnrollOptimizer {
                     .saturating_add(1)
                     .max(body_num_inputs as u32 + 100);
                 for &ub in &initial_sp.used_boxes {
-                    if seen_used.insert(ub) {
+                    if !seen_used.contains(&ub) {
+                        seen_used.insert(ub);
                         current_label_args.push(ub);
                     } else {
                         // shortpreamble.py:343-350 inputarg_from_tp parity:
