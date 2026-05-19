@@ -506,6 +506,14 @@ impl FailDescr for ResumeGuardDescr {
     fn target_descr(&self) -> Option<DescrRef> {
         self.external_jump_target.get().cloned()
     }
+
+    /// Trait override of `set_external_jump_target` forwarding to the
+    /// inherent method (Slice 7-Tβ8); reuses the same write-once
+    /// semantics so trait dispatch on `&dyn FailDescr` lands here for
+    /// the cross-loop JUMP target publish in `collect_guards`.
+    fn set_external_jump_target(&self, target: DescrRef) {
+        ResumeGuardDescr::set_external_jump_target(self, target);
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr

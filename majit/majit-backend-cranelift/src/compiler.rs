@@ -6204,20 +6204,14 @@ pub(crate) fn fail_descr_external_jump_target(descr: &DescrRef) -> Option<DescrR
         .and_then(|rgd| rgd.external_jump_target())
 }
 
-/// Write the external-JUMP target to the meta-side
-/// `ResumeGuardDescr::external_jump_target` slot (Slice 7-Tβ8).
-/// Panics when the descr is not a `ResumeGuardDescr` — cross-loop JUMP
-/// descrs synthesise one in `_compile_one_block` (compiler.rs) before
-/// invoking this.  Slice 7-Tβ14c lift-off.
+/// Write the external-JUMP target into the meta-side per-emission
+/// slot on the Resume-family descr (Slice 7-Tβ8).  Dispatches via
+/// the `FailDescr::set_external_jump_target` trait method which
+/// the Resume-family overrides; non-Resume descrs trip the trait
+/// panic default.  Cross-loop JUMP descrs synthesise a fresh
+/// `ResumeGuardDescr` in `collect_guards` before invoking this.
 pub(crate) fn fail_descr_set_external_jump_target(descr: &DescrRef, target: DescrRef) {
-    let rgd = descr
-        .as_any()
-        .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        .expect(
-            "set_external_jump_target requires a ResumeGuardDescr meta; \
-             cross-loop JUMP descrs synthesise one in _compile_one_block",
-        );
-    rgd.set_external_jump_target(target);
+    as_fd(descr).set_external_jump_target(target);
 }
 
 /// Build the per-trace `FailDescrLayout` view for a slice of

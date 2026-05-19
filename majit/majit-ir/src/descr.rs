@@ -1751,6 +1751,22 @@ pub trait FailDescr: Descr {
         None
     }
 
+    /// Pyre-only cranelift cross-loop JUMP target publish (Slice 7-Tβ8).
+    /// Writes the target `DescrRef` into the per-emission slot read
+    /// back via `target_descr` / `is_external_jump`.  Default panics —
+    /// only Resume-family descrs (`ResumeGuardDescr` /
+    /// `ResumeGuardCopiedDescr` + their subclass wrappers) own the
+    /// slot.  Callers reach this through trait dispatch on whatever
+    /// descr the JUMP synthesised carries.
+    fn set_external_jump_target(&self, _target: DescrRef) {
+        panic!(
+            "set_external_jump_target invoked on a FailDescr that does \
+             not carry the per-emission external_jump_target slot \
+             (only Resume-family descrs synthesised for cross-loop \
+             JUMP exits in cranelift collect_guards own it)"
+        );
+    }
+
     /// history.py:137-139: exits_early()
     /// Is this guard a guard_early_exit or moved before one?
     fn exits_early(&self) -> bool {

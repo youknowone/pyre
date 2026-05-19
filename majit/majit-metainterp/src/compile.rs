@@ -3215,6 +3215,15 @@ impl FailDescr for ResumeAtPositionDescr {
     ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
+    fn is_external_jump(&self) -> bool {
+        FailDescr::is_external_jump(&self.inner)
+    }
+    fn target_descr(&self) -> Option<DescrRef> {
+        FailDescr::target_descr(&self.inner)
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        FailDescr::set_external_jump_target(&self.inner, target);
+    }
 }
 
 /// Create a ResumeAtPositionDescr with auto-assigned fail_index, the
@@ -3476,6 +3485,15 @@ impl FailDescr for ResumeGuardForcedDescr {
     ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
+    fn is_external_jump(&self) -> bool {
+        FailDescr::is_external_jump(&self.inner)
+    }
+    fn target_descr(&self) -> Option<DescrRef> {
+        FailDescr::target_descr(&self.inner)
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        FailDescr::set_external_jump_target(&self.inner, target);
+    }
 }
 
 /// Create a ResumeGuardForcedDescr with auto-assigned fail_index, the
@@ -3721,6 +3739,15 @@ impl FailDescr for ResumeGuardExcDescr {
     ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
+    fn is_external_jump(&self) -> bool {
+        FailDescr::is_external_jump(&self.inner)
+    }
+    fn target_descr(&self) -> Option<DescrRef> {
+        FailDescr::target_descr(&self.inner)
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        FailDescr::set_external_jump_target(&self.inner, target);
+    }
 }
 
 /// Create a ResumeGuardExcDescr with auto-assigned fail_index, the
@@ -3875,6 +3902,14 @@ pub struct ResumeGuardCopiedDescr {
     /// invoked by `Drop` on the surviving payload to reclaim the
     /// published `Arc<BridgeData>` without knowing its concrete type.
     bridge_dispatch_drop_fn: std::sync::OnceLock<unsafe fn(*mut ())>,
+    /// Pyre-only per-emission cranelift cross-loop JUMP target slot.
+    /// Mirrors `ResumeGuardDescr::external_jump_target`; per-emission
+    /// because each copied descr can be the JUMP exit for an
+    /// independently retraced loop-version peel, even though the
+    /// donor (`prev`) carries shared resume payload.  Membership
+    /// (`OnceLock.get().is_some()`) is the `is_external_jump`
+    /// predicate.  Write-once at codegen finalisation.
+    pub external_jump_target: std::sync::OnceLock<DescrRef>,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3925,6 +3960,17 @@ impl ResumeGuardCopiedDescr {
         // Safety: single-threaded JIT, no concurrent readers.
         unsafe { *self.prev.get() = prev }
     }
+
+    /// Mirror `ResumeGuardDescr::set_external_jump_target` (Slice 7-Tβ8):
+    /// publish the cross-loop JUMP target `DescrRef` into the
+    /// write-once slot.  Each copied descr carries its own slot so
+    /// distinct loop-version peels sharing a donor (compile.py:840
+    /// `prev`) can each be the JUMP exit for their independent peel.
+    pub fn set_external_jump_target(&self, target: DescrRef) {
+        self.external_jump_target
+            .set(target)
+            .expect("external_jump_target already published");
+    }
 }
 
 impl majit_ir::Descr for ResumeGuardCopiedDescr {
@@ -3968,6 +4014,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
             bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
+            external_jump_target: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -4217,6 +4264,23 @@ impl FailDescr for ResumeGuardCopiedDescr {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
+
+    /// Mirror `ResumeGuardDescr::is_external_jump` (Slice 7-Tβ8 +
+    /// resume_guard_descr.rs:498): membership in the per-emission
+    /// `external_jump_target` slot IS the cross-loop-JUMP predicate.
+    fn is_external_jump(&self) -> bool {
+        self.external_jump_target.get().is_some()
+    }
+
+    /// Mirror `ResumeGuardDescr::target_descr` (resume_guard_descr.rs:506):
+    /// when this copied descr is the synthesised cross-loop JUMP exit,
+    /// surface the target `DescrRef` the dispatcher re-enters via.
+    fn target_descr(&self) -> Option<DescrRef> {
+        self.external_jump_target.get().cloned()
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        ResumeGuardCopiedDescr::set_external_jump_target(self, target);
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -4270,6 +4334,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
                 bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
+            external_jump_target: std::sync::OnceLock::new(),
             },
         }))
     }
@@ -4421,6 +4486,15 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     ) -> *mut () {
         self.inner.bridge_dispatch_swap(new_ptr, drop_fn)
     }
+    fn is_external_jump(&self) -> bool {
+        FailDescr::is_external_jump(&self.inner)
+    }
+    fn target_descr(&self) -> Option<DescrRef> {
+        FailDescr::target_descr(&self.inner)
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        FailDescr::set_external_jump_target(&self.inner, target);
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -4468,6 +4542,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
         bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
+        external_jump_target: std::sync::OnceLock::new(),
     })
 }
 
@@ -4507,6 +4582,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
             bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
+            external_jump_target: std::sync::OnceLock::new(),
         },
     })
 }
@@ -4853,6 +4929,15 @@ impl FailDescr for CompileLoopVersionDescr {
         drop_fn: unsafe fn(*mut ()),
     ) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
+    }
+    fn is_external_jump(&self) -> bool {
+        FailDescr::is_external_jump(&self.inner)
+    }
+    fn target_descr(&self) -> Option<DescrRef> {
+        FailDescr::target_descr(&self.inner)
+    }
+    fn set_external_jump_target(&self, target: DescrRef) {
+        FailDescr::set_external_jump_target(&self.inner, target);
     }
 }
 
