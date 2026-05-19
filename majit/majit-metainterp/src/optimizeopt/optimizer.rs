@@ -616,7 +616,7 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &_> =
+        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &ImportedVirtual> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
         for iv in &self.imported_virtuals {
             iv_map.insert(iv.inputarg_index, iv);
@@ -636,7 +636,7 @@ impl Optimizer {
         let mut walk_visited: crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
-            if let Some(iv) = iv_map.get(&state_idx) {
+            if let Some(iv) = iv_map.get(&state_idx).copied() {
                 // Virtual state: process fields recursively, consuming slots
                 // for non-virtual leaf fields.
                 //
