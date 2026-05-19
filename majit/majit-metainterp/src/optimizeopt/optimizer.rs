@@ -1588,9 +1588,10 @@ impl Optimizer {
                 | crate::optimizeopt::info::PtrInfo::VirtualArray(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
         ) {
-            if !rec.insert(resolved) {
+            if rec.contains(&resolved) {
                 return resolved;
             }
+            rec.insert(resolved);
             info.force_at_the_end_of_preamble(|child| {
                 self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });
