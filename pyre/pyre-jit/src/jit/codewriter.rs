@@ -786,12 +786,24 @@ fn strip_walker_block_boundary_goto(
         // entry in `all_walker_blocks` is the now-empty dead block,
         // not the supersede newblock that holds the matching
         // `Label(pcN)` first insn.
-        let next_label_name: Option<String> = (i + 1..n)
-            .find_map(|j| blocks[j].first().map(|first| (j, first)))
-            .and_then(|(_, first)| match first {
-                super::flatten::Insn::Label(l) => Some(l.name.clone()),
-                _ => None,
-            });
+        // T6.1 Slice 4: block-entry emits both `Label("block{addr}")`
+        // (RPython-orthodox) and `Label("pcN")` (per-PC anchor) at the
+        // first PC of the block.  The strip's `goto Label("pcN")`
+        // target may match the SECOND leading label of the next block,
+        // not the first — so scan the entire leading-label cluster
+        // rather than just `first()`.
+        let next_label_names: Vec<String> = (i + 1..n)
+            .flat_map(|j| {
+                blocks[j]
+                    .iter()
+                    .take_while(|insn| matches!(insn, super::flatten::Insn::Label(_)))
+                    .filter_map(|insn| match insn {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let first_label_for_diag = blocks[i].first().and_then(|insn| match insn {
             super::flatten::Insn::Label(l) => Some(l.name.clone()),
             _ => None,
@@ -802,22 +814,20 @@ fn strip_walker_block_boundary_goto(
             match (
                 &block_insns[len - 2],
                 &block_insns[len - 1],
-                next_label_name.as_deref(),
             ) {
                 (
                     super::flatten::Insn::Op { opname, args, .. },
                     super::flatten::Insn::Unreachable,
-                    Some(next_name),
                 ) if opname == "goto"
                     && args.len() == 1
-                    && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
+                    && matches!(&args[0], Operand::TLabel(target)
+                        if next_label_names.iter().any(|n| n == &target.name)) =>
                 {
                     (2, None)
                 }
                 (
                     super::flatten::Insn::Op { opname, args, .. },
                     super::flatten::Insn::Unreachable,
-                    _,
                 ) if opname == "goto" && args.len() == 1 => {
                     let target = match &args[0] {
                         Operand::TLabel(t) => Some(t.name.clone()),
@@ -833,8 +843,8 @@ fn strip_walker_block_boundary_goto(
         if std::env::var_os("PYRE_PHASE3_STRIP_DIAG").is_some() {
             if let Some(target) = goto_target_for_diag {
                 eprintln!(
-                    "[phase3-strip-no-match] block_index={} block_first={:?} goto_target={} next_label={:?}",
-                    i, first_label_for_diag, target, next_label_name,
+                    "[phase3-strip-no-match] block_index={} block_first={:?} goto_target={} next_labels={:?}",
+                    i, first_label_for_diag, target, next_label_names,
                 );
             }
         }
@@ -5630,6 +5640,26 @@ impl CodeWriter {
                 // start of every new block iteration so a previous
                 // block's queued switch doesn't bleed into this one.
                 block_switch_pending = false;
+                // T6.1 Slice 4: block-entry `Label(block)` per
+                // `rpython/jit/codewriter/flatten.py:116
+                // self.emitline(Label(block))`.  Emitted at the moment a
+                // freshly-popped block becomes `current_block`,
+                // mirroring upstream's recursive `make_bytecode_block`
+                // top.  Coexists with the per-PC `Label("pcN")` that
+                // `emit_mark_label_pc!` pushes shortly after — both
+                // label families remain valid branch targets until
+                // Slices 5 + 6 retire the per-PC labels.  Skipped when
+                // the per-block accumulator already contains content
+                // (mergeblock candidate joins emit into the block
+                // before the pop in some flows).
+                if current_block.per_block_ssarepr_len() == 0 {
+                    push_walker_emit(
+                        &current_block,
+                        super::flatten::Insn::Label(super::flatten::Label::new(
+                            super::flatten::block_label_name(&current_block.block()),
+                        )),
+                    );
+                }
                 // Note — upstream `flowcontext.py:407-416`
                 // drives per-block op accumulation via `while True:
                 // handle_bytecode(...)` until a terminator, then
