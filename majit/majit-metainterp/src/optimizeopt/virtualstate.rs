@@ -2541,7 +2541,7 @@ fn export_single_value(
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
     // (RPython parity gap documented above) is therefore latent — no
     // benchmark constructs the necessary self-referential structures.
-    if !cache.in_progress.insert(opref) {
+    if cache.in_progress.contains(&opref) {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
         // form through ptr fields, so the only reachable cycles are on
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
@@ -2549,6 +2549,7 @@ fn export_single_value(
         // with LEVEL_UNKNOWN.
         return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
+    cache.in_progress.insert(opref);
 
     let info = export_single_value_inner(opref, ctx, cache);
     let rc = VirtualStateInfoNode::new_rc(info);
