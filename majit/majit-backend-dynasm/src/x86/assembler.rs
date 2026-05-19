@@ -641,9 +641,9 @@ pub struct Assembler386<'a> {
     /// Mirrors `OpTypeIndex::op_pos`.
     op_pos: Vec<u32>,
     /// Constants: OpRef index (>= 10000) → i64 value.
-    constants: HashMap<u32, i64>,
+    constants: majit_ir::VecAssoc<u32, i64>,
     /// Constant type annotations for float immediates and fail args.
-    constant_types: HashMap<u32, Type>,
+    constant_types: majit_ir::VecAssoc<u32, Type>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -803,7 +803,7 @@ impl<'a> Assembler386<'a> {
     pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
-        constants: HashMap<u32, i64>,
+        constants: majit_ir::VecAssoc<u32, i64>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
@@ -832,7 +832,7 @@ impl<'a> Assembler386<'a> {
             inputarg_pos,
             op_pos,
             constants,
-            constant_types: HashMap::new(),
+            constant_types: majit_ir::VecAssoc::new(),
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: HashMap::new(),
@@ -8164,12 +8164,12 @@ impl<'a> Assembler386<'a> {
 
     /// Populate the constants map. Called by the frontend before assembly
     /// if constant OpRefs are used (OpRef.0 >= 10000).
-    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
         self.constants = constants;
     }
 
     /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+    pub fn set_constant_types(&mut self, constant_types: majit_ir::VecAssoc<u32, majit_ir::Type>) {
         self.constant_types = constant_types;
     }
 }

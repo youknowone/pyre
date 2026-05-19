@@ -1627,12 +1627,12 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants_va = std::mem::take(&mut self.constants);
-        let constant_types_va = std::mem::take(&mut self.constant_types);
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants_va);
+        let constants = std::mem::take(&mut self.constants);
+        let constant_types = std::mem::take(&mut self.constant_types);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants_va);
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
@@ -1649,14 +1649,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
-        let constants_hm: std::collections::HashMap<u32, i64> =
-            constants_va.into_iter().collect();
-        let constant_types_hm: std::collections::HashMap<u32, majit_ir::Type> =
-            constant_types_va.into_iter().collect();
         let mut asm = Asm::new(
             trace_id,
             header_pc,
-            constants_hm,
+            constants,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1668,7 +1664,7 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types_hm);
+        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop()?;
 
@@ -1833,20 +1829,20 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let prepared_ops = self.prepare_ops_for_compile(inputargs, &ops_owned);
-        let constants_va = std::mem::take(&mut self.constants);
-        let constant_types_va = std::mem::take(&mut self.constant_types);
+        let constants = std::mem::take(&mut self.constants);
+        let constant_types = std::mem::take(&mut self.constant_types);
         if crate::majit_log_enabled() && trace_id == 2 {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
                 fail_descr.fail_index_per_trace(),
-                majit_ir::format_trace(&prepared_ops, &constants_va)
+                majit_ir::format_trace(&prepared_ops, &constants)
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants_va);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table =
-            self.collect_classptr_subclass_range_table(&prepared_ops, &constants_va);
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
@@ -1863,14 +1859,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
-        let constants_hm: std::collections::HashMap<u32, i64> =
-            constants_va.into_iter().collect();
-        let constant_types_hm: std::collections::HashMap<u32, majit_ir::Type> =
-            constant_types_va.into_iter().collect();
         let mut asm = Asm::new(
             trace_id,
             0,
-            constants_hm,
+            constants,
             self.vtable_offset,
             typeid_table,
             guard_gc_type_info,
@@ -1882,7 +1874,7 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        asm.set_constant_types(constant_types_hm);
+        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);
