@@ -13043,10 +13043,18 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // whose descr targets a same-function Label with matching arity is an
     // internal jump (no fail args); otherwise external and contributes
     // `op.args.len()` slots.
-    let label_arity_by_descr: HashMap<u32, usize> = ops
+    //
+    // Key by `descr_identity` (Arc allocation address) per
+    // `history.py:477` TargetToken object-identity semantics: `d.index()`
+    // is not unique across distinct TargetTokens in the same trace.
+    let label_arity_by_descr: Vec<(usize, usize)> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.descr.as_ref().map(|d| (d.index(), op.args.len())))
+        .filter_map(|op| {
+            op.descr
+                .as_ref()
+                .map(|d| (majit_ir::descr_identity(d), op.args.len()))
+        })
         .collect();
     let num_inputs = inputargs.len();
     let mut max_slots = num_inputs;
@@ -13054,13 +13062,16 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = op.opcode == OpCode::Jump
-            && op
-                .descr
-                .as_ref()
-                .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
+            && op.descr.as_ref().map_or(false, |d| {
+                let id = majit_ir::descr_identity(d);
+                match label_arity_by_descr
+                    .iter()
+                    .find(|(label_id, _)| *label_id == id)
+                {
                     None => true,
-                    Some(&arity) => arity != op.args.len(),
-                });
+                    Some(&(_, arity)) => arity != op.args.len(),
+                }
+            });
         if !is_guard && !is_finish && !is_external_jump {
             continue;
         }
