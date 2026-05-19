@@ -624,6 +624,7 @@ impl TreeLoop {
                         .map(|f| crate::recorder::SnapshotFrame {
                             jitcode_index: f.jitcode_index,
                             pc: f.pc,
+                            jitcode_pc: f.jitcode_pc,
                             boxes: f.boxes.iter().map(&remap_tagged).collect(),
                         })
                         .collect(),
@@ -1892,6 +1893,16 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
+                // Phase 7a (issue #73): segmented driver path has no
+                // PyJitCode handle to resolve `pc_map[py_pc]`; resume
+                // through this helper still goes via the legacy
+                // `PyJitCode::resume_jitcode_pc_for` lookup that pyre's
+                // `build_resumed_frames` performs at decode time.  This
+                // 0 placeholder is structurally distinct from a real
+                // JitCode offset of 0 (the placeholder applies only to
+                // segmented-driver tests + force-finish guards, neither
+                // of which currently read the field).
+                jitcode_pc: 0,
                 boxes,
             }],
             vable_boxes: Vec::new(),

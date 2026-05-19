@@ -28,6 +28,7 @@ fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Ty
         frames: vec![SnapshotFrame {
             jitcode_index: 0,
             pc,
+            jitcode_pc: 0,
             boxes: boxes
                 .iter()
                 .map(|(opref, tp)| SnapshotTagged::Box(*opref, *tp))

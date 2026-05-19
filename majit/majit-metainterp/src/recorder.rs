@@ -67,8 +67,27 @@ pub struct Snapshot {
 pub struct SnapshotFrame {
     /// Index of the jitcode (or 0 for the root portal).
     pub jitcode_index: u32,
-    /// Program counter within the jitcode.
+    /// Program counter within the jitcode.  In RPython, the MIFrame's
+    /// `pc` field IS the JitCode byte offset (`pyjitpl.py:185
+    /// setposition`).  Pyre's tracer historically populated this slot
+    /// with the Python bytecode PC because pyre traces Python bytecode
+    /// rather than JitCode — see `[[project-issue73-phase5-design]]`
+    /// for the broader deviation context.  Phase 7 (issue #73) adds a
+    /// parallel `jitcode_pc` slot below so resume readers can consume
+    /// the JitCode offset directly; this `pc` slot stays in the pyre-
+    /// specific Python-PC role until Phase 8/9 finishes the swap.
     pub pc: u32,
+    /// JitCode byte offset paired with `pc`.  Issue #73 Phase 7a: a
+    /// per-frame translation of the Python PC into the JitCode position
+    /// where blackhole resume / inline-call retracing should restart.
+    /// Pyre writers populate this via
+    /// `PyJitCode::resume_jitcode_pc_for(py_pc)` so resume readers no
+    /// longer have to repeat the `pc_map` lookup; majit-metainterp tests
+    /// + non-pyre callers default to `0` because they have no
+    /// `PyJitCode` to consult and currently no consumer.  RPython has
+    /// no analog — there `pc` is already the JitCode PC — so this slot
+    /// exists only while pyre retires `pc_map` (Phase 9).
+    pub jitcode_pc: u32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,
 }
