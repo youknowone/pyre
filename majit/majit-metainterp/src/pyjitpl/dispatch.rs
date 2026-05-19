@@ -5277,7 +5277,7 @@ fn build_concrete_values(
     values
 }
 
-pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
+pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     unsafe {
         match args {
             [] => {
@@ -5502,11 +5502,11 @@ pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `bh_call_r` rather than a re-use of `bh_call_i` — when the GC handle
 /// shape diverges from `i64` the call site can pick the right ABI by
 /// switching here without touching the caller.
-pub(crate) fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
+pub fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
     call_int_function(func_ptr, args)
 }
 
-pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
+pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
     unsafe {
         match args {
             [] => {
