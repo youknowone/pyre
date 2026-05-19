@@ -64,9 +64,9 @@ impl LoopVersionInfo {
 
     /// version.py:38-42: remove(descr)
     pub fn remove(&mut self, fail_index: u32) {
-        if self.leads_to.remove(&fail_index).is_none() {
-            panic!("version.py:42 could not remove fail_index={}", fail_index);
-        }
+        self.leads_to.remove(&fail_index).unwrap_or_else(|| {
+            panic!("version.py:42 could not remove fail_index={}", fail_index)
+        });
         self.descrs.retain(|d| *d != fail_index);
     }
 
