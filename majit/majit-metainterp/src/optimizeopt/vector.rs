@@ -135,7 +135,8 @@ impl VectorLoop {
             // Map label args → jump args (or remapped jump args)
             for (i, la) in label_args.iter().enumerate() {
                 if i < jump_args.len() {
-                    let ja = *remap.get(&jump_args[i]).unwrap_or(&jump_args[i]);
+                    let key = jump_args[i];
+                    let ja = remap.get(&key).copied().unwrap_or(key);
                     if *la != ja {
                         remap.insert(*la, ja);
                     }
@@ -713,11 +714,12 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut node_to_pack: Vec<Option<usize>> = vec![None; self.body_ops.len()];
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
-                node_to_pack.insert(idx, pi);
+                if idx < node_to_pack.len() {
+                    node_to_pack[idx] = Some(pi);
+                }
             }
         }
 
@@ -728,7 +730,7 @@ impl VectorizingOptimizer {
         // Walk in scheduled (dependency) order
         let scheduled_order = schedule_operations(&dep_graph);
         for &node_idx in &scheduled_order {
-            if let Some(&pack_idx) = node_to_pack.get(&node_idx) {
+            if let Some(pack_idx) = node_to_pack.get(node_idx).copied().flatten() {
                 // schedule.py:683-695: delay() gating.
                 pack_visited_count[pack_idx] += 1;
                 let pack = &profitable[pack_idx];
