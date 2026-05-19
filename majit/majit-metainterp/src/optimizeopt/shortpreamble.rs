@@ -203,8 +203,10 @@ impl ShortPreamble {
 pub struct CollectedShortPreambleBuilder {
     /// Raw ops collected during the preamble phase (before Label).
     raw_ops: Vec<Op>,
-    /// Label args carried across the Label (set when Label is found).
-    /// The index into this Vec is the label arg index.
+    /// shortpreamble.py:414 `ShortPreambleBuilder.label_args` — the
+    /// OpRefs that the Label carries. Index in this list IS the label
+    /// arg index. Lookup uses linear scan (label_args is small —
+    /// bounded by loop-carried value count).
     label_args: Vec<OpRef>,
     /// Whether the builder is still collecting (before Label).
     active: bool,
@@ -224,7 +226,8 @@ impl CollectedShortPreambleBuilder {
     /// Called when the Label is encountered. `label_args` are the OpRefs
     /// that the Label carries (= the loop-carried values from the preamble).
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.label_args = label_args.to_vec();
+        self.label_args.clear();
+        self.label_args.extend_from_slice(label_args);
         self.active = false; // Switch from preamble to body phase
     }
 
@@ -879,8 +882,9 @@ pub struct CollectedExtendedShortPreambleBuilder {
     pure_ops: Vec<PreambleOp>,
     /// Loop-invariant calls from the preamble.
     loopinvariant_ops: Vec<PreambleOp>,
-    /// Label args carried across the Label. Index into this Vec is the label
-    /// arg index.
+    /// shortpreamble.py:414 `ShortPreambleBuilder.label_args` — the
+    /// OpRefs that the Label carries. Index in this list IS the label
+    /// arg index. Lookup uses linear scan (label_args is small).
     label_args: Vec<OpRef>,
 }
 
@@ -897,7 +901,8 @@ impl CollectedExtendedShortPreambleBuilder {
 
     /// Set the label args mapping.
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.label_args = label_args.to_vec();
+        self.label_args.clear();
+        self.label_args.extend_from_slice(label_args);
     }
 
     fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
