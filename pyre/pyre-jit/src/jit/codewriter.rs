@@ -3177,11 +3177,7 @@ fn decode_exception_catch_sites(
     assembler: &mut SSAReprEmitter,
     code: &CodeObject,
     num_instrs: usize,
-) -> (
-    Vec<Option<u16>>,
-    Vec<ExceptionCatchSite>,
-    std::collections::HashMap<usize, u16>,
-) {
+) -> (Vec<Option<u16>>, Vec<ExceptionCatchSite>, Vec<Option<u16>>) {
     // `decode_exceptiontable` yields byte offsets; codewriter operates in
     // instruction-index units.  Convert at the boundary.
     let exception_entries: Vec<_> =
@@ -3230,13 +3226,13 @@ fn decode_exception_catch_sites(
             lasti_py_pc: py_pc,
         });
     }
-    let handler_depth_at: std::collections::HashMap<usize, u16> = exception_entries
-        .iter()
-        .map(|(_start, _end, target, depth, lasti)| {
+    let mut handler_depth_at: Vec<Option<u16>> = vec![None; num_instrs];
+    for (_start, _end, target, depth, lasti) in &exception_entries {
+        if *target < num_instrs {
             let extra = if *lasti { 1u16 } else { 0 };
-            (*target, *depth + extra + 1)
-        })
-        .collect();
+            handler_depth_at[*target] = Some(*depth + extra + 1);
+        }
+    }
     (catch_for_pc, catch_sites, handler_depth_at)
 }
 
@@ -5545,7 +5541,10 @@ impl CodeWriter {
                     // Exception handler entry: Python resets stack depth to the
                     // handler's specified depth and arrives only from
                     // `catch_exception` edges, not from sequential fallthrough.
-                    if handler_depth_at.contains_key(&py_pc) {
+                    if handler_depth_at
+                        .get(py_pc)
+                        .map_or(false, |v| v.is_some())
+                    {
                         // Phase 4 slice 4: when reached sequentially from
                         // a prior PC (start_pc != py_pc), break.  Handler
                         // PCs are reached only via exception edges in
@@ -5567,7 +5566,9 @@ impl CodeWriter {
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
                             needs_fallthrough = false;
-                        } else if let Some(&handler_depth) = handler_depth_at.get(&py_pc) {
+                        } else if let Some(handler_depth) =
+                            handler_depth_at.get(py_pc).copied().flatten()
+                        {
                             current_depth = handler_depth;
                         }
                     }
