@@ -385,6 +385,19 @@ pub enum PyErrorKind {
     /// Internal JIT trace-abort signal. This is not a Python exception
     /// class and must be intercepted before user-visible error handling.
     TraceAbort,
+    /// `pypy/module/exceptions/interp_exceptions.py:474 W_LookupError`
+    /// — intermediate parent of IndexError / KeyError.  Distinct
+    /// PyErrorKind variant so `from_exc_object(LookupError)` /
+    /// `to_exc_object()` / `render_exception` round-trip preserves
+    /// the exact class rather than collapsing it onto IndexError or
+    /// Exception.
+    LookupError,
+    /// `pypy/module/exceptions/interp_exceptions.py:418 W_UnicodeError`
+    /// — intermediate parent of UnicodeDecodeError / UnicodeEncodeError,
+    /// itself a subclass of ValueError.
+    UnicodeError,
+    UnicodeDecodeError,
+    UnicodeEncodeError,
 }
 
 impl PyError {
@@ -610,6 +623,10 @@ impl PyError {
             PyErrorKind::MemoryError => ExcKind::MemoryError,
             PyErrorKind::SystemError => ExcKind::SystemError,
             PyErrorKind::TraceAbort => ExcKind::RuntimeError,
+            PyErrorKind::LookupError => ExcKind::LookupError,
+            PyErrorKind::UnicodeError => ExcKind::UnicodeError,
+            PyErrorKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
+            PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
         }
     }
 
@@ -653,24 +670,21 @@ impl PyError {
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
             ExcKind::OSError => PyErrorKind::OSError,
             ExcKind::FileNotFoundError => PyErrorKind::FileNotFoundError,
-            // Unicode errors don't have a dedicated PyErrorKind; they
-            // flow through the general ValueError handler.  UnicodeError
-            // is the intermediate parent of UnicodeDecodeError and
-            // UnicodeEncodeError (`pypy/module/exceptions/
-            // interp_exceptions.py:418`).
-            ExcKind::UnicodeError
-            | ExcKind::UnicodeDecodeError
-            | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
+            // `pypy/module/exceptions/interp_exceptions.py:418`
+            // W_UnicodeError = _new_exception('UnicodeError',
+            // W_ValueError, ...).  Each Unicode subclass round-trips
+            // through its own PyErrorKind variant so render_exception
+            // preserves the exact class.
+            ExcKind::UnicodeError => PyErrorKind::UnicodeError,
+            ExcKind::UnicodeDecodeError => PyErrorKind::UnicodeDecodeError,
+            ExcKind::UnicodeEncodeError => PyErrorKind::UnicodeEncodeError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
             ExcKind::MemoryError => PyErrorKind::MemoryError,
             ExcKind::SystemError => PyErrorKind::SystemError,
-            // LookupError is the intermediate parent of IndexError and
-            // KeyError (`pypy/module/exceptions/interp_exceptions.py:474`).
-            // No dedicated PyErrorKind variant; the closest non-subclass
-            // mapping is IndexError, which preserves the LookupError-as-
-            // catchall behaviour for runtime callers that don't know
-            // which subclass they're seeing.
-            ExcKind::LookupError => PyErrorKind::IndexError,
+            // `pypy/module/exceptions/interp_exceptions.py:474`
+            // W_LookupError = _new_exception('LookupError', W_Exception,
+            // ...) — intermediate parent of IndexError / KeyError.
+            ExcKind::LookupError => PyErrorKind::LookupError,
         }
     }
 

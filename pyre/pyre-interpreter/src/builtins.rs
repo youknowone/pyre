@@ -352,7 +352,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_exc_type("FloatingPointError", exc_arithmetic_error_new, arithmetic),
     );
 
-    let lookup_error = make_exc_type("LookupError", exc_exception_new, exception);
+    let lookup_error = make_exc_type("LookupError", exc_lookup_error_new, exception);
     crate::dict_storage_store(namespace, "LookupError", lookup_error);
     crate::dict_storage_store(
         namespace,
@@ -490,22 +490,34 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         );
     }
 
-    let unicode_error = make_exc_type("UnicodeError", exc_value_error_new, value_error);
+    let unicode_error = make_exc_type("UnicodeError", exc_unicode_error_new, value_error);
     crate::dict_storage_store(namespace, "UnicodeError", unicode_error);
     crate::dict_storage_store(
         namespace,
         "UnicodeDecodeError",
-        make_exc_type("UnicodeDecodeError", exc_value_error_new, unicode_error),
+        make_exc_type(
+            "UnicodeDecodeError",
+            exc_unicode_decode_error_new,
+            unicode_error,
+        ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeEncodeError",
-        make_exc_type("UnicodeEncodeError", exc_value_error_new, unicode_error),
+        make_exc_type(
+            "UnicodeEncodeError",
+            exc_unicode_encode_error_new,
+            unicode_error,
+        ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeTranslateError",
-        make_exc_type("UnicodeTranslateError", exc_value_error_new, unicode_error),
+        make_exc_type(
+            "UnicodeTranslateError",
+            exc_unicode_error_new,
+            unicode_error,
+        ),
     );
 
     crate::dict_storage_store(
@@ -1327,6 +1339,22 @@ exc_constructor!(
     exc_assertion_error,
     pyre_object::excobject::ExcKind::AssertionError
 );
+exc_constructor!(
+    exc_lookup_error,
+    pyre_object::excobject::ExcKind::LookupError
+);
+exc_constructor!(
+    exc_unicode_error,
+    pyre_object::excobject::ExcKind::UnicodeError
+);
+exc_constructor!(
+    exc_unicode_decode_error,
+    pyre_object::excobject::ExcKind::UnicodeDecodeError
+);
+exc_constructor!(
+    exc_unicode_encode_error,
+    pyre_object::excobject::ExcKind::UnicodeEncodeError
+);
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
@@ -1364,6 +1392,10 @@ exc_new_wrapper!(exc_overflow_error_new, exc_overflow_error);
 exc_new_wrapper!(exc_import_error_new, exc_import_error);
 exc_new_wrapper!(exc_not_implemented_error_new, exc_not_implemented_error);
 exc_new_wrapper!(exc_assertion_error_new, exc_assertion_error);
+exc_new_wrapper!(exc_lookup_error_new, exc_lookup_error);
+exc_new_wrapper!(exc_unicode_error_new, exc_unicode_error);
+exc_new_wrapper!(exc_unicode_decode_error_new, exc_unicode_decode_error);
+exc_new_wrapper!(exc_unicode_encode_error_new, exc_unicode_encode_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 fn make_exc_type(

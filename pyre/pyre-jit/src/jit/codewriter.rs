@@ -858,8 +858,21 @@ fn fresh_variable_for_state(
 ///     `switch` ends the source block; we splice per-link renamings
 ///     at the target's entry — but only when the target has a unique
 ///     predecessor (otherwise multiple edges' renamings would collide
-///     at the same entry).  Multi-predecessor targets need per-link
-///     trampoline blocks to fully match upstream.
+///     at the same entry).
+///
+/// **Known incompleteness — multi-predecessor targets.**  Loop
+/// headers, merge blocks, and any other block with `in_degree > 1`
+/// SKIP renamings.  Upstream `flatten.py:306` runs
+/// `insert_renamings(link)` for EVERY link unconditionally, splicing
+/// each link's renamings between its own `Label(link)` and the
+/// recursive `make_bytecode_block(link.target)`.  Pyre's walker
+/// collapses every edge into the target block's entry label, so two
+/// incoming edges with different `(link.arg → target.inputarg)` color
+/// pairings would emit conflicting `<kind>_copy` ops at the same
+/// position.  Faithful upstream parity requires either per-link
+/// trampoline blocks or distinct per-link labels (T6 epic territory);
+/// until that lands, edges that need a copy through a
+/// multi-predecessor target are silently elided here.
 fn walker_post_walk_insert_renamings(
     graph: &super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
@@ -955,10 +968,7 @@ fn walker_post_walk_insert_renamings(
             all_walker_blocks,
             SpliceSite::SourceBeforeTerminator,
         ) {
-            shift_walker_pc_tracked_offsets(
-                walker_pc_live_marker_pos,
-                &shift,
-            );
+            shift_walker_pc_tracked_offsets(walker_pc_live_marker_pos, &shift);
         }
     }
 
@@ -990,10 +1000,7 @@ fn walker_post_walk_insert_renamings(
                 all_walker_blocks,
                 SpliceSite::TargetAfterAnchor,
             ) {
-                shift_walker_pc_tracked_offsets(
-                    walker_pc_live_marker_pos,
-                    &shift,
-                );
+                shift_walker_pc_tracked_offsets(walker_pc_live_marker_pos, &shift);
             }
         }
     }
@@ -1111,8 +1118,11 @@ where
 
     // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
     // `Kind::index()` per [[feedback-no-hashmap-ever]].
-    let mut renamings: [(Vec<u16>, Vec<u16>); 3] =
-        [(Vec::new(), Vec::new()), (Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+    ];
     for (src, dst, kind) in pairs {
         let bucket = &mut renamings[kind.index()];
         bucket.0.push(src);
@@ -1173,18 +1183,22 @@ where
     let insns = &mut spam_borrow.per_block_ssarepr;
     let insert_pos = match site {
         SpliceSite::SourceBeforeTerminator => {
-            // Scan backward from the END to find the terminator op,
-            // splicing immediately before it.  A walker SpamBlock can
-            // contain content from PCs AFTER its terminator (e.g. the
-            // next linear PC's leading `Label + -live-` scaffold
-            // appended via supersede / fall-through when the
-            // same SpamBlock spans multiple Python PCs), so naive
-            // "check last insn" misses the terminator.  Canonical
-            // `flatten.py:154 insert_renamings(link)` runs immediately
-            // before `make_bytecode_block(link.target)`, which emits
-            // `goto Label(block)` when target is already in
-            // `seen_blocks` — that goto IS the terminator we must
-            // splice before.
+            // Forward-scan for the FIRST terminator op and splice
+            // immediately before it.  The caller guards on
+            // `block_ref.borrow().exits.len() == 1`, so the block has
+            // exactly one link and therefore at most one terminator —
+            // the first match is the terminator for the link we are
+            // emitting renamings for, matching `flatten.py:154
+            // insert_renamings(link)` which runs immediately before
+            // `make_bytecode_block(link.target)` (whose first emit is
+            // `goto Label(block)` when target is in `seen_blocks`).
+            //
+            // Trailing content after the terminator (next linear PC's
+            // `Label + -live-` scaffold accumulated under
+            // supersede / fall-through when the same SpamBlock spans
+            // multiple Python PCs) stays AFTER the terminator — it is
+            // not another terminator, so first-match cannot land
+            // there.
             let terminators = [
                 "goto",
                 "int_return",
@@ -4748,9 +4762,7 @@ impl CodeWriter {
                     "goto_if_not",
                     vec![
                         Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::block_tlabel(
-                            &target_block.block(),
-                        )),
+                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
                     ],
                 );
                 push_walker_emit(&current_block, insn);
@@ -4786,9 +4798,7 @@ impl CodeWriter {
                     "goto_if_not_int_is_zero",
                     vec![
                         Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::block_tlabel(
-                            &target_block.block(),
-                        )),
+                        Operand::TLabel(super::flatten::block_tlabel(&target_block.block())),
                     ],
                 );
                 push_walker_emit(&current_block, insn);
@@ -5662,8 +5672,7 @@ impl CodeWriter {
                     // block contributes non-empty content to the
                     // final SSARepr.
                     let offset = current_block.per_block_ssarepr_len() - 1;
-                    walker_pc_live_marker_pos[py_pc]
-                        .push((current_block.clone(), offset));
+                    walker_pc_live_marker_pos[py_pc].push((current_block.clone(), offset));
 
                     // Dead-code dispatch gate: `current_block` has already
                     // been closed by a previous terminator emit (`emit_goto!`,
@@ -6204,7 +6213,11 @@ impl CodeWriter {
 
                         Instruction::PushNull => {
                             current_state.stack.push(null_stack_sentinel());
-                            emit_pushvalue_ref_const!(current_depth, pyre_object::PY_NULL as i64, py_pc);
+                            emit_pushvalue_ref_const!(
+                                current_depth,
+                                pyre_object::PY_NULL as i64,
+                                py_pc
+                            );
                         }
 
                         // jtransform.py: rewrite_op_int_add etc.
@@ -8701,8 +8714,7 @@ impl CodeWriter {
             // append in their original creation order after the
             // DFS-matched prefix.
             let dfs_blocks = graph.iterblocks();
-            let mut reordered: Vec<SpamBlockRef> =
-                Vec::with_capacity(all_walker_blocks.len());
+            let mut reordered: Vec<SpamBlockRef> = Vec::with_capacity(all_walker_blocks.len());
             let mut placed: Vec<bool> = vec![false; all_walker_blocks.len()];
             for gb in &dfs_blocks {
                 for (idx, spam) in all_walker_blocks.iter().enumerate() {
@@ -8785,18 +8797,16 @@ impl CodeWriter {
                     |records: &Vec<Vec<(SpamBlockRef, usize)>>| -> Option<Vec<usize>> {
                         let mut translated: Vec<usize> = Vec::with_capacity(records.len());
                         for py_pc_entries in records {
-                            let resolved =
-                                py_pc_entries.iter().find_map(|(block_ref, offset)| {
-                                    let block_pos =
-                                        reordered.iter().position(|b| b == block_ref)?;
-                                    if post_strip_lens[block_pos] == 0 {
-                                        return None;
-                                    }
-                                    if *offset >= post_strip_lens[block_pos] {
-                                        return None;
-                                    }
-                                    Some(post_strip_block_starts[block_pos] + offset)
-                                });
+                            let resolved = py_pc_entries.iter().find_map(|(block_ref, offset)| {
+                                let block_pos = reordered.iter().position(|b| b == block_ref)?;
+                                if post_strip_lens[block_pos] == 0 {
+                                    return None;
+                                }
+                                if *offset >= post_strip_lens[block_pos] {
+                                    return None;
+                                }
+                                Some(post_strip_block_starts[block_pos] + offset)
+                            });
                             match resolved {
                                 Some(idx) => translated.push(idx),
                                 None => return None,
@@ -9602,10 +9612,7 @@ mod tests {
         // The strip should NOT fire when the goto target doesn't
         // match the next block's label.
         let other_name = "block_other_99".to_string();
-        let goto_to_other = Insn::op(
-            "goto",
-            vec![Operand::TLabel(TLabel::new(other_name))],
-        );
+        let goto_to_other = Insn::op("goto", vec![Operand::TLabel(TLabel::new(other_name))]);
         let block_a = vec![Insn::live(Vec::new()), goto_to_other, Insn::Unreachable];
         let block_b = vec![Insn::Label(FlatLabel::new(target_name))];
         let mut blocks = vec![block_a, block_b];
