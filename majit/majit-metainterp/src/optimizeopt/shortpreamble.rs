@@ -454,7 +454,9 @@ pub struct ShortBoxes {
     known_constants: VecSet<OpRef>,
     /// shortpreamble.py: short_inputargs
     short_inputargs: Vec<OpRef>,
-    /// shortpreamble.py: boxes_in_production
+    /// shortpreamble.py: boxes_in_production — cycle-detection set
+    /// for `materialize_one` recursion. Active set is bounded by
+    /// recursion depth (linear scan suffices).
     boxes_in_production: VecSet<OpRef>,
     /// The number of label args.
     pub num_label_args: usize,
@@ -651,7 +653,7 @@ impl ShortBoxes {
         if let Some(existing) = self.produced_short_boxes.get(&opref) {
             return Some(existing.preamble_op.pos.get());
         }
-        if self.boxes_in_production.contains(&opref) {
+        if self.boxes_in_production.iter().any(|x| *x == opref) {
             return None;
         }
         if self.known_constants.contains(&opref) {
@@ -701,7 +703,7 @@ impl ShortBoxes {
         if let Some(existing) = self.produced_short_boxes.get(&result) {
             return Some(existing.clone());
         }
-        if self.boxes_in_production.contains(&result) {
+        if self.boxes_in_production.iter().any(|x| *x == result) {
             return None;
         }
         let candidate = self.potential_ops.get(&result)?.clone();
