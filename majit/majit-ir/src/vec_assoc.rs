@@ -196,6 +196,18 @@ impl<'a, K: Eq, V> IntoIterator for &'a VecAssoc<K, V> {
     }
 }
 
+impl<K, V, Q> std::ops::Index<&Q> for VecAssoc<K, V>
+where
+    K: Eq + std::borrow::Borrow<Q>,
+    Q: ?Sized + Eq,
+{
+    type Output = V;
+
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
 impl<V> crate::resoperation::ConstLookup<V> for VecAssoc<u32, V> {
     fn lookup(&self, key: u32) -> Option<&V> {
         self.get(&key)
