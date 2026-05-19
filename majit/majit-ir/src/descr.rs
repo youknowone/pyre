@@ -6,34 +6,95 @@
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
 ///
-/// # TODO: migrate `descr_index: u32` → `descr: DescrRef` on resume metadata
+/// # Descr identity status (Unified-Descr Port follow-up)
 ///
-/// **Deviation.** RPython's `ResOperation` carries `Arc<dyn Descr>`
-/// directly (`history.py:95 AbstractDescr`); identity is pointer
-/// comparison via `op.getdescr() is other.getdescr()`.  Pyre's
-/// resume-metadata structs (`RdVirtualInfo` variants at
-/// resoperation.rs:436/448/457/466/475, `GuardPendingFieldEntry` at
-/// resoperation.rs:784) carry a `descr_index: u32` alongside `descr:
-/// Option<DescrRef>` for serialization sinks
-/// (`ExitVirtualLayout` / `ExitPendingFieldLayout` /
-/// `PendingFieldLayoutSummary`).  The pool canonicalises per-LLType so
-/// `u32` equality is identity-equivalent to RPython's pointer
-/// equality, but the indirection layer is pyre-only.
+/// **Done.** `Op::descr` is `Option<DescrRef>` (resoperation.rs:992) and
+/// every resume-metadata variant that carries a descr now stores it as
+/// `Option<DescrRef>` rather than a `descr_index: u32` handle:
 ///
-/// **When to fix.** When the build-time `opcode_insns.bin`
-/// determinism guarantee no longer needs to come from a `u32` pool
-/// (e.g. once a stable-id registry replaces the deterministic pool),
-/// or when an upstream pass requires in-place descr mutation that the
-/// pool indirection blocks.
+/// * `RdVirtualInfo` variants (resoperation.rs:519-643).  `PartialEq`
+///   (resoperation.rs:664-814) uses `opt_descr_ptr_eq` (Arc::ptr_eq),
+///   matching `history.py:125 id(descr)`.
+/// * `ExitVirtualLayout` (`majit-backend/src/lib.rs:370`) and
+///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs:549`) compare
+///   descrs via `opt_descr_ptr_eq` for the same reason.
+/// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
+///   (`majit-metainterp/src/resume.rs:1496/1523`) and
+///   `PendingFieldLayoutSummary` (`majit-ir/src/resumedata.rs:137`) use
+///   the canonical `resumedata::opt_descr_arc_ptr_eq`.
+/// * `GuardPendingFieldEntry` (resoperation.rs:892) carries
+///   `Option<DescrRef>` directly and intentionally has no `PartialEq`
+///   impl: `PENDINGFIELDSTRUCT` (`resume.py:87-92`) is write-only
+///   resume data that RPython never compares by value.
+/// * The `descr_index: u32` retained on individual descriptors
+///   (`get_descr_index`/`set_descr_index`) is now the pure serialization
+///   handle assigned by `descr.py:28 v.descr_index = len(all_descrs)`
+///   via `optimizer::ensure_descr_index`.
 ///
-/// **How to fix.** (1) Switch identity `PartialEq` comparisons in
-/// `RdVirtualInfo` / `GuardPendingFieldEntry` from `descr_index` to
-/// `Arc::ptr_eq` on the carried `descr` Arcs (PyPy `id(descr)`
-/// parity).  (2) Keep `descr_index` as a pure serialization handle
-/// (downstream `ExitVirtualLayout` / `ExitPendingFieldLayout` still
-/// need a stable `u32` for trace-dump replay).  (3) Audit for Arc
-/// cycle risk between IR ops and the descr graph (FieldDescr →
-/// SizeDescr, CallDescr → effectinfo's field/array descr lists).
+/// **Arc cycle audit (Phase D prereq B, 2026-05-19).**
+///
+/// | Edge | Direction | Strength | Status |
+/// |---|---|---|---|
+/// | `SimpleSizeDescr.all_fielddescrs` → `FieldDescr` | child | strong | OK |
+/// | `SimpleFieldDescr.parent_descr` → `SizeDescr` | parent | **Weak** (descr.rs:3147, 3272) | OK — cycle broken |
+/// | `SimpleFieldDescr.vinfo` → `VirtualizableInfo` | back | **Weak** (descr.rs:3154, 3281) | OK — cycle broken |
+/// | `VirtualizableInfo._static_field_descrs` → `FieldDescr` | child | strong | OK (paired with Weak above) |
+/// | `CallDescr → EffectInfo._readonly/write_descrs_*` → `FieldDescr/ArrayDescr` | uni | strong | OK — no back-ref |
+/// | `SimpleArrayDescr.lendescr` → length `FieldDescr` (parent_descr=None) | uni | strong | OK — no back-ref |
+/// | `SimpleArrayDescr.all_interiorfielddescrs` ↔ `SimpleInteriorFieldDescr.array_descr` | both | **strong both ways** | **CYCLE, accepted** |
+///
+/// The struct-array interior cycle (last row) mirrors PyPy's
+/// `arraydescr.all_interiorfielddescrs = descrs` +
+/// `InteriorFieldDescr.arraydescr = arraydescr`
+/// (`descr.py:372-375` + `descr.py:388-391`).  Python tolerates it via
+/// cycle-collecting GC; Rust's `Arc` does not.  In practice the descr
+/// graph is process-lifetime pinned by `GcCache._cache_size` /
+/// `_cache_array` / `_cache_interiorfield` (descr.rs:498/660/710) — the
+/// global singleton `gc_cache()` keeps strong roots for every minted
+/// descr, so dropping IR-side `DescrRef` clones never decrements the
+/// last strong count, and the cycle never gets a chance to leak.  If a
+/// future port ever needs per-test descr teardown, weaken
+/// `SimpleInteriorFieldDescr.array_descr` to `Weak<dyn ArrayDescr>`
+/// (parity: PyPy reaches the array descr via `gccache._cache_array`
+/// rather than relying on the InteriorFieldDescr backreference for
+/// identity).
+///
+/// **C (landed 2026-05-19).**  Trait-dispatch + structural keying
+/// migration for the virtualizable / virtualref field paths:
+///
+/// * `optimize_setfield_gc`, `optimize_getfield_gc`, and
+///   `resolve_array_source` read `op.descr.as_field_descr()?.offset()`
+///   and `.is_typeptr()` directly (RPython `op.getdescr().offset` /
+///   `heaptracker.py:66 name == 'typeptr'` parity).
+/// * `optimize_(get|set)interiorfield_gc` extract the inner
+///   `FieldDescr` via `as_interior_field_descr().field_descr()`
+///   (`descr.py:388 InteriorFieldDescr.__init__` parity) — they no
+///   longer panic for InteriorFieldDescr ops.
+/// * `VirtualizableFieldState.fields` is now keyed by
+///   `FieldDescr::index_in_parent()` (RPython
+///   `info.AbstractStructPtrInfo._fields[fielddescr.get_index()]`,
+///   `info.py:203-206`) instead of the packed
+///   `FIELD_DESCR_TAG | offset << 4 | size << 1 | type_bits` u32.
+///   The synthetic fallback at `init` assigns `1 + field_idx_in_vinfo`
+///   for static slots and `1 + num_static + array_idx` for array
+///   slots, matching `virtualizable.py:71-72 build_field_descr`.
+/// * The pyre-only `FieldIndexDescr`, `make_field_index_descr`,
+///   `virtualizable_field_index`, `extract_field_offset`,
+///   `descr_index` helper, and `debug_assert_no_typeptr_in_virtual_fields`
+///   are deleted.  The typeptr-exclusion invariant is enforced at
+///   `optimize_setfield_gc`'s typeptr fold (RPython
+///   `heaptracker.py:66-67`), not by a runtime assert.
+/// * `VirtualRefInfo`'s pyre-only `descr_virtual_token: u32` /
+///   `descr_forced: u32` / `descr_size: u32` placeholders and the
+///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
+///   retired.  RPython caches real `Arc<dyn FieldDescr>` /
+///   `Arc<dyn SizeDescr>` on the equivalent struct
+///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre constructs vref
+///   field descrs on demand at the SETFIELD_GC emit sites
+///   (`optimizeopt/virtualize.rs:1521/1528 make_vref_field_descr`).
+///   Caching them on `VirtualRefInfo` for identity stability is a
+///   separate follow-up (no current pyre call site relied on the
+///   removed u32 placeholders).
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;

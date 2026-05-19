@@ -2581,12 +2581,6 @@ fn export_single_value_inner(
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
-                // RPython parity: heaptracker.py:66-67 excludes typeptr from
-                // all_fielddescrs(); see VirtualInfo struct-level docs.
-                crate::optimizeopt::virtualize::debug_assert_no_typeptr_in_virtual_fields(
-                    &vinfo.fields,
-                    "export_single_value::Virtual",
-                );
                 let fields = vinfo
                     .fields
                     .iter()

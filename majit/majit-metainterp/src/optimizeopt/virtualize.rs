@@ -150,45 +150,60 @@ impl VirtualizableTracker {
         };
         let mut flat_input_idx = 1usize + self.config.vable_input_offset;
 
-        for (field_idx_in_vinfo, &offset) in self.config.static_field_offsets.iter().enumerate() {
+        // RPython `info.AbstractStructPtrInfo._fields` is keyed by
+        // `fielddescr.get_index()` (descr.py:228 `index_in_parent`,
+        // populated by `cpu.fielddescrof(VTYPE, name)`).  Mirror that
+        // here so runtime queries via
+        // `op.descr.as_field_descr()?.index_in_parent() as u32` find the
+        // slot the init step seeded.
+        //
+        // `virtualizable.py:71-72 build_field_descr` assigns
+        // `index_in_parent = 1 + i` for static fields and
+        // `1 + num_static + j` for array-pointer fields; mirror that
+        // schedule for the synthetic fallback used by tests that pass
+        // empty `static_field_descrs` / `array_field_descrs`.
+        let num_static = self.config.static_field_offsets.len();
+        for (field_idx_in_vinfo, &_offset) in self.config.static_field_offsets.iter().enumerate() {
             if flat_input_idx >= ctx.num_inputs() {
                 break;
             }
-            let field_idx = virtualizable_field_index(offset);
+            let descr_for_slot = self
+                .config
+                .static_field_descrs
+                .get(field_idx_in_vinfo)
+                .cloned();
+            let field_idx = descr_for_slot
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map(|fd| fd.index_in_parent() as u32)
+                .unwrap_or((1 + field_idx_in_vinfo) as u32);
             let slot_tp = ctx
                 .inputarg_type_at(flat_input_idx)
                 .unwrap_or(majit_ir::Type::Ref);
             let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
             set_field(&mut state.fields, field_idx, input_ref);
-            set_field_descr(
-                &mut state.field_descrs,
-                field_idx,
-                self.config
-                    .static_field_descrs
-                    .get(field_idx_in_vinfo)
-                    .cloned()
-                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
-            );
+            if let Some(descr) = descr_for_slot {
+                set_field_descr(&mut state.field_descrs, field_idx, descr);
+            }
             flat_input_idx += 1;
         }
 
-        for (array_idx, (&offset, &length)) in self
+        for (array_idx, (&_offset, &length)) in self
             .config
             .array_field_offsets
             .iter()
             .zip(self.config.array_lengths.iter())
             .enumerate()
         {
-            let field_idx = virtualizable_field_index(offset);
-            set_field_descr(
-                &mut state.field_descrs,
-                field_idx,
-                self.config
-                    .array_field_descrs
-                    .get(array_idx)
-                    .cloned()
-                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
-            );
+            let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
+            let field_idx = descr_for_slot
+                .as_ref()
+                .and_then(|d| d.as_field_descr())
+                .map(|fd| fd.index_in_parent() as u32)
+                .unwrap_or((1 + num_static + array_idx) as u32);
+            if let Some(descr) = descr_for_slot {
+                set_field_descr(&mut state.field_descrs, field_idx, descr);
+            }
 
             let mut elements = Vec::with_capacity(length);
             for _ in 0..length {
@@ -240,8 +255,11 @@ impl VirtualizableTracker {
         if !self.is_standard_ref(frame_ref, ctx) {
             return None;
         }
-        let field_idx = descr_index_of_op(&producer);
-        let offset = extract_field_offset(field_idx)?;
+        // `virtualize.py` reads `op.getdescr().offset` directly to resolve
+        // raw-field byte offsets; mirror that via `FieldDescr::offset()`.
+        let offset = producer
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|fd| fd.offset()))?;
         let array_idx = self.array_idx_for_offset(offset)?;
         Some((frame_ref, array_idx))
     }
@@ -527,14 +545,14 @@ impl OptVirtualize {
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
         let value_ref = ctx.get_box_replacement(op.arg(1));
-        let field_idx = descr_index_of_op(op);
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
         let field_descr = setfield_descr_arc
             .as_field_descr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
-        let offset = extract_field_offset(field_idx);
+        let field_idx = field_descr.index_in_parent() as u32;
+        let is_typeptr = field_descr.is_typeptr();
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
@@ -556,7 +574,7 @@ impl OptVirtualize {
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        let descr_for_vstate = op.getdescr();
+        let descr_for_vstate = Some(setfield_descr_arc.clone());
         let struct_box = ctx.ensure_box(struct_ref);
         let early = struct_box
             .as_ref()
@@ -564,7 +582,7 @@ impl OptVirtualize {
                 if !info.is_virtual() {
                     return None;
                 }
-                if offset != Some(0) {
+                if !is_typeptr {
                     let parent_descr = field_descr.get_parent_descr().expect(
                         "optimize_setfield_gc: non-typeptr FieldDescr.get_parent_descr() returned None",
                     );
@@ -579,9 +597,9 @@ impl OptVirtualize {
                         // → _fields never contains typeptr. In pyre, typeptr
                         // setfield is filtered at trace recording time
                         // (jtransform.py:908-911 parity in helpers.rs), so this
-                        // branch should not observe offset=0. Defensively capture
-                        // known_class if an offset-0 setfield still arrives.
-                        if offset == Some(0) {
+                        // branch should not observe a typeptr op. Defensively
+                        // capture known_class if a typeptr setfield still arrives.
+                        if is_typeptr {
                             if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(majit_ir::GcRef(class_val));
@@ -597,10 +615,6 @@ impl OptVirtualize {
                                     .as_size_descr()
                                     .map(|sd| sd.all_fielddescrs().len())
                                     .unwrap_or(0)
-                        );
-                        debug_assert_no_typeptr_in_virtual_fields(
-                            &vinfo.fields,
-                            "optimize_setfield_gc::Virtual",
                         );
                         Some(OptimizationResult::Remove)
                     }
@@ -649,7 +663,14 @@ impl OptVirtualize {
 
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_ref = ctx.get_box_replacement(op.arg(0));
-        let field_idx = descr_index_of_op(op);
+        let field_descr_arc = op
+            .getdescr()
+            .expect("optimize_getfield_gc: field op without FieldDescr");
+        let field_descr = field_descr_arc
+            .as_field_descr()
+            .expect("optimize_getfield_gc: descr is not a FieldDescr");
+        let field_idx = field_descr.index_in_parent() as u32;
+        let is_typeptr = field_descr.is_typeptr();
         let is_raw_op = matches!(
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
@@ -666,11 +687,10 @@ impl OptVirtualize {
             .and_then(|b| ctx.peek_ptr_info(b))
         {
             // info.py:212-214 getfield: return _fields[fielddescr.get_index()].
-            // For Virtual, ob_type (offset 0) is not in fields — fold from
+            // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py:324-325 get_known_class).
             if let PtrInfo::Virtual(ref vinfo) = info {
-                let offset = extract_field_offset(field_idx);
-                if offset == Some(0) {
+                if is_typeptr {
                     if let Some(gc_ref) = vinfo.known_class {
                         let class_val = gc_ref.as_usize() as i64;
                         ctx.make_constant(op.pos.get(), majit_ir::Value::Int(class_val));
@@ -849,7 +869,17 @@ impl OptVirtualize {
     ) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        let field_idx = descr_index_of_op(op);
+        // `info.py:573-581 getinteriorfield_virtual` indexes the per-element
+        // field list by `fielddescr.get_index()`.  Strip the surrounding
+        // `InteriorFieldDescr` first (`descr.py:388 InteriorFieldDescr.
+        // __init__` stores the inner `fielddescr`).
+        let field_idx = op
+            .getdescr()
+            .and_then(|d| {
+                d.as_interior_field_descr()
+                    .map(|ifd| ifd.field_descr().index_in_parent() as u32)
+            })
+            .expect("optimize_getinteriorfield_gc: op without InteriorFieldDescr");
 
         if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx
             .get_box_replacement_box(array_ref)
@@ -893,7 +923,16 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
-        let field_idx = descr_index_of_op(op);
+        // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
+        // field list by `fielddescr.get_index()`.  Same shape as the GET
+        // counterpart — strip the outer `InteriorFieldDescr` first.
+        let field_idx = op
+            .getdescr()
+            .and_then(|d| {
+                d.as_interior_field_descr()
+                    .map(|ifd| ifd.field_descr().index_in_parent() as u32)
+            })
+            .expect("optimize_setinteriorfield_gc: op without InteriorFieldDescr");
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             let elem_idx = index as usize;
@@ -1952,33 +1991,6 @@ fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
     fields.push((field_idx, value_ref));
 }
 
-/// RPython parity assertion: `VirtualInfo.fields` must NEVER contain
-/// typeptr (offset 0). heaptracker.py:66-67 `all_fielddescrs()` skips
-/// typeptr, so `info.py:180 AbstractStructPtrInfo._fields` is sized to
-/// the non-typeptr field count and has no slot for offset 0.
-///
-/// This helper asserts the invariant at boundaries where `Virtual.fields`
-/// is constructed/populated/iterated: import (virtualstate), export
-/// (virtualstate), force path (force_virtual_instance), and the
-/// `optimize_setfield_gc` Virtual arm (before `set_field`).
-///
-/// Only `VirtualInfo.fields` is subject to this invariant;
-/// `VirtualStructInfo.fields` (OpCode::New without vtable) may contain
-/// any offset including 0.
-#[inline]
-pub(crate) fn debug_assert_no_typeptr_in_virtual_fields(
-    fields: &[(u32, OpRef)],
-    context: &'static str,
-) {
-    debug_assert!(
-        fields
-            .iter()
-            .all(|(idx, _)| extract_field_offset(*idx) != Some(0)),
-        "VirtualInfo.fields must exclude typeptr (offset 0) — RPython \
-         heaptracker.py:66-67 all_fielddescrs() parity violation at {context}",
-    );
-}
-
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
@@ -2001,66 +2013,6 @@ fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
         .iter()
         .find(|(idx, _)| *idx == field_idx)
         .map(|(_, opref)| *opref)
-}
-
-/// Extract the descriptor index used as a field identifier.
-fn descr_index_of_op(op: &majit_ir::Op) -> u32 {
-    op.with_field_descr(|field_descr| field_descr.index_in_parent() as u32)
-        .expect("descr_index: field operations must carry a FieldDescr with parent-local index")
-}
-
-// ── Minimal descriptor for field identification in forced setfield ops ──
-
-#[derive(Debug)]
-struct FieldIndexDescr(u32);
-
-impl Descr for FieldIndexDescr {
-    fn index(&self) -> u32 {
-        self.0
-    }
-    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(self)
-    }
-}
-
-impl FieldDescr for FieldIndexDescr {
-    fn index_in_parent(&self) -> usize {
-        // Return the raw encoded descriptor value as the field key.
-        // VirtualStructInfo.fields stores this same value as the key,
-        // so descr_index() → index_in_parent() matches field lookups.
-        self.0 as usize
-    }
-
-    fn offset(&self) -> usize {
-        // Decode offset from the encoded field descriptor index.
-        // Format: FIELD_DESCR_TAG | (offset << 4) | (size << 1) | (signed << 3) | type_bits
-        ((self.0 >> 4) & 0x000f_ffff) as usize
-    }
-
-    fn field_size(&self) -> usize {
-        // Match the stable field descriptor encoding used by the real
-        // pyre/majit descriptors: pointer-sized fields encode size_bits == 0
-        // because (8 & 0x7) == 0, but the runtime field width is still 8.
-        let size_bits = ((self.0 >> 1) & 0x7) as usize;
-        if size_bits == 0 { 8 } else { size_bits }
-    }
-
-    fn is_field_signed(&self) -> bool {
-        (self.0 >> 3) & 1 != 0
-    }
-
-    fn field_type(&self) -> majit_ir::Type {
-        match self.0 & 0x3 {
-            0 => majit_ir::Type::Int,
-            1 => majit_ir::Type::Ref,
-            2 => majit_ir::Type::Float,
-            _ => majit_ir::Type::Void,
-        }
-    }
-}
-
-pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
-    Arc::new(FieldIndexDescr(idx))
 }
 
 #[derive(Debug)]
@@ -2187,43 +2139,6 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     fn all_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
         &VREF_ALL_FIELDDESCRS
     }
-}
-
-fn virtualizable_field_index(offset: usize) -> u32 {
-    // Encode as: FIELD_DESCR_TAG | (offset << 4) | (size_bits << 1) | type_bits
-    // type_bits = 0 (Int), size_bits = 0 (8 & 0x7 = 0 for pointer-sized fields)
-    0x1000_0000 | (((offset as u32) & 0x000f_ffff) << 4)
-}
-
-/// Extract the byte offset from a field descriptor index.
-///
-/// Field descriptor indices encode offset, size, and type. This extracts
-/// just the byte offset for matching against VirtualizableConfig offsets.
-///
-/// # TODO: replace u32 packing with proper Descr access
-///
-/// **Deviation.** RPython reads `op.getdescr().offset` directly from a
-/// heap-allocated `FieldDescr` instance
-/// (`rpython/jit/backend/llsupport/descr.py`). Pyre's `Op.descr` is a
-/// `u32` index instead of `Box<dyn Descr>`, so the encoding
-/// `FIELD_DESCR_TAG | (offset << 4) | (size << 1) | type_bits` packs
-/// the descriptor's distinguishing fields into the index itself; the
-/// tag bit `0x1000_0000` distinguishes field descriptors from other
-/// descr kinds sharing the same `u32` namespace.
-///
-/// **When to fix.** When `descr_index: u32` migrates to `descr:
-/// DescrRef` on `ResOperation` (see `majit-ir/src/descr.rs` TODO).
-///
-/// **How to fix.** Drop the `FIELD_DESCR_TAG` packing/unpacking
-/// entirely; replace the body with `descr.as_field_descr()?.offset`.
-/// Delete this helper if every call site can switch to direct trait
-/// dispatch.
-fn extract_field_offset(descr_idx: u32) -> Option<usize> {
-    const FIELD_DESCR_TAG: u32 = 0x1000_0000;
-    if descr_idx & 0xF000_0000 != FIELD_DESCR_TAG {
-        return None;
-    }
-    Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
 }
 
 /// Lookup helper for `PtrInfo::Virtualizable.arrays` — returns the OpRef
@@ -2517,6 +2432,25 @@ mod tests {
         Arc::new(TestArrayDescr { idx })
     }
 
+    /// Test helper: build a `FieldDescr` with explicit `offset` and
+    /// `index_in_parent` for the virtualizable-field test sites.  Mirrors
+    /// the shape `cpu.fielddescrof(VTYPE, name)` produces (descr.py:218-239
+    /// `get_field_descr`) — pyre's `init` keys `VirtualizableFieldState.fields`
+    /// by `fielddescr.get_index()` (info.py:203-206), so the synthetic
+    /// fallback at `init` assigns `1 + field_idx_in_vinfo` for static slots
+    /// and `1 + num_static + array_idx` for array slots.
+    fn test_vable_field_descr(offset: usize, field_type: Type, index_in_parent: usize) -> DescrRef {
+        let field_size = match field_type {
+            Type::Int | Type::Ref | Type::Float => 8,
+            Type::Void => 0,
+        };
+        let flag = majit_ir::ArrayFlag::from_field_type(field_type);
+        let mut fd = majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+            .with_flag(flag);
+        fd.index_in_parent = index_in_parent;
+        Arc::new(fd) as DescrRef
+    }
+
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             // Slice P6a: type-tag op.pos so `opref_type` priority 0
@@ -2696,8 +2630,11 @@ mod tests {
         });
         pass.setup();
 
-        let field_descr =
-            make_field_index_descr(0x1000_0000 | (((8_u32) & 0x000f_ffff) << 4) | (0x7 << 1));
+        // array slot at byte offset 8; array_idx_for_offset reads the
+        // FieldDescr's `offset()` directly so the index_in_parent value is
+        // immaterial — pass `1` (= `1 + num_static + array_idx` with
+        // num_static=0) for consistency with `init`.
+        let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
         ctx.make_constant(OpRef::int_op(50), Value::Int(0));
 
@@ -2820,7 +2757,7 @@ mod tests {
         pass.setup();
 
         let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get.setdescr(make_field_index_descr(virtualizable_field_index(8)));
+        get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos.set(OpRef::int_op(10));
 
         let result = pass.propagate_forward(&get, &mut ctx);
@@ -2847,7 +2784,7 @@ mod tests {
             OpCode::SetfieldRaw,
             &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
         );
-        set.setdescr(make_field_index_descr(virtualizable_field_index(8)));
+        set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
         let result = pass.propagate_forward(&set, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2878,7 +2815,15 @@ mod tests {
         let Some(PtrInfo::Virtualizable(vstate)) = ctx.peek_ptr_info(&vbox) else {
             panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
         };
-        let seeded = get_field_descr(&vstate.field_descrs, virtualizable_field_index(8))
+        // `info.AbstractStructPtrInfo._fields` is keyed by
+        // `fielddescr.get_index()`; `virtualizable.py:71-72
+        // build_field_descr` assigns `index_in_parent = 1 + i` to the
+        // i-th static field, so the `pc` slot lands at index 1.
+        let key = real_descr
+            .as_field_descr()
+            .expect("virtualizable static_field_descr is a FieldDescr")
+            .index_in_parent() as u32;
+        let seeded = get_field_descr(&vstate.field_descrs, key)
             .expect("virtualizable init should seed field descr");
         assert_eq!(
             majit_ir::descr::descr_identity(&seeded),
@@ -2891,37 +2836,6 @@ mod tests {
                 .is_some(),
             "standard virtualizable config must carry real fielddescr.parent_descr",
         );
-    }
-
-    #[test]
-    fn test_field_index_descr_decodes_pointer_sized_field_width() {
-        let descr = make_field_index_descr(virtualizable_field_index(8));
-        let fd = descr.as_field_descr().expect("field descr");
-        assert_eq!(fd.offset(), 8);
-        assert_eq!(fd.field_size(), 8);
-        assert_eq!(fd.field_type(), Type::Int);
-    }
-
-    #[test]
-    fn test_descr_index_prefers_parent_local_field_slot() {
-        let parent = majit_ir::make_size_descr_full(100, 16, 1);
-        // Keep `parent` alive across the assertion: with_parent_descr stores
-        // only a Weak<DescrRef>, so the local Arc must outlive descr_index().
-        let descr: DescrRef = Arc::new(
-            majit_ir::descr::SimpleFieldDescr::new_with_name(
-                200,
-                8,
-                8,
-                Type::Ref,
-                false,
-                majit_ir::ArrayFlag::Pointer,
-                "T.x".to_string(),
-            )
-            .with_parent_descr(parent.clone(), 3),
-        );
-        let fd = descr.as_field_descr().expect("field descr");
-        assert_eq!(fd.index_in_parent() as u32, 3);
-        drop(parent);
     }
 
     #[test]
@@ -2941,7 +2855,7 @@ mod tests {
         pass.setup();
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get_field.setdescr(make_field_index_descr(virtualizable_field_index(24)));
+        get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
@@ -2975,7 +2889,7 @@ mod tests {
         pass.setup();
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get_field.setdescr(make_field_index_descr(virtualizable_field_index(24)));
+        get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
