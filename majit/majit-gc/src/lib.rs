@@ -7,7 +7,7 @@
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-use majit_ir::{GcRef, Op, OpRc, Type};
+use majit_ir::{GcRef, Op, OpRc, Type, VecAssoc};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
@@ -508,18 +508,10 @@ pub trait GcRewriter: Send {
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
-        constants: &std::collections::HashMap<u32, i64>,
-    ) -> (
-        Vec<Op>,
-        std::collections::HashMap<u32, i64>,
-        std::collections::HashMap<u32, Type>,
-    ) {
+        constants: &VecAssoc<u32, i64>,
+    ) -> (Vec<Op>, VecAssoc<u32, i64>, VecAssoc<u32, Type>) {
         let _ = constants;
-        (
-            self.rewrite_for_gc(ops),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )
+        (self.rewrite_for_gc(ops), VecAssoc::new(), VecAssoc::new())
     }
 }
 

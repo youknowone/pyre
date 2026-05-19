@@ -926,8 +926,7 @@ impl DynasmBackend {
         constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>,
     ) -> Option<majit_gc::rewrite::GcRewriterImpl> {
         with_dynasm_active_gc(|gc| {
-            let ct: std::collections::HashMap<u32, majit_ir::Type> =
-                constant_types.iter().map(|(&k, &t)| (k, t)).collect();
+            let ct = constant_types.clone();
             majit_gc::rewrite::GcRewriterImpl {
                 nursery_free_addr: gc.nursery_free_addr(),
                 nursery_top_addr: gc.nursery_top_addr(),
@@ -1060,13 +1059,8 @@ impl DynasmBackend {
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
-            let constants_hm: std::collections::HashMap<u32, i64> = self
-                .constants
-                .iter()
-                .map(|(&k, &v)| (k, v))
-                .collect();
             let (result, new_constants, new_constant_types) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, &constants_hm);
+                rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
             for (k, v) in new_constants {
                 self.constants.entry_or_insert_with(k, || v);
             }

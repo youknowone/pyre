@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use majit_ir::Type;
+use majit_ir::VecAssoc;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 
@@ -113,7 +114,7 @@ pub struct GcRewriterImpl {
     /// boxes carry `.type` intrinsically; here we pass constant types
     /// from the optimizer so the rewriter can check `v.type == 'r'` on
     /// constant values (rewrite.py:930).
-    pub constant_types: HashMap<u32, Type>,
+    pub constant_types: VecAssoc<u32, Type>,
     /// rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
     /// by target token number. Provided by the backend.
     pub call_assembler_callee_locs:
@@ -322,17 +323,17 @@ struct RewriteState {
     /// explicit source position to preserve.
     next_pos: u32,
     /// Constant pool (from optimizer) — maps OpRef key → i64 value.
-    constants: HashMap<u32, i64>,
+    constants: VecAssoc<u32, i64>,
     /// Type annotations for constants minted by this rewrite pass. RPython
     /// gets this from each `ConstInt` object's `.type`; pyre must return the
     /// side-channel entry together with the constant pool entry.
-    new_constant_types: HashMap<u32, Type>,
+    new_constant_types: VecAssoc<u32, Type>,
     /// rewrite.py:930 parity — structural equivalent of Box.type.
     /// Maps OpRef.0 → Type for all known values (both op results and
     /// constants). In RPython each Box carries its own `.type` attribute;
     /// here we mirror that with an explicit lookup table because OpRef
     /// is a plain u32 without embedded type information.
-    result_types: HashMap<u32, Type>,
+    result_types: VecAssoc<u32, Type>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -431,9 +432,9 @@ impl RewriteState {
         RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
-            constants: HashMap::new(),
-            new_constant_types: HashMap::new(),
-            result_types: HashMap::new(),
+            constants: VecAssoc::new(),
+            new_constant_types: VecAssoc::new(),
+            result_types: VecAssoc::new(),
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -452,7 +453,7 @@ impl RewriteState {
         }
     }
 
-    fn with_constants(hint: usize, next_pos: u32, constants: HashMap<u32, i64>) -> Self {
+    fn with_constants(hint: usize, next_pos: u32, constants: VecAssoc<u32, i64>) -> Self {
         // P3 category E — `constants` is an index-keyed constant pool
         // (raw u32 key), not a Box-identity dict.  Bit-helpers replace
         // the `OpRef::from_raw(k).is_constant()` round-trip that would
@@ -2669,14 +2670,14 @@ impl GcRewriterImpl {
 
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op> {
-        self.rewrite_for_gc_with_constants(ops, &HashMap::new()).0
+        self.rewrite_for_gc_with_constants(ops, &VecAssoc::new()).0
     }
 
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
-        constants: &HashMap<u32, i64>,
-    ) -> (Vec<Op>, HashMap<u32, i64>, HashMap<u32, Type>) {
+        constants: &VecAssoc<u32, i64>,
+    ) -> (Vec<Op>, VecAssoc<u32, i64>, VecAssoc<u32, Type>) {
         // rewrite.py:988-1001 remove_bridge_exception: strip a
         // SaveExcClass+SaveException+RestoreException prefix that is
         // a no-op (common in bridges).
@@ -2699,7 +2700,7 @@ impl GcRewriter for GcRewriterImpl {
         // Merge constant types — RPython's ConstPtr/ConstInt carry type
         // intrinsically; here we inject them into the same map.
         for (&k, &tp) in &self.constant_types {
-            st.result_types.entry(k).or_insert(tp);
+            st.result_types.entry_or_insert_with(k, || tp);
         }
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this
@@ -3022,7 +3023,7 @@ mod tests {
                 jit_wb_cards_set_singlebyte: 0,
             },
             jitframe_info: None,
-            constant_types: HashMap::new(),
+            constant_types: VecAssoc::new(),
             call_assembler_callee_locs: None,
             // llmodel.py:39 default keeps existing pre-scale-everything behavior
             // in tests written against it; per-backend overrides have dedicated
@@ -3161,7 +3162,7 @@ mod tests {
         let ops = vec![Op::with_descr(OpCode::New, &[], size_descr(32, 7))];
 
         let (result, constants, constant_types) =
-            rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+            rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect: CallMallocNursery, GcStore (tid)
         assert_eq!(result.len(), 2);
@@ -3234,7 +3235,7 @@ mod tests {
         // array_descr_ref: base_size=8, item_size=8 →
         //   total = 8 + 8*512 = 4104; gen_malloc_nursery sees
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
-        let mut constants = HashMap::new();
+        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
         constants.insert(10_000, 512_i64);
         let mut new_array = Op::with_descr(OpCode::NewArray, &[len_ref], array_descr_ref());
         new_array.pos.set(OpRef::ref_op(0));
@@ -3403,7 +3404,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, _consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Allocation header stores only (CallMallocNursery + tid GcStore) + Jump.
         // No delayed-zero NULL-pointer stores must be emitted because
@@ -3435,7 +3436,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Collect the NULL-pointer stores emitted by the pending-zero flush.
         let mut seen_offsets: Vec<i64> = result
@@ -3463,7 +3464,7 @@ mod tests {
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
         let val = OpRef::const_ptr(100);
-        let mut constants = HashMap::new();
+        let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
         constants.insert(val.raw(), 0x1234);
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
@@ -3519,7 +3520,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
         ];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
         assert!(
@@ -3653,7 +3654,7 @@ mod tests {
             vtable_descr(48, 3, 0xDEAD),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // CallMallocNursery + GcStore(tid) + GcStore(vtable)
         assert_eq!(result.len(), 3);
@@ -3874,7 +3875,7 @@ mod tests {
         guard.store_final_boxes(vec![OpRef::int_op(2)]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         let same = result
             .iter()
@@ -3898,7 +3899,7 @@ mod tests {
         guard.store_final_boxes(vec![OpRef::int_op(10), OpRef::int_op(11)]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, consts, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert!(
             result.iter().all(|o| o.opcode != OpCode::GuardAlwaysFails),
@@ -3950,7 +3951,7 @@ mod tests {
 
     /// Helper: build a constants map mapping `key` → `value` for tests
     /// that need the rewriter's resolve_constant to find a length.
-    fn const_pool(entries: &[(u32, i64)]) -> HashMap<u32, i64> {
+    fn const_pool(entries: &[(u32, i64)]) -> VecAssoc<u32, i64> {
         entries.iter().copied().collect()
     }
 
@@ -4185,7 +4186,7 @@ mod tests {
                 jit_wb_cards_set_singlebyte: 0x40,
             },
             jitframe_info: None,
-            constant_types: HashMap::new(),
+            constant_types: VecAssoc::new(),
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
             supports_load_effective_address: true,
@@ -4233,7 +4234,7 @@ mod tests {
         for &num_elem in &[10_i64, 200_i64] {
             let rw = make_rewriter_with_cards();
             let len_ref = OpRef::int_op(10_000);
-            let mut constants = HashMap::new();
+            let mut constants: VecAssoc<u32, i64> = VecAssoc::new();
             constants.insert(10_000, num_elem);
             let mut new_array =
                 Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
@@ -4369,7 +4370,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         assert_eq!(
             result.len(),
@@ -4412,7 +4413,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect: LEA, LEA, INT_LSHIFT(i_len, 2), CALL_N
         assert_eq!(result.len(), 4);
@@ -4447,7 +4448,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect (itemscale=0 so no INT_LSHIFT):
         //   i2b = int_add(p0, i0)
@@ -4494,7 +4495,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+        let (result, constants, _) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
 
         // Expect (itemscale=2):
         //   i0s = int_lshift(i0, 2)

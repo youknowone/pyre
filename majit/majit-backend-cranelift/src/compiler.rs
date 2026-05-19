@@ -7245,8 +7245,7 @@ impl CraneliftBackend {
     // consumers can reach them through `&mut dyn Backend`.
 
     fn gc_rewriter(&self, constant_types: &majit_ir::VecAssoc<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
-        let ct: HashMap<u32, majit_ir::Type> =
-            constant_types.iter().map(|(&k, &t)| (k, t)).collect();
+        let ct = constant_types.clone();
         with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
             nursery_top_addr: gc.nursery_top_addr(),
@@ -7385,10 +7384,8 @@ impl CraneliftBackend {
                 .entry_or_insert_with(ia.index, || ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
-            let constants_hm: HashMap<u32, i64> =
-                constants.iter().map(|(&k, &v)| (k, v)).collect();
             let (result, new_constants, new_constant_types) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, &constants_hm);
+                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
                 self.constants.entry_or_insert_with(k, || v);
