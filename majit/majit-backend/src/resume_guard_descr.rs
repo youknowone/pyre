@@ -8,6 +8,36 @@
 //! per-emission wrapper `DynasmFailDescr` was retired (Slice 7-Tα7);
 //! the cranelift counterpart still carries codegen-bound payload
 //! pending Phase 7-Tβ.
+//!
+//! # Concurrency invariant (audited 2026-05-19)
+//!
+//! Several slots — `trace_info` (`AtomicPtr<CompiledTraceInfo>`),
+//! `bridge_dispatch_cell` (`AtomicPtr<()>`), and `bridge_code_ptr_cache`
+//! / `bridge_frame_depth_cache` — are accessed through atomics so that
+//! JIT-baked machine code can read them without a Mutex.  The
+//! `Arc::into_raw` / `Arc::increment_strong_count` / `Arc::from_raw`
+//! protocol used on the dispatch / trace_info cells has a textbook
+//! `load → retain` window that is unsafe under truly concurrent
+//! publishers or droppers.  The protocol relies on this invariant:
+//!
+//! - `set_trace_info`, `bridge_dispatch_swap`, and the corresponding
+//!   readers all execute on pyre's single JIT thread (RPython GIL
+//!   parity).  All call paths originate from `MetaInterp` / backend
+//!   codegen, both serial.
+//! - `Drop::drop` for `ResumeGuardDescr` runs when the last `Arc<dyn
+//!   FailDescr>` is released; a reader inside `trace_info()` /
+//!   `bridge_dispatch_load()` necessarily holds such an `Arc` for the
+//!   borrow lifetime, so drop cannot interleave with the load → retain
+//!   window.
+//! - The only background thread spawned by the driver
+//!   (`jitdriver.rs:762 invalidation_thread`) touches a
+//!   `Mutex<QuasiImmut>` and never reaches into `ResumeGuardDescr`.
+//!
+//! These three facts together close the race CodeRabbit and Codex
+//! flagged on PR #68 (Critical #6/#10/#13).  Any future change that
+//! introduces multi-threaded descr publishing or compilation MUST
+//! replace this protocol with a hazard-pointer / RCU scheme — atomics
+//! alone do not suffice.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -478,11 +508,7 @@ impl FailDescr for ResumeGuardDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.bridge_dispatch_cell.load(Ordering::Acquire)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
@@ -702,11 +728,7 @@ impl ResumeGuardDescr {
     /// owned `Arc`.  The cleanup function is registered once
     /// (idempotent) and invoked by `Drop` on any payload still in the
     /// cell at descr teardown.
-    pub fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }

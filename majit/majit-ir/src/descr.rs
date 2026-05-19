@@ -2084,11 +2084,7 @@ pub trait FailDescr: Descr {
     /// (caller already transferred ownership by `Arc::into_raw`).
     /// Callers must gate by `is_resume_guard() ||
     /// is_resume_guard_copied()`.
-    fn bridge_dispatch_swap(
-        &self,
-        _new_ptr: *mut (),
-        _drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, _new_ptr: *mut (), _drop_fn: unsafe fn(*mut ())) -> *mut () {
         panic!(
             "bridge_dispatch_swap invoked on a FailDescr that does not \
              carry the per-emission bridge_dispatch_cell (only \

@@ -3208,11 +3208,7 @@ impl FailDescr for ResumeAtPositionDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
     fn is_external_jump(&self) -> bool {
@@ -3478,11 +3474,7 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
     fn is_external_jump(&self) -> bool {
@@ -3732,11 +3724,7 @@ impl FailDescr for ResumeGuardExcDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
     fn is_external_jump(&self) -> bool {
@@ -4256,11 +4244,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.bridge_dispatch_cell.load(Ordering::Acquire)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
@@ -4334,7 +4318,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
                 bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
-            external_jump_target: std::sync::OnceLock::new(),
+                external_jump_target: std::sync::OnceLock::new(),
             },
         }))
     }
@@ -4479,11 +4463,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         self.inner.bridge_dispatch_load()
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         self.inner.bridge_dispatch_swap(new_ptr, drop_fn)
     }
     fn is_external_jump(&self) -> bool {
@@ -4923,11 +4903,7 @@ impl FailDescr for CompileLoopVersionDescr {
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
     }
-    fn bridge_dispatch_swap(
-        &self,
-        new_ptr: *mut (),
-        drop_fn: unsafe fn(*mut ()),
-    ) -> *mut () {
+    fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
         FailDescr::bridge_dispatch_swap(&self.inner, new_ptr, drop_fn)
     }
     fn is_external_jump(&self) -> bool {

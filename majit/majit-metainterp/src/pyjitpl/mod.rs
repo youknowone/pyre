@@ -1662,11 +1662,10 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 Vec::new()
             };
-        if let Some(backend_layouts) = compiled
-            .live_token()
-            .as_deref()
-            .and_then(|token| self.backend.compiled_trace_fail_descr_layouts(token, trace_id))
-        {
+        if let Some(backend_layouts) = compiled.live_token().as_deref().and_then(|token| {
+            self.backend
+                .compiled_trace_fail_descr_layouts(token, trace_id)
+        }) {
             let mut merged = HashMap::new();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
@@ -1716,11 +1715,10 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 Vec::new()
             };
-        if let Some(backend_layouts) = compiled
-            .live_token()
-            .as_deref()
-            .and_then(|token| self.backend.compiled_trace_terminal_exit_layouts(token, trace_id))
-        {
+        if let Some(backend_layouts) = compiled.live_token().as_deref().and_then(|token| {
+            self.backend
+                .compiled_trace_terminal_exit_layouts(token, trace_id)
+        }) {
             let mut merged = HashMap::new();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
