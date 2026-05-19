@@ -2175,8 +2175,10 @@ impl<S: JitState> JitDriver<S> {
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
-                let resolve_jitcode =
-                    |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
+                let resolve_jitcode = |jitcode_index: i32,
+                                       pc: i32,
+                                       _jitcode_pc: i32|
+                 -> Option<crate::resume::ResolvedJitCode> {
                         let resolved_jitcode = if last_resolved.borrow().is_none() {
                             // Root frame: clone the dispatch JitCode
                             // singleton registered at install time
@@ -4048,8 +4050,10 @@ impl<S: JitState> JitDriver<S> {
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,
                 > = std::cell::RefCell::new(None);
-                let resolve_jitcode =
-                    |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
+                let resolve_jitcode = |jitcode_index: i32,
+                                       pc: i32,
+                                       _jitcode_pc: i32|
+                 -> Option<crate::resume::ResolvedJitCode> {
                         let resolved_jitcode = if last_resolved.borrow().is_none() {
                             // Root frame: clone the dispatch JitCode
                             // singleton registered at install time

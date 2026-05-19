@@ -4967,13 +4967,14 @@ mod tests {
         use crate::jitcode::JitCodeBuilder;
         use crate::jitcode::insns::{BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
 
-        let mut writer = crate::resumecode::Writer::new(6);
+        let mut writer = crate::resumecode::Writer::new(7);
         writer.append_int(0); // items_resume_section (patched below)
         writer.append_int(0); // count: no failargs
         writer.append_int(0); // vable_array length
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
+        writer.append_int(0); // jitcode_pc (Phase 7c)
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
@@ -4994,9 +4995,10 @@ mod tests {
             BC_CATCH_EXCEPTION as i32,
             BC_RVMPROF_CODE as i32,
         );
-        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
-            Some(ResolvedJitCode::new(runtime.clone(), 0))
-        };
+        let resolve_jitcode =
+            |_jitcode_pos: i32, _pc: i32, _jitcode_pc: i32| -> Option<ResolvedJitCode> {
+                Some(ResolvedJitCode::new(runtime.clone(), 0))
+            };
 
         let all_liveness: Vec<u8> = vec![0, 0, 0];
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
@@ -6198,11 +6200,19 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
 
-    /// resume.py:928 read_jitcode_pos_pc
-    pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
+    /// resume.py:928 read_jitcode_pos_pc.
+    ///
+    /// Issue #73 Phase 7c: returns `(jitcode_pos, pc, jitcode_pc)`.  Pyre's
+    /// `rd_numb` carries the JitCode byte offset alongside `pc` (Python PC)
+    /// — both items are written by `ResumeDataLoopMemo::number` /
+    /// `encode_shared` (per-frame triple `[jitcode_index, pc, jitcode_pc]`).
+    /// Consumers prefer `jitcode_pc` directly when non-zero to avoid the
+    /// runtime `PyJitCode::resume_jitcode_pc_for(py_pc)` lookup.
+    pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
         let pc = self.resumecodereader.next_item();
-        (jitcode_pos, pc)
+        let jitcode_pc = self.resumecodereader.next_item();
+        (jitcode_pos, pc, jitcode_pc)
     }
 
     /// resume.py:933 next_int
@@ -6493,14 +6503,17 @@ impl<'a> ResumeDataDirectReader<'a> {
         resolve_jitcode: &dyn Fn(
             i32,
             i32,
+            i32,
         )
             -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
         outputs: &mut Vec<i64>,
     ) -> bool {
         while !self.done_reading() {
-            // resume.py:1338-1340 read_jitcode_pos_pc.
-            let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
-            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
+            // resume.py:1338-1340 read_jitcode_pos_pc + Phase 7c jitcode_pc.
+            let (jitcode_pos, pc, jitcode_pc) = self.read_jitcode_pos_pc();
+            let Some((jitcode, resolved_pc, op_live)) =
+                resolve_jitcode(jitcode_pos, pc, jitcode_pc)
+            else {
                 return false;
             };
             // `blackhole.rs:1435 get_current_position_info` parity —
@@ -6804,7 +6817,7 @@ impl ResolvedJitCode {
 
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
+    resolve_jitcode: &dyn Fn(i32, i32, i32) -> Option<ResolvedJitCode>,
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
@@ -6856,10 +6869,10 @@ pub fn blackhole_from_resumedata<'a>(
         let mut nextbh = builder.acquire_interp();
         nextbh.nextblackholeinterp = curbh;
 
-        // resume.py:1338-1340
-        let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
+        // resume.py:1338-1340 + Phase 7c jitcode_pc.
+        let (jitcode_pos, pc, jitcode_pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc)
-        let resolved = resolve_jitcode(jitcode_pos, pc)?;
+        let resolved = resolve_jitcode(jitcode_pos, pc, jitcode_pc)?;
         nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;

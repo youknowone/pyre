@@ -1941,7 +1941,17 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // through the trace-side MetaInterpStaticData.jitcodes store.
-    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
+    //
+    // Issue #73 Phase 7c: the per-frame `jitcode_pc` is carried alongside
+    // `pc` in rd_numb.  Prefer it directly; fall back to the legacy
+    // `PyJitCode::resume_jitcode_pc_for(py_pc)` lookup only when the
+    // writer could not resolve the value (encoded as 0 — collides with
+    // the legitimate entry-point JitCode PC, which the legacy path
+    // returns equivalently, so the fallback is safe).
+    let resolve_jitcode = |jitcode_index: i32,
+                           pc: i32,
+                           jitcode_pc: i32|
+     -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
         }
@@ -1949,7 +1959,11 @@ pub fn blackhole_resume_via_rd_numb(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let jitcode_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
+        let resolved_pc = if jitcode_pc > 0 {
+            jitcode_pc as usize
+        } else {
+            pyjitcode.resume_jitcode_pc_for(pc as usize)?
+        };
         // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
         // `state::code_for_jitcode_index` indices name the runtime
         // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
@@ -1958,7 +1972,7 @@ pub fn blackhole_resume_via_rd_numb(
         // canonical store by `jitcode_index` until pyre actually shares a
         // single JitCode object graph end-to-end.
         Some(
-            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
+            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
                 .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
         )
     };
@@ -3982,8 +3996,12 @@ pub fn cranelift_resumedata_deopt(
         return false;
     }
     let op_live = op_live_i32 as u8;
+    // Issue #73 Phase 7c: take `jitcode_pc` directly from rd_numb when
+    // non-zero; fall back to the legacy `pc_map[py_pc]` lookup only when
+    // the writer could not resolve the JitCode offset at encode time.
     let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32|
+                           pc: i32,
+                           jitcode_pc: i32|
      -> Option<(
         std::sync::Arc<majit_metainterp::jitcode::JitCode>,
         usize,
@@ -3996,8 +4014,12 @@ pub fn cranelift_resumedata_deopt(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
-        Some((pyjitcode.jitcode.clone(), jitcode_pc, op_live))
+        let resolved_pc = if jitcode_pc > 0 {
+            jitcode_pc as usize
+        } else {
+            pyjitcode.metadata.pc_map.get(pc as usize).copied()?
+        };
+        Some((pyjitcode.jitcode.clone(), resolved_pc, op_live))
     };
 
     // 8. Drive the per-section consume loop, appending decoded values
