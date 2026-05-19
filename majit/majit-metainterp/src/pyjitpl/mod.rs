@@ -854,7 +854,6 @@ pub struct PartialTrace {
 ///   return ConstInt(ptr2int(obj.typeptr))
 /// Reads the first word of the object (typeptr/vtable pointer).
 fn default_cls_of_box(raw_ref: i64) -> i64 {
-    debug_assert!(raw_ref != 0, "cls_of_box: null ref");
     unsafe { *(raw_ref as *const usize) as i64 }
 }
 
