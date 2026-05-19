@@ -817,8 +817,8 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
         chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      40,      None)
-        chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       10,      None,    10,      None)
-        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       15,      None,    15,      None)
+        chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       15,      None,    15,      None)
+        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       20,      None,    20,      None)
         chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
         chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
 

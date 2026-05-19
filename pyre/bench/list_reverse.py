@@ -3,11 +3,11 @@
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + setarrayitem(ArrayS 8) swaps.
 # On main, reverse() called items_to_vec() → Object strategy first.
 # On this branch, reverse() stays in Integer strategy (no boxing overhead).
-# REPS=9 (odd): final list is reversed, so lst[0]=N-1, lst[-1]=0.
+# REPS=15 (odd): final list is reversed, so lst[0]=N-1, lst[-1]=0.
 #
 def main():
-    N = 200000
-    REPS = 9
+    N = 700000
+    REPS = 15
 
     lst = []
     i = 0

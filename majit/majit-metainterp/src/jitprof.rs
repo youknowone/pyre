@@ -108,14 +108,45 @@ impl JitProfiler {
     /// signal (pyjitpl.py:2300-2302).
     ///
     /// Returns whether `start()` actually ran the initialisation
-    /// (`false` if `initialized` was already set).  Counters / calls
-    /// are not reset here — pyre creates the profiler via
-    /// `Default::default()` which already zeros every slot, and
-    /// post-`start()` resets would discard counts accumulated by
-    /// out-of-band callers (eg. tests that count_ops before
-    /// `_setup_once`).
+    /// (`false` if `initialized` was already set).  On the first
+    /// real call every counter is zeroed to match upstream's
+    /// `self.counters = [0] * ncounters; self.calls = 0` reset
+    /// (jitprof.py:63-64).  Out-of-band counts accumulated before
+    /// `_setup_once` (e.g. fixture-driven `count_ops` calls) are
+    /// discarded by design — the canonical "session start" moment
+    /// is when `_setup_once` flips `initialized`.
     pub fn start(&self) -> bool {
-        !self.initialized.swap(true, Ordering::AcqRel)
+        if self.initialized.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        for field in [
+            &self.tracing,
+            &self.backend,
+            &self.ops,
+            &self.heapcached_ops,
+            &self.recorded_ops,
+            &self.guards,
+            &self.opt_ops,
+            &self.opt_guards,
+            &self.opt_guards_shared,
+            &self.opt_forcings,
+            &self.opt_vectorize_try,
+            &self.opt_vectorized,
+            &self.abort_too_long,
+            &self.abort_bridge,
+            &self.abort_bad_loop,
+            &self.abort_escape,
+            &self.abort_force_quasiimmut,
+            &self.abort_segmented_trace,
+            &self.force_virtualizables,
+            &self.nvirtuals,
+            &self.nvholes,
+            &self.nvreused,
+            &self.calls,
+        ] {
+            field.store(0, Ordering::Relaxed);
+        }
+        true
     }
 
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.

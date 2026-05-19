@@ -936,6 +936,18 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
+        // `pyjitpl.py:2273-2283 finish_setup_descrs_for_jitdrivers` —
+        // production `JitDriver` consumers reach this via
+        // `register_descriptor` (called from the macro-emitted
+        // `__JitMeta::install_canonical_liveness`).  `with_descriptor`
+        // skips registration on purpose (it is a "pre-built descriptor"
+        // shortcut used by integration tests and `with_declarative`),
+        // so the propagate-exception descr would otherwise stay
+        // unattached and the first `backend.compile_loop` would build
+        // a per-CPU trampoline against a NULL descr pointer
+        // (`x86/assembler.rs:238`).  The call is idempotent — a later
+        // `register_descriptor` re-uses the same `Arc` by identity.
+        driver.meta.finish_setup_descrs_for_jitdrivers();
         // warmstate.py:564 `_green_args_spec` carries lltype TYPE per
         // green arg, including `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
         // distinct from generic Ptr.  `JitDriverVar.green_type` is the

@@ -1848,25 +1848,30 @@ impl<M: Clone> MetaInterp<M> {
             ..
         } = this;
         staticdata.attach_descrs_to_cpu(backend);
-        // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()`
-        // — PyPy creates this in `finish_setup_descrs_for_jitdrivers`
-        // (which runs from `warmspot.py:289`), before any
-        // `cpu.setup_once()`.  Pyre's back-edge / function-entry trace
-        // starts both gate through `_setup_once`, which materialises
-        // the per-CPU propagate trampoline; the trampoline reads
-        // `propagate_exception_descr` from the CPU.  Eagerly create
-        // and attach the descr here so the lifecycle holds for
-        // callers that construct a `MetaInterp` without running the
-        // full `register_jitdriver_sd` path (notably the test
-        // harness).  `finish_setup_descrs_for_jitdrivers` re-uses the
-        // existing `Arc` by identity, so a later
-        // `register_jitdriver_sd` call sees the same descr — no
-        // duplicate, no swap.
-        let sd_mut = std::sync::Arc::get_mut(staticdata).expect(
-            "MetaInterp::new: staticdata Arc must still have refcount 1 \
-             at construction time",
-        );
-        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
+        // `pyjitpl.py:2273-2283` `finish_setup_descrs_for_jitdrivers`
+        // runs as part of `finish_setup` (`warmspot.py:289`) before any
+        // `MetaInterp` is constructed.  Pyre's production entry point
+        // (`JitDriver::register_descriptor`, `mod.rs:2023
+        // set_result_type`, …) calls `finish_setup_descrs_for_jitdrivers`
+        // on each driver registration, so by the time the back-edge or
+        // function-entry trace start hits `_setup_once` the
+        // `propagate_exception_descr` is already on the cpu.
+        //
+        // Inline `#[test]` modules that build a `MetaInterp` directly
+        // skip the registration path (no portal runner, no macro-emitted
+        // `install_canonical_liveness`) but still drive
+        // `force_start_tracing` / `bound_reached` / `compile_loop`.
+        // Running the descr setup here under `cfg(test)` keeps those
+        // fixtures working without leaking the shortcut into production
+        // — the call is idempotent (`finish_setup_descrs_for_jitdrivers`
+        // re-uses the existing `Arc` by identity) so the later real
+        // registration sees the same descr, no duplicate, no swap.
+        #[cfg(test)]
+        {
+            let sd_mut = std::sync::Arc::get_mut(staticdata)
+                .expect("staticdata Arc must still have refcount 1 at construction");
+            sd_mut.finish_setup_descrs_for_jitdrivers(backend);
+        }
         this
     }
 
@@ -1931,6 +1936,31 @@ impl<M: Clone> MetaInterp<M> {
     /// thread it explicitly.
     pub fn finish_setup_descrs(&self) {
         self.staticdata.finish_setup_descrs();
+    }
+
+    /// `pyjitpl.py:2273-2283 finish_setup_descrs_for_jitdrivers` —
+    /// create the shared `PropagateExceptionDescr`, attach it to the
+    /// cpu, and bind `propagate_exc_descr` / `portal_finishtoken` /
+    /// `portal_calldescr` on every registered jitdriver.
+    ///
+    /// Real entry points (`JitDriver::register_descriptor`,
+    /// `MetaInterpStaticData::set_result_type`) call the underlying
+    /// staticdata method themselves; this wrapper is the public
+    /// surface for integration-test fixtures that build a
+    /// `MetaInterp` without the registration plumbing.  Idempotent —
+    /// re-running picks the same `Arc` by identity.
+    pub fn finish_setup_descrs_for_jitdrivers(&mut self) {
+        let MetaInterp {
+            staticdata,
+            backend,
+            ..
+        } = self;
+        let sd_mut = std::sync::Arc::get_mut(staticdata).expect(
+            "MetaInterp::finish_setup_descrs_for_jitdrivers: staticdata Arc \
+             must still have refcount 1; call before any tracing session \
+             clones it",
+        );
+        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical
@@ -2784,8 +2814,15 @@ impl<M: Clone> MetaInterp<M> {
         // jitlog header before the first trace records anything.
         // Idempotent — `globaldata.initialized` short-circuits after
         // the first call.
-        self.staticdata
-            ._setup_once(&mut self.backend, &mut self.warm_state);
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
+        // `WarmEnterState` rather than `MetaInterpStaticData`, so the
+        // `pyjitpl.py:2295 self.jitlog.setup_once()` step is driven
+        // here against this MetaInterp's own warmstate.  Idempotent
+        // — `ensure_jitlog_initialised` only fills the slot when it
+        // is still `None`.
+        self.warm_state.ensure_jitlog_initialised();
+        self.staticdata._setup_once(&mut self.backend);
 
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
@@ -2920,8 +2957,13 @@ impl<M: Clone> MetaInterp<M> {
         // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
         // back-edge entry routes through `bound_reached`, so the
         // gate fires here.  Idempotent.
-        self.staticdata
-            ._setup_once(&mut self.backend, &mut self.warm_state);
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
+        // `WarmEnterState`, not on `MetaInterpStaticData`; drive the
+        // per-warmstate `setup_once` step here before the staticdata
+        // hook runs (matches PyPy's `jitlog → ...` order).
+        self.warm_state.ensure_jitlog_initialised();
+        self.staticdata._setup_once(&mut self.backend);
 
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
@@ -14539,41 +14581,67 @@ impl MetaInterpStaticData {
     ///         self.globaldata.initialized = True
     /// ```
     ///
-    /// Each hook is dispatched in the same order:
+    /// PRE-EXISTING-ADAPTATION: pyre owns the jitlog `Logger` on
+    /// `WarmEnterState`, not on `MetaInterpStaticData` as PyPy does
+    /// on `self.jitlog`.  The PyPy `setup_once` step `self.jitlog
+    /// .setup_once()` therefore cannot run from here — it would need
+    /// a list of registered warmstates that pyre doesn't keep, and
+    /// the per-warmstate `Option<Logger>` is initialised eagerly by
+    /// `WarmEnterState::new` / `with_jitlog` constructors anyway.
+    /// Callers that wrap `_setup_once` (`force_start_tracing`,
+    /// `bound_reached`) drive `WarmEnterState::ensure_jitlog_initialised`
+    /// against their own warmstate just before invoking this hook,
+    /// which preserves the lifecycle ordering (jitlog → debug_print
+    /// → cpu.setup_once → vector_ext → profiler) for the single
+    /// warmstate they own.
     ///
-    /// 1. `jitlog.setup_once()` — `setup_once_jitlog` walks the
-    ///    registered jitdrivers and forces each `WarmEnterState`'s
-    ///    `Logger::from_env` to materialise (pyre adapts PyPy's
-    ///    single staticdata-owned `JitLogger` into a per-jitdriver
-    ///    `Logger`).
-    /// 2. `debug_print(self.jit_starting_line)` — prints to stderr
+    /// Each remaining hook is dispatched in the same order as upstream:
+    ///
+    /// 1. `debug_print(self.jit_starting_line)` — prints to stderr
     ///    when `MAJIT_LOG` is set, matching PyPy's `PYPYLOG`-gated
     ///    `debug_print`.  When `jit_starting_line` is empty (the
     ///    default), `debug_print_jit_starting_line` formats one from
     ///    `backend.backend_name()`; embedders may pre-assign a custom
     ///    banner string instead.
-    /// 3. `cpu.setup_once()` — backends materialise per-CPU
+    /// 2. `cpu.setup_once()` — backends materialise per-CPU
     ///    trampolines (x86 `_build_propagate_exception_path` /
     ///    `_build_malloc_slowpath`).
-    /// 4. `cpu.vector_ext.setup_once(cpu.assembler)` — pyre dispatches
+    /// 3. `cpu.vector_ext.setup_once(cpu.assembler)` — pyre dispatches
     ///    through the `Backend::vector_ext_setup_once` trait hook;
     ///    every current backend is a no-op (no `vector_ext`), but
     ///    the call site is in place for when a backend grows one.
-    /// 5. `profiler.start()` — flips the profiler `initialized` flag.
+    /// 4. `profiler.start()` — flips the profiler `initialized` flag
+    ///    and zeroes every counter (`jitprof.py:55-64`).
     ///
-    /// Pyre invokes this from the metainterp's back-edge entry
-    /// `MetaInterp::bound_reached` (pyre analogue of
-    /// `pyjitpl.py:2889 compile_and_run_once`).
-    pub fn _setup_once(
-        &self,
-        backend: &mut BackendImpl,
-        warm_state: &mut crate::warmstate::WarmEnterState,
-    ) {
+    /// Pyre invokes this from `MetaInterp::bound_reached` (analogue
+    /// of `pyjitpl.py:2889 compile_and_run_once`) and from
+    /// `MetaInterp::force_start_tracing` for the function-entry trace
+    /// path.
+    pub fn _setup_once(&self, backend: &mut BackendImpl) {
         let mut gd = self.globaldata.lock().unwrap();
         if gd.initialized {
             return;
         }
-        warm_state.ensure_jitlog_initialised();
+        // `pyjitpl.py:2273-2283` `finish_setup_descrs_for_jitdrivers`
+        // runs before `_setup_once` — in PyPy the call sits earlier in
+        // `finish_setup` so by the time `pyjitpl.py:2884
+        // compile_and_run_once` triggers the `globaldata.initialized`
+        // dispatch, `propagate_exception_descr` is already on the cpu
+        // and every jitdriver has its `propagate_exc_descr`/`portal_*`
+        // slots populated.  Pyre keeps the same invariant: real entry
+        // points (`MetaInterpStaticData::register_jitdriver_sd_*`,
+        // `set_result_type`) drive that method, and test fixtures that
+        // construct a `MetaInterp` without going through registration
+        // must call `finish_setup_descrs_for_jitdrivers` explicitly
+        // before tracing starts.  Panicking here exposes the missing
+        // setup at the call site instead of letting the per-CPU
+        // propagate trampoline bake a NULL descr immediate.
+        assert!(
+            self.propagate_exception_descr.is_some(),
+            "_setup_once: finish_setup_descrs_for_jitdrivers must run \
+             before the first trace start (pyjitpl.py:2273-2283 \
+             precedes pyjitpl.py:2292-2303)"
+        );
         self.debug_print_jit_starting_line(backend.backend_name());
         backend.setup_once();
         backend.vector_ext_setup_once();

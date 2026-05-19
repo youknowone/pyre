@@ -4,7 +4,7 @@
 # On main, first pop() called items_to_vec() → Object strategy;
 # on this branch, stays Integer throughout (no boxing overhead).
 
-N = 300000
+N = 700000
 
 
 def main():

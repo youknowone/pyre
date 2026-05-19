@@ -56,6 +56,9 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     // all_const=false → cut from patch_pos and re-emit CALL → CALL_PURE.
 
     let mut meta = MetaInterp::<()>::new(0);
+    // pyjitpl.py:2273-2283 — fixtures that bypass JitDriver::register_descriptor
+    // must seed propagate_exception_descr before the first trace start.
+    meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -124,6 +127,7 @@ fn elidable_canary_all_const_args_fold_to_const_and_cut_call() {
     // ConstInt(resvalue) returned.
 
     let mut meta = MetaInterp::<()>::new(0);
+    meta.finish_setup_descrs_for_jitdrivers();
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 

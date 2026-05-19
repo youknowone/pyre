@@ -6514,6 +6514,15 @@ impl<'a> Assembler386<'a> {
     /// aarch64/opassembler.py:1036 _emit_call.
     /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
     /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    ///
+    /// Register-bound arg moves go through `remap_frame_layout_mixed`
+    /// (a parallel-move algorithm) mirroring x86/callbuilder.py:584
+    /// `prepare_arguments` → `remap_frame_layout`.  Emitting them naively
+    /// in source order broke Win64 where two args could map to the same
+    /// dst-then-src register (e.g. arg0 → rcx clobbering Reg(rcx) before
+    /// arg1 reads it as Gpr(rdx)).  Linux SysV escaped the same code
+    /// path because its rdi/rsi placement happened not to collide with
+    /// regalloc-chosen rcx/rdx for these traces.
     fn emit_call_from_arglocs(&mut self, op: &Op, arglocs: &[Loc], func_index: usize) {
         let arg_count = arglocs.len();
         let call_arg_count = arg_count.saturating_sub(func_index + 1);
@@ -6529,48 +6538,79 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; push rbp);
         let call_area_adjust = self.emit_reserve_abi_call_area(1, stack_slots);
 
+        // Pass 1: emit stack-dst args first.  Their sources may be
+        // registers the parallel move below will overwrite, but stack
+        // writes never disturb registers, so doing them up front keeps
+        // every register source live for Pass 2.
         for i in (func_index + 1)..arg_count {
             let abi_idx = i - func_index - 1;
             let placement = placements[abi_idx];
+            if !matches!(placement, AbiArgPlacement::Stack(_)) {
+                continue;
+            }
             let arg_type = arg_types[abi_idx];
             let arg = &arglocs[i];
             match arg {
-                Loc::Frame(f) => {
-                    let offset = f.ebp_loc.value;
-                    self.emit_abi_arg_from_mem(placement, offset, arg_type);
-                }
+                Loc::Frame(f) => self.emit_abi_arg_from_mem(placement, f.ebp_loc.value, arg_type),
                 Loc::Reg(r) => self.emit_abi_arg_from_reg(placement, *r, arg_type),
-                Loc::Immed(i) => {
-                    let val = i.value;
-                    self.emit_abi_arg_from_imm(placement, val, arg_type);
-                }
+                Loc::Immed(i) => self.emit_abi_arg_from_imm(placement, i.value, arg_type),
                 _ => {}
             }
         }
 
-        match arglocs.get(func_index) {
-            Some(Loc::Frame(f)) => {
-                let offset = f.ebp_loc.value;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, [rbp + offset]
-                    ; call rax
-                );
+        // Pass 2: parallel-move register-bound args (GPR and XMM groups
+        // separately).  If the call target itself is a register, append
+        // it to the int group with rax as the dst so the move algorithm
+        // sees the dependency — otherwise loading the target after the
+        // move could read a register whose old value has just been
+        // overwritten by Gpr(reg)-placed args.
+        let mut int_src: Vec<Loc> = Vec::new();
+        let mut int_dst: Vec<Loc> = Vec::new();
+        let mut xmm_src: Vec<Loc> = Vec::new();
+        let mut xmm_dst: Vec<Loc> = Vec::new();
+        for i in (func_index + 1)..arg_count {
+            let abi_idx = i - func_index - 1;
+            let placement = placements[abi_idx];
+            let arg = arglocs[i];
+            match placement {
+                AbiArgPlacement::Gpr(dst_reg) => {
+                    int_src.push(arg);
+                    int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, false)));
+                }
+                AbiArgPlacement::Xmm(dst_reg) => {
+                    xmm_src.push(arg);
+                    xmm_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, true)));
+                }
+                AbiArgPlacement::Stack(_) => {}
             }
-            Some(Loc::Reg(r)) => {
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, Rq(r.value)
-                    ; call rax
-                );
-            }
-            Some(Loc::Immed(i)) => {
-                let val = i.value;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD val
-                    ; call rax
-                );
-            }
-            _ => {}
         }
+        let func_in_rax_after_move = matches!(arglocs.get(func_index), Some(Loc::Reg(_)));
+        if let Some(Loc::Reg(r)) = arglocs.get(func_index) {
+            int_src.push(Loc::Reg(*r));
+            int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(0, false))); // rax
+        }
+        let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
+        let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
+        self.remap_frame_layout_mixed(&int_src, &int_dst, tmpreg1, &xmm_src, &xmm_dst, tmpreg2);
+
+        // Call.  For Immed/Frame targets, load rax now (parallel move
+        // never touches rax or rbp, so this is safe).  For Reg targets,
+        // the parallel move above already left the function pointer in
+        // rax.
+        if !func_in_rax_after_move {
+            match arglocs.get(func_index) {
+                Some(Loc::Frame(f)) => {
+                    let offset = f.ebp_loc.value;
+                    dynasm!(self.mc ; .arch x64 ; mov rax, [rbp + offset]);
+                }
+                Some(Loc::Immed(i)) => {
+                    let val = i.value;
+                    dynasm!(self.mc ; .arch x64 ; mov rax, QWORD val);
+                }
+                _ => {}
+            }
+        }
+        dynasm!(self.mc ; .arch x64 ; call rax);
 
         self.emit_release_abi_call_area(call_area_adjust);
         dynasm!(self.mc ; .arch x64 ; pop rbp);

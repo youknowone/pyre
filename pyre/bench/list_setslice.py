@@ -4,7 +4,7 @@
 # On main, there was no setslice op (Object-only fallback).
 # On this branch, setslice stays in Integer strategy when new items are plain ints.
 #
-N = 200000
+N = 500000
 
 def main():
     lst = [0] * 10
