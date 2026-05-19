@@ -3505,7 +3505,7 @@ impl OptUnroll {
         current_short_jump_args(short_preamble, ctx)
             .iter()
             .map(|&jump_arg| {
-                let mapped = *mapping.get(&jump_arg).unwrap_or(&jump_arg);
+                let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
                 ctx.get_box_replacement(mapped)
             })
             .collect()
