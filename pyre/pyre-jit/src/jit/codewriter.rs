@@ -4289,24 +4289,15 @@ impl CodeWriter {
         macro_rules! emit_goto {
             ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                let insn = Insn::op(
-                    "goto",
-                    vec![Operand::TLabel(super::flatten::pc_tlabel(target_py_pc))],
-                );
-                push_walker_emit(&current_block, insn);
-                // `rpython/jit/codewriter/flatten.py:111-112`: an
-                // unconditional goto implicitly ends a block so the
-                // liveness pass (`liveness.py:68-69`) can reset the alive
-                // set.
-                push_walker_emit(&current_block, Insn::Unreachable);
-                // `flatten.py:161` `self.emitline('goto',
-                // TLabel(link.target))` is the serialised view of the
-                // same edge.  Phase A.4 retired the back-edge skip
-                // (was Phase 4.C); back-edge mergeblock now creates a
-                // re-walked supersede block, which the relaxed
-                // `live_marker_indices_by_pc` last-takes semantics
-                // tolerates.
-                mergeblock(
+                // T6.1 Slice 5: mergeblock first to learn the target
+                // SpamBlock, then emit `goto` against its block-identity
+                // `TLabel("block{addr}")`.  Mirrors upstream
+                // `flatten.py:161 self.emitline('goto',
+                // TLabel(link.target))` where `link.target` is a Block
+                // identity, not a PC.  The per-PC `Label("pcN")` at the
+                // target's first PC remains a valid branch target until
+                // Slice 6 retires the per-PC labels.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4322,6 +4313,18 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto",
+                    vec![Operand::TLabel(super::flatten::block_tlabel(
+                        &target_block.block(),
+                    ))],
+                );
+                push_walker_emit(&current_block, insn);
+                // `rpython/jit/codewriter/flatten.py:111-112`: an
+                // unconditional goto implicitly ends a block so the
+                // liveness pass (`liveness.py:68-69`) can reset the alive
+                // set.
+                push_walker_emit(&current_block, Insn::Unreachable);
                 needs_fallthrough = false;
             }};
         }
@@ -4729,9 +4732,15 @@ impl CodeWriter {
                     // fallthrough to whichever block lands next in
                     // walker-pop order.
                     if needs_fallthrough {
+                        // T6.1 Slice 5: emit goto against the new
+                        // block's identity TLabel, matching upstream
+                        // `flatten.py:161` `TLabel(link.target)` where
+                        // `link.target` is a Block, not a PC.
                         let goto_insn = Insn::op(
                             "goto",
-                            vec![Operand::TLabel(super::flatten::pc_tlabel(py_pc))],
+                            vec![Operand::TLabel(super::flatten::block_tlabel(
+                                &new_block.block(),
+                            ))],
                         );
                         push_walker_emit(&current_block, goto_insn);
                         push_walker_emit(&current_block, Insn::Unreachable);
@@ -4863,18 +4872,10 @@ impl CodeWriter {
                 // args lives at the START of each PC's emission, not
                 // here.
                 push_walker_emit(&current_block, Insn::live(Vec::new()));
-                let insn = Insn::op(
-                    "goto_if_not",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-                // `flatten.py:240-267` linkfalse mergeblock.  Phase A.4
-                // retired the back-edge skip so this fires on every
-                // emit, matching upstream's `set_branch` semantic.
-                mergeblock(
+                // T6.1 Slice 5: mergeblock first to learn target block
+                // identity, then emit the guard with block-identity
+                // `TLabel`.  `flatten.py:240-267` linkfalse mergeblock.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4890,6 +4891,16 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto_if_not",
+                    vec![
+                        Operand::reg(Kind::Int, cond),
+                        Operand::TLabel(super::flatten::block_tlabel(
+                            &target_block.block(),
+                        )),
+                    ],
+                );
+                push_walker_emit(&current_block, insn);
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
@@ -4898,19 +4909,11 @@ impl CodeWriter {
                 let py_pc = $py_pc;
                 // `flatten.py:259` bare `-live-` precedes the guard.
                 push_walker_emit(&current_block, Insn::live(Vec::new()));
-                let insn = Insn::op(
-                    "goto_if_not_int_is_zero",
-                    vec![
-                        Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
-                    ],
-                );
-                push_walker_emit(&current_block, insn);
-                // same as `emit_goto_if_not!` — the
-                // specialised `int_is_zero` form is the pyre-port of
-                // `flatten.py:247` `goto_if_not_int_is_zero`; Link
-                // shape is identical.
-                mergeblock(
+                // T6.1 Slice 5: mergeblock first to learn target block,
+                // then emit guard with block-identity `TLabel`.
+                // `flatten.py:247` `goto_if_not_int_is_zero` shape is
+                // identical to `goto_if_not` save for the opname.
+                let target_block = mergeblock(
                     code,
                     &mut graph,
                     &mut joinpoints,
@@ -4926,6 +4929,16 @@ impl CodeWriter {
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
+                let insn = Insn::op(
+                    "goto_if_not_int_is_zero",
+                    vec![
+                        Operand::reg(Kind::Int, cond),
+                        Operand::TLabel(super::flatten::block_tlabel(
+                            &target_block.block(),
+                        )),
+                    ],
+                );
+                push_walker_emit(&current_block, insn);
             }};
         }
 
