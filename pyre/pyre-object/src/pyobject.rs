@@ -412,6 +412,13 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::excobject::EXC_UNICODE_ENCODE_ERROR_TYPE,
             &crate::excobject::EXC_UNICODE_ERROR_TYPE,
         ),
+        // `pypy/module/exceptions/interp_exceptions.py:426
+        // W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
+        // W_UnicodeError, ...)`.
+        (
+            &crate::excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
+        ),
         (
             &crate::excobject::EXC_NAME_ERROR_TYPE,
             &crate::excobject::EXC_EXCEPTION_TYPE,
