@@ -668,9 +668,10 @@ impl VirtualState {
         visited: &mut majit_ir::vec_set::VecSet<usize>,
     ) {
         let key = Rc::as_ptr(node) as usize;
-        if !visited.insert(key) {
+        if visited.contains(&key) {
             return;
         }
+        visited.insert(key);
         node.position.set(-1);
         node.position_in_notvirtuals.set(-1);
         match &node.info {
