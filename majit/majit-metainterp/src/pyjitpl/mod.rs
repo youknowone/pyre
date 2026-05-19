@@ -601,11 +601,14 @@ fn normalize_root_loop_entry_contract(
 /// Slice T-final.F.0 survey probe.
 ///
 pub(crate) struct CompiledEntry<M> {
-    /// `Weak<JitCellToken>` so `MemoryManager.alive_loops` (memmgr.py:73)
-    /// remains the sole strong owner of compiled tokens.  Slice X-G
-    /// second cut: readers call `live_token()` for the upgrade-or-panic
-    /// shape (most call sites assume the entry is alive); eviction
-    /// paths use `token.upgrade()` directly to tolerate `None`.
+    /// `Weak<JitCellToken>` so this compiled-loop index does not keep
+    /// tokens alive after `MemoryManager.alive_loops` prunes them
+    /// (memmgr.py:73).  Slice X-G second cut: readers call `live_token()`
+    /// for the upgrade-or-panic shape (most call sites assume the entry is
+    /// alive); eviction paths use `token.upgrade()` directly to tolerate
+    /// `None`.  Warmstate still owns a separate `Arc<JitCellToken>`
+    /// (`warmstate.rs:77`), so Pyre has not yet reached PyPy's "alive_loops
+    /// is the only long-lived strong owner" shape.
     pub(crate) token: std::sync::Weak<JitCellToken>,
     pub(crate) meta: M,
     /// Front-end loop-version state, mirroring RPython's
@@ -620,10 +623,11 @@ pub(crate) struct CompiledEntry<M> {
     /// In majit, each retrace produces a new Cranelift function;
     /// previous functions are kept here so external target_token JUMPs
     /// can redirect to them via runtime trampoline.  Slice X-G: stored
-    /// as `Weak<JitCellToken>` so `MemoryManager.alive_loops` remains the
-    /// sole strong owner (memmgr.py:73 parity).  `previous_tokens_upgraded`
-    /// is the readers' entry point — it upgrades and filters out dead
-    /// references.
+    /// as `Weak<JitCellToken>` so this metadata index does not extend token
+    /// lifetime beyond `MemoryManager.alive_loops` (memmgr.py:73).
+    /// `previous_tokens_upgraded` is the readers' entry point — it upgrades
+    /// and filters out dead references.  The remaining warmstate-side strong
+    /// owner is documented on `BaseJitCell::loop_token`.
     pub(crate) previous_tokens: Vec<std::sync::Weak<JitCellToken>>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
     /// compilation starts allocating fresh boxes.
@@ -7052,14 +7056,15 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// PRE-EXISTING-ADAPTATION: pyre also drops the matching
     /// `compiled_loops` entry.  RPython's `try_to_free_some_loops` is
-    /// one line — `next_generation()` alone — because dropping the
-    /// only `alive_loops` strong owner triggers `LoopToken.__del__`
-    /// (`memmgr.py:13`).  Pyre's `compiled_loops` is still a second
-    /// strong owner, so without explicit removal here the backend
-    /// resources stay pinned forever.  Slice X-G (memmgr Slice 3.6)
-    /// downgrades `compiled_loops` to `Weak`, after which this branch
-    /// is removed and the function reverts to the upstream one-liner
-    /// shape.
+    /// one line — `next_generation()` alone — because long-lived
+    /// references outside `alive_loops` are weakrefs, so pruning
+    /// `alive_loops` can trigger `LoopToken.__del__` (`memmgr.py:9-14`).
+    /// Pyre's `compiled_loops` token handles are now weak, but the map
+    /// still holds per-trace metadata and warmstate still keeps
+    /// `BaseJitCell.loop_token` as an `Arc<JitCellToken>` until the
+    /// weakref convergence work there lands.  Keep this explicit cleanup
+    /// until warmstate reaches the PyPy weakref shape and compiled-loop
+    /// metadata no longer needs object-identity pruning.
     ///
     /// The eviction dispatch matches by **token-object identity**
     /// (`Arc::ptr_eq`) — mirroring `memmgr.py:73`'s `del

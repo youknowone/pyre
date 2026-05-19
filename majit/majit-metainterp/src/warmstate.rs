@@ -77,23 +77,21 @@ pub struct BaseJitCell {
     /// Compiled loop token, if compilation has completed.
     ///
     /// PRE-EXISTING-ADAPTATION: upstream `warmstate.py:188` stores
-    /// `wref_procedure_token` as a `weakref.ref(token)` so the warmstate
-    /// holds only a weak handle and the strong owner is the
-    /// `MemoryManager`'s `alive_loops` list (`memmgr.py:13`).  Pyre
-    /// stores `Arc<JitCellToken>` here because:
-    ///   1. `MetaInterp.compiled_loops: HashMap<u64, CompiledEntry>`
-    ///      already holds a separate strong owner (the T-final.F retire
-    ///      target), so the warmstate-side ref must also be strong to
-    ///      keep the cell-routed lookup path
-    ///      (`get_procedure_token` → `loop_token.as_ref()`) live until
-    ///      `compiled_loops` is fully retired.
-    ///   2. After F.6 (drop `compiled_loops` field), this Arc becomes
-    ///      the canonical strong owner; the convergence target is to
-    ///      downgrade to `Weak<JitCellToken>` so eviction by
-    ///      `MemoryManager` matches `should_remove_jitcell`'s dead-weakref
-    ///      check (`warmstate.py:212-225`).  See
-    ///      `slice_x_f_landed_2026_05_02.md` memo Issue 3.3 for the
-    ///      remaining weak-ref convergence work.
+    /// `wref_procedure_token` as a `weakref.ref(token)` so warmstate
+    /// holds only a weak handle; `MemoryManager.alive_loops` is the only
+    /// long-lived strong owner (`memmgr.py:9-14`).  Pyre still stores
+    /// `Arc<JitCellToken>` here, so warmstate remains an extra strong owner
+    /// even though `MetaInterp.compiled_loops` now stores weak token handles.
+    /// This keeps the cell-routed lookup path (`get_procedure_token` →
+    /// `loop_token.as_ref()`) live while the surrounding warmstate /
+    /// compiled-loop metadata is still being converged.
+    ///
+    /// Convergence target: downgrade this field to `Weak<JitCellToken>` so
+    /// eviction by `MemoryManager` matches `should_remove_jitcell`'s
+    /// dead-weakref check (`warmstate.py:212-225`) and Pyre reaches PyPy's
+    /// "alive_loops is the only long-lived strong owner" shape.  See
+    /// `slice_x_f_landed_2026_05_02.md` memo Issue 3.3 for the remaining
+    /// weak-ref convergence work.
     pub loop_token: Option<Arc<JitCellToken>>,
     /// Number of times tracing was aborted for this key.
     ///

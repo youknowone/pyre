@@ -509,8 +509,9 @@ impl FailDescr for ResumeGuardDescr {
         self.bridge_dispatch_cell.load(Ordering::Acquire)
     }
     fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
-        let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
-        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+        // Forward to the inherent method so the re-attach cleanup-fn
+        // identity assertion lives in one place.
+        ResumeGuardDescr::bridge_dispatch_swap(self, new_ptr, drop_fn)
     }
 
     /// `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
@@ -729,7 +730,23 @@ impl ResumeGuardDescr {
     /// (idempotent) and invoked by `Drop` on any payload still in the
     /// cell at descr teardown.
     pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
-        let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        // Re-attach must use the same cleanup function the first
+        // attach registered: `Drop` reclaims the surviving payload via
+        // the stored `drop_fn`, so a mismatched destructor on a later
+        // re-attach would type-pun the payload and corrupt the
+        // backend's owned Arc.  Compare function pointers by raw
+        // address — `fn` is `Copy` and equality on raw fn-pointers is
+        // well-defined for monomorphised functions baked at codegen.
+        if let Some(existing) = self.bridge_dispatch_drop_fn.get() {
+            assert_eq!(
+                *existing as usize, drop_fn as usize,
+                "bridge_dispatch_swap re-attach registered a different cleanup fn \
+                 for the same descr — payload type-shape must be stable across \
+                 re-attach (otherwise Drop would type-pun the survivor)",
+            );
+        } else {
+            let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
+        }
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
 }

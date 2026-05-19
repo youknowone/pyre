@@ -321,13 +321,20 @@ fn test_bridge_end_to_end() {
     // no per-emission backend wrapper exists anymore; `compile_bridge`
     // takes a `&dyn FailDescr` and `ResumeGuardDescr` is the
     // metainterp class that implements it (`compile.py:840-843`).
-    let _ = source_fail_index_per_trace;
     let bridge_fail_descr_arc: DescrRef =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    bridge_fail_descr_arc
-        .as_fail_descr()
-        .expect("ResumeGuardDescr implements FailDescr")
-        .set_trace_id(source_trace_id);
+    {
+        let fd = bridge_fail_descr_arc
+            .as_fail_descr()
+            .expect("ResumeGuardDescr implements FailDescr");
+        fd.set_trace_id(source_trace_id);
+        // `compile.rs:449` parity: the bridge descr's per-trace fail
+        // index identifies which source guard inside the trace this
+        // bridge attaches to.  Without stamping it here a multi-guard
+        // trace bridge lookup that accidentally matches on trace_id
+        // alone would still pass the test.
+        fd.set_fail_index_per_trace(source_fail_index_per_trace);
+    }
     let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     let bridge_info = backend
@@ -2367,10 +2374,20 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
 
     let bridge_fail_descr_arc: DescrRef =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    bridge_fail_descr_arc
-        .as_fail_descr()
-        .expect("ResumeGuardDescr implements FailDescr")
-        .set_trace_id(910);
+    {
+        let fd = bridge_fail_descr_arc
+            .as_fail_descr()
+            .expect("ResumeGuardDescr implements FailDescr");
+        fd.set_trace_id(910);
+        // Mirror the source guard's per-trace fail index (the loop guard
+        // at line 2302 is the first guard of trace 910, so index 0
+        // matches the `source_guard: Some((909, 0))` recovery layout
+        // above).  Without this, a bridge lookup that only matches
+        // trace_id would still pass — see
+        // `compile.rs:449 set_fail_index_per_trace` for the production
+        // path's identity contract.
+        fd.set_fail_index_per_trace(0);
+    }
     let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
 
     backend.set_next_trace_id(911);

@@ -1156,7 +1156,18 @@ pub trait LoopTargetDescr: Descr {
     fn label_block_id(&self) -> u32 {
         0
     }
-    fn set_label_block_id(&self, _id: u32) {}
+    /// Default panics so an incomplete `LoopTargetDescr` migration that
+    /// reaches `set_dispatch_target` is surfaced loudly instead of
+    /// silently dropping `block_id` and routing multi-LABEL entries to
+    /// block 0.  Matches the panic-by-default discipline on the
+    /// `FailDescr` write-side defaults.
+    fn set_label_block_id(&self, _id: u32) {
+        panic!(
+            "set_label_block_id requires an AtomicU32-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
     fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
         panic!(
             "label_block_id_ptr requires an AtomicU32-backed slot \
