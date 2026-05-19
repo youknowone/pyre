@@ -2135,18 +2135,14 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
-    _backend: &mut dyn majit_backend::Backend,
-    _token: &majit_backend::JitCellToken,
-    _trace_id: u64,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
 ) {
-    // Slice X3-E: backend no longer caches a per-descr recovery layout;
-    // the metainterp's `StoredExitLayout.recovery_layout` cache is the
+    // Backend no longer caches a per-descr recovery layout; the
+    // metainterp's `StoredExitLayout.recovery_layout` cache is the
     // single canonical store, and `describe_deadframe` consumers fall
-    // back to `trace_layout_ref.recovery_layout` (the same path dynasm
-    // has used since Slice NN).  This pass keeps `StoredExitLayout`
-    // populated with the resume_layout-derived recovery so consumers
-    // see the patched virtuals/pending_fields.
+    // back to `trace_layout_ref.recovery_layout`.  This pass keeps
+    // `StoredExitLayout` populated with the resume_layout-derived
+    // recovery so consumers see the patched virtuals/pending_fields.
     for (_, exit_layout) in exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
             continue;
