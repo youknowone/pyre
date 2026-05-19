@@ -3220,7 +3220,13 @@ impl OptUnroll {
             // Box itself, so no parallel raw-u32 type side-table is
             // needed (callers recover the type via `OpRef::ty()` or
             // `Const::get_type()`).
-            ctx.const_pool.entry_or_insert_with(idx, || value);
+            //
+            // `short_preamble.constants` is keyed by `arg.raw()` (CONST_BIT
+            // set); `OptContext.const_pool` is Vec-backed dense-indexed by
+            // `OpRef::const_index()` (CONST_BIT masked). Use the masked
+            // index to avoid resizing the Vec to ~2 GiB slots.
+            ctx.const_pool
+                .entry_or_insert_with(typed_opref.const_index(), || value);
         }
 
         let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
