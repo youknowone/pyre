@@ -4897,7 +4897,9 @@ fn remap_snapshot_boxes(
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
-        .map(|&boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
+        .map(|&boxref| {
+            boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref))
+        })
         .collect()
 }
 
