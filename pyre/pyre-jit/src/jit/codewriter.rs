@@ -899,6 +899,8 @@ fn walker_post_walk_insert_renamings_single_exit(
     walker_slot_for_variable: &[Option<u16>],
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
     all_walker_blocks: &[SpamBlockRef],
+    walker_pc_anchor_pos: &mut [Vec<(SpamBlockRef, usize)>],
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
 ) {
     // Variable → walker slot resolver, identical to canonical's
     // `get_register` closure in `flatten_graph_with_walker_slots`
@@ -982,13 +984,19 @@ fn walker_post_walk_insert_renamings_single_exit(
             continue;
         }
         let link_ref = block_ref.borrow().exits[0].clone();
-        emit_link_renamings_into_block(
+        if let Some(shift) = emit_link_renamings_into_block(
             block_ref,
             &link_ref,
             &get_color,
             all_walker_blocks,
             SpliceSite::SourceBeforeTerminator,
-        );
+        ) {
+            shift_walker_pc_tracked_offsets(
+                walker_pc_anchor_pos,
+                walker_pc_live_marker_pos,
+                &shift,
+            );
+        }
     }
 
     // Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
@@ -1012,15 +1020,62 @@ fn walker_post_walk_insert_renamings_single_exit(
             if in_degree_of(&target_ref) > 1 {
                 continue;
             }
-            emit_link_renamings_into_block(
+            if let Some(shift) = emit_link_renamings_into_block(
                 block_ref,
                 &link_ref,
                 &get_color,
                 all_walker_blocks,
                 SpliceSite::TargetAfterAnchor,
-            );
+            ) {
+                shift_walker_pc_tracked_offsets(
+                    walker_pc_anchor_pos,
+                    walker_pc_live_marker_pos,
+                    &shift,
+                );
+            }
         }
     }
+}
+
+/// Apply a splice's offset shift to the walker-tracked PC anchor /
+/// live-marker side-tables.  Called immediately after
+/// `emit_link_renamings_into_block` reports a non-empty insertion so
+/// any recorded (block_ref, offset) pair whose offset has been pushed
+/// forward by the insertion stays consistent with the post-splice
+/// `per_block_ssarepr` layout.
+fn shift_walker_pc_tracked_offsets(
+    walker_pc_anchor_pos: &mut [Vec<(SpamBlockRef, usize)>],
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
+    shift: &SpliceShift,
+) {
+    let SpliceShift {
+        block_ref,
+        insert_pos,
+        count,
+    } = shift;
+    for entries in walker_pc_anchor_pos.iter_mut() {
+        for (block, offset) in entries.iter_mut() {
+            if block == block_ref && *offset >= *insert_pos {
+                *offset += *count;
+            }
+        }
+    }
+    for entries in walker_pc_live_marker_pos.iter_mut() {
+        for (block, offset) in entries.iter_mut() {
+            if block == block_ref && *offset >= *insert_pos {
+                *offset += *count;
+            }
+        }
+    }
+}
+
+/// Description of a `Vec::insert` shift produced by
+/// [`emit_link_renamings_into_block`]: `count` insns were inserted at
+/// `insert_pos` inside `block_ref`'s `per_block_ssarepr`.
+struct SpliceShift {
+    block_ref: SpamBlockRef,
+    insert_pos: usize,
+    count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1040,16 +1095,15 @@ fn emit_link_renamings_into_block<F>(
     get_color: &F,
     all_walker_blocks: &[SpamBlockRef],
     site: SpliceSite,
-) where
+) -> Option<SpliceShift>
+where
     F: Fn(&super::flow::Variable) -> u16,
 {
     let link_borrow = link_ref.borrow();
-    let Some(target_ref) = link_borrow.target.clone() else {
-        return;
-    };
+    let target_ref = link_borrow.target.clone()?;
     let target_borrow = target_ref.borrow();
     if link_borrow.args.len() != target_borrow.inputargs.len() {
-        return;
+        return None;
     }
     // Skip blocks whose target is `returnblock`/`exceptblock`
     // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
@@ -1063,7 +1117,7 @@ fn emit_link_renamings_into_block<F>(
     // terminator reading the un-copied source slot and breaks
     // SSA allocator coalescing on trivial return functions.
     if target_borrow.is_final && target_borrow.exits.is_empty() {
-        return;
+        return None;
     }
 
     // `flatten.py:308-311` pair extraction.  Skip pairs whose
@@ -1096,7 +1150,7 @@ fn emit_link_renamings_into_block<F>(
     drop(link_borrow);
 
     if pairs.is_empty() {
-        return;
+        return None;
     }
     // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
     pairs.sort_by_key(|(_, dst, _)| *dst);
@@ -1148,7 +1202,7 @@ fn emit_link_renamings_into_block<F>(
     }
 
     if emitted.is_empty() {
-        return;
+        return None;
     }
 
     let splice_block = match site {
@@ -1159,7 +1213,7 @@ fn emit_link_renamings_into_block<F>(
         .iter()
         .find(|s| !s.dead() && s.block() == splice_block)
     else {
-        return;
+        return None;
     };
     let mut spam_borrow = spam.0.borrow_mut();
     let insns = &mut spam_borrow.per_block_ssarepr;
@@ -1219,9 +1273,16 @@ fn emit_link_renamings_into_block<F>(
             pos
         }
     };
+    let count = emitted.len();
     for (offset, insn) in emitted.into_iter().enumerate() {
         insns.insert(insert_pos + offset, insn);
     }
+    drop(spam_borrow);
+    Some(SpliceShift {
+        block_ref: spam.clone(),
+        insert_pos,
+        count,
+    })
 }
 
 fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
@@ -3123,7 +3184,7 @@ fn filter_liveness_in_place(
     portal_frame_reg: u16,
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
-) {
+) -> Vec<usize> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // T6.1 Slice 6 prep: thread a protected-position bitmap into the
     // liveness pass so per-PC `-live-` markers don't merge.  Built
@@ -3142,7 +3203,7 @@ fn filter_liveness_in_place(
             }
             bitmap
         });
-    super::liveness::compute_liveness_with_protected(
+    let remap = super::liveness::compute_liveness_with_remap(
         ssarepr,
         protected_per_pc_live.as_deref(),
     );
@@ -3150,15 +3211,17 @@ fn filter_liveness_in_place(
     let nlocals = code.varnames.len();
     // T6.1 Slice 3 production: prefer walker-tracked positions over the
     // SSARepr scan when available; falls back to scan for callers that
-    // don't thread the side-table (test fixtures).  Both sources agree
-    // post-`remove_repeated_live` (per the parity assertion at
-    // `pc_map` computation site).
+    // don't thread the side-table (test fixtures).  Walker-tracked
+    // indices are captured in the PRE-`remove_repeated_live` ssarepr;
+    // translate through the remap to land on the corresponding NEW
+    // index after the merge pass.
     let live_markers: Vec<usize> = match walker_tracked_pc_live_indices {
         Some(walker_tracked) if walker_tracked.len() == code.instructions.len() => {
-            walker_tracked.to_vec()
+            walker_tracked.iter().map(|&old| remap[old]).collect()
         }
         _ => live_marker_indices_by_pc(ssarepr, code.instructions.len()),
     };
+    let live_markers_out = live_markers.clone();
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
@@ -3301,6 +3364,7 @@ fn filter_liveness_in_place(
         }
         existing.extend(non_register);
     }
+    live_markers_out
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -8900,6 +8964,8 @@ impl CodeWriter {
                 &walker_slot_for_variable,
                 &_graph_regallocs,
                 &all_walker_blocks,
+                &mut walker_pc_anchor_pos,
+                &mut walker_pc_live_marker_pos,
             );
             // Reorder all_walker_blocks per `graph.iterblocks()` DFS
             // pre-order so the drain matches canonical `make_bytecode_block`
@@ -8952,17 +9018,51 @@ impl CodeWriter {
             // whose block contributes non-empty content to the final
             // SSARepr (matches `live_marker_indices_by_pc`'s scan).
             let walker_tracked_pc_indices: (Option<Vec<usize>>, Option<Vec<usize>>) = {
-                let mut post_strip_lens: Vec<usize> = Vec::with_capacity(blocks.len());
-                for (i, b) in blocks.iter().enumerate() {
-                    let mut probe = vec![b.clone()];
-                    if i + 1 < blocks.len() {
-                        probe.push(blocks[i + 1].clone());
-                    } else {
-                        probe.push(Vec::new());
-                    }
-                    super::codewriter::strip_walker_block_boundary_goto(&mut probe);
-                    post_strip_lens.push(probe[0].len());
-                }
+                // Compute each block's post-strip length without invoking
+                // `strip_walker_block_boundary_goto` directly: that helper
+                // moves block insns into its return value (via
+                // `Vec::append`), which would zero-out the source blocks
+                // and corrupt the resolver's offset math.  Mirror the
+                // helper's strip-detection rule (goto+Unreachable tail
+                // whose target matches a leading label in any subsequent
+                // block) but only measure the resulting length here.
+                let post_strip_lens: Vec<usize> = (0..blocks.len())
+                    .map(|i| {
+                        let next_label_names: Vec<String> = (i + 1..blocks.len())
+                            .flat_map(|j| {
+                                blocks[j]
+                                    .iter()
+                                    .take_while(|insn| {
+                                        matches!(insn, super::flatten::Insn::Label(_))
+                                    })
+                                    .filter_map(|insn| match insn {
+                                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        let len = blocks[i].len();
+                        let strip_tail = if len >= 2 {
+                            match (&blocks[i][len - 2], &blocks[i][len - 1]) {
+                                (
+                                    super::flatten::Insn::Op { opname, args, .. },
+                                    super::flatten::Insn::Unreachable,
+                                ) if opname == "goto"
+                                    && args.len() == 1
+                                    && matches!(&args[0], Operand::TLabel(target)
+                                        if next_label_names.iter().any(|n| n == &target.name)) =>
+                                {
+                                    2
+                                }
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        len - strip_tail
+                    })
+                    .collect();
                 let mut post_strip_block_starts: Vec<usize> = Vec::with_capacity(blocks.len());
                 let mut running = 0usize;
                 for &len in &post_strip_lens {
@@ -8977,14 +9077,9 @@ impl CodeWriter {
                                 py_pc_entries.iter().find_map(|(block_ref, offset)| {
                                     let block_pos =
                                         reordered.iter().position(|b| b == block_ref)?;
-                                    // Skip if the block's post-strip contribution
-                                    // is empty (mark_dead cleared per_block_ssarepr,
-                                    // or strip removed the only content).
                                     if post_strip_lens[block_pos] == 0 {
                                         return None;
                                     }
-                                    // Skip if the offset would land in the stripped
-                                    // tail (offset >= post_strip_len).
                                     if *offset >= post_strip_lens[block_pos] {
                                         return None;
                                     }
@@ -9744,7 +9839,7 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        filter_liveness_in_place(
+        let post_remove_live_indices = filter_liveness_in_place(
             &mut ssarepr,
             code,
             &depth_at_pc,
@@ -9761,34 +9856,25 @@ impl CodeWriter {
         // from the per-PC `Label("pcN")` anchor, so record the final
         // per-PC live-marker positions here instead of the label indices.
         //
-        // T6.1 Slice 3 production switch: prefer the walker-tracked
-        // side-table over the SSARepr scan.  The walker records every
-        // per-PC `-live-` position at emit time (see
-        // `walker_pc_live_marker_pos`) and the resolver picks the first
-        // live block per py_pc, matching `live_marker_indices_by_pc`'s
-        // first-takes semantics.  Pyre's per-PC label carveout in
-        // `remove_repeated_live` (`liveness.rs:292-296`) keeps those
-        // positions stable through liveness filtering — guarded by the
-        // post-remove parity assertion below.  Falls back to the scan
-        // if the resolver couldn't translate (e.g. a recording-site
-        // invariant broke), so an unexpected walker miss surfaces
-        // through the assertion rather than corrupt pc_map indices.
-        let pc_map = match walker_tracked_pc_live_indices_out.as_ref() {
-            Some(walker_tracked) if walker_tracked.len() == num_instrs => {
-                walker_tracked.clone()
-            }
-            _ => live_marker_indices_by_pc(&ssarepr, num_instrs),
+        // T6.1 Slice 3 production switch: `filter_liveness_in_place`
+        // returns the post-`remove_repeated_live` per-PC `-live-`
+        // positions (computed from the walker-tracked PRE-merge
+        // positions via the merge pass's remap), which is the
+        // authoritative source for `pc_map`.  Falls back to the scan
+        // when walker tracking is unavailable (test fixtures).
+        let pc_map = if post_remove_live_indices.len() == num_instrs {
+            post_remove_live_indices.clone()
+        } else {
+            live_marker_indices_by_pc(&ssarepr, num_instrs)
         };
         #[cfg(debug_assertions)]
-        if let Some(walker_tracked) = walker_tracked_pc_live_indices_out.as_ref() {
-            if walker_tracked.len() == num_instrs {
-                let scanned = live_marker_indices_by_pc(&ssarepr, num_instrs);
-                assert_eq!(
-                    walker_tracked, &scanned,
-                    "T6.1 walker-tracked PC live-marker positions diverge \
-                     from live_marker_indices_by_pc post-`remove_repeated_live`"
-                );
-            }
+        if post_remove_live_indices.len() == num_instrs {
+            let scanned = live_marker_indices_by_pc(&ssarepr, num_instrs);
+            assert_eq!(
+                post_remove_live_indices, scanned,
+                "T6.1 walker-tracked PC live-marker positions diverge \
+                 from live_marker_indices_by_pc post-`remove_repeated_live`"
+            );
         }
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1

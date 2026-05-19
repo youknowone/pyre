@@ -40,9 +40,19 @@ pub fn compute_liveness_with_protected(
     ssarepr: &mut SSARepr,
     protected_per_pc_live: Option<&[bool]>,
 ) {
+    let _ = compute_liveness_with_remap(ssarepr, protected_per_pc_live);
+}
+
+/// `compute_liveness_with_protected` variant that also returns the
+/// position remap produced by the trailing `remove_repeated_live`
+/// pass.  See [`remove_repeated_live_with_remap`].
+pub fn compute_liveness_with_remap(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) -> Vec<usize> {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
-    remove_repeated_live_with_protected(ssarepr, protected_per_pc_live);
+    remove_repeated_live_with_remap(ssarepr, protected_per_pc_live)
 }
 
 /// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
@@ -277,8 +287,25 @@ pub fn remove_repeated_live_with_protected(
     ssarepr: &mut SSARepr,
     protected_per_pc_live: Option<&[bool]>,
 ) {
+    let _ = remove_repeated_live_with_remap(ssarepr, protected_per_pc_live);
+}
+
+/// `remove_repeated_live_with_protected` variant that also returns a
+/// position remap.  `remap[old_idx] = new_idx` where `new_idx` is the
+/// index in the rebuilt `ssarepr.insns` that the original entry at
+/// `old_idx` maps to.  Entries that were merged into a preceding
+/// `-live-` marker map to that surviving marker's new index.
+///
+/// Used by T6.1 to keep walker-tracked per-PC live-marker positions
+/// valid across `compute_liveness` (which may shift indices when
+/// non-protected `-live-` markers are folded away).
+pub fn remove_repeated_live_with_remap(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) -> Vec<usize> {
     // `liveness.py:83-85` `last_i_pos = None; i = 0; res = []`.
     let mut res: Vec<Insn> = Vec::with_capacity(ssarepr.insns.len());
+    let mut remap: Vec<usize> = vec![0usize; ssarepr.insns.len()];
     let mut i = 0usize;
 
     let is_protected = |idx: usize| -> bool {
@@ -292,15 +319,17 @@ pub fn remove_repeated_live_with_protected(
         let insn = ssarepr.insns[i].clone();
         // `liveness.py:88-91`.
         if !insn.is_live() {
+            remap[i] = res.len();
             res.push(insn);
             i += 1;
             continue;
         }
         // `liveness.py:92-95` — collect `lives` and `labels` runs.
-        let _last_i_pos = i;
         i += 1;
         let mut labels: Vec<Insn> = Vec::new();
+        let mut label_old_positions: Vec<usize> = Vec::new();
         let mut lives: Vec<Insn> = vec![insn];
+        let mut live_old_positions: Vec<usize> = vec![i - 1];
 
         // `liveness.py:97-106` inner loop.
         //
@@ -326,6 +355,7 @@ pub fn remove_repeated_live_with_protected(
                 if is_protected(i) {
                     break;
                 }
+                live_old_positions.push(i);
                 lives.push(next);
                 i += 1;
             } else if super::flatten::label_pc_index(&next).is_some() {
@@ -334,6 +364,7 @@ pub fn remove_repeated_live_with_protected(
                 // can find one `-live-` marker per anchor.
                 break;
             } else if matches!(next, Insn::Label(_)) {
+                label_old_positions.push(i);
                 labels.push(next);
                 i += 1;
             } else {
@@ -343,7 +374,11 @@ pub fn remove_repeated_live_with_protected(
 
         // `liveness.py:107-110`.
         if lives.len() == 1 {
-            res.extend(labels);
+            for (k, label) in labels.into_iter().enumerate() {
+                remap[label_old_positions[k]] = res.len();
+                res.push(label);
+            }
+            remap[live_old_positions[0]] = res.len();
             res.push(lives.into_iter().next().unwrap());
             continue;
         }
@@ -367,7 +402,10 @@ pub fn remove_repeated_live_with_protected(
                 }
             }
         }
-        res.extend(labels);
+        for (k, label) in labels.into_iter().enumerate() {
+            remap[label_old_positions[k]] = res.len();
+            res.push(label);
+        }
         // `liveness.py:115` `res.append(('-live-', ) + tuple(sorted(liveset)))`.
         //
         // Python's `sorted(set_of_mixed_objects)` raises `TypeError` in
@@ -384,6 +422,10 @@ pub fn remove_repeated_live_with_protected(
             (LiveItem::TLabel(_), LiveItem::Register(_)) => std::cmp::Ordering::Greater,
             (LiveItem::TLabel(la), LiveItem::TLabel(lb)) => la.name.cmp(&lb.name),
         });
+        let merged_new_pos = res.len();
+        for &pos in &live_old_positions {
+            remap[pos] = merged_new_pos;
+        }
         res.push(Insn::live(
             sorted.into_iter().map(LiveItem::into_operand).collect(),
         ));
@@ -391,6 +433,7 @@ pub fn remove_repeated_live_with_protected(
 
     // `liveness.py:116` `ssarepr.insns = res`.
     ssarepr.insns = res;
+    remap
 }
 
 #[cfg(test)]
