@@ -19,10 +19,14 @@ impl Renamer {
         }
     }
 
+    fn lookup(&self, opref: OpRef) -> Option<OpRef> {
+        self.rename_map.get(&opref).copied()
+    }
+
     /// renamer.py:7-8: rename_box — look up the renamed OpRef.
     /// Returns the original if no mapping exists.
     pub fn rename_box(&self, opref: OpRef) -> OpRef {
-        self.rename_map.get(&opref).copied().unwrap_or(opref)
+        self.lookup(opref).unwrap_or(opref)
     }
 
     /// renamer.py:10-18: start_renaming — register a mapping from var to tovar.
@@ -53,7 +57,7 @@ impl Renamer {
             if let Some(fail_args) = op.fail_args_mut() {
                 let cloned: Vec<OpRef> = fail_args
                     .iter()
-                    .map(|arg| self.rename_map.get(arg).copied().unwrap_or(*arg))
+                    .map(|arg| self.lookup(*arg).unwrap_or(*arg))
                     .collect();
                 fail_args.clear();
                 fail_args.extend(cloned);
@@ -67,7 +71,7 @@ impl Renamer {
     pub fn rename_failargs(&self, fail_args: &[OpRef]) -> Vec<OpRef> {
         fail_args
             .iter()
-            .map(|arg| self.rename_map.get(arg).copied().unwrap_or(*arg))
+            .map(|arg| self.lookup(*arg).unwrap_or(*arg))
             .collect()
     }
 
