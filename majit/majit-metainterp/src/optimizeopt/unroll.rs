@@ -3391,7 +3391,9 @@ impl OptUnroll {
                     // only (ConstInt/ConstPtr/ConstFloat). make_constant'd values
                     // are NOT Const objects — they are regular boxes with forwarded
                     // set to a Const, so they must go through the mapping.
-                    if arg.is_constant() || short_preamble.constants.contains_key(&arg.raw()) {
+                    if arg.is_constant()
+                        || short_preamble.constants.iter().any(|(k, _)| *k == arg.raw())
+                    {
                         continue;
                     }
                     // unroll.py:404: _map_args — non-Const must be in mapping.
@@ -3470,7 +3472,10 @@ impl OptUnroll {
                 let mapped_jump_args: Vec<OpRef> = short_jump_args
                     .iter()
                     .map(|jump_arg| {
-                        let mapped = if short_preamble.constants.contains_key(&jump_arg.raw())
+                        let mapped = if short_preamble
+                            .constants
+                            .iter()
+                            .any(|(k, _)| *k == jump_arg.raw())
                             || jump_arg.is_constant()
                         {
                             *jump_arg
