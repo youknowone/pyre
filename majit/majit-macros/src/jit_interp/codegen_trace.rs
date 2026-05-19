@@ -81,15 +81,15 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let dispatch_red_schema_types: Vec<&proc_macro2::TokenStream> =
         dispatch_red_schema.iter().map(|(_, t)| t).collect();
 
-    // Slice 91.3 (post-audit) — identity closure so
-    // `runtime.label_at(pc)` returns the OUTER interpreter pc that
-    // `BC_JIT_MERGE_POINT` (`dispatch.rs`) feeds it (`self.portal_pc`,
-    // populated from `outer_program_pc`).  The legacy `|_unused_pc|
-    // 0usize` always returned 0, defeating the loop-header check at
-    // `runtime.label_at(pc) == sym.loop_header_pc()` for every consumer
-    // whose `loop_header_pc()` is non-zero.  Mirrors RPython's portal
-    // pc-as-label model where the merge point's identity is its pc.
-    let label_closure = quote! { |pc: usize| pc };
+    // Slice X-D production wire-up: the identity `label_at` closure
+    // and the `jitcell_token_arc_for_number` resolver are constructed
+    // by `generate_merge_wrapper` and passed into `__trace_*` as a
+    // `ClosureRuntimeWithResolver`.  Both closures need to live at the
+    // merge wrapper layer because the resolver borrows
+    // `MetaInterp::compiled_loops` / `warm_state` via the
+    // `with_trace_ctx_and_token_resolver` split-borrow helper.
+    // (Legacy Slice 91.3 identity closure `|pc| pc` retained at the
+    // call site there.)
     let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
@@ -103,11 +103,18 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let trace_fn_body = quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
-        fn #trace_fn_name(
+        fn #trace_fn_name<__R: majit_metainterp::JitCodeRuntime>(
             __ctx: &mut majit_metainterp::TraceCtx,
             __sym: &mut __JitSym,
             program: &#env_type,
             pc: usize,
+            // Slice X-D production wire-up: caller passes a
+            // `ClosureRuntimeWithResolver` carrying both `label_at` and
+            // the warmstate-backed `jitcell_token_arc_for_number`
+            // callback so BC_CALL_ASSEMBLER_* dispatch resolves to the
+            // production `Arc<JitCellToken>` instead of the synth-Arc
+            // `_by_number_typed` fallback.
+            __runtime: &__R,
             // Dispatch JitCode singleton cloned from JitDriver by the
             // caller before the mutable borrow. `None` only when
             // `lower_dispatch_body` returned `None` at proc-macro time
@@ -166,12 +173,12 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __pc_bits,
             ));
             #push_virtualizable_argbox
-            let __result = majit_metainterp::trace_jitcode_observer_with_args(
+            let __result = majit_metainterp::trace_jitcode_observer_with_args_and_runtime(
                 __ctx,
                 __sym,
                 &__jitcode,
                 pc,
-                #label_closure,
+                __runtime,
                 &__jitcode_args,
             );
             if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {

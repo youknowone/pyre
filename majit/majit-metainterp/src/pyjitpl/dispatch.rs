@@ -4043,7 +4043,9 @@ where
                 //    direct_assembler_call → history.record_nospec)
                 match _runtime.jitcell_token_arc_for_number(token_number) {
                     Some(arc) => ctx.call_assembler_void_arc_typed(arc, &args, &arg_types),
-                    None => ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types),
+                    None => {
+                        ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types)
+                    }
                 }
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py:2078-2079)
@@ -4811,6 +4813,27 @@ where
     FLabel: Fn(usize) -> usize,
 {
     let runtime = ClosureRuntime::new(label_at);
+    trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, &runtime, argboxes)
+}
+
+/// Slice X-D production wire-up: variant that takes a pre-built
+/// `JitCodeRuntime` instance, so the caller can provide a
+/// `ClosureRuntimeWithResolver` carrying both `label_at` and the
+/// `jitcell_token_arc_for_number` callback — the second is what lets
+/// `BC_CALL_ASSEMBLER_*` dispatch hit the production `Arc<JitCellToken>`
+/// instead of the `_by_number_typed` synth-Arc fallback.
+pub fn trace_jitcode_with_args_and_runtime<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime: &R,
+    argboxes: &[(JitArgKind, OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
     let mut frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
@@ -4823,7 +4846,7 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
-    machine.run_to_end(ctx, sym, &runtime)
+    machine.run_to_end(ctx, sym, runtime)
 }
 
 /// Observer-mode variant of [`trace_jitcode`].
@@ -4872,6 +4895,27 @@ where
 {
     let _observer_guard = ObserverGuard::enter();
     trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes)
+}
+
+/// Observer-mode variant of [`trace_jitcode_with_args_and_runtime`] —
+/// the Slice X-D production wire-up entry the macro-generated
+/// `__trace_*` wrapper calls so the dispatcher's `BC_CALL_ASSEMBLER_*`
+/// path can resolve targets through the real warmstate-backed
+/// `Arc<JitCellToken>` rather than the synth-Arc fallback.
+pub fn trace_jitcode_observer_with_args_and_runtime<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime: &R,
+    argboxes: &[(JitArgKind, OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    let _observer_guard = ObserverGuard::enter();
+    trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes)
 }
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —

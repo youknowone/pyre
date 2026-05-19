@@ -4635,9 +4635,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 types: UnsafeCell::new(unsafe { (&*self.inner.types.get()).clone() }),
                 resume_data: self.inner.resume_data.clone(),
                 payload: self.inner.payload.deep_clone(),
-                vector_info: UnsafeCell::new(unsafe {
-                    (&*self.inner.vector_info.get()).clone()
-                }),
+                vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
                 status: AtomicU64::new(0),

@@ -3,10 +3,12 @@ mod frame;
 
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
-    ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
-    consume_observed_float_call, consume_observed_int_call, consume_observed_ref_call,
-    consume_observed_void_call, observer_arg_to_i64, observer_i64_to_value, trace_jitcode,
-    trace_jitcode_observer, trace_jitcode_observer_with_args, trace_jitcode_with_args,
+    ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
+    StandaloneFrameStack, consume_observed_float_call, consume_observed_int_call,
+    consume_observed_ref_call, consume_observed_void_call, observer_arg_to_i64,
+    observer_i64_to_value, trace_jitcode, trace_jitcode_observer, trace_jitcode_observer_with_args,
+    trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub(crate) use dispatch::{
     call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
@@ -3056,6 +3058,41 @@ impl<M: Clone> MetaInterp<M> {
     /// Access the active TraceCtx (if currently tracing).
     pub fn trace_ctx(&mut self) -> Option<&mut TraceCtx> {
         self.tracing.as_mut()
+    }
+
+    /// Slice X-D production wire-up: split-borrow helper that lets a
+    /// caller (typically the macro-generated `__merge_*` wrapper) hold
+    /// the active `TraceCtx` mutably while a `jitcell_token_by_number`
+    /// resolver closure borrows `compiled_loops` and `warm_state`
+    /// immutably.  The closure is what dispatches `BC_CALL_ASSEMBLER_*`
+    /// against the production `Arc<JitCellToken>` rather than the
+    /// `_by_number_typed` synth-Arc fallback path.  Returns `None` when
+    /// no trace is active.
+    pub fn with_trace_ctx_and_token_resolver<R>(
+        &mut self,
+        f: impl FnOnce(&mut TraceCtx, &dyn Fn(u64) -> Option<Arc<JitCellToken>>) -> R,
+    ) -> Option<R> {
+        let tracing = self.tracing.as_mut()?;
+        let compiled_loops = &self.compiled_loops;
+        let warm_state = &self.warm_state;
+        let resolver = |n: u64| -> Option<Arc<JitCellToken>> {
+            for compiled in compiled_loops.values() {
+                if let Some(tok) = compiled.token.upgrade() {
+                    if tok.number == n {
+                        return Some(tok);
+                    }
+                }
+                for previous in &compiled.previous_tokens {
+                    if let Some(prev) = previous.upgrade() {
+                        if prev.number == n {
+                            return Some(prev);
+                        }
+                    }
+                }
+            }
+            warm_state.find_token_by_number(n).map(Arc::clone)
+        };
+        Some(f(tracing, &resolver))
     }
 
     pub fn force_finish_trace_enabled(&self) -> bool {
@@ -6431,7 +6468,9 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
-        let result = self.backend.execute_token_raw(&compiled.live_token(), live_values);
+        let result = self
+            .backend
+            .execute_token_raw(&compiled.live_token(), live_values);
         Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
@@ -6708,7 +6747,9 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
-        let frame = self.backend.execute_token(&compiled.live_token(), live_values);
+        let frame = self
+            .backend
+            .execute_token(&compiled.live_token(), live_values);
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -6902,7 +6943,8 @@ impl<M: Clone> MetaInterp<M> {
         let Some((trace_id, trace_info)) = self.compiled_loops.get(&green_key).map(|compiled| {
             (
                 trace_id,
-                self.backend.compiled_trace_info(&compiled.live_token(), trace_id),
+                self.backend
+                    .compiled_trace_info(&compiled.live_token(), trace_id),
             )
         }) else {
             return;
@@ -7887,9 +7929,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         for prev_token in &compiled.previous_tokens {
             if let Some(prev) = prev_token.upgrade() {
-                if let Some(descr) =
-                    self.backend
-                        .find_source_fail_descr(&prev, trace_id, fail_index)
+                if let Some(descr) = self
+                    .backend
+                    .find_source_fail_descr(&prev, trace_id, fail_index)
                 {
                     return Some(descr);
                 }

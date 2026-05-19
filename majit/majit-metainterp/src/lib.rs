@@ -82,15 +82,16 @@ pub use majit_backend::CompiledTraceInfo;
 pub use majit_translate::jit_codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
-    BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, ClosureRuntime, CompileOutcome,
-    CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts,
-    DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
-    JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
-    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
-    consume_observed_float_call, consume_observed_int_call, consume_observed_ref_call,
-    consume_observed_void_call, counters, observer_arg_to_i64, observer_i64_to_value,
-    trace_jitcode, trace_jitcode_observer, trace_jitcode_observer_with_args,
-    trace_jitcode_with_args,
+    BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, ClosureRuntime,
+    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
+    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, DriverRunOutcome,
+    InlineDecision, JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame,
+    MIFrameStack, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, RawCompileResult,
+    StandaloneFrameStack, build_state_field_snapshot, consume_observed_float_call,
+    consume_observed_int_call, consume_observed_ref_call, consume_observed_void_call, counters,
+    observer_arg_to_i64, observer_i64_to_value, trace_jitcode, trace_jitcode_observer,
+    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
+    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::MergePoint;

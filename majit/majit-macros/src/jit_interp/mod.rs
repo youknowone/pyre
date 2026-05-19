@@ -811,23 +811,39 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 __driver.dispatch_jitcode().cloned();
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
-                let __ctx = __meta
-                    .trace_ctx()
-                    .expect("merge_point invariant: tracing must be Some");
                 if __sym.trace_started && __pc == __sym.loop_header_pc() {
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
-                let __result = #trace_fn_name(
-                    __ctx,
-                    __sym,
-                    __env,
-                    __pc,
-                    __dispatch_jitcode.as_ref(),
-                );
+                // Slice X-D production wire-up: split-borrow the active
+                // TraceCtx and a `jitcell_token_by_number` resolver so
+                // the dispatcher's BC_CALL_ASSEMBLER_* path can route
+                // through the production `Arc<JitCellToken>` rather
+                // than the synth-Arc `_by_number_typed` fallback.
+                let __result = __meta
+                    .with_trace_ctx_and_token_resolver(|__ctx, __resolve| {
+                        let __runtime =
+                            majit_metainterp::ClosureRuntimeWithResolver::new(
+                                |pc: usize| pc,
+                                __resolve,
+                            );
+                        #trace_fn_name(
+                            __ctx,
+                            __sym,
+                            __env,
+                            __pc,
+                            &__runtime,
+                            __dispatch_jitcode.as_ref(),
+                        )
+                    })
+                    .expect("merge_point invariant: tracing must be Some");
                 __sym.trace_started = true;
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check
                 // AFTER executing the step (RPython _interpret loop order).
-                if __ctx.is_too_long() {
+                let __too_long = __meta
+                    .trace_ctx()
+                    .map(|__ctx| __ctx.is_too_long())
+                    .unwrap_or(false);
+                if __too_long {
                     if majit_metainterp::majit_log_enabled() {
                         eprintln!("[jit] trace too long, aborting");
                     }
