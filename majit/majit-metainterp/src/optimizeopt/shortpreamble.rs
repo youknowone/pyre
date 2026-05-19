@@ -2206,7 +2206,8 @@ impl ExtendedShortPreambleBuilder {
                 if let Some(&phase1_ref) = entry.op.getarglist().get(arg_pos) {
                     if let Some(&current_inputarg) = label_args.get(label_idx) {
                         if phase1_ref != current_inputarg {
-                            self.phase1_to_inputarg.insert(phase1_ref, current_inputarg);
+                            self.phase1_to_inputarg
+                                .insert(phase1_ref, current_inputarg);
                         }
                     }
                 }
