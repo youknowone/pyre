@@ -147,6 +147,23 @@ fn as_fd(d: &DescrRef) -> &dyn FailDescr {
         .expect("fail_descrs entries always implement FailDescr")
 }
 
+/// Increment per-emission `fail_count` when `fd` owns the slot
+/// (Resume-family only — `compile.py:683`
+/// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Singleton
+/// FINISH / synthetic descrs (PropagateExceptionDescr,
+/// DoneWithThisFrameDescr*, ExitFrameWithExceptionDescrRef) bypass
+/// the jitcounter/bridge-retrace machinery and have no counter slot
+/// — the trait default panics on them, so this gate keeps the
+/// guard-failure dispatcher honest for non-Resume descrs reaching
+/// it via the Slice X-D / #124 identity-preservation path.
+fn maybe_increment_fail_count(fd: &dyn FailDescr) -> u32 {
+    if fd.is_resume_guard() || fd.is_resume_guard_copied() {
+        fd.increment_fail_count()
+    } else {
+        0
+    }
+}
+
 fn attached_descr_ptrs_with_fallbacks(
     attached: majit_backend::AttachedDescrPtrs,
 ) -> majit_backend::AttachedDescrPtrs {
@@ -2766,7 +2783,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
         let fail_descr_fd = as_fd(fail_descr);
-        fail_descr_fd.increment_fail_count();
+        maybe_increment_fail_count(fail_descr_fd);
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
@@ -3049,7 +3066,7 @@ fn call_assembler_guard_failure_inner(
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
     // (pyjitpl/mod.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
-    fail_descr.increment_fail_count();
+    maybe_increment_fail_count(fail_descr);
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
@@ -3201,7 +3218,7 @@ fn call_assembler_fast_path_heap(
     }
 
     // Guard failure — check for bridge, then fall back to force
-    fail_descr_fd.increment_fail_count();
+    maybe_increment_fail_count(fail_descr_fd);
 
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
         // Slice QQ-3: dispatch routes on-demand ResumeDataDirectReader
@@ -7468,7 +7485,7 @@ impl CraneliftBackend {
                 return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
             }
 
-            fail_descr_fd.increment_fail_count();
+            maybe_increment_fail_count(fail_descr_fd);
 
             // llgraph/runner.py:1192-1194 fail_guard → ExecutionFinished
             // (LLDeadFrame).
@@ -7535,7 +7552,7 @@ impl CraneliftBackend {
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
 
-        fail_descr_fd.increment_fail_count();
+        maybe_increment_fail_count(fail_descr_fd);
 
         if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             return Self::execute_bridge(
@@ -13702,9 +13719,14 @@ fn collect_guards(
             }
             // Per-emission setters publish into ResumeGuardDescr slots
             // reached directly off `descr` (Slice 7-Tβ6 source_op_index,
-            // Slice 7-Tβ7 force_token_slots).
-            as_fd(&descr).set_source_op_index(op_idx);
-            as_fd(&descr).set_force_token_slots(force_token_slots);
+            // Slice 7-Tβ7 force_token_slots).  Gate on Resume-family
+            // ownership — non-Resume descrs (PropagateExceptionDescr
+            // attached via compile_tmp_callback, etc.) carry neither
+            // slot and the trait-default panic would fire otherwise.
+            if descr.is_resume_guard() || descr.is_resume_guard_copied() {
+                as_fd(&descr).set_source_op_index(op_idx);
+                as_fd(&descr).set_force_token_slots(force_token_slots);
+            }
             // Slice X3-E: dropped the codegen-time recovery_layout stamp.
             // Backend no longer caches an `ExitRecoveryLayout` per descr;
             // `fail_descr_recovery_layout` reads on demand via
@@ -14708,7 +14730,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 };
             }
 
-            fail_descr_fd.increment_fail_count();
+            maybe_increment_fail_count(fail_descr_fd);
 
             // X1-delete proved the host-loop bridge fallback is dead for
             // `execute_with_inputs`: every attached bridge is dispatched

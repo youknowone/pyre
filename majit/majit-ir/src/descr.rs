@@ -1925,9 +1925,20 @@ pub trait FailDescr: Descr {
     /// equivalent GC map into machine code at codegen time per
     /// emission; the slot list is the cranelift analog and follows
     /// the same per-emission classification as `rd_locs`
-    /// (`assembler.py:279`).  Default no-op for non-resume FailDescrs.
+    /// (`assembler.py:279`).
+    ///
+    /// Default panics — only `ResumeGuardDescr`-family carries the
+    /// slot.  Callers must gate by `is_resume_guard() ||
+    /// is_resume_guard_copied()` before invoking, mirroring
+    /// `set_trace_id` / `set_rd_*` / `set_adr_jump_offset`.
     /// Implementations must sort+dedup so consumers can `binary_search`.
-    fn set_force_token_slots(&self, _slots: Vec<usize>) {}
+    fn set_force_token_slots(&self, _slots: Vec<usize>) {
+        panic!(
+            "set_force_token_slots invoked on a FailDescr that does not \
+             carry the per-emission force_token_slots slot (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
+        );
+    }
 
     /// Pyre-only per-emission failure counter.  PyPy carries the
     /// equivalent jitcounter hash in the per-descr `status` slot
@@ -1942,10 +1953,16 @@ pub trait FailDescr: Descr {
     }
 
     /// Pyre-only per-emission failure-count increment.  Returns the
-    /// post-increment value.  Default no-op returning 0 for descrs
-    /// that never compile bridges.
+    /// post-increment value.  Default panics — only Resume-family
+    /// guards carry the counter (`compile.py:683`
+    /// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Callers
+    /// must gate by `is_resume_guard() || is_resume_guard_copied()`.
     fn increment_fail_count(&self) -> u32 {
-        0
+        panic!(
+            "increment_fail_count invoked on a FailDescr that does not \
+             carry a fail_count slot (compile.py:683 `_attrs_` only on \
+             AbstractResumeGuardDescr / ResumeGuardCopiedDescr)"
+        );
     }
 
     /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
@@ -1963,9 +1980,16 @@ pub trait FailDescr: Descr {
 
     /// Pyre-only per-emission `CompiledTraceInfo` slot write.  Caller
     /// passes an `Arc<CompiledTraceInfo>` upcast to `Arc<dyn Any>`;
-    /// the impl downcasts.  Default no-op for descrs that never
-    /// carry trace info (singletons / synthetic FINISH).
-    fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {}
+    /// the impl downcasts.  Default panics — only Resume-family
+    /// guards own the slot.  Callers must gate by `is_resume_guard()
+    /// || is_resume_guard_copied()`.
+    fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        panic!(
+            "set_trace_info_any invoked on a FailDescr that does not \
+             carry the per-emission trace_info slot (only Resume-family \
+             guards reached by record_loop_or_bridge at compile.py:185)"
+        );
+    }
 
     /// Pyre-only cranelift bridge-attach cell addresses.  Returns
     /// `(code_ptr_addr, frame_depth_addr)` — heap-pinned `usize`
@@ -1988,8 +2012,16 @@ pub trait FailDescr: Descr {
 
     /// Pyre-only cranelift bridge cache publish.  Atomic-stores
     /// `(code_ptr, frame_depth)` into the cells whose addresses
-    /// `bridge_cache_addrs` reported.  Default no-op.
-    fn store_bridge_caches(&self, _code_ptr: usize, _frame_depth: usize) {}
+    /// `bridge_cache_addrs` reported.  Default panics — only
+    /// Resume-family guards carry bridge cache cells.  Callers
+    /// gate by `is_resume_guard() || is_resume_guard_copied()`.
+    fn store_bridge_caches(&self, _code_ptr: usize, _frame_depth: usize) {
+        panic!(
+            "store_bridge_caches invoked on a FailDescr that does not \
+             carry the per-emission bridge cache cells (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own them)"
+        );
+    }
 
     /// Pyre-only cranelift bridge dispatch payload read (type-erased
     /// raw pointer, backend re-Arcs via `Arc::from_raw`).  Null when
@@ -2001,17 +2033,28 @@ pub trait FailDescr: Descr {
     /// Pyre-only cranelift bridge dispatch payload publish.  Atomic-
     /// swaps `new_ptr` in and registers `drop_fn` for cleanup at
     /// descr teardown.  Returns the previous payload so the caller
-    /// can reclaim.  Default returns null (no slot).
+    /// can reclaim.
     ///
     /// `drop_fn` is `unsafe fn` because it reconstructs an `Arc` from
     /// the raw pointer the caller published; the contract between the
     /// publisher and `drop_fn` is unsafe by construction.
+    ///
+    /// Default panics — only Resume-family guards own the dispatch
+    /// cell.  Silent default would immediately leak `new_ptr`
+    /// (caller already transferred ownership by `Arc::into_raw`).
+    /// Callers must gate by `is_resume_guard() ||
+    /// is_resume_guard_copied()`.
     fn bridge_dispatch_swap(
         &self,
         _new_ptr: *mut (),
         _drop_fn: unsafe fn(*mut ()),
     ) -> *mut () {
-        std::ptr::null_mut()
+        panic!(
+            "bridge_dispatch_swap invoked on a FailDescr that does not \
+             carry the per-emission bridge_dispatch_cell (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it); the \
+             silent default would leak the supplied new_ptr"
+        );
     }
 
     /// Pyre-only per-emission slot: index of the trace op that produced
@@ -2031,10 +2074,16 @@ pub trait FailDescr: Descr {
     }
 
     /// Pyre-only per-emission slot write.  See `source_op_index` for
-    /// the per-emission rationale.  Default no-op for non-resume
-    /// FailDescrs (singleton FINISH / synthetic descrs have no
-    /// associated trace op upstream).
-    fn set_source_op_index(&self, _source_op_index: usize) {}
+    /// the per-emission rationale.  Default panics — only Resume-family
+    /// guards own the slot.  Callers must gate by
+    /// `is_resume_guard() || is_resume_guard_copied()`.
+    fn set_source_op_index(&self, _source_op_index: usize) {
+        panic!(
+            "set_source_op_index invoked on a FailDescr that does not \
+             carry the per-emission source_op_index slot (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
+        );
+    }
 
     /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
     /// — packs `ST_BUSY_FLAG` + type tag + hash on the resume-guard
