@@ -1506,7 +1506,6 @@ fn handler_entry_state_from_catch_sites(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
     catch_sites: &[ExceptionCatchSite],
-    catch_landing_blocks: &HashMap<u16, SpamBlockRef>,
     handler_py_pc: usize,
 ) -> Option<FrameState> {
     let mut merged: Option<FrameState> = None;
@@ -1514,9 +1513,7 @@ fn handler_entry_state_from_catch_sites(
         if site.handler_py_pc != handler_py_pc {
             continue;
         }
-        let landing_state = catch_landing_blocks
-            .get(&site.landing_label)
-            .and_then(|block| block.framestate())?;
+        let landing_state = site.landing.framestate()?;
         let candidate = handler_entry_state_from_catch_site(code, graph, &landing_state, site);
         merged = Some(match merged {
             None => candidate,
@@ -2499,8 +2496,8 @@ fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
 /// After Phase P2c the walker maintains two `SpamBlockRef` containers:
 ///   - `joinpoints[py_pc]`          — every merged / superseded / fresh
 ///     candidate for each Python PC.
-///   - `catch_landing_blocks[label]` — pre-allocated catch-landing
-///     entries.
+///   - `catch_sites[i].landing`     — pre-allocated catch-landing
+///     SpamBlockRef per `ExceptionCatchSite`.
 ///
 /// Catch-landing `SpamBlockRef`s are constructed with `framestate =
 /// None` (`SpamBlockRef::new(..., None)`), so they are naturally
@@ -2513,7 +2510,7 @@ fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
 /// the production walker path.
 fn collect_block_states(
     joinpoints: &[Vec<SpamBlockRef>],
-    catch_landing_blocks: &HashMap<u16, SpamBlockRef>,
+    catch_sites: &[ExceptionCatchSite],
 ) -> HashMap<super::flow::BlockRef, FrameState> {
     let mut map = HashMap::new();
     let mut absorb = |entry: &SpamBlockRef| {
@@ -2526,8 +2523,8 @@ fn collect_block_states(
             absorb(entry);
         }
     }
-    for entry in catch_landing_blocks.values() {
-        absorb(entry);
+    for site in catch_sites {
+        absorb(&site.landing);
     }
     map
 }
@@ -2638,13 +2635,14 @@ fn collect_link_slot_pairs(
 // so both the codewriter (here) and the trace/blackhole runtime can hold
 // the same `Arc<PyJitCode>` instances.
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ExceptionCatchSite {
     landing_label: u16,
     handler_py_pc: usize,
     stack_depth: u16,
     push_lasti: bool,
     lasti_py_pc: usize,
+    landing: SpamBlockRef,
 }
 
 /// RPython: per-graph output of `perform_register_allocation` over the
@@ -3175,6 +3173,7 @@ fn filter_liveness_in_place(
 /// preprocessing step is pyre-specific.
 fn decode_exception_catch_sites(
     assembler: &mut SSAReprEmitter,
+    graph: &mut super::flow::FunctionGraph,
     code: &CodeObject,
     num_instrs: usize,
 ) -> (Vec<Option<u16>>, Vec<ExceptionCatchSite>, Vec<Option<u16>>) {
@@ -3218,12 +3217,14 @@ fn decode_exception_catch_sites(
         }
         let landing_label = assembler.new_label();
         catch_for_pc[py_pc] = Some(landing_label);
+        let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
         catch_sites.push(ExceptionCatchSite {
             landing_label,
             handler_py_pc,
             stack_depth: depth,
             push_lasti,
             lasti_py_pc: py_pc,
+            landing,
         });
     }
     let mut handler_depth_at: Vec<Option<u16>> = vec![None; num_instrs];
@@ -3726,9 +3727,6 @@ impl CodeWriter {
             labels.push(assembler.new_label());
         }
 
-        let (catch_for_pc, catch_sites, handler_depth_at) =
-            decode_exception_catch_sites(&mut assembler, code, num_instrs);
-
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
         // — RPython looks up portal-ness in the registry that
         // `setup_jitdriver` populates. pyre matches that: a code is a
@@ -3773,6 +3771,8 @@ impl CodeWriter {
         // upstream non-orthodoxy by adding unused inputargs to non-
         // portal graphs).
         let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
+        let (catch_for_pc, catch_sites, handler_depth_at) =
+            decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
         let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); num_instrs];
         // snapshot the walker's `currentstate` at
         // every terminator emission so `collect_link_slot_pairs` can
@@ -3814,21 +3814,12 @@ impl CodeWriter {
         // anchors in the final SSARepr (T6.1 Slice 6).
         let mut walker_pc_live_marker_pos: Vec<Vec<(SpamBlockRef, usize)>> =
             vec![Vec::new(); num_instrs];
-        let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
-            HashMap::with_capacity(catch_sites.len());
-        for site in &catch_sites {
-            let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-            // NOTE: catch landings are NOT pushed to `all_walker_blocks`
-            // at creation — they're queued at emission time inside
-            // `emit_mark_label_catch_landing!` so the drain order
-            // reflects walker emission order (catch landings emit
-            // AFTER the main walker loop completes per
-            // `codewriter.rs::6907+`).  Creation-order tracking would
-            // place them before the walker-created blocks in the
-            // drain, misaligning with the post-main-loop emission
-            // sequence.
-            catch_landing_blocks.insert(site.landing_label, landing);
-        }
+        // Catch landings live on `ExceptionCatchSite::landing` (decode-
+        // time SpamBlockRef::new with framestate=None) and are NOT pushed
+        // to `all_walker_blocks` at creation — they're queued at emission
+        // time inside `emit_mark_label_catch_landing!` so the drain order
+        // reflects walker emission order (catch landings emit AFTER the
+        // main walker loop completes per `codewriter.rs::6907+`).
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
         // `emit_mark_label_catch_landing!` reassign it as the walker enters
         // each block. Initialised to the first PC block so the
@@ -4375,10 +4366,16 @@ impl CodeWriter {
                 // normal-control-flow Link (fallthrough / goto) is
                 // added by its own emit macro so the two edges coexist
                 // on `Block.exits`.
+                let landing = catch_sites
+                    .iter()
+                    .find(|s| s.landing_label == catch_label)
+                    .expect("catch_sites entry for catch_label")
+                    .landing
+                    .clone();
                 attach_catch_exception_edge(
                     &mut graph,
                     &current_block.block(),
-                    &catch_landing_blocks[&catch_label],
+                    &landing,
                     &current_state,
                     &mut link_exit_states,
                 );
@@ -4642,7 +4639,12 @@ impl CodeWriter {
                 // fallthrough, so no implicit Link is inserted here —
                 // reset `needs_fallthrough` for the landing block's
                 // own emission sequence.
-                current_block = catch_landing_blocks[&landing_label].clone();
+                current_block = catch_sites
+                    .iter()
+                    .find(|s| s.landing_label == landing_label)
+                    .expect("catch_sites entry for landing_label")
+                    .landing
+                    .clone();
                 if let Some(state) = current_block.framestate() {
                     current_state = state;
                 }
@@ -5560,7 +5562,6 @@ impl CodeWriter {
                             code,
                             &mut graph,
                             &catch_sites,
-                            &catch_landing_blocks,
                             py_pc,
                         ) {
                             current_depth = handler_state.stack.len() as u16;
@@ -8372,9 +8373,9 @@ impl CodeWriter {
                 // catch-landing dual-write rely on this targeting being
                 // intact.
                 debug_assert_eq!(
-                    current_block, catch_landing_blocks[&site.landing_label],
+                    current_block, site.landing,
                     "catch_landing block-targeting invariant violated: \
-                 current_block != catch_landing_blocks[{}] after \
+                 current_block != site.landing for landing_label {} after \
                  emit_mark_label_catch_landing!",
                     site.landing_label,
                 );
@@ -8863,7 +8864,7 @@ impl CodeWriter {
         // (`regalloc.py:79-96` projected onto pyre's u16 slot space)
         // and feed them into `allocate_registers` alongside the
         // existing SSARepr `*_copy` scanner.  Consumers (this call):
-        //   - `collect_block_states(joinpoints, catch_landing_blocks)`
+        //   - `collect_block_states(joinpoints, catch_sites)`
         //     → target ENTRY FrameStates per BlockRef.
         //   - `link_exit_states` — populated by the walker at every
         //     `append_exit_with_state` site (S4a).
@@ -8876,7 +8877,7 @@ impl CodeWriter {
         // preserves the exact iteration shape of
         // `regalloc.py:79-96`.  Intra-block `*_copy` coalescing stays
         // in `RegAllocator::coalesce_variables` (orthogonal source).
-        let block_entry_states = collect_block_states(&joinpoints, &catch_landing_blocks);
+        let block_entry_states = collect_block_states(&joinpoints, &catch_sites);
         let cfg_coalesce_pairs =
             collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         let alloc_result = super::regalloc::allocate_registers(
@@ -10612,11 +10613,17 @@ mod tests {
         let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 3];
         joinpoints[0] = vec![a_ref.clone()];
         joinpoints[2] = vec![b_ref.clone()];
-        let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> = HashMap::new();
         // Catch landings have framestate = None and MUST be skipped.
-        catch_landing_blocks.insert(7, landing_ref);
+        let catch_sites = vec![ExceptionCatchSite {
+            landing_label: 7,
+            handler_py_pc: 0,
+            stack_depth: 0,
+            push_lasti: false,
+            lasti_py_pc: 0,
+            landing: landing_ref,
+        }];
 
-        let map = collect_block_states(&joinpoints, &catch_landing_blocks);
+        let map = collect_block_states(&joinpoints, &catch_sites);
 
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&block_a), Some(&state_a));
@@ -10661,9 +10668,9 @@ mod tests {
             Some(start_state.clone()),
         )];
         joinpoints[1] = vec![SpamBlockRef::new(next.clone(), Some(next_state.clone()))];
-        let catch_landing_blocks = HashMap::new();
+        let catch_sites: Vec<ExceptionCatchSite> = Vec::new();
 
-        let block_entry_states = collect_block_states(&joinpoints, &catch_landing_blocks);
+        let block_entry_states = collect_block_states(&joinpoints, &catch_sites);
         let link_exit_states = link_exit_states_from(vec![(link, start_state)]);
         let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         assert_eq!(pairs, vec![(0, 0)]);
