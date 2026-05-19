@@ -2987,13 +2987,17 @@ impl<M: Clone> MetaInterp<M> {
 
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => self.setup_tracing(
-                green_key,
-                green_key_raw,
-                green_key_values,
-                driver_descriptor,
-                live_values,
-            ),
+            HotResult::StartTracing => {
+                self.warm_state.ensure_jitlog_initialised();
+                self.staticdata._setup_once(&mut self.backend);
+                self.setup_tracing(
+                    green_key,
+                    green_key_raw,
+                    green_key_values,
+                    driver_descriptor,
+                    live_values,
+                )
+            }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }

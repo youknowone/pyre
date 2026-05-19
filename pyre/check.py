@@ -12,6 +12,11 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 EXE = ".exe" if sys.platform == "win32" else ""
 PYTHON3 = os.environ.get("PYRE_CHECK_PYTHON3") or (
     "python3" if shutil.which("python3") else "python"
