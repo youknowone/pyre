@@ -30,9 +30,19 @@ pub use majit_translate::liveness::{
 ///     remove_repeated_live(ssarepr)
 /// ```
 pub fn compute_liveness(ssarepr: &mut SSARepr) {
+    compute_liveness_with_protected(ssarepr, None);
+}
+
+/// `compute_liveness` variant that passes a per-PC-live protection
+/// bitmap down to the internal `remove_repeated_live` call.  See
+/// [`remove_repeated_live_with_protected`].
+pub fn compute_liveness_with_protected(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
-    remove_repeated_live(ssarepr);
+    remove_repeated_live_with_protected(ssarepr, protected_per_pc_live);
 }
 
 /// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
@@ -252,9 +262,30 @@ impl LiveItem {
 /// `Label` markers) into a single `-live-` whose arguments are the union
 /// of all collapsed markers.
 pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
+    remove_repeated_live_with_protected(ssarepr, None);
+}
+
+/// `remove_repeated_live` with an optional bitmap of SSARepr positions
+/// whose `-live-` markers must NOT be folded into a preceding run.
+///
+/// Used by T6.1's per-PC anchor retirement: walker tracks each
+/// per-PC `-live-` position and passes it in so the merge breaks at
+/// the same boundaries that `Label("pcN")` used to provide via the
+/// `label_pc_index` carveout below.  Once Slice 6 retires per-PC
+/// label emission, the carveout fires solely via `protected_per_pc_live`.
+pub fn remove_repeated_live_with_protected(
+    ssarepr: &mut SSARepr,
+    protected_per_pc_live: Option<&[bool]>,
+) {
     // `liveness.py:83-85` `last_i_pos = None; i = 0; res = []`.
     let mut res: Vec<Insn> = Vec::with_capacity(ssarepr.insns.len());
     let mut i = 0usize;
+
+    let is_protected = |idx: usize| -> bool {
+        protected_per_pc_live
+            .and_then(|p| p.get(idx).copied())
+            .unwrap_or(false)
+    };
 
     while i < ssarepr.insns.len() {
         // `liveness.py:87` `insn = ssarepr.insns[i]`.
@@ -284,9 +315,17 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         // merging per upstream `liveness.py:99-100`.  This carveout
         // is the necessary structural adaptation for pyre's per-PC
         // Label model.
+        //
+        // T6.1 Slice 6 prep: `protected_per_pc_live[i]` provides the
+        // same break behaviour position-by-position so the carveout
+        // survives after per-PC label emission retires.  Both
+        // mechanisms coexist while the transition is in flight.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
+                if is_protected(i) {
+                    break;
+                }
                 lives.push(next);
                 i += 1;
             } else if super::flatten::label_pc_index(&next).is_some() {
