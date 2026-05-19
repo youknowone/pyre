@@ -8848,6 +8848,12 @@ impl CodeWriter {
                 }
             }
         }
+        // T6.1: walker-tracked PC live-marker positions exposed to the
+        // post-drain pc_map computation.  Populated inside the drain
+        // block below; consumed at the `live_marker_indices_by_pc`
+        // call site to validate (and eventually replace) the
+        // SSARepr-scan source for `pc_map`.
+        let mut walker_tracked_pc_live_indices_out: Option<Vec<usize>> = None;
         {
             // Phase 4 endgame — walker post-walk insert_renamings.
             // Run BEFORE the per-block drain so the splice positions
@@ -8996,7 +9002,7 @@ impl CodeWriter {
                     }
                 }
             }
-            let _ = walker_tracked_pc_indices;
+            walker_tracked_pc_live_indices_out = walker_tracked_pc_indices.1;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -9723,6 +9729,25 @@ impl CodeWriter {
         // from the per-PC `Label("pcN")` anchor, so record the final
         // per-PC live-marker positions here instead of the label indices.
         let pc_map = live_marker_indices_by_pc(&ssarepr, num_instrs);
+        // T6.1 post-`remove_repeated_live` parity: walker-tracked
+        // positions must remain valid after `filter_liveness_in_place`'s
+        // internal `remove_repeated_live` pass.  Pyre's per-PC carveout
+        // (`liveness.rs:292-296` breaks merge runs on `pc{N}` labels)
+        // guarantees per-PC `-live-` markers survive unmerged, so
+        // walker positions are stable.  Asserts that contract here so a
+        // future change to the carveout (Slice 6) gets caught.  Outer
+        // `if let` is required because `walker_tracked_pc_live_indices_out`
+        // can be `None` when a recording-site invariant breaks.
+        #[cfg(debug_assertions)]
+        if let Some(walker_tracked) = walker_tracked_pc_live_indices_out.as_ref() {
+            if walker_tracked.len() == num_instrs {
+                assert_eq!(
+                    walker_tracked, &pc_map,
+                    "T6.1 walker-tracked PC live-marker positions diverge \
+                     from pc_map post-`remove_repeated_live`"
+                );
+            }
+        }
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
