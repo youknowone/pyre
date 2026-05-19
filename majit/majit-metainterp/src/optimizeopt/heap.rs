@@ -1452,7 +1452,7 @@ impl OptHeap {
             DictArgKey::from_arg(op.arg(2), ctx),
         ];
 
-        if let Some(&res_v) = d.get(&key) {
+        if let Some(res_v) = d.get(&key).copied() {
             // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
             if flag != FLAG_LOOKUP {
                 let known_ge_zero = ctx
@@ -1761,7 +1761,8 @@ impl OptHeap {
                 self.force_lazy_set_field(&descr, false, ctx);
                 // heap.py:547-552 del self.cached_dict_reads[fielddescr]
                 if !descr.is_always_pure() {
-                    self.cached_dict_reads.remove(&descr_identity(&descr));
+                    let did = descr_identity(&descr);
+                    self.cached_dict_reads.remove(&did);
                 }
             }
         }
