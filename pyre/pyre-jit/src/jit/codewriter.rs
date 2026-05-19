@@ -3125,7 +3125,27 @@ fn filter_liveness_in_place(
     walker_tracked_pc_live_indices: Option<&[usize]>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
-    super::liveness::compute_liveness(ssarepr);
+    // T6.1 Slice 6 prep: thread a protected-position bitmap into the
+    // liveness pass so per-PC `-live-` markers don't merge.  Built
+    // from the walker-tracked indices (one entry per Python PC) so
+    // every per-PC `-live-` carries a stable position through
+    // `remove_repeated_live`.  Falls back to the label-based carveout
+    // for callers that don't thread the side-table.
+    let protected_per_pc_live: Option<Vec<bool>> = walker_tracked_pc_live_indices
+        .filter(|walker_tracked| walker_tracked.len() == code.instructions.len())
+        .map(|walker_tracked| {
+            let mut bitmap = vec![false; ssarepr.insns.len()];
+            for &idx in walker_tracked {
+                if let Some(slot) = bitmap.get_mut(idx) {
+                    *slot = true;
+                }
+            }
+            bitmap
+        });
+    super::liveness::compute_liveness_with_protected(
+        ssarepr,
+        protected_per_pc_live.as_deref(),
+    );
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     // T6.1 Slice 3 production: prefer walker-tracked positions over the
