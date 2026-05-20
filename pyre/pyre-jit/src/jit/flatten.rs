@@ -2482,10 +2482,7 @@ pub fn identity_test_regallocs(
 /// [`identity_test_regallocs`] and runs `GraphFlattener::
 /// generate_ssa_form`.  Skips `enforce_input_args` because identity
 /// coloring is a fixed-point for id-ordered inputargs.
-pub fn flatten_graph_for_test(
-    graph: &super::flow::FunctionGraph,
-    ssarepr: &mut SSARepr,
-) {
+pub fn flatten_graph_for_test(graph: &super::flow::FunctionGraph, ssarepr: &mut SSARepr) {
     let regallocs = identity_test_regallocs(graph);
     let mut flattener = GraphFlattener::new(ssarepr, &regallocs);
     flattener.generate_ssa_form(graph);
@@ -2502,8 +2499,7 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
     cpu: Option<&'a super::cpu::Cpu>,
 ) {
     let regallocs = identity_test_regallocs(graph);
-    let mut flattener =
-        GraphFlattener::new(ssarepr, &regallocs).with_lowering_ctx(lowering_ctx);
+    let mut flattener = GraphFlattener::new(ssarepr, &regallocs).with_lowering_ctx(lowering_ctx);
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }

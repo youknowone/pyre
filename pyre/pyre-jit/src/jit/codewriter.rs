@@ -18,6 +18,8 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use vecset::VecMap;
+
 use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
 use super::assembler::Assembler;
@@ -1535,14 +1537,18 @@ fn make_next_block(
 fn mergeblock(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
-    joinpoints: &mut Vec<Vec<SpamBlockRef>>,
+    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
-    let candidates = &mut joinpoints[next_offset];
+    // `flowcontext.py:426 candidates = self.joinpoints.setdefault(
+    // next_offset, [])` — sparse-by-PC dict in upstream.  VecMap
+    // preserves the sparse semantics (only PCs that actually carry
+    // joinpoint candidates allocate an entry).
+    let candidates = joinpoints.entry(next_offset).or_insert_with(Vec::new);
     for index in 0..candidates.len() {
         let block = candidates[index].clone();
         let block_state = block
@@ -3619,7 +3625,12 @@ impl CodeWriter {
         let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
-        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); num_instrs];
+        // `flowcontext.py:293 self.joinpoints = {}` — sparse-by-PC dict
+        // keyed by `next_offset`, populated via `setdefault(...)` per
+        // `flowcontext.py:426`.  Vec-of-Vec value preserves the candidate
+        // list semantics for supersede where multiple SpamBlocks at the
+        // same PC are tracked head-of-list.
+        let mut joinpoints: VecMap<usize, Vec<SpamBlockRef>> = VecMap::new();
         let start_state = entry_frame_state(code, is_portal);
         // Collect every walker-created block in walker-visit order so the
         // post-walk drain can iterate per-block accumulators in the same
@@ -3631,9 +3642,7 @@ impl CodeWriter {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
             all_walker_blocks.push(start_block.clone());
-            if !joinpoints.is_empty() {
-                joinpoints[0] = vec![start_block];
-            }
+            joinpoints.insert(0, vec![start_block]);
         }
         // Walker-time PC dispatch tracker.  Records every per-PC
         // `-live-` marker as `(SpamBlockRef, offset_in_block)` so a
@@ -3664,7 +3673,7 @@ impl CodeWriter {
         // emissions that precede the first `emit_mark_label_pc!`
         // belong to it.
         let mut current_block: SpamBlockRef = joinpoints
-            .first()
+            .get(&0)
             .and_then(|blocks| blocks.first().cloned())
             .unwrap_or_else(|| {
                 let synthetic =
@@ -4316,7 +4325,7 @@ impl CodeWriter {
                     }
                     merged
                 } else if let Some(target) = joinpoints
-                    .get(py_pc)
+                    .get(&py_pc)
                     .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
                     .cloned()
                 {
@@ -5358,10 +5367,7 @@ impl CodeWriter {
                     // Exception handler entry: Python resets stack depth to the
                     // handler's specified depth and arrives only from
                     // `catch_exception` edges, not from sequential fallthrough.
-                    if handler_depth_at
-                        .get(py_pc)
-                        .map_or(false, |v| v.is_some())
-                    {
+                    if handler_depth_at.get(py_pc).map_or(false, |v| v.is_some()) {
                         // Phase 4 slice 4: when reached sequentially from
                         // a prior PC (start_pc != py_pc), break.  Handler
                         // PCs are reached only via exception edges in
@@ -5459,21 +5465,20 @@ impl CodeWriter {
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
-                            let portal_regallocs =
-                                [
-                                    super::regalloc::GraphAllocationResult {
-                                        coloring: std::collections::HashMap::new(),
-                                        num_colors: 0,
-                                    },
-                                    super::regalloc::GraphAllocationResult {
-                                        coloring: portal_ref_coloring,
-                                        num_colors: 3,
-                                    },
-                                    super::regalloc::GraphAllocationResult {
-                                        coloring: std::collections::HashMap::new(),
-                                        num_colors: 0,
-                                    },
-                                ];
+                            let portal_regallocs = [
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: std::collections::HashMap::new(),
+                                    num_colors: 0,
+                                },
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: portal_ref_coloring,
+                                    num_colors: 3,
+                                },
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: std::collections::HashMap::new(),
+                                    num_colors: 0,
+                                },
+                            ];
                             GraphFlattener::new(&mut ssarepr, &portal_regallocs)
                                 .serialize_op(&graph_op);
                             for insn in ssarepr.insns[pre_len..].iter().cloned() {
@@ -10745,12 +10750,8 @@ mod tests {
         let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
 
-        let link = attach_catch_exception_edge(
-            &mut graph,
-            &startblock_ref,
-            &catch_ref,
-            &source_state,
-        );
+        let link =
+            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
         let startblock = graph.startblock.borrow();
 
         assert_eq!(
@@ -10782,12 +10783,8 @@ mod tests {
         );
         let startblock_ref = graph.startblock.clone();
 
-        let link = attach_catch_exception_edge(
-            &mut graph,
-            &startblock_ref,
-            &catch_ref,
-            &source_state,
-        );
+        let link =
+            attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
 
         let link_borrow = link.borrow();
         assert!(link_borrow.last_exception.is_some());
@@ -10816,12 +10813,7 @@ mod tests {
             "catch landing block starts with no inputargs"
         );
 
-        attach_catch_exception_edge(
-            &mut graph,
-            &startblock_ref,
-            &catch_ref,
-            &source_state,
-        );
+        attach_catch_exception_edge(&mut graph, &startblock_ref, &catch_ref, &source_state);
 
         let inputargs = catch_block.borrow().inputargs.clone();
         assert_eq!(
@@ -10881,8 +10873,8 @@ mod tests {
             graph.new_block(target_state.getvariables()),
             Some(target_state),
         );
-        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 2];
-        joinpoints[1] = vec![target_block.clone()];
+        let mut joinpoints: VecMap<usize, Vec<SpamBlockRef>> = VecMap::new();
+        joinpoints.insert(1, vec![target_block.clone()]);
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
@@ -10899,7 +10891,7 @@ mod tests {
 
         assert_eq!(merged, target_block);
         assert_eq!(
-            joinpoints.get(1).and_then(|b| b.first()),
+            joinpoints.get(&1).and_then(|b| b.first()),
             Some(&target_block)
         );
         // flowcontext.py:438-441 match-success returns without touching
@@ -10947,8 +10939,8 @@ mod tests {
             graph.new_block(existing_state.getvariables()),
             Some(existing_state),
         );
-        let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 3];
-        joinpoints[2] = vec![existing_block.clone()];
+        let mut joinpoints: VecMap<usize, Vec<SpamBlockRef>> = VecMap::new();
+        joinpoints.insert(2, vec![existing_block.clone()]);
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
@@ -10979,7 +10971,7 @@ mod tests {
             Some(2),
             "pending block's framestate.next_offset must carry the merge PC"
         );
-        assert_eq!(joinpoints.get(2).and_then(|b| b.first()), Some(&merged));
+        assert_eq!(joinpoints.get(&2).and_then(|b| b.first()), Some(&merged));
         let merged_state = merged
             .framestate()
             .expect("merged block should keep framestate");

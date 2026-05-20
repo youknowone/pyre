@@ -390,10 +390,7 @@ pub fn perform_graph_register_allocation_all_kinds(
 /// than a `GraphFlattener` method: pyre's `get_register` closure
 /// captures `&regallocs` immutably, so the `&mut regallocs`
 /// swap must run BEFORE the closure is constructed.
-pub fn enforce_input_args_graph(
-    graph: &FlowGraph,
-    regallocs: &mut [GraphAllocationResult; 3],
-) {
+pub fn enforce_input_args_graph(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
     // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
     // counter in a `[u16; 3]` array indexed by `Kind::index()` per
@@ -1630,5 +1627,4 @@ mod tests {
         assert_eq!(counts[Kind::Ref.index()], 0);
         assert_eq!(counts[Kind::Float.index()], 0);
     }
-
 }
