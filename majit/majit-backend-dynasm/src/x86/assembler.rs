@@ -3887,8 +3887,9 @@ impl<'a> Assembler386<'a> {
                 // and `handle_fail_exit_frame_with_exception` match by
                 // ptr-equality on the singleton, so the cell only carries
                 // the keep-alive identity for `clt.asmmemmgr_gcreftracers`.
-                self.fail_descrs
-                    .push(majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef));
+                self.fail_descrs.push(majit_ir::FailDescrCell::wrap(
+                    descr.clone() as majit_ir::DescrRef
+                ));
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -4993,7 +4994,9 @@ impl<'a> Assembler386<'a> {
 
     /// assembler.py:1005 write_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
-    fn write_pending_failure_recoveries(&mut self) -> Vec<(std::sync::Arc<majit_ir::FailDescrCell>, usize)> {
+    fn write_pending_failure_recoveries(
+        &mut self,
+    ) -> Vec<(std::sync::Arc<majit_ir::FailDescrCell>, usize)> {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.  Iterate `ALL_CORE_REGS`
         // / `ALL_FLOAT_REGS` (Win64-aware: R13 dropped from GPRs, XMM5..14
@@ -5877,8 +5880,9 @@ impl<'a> Assembler386<'a> {
 
         // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
         // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs
-            .push(majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef));
+        self.fail_descrs.push(majit_ir::FailDescrCell::wrap(
+            descr.clone() as majit_ir::DescrRef
+        ));
     }
 
     // ----------------------------------------------------------------

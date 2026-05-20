@@ -145,7 +145,11 @@ impl std::ops::Deref for FailDescrCell {
 
 impl std::fmt::Debug for FailDescrCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FailDescrCell({:p})", Arc::as_ptr(&self.descr) as *const ())
+        write!(
+            f,
+            "FailDescrCell({:p})",
+            Arc::as_ptr(&self.descr) as *const ()
+        )
     }
 }
 

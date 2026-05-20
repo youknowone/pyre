@@ -6392,7 +6392,7 @@ fn find_fail_descr_in_fail_descrs(
 /// Resolve a JIT-baked `jf_descr` pointer back to its owning
 /// `DescrRef` (`history.py:109-114 AbstractDescr.show`).
 ///
-/// Two address kinds reach this lookup:
+/// Three address kinds reach this lookup:
 ///
 /// * Non-FINISH guards bake the per-emission `FailDescrCell` thin
 ///   pointer (`collect_guards` Slice 80-G.7).  `recover_fail_descr_cell`
@@ -6401,11 +6401,30 @@ fn find_fail_descr_in_fail_descrs(
 /// * FINISH emissions bake the metainterp `AbstractFailDescr` Arc's
 ///   data pointer (singleton `DoneWithThisFrame*` /
 ///   `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr`).
-///   The caller (`run_compiled_code_inner`) handles these via
-///   `match_metainterp_finish_descr` before reaching this fallback.
+///   The caller (`run_compiled_code_inner`) handles attached
+///   metainterp singletons via `match_metainterp_finish_descr` before
+///   reaching this fallback.
+/// * Backend-only test paths bypass `MetaInterp::attach_descrs_to_cpu`,
+///   so the FINISH bake falls back to the cranelift-local LazyLock
+///   singletons via `attached_descr_ptrs_with_fallbacks`.  We MUST
+///   pointer-match these here before attempting `recover_fail_descr_cell`,
+///   because the LazyLock addresses are bare `Arc<dyn Descr>` data
+///   pointers, not `FailDescrCell` thin pointers — feeding them to
+///   `Arc::from_raw` as cells is undefined behavior.
 fn find_fail_descr_by_ptr(_fail_descrs: &[DescrRef], descr_ptr: usize) -> Option<DescrRef> {
     if descr_ptr == 0 {
         return None;
+    }
+    for global in [
+        &*DONE_WITH_THIS_FRAME_DESCR_INT,
+        &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+        &*DONE_WITH_THIS_FRAME_DESCR_REF,
+        &*DONE_WITH_THIS_FRAME_DESCR_VOID,
+        &*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL,
+    ] {
+        if Arc::as_ptr(global) as *const () as usize == descr_ptr {
+            return Some(global.clone());
+        }
     }
     let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_ptr) };
     Some(cell.descr.clone())
@@ -14578,7 +14597,6 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
-
 
         // llmodel.py:290-329 `execute_token` parity (raw-output variant).
         // PyPy's `execute_token` performs one `func(ll_frame, ...)` call
