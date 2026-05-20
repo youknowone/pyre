@@ -94,32 +94,6 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// `Variable::new` allocates a fresh process-wide identity
 /// (`flowspace/model.rs:2042`). Identity correspondence is preserved
 /// out-of-band by [`ValueIdToVariable`].
-/// Return `true` when `value` is a synthetic placeholder allocated
-/// by `model.rs::set_return(_, None)` for a void return — i.e. a
-/// `ValueId` that appears in `Link.args` but is **not** defined as
-/// any block's `inputargs` entry or any op's `result`.  Mirrors
-/// `translator/rtyper/legacy_annotator.rs:183-193
-/// is_synthetic_return_void_value` line-by-line so the adapter and
-/// the legacy annotator agree on which `Link.args` ValueIds are
-/// "void return placeholders" eligible for the Void pre-seed and
-/// which are genuine `undefined operand` producer bugs that should
-/// remain fail-loud.
-fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
-    for block in &graph.blocks {
-        if block.inputarg_value_ids(graph).contains(&value) {
-            return false;
-        }
-        if block
-            .operations
-            .iter()
-            .any(|op| op.result.as_ref().and_then(|v| graph.value_id_of(v)) == Some(value))
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
     let var = Variable::new();
     // Copy the precise per-`ValueId` `SomeValue` onto
@@ -1557,47 +1531,6 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         }
     }
 
-    // ─── Synthetic void-return placeholder seeding ───
-    // `model.rs::set_return(block, None)` (`model.rs:1177`) emits a
-    // Link to the canonical returnblock with a fresh
-    // `alloc_value()`-allocated ValueId in `args[0]` — a pyre
-    // divergence from RPython's `RETURN_VALUE`
-    // (`flowcontext.py:687-689`) which carries `Constant(None)` from
-    // a preceding `LOAD_CONST None` directly.  The legacy annotator
-    // already pre-seeds these synthetic placeholders as
-    // `ValueType::Void` (`translator/rtyper/legacy_annotator.rs:
-    // 47-62` + `is_synthetic_return_void_value`); the adapter
-    // mirrors the same pre-seed by materializing a Variable with
-    // the Void shell that `valuetype_to_someshell(&ValueType::Void)`
-    // returns (`SomeImpossible`).  `RPythonTyper::specialize` then
-    // assigns `Void` LowLevelType, the LL→Concrete projector maps
-    // back to `Void`, and the dual-gate matches legacy's `Void`
-    // resolution — keeping the synthetic placeholder resolvable in
-    // `link_arg_to_hlvalue` without dropping the fail-loud invariant
-    // for genuinely-undefined Link.args producers.
-    let mut synthetic_void_hlvalues: HashMap<ValueId, Hlvalue> = HashMap::new();
-    for legacy_block in &legacy.blocks {
-        for link in &legacy_block.exits {
-            if link.target != legacy.returnblock {
-                continue;
-            }
-            let Some(vid) = link.args.first().and_then(|a| a.as_value(legacy)) else {
-                continue;
-            };
-            if !is_synthetic_return_void_value(legacy, vid) {
-                continue;
-            }
-            let var = Variable::new();
-            if let Some(shell) = valuetype_to_someshell(&crate::model::ValueType::Void) {
-                *var.annotation.borrow_mut() = Some(Rc::new(shell));
-            }
-            value_to_var.entry(vid).or_insert_with(|| var.clone());
-            synthetic_void_hlvalues
-                .entry(vid)
-                .or_insert(Hlvalue::Variable(var));
-        }
-    }
-
     // ──────────────────────────────────────────────────────────────
     // Pass 1 — allocate fresh `flowspace::BlockRef` for every legacy
     // non-final block. The legacy `returnblock` and `exceptblock` are
@@ -1706,14 +1639,6 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         }
         let block_ref = block_map[&legacy_block.id].clone();
         let mut value_map = constant_hlvalues.clone();
-        // Mirror the legacy annotator's `is_synthetic_return_void_value`
-        // pre-seed: any synthetic void-return placeholder ValueId is
-        // available in every block's value_map so `link_arg_to_hlvalue`
-        // resolves the Link.args[0] entry instead of failing
-        // `undefined operand`.
-        for (&vid, hlv) in &synthetic_void_hlvalues {
-            value_map.entry(vid).or_insert_with(|| hlv.clone());
-        }
         let mut name_to_value: HashMap<String, Hlvalue> = HashMap::new();
 
         if let Some(inputs) = block_inputarg_vars.get(&legacy_block.id) {

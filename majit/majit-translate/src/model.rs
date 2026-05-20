@@ -2879,21 +2879,35 @@ impl FunctionGraph {
 
     /// Route a return through the graph's canonical `returnblock`.
     ///
-    /// RPython `flowcontext.py` return handling produces a fresh
-    /// prevblock-side Variable (Void Variable for `return None`), then
-    /// builds a Link carrying that value into the returnblock's
-    /// inputargs.  pyre's codewriter adaptation mirrors that shape: a
-    /// `None` `value` allocates a fresh prevblock-side ValueId whose
-    /// kind defaults to Void (no regalloc color, no emitted move), so
-    /// `Link.args` is always a prevblock value per upstream's
-    /// `flowspace/model.py:114` invariant.
+    /// RPython `flowcontext.py:687-689 RETURN_VALUE` pops `w_returnvalue`
+    /// from the stack and wraps it in `Return(w_returnvalue)`; in
+    /// `flowcontext.py:1232-1236 Return.nomoreblocks`, the link is built
+    /// as `Link([w_result], ctx.graph.returnblock)`.  For `def foo():
+    /// pass`, the bytecode is `LOAD_CONST None; RETURN_VALUE`, so
+    /// `w_result` is `Constant(None)` and `Link.args = [Constant(None)]`
+    /// — an `Hlvalue::Constant`, not a freshly allocated Variable.
+    ///
+    /// `value == None` wires `LinkArg::Const(ConstValue::None)` with
+    /// `concretetype = Void` into `Link.args[0]` directly, matching
+    /// upstream's `Constant(None)`-on-the-stack shape with the
+    /// `NoneRepr.lowleveltype = Void` (`rpython/rtyper/rnone.py`)
+    /// kind stamped at construction.  Pyre's downstream consumers
+    /// (`flatten::constant_kind`, assembler `emit_const`) honour the
+    /// explicit concretetype so the constant flows through
+    /// `FlatOp::VoidReturn` instead of the `constvalue_kind(None) → 'r'`
+    /// fallback that would otherwise route a Ref-kind void constant
+    /// into the unsupported `emit_const_r(None)` pool.
     pub fn set_return(&mut self, block: BlockId, value: Option<crate::flowspace::model::Variable>) {
         let (returnblock, _) = self.returnblock_arg();
-        let value_var = value.unwrap_or_else(|| {
-            let vid = self.alloc_value();
-            self.must_variable(vid)
-        });
-        self.set_goto(block, returnblock, vec![value_var]);
+        let arg = match value {
+            Some(var) => LinkArg::Value(var),
+            None => LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                ConstValue::None,
+                crate::translator::rtyper::lltypesystem::lltype::VOID,
+            )),
+        };
+        let link = Link::new_mixed(vec![arg], returnblock, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
     }
 
     /// Route `block` to the graph's canonical `exceptblock` — the

@@ -2576,6 +2576,21 @@ impl Eq for AnnotatorError {}
 
 impl fmt::Display for AnnotatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // RPython `AnnotatorError(msg)` always carries a message; the
+        // Rust port models the `block`/`source` slots as `Option` so an
+        // error in flight before `set_annotator_block` runs has neither
+        // populated.  The previous `if let Some(...)` arms silently
+        // suppressed `AnnotatorError` whose `msg`/`source` were both
+        // `None`, surfacing as `compute_at_fixpoint failed: ` (empty
+        // payload) in `cutover::dual_gate_check_with_registry`'s Skip
+        // log.  Always emit a structural tag plus whatever fields are
+        // populated, so propagators (`complete_pending_blocks` /
+        // `compute_at_fixpoint`) carry the producer-side context.
+        let has_msg = self.msg.is_some();
+        let has_source = self.source.is_some();
+        if !has_msg && !has_source {
+            return write!(f, "AnnotatorError{{block:{:?}}}", self.block);
+        }
         if let Some(msg) = &self.msg {
             write!(f, "\n\n{msg}")?;
         }
