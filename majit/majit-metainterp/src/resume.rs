@@ -4467,7 +4467,7 @@ mod tests {
                 jitcode_index: 0,
                 pc: 100,
                 jitcode_pc: 0,
-            slot_map: vec![
+                slot_map: vec![
                     FrameSlotSource::FailArg(2),
                     FrameSlotSource::Unavailable,
                     FrameSlotSource::FailArg(0),
@@ -4499,13 +4499,13 @@ mod tests {
                     jitcode_index: 0,
                     pc: 10,
                     jitcode_pc: 0,
-            slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::FailArg(1)],
+                    slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::FailArg(1)],
                 },
                 FrameInfo {
                     jitcode_index: 1,
                     pc: 20,
                     jitcode_pc: 0,
-            slot_map: vec![FrameSlotSource::FailArg(2), FrameSlotSource::FailArg(3)],
+                    slot_map: vec![FrameSlotSource::FailArg(2), FrameSlotSource::FailArg(3)],
                 },
             ],
             virtuals: Vec::new(),

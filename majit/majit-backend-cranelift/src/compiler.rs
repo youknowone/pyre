@@ -16610,7 +16610,7 @@ mod tests {
                 source_guard: None,
                 pc: 4242,
                 jitcode_pc: 0,
-                    jitcode_index: 0,
+                jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::Constant(99)],
                 slot_types: Some(vec![Type::Int]),
             }],
