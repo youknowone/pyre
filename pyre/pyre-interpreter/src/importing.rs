@@ -132,6 +132,10 @@ pub fn install_builtin_modules() {
     register_builtin_module("_signal", init_signal_stub);
     register_builtin_module("atexit", init_atexit);
     register_builtin_module("pwd", init_pwd);
+    #[cfg(unix)]
+    register_builtin_module("grp", init_grp);
+    #[cfg(unix)]
+    register_builtin_module("resource", init_resource);
     register_builtin_module("_locale", init_locale);
     register_builtin_module("_random", init_random);
     register_builtin_module("_struct", init_struct);
@@ -175,7 +179,6 @@ pub fn install_builtin_modules() {
         "_csv",
         "marshal",
         "fcntl",
-        "grp",
         "select",
         "_socket",
         "_tracemalloc",
@@ -1040,54 +1043,22 @@ fn stat_result_type() -> PyObjectRef {
 
 /// pwd module — PyPy: pypy/module/pwd/interp_pwd.py.
 ///
-/// getpwuid / getpwnam return a struct_passwd tuple with named fields via
-/// libc's getpwuid(3) / getpwnam(3). The result has the same layout as
-/// CPython's pwd.struct_passwd: (pw_name, pw_passwd, pw_uid, pw_gid,
-/// pw_gecos, pw_dir, pw_shell).
+/// getpwuid / getpwnam / getpwall return struct_passwd tuples with the
+/// same layout as CPython's `pwd.struct_passwd`: (pw_name, pw_passwd,
+/// pw_uid, pw_gid, pw_gecos, pw_dir, pw_shell).  Backed by
+/// `rustpython_host_env::pwd` (a thin `nix` wrapper).
 fn init_pwd(ns: &mut DictStorage) {
-    #[cfg(unix)]
-    unsafe extern "C" {
-        fn getpwuid(uid: u32) -> *mut Passwd;
-        fn getpwnam(name: *const std::os::raw::c_char) -> *mut Passwd;
-    }
-    #[cfg(unix)]
-    #[repr(C)]
-    struct Passwd {
-        pw_name: *const std::os::raw::c_char,
-        pw_passwd: *const std::os::raw::c_char,
-        pw_uid: u32,
-        pw_gid: u32,
-        pw_change: i64,
-        pw_class: *const std::os::raw::c_char,
-        pw_gecos: *const std::os::raw::c_char,
-        pw_dir: *const std::os::raw::c_char,
-        pw_shell: *const std::os::raw::c_char,
-        pw_expire: i64,
-    }
-    #[cfg(unix)]
-    unsafe fn c_str(ptr: *const std::os::raw::c_char) -> String {
-        unsafe {
-            if ptr.is_null() {
-                return String::new();
-            }
-            let cstr = std::ffi::CStr::from_ptr(ptr);
-            cstr.to_string_lossy().into_owned()
-        }
-    }
-    #[cfg(unix)]
-    unsafe fn make_struct_passwd(pw: *mut Passwd) -> pyre_object::PyObjectRef {
-        unsafe {
-            let pw = &*pw;
-            pyre_object::w_tuple_new(vec![
-                pyre_object::w_str_new(&c_str(pw.pw_name)),
-                pyre_object::w_str_new(&c_str(pw.pw_passwd)),
-                pyre_object::w_int_new(pw.pw_uid as i64),
-                pyre_object::w_int_new(pw.pw_gid as i64),
-                pyre_object::w_str_new(&c_str(pw.pw_gecos)),
-                pyre_object::w_str_new(&c_str(pw.pw_dir)),
-                pyre_object::w_str_new(&c_str(pw.pw_shell)),
-            ])
-        }
+    #[cfg(all(unix, feature = "host_env"))]
+    fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(&pw.name),
+            pyre_object::w_str_new(&pw.passwd),
+            pyre_object::w_int_new(pw.uid as i64),
+            pyre_object::w_int_new(pw.gid as i64),
+            pyre_object::w_str_new(&pw.gecos),
+            pyre_object::w_str_new(&pw.dir),
+            pyre_object::w_str_new(&pw.shell),
+        ])
     }
     crate::dict_storage_store(
         ns,
@@ -1098,24 +1069,29 @@ fn init_pwd(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getpwuid() missing argument"));
                 }
-                #[cfg(unix)]
-                unsafe {
-                    if !pyre_object::is_int(args[0]) {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if !unsafe { pyre_object::is_int(args[0]) } {
                         return Err(crate::PyError::type_error(
                             "getpwuid(): uid should be an integer",
                         ));
                     }
-                    let uid = pyre_object::w_int_get_value(args[0]) as u32;
-                    let pw = getpwuid(uid);
-                    if pw.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getpwuid(): uid not found: {}",
-                            uid
-                        )));
+                    let uid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::uid_t;
+                    match rustpython_host_env::pwd::getpwuid(uid) {
+                        Ok(Some(pw)) => return Ok(make_struct_passwd(&pw)),
+                        Ok(None) => {
+                            return Err(crate::PyError::key_error(format!(
+                                "getpwuid(): uid not found: {}",
+                                uid
+                            )));
+                        }
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getpwuid: {e}"),
+                        )),
                     }
-                    return Ok(make_struct_passwd(pw));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(all(unix, feature = "host_env")))]
                 Err(crate::PyError::key_error("getpwuid(): uid not found"))
             },
             1,
@@ -1130,27 +1106,25 @@ fn init_pwd(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getpwnam() missing argument"));
                 }
-                #[cfg(unix)]
-                unsafe {
-                    if !pyre_object::is_str(args[0]) {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if !unsafe { pyre_object::is_str(args[0]) } {
                         return Err(crate::PyError::type_error(
                             "getpwnam(): name should be a string",
                         ));
                     }
-                    let name = pyre_object::w_str_get_value(args[0]);
-                    let cname = std::ffi::CString::new(name).map_err(|_| {
-                        crate::PyError::value_error("getpwnam(): embedded null character in name")
-                    })?;
-                    let pw = getpwnam(cname.as_ptr());
-                    if pw.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getpwnam(): name not found: {}",
-                            name
-                        )));
+                    let name = unsafe { pyre_object::w_str_get_value(args[0]) };
+                    match rustpython_host_env::pwd::getpwnam(name) {
+                        Some(pw) => return Ok(make_struct_passwd(&pw)),
+                        None => {
+                            return Err(crate::PyError::key_error(format!(
+                                "getpwnam(): name not found: {}",
+                                name
+                            )));
+                        }
                     }
-                    return Ok(make_struct_passwd(pw));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(all(unix, feature = "host_env")))]
                 Err(crate::PyError::key_error("getpwnam(): name not found"))
             },
             1,
@@ -1161,10 +1135,316 @@ fn init_pwd(ns: &mut DictStorage) {
         "getpwall",
         crate::make_builtin_function_with_arity(
             "getpwall",
-            |_| Ok(pyre_object::w_list_new(vec![])),
+            |_| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::pwd::getpwall()
+                        .iter()
+                        .map(make_struct_passwd)
+                        .collect();
+                    return Ok(pyre_object::w_list_new(items));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Ok(pyre_object::w_list_new(vec![]))
+            },
             0,
         ),
     );
+}
+
+/// grp module — PyPy: pypy/module/grp/interp_grp.py.
+///
+/// getgrgid / getgrnam / getgrall return struct_group tuples with the
+/// same layout as CPython's `grp.struct_group`: (gr_name, gr_passwd,
+/// gr_gid, gr_mem).  Backed by `rustpython_host_env::grp`.
+fn init_grp(ns: &mut DictStorage) {
+    #[cfg(all(unix, feature = "host_env"))]
+    fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
+        let mem_items: Vec<pyre_object::PyObjectRef> =
+            g.mem.iter().map(|s| pyre_object::w_str_new(s)).collect();
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(&g.name),
+            pyre_object::w_str_new(&g.passwd),
+            pyre_object::w_int_new(g.gid as i64),
+            pyre_object::w_list_new(mem_items),
+        ])
+    }
+    crate::dict_storage_store(
+        ns,
+        "getgrgid",
+        crate::make_builtin_function_with_arity(
+            "getgrgid",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("getgrgid() missing argument"));
+                }
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "getgrgid(): gid should be an integer",
+                        ));
+                    }
+                    let gid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::gid_t;
+                    match rustpython_host_env::grp::getgrgid(gid) {
+                        Ok(Some(g)) => return Ok(make_struct_group(&g)),
+                        Ok(None) => {
+                            return Err(crate::PyError::key_error(format!(
+                                "getgrgid(): gid not found: {}",
+                                gid
+                            )));
+                        }
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrgid: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Err(crate::PyError::key_error("getgrgid(): gid not found"))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "getgrnam",
+        crate::make_builtin_function_with_arity(
+            "getgrnam",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("getgrnam() missing argument"));
+                }
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if !unsafe { pyre_object::is_str(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "getgrnam(): name should be a string",
+                        ));
+                    }
+                    let name = unsafe { pyre_object::w_str_get_value(args[0]) };
+                    match rustpython_host_env::grp::getgrnam(name) {
+                        Ok(Some(g)) => return Ok(make_struct_group(&g)),
+                        Ok(None) => {
+                            return Err(crate::PyError::key_error(format!(
+                                "getgrnam(): name not found: {}",
+                                name
+                            )));
+                        }
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrnam: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Err(crate::PyError::key_error("getgrnam(): name not found"))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "getgrall",
+        crate::make_builtin_function_with_arity(
+            "getgrall",
+            |_| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::grp::getgrall()
+                        .iter()
+                        .map(make_struct_group)
+                        .collect();
+                    return Ok(pyre_object::w_list_new(items));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Ok(pyre_object::w_list_new(vec![]))
+            },
+            0,
+        ),
+    );
+}
+
+/// resource module — PyPy: pypy/module/resource/interp_resource.py.
+///
+/// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
+/// and RLIMIT_* constants.  Backed by `rustpython_host_env::resource`.
+fn init_resource(ns: &mut DictStorage) {
+    // ── struct_rusage tuple (16-field layout matches CPython) ──
+    #[cfg(all(unix, feature = "host_env"))]
+    fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
+        let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
+        pyre_object::w_tuple_new(vec![
+            pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),
+            pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)),
+            pyre_object::w_int_new(r.ru_maxrss as i64),
+            pyre_object::w_int_new(r.ru_ixrss as i64),
+            pyre_object::w_int_new(r.ru_idrss as i64),
+            pyre_object::w_int_new(r.ru_isrss as i64),
+            pyre_object::w_int_new(r.ru_minflt as i64),
+            pyre_object::w_int_new(r.ru_majflt as i64),
+            pyre_object::w_int_new(r.ru_nswap as i64),
+            pyre_object::w_int_new(r.ru_inblock as i64),
+            pyre_object::w_int_new(r.ru_oublock as i64),
+            pyre_object::w_int_new(r.ru_msgsnd as i64),
+            pyre_object::w_int_new(r.ru_msgrcv as i64),
+            pyre_object::w_int_new(r.ru_nsignals as i64),
+            pyre_object::w_int_new(r.ru_nvcsw as i64),
+            pyre_object::w_int_new(r.ru_nivcsw as i64),
+        ])
+    }
+    crate::dict_storage_store(
+        ns,
+        "getrusage",
+        crate::make_builtin_function_with_arity(
+            "getrusage",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let who = if let Some(&a) = args.first() {
+                        if unsafe { pyre_object::is_int(a) } {
+                            unsafe { pyre_object::w_int_get_value(a) as i32 }
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "getrusage(): who should be an integer",
+                            ));
+                        }
+                    } else {
+                        return Err(crate::PyError::type_error("getrusage() missing argument"));
+                    };
+                    match rustpython_host_env::resource::getrusage(who) {
+                        Ok(r) => return Ok(make_struct_rusage(&r)),
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getrusage: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "resource.getrusage requires host_env",
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "getrlimit",
+        crate::make_builtin_function_with_arity(
+            "getrlimit",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let res = if let Some(&a) = args.first() {
+                        if unsafe { pyre_object::is_int(a) } {
+                            unsafe { pyre_object::w_int_get_value(a) as libc::rlim_t }
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "getrlimit(): resource should be an integer",
+                            ));
+                        }
+                    } else {
+                        return Err(crate::PyError::type_error("getrlimit() missing argument"));
+                    };
+                    match rustpython_host_env::resource::getrlimit(res) {
+                        Ok(rl) => {
+                            return Ok(pyre_object::w_tuple_new(vec![
+                                pyre_object::w_int_new(rl.rlim_cur as i64),
+                                pyre_object::w_int_new(rl.rlim_max as i64),
+                            ]));
+                        }
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getrlimit: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "resource.getrlimit requires host_env",
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "setrlimit",
+        crate::make_builtin_function_with_arity(
+            "setrlimit",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("setrlimit() requires 2 arguments"));
+                    }
+                    let res = unsafe {
+                        if !pyre_object::is_int(args[0]) {
+                            return Err(crate::PyError::type_error(
+                                "setrlimit(): resource should be an integer",
+                            ));
+                        }
+                        pyre_object::w_int_get_value(args[0]) as libc::rlim_t
+                    };
+                    // limits is a 2-tuple (soft, hard).
+                    let (soft, hard) = unsafe {
+                        if !pyre_object::is_tuple(args[1]) || pyre_object::w_tuple_len(args[1]) != 2 {
+                            return Err(crate::PyError::type_error(
+                                "setrlimit(): limits should be a tuple of (soft, hard)",
+                            ));
+                        }
+                        let s = pyre_object::w_tuple_getitem(args[1], 0).unwrap();
+                        let h = pyre_object::w_tuple_getitem(args[1], 1).unwrap();
+                        (
+                            pyre_object::w_int_get_value(s) as libc::rlim_t,
+                            pyre_object::w_int_get_value(h) as libc::rlim_t,
+                        )
+                    };
+                    let rl = libc::rlimit { rlim_cur: soft, rlim_max: hard };
+                    match rustpython_host_env::resource::setrlimit(res, rl) {
+                        Ok(()) => return Ok(pyre_object::w_none()),
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("setrlimit: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "resource.setrlimit requires host_env",
+                    ))
+                }
+            },
+            2,
+        ),
+    );
+    // ── Constants (POSIX subset matching CPython) ──
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(ns, "RUSAGE_SELF", pyre_object::w_int_new(libc::RUSAGE_SELF as i64));
+        crate::dict_storage_store(ns, "RUSAGE_CHILDREN", pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64));
+        crate::dict_storage_store(ns, "RLIMIT_CPU", pyre_object::w_int_new(libc::RLIMIT_CPU as i64));
+        crate::dict_storage_store(ns, "RLIMIT_FSIZE", pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64));
+        crate::dict_storage_store(ns, "RLIMIT_DATA", pyre_object::w_int_new(libc::RLIMIT_DATA as i64));
+        crate::dict_storage_store(ns, "RLIMIT_STACK", pyre_object::w_int_new(libc::RLIMIT_STACK as i64));
+        crate::dict_storage_store(ns, "RLIMIT_CORE", pyre_object::w_int_new(libc::RLIMIT_CORE as i64));
+        crate::dict_storage_store(ns, "RLIMIT_NOFILE", pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64));
+        crate::dict_storage_store(ns, "RLIMIT_AS", pyre_object::w_int_new(libc::RLIMIT_AS as i64));
+        crate::dict_storage_store(ns, "RLIMIT_RSS", pyre_object::w_int_new(libc::RLIMIT_RSS as i64));
+        crate::dict_storage_store(ns, "RLIMIT_NPROC", pyre_object::w_int_new(libc::RLIMIT_NPROC as i64));
+        crate::dict_storage_store(ns, "RLIMIT_MEMLOCK", pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64));
+        // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
+        crate::dict_storage_store(ns, "RLIM_INFINITY", pyre_object::w_int_new(libc::RLIM_INFINITY as i64));
+    }
 }
 
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
