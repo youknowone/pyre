@@ -2974,17 +2974,22 @@ impl FunctionGraph {
     /// missing colors.
     pub(crate) fn bind_variable_at(&mut self, idx: usize, var: crate::flowspace::model::Variable) {
         if idx >= self.value_variables.len() {
+            let old_len = self.value_variables.len();
             self.value_variables.resize_with(idx + 1, || {
                 let placeholder = crate::flowspace::model::Variable::new();
                 Some(placeholder)
             });
-            // Re-register the placeholders that just got minted so
-            // `slot_of` lookups against them still succeed.
-            for (slot_idx, slot) in self.value_variables.iter().enumerate() {
-                if let Some(placeholder) = slot {
+            // Register only the placeholders that were just minted —
+            // pre-existing slots already have their `variable_to_vid`
+            // entry from the original allocation site, so the prior
+            // full-vec walk repeated O(n) work per resize call without
+            // changing any pre-existing mapping (the `entry().or_insert`
+            // shape made the rescan a no-op for older slots but still
+            // touched every slot every time).
+            for slot_idx in old_len..self.value_variables.len() {
+                if let Some(placeholder) = &self.value_variables[slot_idx] {
                     self.variable_to_vid
-                        .entry(placeholder.id())
-                        .or_insert(slot_idx);
+                        .insert(placeholder.id(), slot_idx);
                 }
             }
             // Keep the allocator cursor past any slot reserved here so
