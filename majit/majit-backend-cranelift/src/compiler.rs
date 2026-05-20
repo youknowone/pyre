@@ -3600,8 +3600,11 @@ pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: us
         *((old_base + JF_FORWARD_OFS as usize) as *mut *mut i64) = new_jf;
     }
 
-    if majit_log_enabled() {
-        eprintln!("[cranelift][realloc-frame] old={old_jf:p} new={new_jf:p} new_depth={new_depth}");
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one(
+            "jit-backend",
+            &format!("cranelift realloc-frame old={old_jf:p} new={new_jf:p} new_depth={new_depth}"),
+        );
     }
 
     new_jf
@@ -4623,8 +4626,11 @@ fn build_ref_root_slots(
             && used_inputargs.contains(&input.index)
             && seen.insert(input.index)
         {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[ref-root] inputarg idx={} tp={:?}", input.index, input.tp);
+            if majit_ir::debug::have_debug_prints() {
+                majit_ir::debug::log_one(
+                    "jit-backend",
+                    &format!("ref-root inputarg idx={} tp={:?}", input.index, input.tp),
+                );
             }
             slots.push((input.index, slots.len()));
         } else if input.tp == Type::Ref
@@ -6512,15 +6518,18 @@ fn run_compiled_code_inner(
     for (i, &val) in inputs.iter().enumerate() {
         unsafe { *jf_ptr.add(header_words + i) = val };
     }
-    if majit_log_enabled() {
+    if majit_ir::debug::have_debug_prints() {
         let preview: Vec<i64> = inputs.iter().copied().take(10).collect();
-        eprintln!("[pre-call-inputs] {:?}", preview);
+        majit_ir::debug::log_one("jit-running", &format!("pre-call-inputs {preview:?}"));
     }
     // Debug: verify first input (frame ptr) is valid
     if majit_verify_enabled() && !inputs.is_empty() {
         let frame_ptr = inputs[0];
         if frame_ptr != 0 && (frame_ptr < 0x1000 || (frame_ptr as usize & 0x7) != 0) {
-            eprintln!("[VERIFY] BAD frame_ptr input[0]={:#x}", frame_ptr);
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("VERIFY BAD frame_ptr input[0]={frame_ptr:#x}"),
+            );
         }
     }
 
@@ -6538,19 +6547,18 @@ fn run_compiled_code_inner(
     // _call_footer_shadowstack are emitted as inline MOVs in compiled
     // code's prologue/epilogue. The caller does NOT touch root_stack_top.
 
-    if majit_log_enabled() {
-        eprintln!(
-            "[pre-call] code_ptr={:p} jf_ptr={:p} inputs.len={} ref_roots={} max_output={}",
-            code_ptr,
-            jf_ptr,
-            inputs.len(),
-            num_ref_roots,
-            max_output_slots
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one(
+            "jit-running",
+            &format!(
+                "pre-call code_ptr={code_ptr:p} jf_ptr={jf_ptr:p} inputs.len={} ref_roots={num_ref_roots} max_output={max_output_slots}",
+                inputs.len(),
+            ),
         );
     }
     let result_jf = unsafe { func(jf_ptr) };
-    if majit_log_enabled() {
-        eprintln!("[post-call] result_jf={:p}", result_jf);
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one("jit-running", &format!("post-call result_jf={result_jf:p}"));
     }
 
     // jitframe_resolve (jitframe.py:54-57):
@@ -7973,7 +7981,7 @@ impl CraneliftBackend {
         // ops actually reference.
         for ia in inputargs {
             if debug_declares {
-                eprintln!("[jit][declare] input var{}", ia.index);
+                majit_ir::debug::log_one("jit-backend", &format!("declare input var{}", ia.index));
             }
             var_types.insert(ia.index, cl_types::I64);
             declared_vars.insert(ia.index);
@@ -7996,7 +8004,10 @@ impl CraneliftBackend {
                     cl_types::I64
                 };
                 if debug_declares {
-                    eprintln!("[jit][declare] op-result var{} opcode={:?}", vi, op.opcode);
+                    majit_ir::debug::log_one(
+                        "jit-backend",
+                        &format!("declare op-result var{vi} opcode={:?}", op.opcode),
+                    );
                 }
                 var_types.insert(vi as u32, cl_type);
             }
@@ -8038,7 +8049,10 @@ impl CraneliftBackend {
                 }
                 declared_vars.insert(arg.raw());
                 if debug_declares {
-                    eprintln!("[jit][declare] label-arg var{}", arg.raw());
+                    majit_ir::debug::log_one(
+                        "jit-backend",
+                        &format!("declare label-arg var{}", arg.raw()),
+                    );
                 }
                 var_types.insert(arg.raw(), cl_types::I64);
             }
@@ -12843,18 +12857,24 @@ impl CraneliftBackend {
         // Compile
         let mut ctx = Context::for_function(func);
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
-            eprintln!(
-                "[jit][clif-dump] trace_id={} header_pc={} num_inputs={} num_ops={}\n{}",
-                trace_id,
-                header_pc,
+            let _s = majit_ir::debug::scope("jit-backend-dump");
+            majit_ir::debug::debug_print(&format!(
+                "clif-dump trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}",
                 inputargs.len(),
                 ops.len(),
-                ctx.func.display()
-            );
+            ));
+            for line in ctx.func.display().to_string().lines() {
+                majit_ir::debug::debug_print(line);
+            }
         }
         if let Err(e) = self.module.define_function(func_id, &mut ctx) {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit][clif-error] {e}\nCLIF IR:\n{}", ctx.func.display());
+            if majit_ir::debug::have_debug_prints() {
+                let _s = majit_ir::debug::scope("jit-backend");
+                majit_ir::debug::debug_print(&format!("clif-error {e}"));
+                majit_ir::debug::debug_print("CLIF IR:");
+                for line in ctx.func.display().to_string().lines() {
+                    majit_ir::debug::debug_print(line);
+                }
             }
             self.module.clear_context(&mut ctx);
             return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));

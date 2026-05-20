@@ -1,5 +1,5 @@
 //! `rpython/rlib/debug.py` parity — PYPYLOG-style debug scope and print
-//! API for the metainterp.
+//! API shared across the metainterp, optimizer, and backends.
 //!
 //! PyPy structures runtime tracing through `debug_start(category)` /
 //! `debug_stop(category)` brackets with intervening `debug_print(...)`
@@ -15,15 +15,21 @@
 //! emits the same wire shape so log captures cross-tool with PyPy when
 //! the `MAJIT_LOG` env var is set (pyre's `PYPYLOG=…:-` analog).
 //!
-//! Conversion is intentionally incremental: this module is the API and
-//! the structurally-explicit `debug_start/stop` pairs in `memmgr` use
-//! it today.  The bulk of inline `eprintln!("[<cat>] …")` sites — 70+
-//! across metainterp/optimizeopt/backends — retain prefix-style output
-//! for backward compatibility and will be migrated in a follow-up pass.
+//! Single-event sites — the common case in Pyre's metainterp/optimizeopt/
+//! backends — use [`log_one`], which opens a single-line section,
+//! emits the body, and closes the section in one call.  Multi-message
+//! pairs use [`scope`] (RAII) wrapping repeated [`debug_print`] calls.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Whether `MAJIT_LOG` is set, cached at first access.  Mirrors PyPy's
+/// `PYPYLOG` env-var check (`rpython/rlib/debug.py:31-38`).
+pub fn majit_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_LOG").is_some())
+}
 
 /// Wall-clock origin used as the PyPy `read_timestamp()` analog.
 fn ts_origin() -> Instant {
@@ -46,10 +52,9 @@ thread_local! {
 }
 
 /// `rlib/debug.py:163-166 have_debug_prints()` — true when log output
-/// is enabled at all.  Pyre keys this off `MAJIT_LOG` (cached on first
-/// read, matching `crate::majit_log_enabled`).
+/// is enabled at all.  Pyre keys this off `MAJIT_LOG`.
 pub fn have_debug_prints() -> bool {
-    crate::majit_log_enabled()
+    majit_log_enabled()
 }
 
 /// `rlib/debug.py:168-172 have_debug_prints_for(prefix)` — true when at
@@ -123,4 +128,25 @@ impl Drop for DebugScope {
 pub fn scope(category: &'static str) -> DebugScope {
     debug_start(category);
     DebugScope { category }
+}
+
+/// Emit a single body line wrapped in a `debug_start`/`debug_stop`
+/// section of the given category.  Equivalent to PyPy's common pattern
+///
+/// ```python
+/// debug_start(cat); debug_print(msg); debug_stop(cat)
+/// ```
+///
+/// Used for one-shot events (aborts, single-state-transition notices)
+/// that don't have a natural surrounding scope on the Pyre side.  No-op
+/// when [`have_debug_prints`] is false — callers may still incur the
+/// cost of building `msg`; gate that with [`have_debug_prints`] for
+/// hot paths where formatting is non-trivial.
+pub fn log_one(category: &'static str, msg: &str) {
+    if !have_debug_prints() {
+        return;
+    }
+    debug_start(category);
+    debug_print(msg);
+    debug_stop(category);
 }

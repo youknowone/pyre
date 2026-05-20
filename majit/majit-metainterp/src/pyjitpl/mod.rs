@@ -4226,9 +4226,7 @@ impl<M: Clone> MetaInterp<M> {
                     // pyjitpl.py:3004: creation of the loop was cancelled!
                     self.cancel_count += 1;
                     if self.cancelled_too_many_times() {
-                        if crate::majit_log_enabled() {
-                            eprintln!("[jit] retrace cancelled too many times");
-                        }
+                        crate::debug::log_one("jit-tracing", "retrace cancelled too many times");
                         self.clear_retrace_state();
                         if let Some(ctx) = self.tracing.take() {
                             self.warm_state.abort_tracing(ctx.green_key, false);
@@ -4247,9 +4245,10 @@ impl<M: Clone> MetaInterp<M> {
                     // Not too many — clear retrace state and fall through
                     // to normal compile_loop path.
                     self.exported_state = None;
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] retrace cancelled, trying normal compilation");
-                    }
+                    crate::debug::log_one(
+                        "jit-tracing",
+                        "retrace cancelled, trying normal compilation",
+                    );
                 } else {
                     // pyjitpl.py:2994-2995: position mismatch — abort.
                     self.clear_retrace_state();
@@ -4323,8 +4322,11 @@ impl<M: Clone> MetaInterp<M> {
             .map(|token| token.get_retraced_count())
             .unwrap_or(0);
         if prior_retraced_count_early == u32::MAX && !prior_front_target_tokens_early.is_empty() {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] skipping recompile: retraced_count=MAX for key={green_key}");
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-tracing",
+                    &format!("skipping recompile: retraced_count=MAX for key={green_key}"),
+                );
             }
             self.warm_state.abort_tracing(green_key, true);
             return CompileOutcome::Cancelled;
@@ -4680,9 +4682,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
-        if crate::majit_log_enabled() {
-            eprintln!("--- trace (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&compiled_ops, &constants));
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-loop");
+            crate::debug::debug_print("--- trace (after opt) ---");
+            for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
                     if let Some(fa) = op.getfailargs() {
@@ -4690,7 +4695,10 @@ impl<M: Clone> MetaInterp<M> {
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.raw()))
                             .collect();
-                        eprintln!("[jit] FINAL GuardNotInv fail_args=[{}]", raw.join(", "));
+                        crate::debug::debug_print(&format!(
+                            "FINAL GuardNotInv fail_args=[{}]",
+                            raw.join(", ")
+                        ));
                     }
                 }
             }
@@ -4829,13 +4837,16 @@ impl<M: Clone> MetaInterp<M> {
             Ok(r) => r,
             Err(e) => {
                 let is_invalid_loop = e.downcast_ref::<crate::optimize::InvalidLoop>().is_some();
-                if crate::majit_log_enabled() {
+                if crate::debug::have_debug_prints() {
                     let kind = if is_invalid_loop {
                         "InvalidLoop"
                     } else {
                         "panic"
                     };
-                    eprintln!("[jit] compile_loop {kind}, aborting trace at key={green_key}");
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("compile_loop {kind}, aborting trace at key={green_key}"),
+                    );
                 }
                 // compile.py:288 parity: preserve preamble target_tokens
                 // even on InvalidLoop/panic. The unroller's Phase 1 created
@@ -4957,8 +4968,11 @@ impl<M: Clone> MetaInterp<M> {
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!("compiled_loops.insert green_key={green_key}"),
+                    );
                 }
                 token.set_retraced_count(final_retraced_count);
                 self.compiled_loops.insert(
@@ -5010,9 +5024,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(e) => {
                 self.stats.loops_aborted += 1;
                 let msg = format!("JIT compilation failed: {e}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
@@ -5532,8 +5544,11 @@ impl<M: Clone> MetaInterp<M> {
                     .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] compile_retrace: InvalidLoop at key={}", green_key);
+                    if crate::debug::have_debug_prints() {
+                        crate::debug::log_one(
+                            "jit-abort",
+                            &format!("compile_retrace: InvalidLoop at key={green_key}"),
+                        );
                     }
                     return false;
                 }
@@ -5586,17 +5601,18 @@ impl<M: Clone> MetaInterp<M> {
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
-        if crate::majit_log_enabled() {
-            eprintln!("--- retrace combined (after opt) ---");
-            eprint!("{}", majit_ir::format_trace(&combined_ops, &constants));
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-bridge");
+            crate::debug::debug_print("--- retrace combined (after opt) ---");
+            for line in majit_ir::format_trace(&combined_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
         }
 
         let num_combined_ops = combined_ops.len();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] compile_retrace: guardless loop");
-            }
+            crate::debug::log_one("jit-abort", "compile_retrace: guardless loop");
             return false;
         }
 
@@ -5660,8 +5676,11 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => {
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_retrace panicked at key={green_key}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("compile_retrace panicked at key={green_key}"),
+                    );
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 return false;
@@ -5775,8 +5794,11 @@ impl<M: Clone> MetaInterp<M> {
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!("compiled_loops.insert green_key={green_key}"),
+                    );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
@@ -5811,8 +5833,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_retrace failed: {e}");
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one("jit-abort", &format!("compile_retrace failed: {e}"));
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 false
@@ -6043,8 +6065,11 @@ impl<M: Clone> MetaInterp<M> {
                     .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[jit] abort finish: InvalidLoop at key={}", green_key);
+                    if crate::debug::have_debug_prints() {
+                        crate::debug::log_one(
+                            "jit-abort",
+                            &format!("abort finish: InvalidLoop at key={green_key}"),
+                        );
                     }
                     self.warm_state.abort_tracing(green_key, true);
                     // pyjitpl.py:2760 aborted_tracing() reads greenkey from
@@ -6305,10 +6330,12 @@ impl<M: Clone> MetaInterp<M> {
                 // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
                 // the post-`record_loop_or_bridge` total.
                 self.staticdata.profiler.inc_compiled_loop();
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] finish_and_compile: compiled trace key={}, trace_id={}",
-                        green_key, trace_id
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-summary",
+                        &format!(
+                            "finish_and_compile: compiled trace key={green_key}, trace_id={trace_id}"
+                        ),
                     );
                 }
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -6317,9 +6344,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(e) => {
                 let msg = format!("finish_and_compile: compile_loop FAILED key={green_key}: {e:?}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
@@ -7262,8 +7287,11 @@ impl<M: Clone> MetaInterp<M> {
     pub fn invalidate_loop(&mut self, green_key: u64) {
         if let Some(token) = self.warm_state.get_compiled(green_key) {
             token.invalidate();
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] invalidated loop at key={}", green_key);
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-invalidate",
+                    &format!("invalidated loop at key={green_key}"),
+                );
             }
         }
     }
@@ -7347,8 +7375,11 @@ impl<M: Clone> MetaInterp<M> {
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
                 self.compiled_loops.remove(&gk);
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit][memmgr] evicted current loop key={}", gk);
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-mem-collect",
+                        &format!("evicted current loop key={gk}"),
+                    );
                 }
             } else {
                 let before = entry.previous_tokens.len();
@@ -7357,8 +7388,11 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|t| !std::sync::Arc::ptr_eq(&t, &token))
                         .unwrap_or(false)
                 });
-                if crate::majit_log_enabled() && entry.previous_tokens.len() < before {
-                    eprintln!("[jit][memmgr] evicted previous token at key={}", gk);
+                if crate::debug::have_debug_prints() && entry.previous_tokens.len() < before {
+                    crate::debug::log_one(
+                        "jit-mem-collect",
+                        &format!("evicted previous token at key={gk}"),
+                    );
                 }
             }
         }
@@ -7933,9 +7967,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] must_compile: descr_addr=0, skip");
-            }
+            crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
         // compile.py:741: self.status — read live status directly from the
@@ -9278,9 +9310,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is not permanent — the counter resets and may fire again.
                 // RPython uses ST_BUSY_FLAG only (cleared by done_compiling).
                 let msg = format!("Bridge compilation failed: {e}");
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] {msg}");
-                }
+                crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }

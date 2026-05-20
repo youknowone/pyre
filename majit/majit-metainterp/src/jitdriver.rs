@@ -1237,9 +1237,7 @@ impl<S: JitState> JitDriver<S> {
     /// `take_compile_trace_success` substitutes. Same semantics: stop
     /// tracing immediately, switch into compiled code on next iteration.
     pub fn note_compile_trace_success(&mut self) {
-        if crate::majit_log_enabled() {
-            eprintln!("[jit][compile-trace] note success");
-        }
+        crate::debug::log_one("jit-summary", "compile-trace: note success");
         self.compile_trace_success = true;
     }
 
@@ -1280,9 +1278,7 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         if self.sym.is_none() || self.meta.trace_meta().is_none() {
-            if crate::majit_log_enabled() {
-                eprintln!("[mp] abort:sym_none");
-            }
+            crate::debug::log_one("jit-abort", "mp: abort:sym_none");
             self.meta.abort_trace(false);
             self.sym = None;
             self.meta.clear_trace_session();
@@ -1293,9 +1289,7 @@ impl<S: JitState> JitDriver<S> {
         // self.meta and self.sym are disjoint fields → standard split-borrow.
         let mut action = {
             let Some(sym) = self.sym.as_mut() else {
-                if crate::majit_log_enabled() {
-                    eprintln!("[mp] abort:sym_none2");
-                }
+                crate::debug::log_one("jit-abort", "mp: abort:sym_none2");
                 self.meta.abort_trace(false);
                 self.meta.clear_trace_session();
                 return;
@@ -1573,9 +1567,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                 } else {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[mp] abort:validate_close");
-                    }
+                    crate::debug::log_one("jit-abort", "mp: abort:validate_close");
                     self.meta.abort_trace(false);
                     self.meta.clear_trace_session();
                 }
@@ -1766,8 +1758,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.clear_trace_session();
             }
             TraceAction::Abort => {
-                if crate::majit_log_enabled() && self.meta.bridge_info().is_some() {
-                    eprintln!("[bridge] Abort during bridge tracing");
+                if self.meta.bridge_info().is_some() {
+                    crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
                 // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
                 // self.aborted_tracing(stb.reason)` — the
@@ -1825,8 +1817,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.clear_trace_session();
             }
             TraceAction::AbortPermanent => {
-                if crate::majit_log_enabled() && self.meta.bridge_info().is_some() {
-                    eprintln!("[bridge] AbortPermanent during bridge tracing");
+                if self.meta.bridge_info().is_some() {
+                    crate::debug::log_one("jit-abort", "AbortPermanent during bridge tracing");
                 }
                 self.meta.abort_trace(true);
                 self.sym = None;
@@ -2307,8 +2299,11 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         if !state.can_trace() {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] back_edge blocked: can_trace=false key={}", green_key);
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-tracing",
+                    &format!("back_edge blocked: can_trace=false key={green_key}"),
+                );
             }
             return None;
         }
@@ -2920,13 +2915,16 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let live_values = state.extract_live_values(&meta);
-        if crate::majit_log_enabled() {
+        if crate::debug::have_debug_prints() {
             let vals: Vec<String> = live_values
                 .iter()
                 .enumerate()
                 .map(|(i, v)| format!("[{}]={:?}", i, v))
                 .collect();
-            eprintln!("[jit] run_bridge live_values: {}", vals.join(", "));
+            crate::debug::log_one(
+                "jit-running",
+                &format!("run_bridge live_values: {}", vals.join(", ")),
+            );
         }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             return DetailedDriverRunOutcome::Abort {
@@ -3037,21 +3035,25 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let live_values = state.extract_live_values(&meta);
-        if crate::majit_log_enabled() {
+        if crate::debug::have_debug_prints() {
             let vals: Vec<String> = live_values
                 .iter()
                 .enumerate()
                 .map(|(i, v)| format!("[{}]={:?}", i, v))
                 .collect();
-            eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
+            crate::debug::log_one(
+                "jit-running",
+                &format!("BRIDGE live_values: {}", vals.join(", ")),
+            );
         }
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][run-compiled-abort] key={} reason=live-values-descriptor-mismatch target_pc={} nvals={}",
-                    green_key,
-                    target_pc,
-                    live_values.len()
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-abort",
+                    &format!(
+                        "run-compiled-abort key={green_key} reason=live-values-descriptor-mismatch target_pc={target_pc} nvals={}",
+                        live_values.len()
+                    ),
                 );
             }
             return DetailedDriverRunOutcome::Abort {

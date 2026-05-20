@@ -1948,14 +1948,20 @@ impl BlackholeInterpreter {
                     // blackhole.py:1068: raise ContinueRunningNormally(*args)
                     // Propagates out of run() like RPython's JitException.
                     if trace {
-                        eprintln!("[bh-trace] ContinueRunningNormally at pos={}", pos_before);
+                        crate::debug::log_one(
+                            "jit-blackhole",
+                            &format!("ContinueRunningNormally at pos={pos_before}"),
+                        );
                     }
                     return Some(args);
                 }
                 Err(DispatchError::RaiseException(exc)) => {
                     // blackhole.py:359-361: except Exception → handle_exception_in_frame
                     if trace {
-                        eprintln!("[bh-trace] exception at pos={} exc=0x{:x}", pos_before, exc);
+                        crate::debug::log_one(
+                            "jit-blackhole",
+                            &format!("exception at pos={pos_before} exc=0x{exc:x}"),
+                        );
                     }
                     if self.handle_exception_in_frame(exc) {
                         // Handler found, continue execution at handler target

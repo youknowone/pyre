@@ -393,8 +393,11 @@ impl Optimizer {
             VirtualStateInfo::Unknown(tp) => *tp,
         };
         let opref = ctx.alloc_op_position_typed(tp);
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[jit] import_virtual_state_value {opref:?} <= {info:?}");
+        if crate::debug::have_debug_prints() {
+            crate::debug::log_one(
+                "jit-optimizer",
+                &format!("import_virtual_state_value {opref:?} <= {info:?}"),
+            );
         }
         Self::apply_imported_virtual_state(info, opref, ctx);
         opref
@@ -3061,21 +3064,24 @@ impl Optimizer {
         // entries with OpRef::NONE via the snapshot-driven numbering pass
         // (`liveboxes = [None] * n; liveboxes[i] = box for TAGBOX`).
         // No additional const filtering is needed here.
-        if crate::optimizeopt::majit_log_enabled() {
+        if crate::debug::have_debug_prints() {
             let cmf_count = ops.iter().filter(|o| o.opcode.is_call_may_force()).count();
             let gnf_count = ops
                 .iter()
                 .filter(|o| matches!(o.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
                 .count();
-            eprintln!(
-                "[opt] final ops: total={} call_may_force={} guard_not_forced={}",
+            let _s = crate::debug::scope("jit-optimizer");
+            crate::debug::debug_print(&format!(
+                "final ops: total={} call_may_force={cmf_count} guard_not_forced={gnf_count}",
                 ops.len(),
-                cmf_count,
-                gnf_count
-            );
+            ));
             if cmf_count == 0 && gnf_count > 0 {
                 for (i, op) in ops.iter().enumerate() {
-                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos.get());
+                    crate::debug::debug_print(&format!(
+                        "idx={i} {:?} pos={:?}",
+                        op.opcode,
+                        op.pos.get()
+                    ));
                 }
             }
         }
@@ -3298,17 +3304,21 @@ impl Optimizer {
         }
 
         // unroll.py:214-218: retrace check
-        if crate::optimizeopt::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-retrace-check] retraced_count={} retrace_limit={} jump_args={} force_boxes=false",
-                retraced_count,
-                retrace_limit,
-                jump_args.len(),
+        if crate::debug::have_debug_prints() {
+            crate::debug::log_one(
+                "jit-tracing",
+                &format!(
+                    "bridge-retrace-check retraced_count={retraced_count} retrace_limit={retrace_limit} jump_args={} force_boxes=false",
+                    jump_args.len(),
+                ),
             );
         }
         if retraced_count < retrace_limit {
-            if crate::optimizeopt::majit_log_enabled() {
-                eprintln!("[jit] Retracing ({}/{})", retraced_count + 1, retrace_limit);
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-tracing",
+                    &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
+                );
             }
             return (optimized_ops, true);
         }

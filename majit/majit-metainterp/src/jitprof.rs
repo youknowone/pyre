@@ -373,9 +373,7 @@ impl JitProfiler {
             state.current.push(TimingFrame { profiler, event });
         });
         if let Some(channel) = debug_channel_for_event(event) {
-            if crate::majit_log_enabled() {
-                eprintln!("[{channel}] start");
-            }
+            crate::debug::debug_start(channel);
         }
     }
 
@@ -387,9 +385,7 @@ impl JitProfiler {
             let Some(frame) = state.current.pop() else {
                 // jitprof.py:86-88 `if not self.current: debug_print("BROKEN
                 // PROFILER DATA!"); return`.
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit-profiler] BROKEN PROFILER DATA!");
-                }
+                crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
                 state.t1 = Some(now);
                 return;
             };
@@ -399,9 +395,7 @@ impl JitProfiler {
                 // a mismatched profiler-instance frame, which RPython
                 // can't reach because each Profiler owns its own `current`
                 // list.
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit-profiler] BROKEN PROFILER DATA!");
-                }
+                crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
                 state.t1 = Some(now);
                 return;
             }
@@ -411,9 +405,7 @@ impl JitProfiler {
             state.t1 = Some(now);
         });
         if let Some(channel) = debug_channel_for_event(event) {
-            if crate::majit_log_enabled() {
-                eprintln!("[{channel}] stop");
-            }
+            crate::debug::debug_stop(channel);
         }
     }
 

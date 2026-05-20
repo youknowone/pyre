@@ -2516,7 +2516,7 @@ impl<'a> Assembler386<'a> {
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
         if crate::majit_j2plan_log_enabled() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
-            eprintln!("[dynasm:j2plan] {}", plan.summary());
+            majit_ir::debug::log_one("jit-backend", &format!("j2plan: {}", plan.summary()));
         }
 
         let mut ra = RegAlloc::new(
@@ -2588,8 +2588,11 @@ impl<'a> Assembler386<'a> {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
+                    if majit_ir::debug::have_debug_prints() {
+                        majit_ir::debug::log_one(
+                            "jit-backend",
+                            &format!("move: {src:?} → {dst:?}"),
+                        );
                     }
                     self.regalloc_mov(src, dst);
                     continue;
@@ -3740,15 +3743,16 @@ impl<'a> Assembler386<'a> {
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
                 let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[dynasm] Jump remap: {} int src→dst, {} float src→dst",
+                if majit_ir::debug::have_debug_prints() {
+                    let _s = majit_ir::debug::scope("jit-backend");
+                    majit_ir::debug::debug_print(&format!(
+                        "Jump remap: {} int src→dst, {} float src→dst",
                         src_locations1.len(),
                         src_locations2.len()
-                    );
+                    ));
                     for (i, (s, d)) in src_locations1.iter().zip(dst_locations1.iter()).enumerate()
                     {
-                        eprintln!("[dynasm]   int[{}]: {:?} → {:?}", i, s, d);
+                        majit_ir::debug::debug_print(&format!("  int[{i}]: {s:?} → {d:?}"));
                     }
                 }
                 self.remap_frame_layout_mixed(
@@ -3872,8 +3876,11 @@ impl<'a> Assembler386<'a> {
                 let label = self.mc.new_dynamic_label();
                 let descr_arc = op.getdescr();
                 let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
-                if crate::majit_log_enabled() {
-                    eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
+                if majit_ir::debug::have_debug_prints() {
+                    majit_ir::debug::log_one(
+                        "jit-backend",
+                        &format!("LABEL: new DynamicLabel({label:?})"),
+                    );
                 }
                 dynasm!(self.mc ; =>label);
                 if let Some(descr) = label_descr {
@@ -4930,8 +4937,11 @@ impl<'a> Assembler386<'a> {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
-        if crate::majit_log_enabled() {
-            eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("recovery stub: binding {fail_label:?}"),
+            );
         }
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
 
@@ -4991,8 +5001,11 @@ impl<'a> Assembler386<'a> {
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
         }
-        if crate::majit_log_enabled() {
-            eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("write_pending done: {} stubs", stub_offsets.len()),
+            );
         }
         stub_offsets
     }

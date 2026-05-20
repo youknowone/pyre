@@ -371,8 +371,11 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
         let raw = libc::calloc(1, total_size as usize) as u64;
         if raw == 0 { 0 } else { raw + gc_hdr as u64 }
     });
-    if crate::majit_log_enabled() {
-        eprintln!("[dynasm][nursery-frame] total_size={total_size} payload=0x{ptr:x}");
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one(
+            "jit-backend",
+            &format!("nursery-frame total_size={total_size} payload=0x{ptr:x}"),
+        );
     }
     ptr
 }
@@ -1958,8 +1961,11 @@ impl Backend for DynasmBackend {
         if ajo != 0 {
             Asm::patch_jump_for_descr(guard_fd, bridge_addr);
             self.register_bridge_addr(Arc::as_ptr(&guard_descr) as *const () as usize, bridge_addr);
-        } else if crate::majit_log_enabled() {
-            eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
+        } else {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                "dynasm-bridge WARNING: adr_jump_offset=0, bridge NOT patched!",
+            );
         }
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
@@ -2029,39 +2035,49 @@ impl Backend for DynasmBackend {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
         }
 
-        if crate::majit_log_enabled() {
+        if majit_ir::debug::have_debug_prints() {
+            let _s = majit_ir::debug::scope("jit-running");
             for (i, arg) in args.iter().enumerate() {
                 let raw = unsafe {
                     crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
                 };
-                eprintln!("[dynasm]   arg[{}] = {:#018x} ({:?})", i, raw as u64, arg);
+                majit_ir::debug::debug_print(&format!(
+                    "  arg[{i}] = {:#018x} ({arg:?})",
+                    raw as u64
+                ));
             }
-            eprintln!(
-                "[dynasm] execute_token: entry={:?} jf_ptr={:?} num_args={} num_slots={} code_len={}",
-                entry,
-                jf_ptr,
+            majit_ir::debug::debug_print(&format!(
+                "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
                 args.len(),
-                num_slots,
                 compiled.buffer.len()
-            );
+            ));
         }
 
         if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(entry, compiled.buffer.len()) };
-            eprintln!("[dynasm] CODE DUMP ({} bytes at {:?}):", code.len(), entry);
+            let _s = majit_ir::debug::scope("jit-backend-dump");
+            majit_ir::debug::debug_print(&format!(
+                "CODE DUMP ({} bytes at {:?}):",
+                code.len(),
+                entry
+            ));
+            let mut line = String::new();
             for (i, chunk) in code.chunks(4).enumerate() {
                 let word = u32::from_le_bytes([
-                    chunk.get(0).copied().unwrap_or(0),
+                    chunk.first().copied().unwrap_or(0),
                     chunk.get(1).copied().unwrap_or(0),
                     chunk.get(2).copied().unwrap_or(0),
                     chunk.get(3).copied().unwrap_or(0),
                 ]);
-                eprint!("{:08x} ", word);
+                line.push_str(&format!("{word:08x} "));
                 if (i + 1) % 8 == 0 {
-                    eprintln!();
+                    majit_ir::debug::debug_print(&line);
+                    line.clear();
                 }
             }
-            eprintln!();
+            if !line.is_empty() {
+                majit_ir::debug::debug_print(&line);
+            }
         }
 
         // Debug: verify bridge patches are visible

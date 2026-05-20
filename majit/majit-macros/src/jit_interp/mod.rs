@@ -844,9 +844,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     .map(|__ctx| __ctx.is_too_long())
                     .unwrap_or(false);
                 if __too_long {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!("[jit] trace too long, aborting");
-                    }
+                    majit_metainterp::debug::log_one("jit-abort", "trace too long, aborting");
                     return majit_metainterp::TraceAction::Abort;
                 }
                 __result

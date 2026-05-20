@@ -601,7 +601,7 @@ impl CodeWriter {
             // `format_assembler` is ported.
             let _ = verbose;
             let _ = &ssarepr;
-            eprintln!("[CodeWriter] {}", jitcode.name);
+            majit_ir::debug::log_one("jit-codewriter", &format!("CodeWriter {}", jitcode.name));
         }
     }
 

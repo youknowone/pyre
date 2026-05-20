@@ -368,8 +368,11 @@ pub extern "C" fn call_assembler_helper_trampoline(
     green_key: u64,
 ) -> i64 {
     if callee_jf_ptr.is_null() {
-        if majit_log_enabled() {
-            eprintln!("[dynasm][ca-helper] null callee_jf_ptr green_key={green_key}");
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("ca-helper null callee_jf_ptr green_key={green_key}"),
+            );
         }
         return 0;
     }
@@ -724,8 +727,8 @@ pub extern "C" fn call_assembler_execute_trampoline(
     let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
         unsafe { std::mem::transmute(callee_addr) };
     let result = unsafe { func(jf_ptr) };
-    if majit_log_enabled() {
-        eprintln!("[dynasm][ca-exec] leave jf={result:p}");
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one("jit-backend", &format!("ca-exec leave jf={result:p}"));
     }
     result
 }

@@ -1371,9 +1371,10 @@ impl UnrollOptimizer {
                     };
                     if !jumped {
                         // unroll.py:228: "Retrace count reached, jumping to preamble"
-                        if std::env::var_os("MAJIT_LOG").is_some() {
-                            eprintln!("[jit] Retrace count reached, jumping to preamble");
-                        }
+                        crate::debug::log_one(
+                            "jit-tracing",
+                            "Retrace count reached, jumping to preamble",
+                        );
                         // jumped stays false → jump_to_preamble below
                     }
                 }
@@ -1474,13 +1475,17 @@ impl UnrollOptimizer {
             } else {
                 body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
             }
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] jump_to_preamble: body JUMP retargeted to start descr");
-            }
+            crate::debug::log_one(
+                "jit-tracing",
+                "jump_to_preamble: body JUMP retargeted to start descr",
+            );
         } else if !redirected_tail_ops.is_empty() {
             body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
-        } else if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[jit] jump_to_existing_trace: body JUMP → self-loop");
+        } else {
+            crate::debug::log_one(
+                "jit-tracing",
+                "jump_to_existing_trace: body JUMP → self-loop",
+            );
         }
 
         // ── Assembly (compile.py:310-338) ──
@@ -1523,15 +1528,18 @@ impl UnrollOptimizer {
             &combined,
             &mut consts_p2,
         );
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("--- peeled trace (assembled) ---");
-            eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-loop");
+            crate::debug::debug_print("--- peeled trace (assembled) ---");
+            for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
+                crate::debug::debug_print(line);
+            }
             let mut sorted_consts: Vec<_> = consts_p2
                 .iter()
                 .map(|(k, v)| (*k, v.clone()))
                 .collect::<Vec<_>>();
             sorted_consts.sort_by_key(|(k, _)| *k);
-            eprintln!("[jit] consts_p2: {:?}", sorted_consts);
+            crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
         }
         *constants = consts_p2;
         (combined, p2_ni)
@@ -2946,8 +2954,11 @@ impl OptUnroll {
             .collect();
 
         for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
-            if crate::optimizeopt::majit_log_enabled() {
-                eprintln!("[jit][jump_to_existing] trying target_token #{tt_idx}");
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-tracing",
+                    &format!("jump_to_existing trying target_token #{tt_idx}"),
+                );
             }
             let target_vs = match &target_token.virtual_state {
                 Some(vs) => vs,
@@ -3173,8 +3184,11 @@ impl OptUnroll {
                         optimizer,
                         ctx,
                     );
-                    if crate::optimizeopt::majit_log_enabled() {
-                        eprintln!("[jit][jte-isp] done, extra_len={}", extra.len());
+                    if crate::debug::have_debug_prints() {
+                        crate::debug::log_one(
+                            "jit-tracing",
+                            &format!("jte-isp done, extra_len={}", extra.len()),
+                        );
                     }
                 }
             }
@@ -3540,8 +3554,11 @@ impl OptUnroll {
                 .ensure_box(*target)
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.make_equal_to(&b_source, &b_target);
-            if crate::optimizeopt::majit_log_enabled() {
-                eprintln!("[jit] import_state_map[{i}]: source={source:?} target={target:?}");
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-optimizer",
+                    &format!("import_state_map[{i}]: source={source:?} target={target:?}"),
+                );
             }
             // info = exported_state.exported_infos.get(target, None)
             // if info is not None:

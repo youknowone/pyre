@@ -582,8 +582,8 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
     /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
     pub(crate) fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
-        if crate::majit_log_enabled() {
-            eprintln!("[dynasm] remap-mov: {:?} -> {:?}", src, dst);
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one("jit-backend", &format!("remap-mov: {src:?} -> {dst:?}"));
         }
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
@@ -1599,7 +1599,7 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
         if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
-            eprintln!("[dynasm:j2plan] {}", plan.summary());
+            majit_ir::debug::log_one("jit-backend", &format!("j2plan: {}", plan.summary()));
         }
 
         let mut ra = RegAlloc::new(
@@ -1661,8 +1661,11 @@ impl<'a> AssemblerARM64<'a> {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    if crate::majit_log_enabled() {
-                        eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
+                    if majit_ir::debug::have_debug_prints() {
+                        majit_ir::debug::log_one(
+                            "jit-backend",
+                            &format!("move: {src:?} → {dst:?}"),
+                        );
                     }
                     self.regalloc_mov(src, dst);
                     continue;
@@ -2660,8 +2663,11 @@ impl<'a> AssemblerARM64<'a> {
                         .copied()
                         .map(target_argloc_from_loc)
                         .collect::<Vec<_>>();
-                    if crate::majit_log_enabled() {
-                        eprintln!("[dynasm] LABEL target_arglocs={:?}", stored_arglocs);
+                    if majit_ir::debug::have_debug_prints() {
+                        majit_ir::debug::log_one(
+                            "jit-backend",
+                            &format!("LABEL target_arglocs={stored_arglocs:?}"),
+                        );
                     }
                     descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
@@ -3508,8 +3514,11 @@ impl<'a> AssemblerARM64<'a> {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
-        if crate::majit_log_enabled() {
-            eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("recovery stub: binding {fail_label:?}"),
+            );
         }
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
@@ -3563,8 +3572,11 @@ impl<'a> AssemblerARM64<'a> {
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
         }
-        if crate::majit_log_enabled() {
-            eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!("write_pending done: {} stubs", stub_offsets.len()),
+            );
         }
         stub_offsets
     }
