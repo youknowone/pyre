@@ -694,19 +694,11 @@ pub(super) fn rename_lookup(rename: &[Vec<u16>; 3], kind: Kind, pre: u16) -> u16
 ///
 /// `nlocals` is the number of CPython fast locals (`code.varnames.len()`).
 ///
-/// `cfg_coalesce_pairs` is the output of
-/// `codewriter::collect_link_slot_pairs` — `(source_slot,
-/// target_slot)` pairs from CFG link boundaries, all of Ref kind
-/// because every `FrameState.mergeable()` position in pyre holds a
-/// Ref-kind Variable (locals, stack, last_exc pair).  See
-/// `collect_link_slot_pairs` docstring + `regalloc.py:79-96`.
-///
 /// RPython parity: `codewriter.py:45-47, 62-67`.
 pub(super) fn allocate_registers(
     ssarepr: &SSARepr,
     nlocals: usize,
     inputs: ExternalInputs,
-    cfg_coalesce_pairs: &[(u16, u16)],
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
     //   regallocs[kind] = perform_register_allocation(graph, kind)`.
@@ -733,17 +725,7 @@ pub(super) fn allocate_registers(
                 }
             }
         }
-        // `cfg_coalesce_pairs` are CFG-level Variable pairs from Link
-        // boundaries (regalloc.py:79-96).  All mergeable positions in
-        // pyre's FrameState are Ref-kind, so pass them only to the
-        // Ref allocator; Int / Float regalloc sees an empty slice.
-        let cfg_pairs_for_kind: &[(u16, u16)] = if kind == Kind::Ref {
-            cfg_coalesce_pairs
-        } else {
-            &[]
-        };
-        allocators[kind.index()] =
-            perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
+        allocators[kind.index()] = perform_register_allocation(ssarepr, kind, &external);
     }
 
     // flatten.py:88-100 `enforce_input_args` — rotate inputarg colors
@@ -840,44 +822,31 @@ fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs
 /// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
 /// the three-stage pipeline.
 ///
-/// Dual coalesce sources:
-///   1. `cfg_coalesce_pairs` — pre-computed `(source_slot,
-///      target_slot)` pairs from `codewriter::collect_link_slot_pairs`.
-///      These are the upstream `tool/algo/regalloc.py:79-96`
-///      `link.args ↔ link.target.inputargs` pairs, projected from
-///      Variables onto pyre's u16 register slots via the walker's
-///      positional alignment (see `collect_link_slot_pairs`
-///      docstring).  Trivially-equal pairs by `getoutputargs`
-///      construction — their `try_coalesce` is a no-op when
-///      `src_slot == dst_slot`, but the call preserves RPython's
-///      exact iteration shape.
-///   2. SSARepr `*_copy` scanner (Note) — pyre's
-///      walker emits intra-block `int_copy` / `ref_copy` /
-///      `float_copy` ops for stack shuffling / STORE_FAST sequences
-///      that have no CFG / Link representation.  The scanner unions
-///      each copy's src and dst so the chordal coloring reuses one
-///      color, turning the runtime copy into a no-op when
-///      `src_color == dst_color`.  Upstream does not have this
-///      SSARepr-level pass because `flatten.py:306-334`
-///      `insert_renamings` places its copies post-coalesce, so
-///      RPython's CFG-level `regalloc.py:79-96` is the sole coalesce
-///      source.  In pyre both sources are orthogonal — the CFG
-///      pairs cover cross-block link boundaries, the scanner covers
-///      intra-block shuffles — so both run.
+/// Coalesce source: SSARepr `*_copy` scanner — pyre's walker emits
+/// intra-block `int_copy` / `ref_copy` / `float_copy` ops for stack
+/// shuffling / STORE_FAST sequences directly into the SSARepr.  The
+/// scanner unions each copy's src and dst so the chordal coloring
+/// reuses one color, turning the runtime copy into a no-op when
+/// `src_color == dst_color`.  Upstream's `flatten.py:306-334`
+/// `insert_renamings` places its copies post-coalesce at flatten
+/// time, so RPython's CFG-level `regalloc.py:79-96` is its sole
+/// coalesce source.  pyre's u16-indexed SSARepr makes the scanner
+/// equivalent: the upstream CFG `link.args ↔ link.target.inputargs`
+/// coalesce loop would always produce trivially-equal `(slot, slot)`
+/// pairs by `getoutputargs_with_positions` construction (the source
+/// and target mergeable indices are always identical), so its
+/// `try_coalesce` would be a runtime no-op and adds no information
+/// over the scanner.  When the walker eventually defers SSARepr
+/// emission to the canonical `flatten_graph` driver, the upstream
+/// CFG coalesce loop will become load-bearing again and reappear
+/// inside that driver.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
     external_inputs: &[u16],
-    cfg_coalesce_pairs: &[(u16, u16)],
 ) -> RegAllocator {
     let mut alloc = RegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
-    // regalloc.py:79-96 CFG-level coalesce: union link.args[i] with
-    // link.target.inputargs[i] for every block exit.  Fed in from
-    // `codewriter::collect_link_slot_pairs` (Ref kind only).
-    for &(src_slot, dst_slot) in cfg_coalesce_pairs {
-        alloc.try_coalesce(src_slot, dst_slot);
-    }
     alloc.coalesce_variables(ssarepr, kind);
     alloc.find_node_coloring();
     alloc
@@ -1473,7 +1442,7 @@ mod tests {
             portal_ec_reg: 101,
             portal_inputs: true,
         };
-        let result = allocate_registers(&ssarepr, 2, inputs, &[]);
+        let result = allocate_registers(&ssarepr, 2, inputs);
         let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         // locals 0,1 → colors 0,1; portal regs → 2,3.
         assert_eq!(new(0), 0, "local 0 must keep color 0 after enforce");
@@ -1504,7 +1473,7 @@ mod tests {
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
         };
-        let result = allocate_registers(&ssarepr, 1, inputs, &[]);
+        let result = allocate_registers(&ssarepr, 1, inputs);
         let new = |old: u16| rename_lookup(&result.rename, Kind::Ref, old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
         assert_eq!(
@@ -1542,7 +1511,7 @@ mod tests {
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
         };
-        let result = allocate_registers(&ssarepr, 0, inputs, &[]);
+        let result = allocate_registers(&ssarepr, 0, inputs);
         assert_eq!(result.num_regs[Kind::Ref.index()], 3);
         assert_eq!(result.num_regs[Kind::Int.index()], 1);
         assert_eq!(result.num_regs[Kind::Float.index()], 0);
@@ -1590,7 +1559,7 @@ mod tests {
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
         };
-        let result = allocate_registers(&ssarepr, 0, inputs, &[]);
+        let result = allocate_registers(&ssarepr, 0, inputs);
         let new5 = rename_lookup(&result.rename, Kind::Ref, 5);
         let new6 = rename_lookup(&result.rename, Kind::Ref, 6);
         assert_eq!(
@@ -1632,7 +1601,7 @@ mod tests {
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
         };
-        let result = allocate_registers(&ssarepr, 1, inputs, &[]);
+        let result = allocate_registers(&ssarepr, 1, inputs);
         let new50 = rename_lookup(&result.rename, Kind::Ref, 50);
         assert_eq!(
             new50, 0,
