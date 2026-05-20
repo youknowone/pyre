@@ -7535,46 +7535,22 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
 /// conditions exactly (`push_typed_value:1802` and `pop_value:1901,
 /// 1917`).
 fn apply_walker_pop_top(state: &mut MIFrame) {
-    let (is_active, owns_vable, semantic_idx_opt, new_vsd) = {
-        let s = state.sym_mut();
-        if s.valuestackdepth == 0 {
-            return;
-        }
-        s.valuestackdepth -= 1;
-        let new_vsd = s.valuestackdepth;
-        let semantic_idx_opt = new_vsd.checked_sub(s.nlocals).map(|stack_idx| s.nlocals + stack_idx);
-        (
-            s.is_active_vable_owner,
-            s.owns_virtualizable_shadow(),
-            semantic_idx_opt,
-            new_vsd,
-        )
-    };
-    state.with_ctx(|state, ctx| {
-        if is_active {
-            if let Some(semantic_idx) = semantic_idx_opt {
-                let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
-                let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
-                let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
-                ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
-            }
-        }
-        if owns_vable {
-            // The walker arm body emits `setfield_vable_i(vsd_descr,
-            // int_sub_ovf(getfield, 1))` which routes through
-            // `TraceCtx::vable_setfield` →
-            // `set_virtualizable_entry_at("valuestackdepth", v_sub, …)`,
-            // so `virtualizable_boxes[vsd_index]` already carries the
-            // walker's computed OpRef.  Update only the standalone
-            // `sym.vable_valuestackdepth` mirror so snapshot encoders /
-            // close_loop_args_at see the matching new vsd; do NOT
-            // call `mirror_vable_static_to_boxes` here — that would
-            // overwrite the walker's `int_sub_ovf` result OpRef with a
-            // const_int, splitting the shadow's representation.
-            let vsd_op = ctx.const_int(new_vsd as i64);
-            state.sym_mut().vable_valuestackdepth = vsd_op;
-        }
-    });
+    // Minimal sym tracker update: decrement `sym.valuestackdepth`.  The
+    // walker arm body for PopTop emits the IR ops (`setarrayitem_vable_r
+    // (slot, NULL)` + `setfield_vable_i(vsd_descr, depth-1)`) that
+    // mutate both `PyFrame.locals_cells_stack_w` and
+    // `PyFrame.valuestackdepth` at runtime, and routes through
+    // `TraceCtx::vable_setfield` / `vable_setarrayitem_indexed` which
+    // already update `virtualizable_boxes` at the matching flat indices
+    // (`trace_ctx.rs:2284, 2738, 2753`).  So the shadow side-table
+    // entries are already in sync; the only piece the walker does NOT
+    // touch is the standalone `sym.valuestackdepth` counter — that's
+    // this function's responsibility.
+    let s = state.sym_mut();
+    if s.valuestackdepth == 0 {
+        return;
+    }
+    s.valuestackdepth -= 1;
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
