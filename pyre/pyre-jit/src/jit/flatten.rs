@@ -1537,7 +1537,7 @@ where
                          (OverflowError) must succeed for the standard \
                          exception (flatten.py:167)",
                     );
-                let operand = (self.lower_constant)(&ll_ovf);
+                let operand = self.lower_constant_op(&ll_ovf);
                 self.emitline(Insn::op("raise", vec![operand]));
             } else {
                 self.emitline(Insn::op("reraise", Vec::new()));
@@ -2000,7 +2000,7 @@ where
                 continue;
             }
             let src = self.rename_operand(src_value);
-            let dst = (self.get_register)(dst_variable);
+            let dst = self.getcolor_var(dst_variable);
             if src == RenameOperand::Register(dst) {
                 continue;
             }
@@ -2065,7 +2065,7 @@ where
                 let dst = inputarg
                     .as_variable()
                     .expect("last_exception target must be a Variable");
-                let dst_reg = (self.get_register)(dst);
+                let dst_reg = self.getcolor_var(dst);
                 self.emitline(Insn::op_with_result("last_exception", Vec::new(), dst_reg));
             }
         }
@@ -2074,7 +2074,7 @@ where
                 let dst = inputarg
                     .as_variable()
                     .expect("last_exc_value target must be a Variable");
-                let dst_reg = (self.get_register)(dst);
+                let dst_reg = self.getcolor_var(dst);
                 self.emitline(Insn::op_with_result("last_exc_value", Vec::new(), dst_reg));
             }
         }
@@ -2178,7 +2178,7 @@ where
                 if variable.kind.is_none() {
                     return Insn::op(op.opname.clone(), args);
                 }
-                let result = (self.get_register)(variable);
+                let result = self.getcolor_var(variable);
                 Insn::op_with_result(op.opname.clone(), args, result)
             }
             Some(FlowValue::Constant(ref constant)) => {
@@ -2236,9 +2236,24 @@ where
     /// docstring).
     fn getcolor(&mut self, value: &FlowValue) -> Operand {
         match value {
-            FlowValue::Variable(variable) => Operand::Register((self.get_register)(*variable)),
-            FlowValue::Constant(constant) => (self.lower_constant)(constant),
+            FlowValue::Variable(variable) => Operand::Register(self.getcolor_var(*variable)),
+            FlowValue::Constant(constant) => self.lower_constant_op(constant),
         }
+    }
+
+    /// `flatten.py:382-391 GraphFlattener.getcolor(v)` Variable arm.
+    /// Centralizes the `(self.get_register)(v)` invocation so future
+    /// slices can swap the closure for a `regallocs` field without
+    /// touching internal callers.
+    fn getcolor_var(&mut self, v: Variable) -> Register {
+        (self.get_register)(v)
+    }
+
+    /// Centralizes the `(self.lower_constant)(c)` invocation. Companion
+    /// to `getcolor_var` — see its docstring for the future-slice
+    /// rationale.
+    fn lower_constant_op(&mut self, c: &Constant) -> Operand {
+        (self.lower_constant)(c)
     }
 }
 
