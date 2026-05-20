@@ -6663,6 +6663,26 @@ impl MIFrame {
         // + guards) don't accrete orphan exception guards.
         let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
         self.pre_opcode_op_count = Some(pre_op_count);
+        // Issue #73 Phase 4.5: re-converge `sym.valuestackdepth` with the
+        // concrete `PyFrame.valuestackdepth` at every opcode entry.  The
+        // production walker (`dispatch_via_walker_for_opcode`) handles
+        // some opcodes (Nop family + future allow-list expansions) and
+        // records IR ops without running the trait dispatch's
+        // `sym.valuestackdepth` updates.  Without this re-sync the
+        // symbolic mirror would lag PyFrame by the cumulative effect of
+        // every walker-handled opcode and downstream `pop_value` /
+        // `push_typed_value` would index into the wrong stack slot.
+        //
+        // The concrete frame's `valuestackdepth` already reflects every
+        // interpreter step that has run, so adopting it as the per-opcode
+        // baseline matches RPython's "MIFrame reads stack state from
+        // PyFrame each iteration" model (RPython has no symbolic mirror —
+        // see [[issue73-phase4_5-pyresym-vsd-retirement]]).  `registers_r`
+        // and `concrete_stack` slots above the new vsd are dead but
+        // harmless; subsequent pushes overwrite them.
+        if let Some(concrete_vsd) = self.concrete_valuestackdepth() {
+            self.sym_mut().valuestackdepth = concrete_vsd;
+        }
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -7202,6 +7222,26 @@ impl MIFrame {
         // + guards) don't accrete orphan exception guards.
         let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
         self.pre_opcode_op_count = Some(pre_op_count);
+        // Issue #73 Phase 4.5: re-converge `sym.valuestackdepth` with the
+        // concrete `PyFrame.valuestackdepth` at every opcode entry.  The
+        // production walker (`dispatch_via_walker_for_opcode`) handles
+        // some opcodes (Nop family + future allow-list expansions) and
+        // records IR ops without running the trait dispatch's
+        // `sym.valuestackdepth` updates.  Without this re-sync the
+        // symbolic mirror would lag PyFrame by the cumulative effect of
+        // every walker-handled opcode and downstream `pop_value` /
+        // `push_typed_value` would index into the wrong stack slot.
+        //
+        // The concrete frame's `valuestackdepth` already reflects every
+        // interpreter step that has run, so adopting it as the per-opcode
+        // baseline matches RPython's "MIFrame reads stack state from
+        // PyFrame each iteration" model (RPython has no symbolic mirror —
+        // see [[issue73-phase4_5-pyresym-vsd-retirement]]).  `registers_r`
+        // and `concrete_stack` slots above the new vsd are dead but
+        // harmless; subsequent pushes overwrite them.
+        if let Some(concrete_vsd) = self.concrete_valuestackdepth() {
+            self.sym_mut().valuestackdepth = concrete_vsd;
+        }
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
@@ -7449,6 +7489,10 @@ fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
+            | Instruction::PopTop
+            | Instruction::Swap { .. }
+            | Instruction::Copy { .. }
+            | Instruction::PushNull
     )
 }
 
