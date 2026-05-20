@@ -471,7 +471,11 @@ impl RPythonAnnotator {
     /// Driver-level logging. Non-ported methods (`build_types`,
     /// `complete`, `processblock`, ...) land with Commit 7 Part A.
     pub fn warning(&self, msg: &str) {
-        majit_ir::debug::log_one("annrpython-warning", msg);
+        // RPython `warning()` routes through `log.WARNING`, an unconditional
+        // diagnostic channel — not the PYPYLOG-gated `debug_print`.  Match
+        // the unconditional behavior so annotator warnings remain visible
+        // without setting `MAJIT_LOG`.
+        eprintln!("[annrpython warning] {msg}");
     }
 
     /// Install `self.bookkeeper` into `TLS.bookkeeper` — mirrors

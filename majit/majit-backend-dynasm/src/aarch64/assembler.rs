@@ -1599,7 +1599,8 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
         if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
-            majit_ir::debug::log_one("jit-backend", &format!("j2plan: {}", plan.summary()));
+            // Independent debug toggle — not gated by MAJIT_LOG.
+            eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
 
         let mut ra = RegAlloc::new(

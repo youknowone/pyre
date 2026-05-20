@@ -7981,7 +7981,8 @@ impl CraneliftBackend {
         // ops actually reference.
         for ia in inputargs {
             if debug_declares {
-                majit_ir::debug::log_one("jit-backend", &format!("declare input var{}", ia.index));
+                // Independent debug toggle — not gated by MAJIT_LOG.
+                eprintln!("[jit][declare] input var{}", ia.index);
             }
             var_types.insert(ia.index, cl_types::I64);
             declared_vars.insert(ia.index);
@@ -8004,10 +8005,8 @@ impl CraneliftBackend {
                     cl_types::I64
                 };
                 if debug_declares {
-                    majit_ir::debug::log_one(
-                        "jit-backend",
-                        &format!("declare op-result var{vi} opcode={:?}", op.opcode),
-                    );
+                    // Independent debug toggle — not gated by MAJIT_LOG.
+                    eprintln!("[jit][declare] op-result var{vi} opcode={:?}", op.opcode);
                 }
                 var_types.insert(vi as u32, cl_type);
             }
@@ -8049,10 +8048,8 @@ impl CraneliftBackend {
                 }
                 declared_vars.insert(arg.raw());
                 if debug_declares {
-                    majit_ir::debug::log_one(
-                        "jit-backend",
-                        &format!("declare label-arg var{}", arg.raw()),
-                    );
+                    // Independent debug toggle — not gated by MAJIT_LOG.
+                    eprintln!("[jit][declare] label-arg var{}", arg.raw());
                 }
                 var_types.insert(arg.raw(), cl_types::I64);
             }
@@ -12857,15 +12854,13 @@ impl CraneliftBackend {
         // Compile
         let mut ctx = Context::for_function(func);
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
-            let _s = majit_ir::debug::scope("jit-backend-dump");
-            majit_ir::debug::debug_print(&format!(
-                "clif-dump trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}",
+            // Independent debug toggle — not gated by MAJIT_LOG.
+            eprintln!(
+                "[jit][clif-dump] trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}\n{}",
                 inputargs.len(),
                 ops.len(),
-            ));
-            for line in ctx.func.display().to_string().lines() {
-                majit_ir::debug::debug_print(line);
-            }
+                ctx.func.display()
+            );
         }
         if let Err(e) = self.module.define_function(func_id, &mut ctx) {
             if majit_ir::debug::have_debug_prints() {

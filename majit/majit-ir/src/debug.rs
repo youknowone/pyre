@@ -57,15 +57,15 @@ pub fn have_debug_prints() -> bool {
     majit_log_enabled()
 }
 
-/// `rlib/debug.py:168-172 have_debug_prints_for(prefix)` — true when at
-/// least one active category in the current `debug_start` stack starts
-/// with `prefix`, gated by [`have_debug_prints`].  PyPy uses this to
-/// short-circuit message construction when a section is not active.
-pub fn have_debug_prints_for(prefix: &str) -> bool {
-    if !have_debug_prints() {
-        return false;
-    }
-    CATEGORY_STACK.with(|stack| stack.borrow().iter().any(|cat| cat.starts_with(prefix)))
+/// `rlib/debug.py:168-172 have_debug_prints_for(prefix)` — true when
+/// the active log filter accepts `prefix` (RPython queries the
+/// `PYPYLOG=cat1,cat2:filename` filter spec, not the currently-open
+/// `debug_start` stack).  Pyre has no category-level filter — `MAJIT_LOG`
+/// is all-or-nothing — so this reduces to [`have_debug_prints`].  The
+/// `_prefix` parameter is preserved so callers ported 1:1 from PyPy keep
+/// compiling unchanged once a filter mechanism lands.
+pub fn have_debug_prints_for(_prefix: &str) -> bool {
+    have_debug_prints()
 }
 
 /// `rlib/debug.py:101-108 debug_start(category)` — open a logging
@@ -83,17 +83,24 @@ pub fn debug_start(category: &'static str) {
 
 /// `rlib/debug.py:111-116 debug_stop(category)` — close the matching
 /// section opened by [`debug_start`].  Emits `[<ts>] <category>}` and
-/// pops the stack top.  Mismatched stops are silently ignored to mirror
-/// PyPy's `DebugLog.debug_stop` (which scans backwards for the most
-/// recent matching start and is forgiving on unbalanced calls).
+/// pops the stack top.  Mismatched stops panic, mirroring RPython's
+/// `DebugLog.debug_stop` (`rpython/rlib/debug.py:30`), which raises a
+/// nesting error so unbalanced calls surface immediately instead of
+/// being absorbed.
 pub fn debug_stop(category: &'static str) {
     if !have_debug_prints() {
         return;
     }
     CATEGORY_STACK.with(|stack| {
         let mut s = stack.borrow_mut();
-        if s.last() == Some(&category) {
-            s.pop();
+        match s.last() {
+            Some(top) if *top == category => {
+                s.pop();
+            }
+            Some(top) => panic!(
+                "debug_stop({category:?}) does not match the most recent debug_start({top:?})"
+            ),
+            None => panic!("debug_stop({category:?}) with no matching debug_start"),
         }
     });
     eprintln!("[{:x}] {}}}", read_timestamp(), category);
