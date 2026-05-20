@@ -4857,6 +4857,262 @@ fn init_posix(ns: &mut DictStorage) {
                 0,
             ),
         );
+
+        // os.dup(fd) -> new_fd
+        crate::dict_storage_store(
+            ns,
+            "dup",
+            crate::make_builtin_function_with_arity(
+                "dup",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("dup() requires 1 argument"));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let n = unsafe { libc::dup(fd) };
+                    if n < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_int_new(n as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.dup2(fd, fd2, inheritable=True) -> fd2
+        crate::dict_storage_store(
+            ns,
+            "dup2",
+            crate::make_builtin_function("dup2", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("dup2() requires 2 arguments"));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let fd2 = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::c_int;
+                let n = unsafe { libc::dup2(fd, fd2) };
+                if n < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                }
+                Ok(pyre_object::w_int_new(n as i64))
+            }),
+        );
+
+        // os.fsync(fd)
+        crate::dict_storage_store(
+            ns,
+            "fsync",
+            crate::make_builtin_function_with_arity(
+                "fsync",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("fsync() requires 1 argument"));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let r = unsafe { libc::fsync(fd) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // os.fdatasync(fd) — falls back to fsync on macOS, which has no
+        // fdatasync syscall but exposes the same semantics through fsync.
+        crate::dict_storage_store(
+            ns,
+            "fdatasync",
+            crate::make_builtin_function_with_arity(
+                "fdatasync",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "fdatasync() requires 1 argument",
+                        ));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let r = unsafe { libc::fdatasync(fd) };
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let r = unsafe { libc::fsync(fd) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // os.mkfifo(path, mode=0o666) -> None
+        crate::dict_storage_store(
+            ns,
+            "mkfifo",
+            crate::make_builtin_function("mkfifo", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("mkfifo() requires 1 argument"));
+                }
+                let path = extract_path(args[0])?;
+                let mode = if args.len() >= 2 {
+                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::mode_t
+                } else {
+                    0o666
+                };
+                let c_path = std::ffi::CString::new(path.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                let r = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
+                if r < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), &path));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
+        // os.kill(pid, sig) / os.killpg(pgid, sig)
+        crate::dict_storage_store(
+            ns,
+            "kill",
+            crate::make_builtin_function_with_arity(
+                "kill",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("kill() requires 2 arguments"));
+                    }
+                    let pid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::pid_t;
+                    let sig = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::c_int;
+                    let r = unsafe { libc::kill(pid, sig) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "killpg",
+            crate::make_builtin_function_with_arity(
+                "killpg",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
+                    }
+                    let pgid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::pid_t;
+                    let sig = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::c_int;
+                    let r = unsafe { libc::killpg(pgid, sig) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.statvfs(path) / os.fstatvfs(fd) -> statvfs_result
+        #[cfg(not(target_os = "redox"))]
+        fn statvfs_to_obj(
+            info: rustpython_host_env::posix::StatVfsInfo,
+        ) -> pyre_object::PyObjectRef {
+            let wrapper = pyre_object::w_instance_new(stat_result_type());
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_bsize",
+                pyre_object::w_int_new(info.f_bsize as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_frsize",
+                pyre_object::w_int_new(info.f_frsize as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_blocks",
+                pyre_object::w_int_new(info.f_blocks as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_bfree",
+                pyre_object::w_int_new(info.f_bfree as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_bavail",
+                pyre_object::w_int_new(info.f_bavail as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_files",
+                pyre_object::w_int_new(info.f_files as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_ffree",
+                pyre_object::w_int_new(info.f_ffree as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_favail",
+                pyre_object::w_int_new(info.f_favail as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_flag",
+                pyre_object::w_int_new(info.f_flag as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_namemax",
+                pyre_object::w_int_new(info.f_namemax as i64),
+            );
+            let _ = crate::baseobjspace::setattr(
+                wrapper,
+                "f_fsid",
+                pyre_object::w_int_new(info.f_fsid as i64),
+            );
+            wrapper
+        }
+        #[cfg(not(target_os = "redox"))]
+        crate::dict_storage_store(
+            ns,
+            "statvfs",
+            crate::make_builtin_function_with_arity(
+                "statvfs",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("statvfs() requires 1 argument"));
+                    }
+                    let path = extract_path(args[0])?;
+                    let c_path = std::ffi::CString::new(path.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                    let info = host_posix::statvfs_path(&c_path)
+                        .map_err(|e| io_err(e, &path))?;
+                    Ok(statvfs_to_obj(info))
+                },
+                1,
+            ),
+        );
+        #[cfg(not(target_os = "redox"))]
+        crate::dict_storage_store(
+            ns,
+            "fstatvfs",
+            crate::make_builtin_function_with_arity(
+                "fstatvfs",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "fstatvfs() requires 1 argument",
+                        ));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let info = host_posix::statvfs_fd(fd).map_err(|e| io_err(e, ""))?;
+                    Ok(statvfs_to_obj(info))
+                },
+                1,
+            ),
+        );
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
