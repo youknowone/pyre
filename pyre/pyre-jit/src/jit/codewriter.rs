@@ -501,19 +501,8 @@ impl FrameState {
     }
 
     fn getoutputargs(&self, targetstate: &Self) -> Vec<super::flow::FlowValue> {
-        self.getoutputargs_with_positions(targetstate).0
-    }
-
-    fn getoutputargs_with_positions(
-        &self,
-        targetstate: &Self,
-    ) -> (
-        Vec<super::flow::FlowValue>,
-        Vec<super::flow::LinkArgPosition>,
-    ) {
         let mergeable = self.mergeable();
         let mut result = Vec::new();
-        let mut positions = Vec::new();
         for (index, target_value) in targetstate.mergeable().iter().enumerate() {
             if matches!(target_value, Some(super::flow::FlowValue::Variable(_))) {
                 result.push(
@@ -521,13 +510,9 @@ impl FrameState {
                         .clone()
                         .expect("target variable must correspond to a mergeable source value"),
                 );
-                positions.push(super::flow::LinkArgPosition {
-                    source_mergeable_index: Some(index),
-                    target_mergeable_index: Some(index),
-                });
             }
         }
-        (result, positions)
+        result
     }
 }
 
@@ -1278,10 +1263,8 @@ fn output_link(
     target_state: &FrameState,
     target: super::flow::BlockRef,
 ) -> super::flow::LinkRef {
-    let (outputargs, arg_positions) = source_state.getoutputargs_with_positions(target_state);
-    super::flow::Link::new(outputargs, Some(target), None)
-        .with_arg_positions(arg_positions)
-        .into_ref()
+    let outputargs = source_state.getoutputargs(target_state);
+    super::flow::Link::new(outputargs, Some(target), None).into_ref()
 }
 
 /// Build the `[w_type, w_value]` argument list for a Link targeting
@@ -2358,7 +2341,7 @@ fn attach_catch_exception_edge(
     // edge.  `exception_landing_state` clones `source_state` and
     // sets `last_exception` to the fresh pair, so the same
     // Variables can be threaded into BOTH `link.args` (via
-    // `getoutputargs_with_positions` below) AND `link.extravars`.
+    // `getoutputargs` below) AND `link.extravars`.
     let edge_state = exception_landing_state(graph, source_state);
 
     // Update the landing block's framestate / inputargs from the
@@ -2371,22 +2354,22 @@ fn attach_catch_exception_edge(
     // single catch landing block, so the landing's inputargs are
     // the union of all incoming edge states (pyre-only).  The
     // arity invariant below is satisfied either way because
-    // `getoutputargs_with_positions` walks `target_state.mergeable()`
-    // — the same mergeable layout as `target.inputargs`.
+    // `getoutputargs` walks `target_state.mergeable()` — the
+    // same mergeable layout as `target.inputargs`.
     update_catch_landing_state(graph, target, &edge_state);
 
     // `model.py:114-116 Link.__init__` enforces
     // `len(args) == len(target.inputargs)`.  Build `link.args` via
-    // `FrameState::getoutputargs_with_positions(target_state)` so
-    // each link arg aligns with the corresponding target inputarg
-    // by mergeable position.  This restores the RPython invariant
-    // that the previous `Link::new(Vec::new(), …)` then-mutate
-    // flow bypassed (the `Link::new` arity assert ran before
+    // `FrameState::getoutputargs(target_state)` so each link arg
+    // aligns with the corresponding target inputarg by mergeable
+    // position.  This restores the RPython invariant that the
+    // previous `Link::new(Vec::new(), …)` then-mutate flow
+    // bypassed (the `Link::new` arity assert ran before
     // `update_catch_landing_state` populated `target.inputargs`).
     let target_state = target
         .framestate()
         .expect("catch landing must have a framestate after update_catch_landing_state");
-    let (link_args, arg_positions) = edge_state.getoutputargs_with_positions(&target_state);
+    let link_args = edge_state.getoutputargs(&target_state);
 
     // `model.py:127-129 Link.extravars` carries the source-side
     // `(last_exception, last_exc_value)` pair so
@@ -2398,8 +2381,7 @@ fn attach_catch_exception_edge(
     // `last_exception` mergeable position) AND `link.extravars`
     // — matching `flowcontext.py:141-143`.
     let (exc_type, exc_value) = exception_edge_extravars(&edge_state);
-    let mut link = super::flow::Link::new(link_args, Some(target.block()), None)
-        .with_arg_positions(arg_positions);
+    let mut link = super::flow::Link::new(link_args, Some(target.block()), None);
     link.extravars(Some(exc_type), Some(exc_value));
     let link = link.into_ref();
     let _ = source_state;
@@ -9353,8 +9335,8 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
-        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkArgPosition, LinkRef,
-        SpaceOperationArg, Variable, VariableId, c_last_exception,
+        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkRef, SpaceOperationArg,
+        Variable, VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
@@ -9959,15 +9941,6 @@ mod tests {
         assert_eq!(op.result, Some(result.into()));
     }
 
-    fn identity_arg_positions(count: usize) -> Vec<LinkArgPosition> {
-        (0..count)
-            .map(|index| LinkArgPosition {
-                source_mergeable_index: Some(index),
-                target_mergeable_index: Some(index),
-            })
-            .collect()
-    }
-
     /// Step 6A slice S1 regression: `FrameState::mergeable_index_of` locates
     /// a Variable by its `VariableId` across locals / stack / last-exc
     /// positions and returns `None` for non-existent ids or non-Variable
@@ -10557,10 +10530,6 @@ mod tests {
                 Variable::new(VariableId(0), Kind::Ref).into(),
                 Constant::none().into(),
             ]
-        );
-        assert_eq!(
-            state1.getoutputargs_with_positions(&state2).1,
-            identity_arg_positions(2),
         );
     }
 

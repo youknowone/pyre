@@ -833,13 +833,13 @@ fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs
 /// coalesce source.  pyre's u16-indexed SSARepr makes the scanner
 /// equivalent: the upstream CFG `link.args ↔ link.target.inputargs`
 /// coalesce loop would always produce trivially-equal `(slot, slot)`
-/// pairs by `getoutputargs_with_positions` construction (the source
-/// and target mergeable indices are always identical), so its
-/// `try_coalesce` would be a runtime no-op and adds no information
-/// over the scanner.  When the walker eventually defers SSARepr
-/// emission to the canonical `flatten_graph` driver, the upstream
-/// CFG coalesce loop will become load-bearing again and reappear
-/// inside that driver.
+/// pairs by `getoutputargs` construction (the source and target
+/// mergeable indices are always identical), so its `try_coalesce`
+/// would be a runtime no-op and adds no information over the
+/// scanner.  When the walker eventually defers SSARepr emission to
+/// the canonical `flatten_graph` driver, the upstream CFG coalesce
+/// loop will become load-bearing again and reappear inside that
+/// driver.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
