@@ -142,6 +142,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("syslog", init_syslog);
     register_builtin_module("select", init_select);
     register_builtin_module("termios", init_termios);
+    register_builtin_module("_socket", init_socket);
     register_builtin_module("_locale", init_locale);
     register_builtin_module("_random", init_random);
     register_builtin_module("_struct", init_struct);
@@ -184,7 +185,6 @@ pub fn install_builtin_modules() {
         "_json",
         "_csv",
         "marshal",
-        "_socket",
         "_tracemalloc",
         "_stat",
         "_asyncio",
@@ -2295,6 +2295,630 @@ fn init_termios(ns: &mut DictStorage) {
 
 #[cfg(not(all(unix, feature = "host_env")))]
 fn init_termios(_ns: &mut DictStorage) {}
+
+/// _socket module — PyPy: pypy/module/_socket/.
+///
+/// **Slice S1: constants + name resolution helpers.**
+///
+/// Provides the AF_* / SOCK_* / IPPROTO_* / SOL_* / SO_* / SHUT_* /
+/// AI_* / NI_* / IPV4-IPV6 constants plus the small "lookup" helpers
+/// gethostname / sethostname / inet_aton / inet_ntoa / inet_pton /
+/// inet_ntop / htons / htonl / ntohs / ntohl / getservbyname /
+/// getservbyport / gethostbyname.
+///
+/// Does NOT yet provide the `socket` class itself — that requires
+/// per-instance heap state (the OwnedFd + family/type/proto triple) and
+/// is the next slice (S2).  Until then `import socket` succeeds and the
+/// constants/helpers above are usable, but `socket.socket(...)` raises
+/// the C-extension stub error.
+fn init_socket(ns: &mut DictStorage) {
+    // ── Constants ──
+    #[cfg(unix)]
+    {
+        // Address families
+        crate::dict_storage_store(ns, "AF_UNSPEC", pyre_object::w_int_new(libc::AF_UNSPEC as i64));
+        crate::dict_storage_store(ns, "AF_UNIX", pyre_object::w_int_new(libc::AF_UNIX as i64));
+        crate::dict_storage_store(ns, "AF_INET", pyre_object::w_int_new(libc::AF_INET as i64));
+        crate::dict_storage_store(ns, "AF_INET6", pyre_object::w_int_new(libc::AF_INET6 as i64));
+        // Socket types
+        crate::dict_storage_store(ns, "SOCK_STREAM", pyre_object::w_int_new(libc::SOCK_STREAM as i64));
+        crate::dict_storage_store(ns, "SOCK_DGRAM", pyre_object::w_int_new(libc::SOCK_DGRAM as i64));
+        crate::dict_storage_store(ns, "SOCK_RAW", pyre_object::w_int_new(libc::SOCK_RAW as i64));
+        crate::dict_storage_store(ns, "SOCK_RDM", pyre_object::w_int_new(libc::SOCK_RDM as i64));
+        crate::dict_storage_store(ns, "SOCK_SEQPACKET", pyre_object::w_int_new(libc::SOCK_SEQPACKET as i64));
+        // Protocols
+        crate::dict_storage_store(ns, "IPPROTO_IP", pyre_object::w_int_new(libc::IPPROTO_IP as i64));
+        crate::dict_storage_store(ns, "IPPROTO_TCP", pyre_object::w_int_new(libc::IPPROTO_TCP as i64));
+        crate::dict_storage_store(ns, "IPPROTO_UDP", pyre_object::w_int_new(libc::IPPROTO_UDP as i64));
+        crate::dict_storage_store(ns, "IPPROTO_ICMP", pyre_object::w_int_new(libc::IPPROTO_ICMP as i64));
+        crate::dict_storage_store(ns, "IPPROTO_ICMPV6", pyre_object::w_int_new(libc::IPPROTO_ICMPV6 as i64));
+        crate::dict_storage_store(ns, "IPPROTO_RAW", pyre_object::w_int_new(libc::IPPROTO_RAW as i64));
+        crate::dict_storage_store(ns, "IPPROTO_IPV6", pyre_object::w_int_new(libc::IPPROTO_IPV6 as i64));
+        // Special addresses (host byte order — Python keeps them this way)
+        crate::dict_storage_store(ns, "INADDR_ANY", pyre_object::w_int_new(libc::INADDR_ANY as i64));
+        crate::dict_storage_store(ns, "INADDR_LOOPBACK", pyre_object::w_int_new(libc::INADDR_LOOPBACK as i64));
+        crate::dict_storage_store(ns, "INADDR_BROADCAST", pyre_object::w_int_new(libc::INADDR_BROADCAST as i64));
+        crate::dict_storage_store(ns, "INADDR_NONE", pyre_object::w_int_new(libc::INADDR_NONE as i64));
+        // setsockopt levels and options
+        crate::dict_storage_store(ns, "SOL_SOCKET", pyre_object::w_int_new(libc::SOL_SOCKET as i64));
+        crate::dict_storage_store(ns, "SO_REUSEADDR", pyre_object::w_int_new(libc::SO_REUSEADDR as i64));
+        crate::dict_storage_store(ns, "SO_KEEPALIVE", pyre_object::w_int_new(libc::SO_KEEPALIVE as i64));
+        crate::dict_storage_store(ns, "SO_BROADCAST", pyre_object::w_int_new(libc::SO_BROADCAST as i64));
+        crate::dict_storage_store(ns, "SO_DEBUG", pyre_object::w_int_new(libc::SO_DEBUG as i64));
+        crate::dict_storage_store(ns, "SO_DONTROUTE", pyre_object::w_int_new(libc::SO_DONTROUTE as i64));
+        crate::dict_storage_store(ns, "SO_LINGER", pyre_object::w_int_new(libc::SO_LINGER as i64));
+        crate::dict_storage_store(ns, "SO_OOBINLINE", pyre_object::w_int_new(libc::SO_OOBINLINE as i64));
+        crate::dict_storage_store(ns, "SO_RCVBUF", pyre_object::w_int_new(libc::SO_RCVBUF as i64));
+        crate::dict_storage_store(ns, "SO_SNDBUF", pyre_object::w_int_new(libc::SO_SNDBUF as i64));
+        crate::dict_storage_store(ns, "SO_RCVTIMEO", pyre_object::w_int_new(libc::SO_RCVTIMEO as i64));
+        crate::dict_storage_store(ns, "SO_SNDTIMEO", pyre_object::w_int_new(libc::SO_SNDTIMEO as i64));
+        crate::dict_storage_store(ns, "SO_RCVLOWAT", pyre_object::w_int_new(libc::SO_RCVLOWAT as i64));
+        crate::dict_storage_store(ns, "SO_SNDLOWAT", pyre_object::w_int_new(libc::SO_SNDLOWAT as i64));
+        crate::dict_storage_store(ns, "SO_ERROR", pyre_object::w_int_new(libc::SO_ERROR as i64));
+        crate::dict_storage_store(ns, "SO_TYPE", pyre_object::w_int_new(libc::SO_TYPE as i64));
+        crate::dict_storage_store(ns, "SO_ACCEPTCONN", pyre_object::w_int_new(libc::SO_ACCEPTCONN as i64));
+        // TCP-level
+        crate::dict_storage_store(ns, "TCP_NODELAY", pyre_object::w_int_new(libc::TCP_NODELAY as i64));
+        crate::dict_storage_store(ns, "TCP_MAXSEG", pyre_object::w_int_new(libc::TCP_MAXSEG as i64));
+        // TCP_KEEPIDLE is Linux-only at the libc-crate level; macOS exposes
+        // TCP_KEEPALIVE for the same role.  Provide whichever the platform
+        // defines under the conventional Python name.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            crate::dict_storage_store(ns, "TCP_KEEPIDLE", pyre_object::w_int_new(libc::TCP_KEEPIDLE as i64));
+            crate::dict_storage_store(ns, "TCP_KEEPINTVL", pyre_object::w_int_new(libc::TCP_KEEPINTVL as i64));
+            crate::dict_storage_store(ns, "TCP_KEEPCNT", pyre_object::w_int_new(libc::TCP_KEEPCNT as i64));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::dict_storage_store(ns, "TCP_KEEPALIVE", pyre_object::w_int_new(libc::TCP_KEEPALIVE as i64));
+        }
+        // IP-level
+        crate::dict_storage_store(ns, "IP_TTL", pyre_object::w_int_new(libc::IP_TTL as i64));
+        crate::dict_storage_store(ns, "IP_TOS", pyre_object::w_int_new(libc::IP_TOS as i64));
+        crate::dict_storage_store(ns, "IP_MULTICAST_TTL", pyre_object::w_int_new(libc::IP_MULTICAST_TTL as i64));
+        crate::dict_storage_store(ns, "IP_MULTICAST_LOOP", pyre_object::w_int_new(libc::IP_MULTICAST_LOOP as i64));
+        crate::dict_storage_store(ns, "IP_ADD_MEMBERSHIP", pyre_object::w_int_new(libc::IP_ADD_MEMBERSHIP as i64));
+        crate::dict_storage_store(ns, "IP_DROP_MEMBERSHIP", pyre_object::w_int_new(libc::IP_DROP_MEMBERSHIP as i64));
+        // IPv6
+        crate::dict_storage_store(ns, "IPV6_V6ONLY", pyre_object::w_int_new(libc::IPV6_V6ONLY as i64));
+        crate::dict_storage_store(ns, "IPV6_MULTICAST_HOPS", pyre_object::w_int_new(libc::IPV6_MULTICAST_HOPS as i64));
+        crate::dict_storage_store(ns, "IPV6_MULTICAST_LOOP", pyre_object::w_int_new(libc::IPV6_MULTICAST_LOOP as i64));
+        // shutdown how
+        crate::dict_storage_store(ns, "SHUT_RD", pyre_object::w_int_new(libc::SHUT_RD as i64));
+        crate::dict_storage_store(ns, "SHUT_WR", pyre_object::w_int_new(libc::SHUT_WR as i64));
+        crate::dict_storage_store(ns, "SHUT_RDWR", pyre_object::w_int_new(libc::SHUT_RDWR as i64));
+        // Message flags
+        crate::dict_storage_store(ns, "MSG_OOB", pyre_object::w_int_new(libc::MSG_OOB as i64));
+        crate::dict_storage_store(ns, "MSG_PEEK", pyre_object::w_int_new(libc::MSG_PEEK as i64));
+        crate::dict_storage_store(ns, "MSG_DONTROUTE", pyre_object::w_int_new(libc::MSG_DONTROUTE as i64));
+        crate::dict_storage_store(ns, "MSG_WAITALL", pyre_object::w_int_new(libc::MSG_WAITALL as i64));
+        // Address-info flags
+        crate::dict_storage_store(ns, "AI_PASSIVE", pyre_object::w_int_new(libc::AI_PASSIVE as i64));
+        crate::dict_storage_store(ns, "AI_CANONNAME", pyre_object::w_int_new(libc::AI_CANONNAME as i64));
+        crate::dict_storage_store(ns, "AI_NUMERICHOST", pyre_object::w_int_new(libc::AI_NUMERICHOST as i64));
+        crate::dict_storage_store(ns, "AI_NUMERICSERV", pyre_object::w_int_new(libc::AI_NUMERICSERV as i64));
+        crate::dict_storage_store(ns, "AI_ADDRCONFIG", pyre_object::w_int_new(libc::AI_ADDRCONFIG as i64));
+        crate::dict_storage_store(ns, "AI_V4MAPPED", pyre_object::w_int_new(libc::AI_V4MAPPED as i64));
+        crate::dict_storage_store(ns, "AI_ALL", pyre_object::w_int_new(libc::AI_ALL as i64));
+        // Name-info flags
+        crate::dict_storage_store(ns, "NI_NUMERICHOST", pyre_object::w_int_new(libc::NI_NUMERICHOST as i64));
+        crate::dict_storage_store(ns, "NI_NUMERICSERV", pyre_object::w_int_new(libc::NI_NUMERICSERV as i64));
+        crate::dict_storage_store(ns, "NI_NOFQDN", pyre_object::w_int_new(libc::NI_NOFQDN as i64));
+        crate::dict_storage_store(ns, "NI_NAMEREQD", pyre_object::w_int_new(libc::NI_NAMEREQD as i64));
+        crate::dict_storage_store(ns, "NI_DGRAM", pyre_object::w_int_new(libc::NI_DGRAM as i64));
+        crate::dict_storage_store(ns, "NI_MAXHOST", pyre_object::w_int_new(libc::NI_MAXHOST as i64));
+        crate::dict_storage_store(ns, "NI_MAXSERV", pyre_object::w_int_new(libc::NI_MAXSERV as i64));
+        // socket-level cap
+        crate::dict_storage_store(ns, "SOMAXCONN", pyre_object::w_int_new(libc::SOMAXCONN as i64));
+    }
+
+    // ── htons / htonl / ntohs / ntohl ──
+    crate::dict_storage_store(
+        ns,
+        "htons",
+        crate::make_builtin_function_with_arity(
+            "htons",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("htons() missing argument"));
+                }
+                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                Ok(pyre_object::w_int_new(x.to_be() as i64))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ntohs",
+        crate::make_builtin_function_with_arity(
+            "ntohs",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("ntohs() missing argument"));
+                }
+                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                Ok(pyre_object::w_int_new(u16::from_be(x) as i64))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "htonl",
+        crate::make_builtin_function_with_arity(
+            "htonl",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("htonl() missing argument"));
+                }
+                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u32;
+                Ok(pyre_object::w_int_new(x.to_be() as i64))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ntohl",
+        crate::make_builtin_function_with_arity(
+            "ntohl",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("ntohl() missing argument"));
+                }
+                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u32;
+                Ok(pyre_object::w_int_new(u32::from_be(x) as i64))
+            },
+            1,
+        ),
+    );
+
+    // POSIX socket FFI declarations missing from libc 0.2.186.  These are
+    // universal symbols from <arpa/inet.h>, <netdb.h>, <unistd.h>; we
+    // declare them locally rather than pull in `nix` directly.
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
+        fn inet_ntoa(addr: libc::in_addr) -> *mut libc::c_char;
+        fn inet_pton(
+            af: libc::c_int,
+            src: *const libc::c_char,
+            dst: *mut libc::c_void,
+        ) -> libc::c_int;
+        fn inet_ntop(
+            af: libc::c_int,
+            src: *const libc::c_void,
+            dst: *mut libc::c_char,
+            size: libc::socklen_t,
+        ) -> *const libc::c_char;
+        fn gethostname(name: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
+        fn gethostbyname(name: *const libc::c_char) -> *mut HostentRaw;
+        fn getservbyname(
+            name: *const libc::c_char,
+            proto: *const libc::c_char,
+        ) -> *mut ServentRaw;
+        fn getservbyport(
+            port: libc::c_int,
+            proto: *const libc::c_char,
+        ) -> *mut ServentRaw;
+    }
+
+    /// Minimal mirror of `struct hostent` — we only read `h_addr_list[0]`
+    /// and `h_length`, so the rest can stay opaque.
+    #[cfg(unix)]
+    #[repr(C)]
+    #[allow(non_snake_case, dead_code)]
+    struct HostentRaw {
+        h_name: *const libc::c_char,
+        h_aliases: *mut *mut libc::c_char,
+        h_addrtype: libc::c_int,
+        h_length: libc::c_int,
+        h_addr_list: *mut *mut libc::c_char,
+    }
+
+    /// Minimal mirror of `struct servent` — we read `s_name` and `s_port`.
+    #[cfg(unix)]
+    #[repr(C)]
+    #[allow(non_snake_case, dead_code)]
+    struct ServentRaw {
+        s_name: *const libc::c_char,
+        s_aliases: *mut *mut libc::c_char,
+        s_port: libc::c_int,
+        s_proto: *const libc::c_char,
+    }
+
+    // ── inet_aton / inet_ntoa ──
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(
+            ns,
+            "inet_aton",
+            crate::make_builtin_function_with_arity(
+                "inet_aton",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "inet_aton() missing argument",
+                        ));
+                    }
+                    let s = unsafe {
+                        if !pyre_object::is_str(args[0]) {
+                            return Err(crate::PyError::type_error(
+                                "inet_aton: arg must be a string",
+                            ));
+                        }
+                        pyre_object::w_str_get_value(args[0]).to_string()
+                    };
+                    let c = std::ffi::CString::new(s.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("embedded null in argument")
+                    })?;
+                    let mut addr: libc::in_addr = unsafe { std::mem::zeroed() };
+                    let r = unsafe { inet_aton(c.as_ptr(), &mut addr) };
+                    if r == 0 {
+                        return Err(crate::PyError::os_error(
+                            "illegal IP address string passed to inet_aton",
+                        ));
+                    }
+                    let bytes = addr.s_addr.to_ne_bytes();
+                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+                },
+                1,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "inet_ntoa",
+            crate::make_builtin_function_with_arity(
+                "inet_ntoa",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "inet_ntoa() missing argument",
+                        ));
+                    }
+                    let data = unsafe {
+                        if !pyre_object::bytesobject::is_bytes_like(args[0]) {
+                            return Err(crate::PyError::type_error(
+                                "inet_ntoa: argument must be bytes-like",
+                            ));
+                        }
+                        pyre_object::bytesobject::bytes_like_data(args[0])
+                    };
+                    if data.len() != 4 {
+                        return Err(crate::PyError::os_error(
+                            "packed IP wrong length for inet_ntoa",
+                        ));
+                    }
+                    let addr = libc::in_addr {
+                        s_addr: u32::from_ne_bytes([data[0], data[1], data[2], data[3]]),
+                    };
+                    let p = unsafe { inet_ntoa(addr) };
+                    if p.is_null() {
+                        return Err(crate::PyError::os_error("inet_ntoa failed"));
+                    }
+                    let cs = unsafe { std::ffi::CStr::from_ptr(p) };
+                    Ok(pyre_object::w_str_new(&cs.to_string_lossy()))
+                },
+                1,
+            ),
+        );
+
+        // inet_pton(af, ip) → bytes
+        crate::dict_storage_store(
+            ns,
+            "inet_pton",
+            crate::make_builtin_function_with_arity(
+                "inet_pton",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "inet_pton() requires 2 arguments",
+                        ));
+                    }
+                    let af = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let ip = unsafe {
+                        if !pyre_object::is_str(args[1]) {
+                            return Err(crate::PyError::type_error(
+                                "inet_pton: address must be a string",
+                            ));
+                        }
+                        pyre_object::w_str_get_value(args[1]).to_string()
+                    };
+                    let c_ip = std::ffi::CString::new(ip.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let mut buf = [0u8; 16];
+                    let r = unsafe {
+                        inet_pton(af, c_ip.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void)
+                    };
+                    if r != 1 {
+                        return Err(crate::PyError::os_error(
+                            "illegal IP address string passed to inet_pton",
+                        ));
+                    }
+                    let n = match af {
+                        x if x == libc::AF_INET => 4,
+                        x if x == libc::AF_INET6 => 16,
+                        _ => {
+                            return Err(crate::PyError::value_error(
+                                "unknown address family",
+                            ));
+                        }
+                    };
+                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf[..n]))
+                },
+                2,
+            ),
+        );
+
+        // inet_ntop(af, packed) → str
+        crate::dict_storage_store(
+            ns,
+            "inet_ntop",
+            crate::make_builtin_function_with_arity(
+                "inet_ntop",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "inet_ntop() requires 2 arguments",
+                        ));
+                    }
+                    let af = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let data = unsafe {
+                        if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                            return Err(crate::PyError::type_error(
+                                "inet_ntop: argument must be bytes-like",
+                            ));
+                        }
+                        pyre_object::bytesobject::bytes_like_data(args[1])
+                    };
+                    let expected = match af {
+                        x if x == libc::AF_INET => 4,
+                        x if x == libc::AF_INET6 => 16,
+                        _ => {
+                            return Err(crate::PyError::value_error(
+                                "unknown address family",
+                            ));
+                        }
+                    };
+                    if data.len() != expected {
+                        return Err(crate::PyError::value_error(
+                            "invalid length of packed IP address string",
+                        ));
+                    }
+                    let mut buf = [0u8; 64];
+                    let r = unsafe {
+                        inet_ntop(
+                            af,
+                            data.as_ptr() as *const libc::c_void,
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                            buf.len() as libc::socklen_t,
+                        )
+                    };
+                    if r.is_null() {
+                        return Err(crate::PyError::os_error("inet_ntop failed"));
+                    }
+                    let s = unsafe { std::ffi::CStr::from_ptr(r) };
+                    Ok(pyre_object::w_str_new(&s.to_string_lossy()))
+                },
+                2,
+            ),
+        );
+
+        // gethostname() → str
+        crate::dict_storage_store(
+            ns,
+            "gethostname",
+            crate::make_builtin_function_with_arity(
+                "gethostname",
+                |_| {
+                    let mut buf = [0u8; 256];
+                    let r = unsafe {
+                        gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+                    };
+                    if r != 0 {
+                        return Err(crate::PyError::os_error_with_errno(
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                            "gethostname",
+                        ));
+                    }
+                    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                    Ok(pyre_object::w_str_new(
+                        &String::from_utf8_lossy(&buf[..end]),
+                    ))
+                },
+                0,
+            ),
+        );
+
+        // sethostname(name) → None  (host_env::socket-backed)
+        #[cfg(feature = "host_env")]
+        crate::dict_storage_store(
+            ns,
+            "sethostname",
+            crate::make_builtin_function_with_arity(
+                "sethostname",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "sethostname() requires 1 argument",
+                        ));
+                    }
+                    let name = unsafe {
+                        if !pyre_object::is_str(args[0]) {
+                            return Err(crate::PyError::type_error(
+                                "sethostname: name must be a string",
+                            ));
+                        }
+                        pyre_object::w_str_get_value(args[0]).to_string()
+                    };
+                    rustpython_host_env::socket::sethostname(&name).map_err(|e| {
+                        crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("sethostname: {e}"),
+                        )
+                    })?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // gethostbyname(name) → ip_string  (gethostbyname)
+        crate::dict_storage_store(
+            ns,
+            "gethostbyname",
+            crate::make_builtin_function_with_arity(
+                "gethostbyname",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "gethostbyname() missing argument",
+                        ));
+                    }
+                    let name = unsafe {
+                        if !pyre_object::is_str(args[0]) {
+                            return Err(crate::PyError::type_error(
+                                "gethostbyname: arg must be a string",
+                            ));
+                        }
+                        pyre_object::w_str_get_value(args[0]).to_string()
+                    };
+                    let c = std::ffi::CString::new(name.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let he = unsafe { gethostbyname(c.as_ptr()) };
+                    if he.is_null() {
+                        return Err(crate::PyError::os_error(format!(
+                            "gethostbyname failed for {name}"
+                        )));
+                    }
+                    unsafe {
+                        let h = &*he;
+                        if h.h_length != 4 || (*h.h_addr_list).is_null() {
+                            return Err(crate::PyError::os_error(
+                                "gethostbyname: no IPv4 address",
+                            ));
+                        }
+                        let addr_ptr = *h.h_addr_list;
+                        let addr = libc::in_addr {
+                            s_addr: *(addr_ptr as *const u32),
+                        };
+                        let p = inet_ntoa(addr);
+                        Ok(pyre_object::w_str_new(
+                            &std::ffi::CStr::from_ptr(p).to_string_lossy(),
+                        ))
+                    }
+                },
+                1,
+            ),
+        );
+
+        // getservbyname(name[, proto]) → port
+        crate::dict_storage_store(
+            ns,
+            "getservbyname",
+            crate::make_builtin_function("getservbyname", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "getservbyname() missing argument",
+                    ));
+                }
+                let name = unsafe {
+                    if !pyre_object::is_str(args[0]) {
+                        return Err(crate::PyError::type_error(
+                            "getservbyname: name must be a string",
+                        ));
+                    }
+                    pyre_object::w_str_get_value(args[0]).to_string()
+                };
+                let c_name = std::ffi::CString::new(name.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                    && unsafe { pyre_object::is_str(args[1]) }
+                {
+                    let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                    Some(
+                        std::ffi::CString::new(p.as_bytes())
+                            .map_err(|_| crate::PyError::value_error("embedded null"))?,
+                    )
+                } else {
+                    None
+                };
+                let p = unsafe {
+                    getservbyname(
+                        c_name.as_ptr(),
+                        proto_c
+                            .as_ref()
+                            .map(|c| c.as_ptr())
+                            .unwrap_or(std::ptr::null()),
+                    )
+                };
+                if p.is_null() {
+                    return Err(crate::PyError::os_error(format!(
+                        "service/proto not found: {name}"
+                    )));
+                }
+                let port = unsafe { u16::from_be((*p).s_port as u16) };
+                Ok(pyre_object::w_int_new(port as i64))
+            }),
+        );
+
+        // getservbyport(port[, proto]) → name
+        crate::dict_storage_store(
+            ns,
+            "getservbyport",
+            crate::make_builtin_function("getservbyport", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "getservbyport() missing argument",
+                    ));
+                }
+                let port = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                    && unsafe { pyre_object::is_str(args[1]) }
+                {
+                    let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                    Some(
+                        std::ffi::CString::new(p.as_bytes())
+                            .map_err(|_| crate::PyError::value_error("embedded null"))?,
+                    )
+                } else {
+                    None
+                };
+                let p = unsafe {
+                    getservbyport(
+                        port.to_be() as libc::c_int,
+                        proto_c
+                            .as_ref()
+                            .map(|c| c.as_ptr())
+                            .unwrap_or(std::ptr::null()),
+                    )
+                };
+                if p.is_null() {
+                    return Err(crate::PyError::os_error(format!(
+                        "port/proto not found: {port}"
+                    )));
+                }
+                let name =
+                    unsafe { std::ffi::CStr::from_ptr((*p).s_name).to_string_lossy().into_owned() };
+                Ok(pyre_object::w_str_new(&name))
+            }),
+        );
+    }
+
+    // Exception aliases.  pyre doesn't yet model exception subclassing
+    // for builtins so these are just type-stubs the stdlib can `isinstance`-
+    // gate without crashing.
+    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "gaierror", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "herror", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "timeout", crate::typedef::w_object());
+
+    // Default timeout (None) — modulus has a getter/setter; we just stash
+    // a None so attribute lookups succeed.
+    crate::dict_storage_store(ns, "_default_timeout", pyre_object::w_none());
+}
 
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
 /// actually run the registered callbacks on shutdown yet; `register` accepts
