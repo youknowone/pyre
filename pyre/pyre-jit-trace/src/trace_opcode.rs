@@ -2352,9 +2352,18 @@ impl MIFrame {
         // stack_base`, leaving the resumed PyFrame with vsd ≤ stack_base
         // and crashing the next pop. Recompute from the per-PC user-side
         // depth metadata derived in `install_portal_for` (G.4.2).
-        let vsd = self
-            .portal_bridge_vable_vsd(resume_pc)
-            .unwrap_or_else(|| self.sym().valuestackdepth as i64);
+        //
+        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // read from the concrete `PyFrame.valuestackdepth` rather than the
+        // stale `sym.valuestackdepth`.  `resume_pc == self.orgpc` (the
+        // start PC of the current opcode) so PyFrame holds the correct
+        // pre-opcode value (the interpreter step for this opcode has not
+        // run yet).  Falls back to the symbolic value only when
+        // `concrete_frame_addr == 0` (test-only sym-only MIFrames).
+        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
+            self.concrete_valuestackdepth()
+                .unwrap_or_else(|| self.sym().valuestackdepth) as i64
+        });
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
