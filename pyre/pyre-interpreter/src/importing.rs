@@ -2971,6 +2971,51 @@ struct ServentRaw {
 /// is the next slice (S2).  Until then `import socket` succeeds and the
 /// constants/helpers above are usable, but `socket.socket(...)` raises
 /// the C-extension stub error.
+
+/// `interp_socket.py:1066-1084 converted_error` — turn an rsocket
+/// `SocketError` subclass into the matching python-level exception.
+///
+/// `applevelerrcls` matches the field defined on each rsocket error
+/// class (`rpython/rlib/rsocket.py:1316/1360/1372/1383`):
+///   "error"    → builtin `OSError`
+///   "gaierror" → `_socket.gaierror` (OSError subclass)
+///   "herror"   → `_socket.herror`   (OSError subclass)
+///   "timeout"  → builtin `TimeoutError` (per `get_error()` line 1062-3,
+///                NOT the `_socket.timeout` attribute, which is a
+///                separate OSError subclass exposed for `isinstance` use)
+///
+/// When `errno` is `Some`, builds the exception with `(errno, message)`
+/// like `SocketErrorWithErrno` (`interp_socket.py:1074-1075`); otherwise
+/// only `(message,)` like the plain SocketError (`:1077-1078`).
+#[cfg(unix)]
+fn socket_converted_error(
+    applevelerrcls: &str,
+    errno: Option<i32>,
+    message: &str,
+) -> crate::PyError {
+    let cls = match applevelerrcls {
+        "timeout" => crate::builtins::lookup_exc_class("TimeoutError"),
+        "gaierror" => crate::builtins::lookup_exc_class("_socket.gaierror"),
+        "herror" => crate::builtins::lookup_exc_class("_socket.herror"),
+        _ => crate::builtins::lookup_exc_class("OSError"),
+    }
+    .or_else(|| crate::builtins::lookup_exc_class("OSError"))
+    .expect("OSError must be installed");
+
+    let mut args = vec![cls];
+    if let Some(e) = errno {
+        args.push(pyre_object::w_int_new(e as i64));
+    }
+    args.push(pyre_object::w_str_new(message));
+
+    let exc = crate::builtins::exc_exception_new(&args)
+        .expect("exc_exception_new is infallible for str/int args");
+
+    let mut err = crate::PyError::os_error(message);
+    err.exc_object = exc;
+    err
+}
+
 fn init_socket(ns: &mut DictStorage) {
     // ── Constants ──
     #[cfg(unix)]
@@ -3645,14 +3690,20 @@ fn init_socket(ns: &mut DictStorage) {
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
                     let he = unsafe { gethostbyname(c.as_ptr()) };
                     if he.is_null() {
-                        return Err(crate::PyError::os_error(format!(
-                            "gethostbyname failed for {name}"
-                        )));
+                        return Err(socket_converted_error(
+                            "gaierror",
+                            None,
+                            &format!("gethostbyname failed for {name}"),
+                        ));
                     }
                     unsafe {
                         let h = &*he;
                         if h.h_length != 4 || (*h.h_addr_list).is_null() {
-                            return Err(crate::PyError::os_error("gethostbyname: no IPv4 address"));
+                            return Err(socket_converted_error(
+                                "gaierror",
+                                None,
+                                "gethostbyname: no IPv4 address",
+                            ));
                         }
                         let addr_ptr = *h.h_addr_list;
                         let addr = libc::in_addr {
@@ -3708,9 +3759,11 @@ fn init_socket(ns: &mut DictStorage) {
                     )
                 };
                 if p.is_null() {
-                    return Err(crate::PyError::os_error(format!(
-                        "service/proto not found: {name}"
-                    )));
+                    return Err(socket_converted_error(
+                        "error",
+                        None,
+                        &format!("service/proto not found: {name}"),
+                    ));
                 }
                 let port = unsafe { u16::from_be((*p).s_port as u16) };
                 Ok(pyre_object::w_int_new(port as i64))
@@ -3748,9 +3801,11 @@ fn init_socket(ns: &mut DictStorage) {
                     )
                 };
                 if p.is_null() {
-                    return Err(crate::PyError::os_error(format!(
-                        "port/proto not found: {port}"
-                    )));
+                    return Err(socket_converted_error(
+                        "error",
+                        None,
+                        &format!("port/proto not found: {port}"),
+                    ));
                 }
                 let name = unsafe {
                     std::ffi::CStr::from_ptr((*p).s_name)
