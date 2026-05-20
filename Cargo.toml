@@ -53,6 +53,7 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
 rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "b5ff41c2196f6c80d8d01812608daba7085c0f2b" }
 rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "b5ff41c2196f6c80d8d01812608daba7085c0f2b" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "b5ff41c2196f6c80d8d01812608daba7085c0f2b" }
 sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "b5ff41c2196f6c80d8d01812608daba7085c0f2b" }
 
 # majit JIT framework
