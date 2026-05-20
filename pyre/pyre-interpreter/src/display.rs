@@ -473,10 +473,18 @@ unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> i64 {
 ///     ...
 /// return "can't translate characters in position %d-%d: %s"
 /// ```
+///
+/// PyPy's `self.object is None` covers both the never-set state
+/// (class-default `w_object = None`) and a writer-driven
+/// `e.object = None` mutation through `readwrite_attrproperty_w`.
+/// Both shapes resolve to `space.w_None`; pyre stores `PY_NULL` for
+/// the never-set case and the runtime `w_none()` singleton for an
+/// explicit `None` assignment.  Treat either as the unset signal so
+/// `str(e)` mirrors PyPy after `e.object = None`.
 unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
     unsafe {
         let w_object = pyre_object::excobject::w_exception_get_object(obj);
-        if w_object.is_null() {
+        if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
         let start = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
@@ -539,7 +547,7 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
 unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
     unsafe {
         let w_object = pyre_object::excobject::w_exception_get_object(obj);
-        if w_object.is_null() {
+        if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
         let w_encoding = pyre_object::excobject::w_exception_get_encoding(obj);
@@ -581,7 +589,7 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
 unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
     unsafe {
         let w_object = pyre_object::excobject::w_exception_get_object(obj);
-        if w_object.is_null() {
+        if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
         let w_encoding = pyre_object::excobject::w_exception_get_encoding(obj);

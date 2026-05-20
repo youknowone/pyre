@@ -2191,12 +2191,18 @@ impl TraceCtx {
     /// skip their own checks.
     pub fn trace_assert_not_none(&mut self, opref: OpRef, concrete: i64) {
         // pyjitpl.py:387 `if self.metainterp.heapcache.is_nullity_known(box):`
-        // — cache hit short-circuits BEFORE `self.execute(...)` would
-        // invoke the executor.  RPython's `executor.do_assert_not_none`
-        // (executor.py:344-346) `fatalerror` therefore only fires on
-        // cache miss; pyre's inline null-assert below must match that
-        // ordering to avoid spuriously aborting traces whose first
-        // `assert_not_none` proves nullity for subsequent occurrences.
+        // — RPython's `is_nullity_known` (heapcache.py:475-478) returns
+        // `bool(box.getref_base())` for `Const` and `_check_flag(...
+        // HF_KNOWN_NULLITY)` otherwise.  `class_now_known` sets
+        // `HF_KNOWN_NULLITY` alongside `HF_KNOWN_CLASS` (line 470-473),
+        // so the flag semantically means "known to be non-null".
+        // The `if`-test therefore short-circuits only on truthy values
+        // — `Const` known-null returns `False` and falls through to
+        // `executor.do_assert_not_none`, which `fatalerror`s on null
+        // (executor.py:344-346).  Pyre's `is_nullity_known` returns
+        // `Some(true)` for known non-null, `Some(false)` for known
+        // null, `None` for unknown — match PyPy's semantics by
+        // short-circuiting only on `Some(true)`.
         let known = self.heap_cache.is_nullity_known(opref, |op| {
             self.constants.get_value(op).and_then(|v| match v {
                 Value::Int(n) => Some(n),
@@ -2204,7 +2210,7 @@ impl TraceCtx {
                 _ => None,
             })
         });
-        if known.is_some() {
+        if known == Some(true) {
             self.profiler().count_ops(
                 OpCode::AssertNotNone,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,

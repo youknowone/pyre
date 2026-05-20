@@ -495,27 +495,30 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "UnicodeDecodeError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeDecodeError",
             exc_unicode_decode_error_new,
+            Some(exc_unicode_decode_error_init),
             unicode_error,
         ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeEncodeError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeEncodeError",
             exc_unicode_encode_error_new,
+            Some(exc_unicode_encode_error_init),
             unicode_error,
         ),
     );
     crate::dict_storage_store(
         namespace,
         "UnicodeTranslateError",
-        make_exc_type(
+        make_exc_type_with_init(
             "UnicodeTranslateError",
             exc_unicode_translate_error_new,
+            Some(exc_unicode_translate_error_init),
             unicode_error,
         ),
     );
@@ -1351,6 +1354,50 @@ exc_constructor!(
     exc_unicode_error,
     pyre_object::excobject::ExcKind::UnicodeError
 );
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
+/// applied to UnicodeTranslateError: allocate the W_ExceptionObject
+/// and store the raw constructor args verbatim into `args_w`.  PyPy's
+/// `_new` runs no per-arg validation — type checks live in
+/// `descr_init` (line 433-445) and only fire when `__init__` is
+/// invoked by the type-call protocol after `__new__`.  Pyre's
+/// type-call (call.rs:982-996) routes through that same `__new__` ⇒
+/// `__init__` sequence, so `__new__` here can stay validation-free.
+fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeTranslateError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// for UnicodeDecodeError — allocation + raw args_w only.  Encoding,
+/// object, start/end/reason type checks happen in `descr_init` at
+/// `:1041-1059`.
+fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// for UnicodeEncodeError — allocation + raw args_w only.
+fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    Ok(exc)
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py:433-445
 /// W_UnicodeTranslateError.descr_init` —
 ///
@@ -1364,20 +1411,20 @@ exc_constructor!(
 ///         [w_object, w_start, w_end, w_reason])
 /// ```
 ///
-/// The four positional arguments are typed: `w_object` is a `str`,
-/// `w_start`/`w_end` are `int`s, `w_reason` is a `str`.  PyPy raises
-/// `TypeError` from the `*_w` typechecks when the caller passes the
-/// wrong shape; pyre mirrors that via `PyError::type_error`.
-fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 4 {
+/// PyPy's `*_w` helpers raise `TypeError` from the typechecks; pyre
+/// mirrors via `PyError::type_error`.
+fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 5 {
+        // first arg is `self`; PyPy reports argcount excluding `self`.
         return Err(crate::PyError::type_error(
             "function takes exactly 4 arguments",
         ));
     }
-    let w_object = args[0];
-    let w_start = args[1];
-    let w_end = args[2];
-    let w_reason = args[3];
+    let w_self = args[0];
+    let w_object = args[1];
+    let w_start = args[2];
+    let w_end = args[3];
+    let w_reason = args[4];
     unsafe {
         if w_object.is_null() || !pyre_object::is_str(w_object) {
             return Err(crate::PyError::type_error(
@@ -1395,20 +1442,19 @@ fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 "argument 4 must be str, not other",
             ));
         }
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        // `W_BaseException.descr_init(self, space, [w_object, w_start,
+        // w_end, w_reason])` → `self.args_w = args_w`.  The
+        // `W_ExceptionObject.args_w` slot already carries the same
+        // tuple shape from `__new__`, so we re-stamp it from the
+        // bound init args here for parity with PyPy line 444-445.
+        let args_list = pyre_object::w_list_new(vec![w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
     }
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeTranslateError,
-        "",
-    );
-    let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe {
-        pyre_object::excobject::w_exception_set_args(exc, args_list);
-        pyre_object::excobject::w_exception_set_object(exc, w_object);
-        pyre_object::excobject::w_exception_set_start(exc, w_start);
-        pyre_object::excobject::w_exception_set_end(exc, w_end);
-        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
-    }
-    Ok(exc)
+    Ok(pyre_object::w_none())
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py:1041-1059
@@ -1416,19 +1462,19 @@ fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 /// w_end, w_reason)`.  `w_object` may be `bytearray`; PyPy coerces it
 /// via `space.newbytes(space.charbuf_w(w_object))` before storing.
 /// Pyre accepts either `bytes` or `bytearray` and stores the coerced
-/// `bytes` object so reads of `e.object` round-trip as `bytes` per
-/// PyPy.
-fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 5 {
+/// `bytes` so reads of `e.object` round-trip as `bytes` per PyPy.
+fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 6 {
         return Err(crate::PyError::type_error(
             "function takes exactly 5 arguments",
         ));
     }
-    let w_encoding = args[0];
-    let w_object_in = args[1];
-    let w_start = args[2];
-    let w_end = args[3];
-    let w_reason = args[4];
+    let w_self = args[0];
+    let w_encoding = args[1];
+    let w_object_in = args[2];
+    let w_start = args[3];
+    let w_end = args[4];
+    let w_reason = args[5];
     unsafe {
         if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
             return Err(crate::PyError::type_error(
@@ -1451,48 +1497,45 @@ fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 "argument 5 must be str, not other",
             ));
         }
-    }
-    // `interp_exceptions.py:1043-1046` — bytearray gets re-wrapped as
-    // bytes for storage so `e.object` reads bytes.
-    let w_object = unsafe {
-        if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
+        let w_object = if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
             let data = pyre_object::bytes_like_data(w_object_in);
             pyre_object::w_bytes_from_bytes(data)
         } else {
             w_object_in
-        }
-    };
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeDecodeError,
-        "",
-    );
-    let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe {
-        pyre_object::excobject::w_exception_set_args(exc, args_list);
-        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
-        pyre_object::excobject::w_exception_set_object(exc, w_object);
-        pyre_object::excobject::w_exception_set_start(exc, w_start);
-        pyre_object::excobject::w_exception_set_end(exc, w_end);
-        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+        };
+        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        // `interp_exceptions.py:1058-1059` — the args list passed to
+        // `W_BaseException.descr_init` is the un-coerced
+        // `[w_encoding, w_object, w_start, w_end, w_reason]`, so PyPy
+        // preserves the original `bytearray` in `e.args[1]` while
+        // storing the coerced `bytes` in `e.object`.
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object_in, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
     }
-    Ok(exc)
+    Ok(pyre_object::w_none())
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py:1159-1173
 /// W_UnicodeEncodeError.descr_init` — `(w_encoding, w_object, w_start,
 /// w_end, w_reason)`.  Encoding errors require `w_object` to be a
 /// `str` (`space.realutf8_w`).
-fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 5 {
+fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 6 {
         return Err(crate::PyError::type_error(
             "function takes exactly 5 arguments",
         ));
     }
-    let w_encoding = args[0];
-    let w_object = args[1];
-    let w_start = args[2];
-    let w_end = args[3];
-    let w_reason = args[4];
+    let w_self = args[0];
+    let w_encoding = args[1];
+    let w_object = args[2];
+    let w_start = args[3];
+    let w_end = args[4];
+    let w_reason = args[5];
     unsafe {
         if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
             return Err(crate::PyError::type_error(
@@ -1515,21 +1558,16 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 "argument 5 must be str, not other",
             ));
         }
+        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::excobject::w_exception_set_object(w_self, w_object);
+        pyre_object::excobject::w_exception_set_start(w_self, w_start);
+        pyre_object::excobject::w_exception_set_end(w_self, w_end);
+        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        let args_list =
+            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        pyre_object::excobject::w_exception_set_args(w_self, args_list);
     }
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeEncodeError,
-        "",
-    );
-    let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe {
-        pyre_object::excobject::w_exception_set_args(exc, args_list);
-        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
-        pyre_object::excobject::w_exception_set_object(exc, w_object);
-        pyre_object::excobject::w_exception_set_start(exc, w_start);
-        pyre_object::excobject::w_exception_set_end(exc, w_end);
-        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
-    }
-    Ok(exc)
+    Ok(pyre_object::w_none())
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
@@ -1580,10 +1618,34 @@ fn make_exc_type(
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
 ) -> PyObjectRef {
+    make_exc_type_with_init(name, new_fn, None, base)
+}
+
+/// Variant of `make_exc_type` that also installs a per-class `__init__`
+/// descriptor.  Used for the three Unicode*Error subclasses whose PyPy
+/// `descr_init` does typed slot stamping after `__new__`'s raw
+/// `args_w` capture (`interp_exceptions.py:433-445`, `:1041-1059`,
+/// `:1159-1173`).  Without this split, every direct
+/// `UnicodeDecodeError.__new__(cls, *args)` call would inherit the
+/// typechecking that PyPy keeps confined to `descr_init` — see
+/// `_new` at `:274-284` (no per-arg validation).
+fn make_exc_type_with_init(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    init_fn: Option<crate::gateway::BuiltinCodeFn>,
+    base: PyObjectRef,
+) -> PyObjectRef {
     let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
             crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+            if let Some(init_fn) = init_fn {
+                crate::dict_storage_store(
+                    ns,
+                    "__init__",
+                    make_builtin_function("__init__", init_fn),
+                );
+            }
             // `pypy/module/exceptions/interp_exceptions.py:225-235`
             // `BaseException.with_traceback` — installed on every
             // builtin exception class so MRO lookup from a subclass
