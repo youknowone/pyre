@@ -22,7 +22,14 @@ use super::super::flowspace::model::{
 use super::bookkeeper::Bookkeeper;
 use super::model::{SomeValue, TLS, UnionError, unionof};
 use super::policy::{AnnotatorPolicy, PolicyHandle};
+use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::translator::TranslationContext;
+
+/// RPython `annrpython.py:18 log = py.log.Producer("annrpython")`.
+/// Upstream uses `py.log` which Pyre approximates with [`AnsiLogger`]
+/// (`rpython/tool/ansi_print.py` parity port); both unconditionally
+/// route output to stderr.
+pub static LOG: AnsiLogger = AnsiLogger::new("annrpython");
 
 /// RPython `class RPythonAnnotator(object)` (annrpython.py:22).
 ///
@@ -471,11 +478,13 @@ impl RPythonAnnotator {
     /// Driver-level logging. Non-ported methods (`build_types`,
     /// `complete`, `processblock`, ...) land with Commit 7 Part A.
     pub fn warning(&self, msg: &str) {
-        // RPython `warning()` routes through `log.WARNING`, an unconditional
-        // diagnostic channel — not the PYPYLOG-gated `debug_print`.  Match
-        // the unconditional behavior so annotator warnings remain visible
-        // without setting `MAJIT_LOG`.
-        eprintln!("[annrpython warning] {msg}");
+        // RPython `annrpython.py:303 log.WARNING("%s/ %s" % (pos, msg))`.
+        // `log` is `py.log.Producer("annrpython")`, an unconditional
+        // diagnostic channel — not the PYPYLOG-gated `debug_print`.
+        // Pyre routes through the `AnsiLogger("annrpython")` port so the
+        // output shape `[annrpython:WARNING] msg` matches upstream's
+        // `_make_method(':WARNING', ...)` emission.
+        LOG.WARNING(msg);
     }
 
     /// Install `self.bookkeeper` into `TLS.bookkeeper` — mirrors
