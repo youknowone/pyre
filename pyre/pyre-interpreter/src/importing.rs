@@ -9821,6 +9821,334 @@ fn init_posix(ns: &mut DictStorage) {
             crate::dict_storage_store(ns, "POSIX_SPAWN_CLOSE", pyre_object::w_int_new(1));
             crate::dict_storage_store(ns, "POSIX_SPAWN_DUP2", pyre_object::w_int_new(2));
         }
+
+        // os.ttyname(fd) -> str
+        crate::dict_storage_store(
+            ns,
+            "ttyname",
+            crate::make_builtin_function_with_arity(
+                "ttyname",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("ttyname() requires fd"));
+                    }
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let name = host_posix::ttyname(bfd).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_str_new(&name.to_string_lossy()))
+                },
+                1,
+            ),
+        );
+
+        // os.tcgetpgrp(fd) -> pgid
+        crate::dict_storage_store(
+            ns,
+            "tcgetpgrp",
+            crate::make_builtin_function_with_arity(
+                "tcgetpgrp",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("tcgetpgrp() requires fd"));
+                    }
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    let pgid = host_posix::tcgetpgrp(bfd).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(pgid as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.tcsetpgrp(fd, pgid) -> None
+        crate::dict_storage_store(
+            ns,
+            "tcsetpgrp",
+            crate::make_builtin_function_with_arity(
+                "tcsetpgrp",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "tcsetpgrp() requires fd, pgid",
+                        ));
+                    }
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let pgid = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::pid_t;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    host_posix::tcsetpgrp(bfd, pgid).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.getpriority(which, who) -> int
+        crate::dict_storage_store(
+            ns,
+            "getpriority",
+            crate::make_builtin_function_with_arity(
+                "getpriority",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "getpriority() requires which, who",
+                        ));
+                    }
+                    let which = (unsafe { pyre_object::w_int_get_value(args[0]) })
+                        as host_posix::PriorityWhichType;
+                    let who = (unsafe { pyre_object::w_int_get_value(args[1]) })
+                        as host_posix::PriorityWhoType;
+                    let prio = host_posix::getpriority(which, who).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(prio as i64))
+                },
+                2,
+            ),
+        );
+
+        // os.setpriority(which, who, priority) -> None
+        crate::dict_storage_store(
+            ns,
+            "setpriority",
+            crate::make_builtin_function_with_arity(
+                "setpriority",
+                |args| {
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error(
+                            "setpriority() requires which, who, priority",
+                        ));
+                    }
+                    let which = (unsafe { pyre_object::w_int_get_value(args[0]) })
+                        as host_posix::PriorityWhichType;
+                    let who = (unsafe { pyre_object::w_int_get_value(args[1]) })
+                        as host_posix::PriorityWhoType;
+                    let prio = (unsafe { pyre_object::w_int_get_value(args[2]) }) as i32;
+                    host_posix::setpriority(which, who, prio).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                3,
+            ),
+        );
+
+        crate::dict_storage_store(
+            ns,
+            "PRIO_PROCESS",
+            pyre_object::w_int_new(libc::PRIO_PROCESS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PRIO_PGRP",
+            pyre_object::w_int_new(libc::PRIO_PGRP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PRIO_USER",
+            pyre_object::w_int_new(libc::PRIO_USER as i64),
+        );
+
+        // os.pathconf(path, name) -> int | None
+        crate::dict_storage_store(
+            ns,
+            "pathconf",
+            crate::make_builtin_function_with_arity(
+                "pathconf",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "pathconf() requires path, name",
+                        ));
+                    }
+                    let path = extract_path(args[0])?;
+                    let cpath = std::ffi::CString::new(path.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("pathconf: embedded null in path")
+                    })?;
+                    let name = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    match host_posix::pathconf(&cpath, name).map_err(|e| io_err(e, ""))? {
+                        Some(v) => Ok(pyre_object::w_int_new(v as i64)),
+                        None => Ok(pyre_object::w_none()),
+                    }
+                },
+                2,
+            ),
+        );
+
+        // os.fpathconf(fd, name) -> int | None
+        crate::dict_storage_store(
+            ns,
+            "fpathconf",
+            crate::make_builtin_function_with_arity(
+                "fpathconf",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "fpathconf() requires fd, name",
+                        ));
+                    }
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let name = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    match host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))? {
+                        Some(v) => Ok(pyre_object::w_int_new(v as i64)),
+                        None => Ok(pyre_object::w_none()),
+                    }
+                },
+                2,
+            ),
+        );
+
+        // os.sysconf(name) -> int
+        crate::dict_storage_store(
+            ns,
+            "sysconf",
+            crate::make_builtin_function_with_arity(
+                "sysconf",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("sysconf() requires name"));
+                    }
+                    let name = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let v = host_posix::sysconf(name).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(v as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.initgroups(username, gid) -> None
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        crate::dict_storage_store(
+            ns,
+            "initgroups",
+            crate::make_builtin_function_with_arity(
+                "initgroups",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "initgroups() requires username, gid",
+                        ));
+                    }
+                    let user = unsafe {
+                        if pyre_object::is_str(args[0]) {
+                            pyre_object::w_str_get_value(args[0]).to_string()
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "initgroups(): username must be str",
+                            ));
+                        }
+                    };
+                    let cuser = std::ffi::CString::new(user.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("initgroups: embedded null in username")
+                    })?;
+                    let gid = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
+                    host_posix::initgroups(&cuser, gid).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.openpty() -> (master_fd, slave_fd)
+        crate::dict_storage_store(
+            ns,
+            "openpty",
+            crate::make_builtin_function_with_arity(
+                "openpty",
+                |_| {
+                    use std::os::fd::IntoRawFd;
+                    let (master, slave) = host_posix::openpty().map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(master.into_raw_fd() as i64),
+                        pyre_object::w_int_new(slave.into_raw_fd() as i64),
+                    ]))
+                },
+                0,
+            ),
+        );
+
+        // os.getresuid() -> (ruid, euid, suid)
+        #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
+        crate::dict_storage_store(
+            ns,
+            "getresuid",
+            crate::make_builtin_function_with_arity(
+                "getresuid",
+                |_| {
+                    let (r, e, s) = host_posix::getresuid().map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(r as i64),
+                        pyre_object::w_int_new(e as i64),
+                        pyre_object::w_int_new(s as i64),
+                    ]))
+                },
+                0,
+            ),
+        );
+
+        // os.getresgid() -> (rgid, egid, sgid)
+        #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
+        crate::dict_storage_store(
+            ns,
+            "getresgid",
+            crate::make_builtin_function_with_arity(
+                "getresgid",
+                |_| {
+                    let (r, e, s) = host_posix::getresgid().map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(r as i64),
+                        pyre_object::w_int_new(e as i64),
+                        pyre_object::w_int_new(s as i64),
+                    ]))
+                },
+                0,
+            ),
+        );
+
+        // os.setresuid(ruid, euid, suid) -> None
+        #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        crate::dict_storage_store(
+            ns,
+            "setresuid",
+            crate::make_builtin_function_with_arity(
+                "setresuid",
+                |args| {
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error(
+                            "setresuid() requires ruid, euid, suid",
+                        ));
+                    }
+                    let r = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
+                    let e = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
+                    let s = (unsafe { pyre_object::w_int_get_value(args[2]) }) as u32;
+                    host_posix::setresuid(r, e, s).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                3,
+            ),
+        );
+
+        // os.setresgid(rgid, egid, sgid) -> None
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        crate::dict_storage_store(
+            ns,
+            "setresgid",
+            crate::make_builtin_function_with_arity(
+                "setresgid",
+                |args| {
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error(
+                            "setresgid() requires rgid, egid, sgid",
+                        ));
+                    }
+                    let r = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
+                    let e = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
+                    let s = (unsafe { pyre_object::w_int_get_value(args[2]) }) as u32;
+                    host_posix::setresgid(r, e, s).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                3,
+            ),
+        );
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
