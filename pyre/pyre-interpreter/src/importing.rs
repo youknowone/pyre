@@ -3126,365 +3126,239 @@ fn socket_converted_error(
 }
 
 fn init_socket(ns: &mut DictStorage) {
-    // ── Constants ──
+    // `_rsocket_rffi.py:140-220 constant_names` + `:234-262
+    // constants_w_defaults` — populated through the libc crate where
+    // available, hardcoded for platform-specific constants the crate
+    // does not expose.  Mirrors PyPy's
+    // `for constant, value in rsocket.constants.iteritems(): wrap(value)`
+    // loop in `_socket/moduledef.py:48-50`.
     #[cfg(unix)]
     {
-        // Address families
-        crate::dict_storage_store(
-            ns,
-            "AF_UNSPEC",
-            pyre_object::w_int_new(libc::AF_UNSPEC as i64),
-        );
-        crate::dict_storage_store(ns, "AF_UNIX", pyre_object::w_int_new(libc::AF_UNIX as i64));
-        crate::dict_storage_store(ns, "AF_INET", pyre_object::w_int_new(libc::AF_INET as i64));
-        crate::dict_storage_store(
-            ns,
-            "AF_INET6",
-            pyre_object::w_int_new(libc::AF_INET6 as i64),
-        );
-        // Socket types
-        crate::dict_storage_store(
-            ns,
-            "SOCK_STREAM",
-            pyre_object::w_int_new(libc::SOCK_STREAM as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SOCK_DGRAM",
-            pyre_object::w_int_new(libc::SOCK_DGRAM as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SOCK_RAW",
-            pyre_object::w_int_new(libc::SOCK_RAW as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SOCK_RDM",
-            pyre_object::w_int_new(libc::SOCK_RDM as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SOCK_SEQPACKET",
-            pyre_object::w_int_new(libc::SOCK_SEQPACKET as i64),
-        );
-        // Protocols
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_IP",
-            pyre_object::w_int_new(libc::IPPROTO_IP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_TCP",
-            pyre_object::w_int_new(libc::IPPROTO_TCP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_UDP",
-            pyre_object::w_int_new(libc::IPPROTO_UDP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_ICMP",
-            pyre_object::w_int_new(libc::IPPROTO_ICMP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_ICMPV6",
-            pyre_object::w_int_new(libc::IPPROTO_ICMPV6 as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_RAW",
-            pyre_object::w_int_new(libc::IPPROTO_RAW as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPPROTO_IPV6",
-            pyre_object::w_int_new(libc::IPPROTO_IPV6 as i64),
-        );
-        // Special addresses (host byte order — Python keeps them this way)
-        crate::dict_storage_store(
-            ns,
-            "INADDR_ANY",
-            pyre_object::w_int_new(libc::INADDR_ANY as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "INADDR_LOOPBACK",
-            pyre_object::w_int_new(libc::INADDR_LOOPBACK as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "INADDR_BROADCAST",
-            pyre_object::w_int_new(libc::INADDR_BROADCAST as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "INADDR_NONE",
-            pyre_object::w_int_new(libc::INADDR_NONE as i64),
-        );
-        // setsockopt levels and options
-        crate::dict_storage_store(
-            ns,
-            "SOL_SOCKET",
-            pyre_object::w_int_new(libc::SOL_SOCKET as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_REUSEADDR",
-            pyre_object::w_int_new(libc::SO_REUSEADDR as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_KEEPALIVE",
-            pyre_object::w_int_new(libc::SO_KEEPALIVE as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_BROADCAST",
-            pyre_object::w_int_new(libc::SO_BROADCAST as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_DEBUG",
-            pyre_object::w_int_new(libc::SO_DEBUG as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_DONTROUTE",
-            pyre_object::w_int_new(libc::SO_DONTROUTE as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_LINGER",
-            pyre_object::w_int_new(libc::SO_LINGER as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_OOBINLINE",
-            pyre_object::w_int_new(libc::SO_OOBINLINE as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_RCVBUF",
-            pyre_object::w_int_new(libc::SO_RCVBUF as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_SNDBUF",
-            pyre_object::w_int_new(libc::SO_SNDBUF as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_RCVTIMEO",
-            pyre_object::w_int_new(libc::SO_RCVTIMEO as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_SNDTIMEO",
-            pyre_object::w_int_new(libc::SO_SNDTIMEO as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_RCVLOWAT",
-            pyre_object::w_int_new(libc::SO_RCVLOWAT as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_SNDLOWAT",
-            pyre_object::w_int_new(libc::SO_SNDLOWAT as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "SO_ERROR",
-            pyre_object::w_int_new(libc::SO_ERROR as i64),
-        );
-        crate::dict_storage_store(ns, "SO_TYPE", pyre_object::w_int_new(libc::SO_TYPE as i64));
-        crate::dict_storage_store(
-            ns,
-            "SO_ACCEPTCONN",
-            pyre_object::w_int_new(libc::SO_ACCEPTCONN as i64),
-        );
-        // TCP-level
-        crate::dict_storage_store(
-            ns,
-            "TCP_NODELAY",
-            pyre_object::w_int_new(libc::TCP_NODELAY as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "TCP_MAXSEG",
-            pyre_object::w_int_new(libc::TCP_MAXSEG as i64),
-        );
-        // TCP_KEEPIDLE is Linux-only at the libc-crate level; macOS exposes
-        // TCP_KEEPALIVE for the same role.  Provide whichever the platform
-        // defines under the conventional Python name.
+        macro_rules! cst {
+            ($name:literal, $val:expr) => {
+                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        // ── Address families ──
+        cst!("AF_UNSPEC", libc::AF_UNSPEC);
+        cst!("AF_UNIX", libc::AF_UNIX);
+        cst!("AF_INET", libc::AF_INET);
+        cst!("AF_INET6", libc::AF_INET6);
+        cst!("AF_ROUTE", libc::AF_ROUTE);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            crate::dict_storage_store(
-                ns,
-                "TCP_KEEPIDLE",
-                pyre_object::w_int_new(libc::TCP_KEEPIDLE as i64),
-            );
-            crate::dict_storage_store(
-                ns,
-                "TCP_KEEPINTVL",
-                pyre_object::w_int_new(libc::TCP_KEEPINTVL as i64),
-            );
-            crate::dict_storage_store(
-                ns,
-                "TCP_KEEPCNT",
-                pyre_object::w_int_new(libc::TCP_KEEPCNT as i64),
-            );
+            cst!("AF_PACKET", libc::AF_PACKET);
+            cst!("AF_NETLINK", libc::AF_NETLINK);
+            cst!("AF_VSOCK", libc::AF_VSOCK);
+        }
+        // ── Socket types ──
+        cst!("SOCK_STREAM", libc::SOCK_STREAM);
+        cst!("SOCK_DGRAM", libc::SOCK_DGRAM);
+        cst!("SOCK_RAW", libc::SOCK_RAW);
+        cst!("SOCK_RDM", libc::SOCK_RDM);
+        cst!("SOCK_SEQPACKET", libc::SOCK_SEQPACKET);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            cst!("SOCK_CLOEXEC", libc::SOCK_CLOEXEC);
+            cst!("SOCK_NONBLOCK", libc::SOCK_NONBLOCK);
+        }
+        // ── Protocols ──
+        cst!("IPPROTO_IP", libc::IPPROTO_IP);
+        cst!("IPPROTO_HOPOPTS", libc::IPPROTO_HOPOPTS);
+        cst!("IPPROTO_ICMP", libc::IPPROTO_ICMP);
+        cst!("IPPROTO_IGMP", libc::IPPROTO_IGMP);
+        cst!("IPPROTO_IPIP", libc::IPPROTO_IPIP);
+        cst!("IPPROTO_TCP", libc::IPPROTO_TCP);
+        cst!("IPPROTO_EGP", libc::IPPROTO_EGP);
+        cst!("IPPROTO_PUP", libc::IPPROTO_PUP);
+        cst!("IPPROTO_UDP", libc::IPPROTO_UDP);
+        cst!("IPPROTO_IDP", libc::IPPROTO_IDP);
+        cst!("IPPROTO_TP", libc::IPPROTO_TP);
+        cst!("IPPROTO_IPV6", libc::IPPROTO_IPV6);
+        cst!("IPPROTO_ROUTING", libc::IPPROTO_ROUTING);
+        cst!("IPPROTO_FRAGMENT", libc::IPPROTO_FRAGMENT);
+        cst!("IPPROTO_ESP", libc::IPPROTO_ESP);
+        cst!("IPPROTO_AH", libc::IPPROTO_AH);
+        cst!("IPPROTO_ICMPV6", libc::IPPROTO_ICMPV6);
+        cst!("IPPROTO_NONE", libc::IPPROTO_NONE);
+        cst!("IPPROTO_DSTOPTS", libc::IPPROTO_DSTOPTS);
+        cst!("IPPROTO_PIM", libc::IPPROTO_PIM);
+        cst!("IPPROTO_SCTP", libc::IPPROTO_SCTP);
+        cst!("IPPROTO_RAW", libc::IPPROTO_RAW);
+        cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
+        cst!("IPPROTO_GRE", libc::IPPROTO_GRE);
+        cst!("IPPROTO_RSVP", libc::IPPROTO_RSVP);
+        // `_rsocket_rffi.py:234-241 constants_w_defaults` — SOL_IP/TCP/UDP
+        // and IPPROTO_* duplicates kept for PyPy compatibility.
+        cst!("SOL_IP", 0);
+        cst!("SOL_TCP", 6);
+        cst!("SOL_UDP", 17);
+        // ── INADDR_* (host byte order) ──
+        cst!("INADDR_ANY", libc::INADDR_ANY);
+        cst!("INADDR_LOOPBACK", libc::INADDR_LOOPBACK);
+        cst!("INADDR_BROADCAST", libc::INADDR_BROADCAST);
+        cst!("INADDR_NONE", libc::INADDR_NONE);
+        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32);
+        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32);
+        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32);
+        cst!("IPPORT_RESERVED", 1024);
+        cst!("IPPORT_USERRESERVED", 5000);
+        // ── SOL_* / SO_* (socket level) ──
+        cst!("SOL_SOCKET", libc::SOL_SOCKET);
+        cst!("SO_REUSEADDR", libc::SO_REUSEADDR);
+        cst!("SO_REUSEPORT", libc::SO_REUSEPORT);
+        cst!("SO_KEEPALIVE", libc::SO_KEEPALIVE);
+        cst!("SO_BROADCAST", libc::SO_BROADCAST);
+        cst!("SO_DEBUG", libc::SO_DEBUG);
+        cst!("SO_DONTROUTE", libc::SO_DONTROUTE);
+        cst!("SO_LINGER", libc::SO_LINGER);
+        cst!("SO_OOBINLINE", libc::SO_OOBINLINE);
+        cst!("SO_RCVBUF", libc::SO_RCVBUF);
+        cst!("SO_SNDBUF", libc::SO_SNDBUF);
+        cst!("SO_RCVTIMEO", libc::SO_RCVTIMEO);
+        cst!("SO_SNDTIMEO", libc::SO_SNDTIMEO);
+        cst!("SO_RCVLOWAT", libc::SO_RCVLOWAT);
+        cst!("SO_SNDLOWAT", libc::SO_SNDLOWAT);
+        cst!("SO_ERROR", libc::SO_ERROR);
+        cst!("SO_TYPE", libc::SO_TYPE);
+        cst!("SO_ACCEPTCONN", libc::SO_ACCEPTCONN);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            cst!("SO_DOMAIN", libc::SO_DOMAIN);
+            cst!("SO_PROTOCOL", libc::SO_PROTOCOL);
+            cst!("SO_PEERCRED", libc::SO_PEERCRED);
+            cst!("SO_PASSCRED", libc::SO_PASSCRED);
+            cst!("SO_PEERSEC", libc::SO_PEERSEC);
+            cst!("SO_PASSSEC", libc::SO_PASSSEC);
+        }
+        // ── TCP-level ──
+        cst!("TCP_NODELAY", libc::TCP_NODELAY);
+        cst!("TCP_MAXSEG", libc::TCP_MAXSEG);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            cst!("TCP_KEEPIDLE", libc::TCP_KEEPIDLE);
+            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
+            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
+            cst!("TCP_CORK", libc::TCP_CORK);
+            cst!("TCP_DEFER_ACCEPT", libc::TCP_DEFER_ACCEPT);
+            cst!("TCP_INFO", libc::TCP_INFO);
+            cst!("TCP_LINGER2", libc::TCP_LINGER2);
+            cst!("TCP_QUICKACK", libc::TCP_QUICKACK);
+            cst!("TCP_SYNCNT", libc::TCP_SYNCNT);
+            cst!("TCP_WINDOW_CLAMP", libc::TCP_WINDOW_CLAMP);
+            cst!("TCP_USER_TIMEOUT", libc::TCP_USER_TIMEOUT);
+            cst!("TCP_CONGESTION", libc::TCP_CONGESTION);
+            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
+            cst!("TCP_NOTSENT_LOWAT", libc::TCP_NOTSENT_LOWAT);
         }
         #[cfg(target_os = "macos")]
         {
-            crate::dict_storage_store(
-                ns,
-                "TCP_KEEPALIVE",
-                pyre_object::w_int_new(libc::TCP_KEEPALIVE as i64),
-            );
+            cst!("TCP_KEEPALIVE", libc::TCP_KEEPALIVE);
         }
-        // IP-level
-        crate::dict_storage_store(ns, "IP_TTL", pyre_object::w_int_new(libc::IP_TTL as i64));
-        crate::dict_storage_store(ns, "IP_TOS", pyre_object::w_int_new(libc::IP_TOS as i64));
-        crate::dict_storage_store(
-            ns,
-            "IP_MULTICAST_TTL",
-            pyre_object::w_int_new(libc::IP_MULTICAST_TTL as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IP_MULTICAST_LOOP",
-            pyre_object::w_int_new(libc::IP_MULTICAST_LOOP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IP_ADD_MEMBERSHIP",
-            pyre_object::w_int_new(libc::IP_ADD_MEMBERSHIP as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IP_DROP_MEMBERSHIP",
-            pyre_object::w_int_new(libc::IP_DROP_MEMBERSHIP as i64),
-        );
-        // IPv6
-        crate::dict_storage_store(
-            ns,
-            "IPV6_V6ONLY",
-            pyre_object::w_int_new(libc::IPV6_V6ONLY as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPV6_MULTICAST_HOPS",
-            pyre_object::w_int_new(libc::IPV6_MULTICAST_HOPS as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "IPV6_MULTICAST_LOOP",
-            pyre_object::w_int_new(libc::IPV6_MULTICAST_LOOP as i64),
-        );
-        // shutdown how
-        crate::dict_storage_store(ns, "SHUT_RD", pyre_object::w_int_new(libc::SHUT_RD as i64));
-        crate::dict_storage_store(ns, "SHUT_WR", pyre_object::w_int_new(libc::SHUT_WR as i64));
-        crate::dict_storage_store(
-            ns,
-            "SHUT_RDWR",
-            pyre_object::w_int_new(libc::SHUT_RDWR as i64),
-        );
-        // Message flags
-        crate::dict_storage_store(ns, "MSG_OOB", pyre_object::w_int_new(libc::MSG_OOB as i64));
-        crate::dict_storage_store(
-            ns,
-            "MSG_PEEK",
-            pyre_object::w_int_new(libc::MSG_PEEK as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "MSG_DONTROUTE",
-            pyre_object::w_int_new(libc::MSG_DONTROUTE as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "MSG_WAITALL",
-            pyre_object::w_int_new(libc::MSG_WAITALL as i64),
-        );
-        // Address-info flags
-        crate::dict_storage_store(
-            ns,
-            "AI_PASSIVE",
-            pyre_object::w_int_new(libc::AI_PASSIVE as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "AI_CANONNAME",
-            pyre_object::w_int_new(libc::AI_CANONNAME as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "AI_NUMERICHOST",
-            pyre_object::w_int_new(libc::AI_NUMERICHOST as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "AI_NUMERICSERV",
-            pyre_object::w_int_new(libc::AI_NUMERICSERV as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "AI_ADDRCONFIG",
-            pyre_object::w_int_new(libc::AI_ADDRCONFIG as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "AI_V4MAPPED",
-            pyre_object::w_int_new(libc::AI_V4MAPPED as i64),
-        );
-        crate::dict_storage_store(ns, "AI_ALL", pyre_object::w_int_new(libc::AI_ALL as i64));
-        // Name-info flags
-        crate::dict_storage_store(
-            ns,
-            "NI_NUMERICHOST",
-            pyre_object::w_int_new(libc::NI_NUMERICHOST as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_NUMERICSERV",
-            pyre_object::w_int_new(libc::NI_NUMERICSERV as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_NOFQDN",
-            pyre_object::w_int_new(libc::NI_NOFQDN as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_NAMEREQD",
-            pyre_object::w_int_new(libc::NI_NAMEREQD as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_DGRAM",
-            pyre_object::w_int_new(libc::NI_DGRAM as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_MAXHOST",
-            pyre_object::w_int_new(libc::NI_MAXHOST as i64),
-        );
-        crate::dict_storage_store(
-            ns,
-            "NI_MAXSERV",
-            pyre_object::w_int_new(libc::NI_MAXSERV as i64),
-        );
-        // socket-level cap
-        crate::dict_storage_store(
-            ns,
-            "SOMAXCONN",
-            pyre_object::w_int_new(libc::SOMAXCONN as i64),
-        );
+        // ── IP-level ──
+        cst!("IP_TTL", libc::IP_TTL);
+        cst!("IP_TOS", libc::IP_TOS);
+        cst!("IP_MULTICAST_TTL", libc::IP_MULTICAST_TTL);
+        cst!("IP_MULTICAST_LOOP", libc::IP_MULTICAST_LOOP);
+        cst!("IP_MULTICAST_IF", libc::IP_MULTICAST_IF);
+        cst!("IP_ADD_MEMBERSHIP", libc::IP_ADD_MEMBERSHIP);
+        cst!("IP_DROP_MEMBERSHIP", libc::IP_DROP_MEMBERSHIP);
+        cst!("IP_HDRINCL", libc::IP_HDRINCL);
+        // IP_OPTIONS / IP_RECVOPTS / IP_RECVRETOPTS / IP_RETOPTS are
+        // POSIX but not exposed by the libc crate on linux/macos;
+        // `_rsocket_rffi.py:170-172` lists them, but
+        // `platform.DefinedConstantInteger` drops them when the header
+        // does not define them.  Same behaviour here — not exposed.
+        cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
+        cst!("IP_DEFAULT_MULTICAST_TTL", 1);
+        cst!("IP_MAX_MEMBERSHIPS", 20);
+        // ── IPv6 ──
+        cst!("IPV6_V6ONLY", libc::IPV6_V6ONLY);
+        cst!("IPV6_MULTICAST_HOPS", libc::IPV6_MULTICAST_HOPS);
+        cst!("IPV6_MULTICAST_LOOP", libc::IPV6_MULTICAST_LOOP);
+        cst!("IPV6_MULTICAST_IF", libc::IPV6_MULTICAST_IF);
+        cst!("IPV6_UNICAST_HOPS", libc::IPV6_UNICAST_HOPS);
+        cst!("IPV6_CHECKSUM", libc::IPV6_CHECKSUM);
+        cst!("IPV6_JOIN_GROUP", libc::IPV6_JOIN_GROUP);
+        cst!("IPV6_LEAVE_GROUP", libc::IPV6_LEAVE_GROUP);
+        cst!("IPV6_RECVTCLASS", libc::IPV6_RECVTCLASS);
+        cst!("IPV6_TCLASS", libc::IPV6_TCLASS);
+        cst!("IPV6_RECVPKTINFO", libc::IPV6_RECVPKTINFO);
+        cst!("IPV6_PKTINFO", libc::IPV6_PKTINFO);
+        cst!("IPV6_RECVHOPLIMIT", libc::IPV6_RECVHOPLIMIT);
+        cst!("IPV6_HOPLIMIT", libc::IPV6_HOPLIMIT);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            cst!("IPV6_DSTOPTS", libc::IPV6_DSTOPTS);
+            cst!("IPV6_HOPOPTS", libc::IPV6_HOPOPTS);
+            cst!("IPV6_NEXTHOP", libc::IPV6_NEXTHOP);
+            cst!("IPV6_RECVDSTOPTS", libc::IPV6_RECVDSTOPTS);
+            cst!("IPV6_RECVHOPOPTS", libc::IPV6_RECVHOPOPTS);
+            cst!("IPV6_RECVRTHDR", libc::IPV6_RECVRTHDR);
+            cst!("IPV6_RTHDR", libc::IPV6_RTHDR);
+            cst!("IPV6_RTHDRDSTOPTS", libc::IPV6_RTHDRDSTOPTS);
+            cst!("IPV6_RTHDR_TYPE_0", libc::IPV6_RTHDR_TYPE_0);
+        }
+        // ── shutdown how ──
+        cst!("SHUT_RD", libc::SHUT_RD);
+        cst!("SHUT_WR", libc::SHUT_WR);
+        cst!("SHUT_RDWR", libc::SHUT_RDWR);
+        // ── Message flags ──
+        cst!("MSG_OOB", libc::MSG_OOB);
+        cst!("MSG_PEEK", libc::MSG_PEEK);
+        cst!("MSG_DONTROUTE", libc::MSG_DONTROUTE);
+        cst!("MSG_DONTWAIT", libc::MSG_DONTWAIT);
+        cst!("MSG_WAITALL", libc::MSG_WAITALL);
+        cst!("MSG_CTRUNC", libc::MSG_CTRUNC);
+        cst!("MSG_TRUNC", libc::MSG_TRUNC);
+        cst!("MSG_EOR", libc::MSG_EOR);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        cst!("MSG_ERRQUEUE", libc::MSG_ERRQUEUE);
+        // ── Address-info flags ──
+        cst!("AI_PASSIVE", libc::AI_PASSIVE);
+        cst!("AI_CANONNAME", libc::AI_CANONNAME);
+        cst!("AI_NUMERICHOST", libc::AI_NUMERICHOST);
+        cst!("AI_NUMERICSERV", libc::AI_NUMERICSERV);
+        cst!("AI_ADDRCONFIG", libc::AI_ADDRCONFIG);
+        cst!("AI_V4MAPPED", libc::AI_V4MAPPED);
+        cst!("AI_ALL", libc::AI_ALL);
+        #[cfg(target_os = "macos")]
+        {
+            cst!("AI_DEFAULT", libc::AI_DEFAULT);
+            cst!("AI_MASK", libc::AI_MASK);
+            cst!("AI_V4MAPPED_CFG", libc::AI_V4MAPPED_CFG);
+        }
+        // ── Name-info flags ──
+        cst!("NI_NUMERICHOST", libc::NI_NUMERICHOST);
+        cst!("NI_NUMERICSERV", libc::NI_NUMERICSERV);
+        cst!("NI_NOFQDN", libc::NI_NOFQDN);
+        cst!("NI_NAMEREQD", libc::NI_NAMEREQD);
+        cst!("NI_DGRAM", libc::NI_DGRAM);
+        cst!("NI_MAXHOST", libc::NI_MAXHOST);
+        cst!("NI_MAXSERV", libc::NI_MAXSERV);
+        // ── EAI_* (gai_strerror codes) ──
+        cst!("EAI_AGAIN", libc::EAI_AGAIN);
+        cst!("EAI_BADFLAGS", libc::EAI_BADFLAGS);
+        cst!("EAI_FAIL", libc::EAI_FAIL);
+        cst!("EAI_FAMILY", libc::EAI_FAMILY);
+        cst!("EAI_MEMORY", libc::EAI_MEMORY);
+        cst!("EAI_NODATA", libc::EAI_NODATA);
+        cst!("EAI_NONAME", libc::EAI_NONAME);
+        cst!("EAI_OVERFLOW", libc::EAI_OVERFLOW);
+        cst!("EAI_SERVICE", libc::EAI_SERVICE);
+        cst!("EAI_SOCKTYPE", libc::EAI_SOCKTYPE);
+        cst!("EAI_SYSTEM", libc::EAI_SYSTEM);
+        // EAI_ADDRFAMILY / EAI_BADHINTS / EAI_PROTOCOL / EAI_MAX exist
+        // on macOS at the system-header level but the libc crate does
+        // not export them; PyPy filters them out via
+        // `platform.DefinedConstantInteger` on platforms where they are
+        // absent, so we mirror that and skip.
+        // ── SCM_* (ancillary data types) ──
+        cst!("SCM_RIGHTS", libc::SCM_RIGHTS);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        cst!("SCM_CREDENTIALS", libc::SCM_CREDENTIALS);
+        // ── socket-level cap ──
+        cst!("SOMAXCONN", libc::SOMAXCONN);
     }
 
     // ── htons / htonl / ntohs / ntohl ──
