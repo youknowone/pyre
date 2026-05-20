@@ -5,9 +5,48 @@
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
+
+/// `rpython/jit/backend/model.py:8-12 CPUTotalTracker` — per-CPU totals
+/// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
+/// and bridges created) and by the memory manager (loops and bridges
+/// freed).  PyPy attaches one tracker per `AbstractCPU` instance
+/// (`model.py:28-29 self.tracker = CPUTotalTracker()`); pyre has a
+/// single backend per process (no multi-CPU JIT setup) so the
+/// `cpu.tracker` chain collapses to one process-global instance
+/// reachable via [`cpu_tracker`].
+///
+/// Each field is an [`AtomicUsize`] because PyPy's GIL-protected
+/// `+= 1` on a Python int becomes a cross-thread mutation in pyre — the
+/// backend may compile loops/bridges from worker threads while another
+/// reads totals.  `Relaxed` ordering matches PyPy: there is no causal
+/// relationship between bumps and snapshots.
+#[derive(Default, Debug)]
+pub struct CpuTotalTracker {
+    /// `model.py:9` `total_compiled_loops` — bumped by
+    /// [`CompiledLoopToken::new`] on every fresh `CompiledLoopToken`.
+    pub total_compiled_loops: AtomicUsize,
+    /// `model.py:10` `total_compiled_bridges` — bumped by
+    /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
+    pub total_compiled_bridges: AtomicUsize,
+    /// `model.py:11` `total_freed_loops` — bumped by the memory manager
+    /// (`memmgr.py:_kill_old_loops_now`) when an evicted token had no
+    /// attached bridges.
+    pub total_freed_loops: AtomicUsize,
+    /// `model.py:12` `total_freed_bridges` — bumped by the memory
+    /// manager for each bridge attached to an evicted token.
+    pub total_freed_bridges: AtomicUsize,
+}
+
+/// Process-global [`CpuTotalTracker`] singleton.  Mirrors PyPy's
+/// `cpu.tracker` for the single-backend pyre runtime; reads/writes
+/// share one instance across all profilers and backends.
+pub fn cpu_tracker() -> &'static CpuTotalTracker {
+    static TRACKER: std::sync::OnceLock<CpuTotalTracker> = std::sync::OnceLock::new();
+    TRACKER.get_or_init(CpuTotalTracker::default)
+}
 
 pub mod call_stub;
 pub mod finish_descrs;
@@ -901,7 +940,17 @@ pub struct CompiledLoopToken {
 impl CompiledLoopToken {
     /// `model.py:296-307` `__init__(self, cpu, number)`. The `cpu` is
     /// implicit in pyre — the owning `Backend` holds the token lifetime.
+    /// Bumps [`cpu_tracker().total_compiled_loops`](cpu_tracker) and emits
+    /// the `jit-mem-looptoken-alloc` debug section line-for-line with
+    /// upstream (`model.py:297, 305-307`).
     pub fn new(number: u64) -> Self {
+        cpu_tracker()
+            .total_compiled_loops
+            .fetch_add(1, Ordering::Relaxed);
+        majit_ir::debug::log_one(
+            "jit-mem-looptoken-alloc",
+            &format!("allocating Loop # {}", number),
+        );
         CompiledLoopToken {
             number,
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
@@ -933,13 +982,26 @@ impl CompiledLoopToken {
         self.loop_token_wref.lock().upgrade()
     }
 
-    /// `model.py:309-314` `compiling_a_bridge(self)`. The accompanying
-    /// `self.cpu.tracker.total_compiled_bridges += 1` and
-    /// `debug_start/debug_print/debug_stop` on the RPython side are
-    /// **PRE-EXISTING-ADAPTATION** (pyre has no global `cpu.tracker`
-    /// counter and uses `tracing` crate instead of `rpython.rlib.debug`).
+    /// `model.py:309-314` `compiling_a_bridge(self)` — bumps the global
+    /// `total_compiled_bridges` tracker, increments this token's local
+    /// `bridges_count`, and emits the `jit-mem-looptoken-alloc` debug
+    /// section line-for-line with upstream.
     pub fn compiling_a_bridge(&self) {
-        *self.bridges_count.lock() += 1;
+        cpu_tracker()
+            .total_compiled_bridges
+            .fetch_add(1, Ordering::Relaxed);
+        let bridges_count = {
+            let mut count = self.bridges_count.lock();
+            *count += 1;
+            *count
+        };
+        majit_ir::debug::log_one(
+            "jit-mem-looptoken-alloc",
+            &format!(
+                "allocating Bridge # {} of Loop # {}",
+                bridges_count, self.number
+            ),
+        );
     }
 
     /// `rpython/jit/backend/model.py:316-329`

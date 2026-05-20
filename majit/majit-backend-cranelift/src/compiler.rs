@@ -14224,6 +14224,11 @@ impl majit_backend::Backend for CraneliftBackend {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/runner.py:100-101` parity — bump the global tracker and
+        // the per-loop bridges_count before assembling.
+        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+            clt.compiling_a_bridge();
+        }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
         let invalidated_arc = original_token.invalidated.clone();

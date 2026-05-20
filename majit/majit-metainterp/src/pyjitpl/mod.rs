@@ -4999,11 +4999,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity); no
+                // explicit metainterp-side bump needed here.
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
@@ -5822,11 +5820,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, 0, num_combined_ops);
@@ -6327,11 +6322,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
@@ -6650,11 +6642,8 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_simple_loop: compiled segmented trace key={}, trace_id={}",
@@ -8671,11 +8660,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                // jitprof.py:106 `self.cpu.tracker.total_compiled_loops`
-                // parity — bump the per-process profiler tracker so
-                // `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` returns
-                // the post-`record_loop_or_bridge` total.
-                self.staticdata.profiler.inc_compiled_loop();
+                // `cpu.tracker.total_compiled_loops` is bumped inside
+                // `CompiledLoopToken::new` (model.py:297 parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(original_green_key, bridge_ops.len(), num_optimized_ops);
                 }
@@ -9255,9 +9241,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
-                // jitprof.py:108 `self.cpu.tracker.total_compiled_bridges`
-                // parity — bump the per-process profiler tracker.
-                self.staticdata.profiler.inc_compiled_bridge();
+                // `cpu.tracker.total_compiled_bridges` is bumped inside
+                // `Backend::compile_bridge` via `clt.compiling_a_bridge()`
+                // (x86/runner.py:100-101, model.py:309-314 parity).
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
