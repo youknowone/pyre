@@ -16,8 +16,51 @@ use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
 
+/// Module-local re-export of the host-OS surface.  Routes through
+/// `rustpython_host_env` when the `host_env` feature is enabled; when
+/// disabled the same names fall back to `std::*` shims so call sites
+/// stay uniform.
 #[cfg(feature = "host_env")]
-use rustpython_host_env::{fs as host_fs, os as host_os};
+mod host {
+    pub use rustpython_host_env::{fs, os};
+}
+#[cfg(not(feature = "host_env"))]
+mod host {
+    pub mod fs {
+        pub use std::fs::{metadata, read, read_dir, read_to_string, symlink_metadata};
+    }
+    pub mod os {
+        pub fn current_dir() -> std::io::Result<std::path::PathBuf> {
+            std::env::current_dir()
+        }
+        pub fn var(key: &str) -> Result<String, std::env::VarError> {
+            std::env::var(key)
+        }
+        pub fn vars_os() -> std::env::VarsOs {
+            std::env::vars_os()
+        }
+        pub fn process_id() -> u32 {
+            std::process::id()
+        }
+        pub fn isatty(fd: i32) -> bool {
+            unsafe { libc::isatty(fd) != 0 }
+        }
+        pub fn rename(
+            from: impl AsRef<std::path::Path>,
+            to: impl AsRef<std::path::Path>,
+        ) -> std::io::Result<()> {
+            std::fs::rename(from, to)
+        }
+        pub fn urandom(size: usize) -> std::io::Result<Vec<u8>> {
+            use std::io::Read;
+            let mut f = std::fs::File::open("/dev/urandom")?;
+            let mut buf = vec![0u8; size];
+            f.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+    }
+}
+use host::{fs as host_fs, os as host_os};
 
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
@@ -2538,7 +2581,7 @@ fn init_posix(ns: &mut DictStorage) {
                 }
                 let src = extract_path(args[0])?;
                 let dst = extract_path(args[1])?;
-                std::fs::rename(&src, &dst).map_err(|e| io_err(e, &src))?;
+                host_os::rename(&src, &dst).map_err(|e| io_err(e, &src))?;
                 Ok(pyre_object::w_none())
             },
             2,
@@ -2555,7 +2598,7 @@ fn init_posix(ns: &mut DictStorage) {
             } else {
                 extract_path(args[0])?
             };
-            let entries = std::fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
+            let entries = host_fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
             let mut items = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|e| io_err(e, &path))?;
@@ -2576,9 +2619,8 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-                let ret = unsafe { libc::isatty(fd) };
-                Ok(pyre_object::w_bool_from(ret != 0))
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
         ),
@@ -2595,15 +2637,7 @@ fn init_posix(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("urandom() requires 1 argument"));
                 }
                 let n = unsafe { pyre_object::w_int_get_value(args[0]) } as usize;
-                let mut buf = vec![0u8; n];
-                // Use /dev/urandom on Unix
-                #[cfg(unix)]
-                {
-                    use std::io::Read;
-                    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-                        let _ = f.read_exact(&mut buf);
-                    }
-                }
+                let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
             1,
@@ -2891,9 +2925,9 @@ fn init_posix(ns: &mut DictStorage) {
             }
         };
         let meta = if follow_symlinks {
-            std::fs::metadata(&path_str)
+            host_fs::metadata(&path_str)
         } else {
-            std::fs::symlink_metadata(&path_str)
+            host_fs::symlink_metadata(&path_str)
         };
         match meta {
             Ok(m) => Ok(make_stat_result(&m)),
@@ -3093,13 +3127,13 @@ fn init_posix(ns: &mut DictStorage) {
             0,
         ),
     );
-    // os.getpid — std::process::id.
+    // os.getpid — host_os::process_id (std::process::id).
     crate::dict_storage_store(
         ns,
         "getpid",
         crate::make_builtin_function_with_arity(
             "getpid",
-            |_| Ok(pyre_object::w_int_new(std::process::id() as i64)),
+            |_| Ok(pyre_object::w_int_new(host_os::process_id() as i64)),
             0,
         ),
     );

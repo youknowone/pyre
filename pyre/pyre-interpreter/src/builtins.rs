@@ -4519,7 +4519,11 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let reading = mode.contains('r') || !writing;
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
-        match std::fs::read(&path) {
+        #[cfg(feature = "host_env")]
+        let read_result = rustpython_host_env::fs::read(&path);
+        #[cfg(not(feature = "host_env"))]
+        let read_result = std::fs::read(&path);
+        match read_result {
             Ok(bytes) => {
                 if binary {
                     // Store bytes-as-string for now; we only support ASCII binary.

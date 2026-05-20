@@ -916,6 +916,9 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
         return None;
     }
+    #[cfg(feature = "host_env")]
+    let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
+    #[cfg(not(feature = "host_env"))]
     let content = std::fs::read_to_string(filename).ok()?;
     content
         .lines()
