@@ -1062,9 +1062,26 @@ impl MIFrame {
         self.pre_opcode_semantic_depth = None;
     }
 
+    /// Pre-opcode stack depth: snapshot-captured `pre_opcode_semantic_depth`
+    /// when available, otherwise the concrete `PyFrame.valuestackdepth`
+    /// (which holds the same pre-opcode state because the interpreter step
+    /// for this opcode has not run yet); falls back to the symbolic
+    /// `sym.valuestackdepth` only when `concrete_frame_addr == 0`
+    /// (unit tests constructing sym-only `MIFrame`s).
+    ///
+    /// Issue #73 Phase 4.5: replaces the `pre_opcode_depth_or(self.sym().valuestackdepth)`
+    /// pattern.  The `pre_opcode_*` machinery exists precisely because
+    /// pyre's `MIFrame::pop_value` / `push_typed_value` mutate
+    /// `sym.valuestackdepth` mid-opcode and the guard/snapshot writers
+    /// need the *pre-mutation* value.  Reading directly from PyFrame
+    /// makes that pre-mutation guarantee structural rather than
+    /// snapshot-bookkeeping-dependent.
     #[inline]
-    fn pre_opcode_depth_or(&self, fallback: usize) -> usize {
-        self.pre_opcode_semantic_depth.unwrap_or(fallback)
+    fn pre_opcode_concrete_depth(&self) -> usize {
+        self.pre_opcode_semantic_depth.unwrap_or_else(|| {
+            self.concrete_valuestackdepth()
+                .unwrap_or_else(|| self.sym().valuestackdepth)
+        })
     }
 
     fn materialize_fail_arg_slot(
@@ -2444,10 +2461,9 @@ impl MIFrame {
         // RPython capture_resumedata(resumepc=orgpc) parity:
         // Always use orgpc (opcode start PC) as the resume PC.
         let resume_pc = self.orgpc;
-        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
-            let s = self.sym();
-            self.pre_opcode_depth_or(s.valuestackdepth) as i64
-        });
+        let vsd = self
+            .portal_bridge_vable_vsd(resume_pc)
+            .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64);
         // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
         // `metainterp.virtualizable_boxes` without mutating it. The two
         // fields that advance per-opcode (`last_instr`, `valuestackdepth`)
@@ -3954,10 +3970,10 @@ impl MIFrame {
         };
         let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
             let resume_pc = self.orgpc;
-            Some(self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
-                let s = self.sym();
-                self.pre_opcode_depth_or(s.valuestackdepth) as i64
-            }))
+            Some(
+                self.portal_bridge_vable_vsd(resume_pc)
+                    .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64),
+            )
         } else {
             None
         };
@@ -3997,7 +4013,7 @@ impl MIFrame {
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;
         let symbolic_stack_len = if self.pre_opcode_registers_r.is_some() {
-            self.pre_opcode_depth_or(sym.valuestackdepth)
+            self.pre_opcode_concrete_depth()
                 .saturating_sub(sym.nlocals)
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
@@ -4034,7 +4050,7 @@ impl MIFrame {
                         + pyre_interpreter::pyframe::ncells(code)
                         + code.max_stackdepth as usize
                 } else {
-                    let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
+                    let current_vsd = self.pre_opcode_concrete_depth();
                     let stack_depth = current_vsd
                         .saturating_sub(sym.nlocals)
                         .min(symbolic_stack_len);
