@@ -136,6 +136,10 @@ pub fn install_builtin_modules() {
     register_builtin_module("grp", init_grp);
     #[cfg(unix)]
     register_builtin_module("resource", init_resource);
+    #[cfg(unix)]
+    register_builtin_module("fcntl", init_fcntl);
+    #[cfg(unix)]
+    register_builtin_module("syslog", init_syslog);
     register_builtin_module("_locale", init_locale);
     register_builtin_module("_random", init_random);
     register_builtin_module("_struct", init_struct);
@@ -178,7 +182,6 @@ pub fn install_builtin_modules() {
         "_json",
         "_csv",
         "marshal",
-        "fcntl",
         "select",
         "_socket",
         "_tracemalloc",
@@ -1444,6 +1447,349 @@ fn init_resource(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "RLIMIT_MEMLOCK", pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64));
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
         crate::dict_storage_store(ns, "RLIM_INFINITY", pyre_object::w_int_new(libc::RLIM_INFINITY as i64));
+    }
+}
+
+/// fcntl module — PyPy: pypy/module/fcntl/interp_fcntl.py.
+///
+/// fcntl(fd, cmd, arg=0) / ioctl(fd, request, arg=0) / flock(fd, op) /
+/// lockf(fd, cmd, len=0, start=0, whence=0).  Backed by
+/// `rustpython_host_env::fcntl`.  Only the integer-argument forms are
+/// implemented; bytes-buffer (out-arg) variants are out of scope.
+fn init_fcntl(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "fcntl",
+        crate::make_builtin_function("fcntl", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "fcntl() requires at least 2 arguments",
+                    ));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let cmd = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let arg = if args.len() >= 3 {
+                    unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
+                } else {
+                    0
+                };
+                match rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg) {
+                    Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("fcntl: {e}"),
+                    )),
+                }
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Err(crate::PyError::runtime_error(
+                    "fcntl.fcntl requires host_env",
+                ))
+            }
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ioctl",
+        crate::make_builtin_function("ioctl", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "ioctl() requires at least 2 arguments",
+                    ));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let raw_req = unsafe { pyre_object::w_int_get_value(args[1]) } as i64;
+                let request = rustpython_host_env::fcntl::normalize_ioctl_request(raw_req);
+                let arg = if args.len() >= 3 {
+                    unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
+                } else {
+                    0
+                };
+                match rustpython_host_env::fcntl::ioctl_int(fd, request, arg) {
+                    Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("ioctl: {e}"),
+                    )),
+                }
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Err(crate::PyError::runtime_error(
+                    "fcntl.ioctl requires host_env",
+                ))
+            }
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "flock",
+        crate::make_builtin_function_with_arity(
+            "flock",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "flock() requires 2 arguments",
+                        ));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let op = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                    match rustpython_host_env::fcntl::flock(fd, op) {
+                        Ok(_) => Ok(pyre_object::w_none()),
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("flock: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "fcntl.flock requires host_env",
+                    ))
+                }
+            },
+            2,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "lockf",
+        crate::make_builtin_function("lockf", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "lockf() requires at least 2 arguments",
+                    ));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let cmd = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let len = if args.len() >= 3 {
+                    unsafe { pyre_object::w_int_get_value(args[2]) }
+                } else {
+                    0
+                };
+                let start = if args.len() >= 4 {
+                    unsafe { pyre_object::w_int_get_value(args[3]) }
+                } else {
+                    0
+                };
+                let whence = if args.len() >= 5 {
+                    unsafe { pyre_object::w_int_get_value(args[4]) as i32 }
+                } else {
+                    0
+                };
+                match rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence) {
+                    Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
+                    Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => Err(
+                        crate::PyError::value_error("lockf: invalid cmd"),
+                    ),
+                    Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => Err(
+                        crate::PyError::value_error(format!("lockf: overflow: {s}")),
+                    ),
+                    Err(rustpython_host_env::fcntl::LockfError::Io(e)) => {
+                        Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("lockf: {e}"),
+                        ))
+                    }
+                }
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Err(crate::PyError::runtime_error(
+                    "fcntl.lockf requires host_env",
+                ))
+            }
+        }),
+    );
+    // Constants (POSIX subset).
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(ns, "F_GETFD", pyre_object::w_int_new(libc::F_GETFD as i64));
+        crate::dict_storage_store(ns, "F_SETFD", pyre_object::w_int_new(libc::F_SETFD as i64));
+        crate::dict_storage_store(ns, "F_GETFL", pyre_object::w_int_new(libc::F_GETFL as i64));
+        crate::dict_storage_store(ns, "F_SETFL", pyre_object::w_int_new(libc::F_SETFL as i64));
+        crate::dict_storage_store(ns, "F_DUPFD", pyre_object::w_int_new(libc::F_DUPFD as i64));
+        crate::dict_storage_store(ns, "F_GETLK", pyre_object::w_int_new(libc::F_GETLK as i64));
+        crate::dict_storage_store(ns, "F_SETLK", pyre_object::w_int_new(libc::F_SETLK as i64));
+        crate::dict_storage_store(ns, "F_SETLKW", pyre_object::w_int_new(libc::F_SETLKW as i64));
+        crate::dict_storage_store(ns, "F_RDLCK", pyre_object::w_int_new(libc::F_RDLCK as i64));
+        crate::dict_storage_store(ns, "F_WRLCK", pyre_object::w_int_new(libc::F_WRLCK as i64));
+        crate::dict_storage_store(ns, "F_UNLCK", pyre_object::w_int_new(libc::F_UNLCK as i64));
+        crate::dict_storage_store(ns, "FD_CLOEXEC", pyre_object::w_int_new(libc::FD_CLOEXEC as i64));
+        crate::dict_storage_store(ns, "LOCK_SH", pyre_object::w_int_new(libc::LOCK_SH as i64));
+        crate::dict_storage_store(ns, "LOCK_EX", pyre_object::w_int_new(libc::LOCK_EX as i64));
+        crate::dict_storage_store(ns, "LOCK_UN", pyre_object::w_int_new(libc::LOCK_UN as i64));
+        crate::dict_storage_store(ns, "LOCK_NB", pyre_object::w_int_new(libc::LOCK_NB as i64));
+    }
+}
+
+/// syslog module — PyPy: pypy/module/syslog/interp_syslog.py.
+///
+/// openlog / syslog / closelog / setlogmask.  Backed by
+/// `rustpython_host_env::syslog`.  Unix-only.
+fn init_syslog(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "openlog",
+        crate::make_builtin_function("openlog", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                let ident = args.first().and_then(|&a| unsafe {
+                    if pyre_object::is_str(a) {
+                        std::ffi::CString::new(pyre_object::w_str_get_value(a))
+                            .ok()
+                            .map(|c| c.into_boxed_c_str())
+                    } else {
+                        None
+                    }
+                });
+                let logoption = args
+                    .get(1)
+                    .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
+                    .unwrap_or(0);
+                let facility = args
+                    .get(2)
+                    .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
+                    .unwrap_or(libc::LOG_USER);
+                rustpython_host_env::syslog::openlog(ident, logoption, facility);
+                Ok(pyre_object::w_none())
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Err(crate::PyError::runtime_error(
+                    "syslog.openlog requires host_env",
+                ))
+            }
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "syslog",
+        crate::make_builtin_function("syslog", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                let (priority, msg_obj) = if args.len() >= 2 {
+                    (
+                        unsafe { pyre_object::w_int_get_value(args[0]) as i32 },
+                        args[1],
+                    )
+                } else if args.len() == 1 {
+                    (libc::LOG_INFO, args[0])
+                } else {
+                    return Err(crate::PyError::type_error("syslog() requires a message"));
+                };
+                if !unsafe { pyre_object::is_str(msg_obj) } {
+                    return Err(crate::PyError::type_error(
+                        "syslog(): message must be a string",
+                    ));
+                }
+                let msg = unsafe { pyre_object::w_str_get_value(msg_obj) };
+                if let Ok(cmsg) = std::ffi::CString::new(msg) {
+                    rustpython_host_env::syslog::syslog(priority, &cmsg);
+                }
+                Ok(pyre_object::w_none())
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Err(crate::PyError::runtime_error(
+                    "syslog.syslog requires host_env",
+                ))
+            }
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "closelog",
+        crate::make_builtin_function_with_arity(
+            "closelog",
+            |_| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    rustpython_host_env::syslog::closelog();
+                }
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "setlogmask",
+        crate::make_builtin_function_with_arity(
+            "setlogmask",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let mask = if let Some(&a) = args.first() {
+                        unsafe { pyre_object::w_int_get_value(a) as i32 }
+                    } else {
+                        return Err(crate::PyError::type_error("setlogmask() missing argument"));
+                    };
+                    return Ok(pyre_object::w_int_new(
+                        rustpython_host_env::syslog::setlogmask(mask) as i64,
+                    ));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "syslog.setlogmask requires host_env",
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    // Priorities + facilities (POSIX subset matching CPython).
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(ns, "LOG_EMERG", pyre_object::w_int_new(libc::LOG_EMERG as i64));
+        crate::dict_storage_store(ns, "LOG_ALERT", pyre_object::w_int_new(libc::LOG_ALERT as i64));
+        crate::dict_storage_store(ns, "LOG_CRIT", pyre_object::w_int_new(libc::LOG_CRIT as i64));
+        crate::dict_storage_store(ns, "LOG_ERR", pyre_object::w_int_new(libc::LOG_ERR as i64));
+        crate::dict_storage_store(ns, "LOG_WARNING", pyre_object::w_int_new(libc::LOG_WARNING as i64));
+        crate::dict_storage_store(ns, "LOG_NOTICE", pyre_object::w_int_new(libc::LOG_NOTICE as i64));
+        crate::dict_storage_store(ns, "LOG_INFO", pyre_object::w_int_new(libc::LOG_INFO as i64));
+        crate::dict_storage_store(ns, "LOG_DEBUG", pyre_object::w_int_new(libc::LOG_DEBUG as i64));
+        crate::dict_storage_store(ns, "LOG_PID", pyre_object::w_int_new(libc::LOG_PID as i64));
+        crate::dict_storage_store(ns, "LOG_CONS", pyre_object::w_int_new(libc::LOG_CONS as i64));
+        crate::dict_storage_store(ns, "LOG_NDELAY", pyre_object::w_int_new(libc::LOG_NDELAY as i64));
+        crate::dict_storage_store(ns, "LOG_NOWAIT", pyre_object::w_int_new(libc::LOG_NOWAIT as i64));
+        crate::dict_storage_store(ns, "LOG_PERROR", pyre_object::w_int_new(libc::LOG_PERROR as i64));
+        crate::dict_storage_store(ns, "LOG_KERN", pyre_object::w_int_new(libc::LOG_KERN as i64));
+        crate::dict_storage_store(ns, "LOG_USER", pyre_object::w_int_new(libc::LOG_USER as i64));
+        crate::dict_storage_store(ns, "LOG_MAIL", pyre_object::w_int_new(libc::LOG_MAIL as i64));
+        crate::dict_storage_store(ns, "LOG_DAEMON", pyre_object::w_int_new(libc::LOG_DAEMON as i64));
+        crate::dict_storage_store(ns, "LOG_AUTH", pyre_object::w_int_new(libc::LOG_AUTH as i64));
+        crate::dict_storage_store(ns, "LOG_LPR", pyre_object::w_int_new(libc::LOG_LPR as i64));
+        crate::dict_storage_store(ns, "LOG_NEWS", pyre_object::w_int_new(libc::LOG_NEWS as i64));
+        crate::dict_storage_store(ns, "LOG_UUCP", pyre_object::w_int_new(libc::LOG_UUCP as i64));
+        crate::dict_storage_store(ns, "LOG_CRON", pyre_object::w_int_new(libc::LOG_CRON as i64));
+        crate::dict_storage_store(ns, "LOG_SYSLOG", pyre_object::w_int_new(libc::LOG_SYSLOG as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL0", pyre_object::w_int_new(libc::LOG_LOCAL0 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL1", pyre_object::w_int_new(libc::LOG_LOCAL1 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL2", pyre_object::w_int_new(libc::LOG_LOCAL2 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL3", pyre_object::w_int_new(libc::LOG_LOCAL3 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL4", pyre_object::w_int_new(libc::LOG_LOCAL4 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL5", pyre_object::w_int_new(libc::LOG_LOCAL5 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL6", pyre_object::w_int_new(libc::LOG_LOCAL6 as i64));
+        crate::dict_storage_store(ns, "LOG_LOCAL7", pyre_object::w_int_new(libc::LOG_LOCAL7 as i64));
     }
 }
 
