@@ -7462,7 +7462,7 @@ unsafe fn trace_check_exc_match_against(
 /// + `_canraise`) has no callee_path entry for the call sites' resolved
 /// `CallTarget`.  Recognising the targets as elidable is the next slice
 /// (issue #73 Phase 3 expansion: helper-by-helper EffectInfo recognition).
-fn production_walker_handles(instruction: &Instruction) -> bool {
+pub fn production_walker_handles(instruction: &Instruction) -> bool {
     matches!(
         instruction,
         Instruction::Nop

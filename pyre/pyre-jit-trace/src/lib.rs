@@ -22,6 +22,7 @@ pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
 pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
+pub use trace_opcode::production_walker_handles;
 pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;

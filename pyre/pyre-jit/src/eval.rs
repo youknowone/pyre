@@ -2980,21 +2980,36 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // Runtime no-op. Only handles trace feed when tracing is active.
+        let mut walker_dispatched_this_opcode = false;
         if is_portal {
             let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
-            if let Some(depth) = tracing_depth {
-                if call_depth() == depth {
-                    if let Some(loop_result) =
-                        jit_merge_point_hook(frame, code, pc, driver, info, &env)
-                    {
-                        return loop_result;
-                    }
-                }
-            } else if driver.is_tracing() {
-                // First merge_point after trace start — depth not yet set.
+            let merge_point_active = if let Some(depth) = tracing_depth {
+                call_depth() == depth
+            } else {
+                driver.is_tracing()
+            };
+            if merge_point_active {
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
                     return loop_result;
+                }
+                // Issue #73 Phase 5 partial flip (per-opcode).  When the
+                // tracer's `trace_code_step` routed the opcode through
+                // `dispatch_via_walker_for_opcode`, the walker arm's
+                // emitted IR ran through `vable_setfield` /
+                // `vable_setarrayitem_indexed` → `synchronize_virtualizable`
+                // (trace_ctx.rs:1224..1265), which writes the shadow
+                // back to the live heap PyFrame.  Running
+                // `execute_opcode_step` below would mutate the same
+                // PyFrame state a second time (double-decrement of
+                // `valuestackdepth`, etc.).  RPython doesn't see this
+                // because MetaInterp.interpret IS the execution loop —
+                // there is no separate `eval_loop_jit`.  Until Phase 5
+                // retires `execute_opcode_step` from this loop entirely,
+                // the per-opcode skip below brings the gating in line
+                // with RPython for the allow-listed instructions only.
+                if pyre_jit_trace::production_walker_handles(&instruction) {
+                    walker_dispatched_this_opcode = true;
                 }
             }
         }
@@ -3049,7 +3064,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         let mut next_instr = frame.next_instr();
-        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+        let step_result = if walker_dispatched_this_opcode {
+            // Walker arm already advanced PyFrame via
+            // `synchronize_virtualizable`; skip the interpreter-side
+            // execute step to avoid double-mutation.  pc advancement
+            // already happened above via `set_last_instr_from_next_instr
+            // (opcode_pc + 1)`.
+            Ok(StepResult::Continue)
+        } else {
+            execute_opcode_step(frame, code, instruction, op_arg, next_instr)
+        };
+        match step_result {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
                 // every traced step to prevent infinite trace recording.
