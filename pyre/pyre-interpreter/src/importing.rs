@@ -3370,7 +3370,39 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "get_ident",
-        crate::make_builtin_function_with_arity("get_ident", |_| Ok(pyre_object::w_int_new(1)), 0),
+        crate::make_builtin_function_with_arity(
+            "get_ident",
+            |_| {
+                #[cfg(feature = "host_env")]
+                {
+                    return Ok(pyre_object::w_int_new(
+                        rustpython_host_env::thread::current_thread_id() as i64,
+                    ));
+                }
+                #[cfg(not(feature = "host_env"))]
+                Ok(pyre_object::w_int_new(1))
+            },
+            0,
+        ),
+    );
+    // _thread.get_native_id() — same source on Unix, only the symbol differs.
+    crate::dict_storage_store(
+        ns,
+        "get_native_id",
+        crate::make_builtin_function_with_arity(
+            "get_native_id",
+            |_| {
+                #[cfg(feature = "host_env")]
+                {
+                    return Ok(pyre_object::w_int_new(
+                        rustpython_host_env::thread::current_thread_id() as i64,
+                    ));
+                }
+                #[cfg(not(feature = "host_env"))]
+                Ok(pyre_object::w_int_new(1))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
