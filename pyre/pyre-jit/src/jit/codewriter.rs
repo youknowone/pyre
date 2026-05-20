@@ -1068,23 +1068,42 @@ fn walker_post_walk_insert_renamings(
     let diagnose_elide = std::env::var_os("PYRE_PHASE4_DIAGNOSE_ELIDE").is_some();
     let mut elided_links: usize = 0;
     let mut elided_links_with_distinct_pairs: usize = 0;
-    let mut elided_distinct_pairs_total: usize = 0;
+    let mut elided_distinct_pair_records: Vec<String> = Vec::new();
     for block_ref in &reachable {
         let exits = block_ref.borrow().exits.clone();
         if exits.len() < 2 {
             continue;
         }
+        let source_pc = block_ref
+            .borrow()
+            .operations
+            .first()
+            .map(|op| op.offset)
+            .unwrap_or(-1);
         for link_ref in exits {
             let Some(target_ref) = link_ref.borrow().target.clone() else {
                 continue;
             };
             if in_degree_of(&target_ref) > 1 {
                 if diagnose_elide {
-                    let distinct = count_distinct_renaming_pairs(&link_ref, &get_color);
+                    let pairs = collect_distinct_renaming_pairs(&link_ref, &get_color);
                     elided_links += 1;
-                    if distinct > 0 {
+                    if !pairs.is_empty() {
                         elided_links_with_distinct_pairs += 1;
-                        elided_distinct_pairs_total += distinct;
+                        let target_pc = target_ref
+                            .borrow()
+                            .operations
+                            .first()
+                            .map(|op| op.offset)
+                            .unwrap_or(-1);
+                        let pair_strs: Vec<String> = pairs
+                            .iter()
+                            .map(|(src, dst, kind)| format!("{}:{}->{}", kind.as_str(), src, dst))
+                            .collect();
+                        elided_distinct_pair_records.push(format!(
+                            "src_pc={source_pc} dst_pc={target_pc} pairs=[{}]",
+                            pair_strs.join(",")
+                        ));
                     }
                 }
                 continue;
@@ -1101,39 +1120,46 @@ fn walker_post_walk_insert_renamings(
         }
     }
     if diagnose_elide && elided_links > 0 {
-        let name = graph.name.clone();
+        let name = &graph.name;
+        let pairs_total: usize = elided_distinct_pair_records.len();
         eprintln!(
             "[phase4-elide] graph={name} elided_links={elided_links} \
              elided_with_distinct_pairs={elided_links_with_distinct_pairs} \
-             elided_distinct_pairs_total={elided_distinct_pairs_total}",
+             elided_distinct_pair_records={pairs_total}",
         );
+        for record in &elided_distinct_pair_records {
+            eprintln!("[phase4-elide]   {record}");
+        }
     }
 }
 
 /// `flatten.py:308-311 insert_renamings` pair extraction restricted
-/// to counting distinct-color pairs that would actually emit a
+/// to collecting distinct-color pairs that would actually emit a
 /// `<kind>_copy` / `<kind>_push` / `<kind>_pop`.  Mirrors the same
 /// `last_exception` / `last_exc_value` skip and the
 /// `src_color != dst_color` check as
 /// [`emit_link_renamings_into_block`] but without emitting any
 /// insns.  Used by the Phase 4 endgame multi-pred elision
 /// diagnostic (`PYRE_PHASE4_DIAGNOSE_ELIDE=1`).
-fn count_distinct_renaming_pairs<F>(link_ref: &super::flow::LinkRef, get_color: &F) -> usize
+fn collect_distinct_renaming_pairs<F>(
+    link_ref: &super::flow::LinkRef,
+    get_color: &F,
+) -> Vec<(u16, u16, Kind)>
 where
     F: Fn(&super::flow::Variable) -> u16,
 {
     let link_borrow = link_ref.borrow();
     let Some(target_ref) = link_borrow.target.clone() else {
-        return 0;
+        return Vec::new();
     };
     let target_borrow = target_ref.borrow();
     if link_borrow.args.len() != target_borrow.inputargs.len() {
-        return 0;
+        return Vec::new();
     }
     if target_borrow.is_final && target_borrow.exits.is_empty() {
-        return 0;
+        return Vec::new();
     }
-    let mut distinct = 0usize;
+    let mut pairs = Vec::new();
     for (i, arg) in link_borrow.args.iter().enumerate() {
         let Some(src_value) = arg.as_ref() else {
             continue;
@@ -1149,11 +1175,14 @@ where
         {
             continue;
         }
-        if get_color(&src_variable) != get_color(&dst_variable) {
-            distinct += 1;
+        let src_color = get_color(&src_variable);
+        let dst_color = get_color(&dst_variable);
+        if src_color != dst_color {
+            let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+            pairs.push((src_color, dst_color, kind));
         }
     }
-    distinct
+    pairs
 }
 
 /// Apply a splice's offset shift to the walker-tracked PC anchor /
