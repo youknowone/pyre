@@ -7553,18 +7553,42 @@ fn apply_walker_pop_top(state: &mut MIFrame) {
     // fused compare` at the next `CompareOp` (see
     // `project_issue73_phase4_poptop_blocker.md`).
     let (owns_vable, new_vsd) = state.with_ctx(|this, ctx| {
-        let s = this.sym();
-        if s.valuestackdepth <= s.nlocals {
-            // Walker arm body emitted IR for a stack pop, but the sym
-            // counter is already at floor — leave the counter alone
-            // and skip the shadow update (mirrors the
-            // `checked_sub(nlocals+1)` floor check in `pop_value`).
-            return (false, s.valuestackdepth);
+        let (stack_idx, semantic_idx) = {
+            let s = this.sym();
+            if s.valuestackdepth <= s.nlocals {
+                // Walker arm body emitted IR for a stack pop, but the sym
+                // counter is already at floor — leave the counter alone
+                // and skip the shadow update (mirrors the
+                // `checked_sub(nlocals+1)` floor check in `pop_value`).
+                return (false, s.valuestackdepth);
+            }
+            let stack_idx = s.valuestackdepth - s.nlocals - 1;
+            (stack_idx, s.nlocals + stack_idx)
+        };
+        let (is_active, owns_vable, new_vsd) = {
+            let s = this.sym_mut();
+            s.valuestackdepth -= 1;
+            (
+                s.is_active_vable_owner,
+                s.owns_virtualizable_shadow(),
+                s.valuestackdepth,
+            )
+        };
+        let _ = stack_idx;
+        // pyframe.py:411-417 `popvalue_maybe_none`: clear the popped
+        // slot in `locals_cells_stack_w` to NULL.  Trait dispatch's
+        // `pop_value` does this via `set_virtualizable_entry_at(NULL)`
+        // (`trace_opcode.rs:1901-1906`); the walker arm body already
+        // emits the IR `setarrayitem_vable_r(slot, NULL)` that runs at
+        // runtime + writes the shadow box, but the slot's OpRef-side
+        // sym must be cleared too so `read_stack_slot` for a future
+        // semantic_idx does not pick up the popped slot's pre-pop OpRef.
+        if is_active {
+            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
+            let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
+            let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+            ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
         }
-        let s = this.sym_mut();
-        s.valuestackdepth -= 1;
-        let new_vsd = s.valuestackdepth;
-        let owns_vable = s.owns_virtualizable_shadow();
         if owns_vable {
             let vsd_op = ctx.const_int(new_vsd as i64);
             this.sym_mut().vable_valuestackdepth = vsd_op;
