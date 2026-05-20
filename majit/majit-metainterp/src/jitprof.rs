@@ -139,6 +139,21 @@ impl JitProfiler {
         }
     }
 
+    /// jitprof.py:95 `Profiler.start_tracing`.
+    ///
+    /// PyPy also accounts elapsed time through `_start(Counters.TRACING)`.
+    /// Pyre's profiler currently stores only the entry count for timed
+    /// counters, so this is the counter-side parity hook.
+    pub fn start_tracing(&self) {
+        self.tracing.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// jitprof.py:96 `Profiler.end_tracing`.
+    ///
+    /// Kept as the structural counterpart to `start_tracing`; elapsed-time
+    /// buckets are not represented in Pyre yet.
+    pub fn end_tracing(&self) {}
+
     /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
     ///
     /// ```python

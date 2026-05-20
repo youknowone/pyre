@@ -2721,13 +2721,15 @@ impl<'a> Assembler386<'a> {
                         match (a0, src) {
                             (Loc::Reg(a), Loc::Immed(i)) => {
                                 // regalloc.py:577 — `_consider_lea` is guarded
-                                // by `rx86.fits_in_32bits(-y.value)`, so the
-                                // negated immediate is guaranteed to fit signed
-                                // disp32.  Fail closed if that invariant breaks
-                                // rather than silently truncating `i.value as i32`.
-                                let v = i32::try_from(i.value)
-                                    .ok()
-                                    .and_then(i32::checked_neg)
+                                // by `rx86.fits_in_32bits(-y.value)`, so check
+                                // the negated value directly.  `y.value =
+                                // 2147483648` is valid here because the disp32
+                                // is `-2147483648`; converting y to i32 first
+                                // would incorrectly reject that PyPy-valid case.
+                                let v = i
+                                    .value
+                                    .checked_neg()
+                                    .and_then(|negated| i32::try_from(negated).ok())
                                     .expect(
                                         "IntSub LEA requires an immediate \
                                          encodable as signed disp32 after negation",

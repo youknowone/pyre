@@ -2990,6 +2990,12 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::StartTracing => {
                 self.warm_state.ensure_jitlog_initialised();
                 self.staticdata._setup_once(&mut self.backend);
+                // pyjitpl.py:2890-2892 `compile_and_run_once`:
+                // `_setup_once`, then `profiler.start_tracing()`, then
+                // `try_to_free_some_loops()` before the trace history is
+                // created.  `setup_tracing` owns the history creation in pyre.
+                self.staticdata.profiler.start_tracing();
+                self.try_to_free_some_loops();
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
