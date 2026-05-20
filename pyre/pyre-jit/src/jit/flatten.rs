@@ -2492,6 +2492,121 @@ pub fn flatten_graph_with_closures<F, C>(
     flattener.generate_ssa_form(graph);
 }
 
+/// Build a `[GraphAllocationResult; 3]` whose `coloring[v.id] = v.id.0`
+/// for every variable in `graph`, partitioned by `Kind`.  Matches the
+/// `|v| Register::new(v.kind, v.id.0)` identity closure that test
+/// fixtures historically passed to `flatten_graph_with_closures`.
+///
+/// Used by `flatten_graph_for_test` / `flatten_graph_for_test_with_lowering`
+/// to build the test-side regallocs without re-deriving per-fixture.
+pub fn identity_test_regallocs(
+    graph: &super::flow::FunctionGraph,
+) -> [super::regalloc::GraphAllocationResult; 3] {
+    use std::collections::HashMap;
+    let mut int_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
+    let mut ref_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
+    let mut float_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
+    let mut record = |v: Variable| {
+        let kind = v.kind.unwrap_or(Kind::Ref);
+        let map = match kind {
+            Kind::Int => &mut int_coloring,
+            Kind::Ref => &mut ref_coloring,
+            Kind::Float => &mut float_coloring,
+        };
+        map.insert(v.id, v.id.0 as u16);
+    };
+    for block in graph.iterblocks() {
+        let block_borrow = block.borrow();
+        for arg in &block_borrow.inputargs {
+            if let Some(v) = arg.as_variable() {
+                record(v);
+            }
+        }
+        for op in &block_borrow.operations {
+            for arg in &op.args {
+                for v in arg.variables() {
+                    record(v);
+                }
+            }
+            if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
+                record(v);
+            }
+        }
+        for link in &block_borrow.exits {
+            for arg in &link.borrow().args {
+                if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
+                    record(v);
+                }
+            }
+        }
+    }
+    let max_color = |map: &HashMap<super::flow::VariableId, u16>| {
+        map.values().copied().max().map(|m| m + 1).unwrap_or(0)
+    };
+    [
+        super::regalloc::GraphAllocationResult {
+            num_colors: max_color(&int_coloring),
+            coloring: int_coloring,
+        },
+        super::regalloc::GraphAllocationResult {
+            num_colors: max_color(&ref_coloring),
+            coloring: ref_coloring,
+        },
+        super::regalloc::GraphAllocationResult {
+            num_colors: max_color(&float_coloring),
+            coloring: float_coloring,
+        },
+    ]
+}
+
+/// Test-fixture entry that replaces `flatten_graph_with_closures(
+/// &graph, &mut ssarepr, |v| Register::new(v.kind, v.id.0),
+/// flatten_constant_operand)` with the regallocs-routed equivalent.
+///
+/// Builds identity-coloring regallocs internally via
+/// [`identity_test_regallocs`], skips `enforce_input_args` (identity
+/// coloring is a fixed-point for id-ordered inputargs), and constructs
+/// GraphFlattener with `.with_regallocs(...)` so `getcolor_var` reads
+/// from regallocs directly.
+pub fn flatten_graph_for_test(
+    graph: &super::flow::FunctionGraph,
+    ssarepr: &mut SSARepr,
+) {
+    let regallocs = identity_test_regallocs(graph);
+    // Dummy closure — inert once `with_regallocs` is set, retained
+    // only to satisfy the F generic parameter until slice 6 drops it.
+    let dummy = |_v: Variable| -> Register { Register::new(Kind::Int, u16::MAX) };
+    let mut flattener =
+        GraphFlattener::new_with_constant_lowering(ssarepr, dummy, flatten_constant_operand)
+            .with_regallocs(&regallocs);
+    flattener.generate_ssa_form(graph);
+}
+
+/// Test-fixture entry that replaces `flatten_graph_with_lowering(...)`
+/// with the regallocs-routed equivalent.  Companion to
+/// [`flatten_graph_for_test`] for fixtures that supply a
+/// `LoweringContext` (retired-family HLOp dispatch).
+pub fn flatten_graph_for_test_with_lowering<'a>(
+    graph: &super::flow::FunctionGraph,
+    ssarepr: &'a mut SSARepr,
+    lowering_ctx: LoweringContext,
+    cpu: Option<&'a super::cpu::Cpu>,
+) {
+    let regallocs = identity_test_regallocs(graph);
+    let dummy = |_v: Variable| -> Register { Register::new(Kind::Int, u16::MAX) };
+    let mut flattener = GraphFlattener::new_with_full_lowering(
+        ssarepr,
+        dummy,
+        flatten_constant_operand,
+        lowering_ctx,
+    )
+    .with_regallocs(&regallocs);
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
+    }
+    flattener.generate_ssa_form(graph);
+}
+
 /// Test-fixture variant of [`flatten_graph`] that takes
 /// `get_register` and `lower_constant` as explicit closures and a
 /// pre-built `LoweringContext`, rather than reading them off
@@ -4473,12 +4588,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("flat_walk");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         // Two loop_header Insns emitted — one per block.
         let header_count = ssarepr
@@ -4509,12 +4619,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("renaming");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         assert!(ssarepr.insns.iter().any(|insn| {
             matches!(
@@ -4608,12 +4713,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("exc_dispatch");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         assert!(
             ssarepr
@@ -4670,12 +4770,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("bool_branch");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         assert!(ssarepr.insns.iter().any(|insn| {
             matches!(
@@ -4728,12 +4823,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one, default]);
 
         let mut ssarepr = SSARepr::new("int_switch");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         let switch = ssarepr
             .insns
@@ -4797,12 +4887,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one]);
 
         let mut ssarepr = SSARepr::new("int_switch_no_default");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         let switch_idx = ssarepr
             .insns
@@ -4861,12 +4946,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one, default]);
 
         let mut ssarepr = SSARepr::new("int_switch_with_default");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         let switch_idx = ssarepr
             .insns
@@ -4921,12 +5001,7 @@ mod tests {
         start.closeblock(vec![case_one, none_link]);
 
         let mut ssarepr = SSARepr::new("int_switch_none_exitcase");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
     }
 
     #[test]
@@ -4962,12 +5037,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("tuple_branch");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         assert!(ssarepr.insns.iter().any(|insn| {
             matches!(
@@ -5071,14 +5141,7 @@ mod tests {
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
-        flatten_graph_with_lowering(
-            &graph,
-            &mut ssarepr,
-            ctx,
-            None,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
         // BINARY_OP `add` → residual_call_ir_r with fn_idx=11.
         let binary = ssarepr.insns.iter().find(|insn| {
@@ -5198,14 +5261,7 @@ mod tests {
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
-        flatten_graph_with_lowering(
-            &graph,
-            &mut ssarepr,
-            ctx,
-            None,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
         // Filter the SSARepr by `(opname, fn_idx)` mirroring the
         // probe's per-family report.  Both families share the
@@ -5329,14 +5385,7 @@ mod tests {
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
-        flatten_graph_with_lowering(
-            &graph,
-            &mut ssarepr,
-            ctx,
-            None,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
     }
 
     #[test]
@@ -5367,12 +5416,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("passthrough");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
 
         let has_add_passthrough = ssarepr
             .insns
@@ -7526,24 +7570,7 @@ mod tests {
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
         };
-        flatten_graph_with_lowering(
-            &graph,
-            &mut ssarepr,
-            ctx,
-            Some(cpu),
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            |c| match (&c.value, c.kind) {
-                (ConstantValue::Opaque(opaque), Some(Kind::Ref)) => {
-                    // Test-side lowering: encode the OverflowError
-                    // marker as `ConstRef(0xFFFF_FFFF)` so the assertion
-                    // can recognize it without resolving the runtime
-                    // pointer.
-                    let _ = opaque;
-                    Operand::ConstRef(0xFFFF_FFFF)
-                }
-                _ => flatten_constant_operand(c),
-            },
-        );
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
 
@@ -7793,11 +7820,6 @@ mod tests {
             Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
         let mut ssarepr = SSARepr::new("ovf_no_catch");
-        flatten_graph_with_closures(
-            &graph,
-            &mut ssarepr,
-            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
-            flatten_constant_operand,
-        );
+        flatten_graph_for_test(&graph, &mut ssarepr);
     }
 }
