@@ -1657,14 +1657,13 @@ impl ConstantOpcodeHandler for PyFrame {
 }
 
 impl OpcodeStepExecutor for PyFrame {
-    type Error = PyError;
 
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
     /// (typeobject.py auto-fills the slot at class creation, but the
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
-    fn setup_annotations(&mut self) -> Result<(), Self::Error> {
+    fn setup_annotations(&mut self) -> Result<(), PyError> {
         let ns = self.getdictscope()?;
         if ns.is_null() {
             return Ok(());
@@ -1685,7 +1684,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// looking for the first callable to use as exit_func instead of relying
     /// on a fixed offset, because the exact slot count depends on whether
     /// LOAD_SPECIAL preserved a NULL placeholder for the cm self.
-    fn with_except_start(&mut self) -> Result<(), Self::Error> {
+    fn with_except_start(&mut self) -> Result<(), PyError> {
         let depth = self.valuestackdepth;
         if depth < 1 {
             return Err(PyError::type_error("WITH_EXCEPT_START on empty stack"));
@@ -1727,7 +1726,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_common_constant(
         &mut self,
         cc: crate::bytecode::CommonConstant,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         use crate::bytecode::CommonConstant;
         let val = match cc {
             CommonConstant::AssertionError => {
@@ -1770,7 +1769,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── PopJumpIfNone / PopJumpIfNotNone ──
     // CPython 3.13: replaces IS_OP + POP_JUMP_IF_TRUE/FALSE for None checks
 
-    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), PyError> {
         let val = self.pop();
         if unsafe { pyre_object::is_none(val) } || val.is_null() {
             self.set_last_instr_from_next_instr(target);
@@ -1778,7 +1777,7 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), PyError> {
         let val = self.pop();
         if !val.is_null() && !unsafe { pyre_object::is_none(val) } {
             self.set_last_instr_from_next_instr(target);
@@ -1797,7 +1796,7 @@ impl OpcodeStepExecutor for PyFrame {
     ///
     /// PyPy: pyopcode.py LOAD_DEREF → cell.get()
     /// If the slot holds a cell object, dereference it to get the value.
-    fn load_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn load_deref(&mut self, idx: usize) -> Result<(), PyError> {
         let slot = self.locals_w()[idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
@@ -1816,7 +1815,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// STORE_DEREF — unified index. Stores into cell if present.
     ///
     /// PyPy: pyopcode.py STORE_DEREF → cell.set(value)
-    fn store_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn store_deref(&mut self, idx: usize) -> Result<(), PyError> {
         let value = self.pop();
         let slot = self.locals_w()[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -1830,7 +1829,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// LOAD_CLOSURE — unified index. Push cell object itself (not contents).
     ///
     /// PyPy: pyopcode.py LOAD_CLOSURE → push cell for closure capture.
-    fn load_closure(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn load_closure(&mut self, idx: usize) -> Result<(), PyError> {
         let cell = self.locals_w()[idx];
         self.push(cell);
         Ok(())
@@ -1844,7 +1843,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// Wraps the current value (PY_NULL if uninitialized) in a W_CellObject.
     /// LoadFast on cell slots returns the cell object itself (needed for
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
-    fn make_cell(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
         let code = unsafe { &*crate::pyframe_get_pycode(self) };
         if std::env::var("PYRE_DEBUG_CELL").is_ok() {
             eprintln!("  varnames: {:?}", code.varnames);
@@ -1858,7 +1857,7 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    fn delete_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         let nlocals = self.nlocals();
         self.locals_w_mut()[nlocals + idx] = PY_NULL;
         Ok(())
@@ -1866,7 +1865,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Exception handling ──
 
-    fn setup_finally(&mut self, handler: usize) -> Result<(), Self::Error> {
+    fn setup_finally(&mut self, handler: usize) -> Result<(), PyError> {
         self.append_block(crate::pyframe::FrameBlock {
             valuestackdepth: self.valuestackdepth,
             handlerposition: handler,
@@ -1875,16 +1874,16 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    fn setup_except(&mut self, handler: usize) -> Result<(), Self::Error> {
+    fn setup_except(&mut self, handler: usize) -> Result<(), PyError> {
         self.setup_finally(handler)
     }
 
-    fn pop_block(&mut self) -> Result<(), Self::Error> {
+    fn pop_block(&mut self) -> Result<(), PyError> {
         self.pop_block();
         Ok(())
     }
 
-    fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
+    fn raise_varargs(&mut self, argc: usize) -> Result<(), PyError> {
         match argc {
             0 => {
                 // Bare `raise` — re-raise current exception
@@ -1954,7 +1953,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
     }
 
-    fn end_finally(&mut self) -> Result<(), Self::Error> {
+    fn end_finally(&mut self) -> Result<(), PyError> {
         // Pop the exception or None from stack
         let _ = self.pop();
         Ok(())
@@ -1963,7 +1962,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── Import ──
     // PyPy: pyopcode.py IMPORT_NAME
     // Stack: [level, fromlist] → pops both, pushes module object.
-    fn import_name(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
         let w_level = self.pop();
         let level = if unsafe { pyre_object::is_int(w_level) } {
@@ -1985,7 +1984,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // PyPy: pyopcode.py IMPORT_FROM
     // Stack: [module] → peek module, push getattr(module, name)
-    fn import_from(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
         let attr = crate::importing::import_from(module, name, self.execution_context)?;
         self.push(attr);
@@ -1995,7 +1994,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── ContainsOp (in / not in) ──
     // PyPy: pyopcode.py COMPARE_OP with 'in' / 'not in'
 
-    fn contains_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
+    fn contains_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError> {
         // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
         let needle = self.pop();
@@ -2011,7 +2010,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── IsOp (is / is not) ──
     // PyPy: pyopcode.py COMPARE_OP with 'is' / 'is not'
 
-    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
+    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError> {
         let b = self.pop();
         let a = self.pop();
         let same = std::ptr::eq(a, b); // pointer identity
@@ -2026,7 +2025,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── ToBool ──
     // CPython 3.13: converts TOS to bool
 
-    fn to_bool(&mut self) -> Result<(), Self::Error> {
+    fn to_bool(&mut self) -> Result<(), PyError> {
         let val = self.pop();
         let truth = crate::baseobjspace::is_true(val);
         self.push(pyre_object::w_bool_from(truth));
@@ -2035,7 +2034,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── DeleteSubscr ──
 
-    fn delete_subscript(&mut self) -> Result<(), Self::Error> {
+    fn delete_subscript(&mut self) -> Result<(), PyError> {
         let index = self.pop();
         let obj = self.pop();
         crate::baseobjspace::delitem(obj, index)?;
@@ -2044,13 +2043,13 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── DeleteFast ──
 
-    fn delete_fast(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn delete_fast(&mut self, idx: usize) -> Result<(), PyError> {
         self.locals_w_mut()[idx] = PY_NULL;
         Ok(())
     }
 
     // ── FormatSimple (str(TOS)) ──
-    fn format_simple(&mut self) -> Result<(), Self::Error> {
+    fn format_simple(&mut self) -> Result<(), PyError> {
         let val = self.pop();
         let s = unsafe { crate::py_str(val) };
         self.push(pyre_object::w_str_new(&s));
@@ -2058,7 +2057,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── FormatWithSpec (format(TOS1, TOS)) ──
-    fn format_with_spec(&mut self) -> Result<(), Self::Error> {
+    fn format_with_spec(&mut self) -> Result<(), PyError> {
         let spec = self.pop();
         let val = self.pop();
         // `pypy/objspace/std/newformat.py format(value, spec)` — empty
@@ -2083,7 +2082,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn convert_value(
         &mut self,
         conv: crate::bytecode::ConvertValueOparg,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         let val = self.pop();
         let s = match conv {
             crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
@@ -2097,7 +2096,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── CopyFreeVars ──
     // CPython 3.13: copy n freevars from function closure to frame cell slots
-    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
+    fn copy_free_vars(&mut self, _count: usize) -> Result<(), PyError> {
         // Phase 1: no-op — closure passing needs call-site integration
         // The closure tuple is on the Function, but COPY_FREE_VARS
         // runs inside the callee frame which doesn't have a reference to
@@ -2114,7 +2113,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn set_function_attribute_with_flag(
         &mut self,
         flag: crate::bytecode::MakeFunctionFlag,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         use crate::bytecode::MakeFunctionFlag;
         let func = self.pop(); // TOS = function
         let attr = self.pop(); // TOS1 = attribute value (closure tuple etc.)
@@ -2166,7 +2165,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── PushExcInfo ──
     // PyPy: executioncontext.py enter_frame / normalize_exception
-    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+    fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = self.pop();
         // Save previous exception, set current
         let prev = CURRENT_EXCEPTION.with(|c| c.get());
@@ -2181,7 +2180,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── CheckExcMatch ──
     // TOS = exception type to match, TOS1 = caught exception
     // Pops type, peeks exc, pushes bool result
-    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+    fn check_exc_match(&mut self) -> Result<(), PyError> {
         let exc_type = self.pop();
         let exc_value = self.peek();
         // pyopcode.py:1032-1040 cmp_exc_match split:
@@ -2202,7 +2201,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── PopExcept ──
-    fn pop_except(&mut self) -> Result<(), Self::Error> {
+    fn pop_except(&mut self) -> Result<(), PyError> {
         // Restore previous exc_info from stack
         let prev_exc = self.pop();
         CURRENT_EXCEPTION.with(|c| c.set(prev_exc));
@@ -2211,7 +2210,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Reraise ──
     // `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
-    fn reraise(&mut self, oparg: u32) -> Result<(), Self::Error> {
+    fn reraise(&mut self, oparg: u32) -> Result<(), PyError> {
         // pyopcode.py:1357-1363
         let reraise_lasti: i32 = if oparg != 0 {
             // pyopcode.py:1361 — self.space.int_w(self.peekvalue(oparg))
@@ -2237,7 +2236,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadFromDictOrGlobals ──
     // CPython 3.13: LOAD_FROM_DICT_OR_GLOBALS — try TOS dict first, then globals
-    fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), PyError> {
         let dict = self.pop();
         // Try dict first (if it's a dict or has attrs)
         if let Ok(val) = crate::baseobjspace::getattr(dict, name) {
@@ -2255,13 +2254,13 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── GetLen ──
-    fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
+    fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let len = crate::baseobjspace::len(obj)?;
         Ok(len)
     }
 
     // ── LoadFastAndClear (comprehension scope) ──
-    fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), Self::Error> {
+    fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), PyError> {
         let val = self.locals_w()[idx];
         self.push(val);
         self.locals_w_mut()[idx] = PY_NULL;
@@ -2269,7 +2268,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── BuildSet ──
-    fn build_set(&mut self, count: usize) -> Result<(), Self::Error> {
+    fn build_set(&mut self, count: usize) -> Result<(), PyError> {
         // Build as a set-like object backed by __data__ dict.
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
@@ -2284,7 +2283,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── DictUpdate ──
     // PyPy: dict.update(source); CPython: DICT_UPDATE
     // Merges source dict entries into STACK[-i] dict.
-    fn dict_update(&mut self, i: usize) -> Result<(), Self::Error> {
+    fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
         unsafe {
@@ -2305,7 +2304,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── DictMerge ──
     // PyPy: dict merge for **kwargs; CPython: DICT_MERGE
-    fn dict_merge(&mut self, i: usize) -> Result<(), Self::Error> {
+    fn dict_merge(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
         unsafe {
@@ -2321,7 +2320,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── MapAdd ──
     // PyPy: STORE_MAP/MAP_ADD; CPython: MAP_ADD
     // dict = STACK[-i-2]; dict[TOS1] = TOS; pop key+value
-    fn map_add(&mut self, i: usize) -> Result<(), Self::Error> {
+    fn map_add(&mut self, i: usize) -> Result<(), PyError> {
         let value = self.pop();
         let key = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
@@ -2334,7 +2333,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── SetAdd ──
     // PyPy: SET_ADD; CPython: SET_ADD
     // set = STACK[-i]; set.add(TOS); pop value
-    fn set_add(&mut self, i: usize) -> Result<(), Self::Error> {
+    fn set_add(&mut self, i: usize) -> Result<(), PyError> {
         let value = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
         unsafe {
@@ -2348,13 +2347,13 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── none_value ──
-    fn none_value(&mut self) -> Result<PyObjectRef, Self::Error> {
+    fn none_value(&mut self) -> Result<PyObjectRef, PyError> {
         Ok(pyre_object::w_none())
     }
 
     // ── unary_positive ──
     // PyPy: UNARY_POSITIVE → space.pos(w_value)
-    fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
+    fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
         unsafe {
             if pyre_object::is_bool(val) {
                 // +True → 1, +False → 0 (int, not bool)
@@ -2371,7 +2370,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── list_to_tuple ──
     // PyPy intrinsic: convert list to tuple (used in star unpacking).
-    fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
+    fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
         unsafe {
             if pyre_object::is_list(val) {
                 let items = pyre_object::w_list_items_copy_as_vec(val);
@@ -2383,7 +2382,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── print_expr ──
     // PyPy: PRINT_EXPR → sys.displayhook(value)
-    fn print_expr(&mut self, val: PyObjectRef) -> Result<(), Self::Error> {
+    fn print_expr(&mut self, val: PyObjectRef) -> Result<(), PyError> {
         if !unsafe { pyre_object::is_none(val) } {
             let s = unsafe { crate::py_repr(val) };
             println!("{}", s);
@@ -2393,7 +2392,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
-    fn delete_name(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn delete_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_locals_object = self.get_w_locals_object();
         if !w_locals_object.is_null() {
             let key = unsafe { pyre_object::w_str_new(name) };
@@ -2442,7 +2441,7 @@ impl OpcodeStepExecutor for PyFrame {
     // canonical W_DictObject so the W_ModuleDictObject's strategy and
     // its mirror `DictStorage` stay coherent via
     // `maybe_sync_dict_storage_delete`.
-    fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn delete_global(&mut self, name: &str) -> Result<(), PyError> {
         let w_globals_obj = self.get_w_globals_obj();
         let found: bool = if w_globals_obj.is_null() {
             let ns = self.get_w_globals();
@@ -2465,7 +2464,7 @@ impl OpcodeStepExecutor for PyFrame {
     // name, value)` rather than the `*mut DictStorage` fast path,
     // matching `pyopcode.py:1078 self.getdictscope()` returning a
     // generic `w_obj`.
-    fn import_star(&mut self) -> Result<(), Self::Error> {
+    fn import_star(&mut self) -> Result<(), PyError> {
         let module = self.pop();
         let w_locals_object = self.get_w_locals_object();
         if !w_locals_object.is_null() {
@@ -2480,21 +2479,21 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── load_build_class ──
     // PyPy: BUILD_CLASS; CPython: LOAD_BUILD_CLASS
-    fn load_build_class(&mut self) -> Result<(), Self::Error> {
+    fn load_build_class(&mut self) -> Result<(), PyError> {
         let bc = crate::get_build_class_func();
         self.push(bc);
         Ok(())
     }
 
     // ── yield from / send ──
-    fn get_yield_from_iter(&mut self) -> Result<(), Self::Error> {
+    fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
         let iterable = self.pop();
         let iter = crate::baseobjspace::iter(iterable)?;
         self.push(iter);
         Ok(())
     }
 
-    fn send_value(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn send_value(&mut self, target: usize) -> Result<(), PyError> {
         let _value = self.pop(); // sent value
         let iter = self.peek();
         match crate::baseobjspace::next(iter) {
@@ -2533,7 +2532,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
     }
 
-    fn end_send(&mut self) -> Result<(), Self::Error> {
+    fn end_send(&mut self) -> Result<(), PyError> {
         let result = self.pop();
         let _iter = self.pop();
         self.push(result);
@@ -2546,7 +2545,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── return_generator ──
     // CPython 3.12: RETURN_GENERATOR creates a generator from the current
     // frame and returns it to the caller. PyPy: generator.py GeneratorIterator.
-    fn return_generator(&mut self) -> Result<(), Self::Error> {
+    fn return_generator(&mut self) -> Result<(), PyError> {
         // When the generator function is already wrapped (CodeFlags::GENERATOR
         // detected in call_user_function_with_eval), RETURN_GENERATOR fires
         // during the first __next__() resume. It's a no-op in that case —
@@ -2559,7 +2558,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_super_attr ──
     // CPython 3.12 LOAD_SUPER_ATTR: stack = [global_super, class, self]
     // → super(class, self).attr
-    fn load_super_attr_with(&mut self, name: &str, is_method: bool) -> Result<(), Self::Error> {
+    fn load_super_attr_with(&mut self, name: &str, is_method: bool) -> Result<(), PyError> {
         let self_obj = self.pop();
         let cls = self.pop();
         let _global_super = self.pop();
@@ -2593,7 +2592,7 @@ impl OpcodeStepExecutor for PyFrame {
     // For non-instances (modules etc.), pushes [attr, NULL].
     // The default trait impl always pushes [attr, NULL], which is what
     // the JIT tracer uses — no runtime branch in the shared path.
-    fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn load_method(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
         let attr = crate::baseobjspace::getattr(obj, name)?;
         if unsafe { pyre_object::is_method(attr) } {
@@ -2684,7 +2683,7 @@ impl OpcodeStepExecutor for PyFrame {
     //
     // CPython 3.12+ CALL: stack is [callable, null_or_self, arg0..argN-1].
     // null_or_self is NULL for plain calls, `self` for method calls.
-    fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call(&mut self, nargs: usize) -> Result<(), PyError> {
         // baseobjspace.py:1240-1261 fast path: Function + no method binding
         //
         // baseobjspace.py:1243 — skip fast path when profiling is active
@@ -2751,7 +2750,7 @@ impl OpcodeStepExecutor for PyFrame {
     // argument.py Arguments.unpack_combined_starargs iterates w_star with
     // space.fixedview_unroll / space.listview_no_unpack, so arbitrary
     // iterables are accepted.
-    fn call_function_ex(&mut self) -> Result<(), Self::Error> {
+    fn call_function_ex(&mut self) -> Result<(), PyError> {
         let kwargs_or_null = self.pop();
         let args_obj = self.pop();
         let _null = self.pop();
@@ -2804,7 +2803,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// Keyword resolution happens HERE (before frame creation) so the
     /// JIT eval loop sees correctly-positioned locals. PyPy does this
     /// in Arguments.parse_into_scope before the frame executes.
-    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call_kw(&mut self, nargs: usize) -> Result<(), PyError> {
         let kwarg_names = self.pop();
         let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
@@ -2959,7 +2958,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_locals ──
     // PyPy: LOAD_LOCALS; CPython: LOAD_LOCALS
     // Pushes the current namespace dict onto the stack.
-    fn load_locals(&mut self) -> Result<(), Self::Error> {
+    fn load_locals(&mut self) -> Result<(), PyError> {
         let dict = pyre_object::w_dict_new();
         unsafe {
             let w_locals = self.get_w_locals();
@@ -2994,7 +2993,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unpack_ex ──
     // PyPy: UNPACK_SEQUENCE with star; CPython: UNPACK_EX
     // `a, *b, c = iterable`
-    fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
+    fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
         let before = args.before as usize;
         let after = args.after as usize;
         let value = self.pop();
@@ -3035,7 +3034,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_attr ──
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
-    fn delete_attr(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn delete_attr(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
         crate::baseobjspace::delattr(obj, name)?;
         Ok(())
@@ -3043,7 +3042,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── set_update ──
     // PyPy: set.update(iterable); CPython: SET_UPDATE
-    fn set_update(&mut self, i: usize) -> Result<(), Self::Error> {
+    fn set_update(&mut self, i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
         unsafe {
@@ -3073,7 +3072,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn build_slice(
         &mut self,
         argc: crate::bytecode::BuildSliceArgCount,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         use crate::bytecode::BuildSliceArgCount;
         let step = match argc {
             BuildSliceArgCount::Three => self.pop(),
@@ -3087,7 +3086,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BinarySlice (a[b:c]) ──
     // PyPy: BINARY_SUBSCR with slice; CPython 3.13: BINARY_SLICE
-    fn binary_slice(&mut self) -> Result<(), Self::Error> {
+    fn binary_slice(&mut self) -> Result<(), PyError> {
         let stop = self.pop();
         let start = self.pop();
         let obj = self.pop();
@@ -3168,14 +3167,14 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── StoreSlice (a[b:c] = d) ──
-    fn store_slice(&mut self) -> Result<(), Self::Error> {
+    fn store_slice(&mut self) -> Result<(), PyError> {
         // Phase 1 stub — rarely used in hot loops
         Err(PyError::type_error("STORE_SLICE not yet implemented"))
     }
 
     // ── BuildString (f-string concatenation) ──
     // CPython 3.13: concatenate N string fragments from stack
-    fn build_string(&mut self, count: usize) -> Result<(), Self::Error> {
+    fn build_string(&mut self, count: usize) -> Result<(), PyError> {
         let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
             parts.push(self.pop());
@@ -3206,7 +3205,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── ListExtend ──
-    fn list_extend(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let list = self.peek();
         unsafe {
@@ -3235,7 +3234,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn unsupported(
         &mut self,
         instruction: &Instruction,
-    ) -> Result<StepResult<PyObjectRef>, Self::Error> {
+    ) -> Result<StepResult<PyObjectRef>, PyError> {
         Err(PyError::type_error(format!(
             "unimplemented instruction: {instruction:?}"
         )))

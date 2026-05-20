@@ -467,6 +467,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyframe_nlocals as *const (),
     );
 
+    // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
+    // at `eval.rs:844 Ok(PyFrame::pop(self))`. The codewriter resolves
+    // the qualified `PyFrame::pop(self)` syntax to a 2-segment CallPath
+    // `["PyFrame", "pop"]` (without the `pyframe::` module prefix that a
+    // bare method call like `self.nlocals()` would have).
+    // `register_macro_helper_trace_fnaddr` strips the leading segment,
+    // so the 3-segment input string `pyre_interpreter::PyFrame::pop`
+    // produces the matching 2-segment canonical form.
+    let pyframe_pop: fn(&mut crate::pyframe::PyFrame) -> pyre_object::PyObjectRef =
+        crate::pyframe::PyFrame::pop;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyFrame::pop",
+        pyframe_pop as *const (),
+    );
+
     // `pop_value`'s underflow guard returns `stack_underflow_error(...)`
     // when the value stack is empty (`eval.rs:840-845` +
     // `eval.rs:847-852 peek_at`). The codewriter follows that call edge

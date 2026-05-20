@@ -707,27 +707,26 @@ pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
 }
 
 pub trait OpcodeStepExecutor: SharedOpcodeHandler {
-    type Error: From<PyError>;
 
-    fn load_const(&mut self, constant: &ConstantData) -> Result<(), Self::Error>
+    fn load_const(&mut self, constant: &ConstantData) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
     {
-        opcode_load_const(self, constant).map_err(Into::into)
+        opcode_load_const(self, constant)
     }
 
-    fn load_small_int(&mut self, value: i64) -> Result<(), Self::Error>
+    fn load_small_int(&mut self, value: i64) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
     {
-        opcode_load_small_int(self, value).map_err(Into::into)
+        opcode_load_small_int(self, value)
     }
 
-    fn load_fast_checked(&mut self, idx: usize, name: &str) -> Result<(), Self::Error>
+    fn load_fast_checked(&mut self, idx: usize, name: &str) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_load_fast_checked(self, idx, name).map_err(Into::into)
+        opcode_load_fast_checked(self, idx, name)
     }
 
     fn load_fast_pair_checked(
@@ -736,60 +735,60 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         name1: &str,
         idx2: usize,
         name2: &str,
-    ) -> Result<(), Self::Error>
+    ) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_load_fast_pair_checked(self, idx1, name1, idx2, name2).map_err(Into::into)
+        opcode_load_fast_pair_checked(self, idx1, name1, idx2, name2)
     }
 
-    fn store_fast(&mut self, idx: usize) -> Result<(), Self::Error>
+    fn store_fast(&mut self, idx: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_store_fast(self, idx).map_err(Into::into)
+        opcode_store_fast(self, idx)
     }
 
-    fn load_fast_load_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), Self::Error>
+    fn load_fast_load_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_load_fast_load_fast(self, idx1, idx2).map_err(Into::into)
+        opcode_load_fast_load_fast(self, idx1, idx2)
     }
 
-    fn store_fast_load_fast(&mut self, store_idx: usize, load_idx: usize) -> Result<(), Self::Error>
+    fn store_fast_load_fast(&mut self, store_idx: usize, load_idx: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_store_fast_load_fast(self, store_idx, load_idx).map_err(Into::into)
+        opcode_store_fast_load_fast(self, store_idx, load_idx)
     }
 
-    fn store_fast_store_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), Self::Error>
+    fn store_fast_store_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_store_fast_store_fast(self, idx1, idx2).map_err(Into::into)
+        opcode_store_fast_store_fast(self, idx1, idx2)
     }
 
-    fn store_name(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
+    fn store_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_store_name(self, name, nameindex).map_err(Into::into)
+        opcode_store_name(self, name, nameindex)
     }
 
-    fn store_global(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
+    fn store_global(&mut self, name: &str, nameindex: usize) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_store_global(self, name, nameindex).map_err(Into::into)
+        opcode_store_global(self, name, nameindex)
     }
 
-    fn load_name(&mut self, name: &str, nameindex: usize) -> Result<(), Self::Error>
+    fn load_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_load_name(self, name, nameindex).map_err(Into::into)
+        opcode_load_name(self, name, nameindex)
     }
 
     fn load_global(
@@ -797,119 +796,119 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         name: &str,
         nameindex: usize,
         push_null: bool,
-    ) -> Result<(), Self::Error>
+    ) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_load_global(self, name, nameindex, push_null).map_err(Into::into)
+        opcode_load_global(self, name, nameindex, push_null)
     }
 
-    fn pop_top(&mut self) -> Result<(), Self::Error>
+    fn pop_top(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_pop_top(self).map_err(Into::into)
+        opcode_pop_top(self)
     }
 
-    fn push_null(&mut self) -> Result<(), Self::Error>
+    fn push_null(&mut self) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
-        opcode_push_null(self).map_err(Into::into)
+        opcode_push_null(self)
     }
 
-    fn copy_value(&mut self, depth: usize) -> Result<(), Self::Error>
+    fn copy_value(&mut self, depth: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_copy_value(self, depth).map_err(Into::into)
+        opcode_copy_value(self, depth)
     }
 
-    fn swap(&mut self, depth: usize) -> Result<(), Self::Error>
+    fn swap(&mut self, depth: usize) -> Result<(), PyError>
     where
         Self: StackOpcodeHandler,
     {
-        opcode_swap(self, depth).map_err(Into::into)
+        opcode_swap(self, depth)
     }
 
-    fn binary_op(&mut self, op: BinaryOperator) -> Result<(), Self::Error>
+    fn binary_op(&mut self, op: BinaryOperator) -> Result<(), PyError>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        opcode_binary_op(self, op).map_err(Into::into)
+        opcode_binary_op(self, op)
     }
 
-    fn compare_op(&mut self, op: ComparisonOperator) -> Result<(), Self::Error>
+    fn compare_op(&mut self, op: ComparisonOperator) -> Result<(), PyError>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        opcode_compare_op(self, op).map_err(Into::into)
+        opcode_compare_op(self, op)
     }
 
-    fn unary_negative(&mut self) -> Result<(), Self::Error>
+    fn unary_negative(&mut self) -> Result<(), PyError>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        opcode_unary_negative(self).map_err(Into::into)
+        opcode_unary_negative(self)
     }
 
-    fn unary_not(&mut self) -> Result<(), Self::Error>
+    fn unary_not(&mut self) -> Result<(), PyError>
     where
         Self: TruthOpcodeHandler,
     {
-        opcode_unary_not(self).map_err(Into::into)
+        opcode_unary_not(self)
     }
 
-    fn unary_invert(&mut self) -> Result<(), Self::Error>
+    fn unary_invert(&mut self) -> Result<(), PyError>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        opcode_unary_invert(self).map_err(Into::into)
+        opcode_unary_invert(self)
     }
 
-    fn jump_forward(&mut self, target: usize) -> Result<(), Self::Error>
+    fn jump_forward(&mut self, target: usize) -> Result<(), PyError>
     where
         Self: ControlFlowOpcodeHandler,
     {
-        opcode_jump_forward(self, target).map_err(Into::into)
+        opcode_jump_forward(self, target)
     }
 
     fn jump_backward(
         &mut self,
         target: usize,
-    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, Self::Error>
+    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>
     where
         Self: ControlFlowOpcodeHandler,
     {
-        opcode_jump_backward(self, target).map_err(Into::into)
+        opcode_jump_backward(self, target)
     }
 
-    fn pop_jump_if_false(&mut self, target: usize) -> Result<(), Self::Error>
+    fn pop_jump_if_false(&mut self, target: usize) -> Result<(), PyError>
     where
         Self: BranchOpcodeHandler,
     {
-        opcode_pop_jump_if_false(self, target).map_err(Into::into)
+        opcode_pop_jump_if_false(self, target)
     }
 
-    fn pop_jump_if_true(&mut self, target: usize) -> Result<(), Self::Error>
+    fn pop_jump_if_true(&mut self, target: usize) -> Result<(), PyError>
     where
         Self: BranchOpcodeHandler,
     {
-        opcode_pop_jump_if_true(self, target).map_err(Into::into)
+        opcode_pop_jump_if_true(self, target)
     }
 
-    fn make_function(&mut self) -> Result<(), Self::Error>
+    fn make_function(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_make_function(self).map_err(Into::into)
+        opcode_make_function(self)
     }
 
     /// `SETUP_ANNOTATIONS` — ensure the current locals namespace exposes
     /// `__annotations__` as a dict for subsequent `STORE_SUBSCR` writes.
     /// Default no-op so non-PyFrame handlers (e.g. trace recorder) can
     /// ignore the opcode; PyFrame overrides this to do the actual work.
-    fn setup_annotations(&mut self) -> Result<(), Self::Error>
+    fn setup_annotations(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
@@ -919,76 +918,76 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// CPython 3.14 WITH_EXCEPT_START — call __exit__ with the active
     /// exception inside a `with` block. Default no-op for the trace
     /// recorder; PyFrame overrides to actually invoke __exit__.
-    fn with_except_start(&mut self) -> Result<(), Self::Error>
+    fn with_except_start(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
         Ok(())
     }
 
-    fn call(&mut self, nargs: usize) -> Result<(), Self::Error>
+    fn call(&mut self, nargs: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_call(self, nargs).map_err(Into::into)
+        opcode_call(self, nargs)
     }
 
     fn return_value(
         &mut self,
-    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, Self::Error>
+    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>
     where
         Self: ControlFlowOpcodeHandler,
     {
-        opcode_return_value(self).map_err(Into::into)
+        opcode_return_value(self)
     }
 
-    fn build_list(&mut self, size: usize) -> Result<(), Self::Error>
+    fn build_list(&mut self, size: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_build_list(self, size).map_err(Into::into)
+        opcode_build_list(self, size)
     }
 
-    fn build_tuple(&mut self, size: usize) -> Result<(), Self::Error>
+    fn build_tuple(&mut self, size: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_build_tuple(self, size).map_err(Into::into)
+        opcode_build_tuple(self, size)
     }
 
-    fn build_map(&mut self, size: usize) -> Result<(), Self::Error>
+    fn build_map(&mut self, size: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_build_map(self, size).map_err(Into::into)
+        opcode_build_map(self, size)
     }
 
-    fn store_subscr(&mut self) -> Result<(), Self::Error>
+    fn store_subscr(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_store_subscr(self).map_err(Into::into)
+        opcode_store_subscr(self)
     }
 
-    fn list_append(&mut self, depth: usize) -> Result<(), Self::Error>
+    fn list_append(&mut self, depth: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_list_append(self, depth).map_err(Into::into)
+        opcode_list_append(self, depth)
     }
 
-    fn unpack_sequence(&mut self, count: usize) -> Result<(), Self::Error>
+    fn unpack_sequence(&mut self, count: usize) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_unpack_sequence(self, count).map_err(Into::into)
+        opcode_unpack_sequence(self, count)
     }
 
-    fn load_attr(&mut self, name: &str) -> Result<(), Self::Error>
+    fn load_attr(&mut self, name: &str) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_load_attr(self, name).map_err(Into::into)
+        opcode_load_attr(self, name)
     }
 
     /// LOAD_ATTR with is_method=true. Default: push [attr, NULL].
@@ -996,132 +995,132 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// PyFrame overrides this to push [attr, self] for instance method
     /// calls. The JIT tracer uses the default (no runtime branch), so
     /// trace and concrete execution always agree in the shared path.
-    fn load_method(&mut self, name: &str) -> Result<(), Self::Error>
+    fn load_method(&mut self, name: &str) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
     {
-        let obj = self.pop_value().map_err(Into::into)?;
-        let attr_val = SharedOpcodeHandler::load_attr(self, obj, name).map_err(Into::into)?;
-        self.push_value(attr_val).map_err(Into::into)?;
-        let null = self.null_value().map_err(Into::into)?;
-        self.push_value(null).map_err(Into::into)
+        let obj = self.pop_value()?;
+        let attr_val = SharedOpcodeHandler::load_attr(self, obj, name)?;
+        self.push_value(attr_val)?;
+        let null = self.null_value()?;
+        self.push_value(null)
     }
 
-    fn store_attr(&mut self, name: &str) -> Result<(), Self::Error>
+    fn store_attr(&mut self, name: &str) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_store_attr(self, name).map_err(Into::into)
+        opcode_store_attr(self, name)
     }
 
-    fn get_iter(&mut self) -> Result<(), Self::Error>
+    fn get_iter(&mut self) -> Result<(), PyError>
     where
         Self: IterOpcodeHandler,
     {
-        opcode_get_iter(self).map_err(Into::into)
+        opcode_get_iter(self)
     }
 
-    fn for_iter(&mut self, target: usize) -> Result<(), Self::Error>
+    fn for_iter(&mut self, target: usize) -> Result<(), PyError>
     where
         Self: IterOpcodeHandler + ControlFlowOpcodeHandler,
     {
-        opcode_for_iter(self, target).map_err(Into::into)
+        opcode_for_iter(self, target)
     }
 
-    fn end_for(&mut self) -> Result<(), Self::Error> {
+    fn end_for(&mut self) -> Result<(), PyError> {
         Ok(())
     }
 
-    fn pop_iter(&mut self) -> Result<(), Self::Error>
+    fn pop_iter(&mut self) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
     {
-        opcode_pop_top(self).map_err(Into::into)
+        opcode_pop_top(self)
     }
 
     // ── Closures / cells ──
-    fn load_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn load_deref(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_deref not implemented").into())
     }
-    fn store_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn store_deref(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("store_deref not implemented").into())
     }
-    fn load_closure(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn load_closure(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_closure not implemented").into())
     }
-    fn delete_deref(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn delete_deref(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_deref not implemented").into())
     }
 
     // ── Exception handling ──
-    fn setup_finally(&mut self, _handler: usize) -> Result<(), Self::Error> {
+    fn setup_finally(&mut self, _handler: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("setup_finally not implemented").into())
     }
-    fn setup_except(&mut self, _handler: usize) -> Result<(), Self::Error> {
+    fn setup_except(&mut self, _handler: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("setup_except not implemented").into())
     }
-    fn pop_block(&mut self) -> Result<(), Self::Error> {
+    fn pop_block(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pop_block not implemented").into())
     }
-    fn raise_varargs(&mut self, _argc: usize) -> Result<(), Self::Error> {
+    fn raise_varargs(&mut self, _argc: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("raise_varargs not implemented").into())
     }
-    fn end_finally(&mut self) -> Result<(), Self::Error> {
+    fn end_finally(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("end_finally not implemented").into())
     }
-    fn exception_handler(&mut self) -> Result<(), Self::Error> {
+    fn exception_handler(&mut self) -> Result<(), PyError> {
         Ok(()) // no-op by default
     }
 
     // ── Import ──
-    fn import_name(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn import_name(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("import_name not implemented").into())
     }
-    fn import_from(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn import_from(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("import_from not implemented").into())
     }
-    fn import_star(&mut self) -> Result<(), Self::Error> {
+    fn import_star(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("import_star not implemented").into())
     }
 
     // ── Stack manipulation ──
-    fn rotate3(&mut self) -> Result<(), Self::Error> {
+    fn rotate3(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("rotate3 not implemented").into())
     }
 
     // ── Delete operations ──
-    fn delete_fast(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn delete_fast(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_fast not implemented").into())
     }
-    fn delete_subscript(&mut self) -> Result<(), Self::Error> {
+    fn delete_subscript(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_subscript not implemented").into())
     }
-    fn delete_attr(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn delete_attr(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_attr not implemented").into())
     }
-    fn delete_name(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn delete_name(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_name not implemented").into())
     }
-    fn delete_global(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn delete_global(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_global not implemented").into())
     }
 
     // Containment / identity
-    fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
+    fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
         Err(crate::PyError::type_error("contains_op not implemented").into())
     }
-    fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
+    fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
         Err(crate::PyError::type_error("is_op not implemented").into())
     }
 
     // Exception handling
-    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+    fn push_exc_info(&mut self) -> Result<(), PyError> {
         Ok(())
     }
-    fn pop_except(&mut self) -> Result<(), Self::Error> {
+    fn pop_except(&mut self) -> Result<(), PyError> {
         Ok(())
     }
-    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+    fn check_exc_match(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("check_exc_match not implemented").into())
     }
     /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
@@ -1131,47 +1130,47 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// peeks lasti at `peekvalue(oparg)` and carries it through
     /// `RaiseWithExplicitTraceback(operr, reraise_lasti=...)`.  When
     /// `oparg == 0` no lasti is attached (default `-1`).
-    fn reraise(&mut self, _oparg: u32) -> Result<(), Self::Error> {
+    fn reraise(&mut self, _oparg: u32) -> Result<(), PyError> {
         Err(crate::PyError::type_error("reraise not implemented").into())
     }
 
     // Collections
-    fn build_set(&mut self, _count: usize) -> Result<(), Self::Error> {
+    fn build_set(&mut self, _count: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("build_set not implemented").into())
     }
     fn build_slice(
         &mut self,
         _argc: crate::bytecode::BuildSliceArgCount,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         Err(crate::PyError::type_error("build_slice not implemented").into())
     }
-    fn build_string(&mut self, _count: usize) -> Result<(), Self::Error> {
+    fn build_string(&mut self, _count: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("build_string not implemented").into())
     }
-    fn list_extend(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("list_extend not implemented").into())
     }
-    fn set_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn set_add(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("set_add not implemented").into())
     }
-    fn dict_merge(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn dict_merge(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("dict_merge not implemented").into())
     }
-    fn dict_update(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn dict_update(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("dict_update not implemented").into())
     }
-    fn set_update(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn set_update(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("set_update not implemented").into())
     }
-    fn map_add(&mut self, _i: usize) -> Result<(), Self::Error> {
+    fn map_add(&mut self, _i: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("map_add not implemented").into())
     }
 
     // Slicing
-    fn binary_slice(&mut self) -> Result<(), Self::Error> {
+    fn binary_slice(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("binary_slice not implemented").into())
     }
-    fn store_slice(&mut self) -> Result<(), Self::Error> {
+    fn store_slice(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("store_slice not implemented").into())
     }
 
@@ -1179,142 +1178,142 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_common_constant(
         &mut self,
         _cc: crate::bytecode::CommonConstant,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_common_constant not implemented").into())
     }
 
     // Boolean
-    fn to_bool(&mut self) -> Result<(), Self::Error> {
+    fn to_bool(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("to_bool not implemented").into())
     }
 
     // None jumps
-    fn pop_jump_if_none(&mut self, _target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_none(&mut self, _target: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pop_jump_if_none not implemented").into())
     }
-    fn pop_jump_if_not_none(&mut self, _target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_not_none(&mut self, _target: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pop_jump_if_not_none not implemented").into())
     }
 
     // Closures 3.11+
     /// MAKE_CELL i — create a cell object in slot i.
     /// PyPy: pyframe.py MAKE_CELL
-    fn make_cell(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn make_cell(&mut self, _idx: usize) -> Result<(), PyError> {
         Ok(()) // default no-op for JIT tracer
     }
-    fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
+    fn copy_free_vars(&mut self, _count: usize) -> Result<(), PyError> {
         Ok(())
     }
-    fn return_generator(&mut self) -> Result<(), Self::Error> {
+    fn return_generator(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("return_generator not implemented").into())
     }
 
     // Call variants
-    fn call_kw(&mut self, _argc: usize) -> Result<(), Self::Error> {
+    fn call_kw(&mut self, _argc: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("call_kw not implemented").into())
     }
-    fn call_function_ex(&mut self) -> Result<(), Self::Error> {
+    fn call_function_ex(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("call_function_ex not implemented").into())
     }
 
     // yield from / send
-    fn get_yield_from_iter(&mut self) -> Result<(), Self::Error> {
+    fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("yield from not implemented").into())
     }
-    fn send_value(&mut self, _target: usize) -> Result<(), Self::Error> {
+    fn send_value(&mut self, _target: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("send not implemented").into())
     }
-    fn end_send(&mut self) -> Result<(), Self::Error> {
+    fn end_send(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("end_send not implemented").into())
     }
 
     // Class
-    fn load_build_class(&mut self) -> Result<(), Self::Error> {
+    fn load_build_class(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_build_class not implemented").into())
     }
-    fn load_super_attr(&mut self) -> Result<(), Self::Error> {
+    fn load_super_attr(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_super_attr not implemented").into())
     }
-    fn load_super_attr_with(&mut self, _name: &str, _is_method: bool) -> Result<(), Self::Error> {
+    fn load_super_attr_with(&mut self, _name: &str, _is_method: bool) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_super_attr not implemented").into())
     }
-    fn load_locals(&mut self) -> Result<(), Self::Error> {
+    fn load_locals(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_locals not implemented").into())
     }
 
     // String formatting
-    fn format_simple(&mut self) -> Result<(), Self::Error> {
+    fn format_simple(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("format_simple not implemented").into())
     }
-    fn format_with_spec(&mut self) -> Result<(), Self::Error> {
+    fn format_with_spec(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("format_with_spec not implemented").into())
     }
     fn convert_value(
         &mut self,
         _conv: crate::bytecode::ConvertValueOparg,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
 
     fn get_len(
         &mut self,
         _obj: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("get_len not implemented").into())
     }
-    fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
     }
     fn set_function_attribute_with_flag(
         &mut self,
         _flag: crate::bytecode::MakeFunctionFlag,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         // Default: pop the attribute value and discard
-        let _attr = self.pop_value().map_err(Into::into)?;
+        let _attr = self.pop_value()?;
         Ok(())
     }
-    fn load_from_dict_or_globals(&mut self, _name: &str) -> Result<(), Self::Error> {
+    fn load_from_dict_or_globals(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_from_dict_or_globals not implemented").into())
     }
-    fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), Self::Error> {
+    fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_from_dict_or_deref not implemented").into())
     }
-    fn match_stub(&mut self) -> Result<(), Self::Error> {
+    fn match_stub(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pattern matching not implemented").into())
     }
-    fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
+    fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
 
     /// CALL_INTRINSIC_1: single-argument intrinsic operations.
-    fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), Self::Error> {
+    fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), PyError> {
         match func {
             IntrinsicFunction1::UnaryPositive => {
                 // PyPy: UNARY_POSITIVE → space.pos(w_value)
-                let val = self.pop_value().map_err(Into::into)?;
+                let val = self.pop_value()?;
                 let result = self.unary_positive(val)?;
-                self.push_value(result).map_err(Into::into)?;
+                self.push_value(result)?;
                 Ok(())
             }
             IntrinsicFunction1::ListToTuple => {
-                let val = self.pop_value().map_err(Into::into)?;
+                let val = self.pop_value()?;
                 let result = self.list_to_tuple(val)?;
-                self.push_value(result).map_err(Into::into)?;
+                self.push_value(result)?;
                 Ok(())
             }
             IntrinsicFunction1::ImportStar => {
                 // Module is TOS; import_star pops it internally
                 self.import_star()?;
                 let none = self.none_value()?;
-                self.push_value(none).map_err(Into::into)?;
+                self.push_value(none)?;
                 Ok(())
             }
             IntrinsicFunction1::Print => {
                 // sys.displayhook(value)
-                let val = self.pop_value().map_err(Into::into)?;
+                let val = self.pop_value()?;
                 self.print_expr(val)?;
                 let none = self.none_value()?;
-                self.push_value(none).map_err(Into::into)?;
+                self.push_value(none)?;
                 Ok(())
             }
             IntrinsicFunction1::StopIterationError => {
@@ -1331,12 +1330,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     /// CALL_INTRINSIC_2: two-argument intrinsic operations.
-    fn call_intrinsic_2(&mut self, func: IntrinsicFunction2) -> Result<(), Self::Error> {
+    fn call_intrinsic_2(&mut self, func: IntrinsicFunction2) -> Result<(), PyError> {
         match func {
             IntrinsicFunction2::SetFunctionTypeParams => {
                 // arg2 = type_params, arg1 = function
                 // Set __type_params__ attribute on the function; push function back
-                let _type_params = self.pop_value().map_err(Into::into)?;
+                let _type_params = self.pop_value()?;
                 // just leave the function on the stack
                 Ok(())
             }
@@ -1352,29 +1351,29 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn unary_positive(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("unary_positive not implemented").into())
     }
     fn list_to_tuple(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("list_to_tuple not implemented").into())
     }
     fn print_expr(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         Err(crate::PyError::type_error("print_expr not implemented").into())
     }
-    fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, Self::Error> {
+    fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("none_value not implemented").into())
     }
 
     fn unsupported(
         &mut self,
         instruction: &Instruction,
-    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, Self::Error>;
+    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>;
 }
 
 /// Widen a `u32`-typed oparg to `i64`. Adapter-friendly stand-in for
@@ -1446,7 +1445,7 @@ pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     instruction: Instruction,
     op_arg: OpArg,
     next_instr: usize,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, E::Error>
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
     E: SharedOpcodeHandler
         + ConstantOpcodeHandler

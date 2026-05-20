@@ -7454,14 +7454,35 @@ unsafe fn trace_check_exc_match_against(
 /// gate, 5.C..N per-opcode batches) grow this set until it covers every
 /// Python opcode, at which point Phase 6 deletes the trait infra.
 ///
-/// PopTop is intentionally NOT in this set yet despite the Phase 5.B
-/// infra (`dispatch_via_miframe_at_opcode_entry`) landing.  Its sub-jitcode
-/// (`pop_value` idx 358 → `nlocals` idx 121) issues two `residual_call`s
-/// whose `CallDescr.EffectInfo` still reads `extraeffect: CanRaise`
-/// because the codewriter-side analysis (`call.py:292-299 getcalldescr`
-/// + `_canraise`) has no callee_path entry for the call sites' resolved
-/// `CallTarget`.  Recognising the targets as elidable is the next slice
-/// (issue #73 Phase 3 expansion: helper-by-helper EffectInfo recognition).
+/// PopTop is intentionally NOT in this set: 2026-05-21 diagnostic
+/// (synth/set_membership SIGBUS, exit 138) traced the failure to the
+/// walker's heap-based concrete read for `PyFrame.valuestackdepth`.
+/// PopTop's arm body inlines `eval.rs pop_value`'s `if vsd <= nlocals
+/// { return Err(stack_underflow_error(...)) }` underflow check.  The
+/// codewriter lowers `self.valuestackdepth` to `getfield_gc_i(frame,
+/// vsd_descr)`; the walker's `field_read_concrete` reads HEAP
+/// `PyFrame.valuestackdepth` at offset 24.  During tracing, the JIT
+/// trait-dispatch leg updates only the symbolic mirror (`sym.
+/// valuestackdepth`) and the `virtualizable_boxes` shadow via
+/// `push_typed_value` (`trace_opcode.rs:1796`) — it does NOT write
+/// through to the heap field.  Heap vsd therefore stays at its
+/// trace-entry value (= `nlocals` in a loop body with empty entry
+/// stack), the walker's `IntLe(vsd, nlocals)` evaluates `Int(3) <=
+/// Int(3) = 1`, and `goto_if_not/iL` records `GuardTrue(v39)` — the
+/// underflow path.  After the optimizer rewrites the GetfieldGcI to
+/// the JIT-tracked vable shadow (which IS correct at runtime), the
+/// guard direction is baked in: every loop iteration the runtime vsd
+/// is `nlocals + 1` (one Call result on stack), `IntLe(4, 3) = 0`,
+/// `GuardTrue` fails, deopt fires.  Repeated deopt eventually SIGBUSes
+/// in the recovery path.
+///
+/// RPython-orthodox fix: the codewriter must emit `getfield_vable_i`
+/// (not `getfield_gc_i`) for inlined vable field accesses (PyPy's
+/// `pyjitpl.py:1167-1186 opimpl_getfield_vable_i` reads from
+/// `metainterp.virtualizable_boxes[index]`, matching the JIT shadow).
+/// That codewriter slice is the next prerequisite; until it lands,
+/// PopTop walker activation is structurally blocked.  Documented in
+/// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
     matches!(
         instruction,
@@ -7811,9 +7832,8 @@ impl TraceHelperAccess for MIFrame {
 // (see majit/majit-translate/src/codegen.rs::generate_trait_impls).
 
 impl OpcodeStepExecutor for MIFrame {
-    type Error = PyError;
 
-    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), PyError> {
         let value = SharedOpcodeHandler::pop_value(self)?;
         if self.value_type(value.opref) != Type::Ref {
             return Err(PyError::type_error("pop_jump_if_none expects a ref value"));
@@ -7848,7 +7868,7 @@ impl OpcodeStepExecutor for MIFrame {
         })
     }
 
-    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), PyError> {
         let value = SharedOpcodeHandler::pop_value(self)?;
         if self.value_type(value.opref) != Type::Ref {
             return Err(PyError::type_error(
@@ -7893,7 +7913,7 @@ impl OpcodeStepExecutor for MIFrame {
         _name1: &str,
         idx2: usize,
         _name2: &str,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), PyError> {
         let c1 = self
             .sym()
             .concrete_locals
@@ -7913,7 +7933,7 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    fn to_bool(&mut self) -> Result<(), Self::Error> {
+    fn to_bool(&mut self) -> Result<(), PyError> {
         Ok(())
     }
 
@@ -7922,7 +7942,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// Mirror eval.rs:1543-1608: push `(attr, null_or_self)` where
     /// `null_or_self` is the bound receiver for instance/class methods and
     /// `PY_NULL` for already-bound methods / static methods / plain attrs.
-    fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
+    fn load_method(&mut self, name: &str) -> Result<(), PyError> {
         let obj = SharedOpcodeHandler::pop_value(self)?;
         let concrete_obj = obj.concrete.to_pyobj();
         let attr = <Self as SharedOpcodeHandler>::load_attr(self, obj, name)?;
@@ -8007,7 +8027,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// interpreter override in eval.rs:1640-1652 prepends it for instance
     /// method calls. Trace-time execution must do the same so `CALL` after
     /// `LOAD_METHOD` sees the same argument list as the interpreter.
-    fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call(&mut self, nargs: usize) -> Result<(), PyError> {
         let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
             args.push(<Self as SharedOpcodeHandler>::pop_value(self)?);
@@ -8027,7 +8047,7 @@ impl OpcodeStepExecutor for MIFrame {
         <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
-    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+    fn call_kw(&mut self, nargs: usize) -> Result<(), PyError> {
         use pyre_interpreter::bytecode::CodeFlags;
 
         let kwarg_names_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
@@ -8293,7 +8313,7 @@ impl OpcodeStepExecutor for MIFrame {
     //                     clear tracer last_exc_value (pyopcode.py:778 /
     //                     eval.rs:1243-1249)
 
-    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+    fn push_exc_info(&mut self) -> Result<(), PyError> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         let exc_obj = exc.concrete.to_pyobj();
         // Emit the residual save/restore pair BEFORE mutating concrete
@@ -8347,7 +8367,7 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    fn pop_except(&mut self) -> Result<(), Self::Error> {
+    fn pop_except(&mut self) -> Result<(), PyError> {
         let prev_exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         // Emit the residual restore so the compiled bridge writes back the
         // saved sys_exc_info at runtime (pyopcode.py:778 / eval.rs:1243-1249).
@@ -8392,7 +8412,7 @@ impl OpcodeStepExecutor for MIFrame {
     /// `pyjitpl.py:1680-1681` asserts last_exc_value + class_of_last_exc
     /// are both set; pyre aborts tracing instead of silently emitting a
     /// constant True if either operand is null at trace time.
-    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+    fn check_exc_match(&mut self) -> Result<(), PyError> {
         let exc_type_val = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         let exc_type_obj = exc_type_val
             .as_ref()
@@ -8413,7 +8433,7 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // pyopcode.py:1034-1039 validity gate. The PyError raised here
-        // is `Self::Error = PyError` at trace_opcode.rs:7091 and aborts
+        // is `PyError = PyError` at trace_opcode.rs:7091 and aborts
         // the trace (the interpreter re-runs CHECK_EXC_MATCH freshly to
         // surface the TypeError without baking it into the recorded
         // trace). Matches `pyre_interpreter::eval::check_exc_match` BC
@@ -8448,7 +8468,7 @@ impl OpcodeStepExecutor for MIFrame {
     ///    state (pyjitpl.py:1690-1696) from the trace-time concrete
     ///    value so `handle_raise_varargs` → `finishframe_exception`
     ///    keeps seeing a pending exception on both paths.
-    fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
+    fn raise_varargs(&mut self, argc: usize) -> Result<(), PyError> {
         if argc == 0 {
             // `eval.rs:1032-1048 RAISE_VARARGS 0` — reraise from the
             // active exception. Prefer the tracer-seeded
@@ -8551,7 +8571,7 @@ impl OpcodeStepExecutor for MIFrame {
     }
 
     /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
-    fn reraise(&mut self, oparg: u32) -> Result<(), Self::Error> {
+    fn reraise(&mut self, oparg: u32) -> Result<(), PyError> {
         // pyopcode.py:1357-1363
         let reraise_lasti: i32 = if oparg != 0 {
             // pyopcode.py:1361 — self.space.int_w(self.peekvalue(oparg))
@@ -8617,7 +8637,7 @@ impl OpcodeStepExecutor for MIFrame {
     fn unsupported(
         &mut self,
         instruction: &Instruction,
-    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, Self::Error> {
+    ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
         Err(PyError::type_error(format!(
             "unsupported instruction during trace: {instruction:?}"
         )))
