@@ -16,6 +16,9 @@ use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
 
+#[cfg(feature = "host_env")]
+use rustpython_host_env::{fs as host_fs, os as host_os};
+
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
 // to module objects. We use a thread-local HashMap<String, PyObjectRef>.
@@ -2019,7 +2022,7 @@ fn init_posix(ns: &mut DictStorage) {
         // On POSIX, posix.environ stores bytes → bytes. os.py's
         // _create_environ_mapping wraps this dict in an _Environ object that
         // encodes/decodes via surrogateescape when accessed.
-        for (key, value) in std::env::vars_os() {
+        for (key, value) in host_os::vars_os() {
             let k_bytes = key.as_encoded_bytes();
             let v_bytes = value.as_encoded_bytes();
             unsafe {
@@ -2989,7 +2992,7 @@ fn init_posix(ns: &mut DictStorage) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(cwd) = host_os::current_dir() {
                         return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
                     }
                 }
@@ -3007,7 +3010,7 @@ fn init_posix(ns: &mut DictStorage) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(cwd) = host_os::current_dir() {
                         return Ok(pyre_object::w_bytes_from_bytes(
                             cwd.as_os_str().as_encoded_bytes(),
                         ));
@@ -3119,7 +3122,7 @@ fn init_posix(ns: &mut DictStorage) {
             };
             #[cfg(feature = "host_env")]
             {
-                if let Ok(value) = std::env::var(&key) {
+                if let Ok(value) = host_os::var(&key) {
                     return Ok(pyre_object::w_str_new(&value));
                 }
             }
@@ -4241,7 +4244,7 @@ pub fn init_sys_path(script_dir: &Path) {
         // Script directory first (PyPy: first entry in sys.path)
         path.push(script_dir.to_path_buf());
         // Current working directory as fallback
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(cwd) = host_os::current_dir() {
             if cwd != script_dir {
                 path.push(cwd);
             }
@@ -4258,7 +4261,7 @@ pub fn init_sys_path(script_dir: &Path) {
 #[cfg(feature = "host_env")]
 fn detect_stdlib_path() -> Option<PathBuf> {
     // Try PYRE_STDLIB env var first
-    if let Ok(p) = std::env::var("PYRE_STDLIB") {
+    if let Ok(p) = host_os::var("PYRE_STDLIB") {
         let path = PathBuf::from(p);
         if path.is_dir() {
             return Some(path);
@@ -4562,7 +4565,7 @@ fn load_source_module(
     pathname: &Path,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let source = std::fs::read_to_string(pathname).map_err(|e| {
+    let source = host_fs::read_to_string(pathname).map_err(|e| {
         crate::PyError::new(
             crate::PyErrorKind::ImportError,
             format!("cannot read '{}': {e}", pathname.display()),
