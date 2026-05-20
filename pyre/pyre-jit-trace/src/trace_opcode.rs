@@ -2829,8 +2829,20 @@ impl MIFrame {
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
         // read_boxes) are carried into the JUMP unchanged, including
         // stack slots. Do NOT truncate to nlocals here.
+        //
+        // Issue #73 Phase 4.5 slice 2 parity: read the user-side
+        // `valuestackdepth` from the concrete `PyFrame` to match
+        // `live_args_shape_at`'s reader.  Both helpers share the same
+        // shape derivation; reading from different sources lets the two
+        // diverge whenever the symbolic mirror drifts from PyFrame.
+        // RPython's pyjitpl.py:2957-2965 derives `live_arg_boxes` from
+        // PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
+        // — no symbolic mirror in the loop.
         let concrete_nlocals = self.sym().nlocals;
-        let concrete_vsd = self.sym().valuestackdepth.max(concrete_nlocals);
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth)
+            .max(concrete_nlocals);
         {
             let s = self.sym_mut();
             s.nlocals = concrete_nlocals;

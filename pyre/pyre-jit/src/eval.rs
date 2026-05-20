@@ -7078,7 +7078,7 @@ mod tests {
             "selected resume pc must decode the raw-int local slot"
         );
         assert_eq!(
-            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32),
+            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32, 0),
             live_regs.len(),
             "frame-value count must come from the same compiled jitcode liveness block"
         );
@@ -7880,7 +7880,7 @@ mod tests {
         // target PC needs depth=2 (post-Task #158 force-add removal,
         // stack-slot colors no longer always appear in `live_r`, so a
         // depth-based locator is needed instead of `&[1, 2]` regs).
-        let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
+        let (mut frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
             "def f(x):\n    return (x, x)\nf(1)\n",
             "f",
             2,
@@ -7888,6 +7888,14 @@ mod tests {
                 frame.locals_w_mut()[0] = w_int_new(7);
             },
         );
+        // Issue #73 Phase 4.5: `live_args_shape_at` and
+        // `close_loop_args_at` both derive their JUMP-args shape from
+        // `concrete_valuestackdepth()`.  The symbolic state below
+        // advertises `valuestackdepth=3` (one local + two stack slots);
+        // seed the concrete `PyFrame.valuestackdepth` to match so the
+        // shape derivation reflects the same user-side stack the
+        // symbolic mirror is testing.
+        frame.valuestackdepth = 3;
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(0);
