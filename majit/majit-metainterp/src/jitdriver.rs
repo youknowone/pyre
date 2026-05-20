@@ -1755,7 +1755,15 @@ impl<S: JitState> JitDriver<S> {
                     }
                 }
                 // Blackhole transition: clear all driver tracing state.
+                // `take_trace_meta` above drained the session, so the
+                // trailing `clear_trace_session` is a no-op for the
+                // session-end side.  Fire `profiler.end_tracing()`
+                // explicitly here to balance the `start_tracing()` that
+                // ran inside `begin_trace_session` — matches PyPy's
+                // pyjitpl.py:2934 `finally: profiler.end_tracing()` for
+                // the SegmentedLoop compile path (`_create_segmented_trace_and_blackhole`).
                 self.sym = None;
+                self.meta.staticdata.profiler.end_tracing();
                 self.meta.clear_trace_session();
             }
             TraceAction::Abort => {

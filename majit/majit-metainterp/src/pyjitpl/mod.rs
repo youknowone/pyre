@@ -2041,12 +2041,25 @@ impl<M: Clone> MetaInterp<M> {
     /// path.  Panics if a prior session was not cleared — mirrors
     /// RPython's invariant that `self.history` has a single owner per
     /// trace.
+    ///
+    /// pyjitpl.py:2890 / 2916 fires `profiler.start_tracing()` at the
+    /// moment a fresh trace session opens — that includes the bridge
+    /// path via `handle_guard_failure`, which pyre routes through
+    /// [`start_retrace_from_guard`] → `begin_trace_session`.  Hosting
+    /// the call here keeps it paired with the eventual
+    /// [`clear_trace_session`] / [`take_trace_meta`] end-of-session
+    /// step regardless of whether the trace closes via root-finish or
+    /// abort.
     pub fn begin_trace_session(&mut self, trace_meta: M) {
         debug_assert!(
             self.active_trace_session.is_none(),
             "begin_trace_session called while a trace session is already active",
         );
-        self.active_trace_session = Some(ActiveTraceSession { trace_meta });
+        self.active_trace_session = Some(ActiveTraceSession {
+            trace_meta,
+            bridge: None,
+        });
+        self.staticdata.profiler.start_tracing();
     }
 
     /// Attach bridge-origin metadata.  Called once at bridge entry
@@ -2099,6 +2112,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `_finish_off_the_metainterp` resets `self.resumekey` together
     /// with the trace's history.
     pub fn clear_trace_session(&mut self) {
+        if self.active_trace_session.is_some() {
+            self.staticdata.profiler.end_tracing();
+        }
         self.active_trace_session = None;
         self.bridge_info = None;
     }
@@ -2857,6 +2873,20 @@ impl<M: Clone> MetaInterp<M> {
         self.on_back_edge_typed(green_key, (0, 0), None, None, &typed_values)
     }
 
+    fn prepare_trace_start_runtime(&mut self) {
+        // pyjitpl.py:2889-2892 `compile_and_run_once`: `_setup_once`,
+        // `profiler.start_tracing()`, then `try_to_free_some_loops()` before
+        // the trace history is created.  `profiler.start_tracing()` itself
+        // lives on `begin_trace_session` so the bridge path
+        // (`start_retrace_from_guard` → `begin_trace_session`) picks it up
+        // too.  pyjitpl.py:2916 fires the same `start_tracing()` from
+        // `handle_guard_failure`, mirrored by the bridge-side
+        // `begin_trace_session`.
+        self.warm_state.ensure_jitlog_initialised();
+        self.staticdata._setup_once(&mut self.backend);
+        self.try_to_free_some_loops();
+    }
+
     /// Force-start tracing for a green key, bypassing the hot counter.
     pub fn force_start_tracing(
         &mut self,
@@ -2865,24 +2895,6 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // pyjitpl.py:2884 `compile_and_run_once` invokes `_setup_once`
-        // before every trace start.  pyre routes back-edge traces
-        // through `bound_reached`, but function-entry traces enter
-        // here, so the same gate must fire to materialise per-CPU
-        // trampolines (`cpu.setup_once`), profiler `start`, and the
-        // jitlog header before the first trace records anything.
-        // Idempotent — `globaldata.initialized` short-circuits after
-        // the first call.
-        //
-        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
-        // `WarmEnterState` rather than `MetaInterpStaticData`, so the
-        // `pyjitpl.py:2295 self.jitlog.setup_once()` step is driven
-        // here against this MetaInterp's own warmstate.  Idempotent
-        // — `ensure_jitlog_initialised` only fills the slot when it
-        // is still `None`.
-        self.warm_state.ensure_jitlog_initialised();
-        self.staticdata._setup_once(&mut self.backend);
-
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -2890,6 +2902,7 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state.force_start_tracing(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                self.prepare_trace_start_runtime();
                 // RPython pyjitpl.py:2604 create_empty_history(inputargs): the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -3014,33 +3027,22 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // `pyjitpl.py:2889 self.staticdata._setup_once()` parity —
-        // PyPy's first `compile_and_run_once` per CPU dispatches the
-        // `globaldata.initialized`-gated `_setup_once` which calls
-        // `cpu.setup_once()` (`pyjitpl.py:2292-2303`).  Pyre's
-        // back-edge entry routes through `bound_reached`, so the
-        // gate fires here.  Idempotent.
-        //
-        // PRE-EXISTING-ADAPTATION: pyre's jitlog `Logger` lives on
-        // `WarmEnterState`, not on `MetaInterpStaticData`; drive the
-        // per-warmstate `setup_once` step here before the staticdata
-        // hook runs (matches PyPy's `jitlog → ...` order).
-        self.warm_state.ensure_jitlog_initialised();
-        self.staticdata._setup_once(&mut self.backend);
-
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
 
         match self.warm_state.force_start_tracing(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => self.setup_tracing(
-                green_key,
-                green_key_raw,
-                green_key_values,
-                driver_descriptor,
-                live_values,
-            ),
+            HotResult::StartTracing => {
+                self.prepare_trace_start_runtime();
+                self.setup_tracing(
+                    green_key,
+                    green_key_raw,
+                    green_key_values,
+                    driver_descriptor,
+                    live_values,
+                )
+            }
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
         }
@@ -3061,14 +3063,7 @@ impl<M: Clone> MetaInterp<M> {
         match self.warm_state.maybe_compile(green_key) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
-                self.warm_state.ensure_jitlog_initialised();
-                self.staticdata._setup_once(&mut self.backend);
-                // pyjitpl.py:2890-2892 `compile_and_run_once`:
-                // `_setup_once`, then `profiler.start_tracing()`, then
-                // `try_to_free_some_loops()` before the trace history is
-                // created.  `setup_tracing` owns the history creation in pyre.
-                self.staticdata.profiler.start_tracing();
-                self.try_to_free_some_loops();
+                self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
@@ -3950,6 +3945,13 @@ impl<M: Clone> MetaInterp<M> {
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
+        // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.  The
+        // parity helper consumes `self.tracing` directly; route the
+        // matching end_tracing through `clear_trace_session` so that
+        // a session started via `begin_trace_session` (the only path
+        // that calls `profiler.start_tracing`) doesn't leak a profiler
+        // stack frame.  No-op when no session was begun.
+        self.clear_trace_session();
         Some((trace, constants))
     }
 
@@ -4760,6 +4762,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend.compile_loop(
                 &inputargs,
@@ -4768,6 +4773,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
@@ -5578,6 +5584,9 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Wrap to `Vec<OpRc>` for the backend's trait boundary.
             let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
@@ -5591,6 +5600,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => {
@@ -6103,12 +6113,17 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        match self.backend.compile_loop(
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
+        let compile_loop_result = self.backend.compile_loop(
             &inputargs,
             &optimized_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
-        ) {
+        );
+        self.staticdata.profiler.end_backend();
+        match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -6451,12 +6466,17 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        match self.backend.compile_loop(
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
+        let compile_loop_result = self.backend.compile_loop(
             &inputargs,
             &compiled_ops_rc,
             Arc::get_mut(&mut token)
                 .expect("JitCellToken must stay uniquely owned until backend compile"),
-        ) {
+        );
+        self.staticdata.profiler.end_backend();
+        match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -8429,6 +8449,9 @@ impl<M: Clone> MetaInterp<M> {
             token_mut.num_scalar_inputargs = self.num_scalar_inputargs;
         }
 
+        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
+        // ... finally: ... profiler.end_backend()`.
+        self.staticdata.profiler.start_backend();
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
                 .iter()
@@ -8441,6 +8464,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("JitCellToken must stay uniquely owned until backend compile"),
             )
         }));
+        self.staticdata.profiler.end_backend();
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => return false,
@@ -9006,7 +9030,10 @@ impl<M: Clone> MetaInterp<M> {
                 .iter()
                 .map(|op| std::rc::Rc::new(op.clone()))
                 .collect();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // compile.py:589-599 `profiler.start_backend() ... try:
+            // do_compile_bridge ... finally: ... profiler.end_backend()`.
+            self.staticdata.profiler.start_backend();
+            let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
                     bridge_inputargs,
@@ -9015,7 +9042,9 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens,
                     caller_recovery_layout.as_ref(),
                 )
-            })) {
+            }));
+            self.staticdata.profiler.end_backend();
+            match bridge_result {
                 Ok(r) => r,
                 Err(e) => {
                     if crate::majit_log_enabled() {
@@ -11909,7 +11938,10 @@ impl<M: Clone> MetaInterp<M> {
         let meta = self
             .take_trace_meta()
             .expect("compile_finish_from_active_session: session must be present");
-        self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception)
+        let result =
+            self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception);
+        self.staticdata.profiler.end_tracing();
+        result
     }
 
     /// pyjitpl.py:2174-2186 `MIFrame.do_residual_or_indirect_call`.
@@ -13600,6 +13632,21 @@ pub mod counters {
     pub const NVHOLES: i32 = 20;
     /// jit.py:1437 `Counters.NVREUSED`.
     pub const NVREUSED: i32 = 21;
+    /// jit.py:1438 `Counters.TOTAL_COMPILED_LOOPS`.  jitprof.py:105-106
+    /// routes this id to `cpu.tracker.total_compiled_loops`.  pyre has
+    /// no global per-CPU tracker yet — [`crate::jitprof::JitProfiler::get_counter`]
+    /// returns `None` for this id (see
+    /// `majit-backend/src/lib.rs:939-943` PRE-EXISTING-ADAPTATION note).
+    pub const TOTAL_COMPILED_LOOPS: i32 = 22;
+    /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_COMPILED_BRIDGES: i32 = 23;
+    /// jit.py:1440 `Counters.TOTAL_FREED_LOOPS`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_FREED_LOOPS: i32 = 24;
+    /// jit.py:1441 `Counters.TOTAL_FREED_BRIDGES`.  See the
+    /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
+    pub const TOTAL_FREED_BRIDGES: i32 = 25;
 }
 
 impl SwitchToBlackhole {
