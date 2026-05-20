@@ -6576,6 +6576,15 @@ impl MIFrame {
         use crate::jitcode_dispatch::DispatchOutcome;
         match walk_result {
             Ok((DispatchOutcome::SubReturn { .. }, _)) => {
+                // Issue #73 Phase 4.5: the walker arm records IR for the
+                // opcode but does NOT run the trait dispatch's
+                // `MIFrame::pop_value` / `push_typed_value` paths that
+                // mutate `sym.valuestackdepth`.  Apply the opcode's net
+                // stack effect here so the symbolic mirror stays
+                // consistent with the IR the walker just emitted, matching
+                // how the trait dispatch advances `sym.valuestackdepth` via
+                // its own push/pop trait methods.
+                apply_walker_stack_effect(self, instruction);
                 Ok(pyre_interpreter::StepResult::Continue)
             }
             Ok((outcome, _)) => panic!(
@@ -6663,26 +6672,6 @@ impl MIFrame {
         // + guards) don't accrete orphan exception guards.
         let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
         self.pre_opcode_op_count = Some(pre_op_count);
-        // Issue #73 Phase 4.5: re-converge `sym.valuestackdepth` with the
-        // concrete `PyFrame.valuestackdepth` at every opcode entry.  The
-        // production walker (`dispatch_via_walker_for_opcode`) handles
-        // some opcodes (Nop family + future allow-list expansions) and
-        // records IR ops without running the trait dispatch's
-        // `sym.valuestackdepth` updates.  Without this re-sync the
-        // symbolic mirror would lag PyFrame by the cumulative effect of
-        // every walker-handled opcode and downstream `pop_value` /
-        // `push_typed_value` would index into the wrong stack slot.
-        //
-        // The concrete frame's `valuestackdepth` already reflects every
-        // interpreter step that has run, so adopting it as the per-opcode
-        // baseline matches RPython's "MIFrame reads stack state from
-        // PyFrame each iteration" model (RPython has no symbolic mirror —
-        // see [[issue73-phase4_5-pyresym-vsd-retirement]]).  `registers_r`
-        // and `concrete_stack` slots above the new vsd are dead but
-        // harmless; subsequent pushes overwrite them.
-        if let Some(concrete_vsd) = self.concrete_valuestackdepth() {
-            self.sym_mut().valuestackdepth = concrete_vsd;
-        }
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -7222,26 +7211,6 @@ impl MIFrame {
         // + guards) don't accrete orphan exception guards.
         let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
         self.pre_opcode_op_count = Some(pre_op_count);
-        // Issue #73 Phase 4.5: re-converge `sym.valuestackdepth` with the
-        // concrete `PyFrame.valuestackdepth` at every opcode entry.  The
-        // production walker (`dispatch_via_walker_for_opcode`) handles
-        // some opcodes (Nop family + future allow-list expansions) and
-        // records IR ops without running the trait dispatch's
-        // `sym.valuestackdepth` updates.  Without this re-sync the
-        // symbolic mirror would lag PyFrame by the cumulative effect of
-        // every walker-handled opcode and downstream `pop_value` /
-        // `push_typed_value` would index into the wrong stack slot.
-        //
-        // The concrete frame's `valuestackdepth` already reflects every
-        // interpreter step that has run, so adopting it as the per-opcode
-        // baseline matches RPython's "MIFrame reads stack state from
-        // PyFrame each iteration" model (RPython has no symbolic mirror —
-        // see [[issue73-phase4_5-pyresym-vsd-retirement]]).  `registers_r`
-        // and `concrete_stack` slots above the new vsd are dead but
-        // harmless; subsequent pushes overwrite them.
-        if let Some(concrete_vsd) = self.concrete_valuestackdepth() {
-            self.sym_mut().valuestackdepth = concrete_vsd;
-        }
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
@@ -7489,11 +7458,47 @@ fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
-            | Instruction::PopTop
-            | Instruction::Swap { .. }
-            | Instruction::Copy { .. }
-            | Instruction::PushNull
     )
+}
+
+/// Apply the net stack effect of a walker-handled opcode to
+/// `sym.valuestackdepth`.  The walker arm records IR ops for stack
+/// pushes/pops but does NOT route through `MIFrame::pop_value` /
+/// `push_typed_value`, which are the trait dispatch's hooks for
+/// advancing the symbolic mirror.  Without this fixup the mirror
+/// would lag the IR each time a walker-handled opcode mutates the
+/// stack, and downstream trait-dispatched opcodes that read
+/// `sym.valuestackdepth` (e.g. `pop_value`, `peek_value`, fused
+/// CompareOp) would index into the wrong slot.
+///
+/// Mirrors `liveness.rs:528..588 _opcode_stack_effect` (Python
+/// `dis.stack_effect` parity).  Walker-handled opcodes must remain a
+/// closed set listed here AND in `production_walker_handles`.
+fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
+    let delta: isize = match instruction {
+        Instruction::Nop
+        | Instruction::ExtendedArg
+        | Instruction::Resume { .. }
+        | Instruction::Cache
+        | Instruction::NotTaken
+        | Instruction::Swap { .. } => 0,
+        Instruction::PopTop => -1,
+        Instruction::Copy { .. } | Instruction::PushNull => 1,
+        other => panic!(
+            "apply_walker_stack_effect: missing stack-effect mapping for {:?}; \
+             every entry in production_walker_handles must list its delta here",
+            other,
+        ),
+    };
+    if delta == 0 {
+        return;
+    }
+    let s = state.sym_mut();
+    if delta > 0 {
+        s.valuestackdepth = s.valuestackdepth.saturating_add(delta as usize);
+    } else {
+        s.valuestackdepth = s.valuestackdepth.saturating_sub((-delta) as usize);
+    }
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
