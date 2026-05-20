@@ -5279,6 +5279,121 @@ fn init_posix(ns: &mut DictStorage) {
                 1,
             ),
         );
+
+        // os.getloadavg() -> (1m, 5m, 15m)
+        crate::dict_storage_store(
+            ns,
+            "getloadavg",
+            crate::make_builtin_function_with_arity(
+                "getloadavg",
+                |_| {
+                    let [l1, l5, l15] = rustpython_host_env::time::getloadavg()
+                        .map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_float_new(l1),
+                        pyre_object::w_float_new(l5),
+                        pyre_object::w_float_new(l15),
+                    ]))
+                },
+                0,
+            ),
+        );
+
+        // os.times() -> posix.times_result(user, system, children_user,
+        //                                  children_system, elapsed)
+        crate::dict_storage_store(
+            ns,
+            "times",
+            crate::make_builtin_function_with_arity(
+                "times",
+                |_| {
+                    let t = rustpython_host_env::time::process_times()
+                        .map_err(|e| io_err(e, ""))?;
+                    let wrapper = pyre_object::w_instance_new(stat_result_type());
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper,
+                        "user",
+                        pyre_object::w_float_new(t.user),
+                    );
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper,
+                        "system",
+                        pyre_object::w_float_new(t.system),
+                    );
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper,
+                        "children_user",
+                        pyre_object::w_float_new(t.children_user),
+                    );
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper,
+                        "children_system",
+                        pyre_object::w_float_new(t.children_system),
+                    );
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper,
+                        "elapsed",
+                        pyre_object::w_float_new(t.elapsed),
+                    );
+                    Ok(wrapper)
+                },
+                0,
+            ),
+        );
+
+        // os.waitstatus_to_exitcode(status) -> int
+        crate::dict_storage_store(
+            ns,
+            "waitstatus_to_exitcode",
+            crate::make_builtin_function_with_arity(
+                "waitstatus_to_exitcode",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "waitstatus_to_exitcode() requires 1 argument",
+                        ));
+                    }
+                    let status = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    match rustpython_host_env::time::waitstatus_to_exitcode(status) {
+                        Some(code) => Ok(pyre_object::w_int_new(code as i64)),
+                        None => Err(crate::PyError::value_error(
+                            "waitstatus_to_exitcode: invalid status",
+                        )),
+                    }
+                },
+                1,
+            ),
+        );
+
+        // os.system(command) -> exit_status
+        crate::dict_storage_store(
+            ns,
+            "system",
+            crate::make_builtin_function_with_arity(
+                "system",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "system() requires 1 argument",
+                        ));
+                    }
+                    let cmd = unsafe {
+                        if pyre_object::is_str(args[0]) {
+                            pyre_object::w_str_get_value(args[0]).to_string()
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "system(): command must be a string",
+                            ));
+                        }
+                    };
+                    let c_cmd = std::ffi::CString::new(cmd.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in command"))?;
+                    let rc = rustpython_host_env::os::system(&c_cmd);
+                    Ok(pyre_object::w_int_new(rc as i64))
+                },
+                1,
+            ),
+        );
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
