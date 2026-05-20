@@ -14,6 +14,22 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
+
+/// `compile.py:665-674` `make_and_attach_done_descrs` singletons
+/// (`_DoneWithThisFrameDescr*`, `ExitFrameWithExceptionDescrRef`,
+/// `PropagateExceptionDescr`) bake their `Arc::as_ptr` addresses into
+/// the assembler's FINISH / propagate trampolines (see
+/// `attached_descr_ptrs_with_fallbacks` and
+/// `X86CpuExt::ensure_propagate_exception_path`).  Mirror each
+/// singleton's address into `FAIL_DESCR_REGISTRY_GLOBAL` so
+/// `Backend::fail_descr_arc_from_addr` resolves consistently for
+/// singletons too — `history.py:109-114` `AbstractDescr.show` makes
+/// no distinction between FINISH and resume-guard descrs.
+fn register_singleton_in_global(descr: &majit_ir::DescrRef) {
+    let ptr = Arc::as_ptr(descr) as *const () as usize;
+    crate::guard::register_fail_descr_global(ptr, descr);
+}
+
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
@@ -905,6 +921,7 @@ impl DynasmBackend {
     /// token boundaries — required when a bridge JUMPs into another
     /// compiled loop and that loop's guard fires before control returns
     /// to the bridge's owning token.
+
     /// Register `DescrRef` instances into the addr→`DescrRef` lookup
     /// table.  Called from `compile_loop` / `compile_bridge` to
     /// populate after codegen.  Re-running is idempotent: existing
@@ -1772,30 +1789,35 @@ impl Backend for DynasmBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_void = Some(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_int = Some(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_ref = Some(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_float = Some(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
@@ -1843,6 +1865,7 @@ impl Backend for DynasmBackend {
              previous descr pointer; bind propagate_exception_descr once \
              before backend.setup_once() (pyjitpl.py:2273-2283 ordering)"
         );
+        register_singleton_in_global(&descr);
         attachments.propagate_exception_descr = Some(descr);
     }
 

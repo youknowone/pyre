@@ -124,13 +124,34 @@ static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<DescrRef> =
 /// compile.py:665-674 parity: return the singleton FailDescr for a
 /// given Finish result type.  Slice 7-Tβ14f: returns the metainterp
 /// `DescrRef` directly (no cranelift wrapper).
+/// `compile.py:665-674` `make_and_attach_done_descrs` singletons
+/// (`_DoneWithThisFrameDescr*`, `ExitFrameWithExceptionDescrRef`,
+/// `PropagateExceptionDescr`) bake their `Arc::as_ptr` addresses
+/// into the FINISH emit sites (`attached_descr_ptrs_with_fallbacks`)
+/// and propagate trampoline.  Mirror each singleton's address into
+/// `FAIL_DESCR_REGISTRY_GLOBAL` so `Backend::fail_descr_arc_from_addr`
+/// resolves consistently for singletons too — `history.py:109-114`
+/// `AbstractDescr.show` makes no distinction between FINISH and
+/// resume-guard descrs.
+fn register_singleton_in_global(descr: &majit_ir::DescrRef) {
+    let ptr = Arc::as_ptr(descr) as *const () as usize;
+    crate::guard::register_fail_descr_global(ptr, descr);
+}
+
 fn done_with_this_frame_descr(result_types: &[Type]) -> &'static DescrRef {
-    match result_types {
+    let descr = match result_types {
         [Type::Float] => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
         [Type::Ref] => &DONE_WITH_THIS_FRAME_DESCR_REF,
         [] => &DONE_WITH_THIS_FRAME_DESCR_VOID,
         _ => &DONE_WITH_THIS_FRAME_DESCR_INT,
-    }
+    };
+    // Backend-only test paths bypass `MetaInterp::attach_descrs_to_cpu`
+    // and bake the LazyLock fallback directly; register it on first
+    // access so `fail_descr_arc_from_addr` and CALL_ASSEMBLER lookups
+    // resolve it.  Idempotent: `register_fail_descr_global` `insert`s
+    // the same Weak each time.
+    register_singleton_in_global(descr);
+    descr
 }
 
 /// Helper for the `fail_descrs: Box<[DescrRef]>` storage migration
@@ -199,7 +220,13 @@ fn attached_descr_ptrs_with_fallbacks(
         ),
         exit_frame_with_exception_descr_ref: or_fallback(
             attached.exit_frame_with_exception_descr_ref,
-            Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as *const () as i64,
+            {
+                // Backend-only test path: register the LazyLock fallback
+                // into `FAIL_DESCR_REGISTRY_GLOBAL` on first access (see
+                // `done_with_this_frame_descr` rationale).
+                register_singleton_in_global(&EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL);
+                Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as *const () as i64
+            },
         ),
         propagate_exception_descr: attached.propagate_exception_descr,
     }
@@ -14008,36 +14035,42 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_void = Some(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_int = Some(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_ref = Some(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .done_with_this_frame_descr_float = Some(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
             .exit_frame_with_exception_descr_ref = Some(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
+        register_singleton_in_global(&descr);
         self.descr_attachments
             .write()
             .unwrap()
