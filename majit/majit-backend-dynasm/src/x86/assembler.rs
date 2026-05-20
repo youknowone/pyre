@@ -470,14 +470,15 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // assembler.py:309-322 OOM tail — patched JZ target above.  When the
     // slowpath helper returns NULL (`libc::calloc` / `gc.alloc_nursery_*`
     // OOM) PyPy tail-JMPs to the standalone `propagate_exception_path`
-    // (line 322).  `jmp extern propagate_path` lowers via dynasm-rs's
-    // `value_reloc` to `E9 + rel32`, matching PyPy line-by-line: the
-    // rel32 is computed at `finalize` time from the propagate buffer's
-    // runtime address (the buffer was finalised by the caller before
-    // this trampoline is built, so its address is known).  Requires
-    // the two ExecutableBuffers to land within ±2GB; if not, finalize
-    // returns `ImpossibleRelocation` and the `expect` in the caller
-    // surfaces a clear diagnostic.
+    // (line 322).  Stage `propagate_path` into a scratch register and
+    // jump indirectly so the transfer is range-independent: dynasm-rs's
+    // `jmp extern` would lower to `E9 + rel32`, but the malloc slowpath
+    // and propagate trampoline live in separately-finalized
+    // `ExecutableBuffer`s that aren't guaranteed to land within ±2GB
+    // under ASLR, so `finalize()` would otherwise fail with
+    // `ImpossibleRelocation` and trip the caller's `expect("malloc_slowpath:
+    // finalize")` on affected layouts.
+    let propagate_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
     dynasm!(asm ; .arch x64
         ; =>oom_tail
         // assembler.py:321 `ADD esp, WORD` — pop the trampoline's own
@@ -485,7 +486,8 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
         // trampoline sees rsp at the trace's body alignment (the same
         // value the trace's `_call_header` left after its SUB).
         ; add rsp, 8
-        ; jmp extern propagate_path
+        ; mov Rq(propagate_scratch), QWORD propagate_path as i64
+        ; jmp Rq(propagate_scratch)
     );
 }
 
@@ -4025,12 +4027,16 @@ impl<'a> Assembler386<'a> {
                 // path above skipped the probe, so re-stage the
                 // operands here.  `gc_header_size` is added so the
                 // slowpath's `dynasm_nursery_slowpath(total)` sees the
-                // same byte count the fast path proposed.
+                // same byte count the fast path proposed.  With no
+                // active GC descriptor the previous code dereferenced
+                // `[nf_addr]` where `nf_addr == 0` (crash before the
+                // helper-only fallback ever ran), so synthesize
+                // `(rcx=0, rdx=total)` directly — `sub edx, ecx`
+                // recovers `total` for the trampoline either way.
                 if nf_addr == 0 || nt_addr == 0 {
                     dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD nf_addr as i64
-                        ; mov rcx, [Rq(scratch)]
-                        ; lea rdx, [rcx + Rq(sv) + gc_header_size]
+                        ; xor rcx, rcx
+                        ; lea rdx, [Rq(sv) + gc_header_size]
                     );
                 }
                 if let Some(gcmap) = self.pending_malloc_nursery_gcmap {

@@ -601,7 +601,12 @@ impl CodeWriter {
             // `format_assembler` is ported.
             let _ = verbose;
             let _ = &ssarepr;
-            majit_ir::debug::log_one("jit-codewriter", &format!("CodeWriter {}", jitcode.name));
+            // RPython `codewriter.py:72 log.dot()` is unconditional —
+            // the only gate is the `CodeWriter.debug` instance flag
+            // (`codewriter.py:18 debug = True`).  Keep that semantics:
+            // a single `self.debug` gate, no additional `MAJIT_LOG`
+            // dependency.
+            eprintln!("[CodeWriter] {}", jitcode.name);
         }
     }
 

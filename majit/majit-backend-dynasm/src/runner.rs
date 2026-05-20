@@ -2054,14 +2054,12 @@ impl Backend for DynasmBackend {
         }
 
         if crate::majit_dump_enabled() {
+            // Independent debug toggle — MAJIT_DUMP must produce output
+            // regardless of whether MAJIT_LOG is set, so emit via plain
+            // eprintln (debug_print would silently no-op without
+            // MAJIT_LOG and lose the dump).
             let code = unsafe { std::slice::from_raw_parts(entry, compiled.buffer.len()) };
-            let _s = majit_ir::debug::scope("jit-backend-dump");
-            majit_ir::debug::debug_print(&format!(
-                "CODE DUMP ({} bytes at {:?}):",
-                code.len(),
-                entry
-            ));
-            let mut line = String::new();
+            eprintln!("[dynasm] CODE DUMP ({} bytes at {:?}):", code.len(), entry);
             for (i, chunk) in code.chunks(4).enumerate() {
                 let word = u32::from_le_bytes([
                     chunk.first().copied().unwrap_or(0),
@@ -2069,15 +2067,12 @@ impl Backend for DynasmBackend {
                     chunk.get(2).copied().unwrap_or(0),
                     chunk.get(3).copied().unwrap_or(0),
                 ]);
-                line.push_str(&format!("{word:08x} "));
+                eprint!("{word:08x} ");
                 if (i + 1) % 8 == 0 {
-                    majit_ir::debug::debug_print(&line);
-                    line.clear();
+                    eprintln!();
                 }
             }
-            if !line.is_empty() {
-                majit_ir::debug::debug_print(&line);
-            }
+            eprintln!();
         }
 
         // Debug: verify bridge patches are visible

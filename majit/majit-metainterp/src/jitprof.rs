@@ -382,7 +382,14 @@ impl JitProfiler {
         let profiler = self.profiler_id();
         TIMING_STATE.with(|cell| {
             let mut state = cell.borrow_mut();
-            let Some(frame) = state.current.pop() else {
+            // RPython peeks the top frame first (`self.current` is
+            // per-Profiler, so a wrong-event peek can only be a
+            // re-entry bug — never another instance leaking in).  Pyre
+            // shares `TIMING_STATE` across `JitProfiler` instances on
+            // the thread, so peek-then-pop is required: popping before
+            // the validation would lose the frame of a sibling
+            // profiler that legitimately owns the stack top.
+            let Some(&frame) = state.current.last() else {
                 // jitprof.py:86-88 `if not self.current: debug_print("BROKEN
                 // PROFILER DATA!"); return`.
                 crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
@@ -394,11 +401,13 @@ impl JitProfiler {
                 // PROFILER DATA!"); return`.  pyre additionally diagnoses
                 // a mismatched profiler-instance frame, which RPython
                 // can't reach because each Profiler owns its own `current`
-                // list.
+                // list.  Leave the top frame in place — its owner will
+                // close it in their own `end_event`.
                 crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
                 state.t1 = Some(now);
                 return;
             }
+            state.current.pop();
             if let Some(t1) = state.t1 {
                 self.add_time(event, now.saturating_duration_since(t1));
             }
