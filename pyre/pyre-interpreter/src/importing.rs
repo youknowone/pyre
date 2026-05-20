@@ -5443,6 +5443,118 @@ fn init_mmap_type(ns: &mut DictStorage) {
             1,
         ),
     );
+
+    // `interp_mmap.py:descr_madvise` — call madvise(addr+start, length,
+    // advice).  Defaults: start=0, length=remaining bytes.
+    crate::dict_storage_store(
+        ns,
+        "madvise",
+        crate::make_builtin_function("madvise", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            let p = mmap_get_attr_i64(obj, "_ptr") as usize;
+            let total = mmap_get_attr_i64(obj, "_len") as usize;
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("madvise() requires option"));
+            }
+            let option = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+            let start: usize = args
+                .get(2)
+                .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as usize)
+                .unwrap_or(0);
+            let length: usize = args
+                .get(3)
+                .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as usize)
+                .unwrap_or(total.saturating_sub(start));
+            if start > total || start.saturating_add(length) > total {
+                return Err(crate::PyError::value_error(
+                    "madvise: start or length out of range",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let rc = unsafe {
+                    libc::madvise((p + start) as *mut libc::c_void, length, option)
+                };
+                if rc != 0 {
+                    return Err(crate::PyError::os_error_with_errno(
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        "madvise",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (p, length, option);
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+
+    // `interp_mmap.py:descr_move` — copy `length` bytes from source
+    // offset to dest offset within the mapping (memmove semantics).
+    crate::dict_storage_store(
+        ns,
+        "move",
+        crate::make_builtin_function_with_arity(
+            "move",
+            |args| {
+                if args.len() < 4 {
+                    return Err(crate::PyError::type_error(
+                        "move() requires dest, src, count",
+                    ));
+                }
+                let obj = args[0];
+                let dest = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
+                let src = (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize;
+                let count = (unsafe { pyre_object::w_int_get_value(args[3]) }) as usize;
+                let p = mmap_get_attr_i64(obj, "_ptr") as usize;
+                let total = mmap_get_attr_i64(obj, "_len") as usize;
+                if dest.saturating_add(count) > total || src.saturating_add(count) > total {
+                    return Err(crate::PyError::value_error(
+                        "source or destination out of range",
+                    ));
+                }
+                #[cfg(unix)]
+                unsafe {
+                    libc::memmove(
+                        (p + dest) as *mut libc::c_void,
+                        (p + src) as *const libc::c_void,
+                        count,
+                    );
+                }
+                #[cfg(not(unix))]
+                let _ = (p, dest, src, count);
+                Ok(pyre_object::w_none())
+            },
+            4,
+        ),
+    );
+
+    // `interp_mmap.py:descr_repr` — `<mmap.mmap closed=False, access=...>`.
+    crate::dict_storage_store(
+        ns,
+        "__repr__",
+        crate::make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let closed = mmap_get_attr_i64(obj, "_ptr") == 0;
+                let len = mmap_get_attr_i64(obj, "_len");
+                let access = mmap_get_attr_i64(obj, "_access");
+                let access_str = match access {
+                    1 => "ACCESS_READ",
+                    2 => "ACCESS_WRITE",
+                    3 => "ACCESS_COPY",
+                    _ => "ACCESS_DEFAULT",
+                };
+                Ok(pyre_object::w_str_new(&format!(
+                    "<mmap.mmap closed={closed}, access={access_str}, length={len}, pos={}, offset=0>",
+                    mmap_get_attr_i64(obj, "_pos")
+                )))
+            },
+            1,
+        ),
+    );
 }
 
 #[cfg(unix)]
@@ -5457,6 +5569,11 @@ const MMAP_ACCESS_COPY: i64 = 3;
 fn init_mmap(ns: &mut DictStorage) {
     #[cfg(unix)]
     {
+        // `interp_mmap.py:42 error = OSError` alias.
+        let w_os_error = crate::builtins::lookup_exc_class("OSError")
+            .expect("OSError must be installed before init_mmap");
+        crate::dict_storage_store(ns, "error", w_os_error);
+
         // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
         // Python ACCESS_* aliases.
         crate::dict_storage_store(
@@ -5479,6 +5596,44 @@ fn init_mmap(ns: &mut DictStorage) {
             "MAP_ANONYMOUS",
             pyre_object::w_int_new(libc::MAP_ANON as i64),
         );
+        crate::dict_storage_store(
+            ns,
+            "MAP_FIXED",
+            pyre_object::w_int_new(libc::MAP_FIXED as i64),
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            crate::dict_storage_store(
+                ns,
+                "MAP_POPULATE",
+                pyre_object::w_int_new(libc::MAP_POPULATE as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "MAP_STACK",
+                pyre_object::w_int_new(libc::MAP_STACK as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "MAP_HUGETLB",
+                pyre_object::w_int_new(libc::MAP_HUGETLB as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "MAP_NORESERVE",
+                pyre_object::w_int_new(libc::MAP_NORESERVE as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "MAP_LOCKED",
+                pyre_object::w_int_new(libc::MAP_LOCKED as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "MAP_NONBLOCK",
+                pyre_object::w_int_new(libc::MAP_NONBLOCK as i64),
+            );
+        }
         crate::dict_storage_store(
             ns,
             "PROT_READ",
@@ -5620,8 +5775,6 @@ fn init_mmap(ns: &mut DictStorage) {
                 Ok(obj)
             }),
         );
-        // Provide `error` alias for stdlib mmap.py.
-        crate::dict_storage_store(ns, "error", crate::typedef::w_object());
     }
 }
 
