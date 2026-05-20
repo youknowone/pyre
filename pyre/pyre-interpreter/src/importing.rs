@@ -143,6 +143,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("select", init_select);
     register_builtin_module("termios", init_termios);
     register_builtin_module("_socket", init_socket);
+    register_builtin_module("mmap", init_mmap);
     register_builtin_module("_locale", init_locale);
     register_builtin_module("_random", init_random);
     register_builtin_module("_struct", init_struct);
@@ -1080,7 +1081,7 @@ fn init_pwd(ns: &mut DictStorage) {
                             "getpwuid(): uid should be an integer",
                         ));
                     }
-                    let uid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::uid_t;
+                    let uid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::uid_t;
                     match rustpython_host_env::pwd::getpwuid(uid) {
                         Ok(Some(pw)) => return Ok(make_struct_passwd(&pw)),
                         Ok(None) => {
@@ -1189,7 +1190,7 @@ fn init_grp(ns: &mut DictStorage) {
                             "getgrgid(): gid should be an integer",
                         ));
                     }
-                    let gid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::gid_t;
+                    let gid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::gid_t;
                     match rustpython_host_env::grp::getgrgid(gid) {
                         Ok(Some(g)) => return Ok(make_struct_group(&g)),
                         Ok(None) => {
@@ -1469,8 +1470,8 @@ fn init_fcntl(ns: &mut DictStorage) {
                         "fcntl() requires at least 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let cmd = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let arg = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
                 } else {
@@ -1504,8 +1505,8 @@ fn init_fcntl(ns: &mut DictStorage) {
                         "ioctl() requires at least 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let raw_req = unsafe { pyre_object::w_int_get_value(args[1]) } as i64;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let raw_req = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i64;
                 let request = rustpython_host_env::fcntl::normalize_ioctl_request(raw_req);
                 let arg = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
@@ -1542,8 +1543,8 @@ fn init_fcntl(ns: &mut DictStorage) {
                             "flock() requires 2 arguments",
                         ));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                    let op = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     match rustpython_host_env::fcntl::flock(fd, op) {
                         Ok(_) => Ok(pyre_object::w_none()),
                         Err(e) => Err(crate::PyError::os_error_with_errno(
@@ -1574,8 +1575,8 @@ fn init_fcntl(ns: &mut DictStorage) {
                         "lockf() requires at least 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let cmd = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let len = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) }
                 } else {
@@ -1986,7 +1987,7 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcgetattr() requires 1 argument",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let t = host_termios::tcgetattr(fd).map_err(|e| {
                     crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -2019,8 +2020,8 @@ fn init_termios(ns: &mut DictStorage) {
                     "tcsetattr() requires 3 arguments",
                 ));
             }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-            let when = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+            let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+            let when = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
             let attrs = args[2];
             if !unsafe { pyre_object::is_list(attrs) } {
                 return Err(crate::PyError::type_error(
@@ -2120,8 +2121,8 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcsendbreak() requires 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let dur = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let dur = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 host_termios::tcsendbreak(fd, dur).map_err(|e| {
                     crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -2145,7 +2146,7 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcdrain() requires 1 argument",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 host_termios::tcdrain(fd).map_err(|e| {
                     crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -2169,8 +2170,8 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcflush() requires 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let q = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let q = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 host_termios::tcflush(fd, q).map_err(|e| {
                     crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -2194,8 +2195,8 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcflow() requires 2 arguments",
                     ));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let action = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let action = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 host_termios::tcflow(fd, action).map_err(|e| {
                     crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -2475,7 +2476,7 @@ fn init_socket(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("htons() missing argument"));
                 }
-                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
             },
             1,
@@ -2490,7 +2491,7 @@ fn init_socket(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("ntohs() missing argument"));
                 }
-                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
                 Ok(pyre_object::w_int_new(u16::from_be(x) as i64))
             },
             1,
@@ -2505,7 +2506,7 @@ fn init_socket(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("htonl() missing argument"));
                 }
-                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u32;
+                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
             },
             1,
@@ -2520,7 +2521,7 @@ fn init_socket(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("ntohl() missing argument"));
                 }
-                let x = unsafe { pyre_object::w_int_get_value(args[0]) } as u32;
+                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
                 Ok(pyre_object::w_int_new(u32::from_be(x) as i64))
             },
             1,
@@ -2615,7 +2616,7 @@ fn init_socket(ns: &mut DictStorage) {
                             "inet_pton() requires 2 arguments",
                         ));
                     }
-                    let af = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let ip = unsafe {
                         if !pyre_object::is_str(args[1]) {
                             return Err(crate::PyError::type_error(
@@ -2662,7 +2663,7 @@ fn init_socket(ns: &mut DictStorage) {
                             "inet_ntop() requires 2 arguments",
                         ));
                     }
-                    let af = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let data = unsafe {
                         if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                             return Err(crate::PyError::type_error(
@@ -2872,7 +2873,7 @@ fn init_socket(ns: &mut DictStorage) {
                         "getservbyport() missing argument",
                     ));
                 }
-                let port = unsafe { pyre_object::w_int_get_value(args[0]) } as u16;
+                let port = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
                 let proto_c: Option<std::ffi::CString> = if args.len() >= 2
                     && unsafe { pyre_object::is_str(args[1]) }
                 {
@@ -2968,7 +2969,7 @@ fn init_socket(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("dup() missing argument"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let n = unsafe { libc::dup(fd) };
                     if n < 0 {
                         return Err(socket_io_err(std::io::Error::last_os_error()));
@@ -3590,7 +3591,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 }
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
-                let n = unsafe { pyre_object::w_int_get_value(args[1]) } as usize;
+                let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
                 let flags = if args.len() >= 3 {
                     (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
                 } else {
@@ -3673,7 +3674,7 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let n = unsafe { pyre_object::w_int_get_value(args[1]) } as usize;
+            let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
@@ -3849,7 +3850,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 }
                 Ok(pyre_object::w_int_new(v as i64))
             } else {
-                let buflen = unsafe { pyre_object::w_int_get_value(args[3]) } as usize;
+                let buflen = (unsafe { pyre_object::w_int_get_value(args[3]) }) as usize;
                 let mut buf = vec![0u8; buflen];
                 let mut sz = buflen as libc::socklen_t;
                 let r = unsafe {
@@ -3987,6 +3988,562 @@ fn init_socket_type(ns: &mut DictStorage) {
 #[cfg(not(unix))]
 fn socket_type() -> pyre_object::PyObjectRef {
     crate::typedef::w_object()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// mmap module — PyPy: pypy/module/mmap/.
+//
+// The `mmap.mmap(fileno, length, ...)` class wraps libc::mmap directly.
+// Per-instance state lives in the instance dict: `_ptr` (raw pointer as
+// i64), `_len` (i64), `_pos` (i64 cursor), `_access` (int).  The
+// pointer is invalidated on close()/`__exit__` via munmap(2); leaking
+// it (e.g. GC drops the instance before close) is acceptable, matching
+// CPython behaviour.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+thread_local! {
+    static MMAP_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+#[cfg(unix)]
+fn mmap_type() -> pyre_object::PyObjectRef {
+    MMAP_TYPE_OBJ.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("mmap", init_mmap_type);
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
+#[cfg(unix)]
+fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
+    let d = crate::baseobjspace::getdict(obj);
+    if d.is_null() {
+        return 0;
+    }
+    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) } {
+        if unsafe { pyre_object::is_int(v) } {
+            return unsafe { pyre_object::w_int_get_value(v) };
+        }
+    }
+    0
+}
+
+#[cfg(unix)]
+fn mmap_set_attr(obj: pyre_object::PyObjectRef, key: &str, v: pyre_object::PyObjectRef) {
+    let d = crate::baseobjspace::getdict(obj);
+    if d.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(d, key, v);
+    }
+}
+
+#[cfg(unix)]
+fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::PyError> {
+    let p = mmap_get_attr_i64(obj, "_ptr") as usize as *mut u8;
+    let len = mmap_get_attr_i64(obj, "_len") as usize;
+    if p.is_null() {
+        return Err(crate::PyError::value_error("mmap closed or invalid"));
+    }
+    Ok((p, len))
+}
+
+#[cfg(unix)]
+fn init_mmap_type(ns: &mut DictStorage) {
+    // close() — munmap and zero the pointer.
+    crate::dict_storage_store(
+        ns,
+        "close",
+        crate::make_builtin_function_with_arity(
+            "close",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let p = mmap_get_attr_i64(obj, "_ptr") as usize;
+                let len = mmap_get_attr_i64(obj, "_len") as usize;
+                if p != 0 && len != 0 {
+                    let _ = unsafe { libc::munmap(p as *mut libc::c_void, len) };
+                    mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
+                    mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // closed — bool property; CPython exposes it as a get-only attribute.
+    crate::dict_storage_store(
+        ns,
+        "closed",
+        crate::make_builtin_function_with_arity(
+            "closed",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_bool_from(
+                    mmap_get_attr_i64(obj, "_ptr") == 0,
+                ))
+            },
+            1,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "size",
+        crate::make_builtin_function_with_arity(
+            "size",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_int_new(mmap_get_attr_i64(obj, "_len")))
+            },
+            1,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "tell",
+        crate::make_builtin_function_with_arity(
+            "tell",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_int_new(mmap_get_attr_i64(obj, "_pos")))
+            },
+            1,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "seek",
+        crate::make_builtin_function("seek", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("seek() missing argument"));
+            }
+            let obj = args[0];
+            let (_, len) = mmap_ptr(obj)?;
+            let off = unsafe { pyre_object::w_int_get_value(args[1]) };
+            let whence = if args.len() >= 3 {
+                unsafe { pyre_object::w_int_get_value(args[2]) }
+            } else {
+                0
+            };
+            let cur = mmap_get_attr_i64(obj, "_pos");
+            let new_pos = match whence {
+                0 => off,
+                1 => cur + off,
+                2 => len as i64 + off,
+                _ => {
+                    return Err(crate::PyError::value_error("invalid whence"));
+                }
+            };
+            if new_pos < 0 || (new_pos as usize) > len {
+                return Err(crate::PyError::value_error("seek out of range"));
+            }
+            mmap_set_attr(obj, "_pos", pyre_object::w_int_new(new_pos));
+            Ok(pyre_object::w_none())
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "read",
+        crate::make_builtin_function("read", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("read() missing self"));
+            }
+            let obj = args[0];
+            let (p, len) = mmap_ptr(obj)?;
+            let pos = mmap_get_attr_i64(obj, "_pos") as usize;
+            let remaining = len.saturating_sub(pos);
+            let n = if args.len() >= 2 {
+                let req = unsafe { pyre_object::w_int_get_value(args[1]) };
+                if req < 0 {
+                    remaining
+                } else {
+                    (req as usize).min(remaining)
+                }
+            } else {
+                remaining
+            };
+            let slice = unsafe { std::slice::from_raw_parts(p.add(pos), n) };
+            let data: Vec<u8> = slice.to_vec();
+            mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + n) as i64));
+            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "read_byte",
+        crate::make_builtin_function_with_arity(
+            "read_byte",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let (p, len) = mmap_ptr(obj)?;
+                let pos = mmap_get_attr_i64(obj, "_pos") as usize;
+                if pos >= len {
+                    return Err(crate::PyError::value_error("read byte out of range"));
+                }
+                let b = unsafe { *p.add(pos) };
+                mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
+                Ok(pyre_object::w_int_new(b as i64))
+            },
+            1,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "write",
+        crate::make_builtin_function_with_arity(
+            "write",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("write() missing buffer"));
+                }
+                let obj = args[0];
+                let (p, len) = mmap_ptr(obj)?;
+                let access = mmap_get_attr_i64(obj, "_access");
+                if access == MMAP_ACCESS_READ {
+                    return Err(crate::PyError::type_error(
+                        "mmap is read-only",
+                    ));
+                }
+                let buf = unsafe {
+                    if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                        return Err(crate::PyError::type_error(
+                            "write: buffer must be bytes-like",
+                        ));
+                    }
+                    pyre_object::bytesobject::bytes_like_data(args[1])
+                };
+                let pos = mmap_get_attr_i64(obj, "_pos") as usize;
+                if pos + buf.len() > len {
+                    return Err(crate::PyError::value_error(
+                        "data out of range",
+                    ));
+                }
+                unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len()) };
+                mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + buf.len()) as i64));
+                Ok(pyre_object::w_int_new(buf.len() as i64))
+            },
+            2,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "write_byte",
+        crate::make_builtin_function_with_arity(
+            "write_byte",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("write_byte() missing arg"));
+                }
+                let obj = args[0];
+                let (p, len) = mmap_ptr(obj)?;
+                let access = mmap_get_attr_i64(obj, "_access");
+                if access == MMAP_ACCESS_READ {
+                    return Err(crate::PyError::type_error("mmap is read-only"));
+                }
+                let pos = mmap_get_attr_i64(obj, "_pos") as usize;
+                if pos >= len {
+                    return Err(crate::PyError::value_error("write_byte out of range"));
+                }
+                let b = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u8;
+                unsafe { *p.add(pos) = b };
+                mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "flush",
+        crate::make_builtin_function("flush", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("flush() missing self"));
+            }
+            let obj = args[0];
+            let (p, len) = mmap_ptr(obj)?;
+            let off = if args.len() >= 2 {
+                (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize
+            } else {
+                0
+            };
+            let n = if args.len() >= 3 {
+                (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize
+            } else {
+                len - off
+            };
+            if off + n > len {
+                return Err(crate::PyError::value_error("flush range out of bounds"));
+            }
+            let r = unsafe { libc::msync(p.add(off) as *mut libc::c_void, n, libc::MS_SYNC) };
+            if r != 0 {
+                return Err(crate::PyError::os_error_with_errno(
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    "msync",
+                ));
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "find",
+        crate::make_builtin_function("find", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("find() missing pattern"));
+            }
+            let obj = args[0];
+            let (p, len) = mmap_ptr(obj)?;
+            let needle = unsafe {
+                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                    return Err(crate::PyError::type_error(
+                        "find: pattern must be bytes-like",
+                    ));
+                }
+                pyre_object::bytesobject::bytes_like_data(args[1])
+            };
+            let cur = mmap_get_attr_i64(obj, "_pos") as usize;
+            let start = if args.len() >= 3 {
+                let s = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if s < 0 { cur } else { s as usize }
+            } else {
+                cur
+            };
+            let end = if args.len() >= 4 {
+                let e = unsafe { pyre_object::w_int_get_value(args[3]) };
+                if e < 0 { len } else { (e as usize).min(len) }
+            } else {
+                len
+            };
+            if start >= end || needle.is_empty() {
+                return Ok(pyre_object::w_int_new(-1));
+            }
+            let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
+            let pos = (0..=hay.len().saturating_sub(needle.len()))
+                .find(|&i| &hay[i..i + needle.len()] == needle)
+                .map(|i| (start + i) as i64)
+                .unwrap_or(-1);
+            Ok(pyre_object::w_int_new(pos))
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "rfind",
+        crate::make_builtin_function("rfind", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("rfind() missing pattern"));
+            }
+            let obj = args[0];
+            let (p, len) = mmap_ptr(obj)?;
+            let needle = unsafe {
+                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                    return Err(crate::PyError::type_error(
+                        "rfind: pattern must be bytes-like",
+                    ));
+                }
+                pyre_object::bytesobject::bytes_like_data(args[1])
+            };
+            let start = if args.len() >= 3 {
+                let s = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if s < 0 { 0 } else { s as usize }
+            } else {
+                0
+            };
+            let end = if args.len() >= 4 {
+                let e = unsafe { pyre_object::w_int_get_value(args[3]) };
+                if e < 0 { len } else { (e as usize).min(len) }
+            } else {
+                len
+            };
+            if start >= end || needle.is_empty() {
+                return Ok(pyre_object::w_int_new(-1));
+            }
+            let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
+            let pos = (0..=hay.len().saturating_sub(needle.len()))
+                .rev()
+                .find(|&i| &hay[i..i + needle.len()] == needle)
+                .map(|i| (start + i) as i64)
+                .unwrap_or(-1);
+            Ok(pyre_object::w_int_new(pos))
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "__enter__",
+        crate::make_builtin_function_with_arity(
+            "__enter__",
+            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "__exit__",
+        crate::make_builtin_function("__exit__", |args| {
+            if let Some(&obj) = args.first() {
+                let p = mmap_get_attr_i64(obj, "_ptr") as usize;
+                let len = mmap_get_attr_i64(obj, "_len") as usize;
+                if p != 0 && len != 0 {
+                    let _ = unsafe { libc::munmap(p as *mut libc::c_void, len) };
+                    mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
+                    mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
+                }
+            }
+            Ok(pyre_object::w_bool_from(false))
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "__len__",
+        crate::make_builtin_function_with_arity(
+            "__len__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_int_new(mmap_get_attr_i64(obj, "_len")))
+            },
+            1,
+        ),
+    );
+}
+
+#[cfg(unix)]
+const MMAP_ACCESS_DEFAULT: i64 = 0;
+#[cfg(unix)]
+const MMAP_ACCESS_READ: i64 = 1;
+#[cfg(unix)]
+const MMAP_ACCESS_WRITE: i64 = 2;
+#[cfg(unix)]
+const MMAP_ACCESS_COPY: i64 = 3;
+
+fn init_mmap(ns: &mut DictStorage) {
+    #[cfg(unix)]
+    {
+        // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
+        // Python ACCESS_* aliases.
+        crate::dict_storage_store(ns, "MAP_SHARED", pyre_object::w_int_new(libc::MAP_SHARED as i64));
+        crate::dict_storage_store(ns, "MAP_PRIVATE", pyre_object::w_int_new(libc::MAP_PRIVATE as i64));
+        crate::dict_storage_store(ns, "MAP_ANON", pyre_object::w_int_new(libc::MAP_ANON as i64));
+        crate::dict_storage_store(ns, "MAP_ANONYMOUS", pyre_object::w_int_new(libc::MAP_ANON as i64));
+        crate::dict_storage_store(ns, "PROT_READ", pyre_object::w_int_new(libc::PROT_READ as i64));
+        crate::dict_storage_store(ns, "PROT_WRITE", pyre_object::w_int_new(libc::PROT_WRITE as i64));
+        crate::dict_storage_store(ns, "PROT_EXEC", pyre_object::w_int_new(libc::PROT_EXEC as i64));
+        crate::dict_storage_store(ns, "PROT_NONE", pyre_object::w_int_new(libc::PROT_NONE as i64));
+        crate::dict_storage_store(ns, "ACCESS_DEFAULT", pyre_object::w_int_new(MMAP_ACCESS_DEFAULT));
+        crate::dict_storage_store(ns, "ACCESS_READ", pyre_object::w_int_new(MMAP_ACCESS_READ));
+        crate::dict_storage_store(ns, "ACCESS_WRITE", pyre_object::w_int_new(MMAP_ACCESS_WRITE));
+        crate::dict_storage_store(ns, "ACCESS_COPY", pyre_object::w_int_new(MMAP_ACCESS_COPY));
+        crate::dict_storage_store(ns, "MADV_NORMAL", pyre_object::w_int_new(libc::MADV_NORMAL as i64));
+        crate::dict_storage_store(ns, "MADV_RANDOM", pyre_object::w_int_new(libc::MADV_RANDOM as i64));
+        crate::dict_storage_store(ns, "MADV_SEQUENTIAL", pyre_object::w_int_new(libc::MADV_SEQUENTIAL as i64));
+        crate::dict_storage_store(ns, "MADV_WILLNEED", pyre_object::w_int_new(libc::MADV_WILLNEED as i64));
+        crate::dict_storage_store(ns, "MADV_DONTNEED", pyre_object::w_int_new(libc::MADV_DONTNEED as i64));
+
+        // Page-related constants (sys.PAGESIZE in CPython mmap module).
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        crate::dict_storage_store(ns, "PAGESIZE", pyre_object::w_int_new(page));
+        crate::dict_storage_store(ns, "ALLOCATIONGRANULARITY", pyre_object::w_int_new(page));
+
+        // Register the type itself.
+        crate::dict_storage_store(ns, "mmap", mmap_type());
+
+        // mmap.mmap(fileno, length, flags=MAP_SHARED, prot=PROT_READ|WRITE,
+        //          access=ACCESS_DEFAULT, offset=0) factory.  Resolves
+        // access→flags/prot per CPython if access != ACCESS_DEFAULT.
+        crate::dict_storage_store(
+            ns,
+            "_mmap_new",
+            crate::make_builtin_function("_mmap_new", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "mmap() requires fileno + length",
+                    ));
+                }
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let length = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::size_t;
+                let flags_arg = if args.len() >= 3 {
+                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+                } else {
+                    libc::MAP_SHARED
+                };
+                let prot_arg = if args.len() >= 4 {
+                    (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
+                } else {
+                    libc::PROT_READ | libc::PROT_WRITE
+                };
+                let access = if args.len() >= 5 {
+                    unsafe { pyre_object::w_int_get_value(args[4]) }
+                } else {
+                    MMAP_ACCESS_DEFAULT
+                };
+                let offset = if args.len() >= 6 {
+                    (unsafe { pyre_object::w_int_get_value(args[5]) }) as libc::off_t
+                } else {
+                    0
+                };
+                let (flags, prot) = match access {
+                    x if x == MMAP_ACCESS_READ => (libc::MAP_SHARED, libc::PROT_READ),
+                    x if x == MMAP_ACCESS_WRITE => {
+                        (libc::MAP_SHARED, libc::PROT_READ | libc::PROT_WRITE)
+                    }
+                    x if x == MMAP_ACCESS_COPY => {
+                        (libc::MAP_PRIVATE, libc::PROT_READ | libc::PROT_WRITE)
+                    }
+                    _ => (flags_arg, prot_arg),
+                };
+                // fileno == -1 → anonymous mapping.
+                let real_fd = if fd == -1 {
+                    -1
+                } else {
+                    fd
+                };
+                let final_flags = if real_fd == -1 {
+                    flags | libc::MAP_ANON
+                } else {
+                    flags
+                };
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        length,
+                        prot,
+                        final_flags,
+                        real_fd,
+                        offset,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(crate::PyError::os_error_with_errno(
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        "mmap",
+                    ));
+                }
+                let obj = pyre_object::w_instance_new(mmap_type());
+                mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(ptr as usize as i64));
+                mmap_set_attr(obj, "_len", pyre_object::w_int_new(length as i64));
+                mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
+                mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
+                Ok(obj)
+            }),
+        );
+        // Provide `error` alias for stdlib mmap.py.
+        crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    }
 }
 
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
@@ -4204,7 +4761,7 @@ fn init_signal_stub(ns: &mut DictStorage) {
                             "setitimer() requires at least 2 arguments",
                         ));
                     }
-                    let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let which = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let read_f = |o: pyre_object::PyObjectRef| -> f64 {
                         unsafe {
                             if pyre_object::is_float(o) {
@@ -4259,7 +4816,7 @@ fn init_signal_stub(ns: &mut DictStorage) {
                                 "getitimer() requires 1 argument",
                             ));
                         }
-                        let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                        let which = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                         let it =
                             rustpython_host_env::signal::getitimer(which).map_err(|e| {
                                 crate::PyError::os_error_with_errno(
@@ -4299,8 +4856,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                                 "siginterrupt() requires 2 arguments",
                             ));
                         }
-                        let sig = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                        let flag = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                        let sig = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                        let flag = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                         rustpython_host_env::signal::siginterrupt(sig, flag).map_err(|e| {
                             crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
@@ -5558,7 +6115,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("close() requires 1 argument"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                 let ret = unsafe { libc::close(fd) };
                 if ret < 0 {
                     return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -5579,8 +6136,8 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("read() requires 2 arguments"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-                let n = unsafe { pyre_object::w_int_get_value(args[1]) } as usize;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
                 let mut buf = vec![0u8; n];
                 let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
                 if ret < 0 {
@@ -5603,7 +6160,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("write() requires 2 arguments"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                 let data = unsafe {
                     if pyre_object::bytesobject::is_bytes_like(args[1]) {
                         pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
@@ -5637,8 +6194,8 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.len() < 3 {
                     return Err(crate::PyError::type_error("lseek() requires 3 arguments"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-                let offset = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::off_t;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let offset = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::off_t;
                 let whence = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
                 let ret = unsafe { libc::lseek(fd, offset, whence) };
                 if ret < 0 {
@@ -5777,7 +6334,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
@@ -5794,7 +6351,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("urandom() requires 1 argument"));
                 }
-                let n = unsafe { pyre_object::w_int_get_value(args[0]) } as usize;
+                let n = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
                 let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
@@ -6171,7 +6728,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("fstat() missing argument"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::FromRawFd;
@@ -6398,7 +6955,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("nice() requires 1 argument"));
                     }
-                    let inc = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let inc = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let n = host_posix::nice(inc).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(n as i64))
                 },
@@ -6416,7 +6973,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("umask() requires 1 argument"));
                     }
-                    let mask = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::mode_t;
+                    let mask = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::mode_t;
                     let prev = host_posix::umask(mask);
                     Ok(pyre_object::w_int_new(prev as i64))
                 },
@@ -6473,7 +7030,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "sched_get_priority_max() requires 1 argument",
                         ));
                     }
-                    let policy = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let policy = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let m = host_posix::sched_get_priority_max(policy)
                         .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(m as i64))
@@ -6494,7 +7051,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "sched_get_priority_min() requires 1 argument",
                         ));
                     }
-                    let policy = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let policy = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let m = host_posix::sched_get_priority_min(policy)
                         .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(m as i64))
@@ -6550,7 +7107,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("fchdir() requires 1 argument"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     host_posix::fchdir(fd).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
@@ -6593,7 +7150,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("dup() requires 1 argument"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let n = unsafe { libc::dup(fd) };
                     if n < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -6612,7 +7169,7 @@ fn init_posix(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("dup2() requires 2 arguments"));
                 }
-                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                 let fd2 = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
                 let n = unsafe { libc::dup2(fd, fd2) };
                 if n < 0 {
@@ -6632,7 +7189,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("fsync() requires 1 argument"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let r = unsafe { libc::fsync(fd) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -6656,7 +7213,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "fdatasync() requires 1 argument",
                         ));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let r = unsafe { libc::fdatasync(fd) };
                     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -6704,7 +7261,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("kill() requires 2 arguments"));
                     }
-                    let pid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::pid_t;
+                    let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
                     let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
                     let r = unsafe { libc::kill(pid, sig) };
                     if r < 0 {
@@ -6724,7 +7281,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
                     }
-                    let pgid = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::pid_t;
+                    let pgid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
                     let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
                     let r = unsafe { libc::killpg(pgid, sig) };
                     if r < 0 {
@@ -6831,7 +7388,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "fstatvfs() requires 1 argument",
                         ));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let info = host_posix::statvfs_fd(fd).map_err(|e| io_err(e, ""))?;
                     Ok(statvfs_to_obj(info))
                 },
@@ -6909,8 +7466,8 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                    let mode = unsafe { pyre_object::w_int_get_value(args[1]) } as u32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let mode = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u32;
                     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
                     host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -6930,7 +7487,7 @@ fn init_posix(ns: &mut DictStorage) {
                     if args.len() < 3 {
                         return Err(crate::PyError::type_error("fchown() requires 3 arguments"));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let uid_raw = unsafe { pyre_object::w_int_get_value(args[1]) };
                     let gid_raw = unsafe { pyre_object::w_int_get_value(args[2]) };
                     let uid = if uid_raw < 0 { None } else { Some(uid_raw as u32) };
@@ -6956,7 +7513,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "set_inheritable() requires 2 arguments",
                         ));
                     }
-                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let inherit =
                         unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
                     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -6976,7 +7533,7 @@ fn init_posix(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("access() requires 2 arguments"));
                 }
                 let path = extract_path(args[0])?;
-                let mode = unsafe { pyre_object::w_int_get_value(args[1]) } as u8;
+                let mode = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u8;
                 match host_posix::check_access(std::path::Path::new(&path), mode) {
                     Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
                     Err(_) => Ok(pyre_object::w_bool_from(false)),
@@ -7078,7 +7635,7 @@ fn init_posix(ns: &mut DictStorage) {
                             "waitstatus_to_exitcode() requires 1 argument",
                         ));
                     }
-                    let status = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                    let status = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     match rustpython_host_env::time::waitstatus_to_exitcode(status) {
                         Some(code) => Ok(pyre_object::w_int_new(code as i64)),
                         None => Err(crate::PyError::value_error(
