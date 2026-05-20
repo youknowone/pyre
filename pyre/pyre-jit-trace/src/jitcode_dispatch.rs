@@ -483,6 +483,117 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// fast-path (`call_jit.rs:894-900 cache_valid`) or the new
     /// snapshot `jitcode_pc` channel — both keyed off this Python PC.
     pub entry_py_pc: u32,
+    /// Caller frames recorded at sub-walk entry, oldest-first.  Mirrors
+    /// RPython's `metainterp.framestack[0..n-1]` — the chain of paused
+    /// `MIFrame`s under the currently-executing top frame
+    /// (`framestack[-1]`).
+    ///
+    /// `pyjitpl.py:2586 capture_resumedata` walks the framestack
+    /// emitting one `SnapshotFrame` per `MIFrame`: the top via
+    /// `create_top_snapshot(top, vable, vref, after_residual_call,
+    /// is_last=...)`, then each parent via `create_snapshot(back,
+    /// is_last=...)` (`opencoder.py:819-832`).  Pyre's walker has no
+    /// `framestack` — sub-walks are stack-nested function calls — so we
+    /// thread the parent chain explicitly through `WalkContext`.
+    ///
+    /// When `dispatch_inline_call_*` constructs a sub-`WalkContext`, it
+    /// pushes the caller's [`WalkerFrameInfo`] onto a fresh
+    /// `parent_frames` Vec (`caller.parent_frames` clone + caller's own
+    /// frame).  The sub-walk reads the chain on guard emission to build
+    /// a multi-frame snapshot; on sub-walk return the parent_frames
+    /// Vec is dropped along with the sub-`WalkContext`.
+    pub parent_frames: Vec<WalkerFrameInfo>,
+    /// JitCode index of the **outer** `PyJitCode.jitcode` — the Python
+    /// bytecode jitcode whose Python opcode is currently being
+    /// dispatched.  Distinct from `current_jitcode_index` (which can
+    /// track the arm jitcode or a sub-walk callee in walker-internal
+    /// terms): pyre's blackhole resume only re-enters Python-bytecode
+    /// jitcodes, so guard snapshots must reference the outer pyjitcode
+    /// regardless of how deep the walker's sub-walk nesting is.
+    ///
+    /// Read from `(*sym.jitcode).index()` at production entry
+    /// ([`dispatch_via_miframe_at_opcode_entry`]); sub-walks inherit
+    /// the parent's value (sub-walks don't change the outer Python
+    /// opcode).  Test fixtures + [`dispatch_via_miframe`] default to
+    /// `0`.
+    pub outer_jitcode_index: u32,
+    /// Frozen `PyFrame` state at the outer Python opcode boundary —
+    /// `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
+    /// captured at [`dispatch_via_miframe_at_opcode_entry`] entry,
+    /// filtered by `OpRef::is_none()`.  This is what
+    /// [`walker_capture_snapshot_for_last_guard`] passes as the
+    /// snapshot frame's active boxes.
+    ///
+    /// Sub-walks clone the parent's Vec — outer active-box count is
+    /// small (a Python frame's live locals + stack tail) and walker
+    /// nesting depth is shallow (2–3 levels), so the per-sub-walk
+    /// clone cost is negligible.
+    pub outer_active_boxes: Vec<OpRef>,
+}
+
+/// Frozen frame state recorded at sub-walk entry — one entry per
+/// paused parent frame on the walker's nested call chain.  Mirrors
+/// `MIFrame` snapshot at `framestack[i]` in RPython.
+#[derive(Clone, Debug)]
+pub struct WalkerFrameInfo {
+    /// Jitcode index of the paused parent frame.
+    pub jitcode_index: u32,
+    /// Caller's `entry_py_pc` (the Python PC of the opcode whose arm
+    /// is paused while this sub-walk runs).
+    pub py_pc: u32,
+    /// JitCode bytecode offset of the inline_call instruction in the
+    /// parent's arm jitcode — the position where the sub-walk was
+    /// invoked from.  `pyjitpl.py:2598 create_snapshot(back, ...)`
+    /// reads `back.pc` for the same purpose.
+    pub jitcode_pc: u32,
+    /// Active OpRef boxes captured at sub-walk entry — the parent's
+    /// frozen register file (`registers_r ∪ registers_i.opref ∪
+    /// registers_f.opref`, filtered by `OpRef::NONE`).  Mirrors
+    /// `frame.get_list_of_active_boxes(in_a_call=True, ...)`
+    /// (`opencoder.py:808`).
+    pub active_boxes: Vec<OpRef>,
+}
+
+/// Build the `parent_frames` Vec to pass into a fresh sub-`WalkContext`.
+/// Clones the caller's chain (`ctx.parent_frames`) and appends the
+/// caller's own frozen frame info, so the sub-walk's chain is
+/// `[root, ..., caller's parent, caller]` (oldest-first).
+///
+/// `call_site_jitcode_pc` is the JitCode offset of the `inline_call_*`
+/// instruction in the caller's arm jitcode — the position
+/// `pyjitpl.py:2598 create_snapshot(back, ...)` would read as
+/// `back.pc` if RPython had pyre's split arm-jitcode layout.
+fn build_parent_frames_for_subwalk(
+    ctx: &WalkContext<'_, '_>,
+    call_site_jitcode_pc: usize,
+) -> Vec<WalkerFrameInfo> {
+    let mut active_boxes = Vec::with_capacity(
+        ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len(),
+    );
+    for r in ctx.registers_r.iter() {
+        if !r.is_none() {
+            active_boxes.push(*r);
+        }
+    }
+    for r in ctx.registers_i.iter() {
+        if !r.is_none() {
+            active_boxes.push(*r);
+        }
+    }
+    for r in ctx.registers_f.iter() {
+        if !r.is_none() {
+            active_boxes.push(*r);
+        }
+    }
+    let caller_frame = WalkerFrameInfo {
+        jitcode_index: ctx.current_jitcode_index,
+        py_pc: ctx.entry_py_pc,
+        jitcode_pc: call_site_jitcode_pc as u32,
+        active_boxes,
+    };
+    let mut chain = ctx.parent_frames.clone();
+    chain.push(caller_frame);
+    chain
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1667,6 +1778,9 @@ pub fn dispatch_via_miframe(
             last_exc_value_concrete: initial_last_exc_value_concrete,
             current_jitcode_index: 0,
             entry_py_pc,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -1788,6 +1902,49 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let initial_last_exc_value_concrete = ConcreteValue::Null;
     let frame_opref = sym.frame;
 
+    // Snapshot the outer PyFrame state for walker-emitted guards.
+    // RPython's `pyjitpl.py:218-225 _get_list_of_active_boxes` reads
+    // `MIFrame.registers_{i,r,f}` filtered by JitCode-liveness; pyre's
+    // walker has no per-PC liveness narrowing yet (Phase 4 follow-up),
+    // so this conservatively snapshots every non-`OpRef::NONE` slot
+    // across all three banks of `sym`.  Over-capture is
+    // correctness-preserving — the optimizer's
+    // `store_final_boxes_in_guard` filters dead boxes from the
+    // snapshot.
+    //
+    // Outer pyjitcode index: `sym.jitcode` points at the
+    // `majit_metainterp::jitcode::JitCode` for the user Python
+    // function being traced — its `.index()` is what RPython's
+    // `framestack[-1].jitcode.index` returns for the top frame
+    // (`pyjitpl.py:2586 capture_resumedata` reads it as the snapshot
+    // frame's `jitcode_index`).  Snapshot frames stamped with this
+    // index resolve to a valid `MetaInterpStaticData.jitcodes[idx]`
+    // entry whose `.code` is the Python `CodeObject`, so
+    // `build_resumed_frames` finds the PyFrame for resume.
+    let outer_jitcode_index = if sym.jitcode.is_null() {
+        0
+    } else {
+        unsafe { (*sym.jitcode).index as u32 }
+    };
+    let mut outer_active_boxes = Vec::with_capacity(
+        sym.registers_r.len() + sym.registers_i.len() + sym.registers_f.len(),
+    );
+    for r in sym.registers_r.iter() {
+        if !r.is_none() {
+            outer_active_boxes.push(*r);
+        }
+    }
+    for r in sym.registers_i.iter() {
+        if !r.is_none() {
+            outer_active_boxes.push(*r);
+        }
+    }
+    for r in sym.registers_f.iter() {
+        if !r.is_none() {
+            outer_active_boxes.push(*r);
+        }
+    }
+
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
     // `copy_constants(registers, constants, num_regs_X, ConstClass)`.
     // `allocate_callee_register_banks` ports this for sub-jitcode
@@ -1839,6 +1996,9 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             last_exc_value_concrete: initial_last_exc_value_concrete,
             current_jitcode_index: entry_jitcode.index() as u32,
             entry_py_pc,
+            parent_frames: Vec::new(),
+            outer_jitcode_index,
+            outer_active_boxes,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -3467,43 +3627,42 @@ fn write_residual_call_result_to_dst(
 /// pass, so dead registers in the snapshot are dropped before they
 /// reach the backend.
 fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
-    let mut active = Vec::with_capacity(
-        ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len(),
-    );
-    for r in ctx.registers_r.iter() {
-        if !r.is_none() {
-            active.push(*r);
-        }
-    }
-    for r in ctx.registers_i.iter() {
-        if !r.is_none() {
-            active.push(*r);
-        }
-    }
-    for r in ctx.registers_f.iter() {
-        if !r.is_none() {
-            active.push(*r);
-        }
-    }
-    // `jitcode_pc: 0` placeholder forces the resume path through
-    // `PyJitCode::resume_jitcode_pc_for(entry_py_pc)` (the legacy
-    // pc_map lookup) instead of the snapshot's jitcode_pc fast-path.
+    // Snapshot semantics for walker-emitted guards
+    // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
     //
-    // Why: the walker's `op.pc` indexes the per-opcode arm jitcode
-    // (e.g. PopTop's arm) — a different JitCode than `pyjitcode.
-    // jitcode` (which the resume reader passes to `bh.setposition`
-    // at `call_jit.rs:915`).  An arm-local pc would mis-position the
-    // blackhole interpreter inside the main jitcode bytes.  Phase 9
-    // (`pc_map` retirement) is the structural cleanup that lets the
-    // resume reader address the arm jitcode directly; until then the
-    // walker snapshot rides the pc_map channel like every other
-    // pyre-side guard emitter.
+    // RPython treats helper jitcodes (pop_value, nlocals, etc.) as
+    // separate `MIFrame`s on `metainterp.framestack`, capturing one
+    // snapshot frame per `MIFrame`.  At resume, RPython's blackhole
+    // interpreter re-enters each frame's jitcode and replays from the
+    // saved pc.
+    //
+    // Pyre's blackhole interpreter only knows how to run *pyjitcode*
+    // bytecode (Python bytecode), not helper jitcodes — pyre's
+    // per-opcode arm jitcodes and sub-jitcode helpers are walker-only
+    // structures with no blackhole entry point.  The structural
+    // consequence: any walker-emitted guard, regardless of how deep
+    // the sub-walk nesting is, must resume to the *outer* Python
+    // opcode boundary (`sym.jitcode` at `entry_py_pc`) — that is the
+    // only resume point pyre's blackhole can re-enter.
+    //
+    // Therefore the snapshot is single-frame and points at the outer
+    // pyjitcode coordinates regardless of `ctx.parent_frames` depth.
+    // `ctx.outer_jitcode_index` + `ctx.entry_py_pc` track those
+    // coordinates; `outer_active_boxes` carries the `PyFrame`
+    // state at the Python opcode boundary (snapshotted once at
+    // `dispatch_via_miframe_at_opcode_entry` from
+    // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`).
+    //
+    // `op_pc` (the walker's arm-local PC) is intentionally not used:
+    // the arm jitcode has no resume entry point in pyre's blackhole.
+    // The walker's `parent_frames` chain — built for potential future
+    // multi-frame resume support — is similarly inert today.
+    let _ = op_pc;
     ctx.trace_ctx.capture_snapshot_for_last_guard(
-        &active,
-        ctx.current_jitcode_index,
+        &ctx.outer_active_boxes,
+        ctx.outer_jitcode_index,
         ctx.entry_py_pc,
     );
-    let _ = op_pc;
 }
 
 fn direct_call_release_gil(
@@ -4286,6 +4445,7 @@ fn dispatch_inline_call_dr_kind(
         callee_concrete_r[i] = *concrete;
     }
 
+    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4306,6 +4466,9 @@ fn dispatch_inline_call_dr_kind(
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
+            parent_frames: sub_parent_frames,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4466,6 +4629,7 @@ fn dispatch_inline_call_dir_kind(
         callee_concrete_r[i] = *concrete;
     }
 
+    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4486,6 +4650,9 @@ fn dispatch_inline_call_dir_kind(
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
+            parent_frames: sub_parent_frames,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4641,6 +4808,7 @@ fn dispatch_inline_call_dirf_kind(
         callee_concrete_r[i] = *concrete;
     }
 
+    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4661,6 +4829,9 @@ fn dispatch_inline_call_dirf_kind(
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
+            parent_frames: sub_parent_frames,
+            outer_jitcode_index: ctx.outer_jitcode_index,
+            outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -5652,6 +5823,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -5821,6 +5995,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -5864,6 +6041,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -5906,6 +6086,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -5957,6 +6140,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -6000,6 +6186,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -6042,6 +6231,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -6179,6 +6371,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -6334,6 +6529,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -6437,6 +6635,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -6534,6 +6735,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -6620,6 +6824,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -6703,6 +6910,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -6764,6 +6974,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -6807,6 +7020,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -6846,6 +7062,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6893,6 +7112,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6946,6 +7168,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -6994,6 +7219,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -7047,6 +7275,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -7099,6 +7330,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -7155,6 +7389,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -7197,6 +7434,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -7242,6 +7482,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7287,6 +7530,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7380,6 +7626,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -7421,6 +7670,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7474,6 +7726,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7557,6 +7812,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7625,6 +7883,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7684,6 +7945,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -7724,6 +7988,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -8337,6 +8604,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8441,6 +8711,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8496,6 +8769,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8548,6 +8824,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -8591,6 +8870,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8633,6 +8915,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -8696,6 +8981,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8747,6 +9035,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -8789,6 +9080,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8830,6 +9124,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -8881,6 +9178,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9023,6 +9323,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9092,6 +9395,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9142,6 +9448,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9214,6 +9523,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9266,6 +9578,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -9307,6 +9622,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -9350,6 +9668,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -9401,6 +9722,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -9444,6 +9768,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9511,6 +9838,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9563,6 +9893,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -9627,6 +9960,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9708,6 +10044,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -9857,6 +10196,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9915,6 +10257,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -9964,6 +10309,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -10008,6 +10356,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10061,6 +10412,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10116,6 +10470,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -10191,6 +10548,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10255,6 +10615,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10318,6 +10681,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -10363,6 +10729,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -10446,6 +10815,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -10522,6 +10894,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -10612,6 +10987,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -10728,6 +11106,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10780,6 +11161,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -10824,6 +11208,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -10892,6 +11279,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -11005,6 +11395,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -11094,6 +11487,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -11182,6 +11578,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -11249,6 +11648,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -11319,6 +11721,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -11387,6 +11792,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -11461,6 +11869,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -11533,6 +11944,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -11593,6 +12007,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11675,6 +12092,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -11734,6 +12154,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -11775,6 +12198,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -11834,6 +12260,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11910,6 +12339,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11979,6 +12411,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -12026,6 +12461,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -12096,6 +12534,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -12146,6 +12587,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12218,6 +12662,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -12276,6 +12723,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
@@ -12342,6 +12792,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12641,6 +13094,9 @@ mod tests {
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
             entry_py_pc: 0,
+            parent_frames: Vec::new(),
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
         };
         assert_eq!(
             walk(&code, 0, &mut wc),

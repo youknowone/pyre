@@ -467,6 +467,41 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyframe_nlocals as *const (),
     );
 
+    // `pop_value`'s underflow guard returns `stack_underflow_error(...)`
+    // when the value stack is empty (`eval.rs:840-845` +
+    // `eval.rs:847-852 peek_at`). The codewriter follows that call edge
+    // into the `stack_underflow_error` helper jitcode, whose `constants_i[0]`
+    // is the function pointer the walker invokes at residual_call time.
+    // Without this binding the codewriter falls back to
+    // `symbolic_fnaddr_for_path`, which is a deterministic hash and
+    // SEGVs when called.  `lib.rs:72 pub use shared_opcode::*` re-exports
+    // the helper at the crate root, so the codewriter resolves
+    // `stack_underflow_error` to `pyre_interpreter::stack_underflow_error`
+    // when it appears as a bare identifier in `eval.rs`; register both
+    // the module-qualified path and the root re-export path via
+    // [`push_alias_pair`].
+    let stack_underflow: fn(&str) -> crate::PyError = crate::shared_opcode::stack_underflow_error;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::shared_opcode::stack_underflow_error",
+        "pyre_interpreter::stack_underflow_error",
+        stack_underflow as *const (),
+    );
+
+    // `PyError::type_error` — invoked by `stack_underflow_error`'s body
+    // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
+    // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
+    // type segment + method segment).  `register_macro_helper_trace_fnaddr`
+    // strips the leading crate segment, so the input string must have
+    // exactly 3 segments to produce the desired 2-segment canonical form.
+    let pyerror_type_error: fn(String) -> crate::PyError =
+        |msg| crate::PyError::type_error(msg);
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyError::type_error",
+        pyerror_type_error as *const (),
+    );
+
     // RPython convention (cross-reference `support.py:255-271` for
     // the C-trunc helpers, `rint.py:398/495` for the Python-floor
     // ones) is to keep the two semantic flavours under DISTINCT
