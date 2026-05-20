@@ -268,27 +268,27 @@ impl FlowGraphRegAllocator {
 ///
 /// The `_graph_` prefix disambiguates from the sibling
 /// `perform_register_allocation` SSARepr scanner further down in this
-/// module.  **Currently not invoked from the production regalloc
-/// path** — it is a tested algorithm port kept to cover the CFG-level
-/// coalesce rules of `regalloc.py:79-112 coalesce_variables`, but pyre
-/// cannot drop the SSARepr scanner and activate this one the way
-/// upstream does, for two orthogonal reasons:
+/// module.  Invoked from production via
+/// `perform_graph_register_allocation_all_kinds` at
+/// `codewriter.rs:transform_graph_to_jitcode`, where its result feeds
+/// `walker_post_walk_insert_renamings` (the walker's port of
+/// `flatten.py:154 self.insert_renamings(link)`).  The SSARepr scanner
+/// further down still runs alongside this CFG allocator because pyre
+/// has two coalesce sources that cover non-overlapping work:
 ///
-///   1. Pyre's `getoutputargs()` builds `link.args` by positional walk
-///      over `targetstate.mergeable()` (`codewriter.rs::FrameState::
-///      getoutputargs`), so every pair this function would produce at
-///      the CFG level is trivially `(slot, slot)` — a structural no-op
-///      relative to what SSARepr-level coalescing already sees.
+///   1. This CFG allocator runs `coalesce_variables` over
+///      `link.args ↔ target.inputargs` pairs.  Every pair is trivially
+///      `(slot, slot)` because `FrameState::getoutputargs` builds
+///      `link.args` by positional walk over
+///      `targetstate.mergeable()`, so `try_coalesce` is a no-op at the
+///      CFG level today.  When the walker eventually defers SSARepr
+///      emission to the canonical `flatten_graph` driver, the CFG
+///      allocator will become the load-bearing coalesce source.
 ///   2. The SSARepr scanner handles **intra-block** `*_copy`
 ///      sequences (emitted by `emit_ref_copy!`/`emit_int_copy!` inline
 ///      for STORE_FAST-LOAD_FAST fusions) that have no Link-level
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
-///
-/// Keeping the helper documents that the RPython algorithm is ported
-/// correctly for the CFG shape pyre does maintain; the unit tests
-/// exercise exactly that surface.  It is not dead code, but it is also
-/// not a drop-in replacement for the scanner.
 pub(super) fn perform_graph_register_allocation(
     graph: &FlowGraph,
     kind: Kind,

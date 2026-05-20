@@ -8425,9 +8425,9 @@ impl CodeWriter {
         // colors (HashMap iteration non-determinism between two
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
-        let mut _graph_regallocs =
+        let mut graph_regallocs =
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args_graph(&graph, &mut _graph_regallocs);
+        super::regalloc::enforce_input_args_graph(&graph, &mut graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
         // BEFORE `walker_post_walk_insert_renamings` reads
         // it.  The same pairing pass also runs downstream (idempotent
@@ -8469,7 +8469,7 @@ impl CodeWriter {
             walker_post_walk_insert_renamings(
                 &graph,
                 &walker_slot_for_variable,
-                &_graph_regallocs,
+                &graph_regallocs,
                 &all_walker_blocks,
                 &mut walker_pc_live_marker_pos,
             );
@@ -8655,7 +8655,7 @@ impl CodeWriter {
         // graph topology that the allocator can't process before any
         // downstream code reads from it.
         //
-        // Phase 4 endgame: `_graph_regallocs` is now computed earlier
+        // Phase 4 endgame: `graph_regallocs` is now computed earlier
         // (pre-drain) so walker insert_renamings shares the same
         // colors as canonical's pass below.  The duplicate compute is
         // retired; we reuse the shared instance.
