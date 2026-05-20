@@ -5113,6 +5113,172 @@ fn init_posix(ns: &mut DictStorage) {
                 1,
             ),
         );
+
+        // os.cpu_count() -> int | None
+        crate::dict_storage_store(
+            ns,
+            "cpu_count",
+            crate::make_builtin_function_with_arity(
+                "cpu_count",
+                |_| {
+                    let n = host_posix::get_number_of_os_threads();
+                    if n <= 0 {
+                        Ok(pyre_object::w_none())
+                    } else {
+                        Ok(pyre_object::w_int_new(n as i64))
+                    }
+                },
+                0,
+            ),
+        );
+        // _cpu_count alias — newer CPython exposes both.
+        crate::dict_storage_store(
+            ns,
+            "_cpu_count",
+            crate::make_builtin_function_with_arity(
+                "_cpu_count",
+                |_| {
+                    let n = host_posix::get_number_of_os_threads();
+                    if n <= 0 {
+                        Ok(pyre_object::w_none())
+                    } else {
+                        Ok(pyre_object::w_int_new(n as i64))
+                    }
+                },
+                0,
+            ),
+        );
+
+        // os.symlink(src, dst, target_is_directory=False) -> None
+        crate::dict_storage_store(
+            ns,
+            "symlink",
+            crate::make_builtin_function("symlink", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("symlink() requires 2 arguments"));
+                }
+                let src = extract_path(args[0])?;
+                let dst = extract_path(args[1])?;
+                let c_src = std::ffi::CString::new(src.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
+                let c_dst = std::ffi::CString::new(dst.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
+                // host_env::posix only exposes symlinkat on non-redox unices;
+                // call libc::symlink directly so we don't need an at-cwd dance.
+                let ret = unsafe { libc::symlink(c_src.as_ptr(), c_dst.as_ptr()) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), &dst));
+                }
+                Ok(pyre_object::w_none())
+            }),
+        );
+
+        // os.fchmod(fd, mode) -> None
+        crate::dict_storage_store(
+            ns,
+            "fchmod",
+            crate::make_builtin_function_with_arity(
+                "fchmod",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let mode = unsafe { pyre_object::w_int_get_value(args[1]) } as u32;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    host_posix::fchmod(bfd, mode).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.fchown(fd, uid, gid) -> None  (uid/gid of -1 means "leave unchanged")
+        crate::dict_storage_store(
+            ns,
+            "fchown",
+            crate::make_builtin_function_with_arity(
+                "fchown",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error("fchown() requires 3 arguments"));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let uid_raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+                    let gid_raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                    let uid = if uid_raw < 0 { None } else { Some(uid_raw as u32) };
+                    let gid = if gid_raw < 0 { None } else { Some(gid_raw as u32) };
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    host_posix::fchown(bfd, uid, gid).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                3,
+            ),
+        );
+
+        // os.set_inheritable(fd, inheritable) -> None
+        crate::dict_storage_store(
+            ns,
+            "set_inheritable",
+            crate::make_builtin_function_with_arity(
+                "set_inheritable",
+                |args| {
+                    use std::os::fd::BorrowedFd;
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "set_inheritable() requires 2 arguments",
+                        ));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let inherit =
+                        unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
+                    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                    host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // os.access(path, mode) -> bool
+        crate::dict_storage_store(
+            ns,
+            "access",
+            crate::make_builtin_function("access", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("access() requires 2 arguments"));
+                }
+                let path = extract_path(args[0])?;
+                let mode = unsafe { pyre_object::w_int_get_value(args[1]) } as u8;
+                match host_posix::check_access(std::path::Path::new(&path), mode) {
+                    Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
+                    Err(_) => Ok(pyre_object::w_bool_from(false)),
+                }
+            }),
+        );
+
+        // os.chroot(path) -> None
+        crate::dict_storage_store(
+            ns,
+            "chroot",
+            crate::make_builtin_function_with_arity(
+                "chroot",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "chroot() requires 1 argument",
+                        ));
+                    }
+                    let path = extract_path(args[0])?;
+                    host_posix::chroot(std::path::Path::new(&path))
+                        .map_err(|e| io_err(e, &path))?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
