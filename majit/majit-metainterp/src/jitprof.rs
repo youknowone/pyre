@@ -380,6 +380,17 @@ impl JitProfiler {
     fn end_event(&self, event: i32) {
         let now = Instant::now();
         let profiler = self.profiler_id();
+        // `ended` mirrors the symmetric `debug_start`/`debug_stop`
+        // pairing in `start_event`: we only close the debug channel
+        // when the TLS frame for this `(profiler, event)` actually
+        // matched and was popped.  On broken-data early returns the
+        // paired `debug_start` either never ran (empty stack) or
+        // belongs to a sibling profiler still owning the top of the
+        // stack; firing `debug_stop` anyway would desynchronize the
+        // per-thread category stack and panic the now-strict
+        // `debug_stop(category)` mismatch guard
+        // (`majit-ir/src/debug.rs:84-`).
+        let mut ended = false;
         TIMING_STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             // RPython peeks the top frame first (`self.current` is
@@ -412,9 +423,12 @@ impl JitProfiler {
                 self.add_time(event, now.saturating_duration_since(t1));
             }
             state.t1 = Some(now);
+            ended = true;
         });
-        if let Some(channel) = debug_channel_for_event(event) {
-            crate::debug::debug_stop(channel);
+        if ended {
+            if let Some(channel) = debug_channel_for_event(event) {
+                crate::debug::debug_stop(channel);
+            }
         }
     }
 
