@@ -7560,14 +7560,19 @@ fn apply_walker_pop_top(state: &mut MIFrame) {
             }
         }
         if owns_vable {
+            // The walker arm body emits `setfield_vable_i(vsd_descr,
+            // int_sub_ovf(getfield, 1))` which routes through
+            // `TraceCtx::vable_setfield` →
+            // `set_virtualizable_entry_at("valuestackdepth", v_sub, …)`,
+            // so `virtualizable_boxes[vsd_index]` already carries the
+            // walker's computed OpRef.  Update only the standalone
+            // `sym.vable_valuestackdepth` mirror so snapshot encoders /
+            // close_loop_args_at see the matching new vsd; do NOT
+            // call `mirror_vable_static_to_boxes` here — that would
+            // overwrite the walker's `int_sub_ovf` result OpRef with a
+            // const_int, splitting the shadow's representation.
             let vsd_op = ctx.const_int(new_vsd as i64);
             state.sym_mut().vable_valuestackdepth = vsd_op;
-            mirror_vable_static_to_boxes(
-                ctx,
-                "valuestackdepth",
-                vsd_op,
-                Value::Int(new_vsd as i64),
-            );
         }
     });
 }
