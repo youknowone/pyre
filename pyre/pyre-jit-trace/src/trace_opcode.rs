@@ -2761,7 +2761,15 @@ impl MIFrame {
     pub(crate) fn live_args_shape_at(&self, ctx: &TraceCtx) -> usize {
         let extra_reds = crate::virtualizable_gen::NUM_EXTRA_REDS;
         let nlocals = self.sym().nlocals;
-        let stack_only = self.sym().valuestackdepth.saturating_sub(nlocals);
+        // Issue #73 Phase 4.5 slice 2: pure-read of stack depth comes from
+        // the concrete `PyFrame` (no symbolic mirror).  RPython's
+        // pyjitpl.py:2957-2965 `live_arg_boxes` shape derives directly
+        // from PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
+        // — there is no symbolic mirror to consult.
+        let vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
+        let stack_only = vsd.saturating_sub(nlocals);
         let target_array_capacity = ctx
             .virtualizable_array_lengths()
             .map(|lengths| lengths.iter().copied().sum::<usize>())
