@@ -1374,11 +1374,15 @@ fn init_pwd(ns: &mut DictStorage) {
     );
 }
 
-/// grp module — PyPy: pypy/module/grp/interp_grp.py.
+/// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via
+/// `_pwdgrp_cffi`).  pyre takes CPython's `Modules/grpmodule.c`
+/// shape since pyre has no app-level stdlib.
 ///
-/// getgrgid / getgrnam / getgrall return struct_group tuples with the
-/// same layout as CPython's `grp.struct_group`: (gr_name, gr_passwd,
-/// gr_gid, gr_mem).  Backed by `rustpython_host_env::grp`.
+/// getgrgid / getgrnam / getgrall return 4-tuples `(gr_name,
+/// gr_passwd, gr_gid, gr_mem)` matching CPython.  `grp.struct_group`
+/// is exposed as a builtin type attribute; full structseq instance
+/// materialisation (so `entry.gr_name` works) is blocked on the
+/// structseq framework task.
 fn init_grp(ns: &mut DictStorage) {
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
@@ -1391,6 +1395,11 @@ fn init_grp(ns: &mut DictStorage) {
             pyre_object::w_list_new(mem_items),
         ])
     }
+    // `lib_pypy/grp.py:13-19 class struct_group` — exposed so
+    // `grp.struct_group` is observable on the module even though
+    // returned values are still raw tuples.
+    let struct_group_type = crate::typedef::make_builtin_type("grp.struct_group", |_| {});
+    crate::dict_storage_store(ns, "struct_group", struct_group_type);
     crate::dict_storage_store(
         ns,
         "getgrgid",
@@ -1402,12 +1411,13 @@ fn init_grp(ns: &mut DictStorage) {
                 }
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    if !unsafe { pyre_object::is_int(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "getgrgid(): gid should be an integer",
-                        ));
-                    }
-                    let gid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::gid_t;
+                    // `Modules/grpmodule.c grp_getgrgid` — accept any
+                    // python int (including bigint) via int_w; reject
+                    // floats as TypeError.  PyPy's `lib_pypy/grp.py`
+                    // forwards directly through ctypes which would
+                    // do the same conversion.
+                    let val = crate::baseobjspace::int_w(args[0])?;
+                    let gid = val as libc::gid_t;
                     match rustpython_host_env::grp::getgrgid(gid) {
                         Ok(Some(g)) => return Ok(make_struct_group(&g)),
                         Ok(None) => {
@@ -1491,11 +1501,24 @@ fn init_grp(ns: &mut DictStorage) {
     );
 }
 
-/// resource module — PyPy: pypy/module/resource/interp_resource.py.
+/// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level
+/// via `_resource_cffi`).  pyre takes CPython's `Modules/resource.c`
+/// shape since pyre has no app-level stdlib.
 ///
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
-/// and RLIMIT_* constants.  Backed by `rustpython_host_env::resource`.
+/// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
+/// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
 fn init_resource(ns: &mut DictStorage) {
+    // `lib_pypy/resource.py:13 error = OSError` and
+    // `:15-37 class struct_rusage`.
+    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+        .expect("OSError must be installed before init_resource");
+    crate::dict_storage_store(ns, "error", w_os_error);
+    crate::dict_storage_store(
+        ns,
+        "struct_rusage",
+        crate::typedef::make_builtin_type("resource.struct_rusage", |_| {}),
+    );
     // ── struct_rusage tuple (16-field layout matches CPython) ──
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
@@ -1647,8 +1670,23 @@ fn init_resource(ns: &mut DictStorage) {
                     match rustpython_host_env::resource::setrlimit(res, rl) {
                         Ok(()) => return Ok(pyre_object::w_none()),
                         Err(e) => {
+                            // `lib_pypy/resource.py:89-95` — EINVAL and
+                            // EPERM both surface as ValueError with
+                            // distinct messages; all other errnos stay
+                            // as OSError.
+                            let errno = e.raw_os_error().unwrap_or(0);
+                            if errno == libc::EINVAL {
+                                return Err(crate::PyError::value_error(
+                                    "current limit exceeds maximum limit",
+                                ));
+                            }
+                            if errno == libc::EPERM {
+                                return Err(crate::PyError::value_error(
+                                    "not allowed to raise maximum limit",
+                                ));
+                            }
                             return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
+                                errno,
                                 format!("setrlimit: {e}"),
                             ));
                         }
@@ -2238,6 +2276,42 @@ fn init_syslog(ns: &mut DictStorage) {
             pyre_object::w_int_new(libc::LOG_LOCAL7 as i64),
         );
     }
+    // `Modules/syslogmodule.c syslog_log_mask / syslog_log_upto` —
+    // helpers for building setlogmask() arguments.
+    //   LOG_MASK(pri)  → 1 << pri
+    //   LOG_UPTO(pri)  → (1 << (pri + 1)) - 1
+    crate::dict_storage_store(
+        ns,
+        "LOG_MASK",
+        crate::make_builtin_function_with_arity(
+            "LOG_MASK",
+            |args| {
+                let pri = crate::baseobjspace::int_w(
+                    args.first().copied().ok_or_else(|| {
+                        crate::PyError::type_error("LOG_MASK() missing argument")
+                    })?,
+                )?;
+                Ok(pyre_object::w_int_new(1i64 << pri))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "LOG_UPTO",
+        crate::make_builtin_function_with_arity(
+            "LOG_UPTO",
+            |args| {
+                let pri = crate::baseobjspace::int_w(
+                    args.first().copied().ok_or_else(|| {
+                        crate::PyError::type_error("LOG_UPTO() missing argument")
+                    })?,
+                )?;
+                Ok(pyre_object::w_int_new((1i64 << (pri + 1)) - 1))
+            },
+            1,
+        ),
+    );
 }
 
 /// _select module — PyPy: pypy/module/select/.
