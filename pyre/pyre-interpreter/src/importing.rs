@@ -4374,6 +4374,10 @@ fn init_posix(ns: &mut DictStorage) {
         }
     }
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
+    // Routed through `host_env::posix::uname_info` when available so the
+    // result reports the host's real POSIX strings ("Darwin", "Linux",
+    // node hostname, kernel release, etc.) instead of Rust's compile-time
+    // `std::env::consts::OS` ("macos"/"linux"/...).
     crate::dict_storage_store(
         ns,
         "uname",
@@ -4381,24 +4385,43 @@ fn init_posix(ns: &mut DictStorage) {
             "uname",
             |_| {
                 let wrapper = pyre_object::w_instance_new(stat_result_type());
-                let sysname = std::env::consts::OS.to_string();
-                let machine = std::env::consts::ARCH.to_string();
-                let _ = crate::baseobjspace::setattr(
-                    wrapper,
-                    "sysname",
-                    pyre_object::w_str_new(&sysname),
-                );
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "nodename", pyre_object::w_str_new(""));
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "release", pyre_object::w_str_new(""));
-                let _ =
-                    crate::baseobjspace::setattr(wrapper, "version", pyre_object::w_str_new(""));
-                let _ = crate::baseobjspace::setattr(
-                    wrapper,
-                    "machine",
-                    pyre_object::w_str_new(&machine),
-                );
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let info = rustpython_host_env::posix::uname_info().unwrap_or(
+                        rustpython_host_env::posix::UnameInfo {
+                            sysname: String::new(),
+                            nodename: String::new(),
+                            release: String::new(),
+                            version: String::new(),
+                            machine: String::new(),
+                        },
+                    );
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "sysname", pyre_object::w_str_new(&info.sysname));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "nodename", pyre_object::w_str_new(&info.nodename));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "release", pyre_object::w_str_new(&info.release));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "version", pyre_object::w_str_new(&info.version));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "machine", pyre_object::w_str_new(&info.machine));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let sysname = std::env::consts::OS.to_string();
+                    let machine = std::env::consts::ARCH.to_string();
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "sysname", pyre_object::w_str_new(&sysname));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "nodename", pyre_object::w_str_new(""));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "release", pyre_object::w_str_new(""));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "version", pyre_object::w_str_new(""));
+                    let _ = crate::baseobjspace::setattr(
+                        wrapper, "machine", pyre_object::w_str_new(&machine));
+                }
                 Ok(wrapper)
             },
             0,
@@ -4600,6 +4623,242 @@ fn init_posix(ns: &mut DictStorage) {
             }
         }),
     );
+    // ── host_env::posix-backed real implementations (override the noop
+    //    placeholders registered above) ───────────────────────────────
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        use rustpython_host_env::posix as host_posix;
+
+        // os.pipe() -> (r_fd, w_fd)
+        crate::dict_storage_store(
+            ns,
+            "pipe",
+            crate::make_builtin_function_with_arity(
+                "pipe",
+                |_| match host_posix::pipe() {
+                    Ok((rfd, wfd)) => {
+                        use std::os::fd::IntoRawFd;
+                        Ok(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(rfd.into_raw_fd() as i64),
+                            pyre_object::w_int_new(wfd.into_raw_fd() as i64),
+                        ]))
+                    }
+                    Err(e) => Err(io_err(e, "")),
+                },
+                0,
+            ),
+        );
+
+        // os.sched_yield()
+        crate::dict_storage_store(
+            ns,
+            "sched_yield",
+            crate::make_builtin_function_with_arity(
+                "sched_yield",
+                |_| {
+                    host_posix::sched_yield().map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+
+        // os.nice(increment) -> new niceness
+        crate::dict_storage_store(
+            ns,
+            "nice",
+            crate::make_builtin_function_with_arity(
+                "nice",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("nice() requires 1 argument"));
+                    }
+                    let inc = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let n = host_posix::nice(inc).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(n as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.umask(mask) -> previous mask
+        crate::dict_storage_store(
+            ns,
+            "umask",
+            crate::make_builtin_function_with_arity(
+                "umask",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("umask() requires 1 argument"));
+                    }
+                    let mask = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::mode_t;
+                    let prev = host_posix::umask(mask);
+                    Ok(pyre_object::w_int_new(prev as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.getlogin() -> str
+        crate::dict_storage_store(
+            ns,
+            "getlogin",
+            crate::make_builtin_function_with_arity(
+                "getlogin",
+                |_| match host_posix::getlogin() {
+                    Some(name) => Ok(pyre_object::w_str_new(
+                        name.to_string_lossy().as_ref(),
+                    )),
+                    None => Err(crate::PyError::os_error_with_errno(
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        "getlogin",
+                    )),
+                },
+                0,
+            ),
+        );
+
+        // os.getgroups() -> list[int]
+        crate::dict_storage_store(
+            ns,
+            "getgroups",
+            crate::make_builtin_function_with_arity(
+                "getgroups",
+                |_| {
+                    let gs = host_posix::getgroups().map_err(|e| io_err(e, ""))?;
+                    let items: Vec<_> = gs
+                        .into_iter()
+                        .map(|g| pyre_object::w_int_new(g as i64))
+                        .collect();
+                    Ok(pyre_object::w_list_new(items))
+                },
+                0,
+            ),
+        );
+
+        // os.sched_get_priority_max(policy) -> int
+        crate::dict_storage_store(
+            ns,
+            "sched_get_priority_max",
+            crate::make_builtin_function_with_arity(
+                "sched_get_priority_max",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "sched_get_priority_max() requires 1 argument",
+                        ));
+                    }
+                    let policy = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let m = host_posix::sched_get_priority_max(policy)
+                        .map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(m as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.sched_get_priority_min(policy) -> int
+        crate::dict_storage_store(
+            ns,
+            "sched_get_priority_min",
+            crate::make_builtin_function_with_arity(
+                "sched_get_priority_min",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "sched_get_priority_min() requires 1 argument",
+                        ));
+                    }
+                    let policy = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let m = host_posix::sched_get_priority_min(policy)
+                        .map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(m as i64))
+                },
+                1,
+            ),
+        );
+
+        // os.sync()
+        #[cfg(not(any(target_os = "redox", target_os = "android")))]
+        crate::dict_storage_store(
+            ns,
+            "sync",
+            crate::make_builtin_function_with_arity(
+                "sync",
+                |_| {
+                    host_posix::sync();
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+
+        // os.chdir(path)
+        crate::dict_storage_store(
+            ns,
+            "chdir",
+            crate::make_builtin_function_with_arity(
+                "chdir",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("chdir() requires 1 argument"));
+                    }
+                    let path = extract_path(args[0])?;
+                    let c_path = std::ffi::CString::new(path.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                    host_posix::chdir(&c_path).map_err(|e| {
+                        crate::PyError::os_error_with_errno(e as i32, format!("chdir: '{}'", path))
+                    })?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // os.fchdir(fd)
+        crate::dict_storage_store(
+            ns,
+            "fchdir",
+            crate::make_builtin_function_with_arity(
+                "fchdir",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("fchdir() requires 1 argument"));
+                    }
+                    let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    host_posix::fchdir(fd).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
+            ),
+        );
+
+        // os.fork() -> child pid in parent, 0 in child
+        crate::dict_storage_store(
+            ns,
+            "fork",
+            crate::make_builtin_function_with_arity(
+                "fork",
+                |_| {
+                    let pid = host_posix::fork().map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_int_new(pid as i64))
+                },
+                0,
+            ),
+        );
+
+        // os.getppid() -> int
+        crate::dict_storage_store(
+            ns,
+            "getppid",
+            crate::make_builtin_function_with_arity(
+                "getppid",
+                |_| Ok(pyre_object::w_int_new(unsafe { libc::getppid() } as i64)),
+                0,
+            ),
+        );
+    }
+
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
 }
 
