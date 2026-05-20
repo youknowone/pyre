@@ -5633,32 +5633,34 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             let pre_len = ssarepr.insns.len();
-                            GraphFlattener::new_with_constant_lowering(
-                            &mut ssarepr,
-                            |v: super::flow::Variable| {
-                                if v.id == frame_var.id {
-                                    Register::new(Kind::Ref, portal_frame_reg)
-                                } else if v.id == ec_var.id {
-                                    Register::new(Kind::Ref, portal_ec_reg)
-                                } else if v.id == pycode_var.id {
-                                    Register::new(Kind::Ref, scratch_pycode_reg)
-                                } else {
-                                    panic!(
-                                        "portal jit_merge_point: unexpected graph Variable {v:?} \
-                                     (only portal frame/ec/pycode expected)"
-                                    )
-                                }
-                            },
-                            |c: &super::flow::Constant| match (&c.value, c.kind) {
-                                (super::flow::ConstantValue::Signed(value), Some(Kind::Int)) => {
-                                    Operand::ConstInt(*value)
-                                }
-                                other => {
-                                    panic!("portal jit_merge_point: unexpected Constant {other:?}")
-                                }
-                            },
-                        )
-                        .serialize_op(&graph_op);
+                            // Build a Ref-only regallocs that maps the
+                            // 3 portal Variables (frame / ec / pycode)
+                            // to their pre-assigned register indices.
+                            // The walker emits jit_merge_point inline
+                            // outside the canonical graph regalloc pass,
+                            // so no `regallocs[]` entry exists for them
+                            // — this site assembles one ad hoc.
+                            let mut portal_ref_coloring = std::collections::HashMap::new();
+                            portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
+                            portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
+                            portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
+                            let portal_regallocs =
+                                [
+                                    super::regalloc::GraphAllocationResult {
+                                        coloring: std::collections::HashMap::new(),
+                                        num_colors: 0,
+                                    },
+                                    super::regalloc::GraphAllocationResult {
+                                        coloring: portal_ref_coloring,
+                                        num_colors: 3,
+                                    },
+                                    super::regalloc::GraphAllocationResult {
+                                        coloring: std::collections::HashMap::new(),
+                                        num_colors: 0,
+                                    },
+                                ];
+                            GraphFlattener::new(&mut ssarepr, &portal_regallocs)
+                                .serialize_op(&graph_op);
                             for insn in ssarepr.insns[pre_len..].iter().cloned() {
                                 current_block.push_insn(insn);
                             }

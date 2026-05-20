@@ -1160,10 +1160,8 @@ impl Insn {
 /// used only for the first production op migrated off direct SSA emission.
 /// Expand this helper as more ops move from `codewriter.rs` into the
 /// flow-graph + flatten pipeline.
-pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
+pub struct GraphFlattener<'a> {
     ssarepr: &'a mut SSARepr,
-    get_register: F,
-    lower_constant: C,
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
@@ -1210,25 +1208,25 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     lowering_ctx: Option<LoweringContext>,
     /// `rpython/jit/codewriter/flatten.py:76 self.regallocs = regallocs`.
     ///
-    /// When `Some`, `getcolor_var` reads `regallocs[kind].coloring[id]`
-    /// directly (the upstream-orthodox path); the `get_register`
-    /// closure becomes inert.  When `None`, falls back to the closure
-    /// (legacy path used by test fixtures that have not yet migrated
-    /// to per-kind `GraphAllocationResult` arrays).  Populated by the
-    /// canonical `flatten_graph` entry; production callers always
-    /// route through it.
-    regallocs: Option<&'a [super::regalloc::GraphAllocationResult; 3]>,
+    /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
+    /// matching upstream's `self.regallocs[kind].getcolor(v)`.
+    regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
 }
 
-impl<'a, F> GraphFlattener<'a, F>
-where
-    F: FnMut(Variable) -> Register,
-{
-    pub fn new(ssarepr: &'a mut SSARepr, get_register: F) -> Self {
+impl<'a> GraphFlattener<'a> {
+    /// `rpython/jit/codewriter/flatten.py:73-83 GraphFlattener.__init__`.
+    ///
+    /// Upstream takes `(graph, regallocs, _include_all_exc_links, cpu)`.
+    /// Pyre keeps `graph` as a per-call argument to `generate_ssa_form`
+    /// because `make_bytecode_block` already threads it, and exposes
+    /// `_include_all_exc_links` / `cpu` / `lowering_ctx` via builder
+    /// methods to keep the common no-options construction concise.
+    pub fn new(
+        ssarepr: &'a mut SSARepr,
+        regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
+    ) -> Self {
         Self {
             ssarepr,
-            get_register,
-            lower_constant: flatten_constant_operand,
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
@@ -1236,64 +1234,7 @@ where
             include_all_exc_links: false,
             cpu: None,
             lowering_ctx: None,
-            regallocs: None,
-        }
-    }
-}
-
-impl<'a, F, C> GraphFlattener<'a, F, C>
-where
-    F: FnMut(Variable) -> Register,
-    C: FnMut(&Constant) -> Operand,
-{
-    pub fn new_with_constant_lowering(
-        ssarepr: &'a mut SSARepr,
-        get_register: F,
-        lower_constant: C,
-    ) -> Self {
-        Self {
-            ssarepr,
-            get_register,
-            lower_constant,
-            seen_blocks: Vec::new(),
-            block_names: Vec::new(),
-            link_names: Vec::new(),
-            next_label_id: 0,
-            include_all_exc_links: false,
-            cpu: None,
-            lowering_ctx: None,
-            regallocs: None,
-        }
-    }
-
-    /// GraphFlattener constructor that enables retired-family HLOp
-    /// lowering.  Routes `add` / `lt` / ... / `bool` / `setitem`
-    /// SpaceOperations through `try_flatten_retired_family_hlop_to_insn`
-    /// (which lowers them to the matching `residual_call_*` Insn
-    /// shape) before the passthrough opname-emit fallback.  Non-HLOp
-    /// opnames (structural ops like `loop_header` /
-    /// `jit_merge_point`, post-rtype `residual_call_*` ops recorded
-    /// by factor-refactored families' graph dual-writes) keep their
-    /// existing passthrough handling because the dispatcher's `try_*`
-    /// returns `None` for them.
-    pub fn new_with_full_lowering(
-        ssarepr: &'a mut SSARepr,
-        get_register: F,
-        lower_constant: C,
-        lowering_ctx: LoweringContext,
-    ) -> Self {
-        Self {
-            ssarepr,
-            get_register,
-            lower_constant,
-            seen_blocks: Vec::new(),
-            block_names: Vec::new(),
-            link_names: Vec::new(),
-            next_label_id: 0,
-            include_all_exc_links: false,
-            cpu: None,
-            lowering_ctx: Some(lowering_ctx),
-            regallocs: None,
+            regallocs,
         }
     }
 
@@ -1303,23 +1244,18 @@ where
     /// Production callers thread `CodeWriter::cpu()` so
     /// `make_exception_link`'s `handling_ovf=True` arm can fetch the
     /// `OverflowError` exception instance (`flatten.py:166-170`).
-    /// Returns `self` to support builder-style chaining at construction.
     pub fn with_cpu(mut self, cpu: &'a super::cpu::Cpu) -> Self {
         self.cpu = Some(cpu);
         self
     }
 
-    /// `flatten.py:76 self.regallocs = regallocs` builder-style equivalent.
-    ///
-    /// Once set, `getcolor_var` reads colors from `regallocs` directly
-    /// instead of routing through the `get_register` closure.  The
-    /// closure remains constructible for back-compat with test fixtures
-    /// that have not migrated.
-    pub fn with_regallocs(
-        mut self,
-        regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
-    ) -> Self {
-        self.regallocs = Some(regallocs);
+    /// Enable retired-family HLOp lowering by attaching a
+    /// `LoweringContext`.  When set, `flatten_space_operation` routes
+    /// `add` / `lt` / `bool` / `setitem` opnames through
+    /// `try_flatten_retired_family_hlop_to_insn`.  When unset, those
+    /// opnames passthrough to `Insn::op("add", ...)` etc.
+    pub fn with_lowering_ctx(mut self, ctx: LoweringContext) -> Self {
+        self.lowering_ctx = Some(ctx);
         self
     }
 
@@ -2183,18 +2119,31 @@ where
         // via the dispatcher.  Non-HLOp opnames return `None` from the
         // dispatcher and fall through to the legacy opname-passthrough
         // below.
-        if let Some(ref ctx) = self.lowering_ctx {
-            // Borrow-split: the dispatcher needs `&mut self.get_register`
-            // and `&mut self.lower_constant` simultaneously, which Rust
-            // accepts only when the two field accesses don't alias.
-            let Self {
-                get_register,
-                lower_constant,
-                ..
-            } = self;
-            if let Some(insn) =
-                try_flatten_retired_family_hlop_to_insn(op, ctx, get_register, lower_constant)
-            {
+        if let Some(ctx) = self.lowering_ctx {
+            // The dispatcher helpers retain their closure-shaped
+            // `&mut F` / `&mut C` parameters so the per-family unit
+            // tests can invoke them directly with identity register
+            // mappers and test-side constant lowering — without
+            // building a GraphFlattener.  Wrap the regallocs read /
+            // constant lowering in fresh closures at the dispatch site
+            // so the dispatcher signature stays stable.
+            let regallocs = self.regallocs;
+            let mut get_register = |v: Variable| -> Register {
+                let kind = v.kind.unwrap_or(Kind::Ref);
+                let color = regallocs[kind.index()]
+                    .coloring
+                    .get(&v.id)
+                    .copied()
+                    .unwrap_or(u16::MAX);
+                Register::new(kind, color)
+            };
+            let mut lower_constant = flatten_constant_operand;
+            if let Some(insn) = try_flatten_retired_family_hlop_to_insn(
+                op,
+                &ctx,
+                &mut get_register,
+                &mut lower_constant,
+            ) {
                 return insn;
             }
         }
@@ -2269,31 +2218,28 @@ where
     }
 
     /// `flatten.py:382-391 GraphFlattener.getcolor(v)` Variable arm.
-    ///
-    /// When `self.regallocs` is set (production canonical entry path),
-    /// reads `regallocs[kind].coloring[v.id]` directly — matching
-    /// upstream's `self.regallocs[kind].getcolor(v)` exactly.  Falls
-    /// back to the `get_register` closure when `regallocs` is `None`
-    /// (legacy test-fixture path; tracked by the closure-retirement
-    /// epic).
-    fn getcolor_var(&mut self, v: Variable) -> Register {
-        if let Some(regallocs) = self.regallocs {
-            let kind = v.kind.unwrap_or(Kind::Ref);
-            let color = regallocs[kind.index()]
-                .coloring
-                .get(&v.id)
-                .copied()
-                .unwrap_or(u16::MAX);
-            return Register::new(kind, color);
-        }
-        (self.get_register)(v)
+    /// Reads `regallocs[kind].coloring[v.id]` directly — matching
+    /// upstream's `self.regallocs[kind].getcolor(v)`.
+    fn getcolor_var(&self, v: Variable) -> Register {
+        let kind = v.kind.unwrap_or(Kind::Ref);
+        let color = self.regallocs[kind.index()]
+            .coloring
+            .get(&v.id)
+            .copied()
+            .unwrap_or(u16::MAX);
+        Register::new(kind, color)
     }
 
-    /// Centralizes the `(self.lower_constant)(c)` invocation. Companion
-    /// to `getcolor_var` — see its docstring for the future-slice
-    /// rationale.
-    fn lower_constant_op(&mut self, c: &Constant) -> Operand {
-        (self.lower_constant)(c)
+    /// Lower a graph `Constant` to the typed `Operand` the assembler
+    /// consumes.  Upstream's `getcolor(v)` passes Constants through
+    /// unchanged because Python's untyped flowgraph allows it; pyre's
+    /// typed `Operand` enum requires the lowering.  Production graphs
+    /// reach `flatten_graph` after `rtype_opaque_constants` has
+    /// pre-resolved pycode / jitdriver / standard-exception pointers
+    /// to typed Signed constants, so the default
+    /// `flatten_constant_operand` (panic on Opaque) is the only impl.
+    fn lower_constant_op(&self, c: &Constant) -> Operand {
+        flatten_constant_operand(c)
     }
 }
 
@@ -2465,37 +2411,10 @@ pub(super) fn flatten_constant_operand_for_test(constant: &super::flow::Constant
     }
 }
 
-/// Test-fixture entry mirroring `rpython/jit/codewriter/flatten.py:63
-/// flatten_graph(graph, regallocs)` — wraps `GraphFlattener::
-/// generate_ssa_form` for callers that already have closure-shaped
-/// `get_register` / `lower_constant` rather than a `regallocs`
-/// HashMap.  Production callers should use the canonical
-/// [`flatten_graph`] entry which carries the full `flatten.py:63-70`
-/// shape (regallocs swap + cpu + lowering_ctx).
-///
-/// The `enforce_input_args` step (`flatten.py:68`) is skipped because
-/// callers supply `get_register` directly: the closure projects
-/// whatever color scheme the test fixture computed, so no
-/// inputarg-color rotation is needed.
-pub fn flatten_graph_with_closures<F, C>(
-    graph: &super::flow::FunctionGraph,
-    ssarepr: &mut SSARepr,
-    get_register: F,
-    lower_constant: C,
-) where
-    F: FnMut(Variable) -> Register,
-    C: FnMut(&Constant) -> Operand,
-{
-    let mut flattener =
-        GraphFlattener::new_with_constant_lowering(ssarepr, get_register, lower_constant);
-    // `flatten.py:69 flattener.generate_ssa_form()`.
-    flattener.generate_ssa_form(graph);
-}
-
 /// Build a `[GraphAllocationResult; 3]` whose `coloring[v.id] = v.id.0`
 /// for every variable in `graph`, partitioned by `Kind`.  Matches the
 /// `|v| Register::new(v.kind, v.id.0)` identity closure that test
-/// fixtures historically passed to `flatten_graph_with_closures`.
+/// fixtures historically passed to the now-retired closure entry.
 ///
 /// Used by `flatten_graph_for_test` / `flatten_graph_for_test_with_lowering`
 /// to build the test-side regallocs without re-deriving per-fixture.
@@ -2559,33 +2478,23 @@ pub fn identity_test_regallocs(
     ]
 }
 
-/// Test-fixture entry that replaces `flatten_graph_with_closures(
-/// &graph, &mut ssarepr, |v| Register::new(v.kind, v.id.0),
-/// flatten_constant_operand)` with the regallocs-routed equivalent.
-///
-/// Builds identity-coloring regallocs internally via
-/// [`identity_test_regallocs`], skips `enforce_input_args` (identity
-/// coloring is a fixed-point for id-ordered inputargs), and constructs
-/// GraphFlattener with `.with_regallocs(...)` so `getcolor_var` reads
-/// from regallocs directly.
+/// Test-fixture entry: builds identity-coloring regallocs via
+/// [`identity_test_regallocs`] and runs `GraphFlattener::
+/// generate_ssa_form`.  Skips `enforce_input_args` because identity
+/// coloring is a fixed-point for id-ordered inputargs.
 pub fn flatten_graph_for_test(
     graph: &super::flow::FunctionGraph,
     ssarepr: &mut SSARepr,
 ) {
     let regallocs = identity_test_regallocs(graph);
-    // Dummy closure — inert once `with_regallocs` is set, retained
-    // only to satisfy the F generic parameter until slice 6 drops it.
-    let dummy = |_v: Variable| -> Register { Register::new(Kind::Int, u16::MAX) };
-    let mut flattener =
-        GraphFlattener::new_with_constant_lowering(ssarepr, dummy, flatten_constant_operand)
-            .with_regallocs(&regallocs);
+    let mut flattener = GraphFlattener::new(ssarepr, &regallocs);
     flattener.generate_ssa_form(graph);
 }
 
-/// Test-fixture entry that replaces `flatten_graph_with_lowering(...)`
-/// with the regallocs-routed equivalent.  Companion to
-/// [`flatten_graph_for_test`] for fixtures that supply a
-/// `LoweringContext` (retired-family HLOp dispatch).
+/// Test-fixture entry: identity-coloring regallocs + an explicit
+/// `LoweringContext` (retired-family HLOp dispatch).  Companion to
+/// [`flatten_graph_for_test`] for fixtures that exercise the HLOp
+/// lowering arm.
 pub fn flatten_graph_for_test_with_lowering<'a>(
     graph: &super::flow::FunctionGraph,
     ssarepr: &'a mut SSARepr,
@@ -2593,47 +2502,11 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
     cpu: Option<&'a super::cpu::Cpu>,
 ) {
     let regallocs = identity_test_regallocs(graph);
-    let dummy = |_v: Variable| -> Register { Register::new(Kind::Int, u16::MAX) };
-    let mut flattener = GraphFlattener::new_with_full_lowering(
-        ssarepr,
-        dummy,
-        flatten_constant_operand,
-        lowering_ctx,
-    )
-    .with_regallocs(&regallocs);
-    if let Some(cpu) = cpu {
-        flattener = flattener.with_cpu(cpu);
-    }
-    flattener.generate_ssa_form(graph);
-}
-
-/// Test-fixture variant of [`flatten_graph`] that takes
-/// `get_register` and `lower_constant` as explicit closures and a
-/// pre-built `LoweringContext`, rather than reading them off
-/// `regallocs` and `cpu`.  Used by the retired-family HLOp lowering
-/// tests where constructing a real `Cpu` and `regallocs` HashMap is
-/// disproportionate to the test's scope.
-///
-/// Production callers should use [`flatten_graph`] (the canonical
-/// entry matching `flatten.py:63-70`); this helper exists only to
-/// keep test fixtures concise.
-pub fn flatten_graph_with_lowering<'a, F, C>(
-    graph: &super::flow::FunctionGraph,
-    ssarepr: &'a mut SSARepr,
-    lowering_ctx: LoweringContext,
-    cpu: Option<&'a super::cpu::Cpu>,
-    get_register: F,
-    lower_constant: C,
-) where
-    F: FnMut(Variable) -> Register,
-    C: FnMut(&Constant) -> Operand,
-{
     let mut flattener =
-        GraphFlattener::new_with_full_lowering(ssarepr, get_register, lower_constant, lowering_ctx);
+        GraphFlattener::new(ssarepr, &regallocs).with_lowering_ctx(lowering_ctx);
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
-    // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
 }
 
@@ -2670,53 +2543,23 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
-    // `regallocs` on `self.regallocs` and the method mutates it
-    // in place; pyre's `get_register` closure (constructed below)
-    // captures `&regallocs`, so the swap runs BEFORE the closure exists.
+    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream's
+    // `enforce_input_args` is a `GraphFlattener` method that mutates
+    // `self.regallocs` via `swapcolors`.  Pyre runs the equivalent
+    // here as a free function so the post-swap regallocs can be
+    // borrowed immutably by `GraphFlattener::new` below.
     super::regalloc::enforce_input_args_graph(graph, regallocs);
-    // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
-    // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)`.
-    let get_register = |variable: Variable| -> Register {
-        let kind = variable.kind.unwrap_or(Kind::Ref);
-        let color = regallocs[kind.index()]
-            .coloring
-            .get(&variable.id)
-            .copied()
-            .unwrap_or(u16::MAX);
-        Register::new(kind, color)
-    };
-    // `flatten_constant_operand` panics on `Opaque(Ref)` constants
-    // — upstream's `flatten` lowering relies on the rtyper preserving
-    // `Constant(ll_ovf, concretetype=...)` through to the assembler,
-    // and pyre's canonical entry takes the same fail-loud stance:
-    // graphs that carry opaque Ref constants (production pycode /
-    // jitdriver pointers, the OverflowError instance from
-    // `make_exception_link`) MUST be flattened via
-    // `flatten_graph_with_lowering` with a production `lower_constant`
-    // closure that resolves the opaque to the runtime PyObject
-    // pointer.  Calling the canonical entry on such a graph surfaces
-    // the divergence instead of silently materialising `ConstRef(0)`.
-    let lower_constant = flatten_constant_operand;
-    let mut flattener = if let Some(ctx) = lowering_ctx {
-        GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
-    } else {
-        GraphFlattener::new_with_constant_lowering(&mut ssarepr, get_register, lower_constant)
-    };
+    // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
+    // _include_all_exc_links, cpu)`.
+    let mut flattener = GraphFlattener::new(&mut ssarepr, regallocs);
+    if let Some(ctx) = lowering_ctx {
+        flattener = flattener.with_lowering_ctx(ctx);
+    }
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
-    // `flatten.py:76 self.regallocs = regallocs` — once set, the
-    // closure captured above becomes inert: `getcolor_var` reads
-    // colors directly from `self.regallocs[kind].coloring`.  The
-    // closure is retained only because legacy test fixtures haven't
-    // migrated; the closure-retirement epic deletes both the field
-    // and the bridging closure once every caller routes through
-    // `regallocs`.
-    flattener = flattener.with_regallocs(regallocs);
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
@@ -4456,9 +4299,8 @@ mod tests {
     fn graph_flattener_emits_loop_header_from_graph_op() {
         let op = SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 17);
         let mut ssarepr = SSARepr::new("test");
-        let mut flattener = GraphFlattener::new(&mut ssarepr, |_| {
-            Register::new(Kind::Ref, VariableId(0).0 as u16)
-        });
+        let empty_regallocs = empty_regallocs();
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &empty_regallocs);
 
         flattener.serialize_op(&op);
 
@@ -4482,6 +4324,12 @@ mod tests {
     fn graph_flattener_preserves_jit_merge_point_graph_shape() {
         let frame = Variable::new(VariableId(10), Kind::Ref);
         let ec = Variable::new(VariableId(11), Kind::Ref);
+        // Pre-resolve the `pycode` opaque pointer to a `Signed(99)`
+        // typed-Ref constant so the canonical `flatten_constant_operand`
+        // path produces `ConstRef(99)` without needing a per-call
+        // closure (the rtype_opaque_constants pre-pass does this in
+        // production; tests bake it in directly).
+        let pycode_ptr = Constant::new(ConstantValue::Signed(99), Some(Kind::Ref));
         let op = SpaceOperation::new(
             "jit_merge_point",
             vec![
@@ -4491,11 +4339,7 @@ mod tests {
                     vec![Constant::signed(17).into(), Constant::signed(0).into()],
                 )
                 .into(),
-                FlowListOfKind::new(
-                    Kind::Ref,
-                    vec![Constant::opaque("pycode", Some(Kind::Ref)).into()],
-                )
-                .into(),
+                FlowListOfKind::new(Kind::Ref, vec![pycode_ptr.into()]).into(),
                 FlowListOfKind::new(Kind::Float, vec![]).into(),
                 FlowListOfKind::new(Kind::Int, vec![]).into(),
                 FlowListOfKind::new(Kind::Ref, vec![frame.into(), ec.into()]).into(),
@@ -4505,15 +4349,24 @@ mod tests {
             3,
         );
         let mut ssarepr = SSARepr::new("test");
-        let mut flattener = GraphFlattener::new_with_constant_lowering(
-            &mut ssarepr,
-            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
-            |constant| match (&constant.value, constant.kind) {
-                (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
-                (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(99),
-                other => panic!("unexpected test constant {other:?}"),
+        let mut ref_coloring = std::collections::HashMap::new();
+        ref_coloring.insert(frame.id, 10u16);
+        ref_coloring.insert(ec.id, 11u16);
+        let regallocs = [
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
             },
-        );
+            super::super::regalloc::GraphAllocationResult {
+                coloring: ref_coloring,
+                num_colors: 2,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+        ];
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
 
         flattener.serialize_op(&op);
 
@@ -5058,12 +4911,24 @@ mod tests {
         let dst = Variable::new(VariableId(1), Kind::Ref);
         let op = SpaceOperation::new("type", vec![src.into()], Some(dst.into()), 23);
         let mut ssarepr = SSARepr::new("generic");
-        let mut flattener = GraphFlattener::new(&mut ssarepr, |variable| {
-            Register::new(
-                variable.kind.expect("test variable kind"),
-                variable.id.0 as u16,
-            )
-        });
+        let mut ref_coloring = std::collections::HashMap::new();
+        ref_coloring.insert(src.id, 0u16);
+        ref_coloring.insert(dst.id, 1u16);
+        let regallocs = [
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: ref_coloring,
+                num_colors: 2,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+        ];
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
 
         flattener.serialize_op(&op);
 
@@ -5629,6 +5494,26 @@ mod tests {
              Operand::ConstRef(0xfeed): {:?}",
             ssarepr.insns
         );
+    }
+
+    /// Helper: build a `[GraphAllocationResult; 3]` with empty
+    /// per-kind colorings.  Used by `serialize_op` tests that operate
+    /// on graphs containing no Variables (only Constants).
+    fn empty_regallocs() -> [super::super::regalloc::GraphAllocationResult; 3] {
+        [
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+            super::super::regalloc::GraphAllocationResult {
+                coloring: std::collections::HashMap::new(),
+                num_colors: 0,
+            },
+        ]
     }
 
     /// Helper: build a `get_register` closure that maps each
