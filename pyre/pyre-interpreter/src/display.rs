@@ -401,6 +401,28 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
         // previously returned the constructor-time `message` snapshot,
         // which split repr/str apart after the user mutated args.
         if unsafe { pyre_object::is_exception(obj) } {
+            // `pypy/module/exceptions/interp_exceptions.py:447-459`
+            // `W_UnicodeTranslateError.descr_str`,
+            // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
+            // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
+            // typedef registers `__str__ = interp2app(descr_str)`,
+            // overriding the inherited `W_BaseException.descr_str`.
+            // Dispatched on `ExcKind` because Pyre flattens the three
+            // PyPy subclasses into the single `W_ExceptionObject`
+            // struct.
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            match kind {
+                pyre_object::excobject::ExcKind::UnicodeTranslateError => {
+                    return unicode_translate_error_str(obj);
+                }
+                pyre_object::excobject::ExcKind::UnicodeDecodeError => {
+                    return unicode_decode_error_str(obj);
+                }
+                pyre_object::excobject::ExcKind::UnicodeEncodeError => {
+                    return unicode_encode_error_str(obj);
+                }
+                _ => {}
+            }
             let args = pyre_object::excobject::w_exception_get_args(obj);
             if args.is_null() {
                 return String::new();
@@ -419,6 +441,202 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
             return py_str(args);
         }
         py_repr(obj)
+    }
+}
+
+/// Read an integer slot from a `W_ExceptionObject` typed Unicode*Error
+/// position field.  Mirrors PyPy's `space.int_w(self.w_start)` on a
+/// post-`descr_init` instance — the type-check in `descr_init` already
+/// rejected non-int operands, so a stored value is always `int`.  `0`
+/// is the safe fallback when the slot was never populated (the user
+/// constructed the exception bypassing the typed `__new__`).
+unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> i64 {
+    unsafe {
+        if !stored.is_null() && pyre_object::is_int(stored) {
+            pyre_object::w_int_get_value(stored)
+        } else {
+            0
+        }
+    }
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:447-459
+/// W_UnicodeTranslateError.descr_str`:
+///
+/// ```python
+/// if self.object is None:
+///     return ""
+/// if self.end == self.start + 1:
+///     badchar = ord(self.object[self.start])
+///     if badchar <= 0xff:
+///         return "can't translate character '\\x%02x' in position %d: %s"
+///     ...
+/// return "can't translate characters in position %d-%d: %s"
+/// ```
+unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
+    unsafe {
+        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        if w_object.is_null() {
+            return String::new();
+        }
+        let start = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
+        let end = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
+        let w_reason = pyre_object::excobject::w_exception_get_reason(obj);
+        let reason = if !w_reason.is_null() && pyre_object::is_str(w_reason) {
+            pyre_object::w_str_get_value(w_reason).to_string()
+        } else {
+            String::new()
+        };
+        if !pyre_object::is_str(w_object) {
+            return format!(
+                "can't translate characters in position {}-{}: {}",
+                start,
+                end - 1,
+                reason
+            );
+        }
+        let text = pyre_object::w_str_get_value(w_object);
+        if end == start + 1 {
+            let chars: Vec<char> = text.chars().collect();
+            if let Some(&ch) = usize::try_from(start).ok().and_then(|i| chars.get(i)) {
+                let badchar = ch as u32;
+                if badchar <= 0xff {
+                    return format!(
+                        "can't translate character '\\x{:02x}' in position {}: {}",
+                        badchar, start, reason
+                    );
+                }
+                if badchar <= 0xffff {
+                    return format!(
+                        "can't translate character '\\u{:04x}' in position {}: {}",
+                        badchar, start, reason
+                    );
+                }
+                return format!(
+                    "can't translate character '\\U{:08x}' in position {}: {}",
+                    badchar, start, reason
+                );
+            }
+        }
+        format!(
+            "can't translate characters in position {}-{}: {}",
+            start,
+            end - 1,
+            reason
+        )
+    }
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1061-1071
+/// W_UnicodeDecodeError.descr_str`:
+///
+/// ```python
+/// if self.object is None: return ""
+/// if self.end == self.start + 1:
+///     return "'%s' codec can't decode byte 0x%02x in position %d: %s"
+/// return "'%s' codec can't decode bytes in position %d-%d: %s"
+/// ```
+unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
+    unsafe {
+        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        if w_object.is_null() {
+            return String::new();
+        }
+        let w_encoding = pyre_object::excobject::w_exception_get_encoding(obj);
+        let encoding = if !w_encoding.is_null() && pyre_object::is_str(w_encoding) {
+            pyre_object::w_str_get_value(w_encoding).to_string()
+        } else {
+            String::new()
+        };
+        let start = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
+        let end = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
+        let w_reason = pyre_object::excobject::w_exception_get_reason(obj);
+        let reason = if !w_reason.is_null() && pyre_object::is_str(w_reason) {
+            pyre_object::w_str_get_value(w_reason).to_string()
+        } else {
+            String::new()
+        };
+        if pyre_object::is_bytes_like(w_object) && end == start + 1 {
+            let data = pyre_object::bytes_like_data(w_object);
+            if let Some(&byte) = usize::try_from(start).ok().and_then(|i| data.get(i)) {
+                return format!(
+                    "'{}' codec can't decode byte 0x{:02x} in position {}: {}",
+                    encoding, byte, start, reason
+                );
+            }
+        }
+        format!(
+            "'{}' codec can't decode bytes in position {}-{}: {}",
+            encoding,
+            start,
+            end - 1,
+            reason
+        )
+    }
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1175-1191
+/// W_UnicodeEncodeError.descr_str` — same single/range split as
+/// `W_UnicodeTranslateError` but prefixed with the encoding name.
+unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
+    unsafe {
+        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        if w_object.is_null() {
+            return String::new();
+        }
+        let w_encoding = pyre_object::excobject::w_exception_get_encoding(obj);
+        let encoding = if !w_encoding.is_null() && pyre_object::is_str(w_encoding) {
+            pyre_object::w_str_get_value(w_encoding).to_string()
+        } else {
+            String::new()
+        };
+        let start = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
+        let end = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
+        let w_reason = pyre_object::excobject::w_exception_get_reason(obj);
+        let reason = if !w_reason.is_null() && pyre_object::is_str(w_reason) {
+            pyre_object::w_str_get_value(w_reason).to_string()
+        } else {
+            String::new()
+        };
+        if !pyre_object::is_str(w_object) {
+            return format!(
+                "'{}' codec can't encode characters in position {}-{}: {}",
+                encoding,
+                start,
+                end - 1,
+                reason
+            );
+        }
+        let text = pyre_object::w_str_get_value(w_object);
+        if end == start + 1 {
+            let chars: Vec<char> = text.chars().collect();
+            if let Some(&ch) = usize::try_from(start).ok().and_then(|i| chars.get(i)) {
+                let badchar = ch as u32;
+                if badchar <= 0xff {
+                    return format!(
+                        "'{}' codec can't encode character '\\x{:02x}' in position {}: {}",
+                        encoding, badchar, start, reason
+                    );
+                }
+                if badchar <= 0xffff {
+                    return format!(
+                        "'{}' codec can't encode character '\\u{:04x}' in position {}: {}",
+                        encoding, badchar, start, reason
+                    );
+                }
+                return format!(
+                    "'{}' codec can't encode character '\\U{:08x}' in position {}: {}",
+                    encoding, badchar, start, reason
+                );
+            }
+        }
+        format!(
+            "'{}' codec can't encode characters in position {}-{}: {}",
+            encoding,
+            start,
+            end - 1,
+            reason
+        )
     }
 }
 

@@ -226,6 +226,34 @@ pub struct W_ExceptionObject {
     /// False` — `raise X from Y` flips this to True via
     /// `descr_setcause` (line 172).
     pub suppress_context: bool,
+    /// `interp_exceptions.py:428 W_UnicodeTranslateError.w_object` /
+    /// `:1036 W_UnicodeDecodeError.w_object` /
+    /// `:1154 W_UnicodeEncodeError.w_object`.  The offending string /
+    /// bytes object passed to `__init__`.  Populated by
+    /// `descr_init`; `PY_NULL` for non-Unicode-error kinds and for
+    /// Unicode errors constructed without going through the public
+    /// `descr_init` path (matches PyPy's class-default `w_object = None`
+    /// — `descr_str` checks `if self.object is None: return ""`).
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy uses three distinct
+    /// `W_UnicodeTranslateError` / `W_UnicodeDecodeError` /
+    /// `W_UnicodeEncodeError` classes each with their own field set.
+    /// Pyre flattens them onto `W_ExceptionObject` to keep a single
+    /// GC type id; per-kind structural split is tracked separately.
+    pub w_object: PyObjectRef,
+    /// `interp_exceptions.py:429 W_UnicodeTranslateError.w_start`
+    /// (and `:1037` / `:1155` for Decode / Encode).
+    pub w_start: PyObjectRef,
+    /// `interp_exceptions.py:430 W_UnicodeTranslateError.w_end`
+    /// (and `:1038` / `:1156` for Decode / Encode).
+    pub w_end: PyObjectRef,
+    /// `interp_exceptions.py:431 W_UnicodeTranslateError.w_reason`
+    /// (and `:1039` / `:1157` for Decode / Encode).
+    pub w_reason: PyObjectRef,
+    /// `interp_exceptions.py:1035 W_UnicodeDecodeError.w_encoding` /
+    /// `:1153 W_UnicodeEncodeError.w_encoding`.  `W_UnicodeTranslateError`
+    /// has no `w_encoding` field per PyPy — left `PY_NULL` for Translate.
+    pub w_encoding: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
@@ -234,17 +262,31 @@ pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, arg
 pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_cause);
 pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_context);
 pub const EXC_W_TRACEBACK_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_traceback);
+pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_object);
+pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_start);
+pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_end);
+pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_reason);
+pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_encoding);
 
 /// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
-/// `interp_exceptions.py:113-117 W_BaseException` class defaults.
-/// `kind` is a `u8` tag, `message` is a `*mut String` (raw heap),
-/// and `suppress_context` is a bool — none of those are GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 4] = [
+/// `interp_exceptions.py:113-117 W_BaseException` class defaults,
+/// plus the five Unicode*Error per-class slots (w_object / w_start /
+/// w_end / w_reason / w_encoding) that PyPy distributes across the
+/// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
+/// subclasses.  `kind` is a `u8` tag, `message` is a `*mut String`
+/// (raw heap), and `suppress_context` is a bool — none of those
+/// are GC-traced.
+pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 9] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET,
+    EXC_W_OBJECT_OFFSET,
+    EXC_W_START_OFFSET,
+    EXC_W_END_OFFSET,
+    EXC_W_REASON_OFFSET,
+    EXC_W_ENCODING_OFFSET,
 ];
 
 /// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
@@ -289,6 +331,18 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         w_context: PY_NULL,
         w_traceback: PY_NULL,
         suppress_context: false,
+        // `interp_exceptions.py:428-431` W_UnicodeTranslateError class
+        // defaults `w_object = w_start = w_end = w_reason = None`
+        // (and `:1035-1039` Decode / `:1153-1157` Encode add
+        // `w_encoding = None`).  PyPy reads `None` as "unset" via
+        // `if self.object is None: return ""`; pyre uses `PY_NULL`
+        // (the args getattr / descr_str arms surface `space.w_None`
+        // when an instance was allocated outside `descr_init`).
+        w_object: PY_NULL,
+        w_start: PY_NULL,
+        w_end: PY_NULL,
+        w_reason: PY_NULL,
+        w_encoding: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -514,6 +568,132 @@ pub unsafe fn w_exception_get_suppress_context(obj: PyObjectRef) -> bool {
 pub unsafe fn w_exception_set_suppress_context(obj: PyObjectRef, value: bool) {
     unsafe {
         (*(obj as *mut W_ExceptionObject)).suppress_context = value;
+    }
+}
+
+// ─── Unicode*Error per-class field accessors ────────────────────────
+//
+// `interp_exceptions.py:468-471 W_UnicodeTranslateError.typedef`
+// (and `:1080-1084 W_UnicodeDecodeError.typedef` /
+// `:1200-1204 W_UnicodeEncodeError.typedef`) wire each field via
+// `readwrite_attrproperty_w('w_object', ...)` etc.  Pyre's
+// `baseobjspace::getattr` and `setattr` arms dispatch on the
+// attribute name + ExcKind and route here.
+//
+// All five accessors return `space.w_None` (resolved by the caller)
+// when the slot is `PY_NULL`, matching PyPy's class-default
+// `w_object = None` etc. — `descr_str` checks `if self.object is
+// None:` and short-circuits to `""`.
+
+/// `interp_exceptions.py:468 readwrite_attrproperty_w('w_object', ...)`
+/// — `e.object` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_object }
+}
+
+/// `interp_exceptions.py:468 readwrite_attrproperty_w('w_object', ...)`
+/// — `e.object = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_object = value;
+    }
+}
+
+/// `interp_exceptions.py:469 readwrite_attrproperty_w('w_start', ...)`
+/// — `e.start` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_start }
+}
+
+/// `interp_exceptions.py:469 readwrite_attrproperty_w('w_start', ...)`
+/// — `e.start = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_start = value;
+    }
+}
+
+/// `interp_exceptions.py:470 readwrite_attrproperty_w('w_end', ...)`
+/// — `e.end` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_end }
+}
+
+/// `interp_exceptions.py:470 readwrite_attrproperty_w('w_end', ...)`
+/// — `e.end = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_end = value;
+    }
+}
+
+/// `interp_exceptions.py:471 readwrite_attrproperty_w('w_reason', ...)`
+/// — `e.reason` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_reason }
+}
+
+/// `interp_exceptions.py:471 readwrite_attrproperty_w('w_reason', ...)`
+/// — `e.reason = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_reason = value;
+    }
+}
+
+/// `interp_exceptions.py:1080 readwrite_attrproperty_w('w_encoding',
+/// ...)` / `:1200 ...` — `e.encoding` reader (Decode / Encode only;
+/// Translate has no encoding field but the slot is still backed by
+/// `PY_NULL`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_ExceptionObject)).w_encoding }
+}
+
+/// `interp_exceptions.py:1080 readwrite_attrproperty_w('w_encoding',
+/// ...)` / `:1200 ...` — `e.encoding = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ExceptionObject`.
+#[inline]
+pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ExceptionObject)).w_encoding = value;
     }
 }
 

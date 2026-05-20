@@ -1351,18 +1351,186 @@ exc_constructor!(
     exc_unicode_error,
     pyre_object::excobject::ExcKind::UnicodeError
 );
-exc_constructor!(
-    exc_unicode_decode_error,
-    pyre_object::excobject::ExcKind::UnicodeDecodeError
-);
-exc_constructor!(
-    exc_unicode_encode_error,
-    pyre_object::excobject::ExcKind::UnicodeEncodeError
-);
-exc_constructor!(
-    exc_unicode_translate_error,
-    pyre_object::excobject::ExcKind::UnicodeTranslateError
-);
+/// `pypy/module/exceptions/interp_exceptions.py:433-445
+/// W_UnicodeTranslateError.descr_init` —
+///
+/// ```python
+/// def descr_init(self, space, w_object, w_start, w_end, w_reason):
+///     space.utf8_w(w_object); space.int_w(w_start); space.int_w(w_end)
+///     space.realtext_w(w_reason)
+///     self.w_object = w_object; self.w_start = w_start
+///     self.w_end = w_end; self.w_reason = w_reason
+///     W_BaseException.descr_init(self, space,
+///         [w_object, w_start, w_end, w_reason])
+/// ```
+///
+/// The four positional arguments are typed: `w_object` is a `str`,
+/// `w_start`/`w_end` are `int`s, `w_reason` is a `str`.  PyPy raises
+/// `TypeError` from the `*_w` typechecks when the caller passes the
+/// wrong shape; pyre mirrors that via `PyError::type_error`.
+fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 4 {
+        return Err(crate::PyError::type_error(
+            "function takes exactly 4 arguments",
+        ));
+    }
+    let w_object = args[0];
+    let w_start = args[1];
+    let w_end = args[2];
+    let w_reason = args[3];
+    unsafe {
+        if w_object.is_null() || !pyre_object::is_str(w_object) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if w_start.is_null() || !pyre_object::is_int(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_end.is_null() || !pyre_object::is_int(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 4 must be str, not other",
+            ));
+        }
+    }
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeTranslateError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe {
+        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        pyre_object::excobject::w_exception_set_object(exc, w_object);
+        pyre_object::excobject::w_exception_set_start(exc, w_start);
+        pyre_object::excobject::w_exception_set_end(exc, w_end);
+        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+    }
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1041-1059
+/// W_UnicodeDecodeError.descr_init` — `(w_encoding, w_object, w_start,
+/// w_end, w_reason)`.  `w_object` may be `bytearray`; PyPy coerces it
+/// via `space.newbytes(space.charbuf_w(w_object))` before storing.
+/// Pyre accepts either `bytes` or `bytearray` and stores the coerced
+/// `bytes` object so reads of `e.object` round-trip as `bytes` per
+/// PyPy.
+fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 5 {
+        return Err(crate::PyError::type_error(
+            "function takes exactly 5 arguments",
+        ));
+    }
+    let w_encoding = args[0];
+    let w_object_in = args[1];
+    let w_start = args[2];
+    let w_end = args[3];
+    let w_reason = args[4];
+    unsafe {
+        if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if w_object_in.is_null() || !pyre_object::is_bytes_like(w_object_in) {
+            return Err(crate::PyError::type_error(
+                "argument 2 must be bytes-like, not other",
+            ));
+        }
+        if w_start.is_null() || !pyre_object::is_int(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_end.is_null() || !pyre_object::is_int(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 5 must be str, not other",
+            ));
+        }
+    }
+    // `interp_exceptions.py:1043-1046` — bytearray gets re-wrapped as
+    // bytes for storage so `e.object` reads bytes.
+    let w_object = unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
+            let data = pyre_object::bytes_like_data(w_object_in);
+            pyre_object::w_bytes_from_bytes(data)
+        } else {
+            w_object_in
+        }
+    };
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe {
+        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::excobject::w_exception_set_object(exc, w_object);
+        pyre_object::excobject::w_exception_set_start(exc, w_start);
+        pyre_object::excobject::w_exception_set_end(exc, w_end);
+        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+    }
+    Ok(exc)
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:1159-1173
+/// W_UnicodeEncodeError.descr_init` — `(w_encoding, w_object, w_start,
+/// w_end, w_reason)`.  Encoding errors require `w_object` to be a
+/// `str` (`space.realutf8_w`).
+fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 5 {
+        return Err(crate::PyError::type_error(
+            "function takes exactly 5 arguments",
+        ));
+    }
+    let w_encoding = args[0];
+    let w_object = args[1];
+    let w_start = args[2];
+    let w_end = args[3];
+    let w_reason = args[4];
+    unsafe {
+        if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
+            return Err(crate::PyError::type_error(
+                "argument 1 must be str, not other",
+            ));
+        }
+        if w_object.is_null() || !pyre_object::is_str(w_object) {
+            return Err(crate::PyError::type_error(
+                "argument 2 must be str, not other",
+            ));
+        }
+        if w_start.is_null() || !pyre_object::is_int(w_start) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_end.is_null() || !pyre_object::is_int(w_end) {
+            return Err(crate::PyError::type_error("an integer is required"));
+        }
+        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+            return Err(crate::PyError::type_error(
+                "argument 5 must be str, not other",
+            ));
+        }
+    }
+    let exc = pyre_object::excobject::w_exception_new(
+        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+        "",
+    );
+    let args_list = pyre_object::w_list_new(args.to_vec());
+    unsafe {
+        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::excobject::w_exception_set_object(exc, w_object);
+        pyre_object::excobject::w_exception_set_start(exc, w_start);
+        pyre_object::excobject::w_exception_set_end(exc, w_end);
+        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+    }
+    Ok(exc)
+}
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
