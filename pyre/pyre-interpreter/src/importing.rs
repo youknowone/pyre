@@ -3096,6 +3096,62 @@ struct ServentRaw {
 /// When `errno` is `Some`, builds the exception with `(errno, message)`
 /// like `SocketErrorWithErrno` (`interp_socket.py:1074-1075`); otherwise
 /// only `(message,)` like the plain SocketError (`:1077-1078`).
+/// `interp_socket.py:102-123 idna_converter` — turn a hostname argument
+/// into a `Vec<u8>` suitable for passing to a DNS resolver.
+///
+/// Accepts str / bytes / bytearray.  For str: tries ASCII first; on
+/// UnicodeEncodeError falls back to `.encode('idna')`.  Embedded null
+/// bytes raise TypeError (matching `:120-122`).  Other input types
+/// raise TypeError.
+///
+/// pyre's `idna` codec presently passes through as UTF-8 instead of
+/// emitting punycode, so non-ASCII hostnames still pass through this
+/// helper without raising but produce incorrect DNS queries — that is
+/// an `encodings/idna` gap, not a `_socket` parity issue.
+#[cfg(unix)]
+fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    if w_host.is_null() {
+        return Err(crate::PyError::type_error(
+            "string or unicode text buffer expected, not None",
+        ));
+    }
+    let bytes: Vec<u8> = unsafe {
+        if pyre_object::is_str(w_host) {
+            let s = pyre_object::w_str_get_value(w_host);
+            if s.is_ascii() {
+                s.as_bytes().to_vec()
+            } else {
+                let method = crate::baseobjspace::getattr(w_host, "encode")?;
+                let codec = pyre_object::w_str_new("idna");
+                let encoded = crate::call_function(method, &[codec]);
+                if encoded.is_null() {
+                    return Err(crate::PyError::type_error(
+                        "idna encoding failed",
+                    ));
+                }
+                if !pyre_object::bytesobject::is_bytes_like(encoded) {
+                    return Err(crate::PyError::type_error(
+                        "idna encode did not return bytes",
+                    ));
+                }
+                pyre_object::w_bytes_data(encoded).to_vec()
+            }
+        } else if pyre_object::bytesobject::is_bytes_like(w_host) {
+            pyre_object::w_bytes_data(w_host).to_vec()
+        } else {
+            return Err(crate::PyError::type_error(
+                "string or unicode text buffer expected",
+            ));
+        }
+    };
+    if bytes.contains(&0) {
+        return Err(crate::PyError::type_error(
+            "host name must not contain null character",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn socket_converted_error(
     applevelerrcls: &str,
@@ -3649,7 +3705,9 @@ fn init_socket(ns: &mut DictStorage) {
             ),
         );
 
-        // gethostbyname(name) → ip_string  (gethostbyname)
+        // gethostbyname(name) → ip_string.  `interp_func.py:32-44` —
+        // host argument runs through encode_idna (→ idna_converter)
+        // before the rsocket call.
         crate::dict_storage_store(
             ns,
             "gethostbyname",
@@ -3661,22 +3719,16 @@ fn init_socket(ns: &mut DictStorage) {
                             "gethostbyname() missing argument",
                         ));
                     }
-                    let name = unsafe {
-                        if !pyre_object::is_str(args[0]) {
-                            return Err(crate::PyError::type_error(
-                                "gethostbyname: arg must be a string",
-                            ));
-                        }
-                        pyre_object::w_str_get_value(args[0]).to_string()
-                    };
-                    let c = std::ffi::CString::new(name.as_bytes())
+                    let host_bytes = socket_idna_converter(args[0])?;
+                    let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
                     let he = unsafe { gethostbyname(c.as_ptr()) };
                     if he.is_null() {
+                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
                         return Err(socket_converted_error(
                             "gaierror",
                             None,
-                            &format!("gethostbyname failed for {name}"),
+                            &format!("gethostbyname failed for {host_repr}"),
                         ));
                     }
                     unsafe {
@@ -3862,6 +3914,13 @@ fn init_socket(ns: &mut DictStorage) {
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
                 }
+                // `rsocket.py:socketpair(inheritable=False)` — every
+                // socket pyre creates from the module starts with
+                // FD_CLOEXEC set, matching CPython's PEP 446 default.
+                unsafe {
+                    libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+                }
                 Ok(pyre_object::w_tuple_new(vec![
                     socket_from_fd(fds[0], family, ty, proto),
                     socket_from_fd(fds[1], family, ty, proto),
@@ -3869,7 +3928,9 @@ fn init_socket(ns: &mut DictStorage) {
             }),
         );
 
-        // dup(fd) → new fd (POSIX wrapper, useful for socket.fromfd)
+        // dup(fd) → new fd.  Per `rsocket.py:dup()` the duplicated
+        // descriptor sets FD_CLOEXEC (rsocket goes through dup3+CLOEXEC
+        // on Linux; we use the portable fcntl path).
         crate::dict_storage_store(
             ns,
             "dup",
@@ -3883,6 +3944,9 @@ fn init_socket(ns: &mut DictStorage) {
                     let n = unsafe { libc::dup(fd) };
                     if n < 0 {
                         return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                    unsafe {
+                        libc::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                     Ok(pyre_object::w_int_new(n as i64))
                 },
@@ -4191,6 +4255,11 @@ fn init_socket_type(ns: &mut DictStorage) {
                     if fd < 0 {
                         return Err(socket_io_err(std::io::Error::last_os_error()));
                     }
+                    // `rsocket.py:RSocket.__init__` sets FD_CLOEXEC on
+                    // every newly created socket (PEP 446).
+                    unsafe {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
                     fd
                 } else {
                     unsafe { pyre_object::w_int_get_value(after_cls[3]) as libc::c_int }
@@ -4357,6 +4426,12 @@ fn init_socket_type(ns: &mut DictStorage) {
                 };
                 if cfd < 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                // `rsocket.py:RSocket._accept` returns the new fd with
+                // FD_CLOEXEC set (rsocket uses accept4(SOCK_CLOEXEC) on
+                // Linux; we use the portable fcntl path).
+                unsafe {
+                    libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 let new_sock = socket_from_fd(cfd, family, ty, proto);
                 let addr = unpack_inet_addr(&storage);
