@@ -4549,42 +4549,76 @@ impl CodeWriter {
         // inside the exception-link handler; `assembler.py:220` turns it
         // into `raise/r`. pyre's single `emit_raise(exc_reg)` call site
         // (RAISE_VARARGS with argc >= 1) corresponds to the same edge.
+        // `$try_catch_adjacency` — when `true`, this raise is an
+        // explicit `RAISE_VARARGS argc >= 1` op and may be covered by
+        // a CPython 3.13 exception-table range. In that case, emit a
+        // `catch_exception/L<L_handlers>` *immediately byte-adjacent*
+        // to `raise/r` so blackhole's `handle_exception_in_frame`
+        // (`blackhole.py:396-408`) can find the catch dispatch right
+        // after `bh.position` advances past the raise. This mirrors
+        // `flatten.py:194-209` canraise-arm shape.
+        //
+        // When `false` (the RERAISE call site), keep the legacy
+        // `Raise.nomoreblocks` shape: link to `graph.exceptblock` and
+        // skip catch_exception adjacency. RERAISE already
+        // semantically *is* the exception-propagation op, and its
+        // surrounding stack/last_exception shape differs from the
+        // explicit-raise shape that the catch-landing union path
+        // expects.
         macro_rules! emit_raise {
-            ($src:expr, $evalue:expr, $offset:expr) => {{
+            ($src:expr, $evalue:expr, $offset:expr, $try_catch_adjacency:expr) => {{
                 let src = $src;
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
+                let try_catch_adjacency: bool = $try_catch_adjacency;
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
                 push_walker_emit(&current_block, insn);
-                // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
-                //   link = Link([w_exc.w_type, w_exc.w_value],
-                //               ctx.graph.exceptblock)
-                // `w_exc.w_value` is the actual trace-level FlowValue
-                // of the raised exception instance; `w_exc.w_type`
-                // upstream is a statically-known Constant because flow
-                // analysis sees the `raise SomeError(...)` source form.
-                //
-                // pyre still emits a single runtime `raise/r`, but the
-                // shadow graph can mirror `flowcontext.py:635-636`
-                // exactly by recording `w_type = type(w_value)` and
-                // routing that result through the explicit raise edge.
-                // Like upstream `Raise.nomoreblocks`, this edge does
-                // NOT use `link.extravars`.
-                let edge_state = explicit_raise_state(
-                    &mut graph,
-                    &current_block.block(),
-                    &current_state,
-                    evalue_fv,
-                    offset,
-                );
-                let link = super::flow::Link::new(
-                    exceptblock_link_args(&edge_state),
-                    Some(graph.exceptblock.clone()),
-                    None,
-                );
-                let link = link.into_ref();
-                let _ = edge_state;
-                append_exit(&current_block.block(), link);
+                let py_pc_for_catch = offset as usize;
+                let catch_label_opt = if try_catch_adjacency {
+                    catch_for_pc.get(py_pc_for_catch).copied().flatten()
+                } else {
+                    None
+                };
+                if let Some(catch_label) = catch_label_opt {
+                    // Raise inside a try/except range: RPython
+                    // canraise-arm shape. The block's exception edge
+                    // goes to the catch landing, not `graph.exceptblock`.
+                    // `emit_catch_exception!` both pushes the
+                    // `catch_exception/L<catch_landing_{label}>` insn
+                    // AND calls `attach_catch_exception_edge` (the
+                    // exception Link onto `current_block.exits`).
+                    emit_catch_exception!(catch_label);
+                } else {
+                    // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
+                    //   link = Link([w_exc.w_type, w_exc.w_value],
+                    //               ctx.graph.exceptblock)
+                    // `w_exc.w_value` is the actual trace-level FlowValue
+                    // of the raised exception instance; `w_exc.w_type`
+                    // upstream is a statically-known Constant because flow
+                    // analysis sees the `raise SomeError(...)` source form.
+                    //
+                    // pyre still emits a single runtime `raise/r`, but the
+                    // shadow graph can mirror `flowcontext.py:635-636`
+                    // exactly by recording `w_type = type(w_value)` and
+                    // routing that result through the explicit raise edge.
+                    // Like upstream `Raise.nomoreblocks`, this edge does
+                    // NOT use `link.extravars`.
+                    let edge_state = explicit_raise_state(
+                        &mut graph,
+                        &current_block.block(),
+                        &current_state,
+                        evalue_fv,
+                        offset,
+                    );
+                    let link = super::flow::Link::new(
+                        exceptblock_link_args(&edge_state),
+                        Some(graph.exceptblock.clone()),
+                        None,
+                    );
+                    let link = link.into_ref();
+                    let _ = edge_state;
+                    append_exit(&current_block.block(), link);
+                }
                 needs_fallthrough = false;
             }};
         }
@@ -7606,7 +7640,13 @@ impl CodeWriter {
                                 let normalized_exc_fv = normalized_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64);
+                                // RAISE_VARARGS argc>=1: explicit
+                                // `raise X` source form. When inside
+                                // a try/except range, `catch_for_pc`
+                                // is consulted to emit
+                                // `catch_exception/L` adjacent to
+                                // `raise/r`.
+                                emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64, true);
                             } else {
                                 // reraise: re-raise exception_last_value
                                 emit_reraise!();
@@ -7860,7 +7900,20 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            emit_raise!(exc_reg, exc_value, py_pc as i64);
+                            // RERAISE: pyre-only deviation from RPython
+                            // (which has no RERAISE bytecode — its
+                            // `Reraise.nomoreblocks` calls reraise
+                            // directly into the exception link).
+                            // Suppress catch_exception adjacency:
+                            // RERAISE's source FrameState has had
+                            // POP_EXCEPT mutate the stack, which
+                            // makes the catch-landing union path
+                            // (`attach_catch_exception_edge` →
+                            // `getoutputargs_with_positions`)
+                            // mismatched against the explicit-raise
+                            // shape that earlier raise sites already
+                            // populated into the same landing.
+                            emit_raise!(exc_reg, exc_value, py_pc as i64, false);
                         }
 
                         Instruction::WithExceptStart => {
