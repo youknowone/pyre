@@ -9025,6 +9025,70 @@ impl CodeWriter {
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
+            // Phase 4 endgame slice ε.4 — post-strip goto over-emit
+            // diagnostic (Task #111).  After `strip_walker_block_
+            // boundary_goto` elides the fall-through `goto + ---`
+            // pairs, any remaining `goto + ---` either corresponds to
+            // a canonical-equivalent emit (back-edge / explicit JUMP /
+            // ε.3 trampoline tail) or is walker over-emit.  Classify
+            // by target-name prefix and dump counts under
+            // `PYRE_PHASE4_DIAGNOSE_GOTO=1`.
+            if std::env::var_os("PYRE_PHASE4_DIAGNOSE_GOTO").is_some() {
+                let mut total_goto: usize = 0;
+                let mut by_prefix: Vec<(&'static str, usize)> = vec![
+                    ("pc", 0),
+                    ("block", 0),
+                    ("epsilon3_link_", 0),
+                    ("catch_landing_", 0),
+                    ("link", 0),
+                    ("other", 0),
+                ];
+                for window in ssarepr.insns.windows(2) {
+                    let super::flatten::Insn::Op { opname, args, .. } = &window[0] else {
+                        continue;
+                    };
+                    if opname != "goto" || args.len() != 1 {
+                        continue;
+                    }
+                    let Some(target_name) = args.iter().find_map(|a| match a {
+                        super::flatten::Operand::TLabel(t) => Some(t.name.as_str()),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if !matches!(window[1], super::flatten::Insn::Unreachable) {
+                        continue;
+                    }
+                    total_goto += 1;
+                    let prefix = if target_name.starts_with("epsilon3_link_") {
+                        "epsilon3_link_"
+                    } else if target_name.starts_with("catch_landing_") {
+                        "catch_landing_"
+                    } else if target_name.starts_with("pc") {
+                        "pc"
+                    } else if target_name.starts_with("block") {
+                        "block"
+                    } else if target_name.starts_with("link") {
+                        "link"
+                    } else {
+                        "other"
+                    };
+                    if let Some(slot) = by_prefix.iter_mut().find(|(p, _)| *p == prefix) {
+                        slot.1 += 1;
+                    }
+                }
+                let categories: Vec<String> = by_prefix
+                    .iter()
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(p, n)| format!("{p}={n}"))
+                    .collect();
+                eprintln!(
+                    "[phase4-goto] graph={} total_goto_pairs={} {}",
+                    graph.name,
+                    total_goto,
+                    categories.join(" "),
+                );
+            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
