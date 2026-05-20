@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 ///
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
-use std::collections::{HashMap, HashSet};
+use majit_ir::{VecAssoc, VecSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -584,8 +584,8 @@ thread_local! {
     /// reading `target_token._ll_loop_code` off the descr directly.
     /// Thread-local matches pyre's single-threaded JIT execution and
     /// aligns with the adjacent `CALL_ASSEMBLER_TARGETS` migration.
-    static LOOP_TARGET_REGISTRY: RefCell<HashMap<usize, LoopTargetEntry>> =
-        RefCell::new(HashMap::new());
+    static LOOP_TARGET_REGISTRY: RefCell<VecAssoc<usize, LoopTargetEntry>> =
+        RefCell::new(VecAssoc::new());
 }
 
 /// history.py:470 TargetToken identity key: Arc allocation address.
@@ -1040,7 +1040,7 @@ thread_local! {
     /// space with dummy declarations to fill the gaps. The thread-local
     /// map below replaces that with a sparse-OpRef → dense-Variable lookup
     /// populated during `do_compile`'s declaration loop.
-    static OPREF_VAR_MAP: std::cell::RefCell<Option<std::collections::HashMap<u32, Variable>>> =
+    static OPREF_VAR_MAP: std::cell::RefCell<Option<majit_ir::VecAssoc<u32, Variable>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1049,7 +1049,7 @@ thread_local! {
 /// past its scope. The early-return branches in do_compile then don't
 /// need explicit cleanup hooks.
 struct OprefVarMapGuard {
-    saved: Option<std::collections::HashMap<u32, Variable>>,
+    saved: Option<majit_ir::VecAssoc<u32, Variable>>,
 }
 
 impl Drop for OprefVarMapGuard {
@@ -1135,11 +1135,11 @@ fn is_vec_float_producing(opcode: OpCode) -> bool {
 }
 
 /// Pre-scan ops to find positions that produce vector values.
-fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
+fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> VecSet<u32> {
     if !USE_NATIVE_SIMD {
-        return HashSet::new();
+        return VecSet::new();
     }
-    let mut set = HashSet::new();
+    let mut set = VecSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if is_vec_producing_opcode(op.opcode) {
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
@@ -1150,11 +1150,11 @@ fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
 }
 
 /// Pre-scan to find which vector-producing positions have float type (F64X2).
-fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
+fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> VecSet<u32> {
     if !USE_NATIVE_SIMD {
-        return HashSet::new();
+        return VecSet::new();
     }
-    let mut set = HashSet::new();
+    let mut set = VecSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if is_vec_float_producing(op.opcode) {
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
@@ -1170,8 +1170,8 @@ fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> HashSet<u32> {
 fn resolve_opref_vec_int(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
-    vec_oprefs: &HashSet<u32>,
-    vec_float_oprefs: &HashSet<u32>,
+    vec_oprefs: &VecSet<u32>,
+    vec_float_oprefs: &VecSet<u32>,
     opref: OpRef,
 ) -> CValue {
     if let Some(&c) = constants.get(&opref.raw()) {
@@ -1197,8 +1197,8 @@ fn resolve_opref_vec_int(
 fn resolve_opref_vec_float(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
-    vec_oprefs: &HashSet<u32>,
-    vec_float_oprefs: &HashSet<u32>,
+    vec_oprefs: &VecSet<u32>,
+    vec_float_oprefs: &VecSet<u32>,
     opref: OpRef,
 ) -> CValue {
     if let Some(&c) = constants.get(&opref.raw()) {
@@ -1517,16 +1517,16 @@ thread_local! {
     /// `CALL_ASSEMBLER_DEADFRAMES` below) keeps cranelift's per-thread
     /// CA state separated and avoids a process-global registry
     /// (`plan:staged-sauteeing-koala.md` Phase 2 goal).
-    static CALL_ASSEMBLER_TARGETS: RefCell<HashMap<u64, RegisteredLoopTarget>> =
-        RefCell::new(HashMap::new());
+    static CALL_ASSEMBLER_TARGETS: RefCell<VecAssoc<u64, RegisteredLoopTarget>> =
+        RefCell::new(VecAssoc::new());
     /// Per-thread caller->callee result-kind expectations. Same
     /// PRE-EXISTING-ADAPTATION rationale as `CALL_ASSEMBLER_TARGETS`.
-    static CALL_ASSEMBLER_EXPECTATIONS: RefCell<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>> =
-        RefCell::new(HashMap::new());
+    static CALL_ASSEMBLER_EXPECTATIONS: RefCell<VecAssoc<u64, VecAssoc<CallAssemblerCallerId, u64>>> =
+        RefCell::new(VecAssoc::new());
     /// Thread-local deadframe storage for call_assembler results.
     /// Each test thread gets its own isolated registry, preventing
     /// non-deterministic failures from shared global state.
-    static CALL_ASSEMBLER_DEADFRAMES: RefCell<HashMap<u64, DeadFrame>> = RefCell::new(HashMap::new());
+    static CALL_ASSEMBLER_DEADFRAMES: RefCell<VecAssoc<u64, DeadFrame>> = RefCell::new(VecAssoc::new());
     static NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -1808,12 +1808,12 @@ const CA_FINISH_INDEX_UNKNOWN: u64 = u64::MAX;
 
 thread_local! {
     /// Per-thread CALL_ASSEMBLER dispatch table. Entries are boxed so their
-    /// addresses are stable across HashMap resizes — the JIT-emitted call
+    /// addresses are stable across VecAssoc resizes — the JIT-emitted call
     /// site holds a raw `*const CaDispatchEntry` obtained via
     /// `ca_dispatch_slot`. Thread-local is safe because the JIT code and
     /// the entries live on the same thread; teardown is concurrent.
-    static CA_DISPATCH_TABLE: RefCell<HashMap<u64, Box<CaDispatchEntry>>> =
-        RefCell::new(HashMap::new());
+    static CA_DISPATCH_TABLE: RefCell<VecAssoc<u64, Box<CaDispatchEntry>>> =
+        RefCell::new(VecAssoc::new());
 }
 
 /// Get or create the stable dispatch entry for a token.
@@ -1821,7 +1821,7 @@ thread_local! {
 fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatchEntry {
     CA_DISPATCH_TABLE.with(|c| {
         let mut table = c.borrow_mut();
-        let entry = table.entry(token_number).or_insert_with(|| {
+        let entry = table.entry_or_insert_with(token_number, || {
             Box::new(CaDispatchEntry {
                 code_ptr: AtomicPtr::new(code_ptr as *mut u8),
                 finish_descr_ptr: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
@@ -1869,10 +1869,10 @@ fn ca_dispatch_remove(token_number: u64) {
 
 thread_local! {
     /// Thread-local cache for call_assembler target lookups.
-    /// The HashMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
+    /// The VecAssoc holds Arc ownership; CA_FAST_PTR caches a raw pointer
     /// for the hot path to avoid atomic refcount ops on every call.
-    static CA_TARGET_CACHE: RefCell<HashMap<u64, Arc<RegisteredLoopTarget>>> =
-        RefCell::new(HashMap::new());
+    static CA_TARGET_CACHE: RefCell<VecAssoc<u64, Arc<RegisteredLoopTarget>>> =
+        RefCell::new(VecAssoc::new());
 
     /// Single-entry raw pointer cache: (token_number, ptr_as_usize).
     /// Valid because the Arc in CA_TARGET_CACHE keeps the data alive.
@@ -1892,7 +1892,7 @@ unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarge
             return p as *const RegisteredLoopTarget;
         }
     }
-    // Warm path: HashMap lookup, extract pointer without Arc clone
+    // Warm path: VecAssoc lookup, extract pointer without Arc clone
     if let Ok(Some(ptr)) = CA_TARGET_CACHE.try_with(|c| {
         c.borrow()
             .get(&token_number)
@@ -2043,7 +2043,7 @@ enum CallAssemblerCallerId {
 }
 
 fn with_call_assembler_registry<R>(
-    f: impl FnOnce(&mut HashMap<u64, RegisteredLoopTarget>) -> R,
+    f: impl FnOnce(&mut VecAssoc<u64, RegisteredLoopTarget>) -> R,
 ) -> R {
     // `try_with` + `expect`: normal call paths run long before the thread's
     // TLS destructor fires. The `Drop for CraneliftBackend` path uses
@@ -2055,7 +2055,7 @@ fn with_call_assembler_registry<R>(
 }
 
 fn with_call_assembler_expectations<R>(
-    f: impl FnOnce(&mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>) -> R,
+    f: impl FnOnce(&mut VecAssoc<u64, VecAssoc<CallAssemblerCallerId, u64>>) -> R,
 ) -> R {
     CALL_ASSEMBLER_EXPECTATIONS
         .try_with(|r| f(&mut r.borrow_mut()))
@@ -2066,12 +2066,12 @@ fn with_call_assembler_expectations<R>(
 /// and may reach these helpers after Rust has destroyed the `RefCell`
 /// thread_local (see `std::thread::LocalKey::try_with`). Since the drop
 /// path is discarding state anyway, silently no-op when TLS is gone.
-fn try_call_assembler_registry_drop(f: impl FnOnce(&mut HashMap<u64, RegisteredLoopTarget>)) {
+fn try_call_assembler_registry_drop(f: impl FnOnce(&mut VecAssoc<u64, RegisteredLoopTarget>)) {
     let _ = CALL_ASSEMBLER_TARGETS.try_with(|r| f(&mut r.borrow_mut()));
 }
 
 fn try_call_assembler_expectations_drop(
-    f: impl FnOnce(&mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>),
+    f: impl FnOnce(&mut VecAssoc<u64, VecAssoc<CallAssemblerCallerId, u64>>),
 ) {
     let _ = CALL_ASSEMBLER_EXPECTATIONS.try_with(|r| f(&mut r.borrow_mut()));
 }
@@ -2142,7 +2142,7 @@ fn validate_registered_target_against_call_assembler_expectations(
 }
 
 fn remove_call_assembler_expectations_locked(
-    expectations: &mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>,
+    expectations: &mut VecAssoc<u64, VecAssoc<CallAssemblerCallerId, u64>>,
     caller_id: CallAssemblerCallerId,
 ) {
     expectations.retain(|_, callers| {
@@ -2177,8 +2177,8 @@ fn unregister_call_assembler_bridge_tree(fail_descrs: &[DescrRef]) {
     }
 }
 
-fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, BackendError> {
-    let mut expectations = HashMap::new();
+fn collect_call_assembler_expectations(ops: &[Op]) -> Result<VecAssoc<u64, u64>, BackendError> {
+    let mut expectations = VecAssoc::new();
     for op in ops {
         let opcode = op.opcode;
         if !matches!(
@@ -2205,7 +2205,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, 
         let resolved_target = resolve_call_assembler_target(opcode, call_descr)?;
         let expected_result_kind =
             expected_call_assembler_result_kind(call_descr, resolved_target.as_ref())?;
-        if let Some(previous) = expectations.insert(target_token, expected_result_kind) {
+        if let Some(&previous) = expectations.get(&target_token) {
             validate_call_assembler_target_result_kind(
                 target_token,
                 previous,
@@ -2213,6 +2213,7 @@ fn collect_call_assembler_expectations(ops: &[Op]) -> Result<HashMap<u64, u64>, 
                 "caller result expectation",
             )?;
         }
+        expectations.insert(target_token, expected_result_kind);
     }
     Ok(expectations)
 }
@@ -2254,8 +2255,7 @@ fn install_call_assembler_expectations(
         remove_call_assembler_expectations_locked(registry, caller_id);
         for (&target_token, &expected_result_kind) in &expectations {
             registry
-                .entry(target_token)
-                .or_default()
+                .entry_or_default(target_token)
                 .insert(caller_id, expected_result_kind);
         }
         Ok(())
@@ -3792,11 +3792,11 @@ extern "C" fn gc_jit_remember_young_pointer_from_array_shim(obj: u64) {
 }
 
 thread_local! {
-    static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
+    static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<majit_ir::VecSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// Op-result variable positions: ops that define a result via def_var.
     /// When an OpRef collides (in both constants map and op-result set),
     /// the variable takes precedence over the constant.
-    static OP_RESULT_VARS: std::cell::RefCell<Option<std::collections::HashSet<u32>>> = const { std::cell::RefCell::new(None) };
+    static OP_RESULT_VARS: std::cell::RefCell<Option<majit_ir::VecSet<u32>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
@@ -4071,7 +4071,7 @@ fn validate_oprefs_for_compile(
     // recoverable case. Walk the ops in trace order with a single
     // `seen` set; do NOT pre-collect a `defined` set that lets
     // forward-references slip through.
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen: majit_ir::VecSet<u32> = majit_ir::VecSet::new();
     for input in inputargs {
         seen.insert(input.index);
     }
@@ -4356,8 +4356,8 @@ fn expected_call_assembler_result_kind(
     }
 }
 
-fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
-    let mut known = HashSet::new();
+fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> VecSet<u32> {
+    let mut known = VecSet::new();
     for input in inputargs {
         known.insert(input.index);
     }
@@ -4369,8 +4369,8 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
     known
 }
 
-fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u32>, BackendError> {
-    let mut force_tokens = HashSet::new();
+fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<VecSet<u32>, BackendError> {
+    let mut force_tokens = VecSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.pos.get().is_none() {
             continue;
@@ -4424,9 +4424,9 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
 fn build_type_overrides(
     ops: &[Op],
     type_index: &OpTypeIndex<'_>,
-) -> (HashMap<u32, Type>, HashMap<u32, usize>) {
-    let mut overrides: HashMap<u32, Type> = HashMap::new();
-    let mut op_def_positions: HashMap<u32, usize> = HashMap::new();
+) -> (VecAssoc<u32, Type>, VecAssoc<u32, usize>) {
+    let mut overrides: VecAssoc<u32, Type> = VecAssoc::new();
+    let mut op_def_positions: VecAssoc<u32, usize> = VecAssoc::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
         let result_type = op.result_type();
@@ -4455,7 +4455,7 @@ fn build_type_overrides(
     // Box objects carry their own types; in our flat OpRef namespace we
     // must propagate types through the JUMP→LABEL edge explicitly.
     // Collect LABEL→descr and JUMP→descr, then match by descr index.
-    let mut label_by_descr: HashMap<u32, usize> = HashMap::new();
+    let mut label_by_descr: VecAssoc<u32, usize> = VecAssoc::new();
     let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
@@ -4471,7 +4471,7 @@ fn build_type_overrides(
         }
     }
     let lookup =
-        |opref: OpRef, at_op_index: usize, fallback: Type, ovrs: &HashMap<u32, Type>| -> Type {
+        |opref: OpRef, at_op_index: usize, fallback: Type, ovrs: &VecAssoc<u32, Type>| -> Type {
             if let Some(&tp) = ovrs.get(&opref.raw()) {
                 return tp;
             }
@@ -4510,7 +4510,7 @@ fn build_type_overrides(
 #[inline]
 fn lookup_type_at(
     type_index: &OpTypeIndex<'_>,
-    overrides: &HashMap<u32, Type>,
+    overrides: &VecAssoc<u32, Type>,
     opref: OpRef,
     op_index: usize,
 ) -> Option<Type> {
@@ -4524,10 +4524,10 @@ fn build_ref_root_slots(
     inputargs: &[InputArg],
     ops: &[Op],
     type_index: &OpTypeIndex<'_>,
-    overrides: &HashMap<u32, Type>,
-    force_tokens: &HashSet<u32>,
+    overrides: &VecAssoc<u32, Type>,
+    force_tokens: &VecSet<u32>,
 ) -> Result<Vec<(u32, usize)>, BackendError> {
-    let mut seen = HashSet::new();
+    let mut seen = VecSet::new();
     let mut slots = Vec::new();
 
     // RPython parity: when jump_to_preamble is used without
@@ -4546,8 +4546,8 @@ fn build_ref_root_slots(
     // `non_ref_at_backedge` and `used_inputargs` by the InputArg's raw
     // OpRef value so the downstream loop's `contains(&input.index)` checks
     // line up with the keys we inserted.
-    let inputarg_oprefs: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
-    let mut non_ref_at_backedge: HashSet<u32> = HashSet::new();
+    let inputarg_oprefs: VecSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    let mut non_ref_at_backedge: VecSet<u32> = VecSet::new();
     let mut has_float_at_ref_position = false;
     // Find the closing JUMP and check arg types against inputarg types
     if let Some((jump_idx, jump)) = ops
@@ -4596,7 +4596,7 @@ fn build_ref_root_slots(
     // optimizer replaced with constants (e.g. guard_value'd code/namespace)
     // are never referenced by ops — they don't need GC root slots.
     // Build the set of inputarg OpRef raw values actually used in ops.
-    let mut used_inputargs: HashSet<u32> = HashSet::new();
+    let mut used_inputargs: VecSet<u32> = VecSet::new();
     for op in ops.iter() {
         for &arg in op.getarglist().iter().chain(
             op.getfailargs()
@@ -4706,7 +4706,7 @@ fn inject_builtin_string_descrs(ops: &mut [Op]) {
 fn resolve_opref_or_imm(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
-    known_values: &HashSet<u32>,
+    known_values: &VecSet<u32>,
     opref: OpRef,
 ) -> CValue {
     if opref.is_none() {
@@ -4733,7 +4733,7 @@ fn resolve_failarg_opref(
     constants: &majit_ir::VecAssoc<u32, i64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    stale_ref_vars: &HashSet<u32>,
+    stale_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
     opref: OpRef,
 ) -> CValue {
@@ -4751,7 +4751,7 @@ fn resolve_failarg_opref(
 
 fn resolve_constant_i64(
     constants: &majit_ir::VecAssoc<u32, i64>,
-    known_values: &HashSet<u32>,
+    known_values: &VecSet<u32>,
     opcode: OpCode,
     opref: OpRef,
     what: &str,
@@ -4783,8 +4783,8 @@ fn resolve_rewriter_immediate_i64(constants: &majit_ir::VecAssoc<u32, i64>, opre
 
 fn type_for_opref(
     type_index: &OpTypeIndex<'_>,
-    overrides: &HashMap<u32, Type>,
-    known_values: &HashSet<u32>,
+    overrides: &VecAssoc<u32, Type>,
+    known_values: &VecSet<u32>,
     opcode: OpCode,
     opref: OpRef,
     op_index: usize,
@@ -4906,7 +4906,7 @@ fn emit_store_to_addr(
 fn emit_dynamic_offset_addr(
     builder: &mut FunctionBuilder,
     constants: &majit_ir::VecAssoc<u32, i64>,
-    known_values: &HashSet<u32>,
+    known_values: &VecSet<u32>,
     base_arg: OpRef,
     offset_arg: OpRef,
 ) -> CValue {
@@ -4976,8 +4976,8 @@ fn spill_ref_roots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
-    stale_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
+    stale_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -4998,8 +4998,8 @@ fn spill_unsynced_ref_roots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
-    synced_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
+    synced_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -5019,7 +5019,7 @@ fn reload_ref_roots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -5041,7 +5041,7 @@ fn sync_ref_root_var(
     var_idx: u32,
     value: CValue,
     ref_root_base_ofs: i32,
-    synced_ref_vars: &mut HashSet<u32>,
+    synced_ref_vars: &mut VecSet<u32>,
 ) {
     if let Some((_, slot)) = ref_root_slots.iter().find(|(idx, _)| *idx == var_idx) {
         let offset = ref_root_base_ofs + (*slot as i32) * 8;
@@ -5050,20 +5050,20 @@ fn sync_ref_root_var(
     }
 }
 
-fn mark_ref_roots_synced(synced_ref_vars: &mut HashSet<u32>, ref_root_slots: &[(u32, usize)]) {
+fn mark_ref_roots_synced(synced_ref_vars: &mut VecSet<u32>, ref_root_slots: &[(u32, usize)]) {
     for &(var_idx, _) in ref_root_slots {
         synced_ref_vars.insert(var_idx);
     }
 }
 
-fn mark_ref_roots_fresh(stale_ref_vars: &mut HashSet<u32>, ref_root_slots: &[(u32, usize)]) {
+fn mark_ref_roots_fresh(stale_ref_vars: &mut VecSet<u32>, ref_root_slots: &[(u32, usize)]) {
     for &(var_idx, _) in ref_root_slots {
         stale_ref_vars.remove(&var_idx);
     }
 }
 
 fn mark_ref_roots_after_selective_reload(
-    stale_ref_vars: &mut HashSet<u32>,
+    stale_ref_vars: &mut VecSet<u32>,
     live_ref_root_slots: &[(u32, usize)],
     reloaded_ref_root_slots: &[(u32, usize)],
 ) {
@@ -5109,8 +5109,8 @@ fn get_gcmap(
     position: usize,
     max_output_slots: usize,
     ref_root_slots: &[(u32, usize)],
-    longevity: &HashMap<u32, usize>,
-    defined_ref_vars: &HashSet<u32>,
+    longevity: &VecAssoc<u32, usize>,
+    defined_ref_vars: &VecSet<u32>,
 ) -> i64 {
     // regalloc.py:1093-1105: iterate bindings, include only alive refs.
     let mut live_bit_positions: Vec<usize> = Vec::new();
@@ -5154,8 +5154,8 @@ fn get_gcmap(
 fn live_ref_root_slots_at(
     position: usize,
     ref_root_slots: &[(u32, usize)],
-    longevity: &HashMap<u32, usize>,
-    defined_ref_vars: &HashSet<u32>,
+    longevity: &VecAssoc<u32, usize>,
+    defined_ref_vars: &VecSet<u32>,
 ) -> Vec<(u32, usize)> {
     ref_root_slots
         .iter()
@@ -5173,7 +5173,7 @@ fn ref_root_slots_with_future_regular_uses(
     position: usize,
     ops: &[Op],
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
 ) -> Vec<(u32, usize)> {
     // RPython regalloc reloads values that remain live after a collecting
     // call. Guard failargs are live uses too: failure recovery reads them
@@ -5390,8 +5390,8 @@ fn emit_collecting_gc_call(
     call_conv: cranelift_codegen::isa::CallConv,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
-    stale_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
+    stale_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
     func_ptr: usize,
@@ -5440,8 +5440,8 @@ fn emit_indirect_call_from_parts(
     ptr_type: cranelift_codegen::ir::Type,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &HashSet<u32>,
-    stale_ref_vars: &HashSet<u32>,
+    defined_ref_vars: &VecSet<u32>,
+    stale_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
 ) -> Option<CValue> {
@@ -5791,7 +5791,7 @@ fn emit_guard_exit(
     jf_ptr: CValue,
     info: &GuardInfo,
     ref_root_slots: &[(u32, usize)],
-    stale_ref_vars: &HashSet<u32>,
+    stale_ref_vars: &VecSet<u32>,
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -5802,7 +5802,7 @@ fn emit_guard_exit(
     // vector_ext.py:119-156 _update_at_exit parity:
     // If accumulation is done in this loop, at the guard exit some vector
     // values must be reduced to scalars before storing to jf_frame.
-    let accum_positions: HashMap<usize, &AccumInfo> = info
+    let accum_positions: VecAssoc<usize, &AccumInfo> = info
         .accum_info
         .iter()
         .map(|ai| (ai.failargs_pos, ai))
@@ -6902,7 +6902,7 @@ fn patch_terminal_exit_recovery_layout(
 fn infer_fail_arg_types(
     fail_arg_refs: &[OpRef],
     type_index: &OpTypeIndex<'_>,
-    overrides: &HashMap<u32, Type>,
+    overrides: &VecAssoc<u32, Type>,
     op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
     let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
@@ -6933,8 +6933,8 @@ fn resolve_fail_arg_types(
     fail_arg_refs: &[OpRef],
     fd: Option<&dyn majit_ir::descr::FailDescr>,
     type_index: &OpTypeIndex<'_>,
-    overrides: &HashMap<u32, Type>,
-    op_def_positions: &HashMap<u32, usize>,
+    overrides: &VecAssoc<u32, Type>,
+    op_def_positions: &VecAssoc<u32, usize>,
     guard_op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
     // Use descriptor types as base, then fix positional conflicts.
@@ -6997,8 +6997,8 @@ pub struct CraneliftBackend {
     trace_counter: u64,
     next_trace_id: Option<u64>,
     next_header_pc: Option<u64>,
-    registered_call_assembler_tokens: HashSet<u64>,
-    registered_call_assembler_bridge_traces: HashSet<u64>,
+    registered_call_assembler_tokens: VecSet<u64>,
+    registered_call_assembler_bridge_traces: VecSet<u64>,
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
     /// pyre PyObject layout: ob_type at offset 0.
     vtable_offset: Option<usize>,
@@ -7017,7 +7017,7 @@ impl CraneliftBackend {
     /// Legacy test-only entry point.  Production code passes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
-    /// `HashMap<u32, i64>` literals by hand.
+    /// `VecAssoc<u32, i64>` literals by hand.
     pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
         self.constants = constants;
     }
@@ -7192,8 +7192,8 @@ impl CraneliftBackend {
             trace_counter: 1,
             next_trace_id: None,
             next_header_pc: None,
-            registered_call_assembler_tokens: HashSet::new(),
-            registered_call_assembler_bridge_traces: HashSet::new(),
+            registered_call_assembler_tokens: VecSet::new(),
+            registered_call_assembler_bridge_traces: VecSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
             // enabled; otherwise it comes from
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
@@ -7808,19 +7808,19 @@ impl CraneliftBackend {
             with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
                 .flatten()
         };
-        let mut defined_ref_vars: HashSet<u32> = inputargs
+        let mut defined_ref_vars: VecSet<u32> = inputargs
             .iter()
             .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
             .map(|input| input.index)
             .collect();
-        let mut synced_ref_vars: HashSet<u32> = HashSet::new();
-        let mut stale_ref_vars: HashSet<u32> = HashSet::new();
+        let mut synced_ref_vars: VecSet<u32> = VecSet::new();
+        let mut stale_ref_vars: VecSet<u32> = VecSet::new();
 
         // regalloc.py:1173-1213 compute_vars_longevity
         // Compute last_usage for each ref root variable. Used by get_gcmap
         // to build per-call-site gcmaps (only alive refs are marked).
-        let longevity: HashMap<u32, usize> = {
-            let mut m: HashMap<u32, usize> = HashMap::new();
+        let longevity: VecAssoc<u32, usize> = {
+            let mut m: VecAssoc<u32, usize> = VecAssoc::new();
             for (i, op) in ops.iter().enumerate() {
                 for &arg in op.getarglist().iter().chain(
                     op.getfailargs()
@@ -7831,9 +7831,9 @@ impl CraneliftBackend {
                 ) {
                     let idx = arg.raw();
                     if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
-                        m.entry(idx)
-                            .and_modify(|last| *last = (*last).max(i))
-                            .or_insert(i);
+                        // iteration order is monotonic in `i`, so a later
+                        // visit always supersedes any earlier `last_usage`.
+                        m.insert(idx, i);
                     }
                 }
             }
@@ -8006,7 +8006,7 @@ impl CraneliftBackend {
         // num_block_params past the original label arity. Used by the
         // OpCode::Jump handler to detect arity-mismatched local jumps and
         // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
-        let label_arity_by_descr: HashMap<u32, usize> = label_indices
+        let label_arity_by_descr: VecAssoc<u32, usize> = label_indices
             .iter()
             .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].num_args())))
             .collect();
@@ -8028,9 +8028,9 @@ impl CraneliftBackend {
         // Collect all variable declarations into a map (index -> type)
         // before declaring them sequentially. Cranelift 0.130 declare_var
         // returns auto-assigned indices, so we must declare in order 0..max.
-        let mut var_types: std::collections::HashMap<u32, cranelift_codegen::ir::Type> =
-            std::collections::HashMap::new();
-        let mut declared_vars = std::collections::HashSet::new();
+        let mut var_types: majit_ir::VecAssoc<u32, cranelift_codegen::ir::Type> =
+            majit_ir::VecAssoc::new();
+        let mut declared_vars = majit_ir::VecSet::new();
 
         // Always declare inputarg variables, even when the trace starts
         // with a LABEL (preamble peeling). Preamble guards reference
@@ -8149,8 +8149,8 @@ impl CraneliftBackend {
         // index assignment is deterministic across runs.
         let mut var_keys: Vec<u32> = var_types.keys().copied().collect();
         var_keys.sort_unstable();
-        let mut opref_var_map: std::collections::HashMap<u32, Variable> =
-            std::collections::HashMap::with_capacity(var_keys.len());
+        let mut opref_var_map: majit_ir::VecAssoc<u32, Variable> =
+            majit_ir::VecAssoc::with_capacity(var_keys.len());
         for opref_idx in var_keys {
             let ty = var_types.get(&opref_idx).copied().unwrap_or(cl_types::I64);
             let returned_var = builder.declare_var(ty);
@@ -8182,7 +8182,7 @@ impl CraneliftBackend {
         });
 
         // Save op-result positions for resolve_opref collision handling.
-        let mut op_result_positions = std::collections::HashSet::new();
+        let mut op_result_positions = majit_ir::VecSet::new();
         for ia in inputargs {
             op_result_positions.insert(ia.index);
         }
@@ -8257,7 +8257,7 @@ impl CraneliftBackend {
         // a Cranelift block per LABEL descr.
 
         let mut label_blocks = Vec::with_capacity(label_indices.len());
-        let mut label_blocks_by_descr = HashMap::new();
+        let mut label_blocks_by_descr = VecAssoc::new();
         for &label_idx in &label_indices {
             let block = builder.create_block();
             for _ in 0..ops[label_idx].num_args() {
@@ -13191,7 +13191,7 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
 fn collect_guards(
     ops: &[Op],
     inputargs: &[InputArg],
-    force_tokens: &HashSet<u32>,
+    force_tokens: &VecSet<u32>,
     fail_descrs: &mut Vec<DescrRef>,
     fail_descr_cells: &mut Vec<Arc<majit_ir::FailDescrCell>>,
     guard_infos: &mut Vec<GuardInfo>,
@@ -13212,7 +13212,7 @@ fn collect_guards(
     // also lowers as an external jump (the target's stack frame layout
     // doesn't match, so we exit this trace and re-enter the target via the
     // dispatcher instead of jumping locally).
-    let label_arity_by_descr: HashMap<u32, usize> = ops
+    let label_arity_by_descr: VecAssoc<u32, usize> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
@@ -13381,8 +13381,8 @@ fn collect_guards(
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
-            let mut vidx_to_slot: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
+            let mut vidx_to_slot: majit_ir::VecAssoc<usize, usize> =
+                majit_ir::VecAssoc::new();
             let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
             for frame in &frames {
                 for val in &frame.values {
@@ -13954,7 +13954,7 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
-    force_tokens: &HashSet<u32>,
+    force_tokens: &VecSet<u32>,
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
@@ -15550,7 +15550,6 @@ mod tests {
     use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
-    use std::collections::HashMap;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let o = Op::new(opcode, args);
@@ -16018,7 +16017,7 @@ mod tests {
         // resoperation.py:719 `InputArgInt.type = 'i'` parity: Label /
         // IntAdd / Jump args that reference the inputarg slot are
         // `InputArgInt` boxes, not `IntOp` results. The op-position
-        // raw-keyed `constants` HashMap (positions 100/101 below) is a
+        // raw-keyed `constants` VecAssoc (positions 100/101 below) is a
         // PRE-EXISTING-ADAPTATION mirroring `make_constant`'s op-position
         // inline-constant path; that part of the fixture is left alone.
         let ia0 = OpRef::input_arg_int(0);

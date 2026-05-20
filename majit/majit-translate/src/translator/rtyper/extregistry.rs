@@ -618,9 +618,9 @@ pub fn register_host_value(host: HostObject, entry: ExtRegistryEntry) -> Result<
 /// is itself OnceLock-gated.
 pub fn register_r_uint(host: HostObject) {
     let mut registry = host_value_registry().lock().unwrap();
-    registry
-        .entry(host.clone())
-        .or_insert(ExtRegistryEntry::ForType { instance: host });
+    if !registry.contains_key(&host) {
+        registry.insert(host.clone(), ExtRegistryEntry::ForType { instance: host });
+    }
 }
 
 /// Rust equivalent of `AutoRegisteringType._register_type`.
