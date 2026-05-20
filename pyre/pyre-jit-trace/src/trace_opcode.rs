@@ -3000,6 +3000,14 @@ impl MIFrame {
         // snapshot below so JUMP args never carry OpRef::NONE in the ec
         // slot on adapter / bridge-from-guard paths.
         let recovered_ec = self.ensure_execution_context(ctx);
+        // Issue #73 Phase 4.5: when the portal-bridge metadata is absent,
+        // the stack depth fallback reads from `PyFrame.valuestackdepth`
+        // (via `concrete_valuestackdepth()`) rather than the symbolic
+        // mirror.  `close_loop_args_at` runs at the orgpc anchor where
+        // PyFrame still holds the pre-opcode state.
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
         let (
             frame,
             execution_context,
@@ -3018,7 +3026,7 @@ impl MIFrame {
             let s = self.sym();
             let nlocals = s.nlocals;
             let stack_only = portal_vsd
-                .unwrap_or(s.valuestackdepth)
+                .unwrap_or(concrete_vsd)
                 .saturating_sub(s.nlocals);
             // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
             // `reached_loop_header`: `virtualizable_boxes` length is the
