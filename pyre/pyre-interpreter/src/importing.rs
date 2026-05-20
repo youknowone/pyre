@@ -144,6 +144,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("termios", init_termios);
     register_builtin_module("_socket", init_socket);
     register_builtin_module("mmap", init_mmap);
+    register_builtin_module("faulthandler", init_faulthandler);
     register_builtin_module("_locale", init_locale);
     register_builtin_module("_random", init_random);
     register_builtin_module("_struct", init_struct);
@@ -4544,6 +4545,199 @@ fn init_mmap(ns: &mut DictStorage) {
         // Provide `error` alias for stdlib mmap.py.
         crate::dict_storage_store(ns, "error", crate::typedef::w_object());
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// faulthandler module — PyPy: pypy/module/faulthandler/.
+//
+// CPython's faulthandler dumps the Python traceback on fatal signals.
+// Pyre has no Python-level traceback machinery yet, so our handler
+// writes a short "Fatal Python error: <name>" line to fd 2 and then
+// restores the default disposition + reraises the signal so the
+// process dies the normal way.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(all(unix, feature = "host_env"))]
+thread_local! {
+    static FAULTHANDLER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
+    // Stay async-signal-safe: write to fd 2 with raw libc::write and
+    // restore the default disposition before reraising.
+    let name = rustpython_host_env::faulthandler::fatal_signal_name(signum)
+        .unwrap_or("unknown signal");
+    let msg = format!("Fatal Python error: {name}\n");
+    rustpython_host_env::faulthandler::write_fd(2, msg.as_bytes());
+    rustpython_host_env::faulthandler::signal_default_and_raise(signum);
+}
+
+fn init_faulthandler(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "enable",
+        crate::make_builtin_function("enable", |_args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
+                    faulthandler_signal_handler,
+                    libc::SA_NODEFER | libc::SA_ONSTACK,
+                );
+                if ok {
+                    FAULTHANDLER_ENABLED.with(|c| c.set(true));
+                    return Ok(pyre_object::w_none());
+                }
+                return Err(crate::PyError::runtime_error(
+                    "faulthandler.enable: sigaction failed",
+                ));
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            Ok(pyre_object::w_none())
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "disable",
+        crate::make_builtin_function_with_arity(
+            "disable",
+            |_| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    rustpython_host_env::faulthandler::disable_fatal_handlers();
+                    FAULTHANDLER_ENABLED.with(|c| c.set(false));
+                }
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "is_enabled",
+        crate::make_builtin_function_with_arity(
+            "is_enabled",
+            |_| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    return Ok(pyre_object::w_bool_from(
+                        FAULTHANDLER_ENABLED.with(|c| c.get()),
+                    ));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Ok(pyre_object::w_bool_from(false))
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "dump_traceback",
+        crate::make_builtin_function("dump_traceback", |_| {
+            // No Python-level traceback machinery — emit a placeholder
+            // so callers that want a forensic dump at least see *something*
+            // instead of silent success.
+            #[cfg(unix)]
+            {
+                let msg = b"<faulthandler: pyre has no Python-level traceback yet>\n";
+                let _ =
+                    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len() as _) };
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "dump_traceback_later",
+        crate::make_builtin_function("dump_traceback_later", |_| Ok(pyre_object::w_none())),
+    );
+    crate::dict_storage_store(
+        ns,
+        "cancel_dump_traceback_later",
+        crate::make_builtin_function_with_arity(
+            "cancel_dump_traceback_later",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
+    );
+    // register/unregister user signals: host_env supports the full API,
+    // but it needs the user-signal handler to be a fixed extern "C" fn.
+    // Provide a "registered → no-op" pattern: install the handler when
+    // registering, restore on unregister.  The handler writes a short
+    // "user signal NN delivered" message to fd 2 (no traceback).
+    crate::dict_storage_store(
+        ns,
+        "register",
+        crate::make_builtin_function("register", |args| {
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "register() missing signal",
+                    ));
+                }
+                let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let fd = if args.len() >= 2 {
+                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32
+                } else {
+                    2
+                };
+                rustpython_host_env::faulthandler::register_user_signal(
+                    signum,
+                    fd,
+                    true,
+                    false,
+                    faulthandler_user_handler,
+                )
+                .map_err(|e| {
+                    crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("register: {e}"),
+                    )
+                })?;
+                Ok(pyre_object::w_none())
+            }
+            #[cfg(not(all(unix, feature = "host_env")))]
+            {
+                let _ = args;
+                Ok(pyre_object::w_none())
+            }
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "unregister",
+        crate::make_builtin_function_with_arity(
+            "unregister",
+            |args| {
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "unregister() missing signal",
+                        ));
+                    }
+                    let signum =
+                        (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                    return Ok(pyre_object::w_bool_from(
+                        rustpython_host_env::faulthandler::unregister_user_signal(signum),
+                    ));
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = args;
+                    Ok(pyre_object::w_bool_from(false))
+                }
+            },
+            1,
+        ),
+    );
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+extern "C" fn faulthandler_user_handler(signum: libc::c_int) {
+    let msg = format!("User signal {signum} delivered (faulthandler)\n");
+    rustpython_host_env::faulthandler::write_fd(2, msg.as_bytes());
 }
 
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
