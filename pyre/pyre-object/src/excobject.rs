@@ -43,9 +43,11 @@ pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
 /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
 /// W_UnicodeError, ...)` — subclass of UnicodeError.  Identity-only
 /// port (dedicated PyType + ExcKind for isinstance / `ob_type`
-/// discrimination); the 5-arg `(object, start, end, reason)` init
-/// signature and custom `__str__` formatting on the W_UnicodeTranslateError
-/// class itself are not yet ported.
+/// discrimination); the 4-arg `(object, start, end, reason)` init
+/// signature and custom `__str__` formatting on the
+/// W_UnicodeTranslateError class itself are not yet ported.  See the
+/// `ExcKind::UnicodeTranslateError` doc for the broader identity-only
+/// pattern across pyre's exception subclasses.
 pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeTranslateError");
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
@@ -159,9 +161,22 @@ pub enum ExcKind {
     /// `pypy/module/exceptions/interp_exceptions.py:426
     /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
     /// W_UnicodeError, ...)`.  Identity-only port: a dedicated kind so
-    /// `ob_type` and `isinstance` discriminate it correctly; the 5-arg
+    /// `ob_type` and `isinstance` discriminate it correctly; the 4-arg
     /// `(object, start, end, reason)` `__init__` and custom `__str__`
-    /// remain TODO (W_UnicodeTranslateError class-level work).
+    /// remain TODO.
+    ///
+    /// Pyre's W_BaseException-derived classes are uniformly identity-
+    /// only at present — W_StopIteration (`w_value`), W_ImportError
+    /// (`w_name`/`w_path`/`w_msg`), W_AttributeError (`w_name`/`w_obj`),
+    /// W_OSError (`w_errno`/`w_strerror`/`w_filename`/...),
+    /// W_UnicodeDecodeError / W_UnicodeEncodeError /
+    /// W_UnicodeTranslateError all lack their per-class fields.
+    /// Closure requires either per-subclass `W_<Kind>Object` structs
+    /// (PyPy-orthodox, one GC type id per kind, isolated layouts) or
+    /// extending `W_ExceptionObject` with the union of all per-class
+    /// fields (single GC type id, every instance pays the slot cost).
+    /// Tracked as a separate multi-class epic — see task #123 for the
+    /// Unicode*Error subset.
     UnicodeTranslateError = 28,
 }
 
