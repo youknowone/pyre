@@ -788,6 +788,20 @@ fn analyze_pipeline_from_parsed(
             let mut crate_segs = vec!["crate"];
             crate_segs.extend(segments.iter().copied());
             paths.push(crate::parse::CallPath::from_segments(crate_segs));
+            // Module-qualified alias for in-module bare calls qualified
+            // by `canonical_call_target:7494-7502`.  Without this every
+            // `#[majit_macros::elidable*]` (and `#[oopspec]` /
+            // `#[loop_invariant]` / etc.) hint on a free fn would be
+            // silently dropped by every same-module call site that
+            // spells the callee as a single identifier.
+            if !func.module_path.is_empty() && segments.len() == 1 {
+                let mut mod_segs: Vec<&str> = func.module_path.split("::").collect();
+                mod_segs.extend(segments.iter().copied());
+                paths.push(crate::parse::CallPath::from_segments(mod_segs.iter().copied()));
+                let mut crate_mod_segs = vec!["crate"];
+                crate_mod_segs.extend(mod_segs.iter().copied());
+                paths.push(crate::parse::CallPath::from_segments(crate_mod_segs));
+            }
         }
         for hint in &func.hints {
             for p in &paths {

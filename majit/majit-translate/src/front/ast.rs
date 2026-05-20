@@ -144,6 +144,21 @@ pub struct SemanticFunction {
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
+    /// Module path of the defining file, as supplied to
+    /// `parse_source_with_module` (e.g. `"pyframe"` for
+    /// `pyre-interpreter/src/pyframe.rs`).  Empty when the caller did not
+    /// supply a module path — top-level items remain at simple-name
+    /// registration.
+    ///
+    /// Used by `lib.rs` registration so a free function's call sites that
+    /// were qualified by `canonical_call_target:7494-7502` (single-segment
+    /// bare call inside a non-empty module) can resolve through the
+    /// `[module_path, name]` path, in addition to the bare-name and
+    /// `crate::` alias paths.  Without the extra path the
+    /// `#[majit_macros::elidable*]` / oopspec / loop-invariant hints
+    /// registered against the bare name are silently dropped at every
+    /// in-module call site.
+    pub module_path: String,
     /// RPython: function-level hints set by GC transformer / decorators.
     /// "close_stack" → _gctransformer_hint_close_stack_
     /// "cannot_collect" → _gctransformer_hint_cannot_collect_
@@ -1516,6 +1531,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
     for parsed in parsed_files {
+        let functions_before = functions.len();
         build_graphs_from_items(
             &parsed.file.items,
             "",
@@ -1527,6 +1543,22 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &known_trait_names,
             &mut functions,
         )?;
+        // Stamp the parsed file's module_path onto each new
+        // SemanticFunction so the free-function hint registry in
+        // `lib.rs` can add the `[module_path, name]` path alongside
+        // the bare-name and `crate::` alias paths.  This pairs with
+        // the single-segment qualification at
+        // `canonical_call_target:7494-7502`: a bare call inside
+        // `mod pyframe` resolves to `["pyframe", helper]` and must
+        // find the same `#[majit_macros::elidable*]` hint that the
+        // bare-name registration carries.
+        if !parsed.module_path.is_empty() {
+            for sf in &mut functions[functions_before..] {
+                if sf.module_path.is_empty() {
+                    sf.module_path = parsed.module_path.clone();
+                }
+            }
+        }
     }
     Ok(SemanticProgram {
         functions,
@@ -3822,6 +3854,7 @@ fn build_function_graph(
         return_type,
         self_ty_root,
         hints,
+        module_path: module_prefix.to_string(),
         access_directly: false,
     })
 }

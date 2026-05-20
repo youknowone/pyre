@@ -2594,6 +2594,7 @@ impl CallControl {
                         return_type: None,
                         self_ty_root: None,
                         hints,
+                        module_path: String::new(),
                         access_directly: false,
                     };
                     if policy.look_inside_graph(&func) {
