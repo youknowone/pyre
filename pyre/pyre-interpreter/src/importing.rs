@@ -2504,40 +2504,52 @@ fn init_signal_stub(ns: &mut DictStorage) {
             ns,
             "setitimer",
             crate::make_builtin_function("setitimer", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error(
-                        "setitimer() requires at least 2 arguments",
-                    ));
-                }
-                let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                let read_f = |o: pyre_object::PyObjectRef| -> f64 {
-                    unsafe {
-                        if pyre_object::is_float(o) {
-                            pyre_object::w_float_get_value(o)
-                        } else {
-                            pyre_object::w_int_get_value(o) as f64
-                        }
+                #[cfg(feature = "host_env")]
+                {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "setitimer() requires at least 2 arguments",
+                        ));
                     }
-                };
-                let new_value = libc::itimerval {
-                    it_value: rustpython_host_env::signal::double_to_timeval(read_f(args[1])),
-                    it_interval: if args.len() >= 3 {
-                        rustpython_host_env::signal::double_to_timeval(read_f(args[2]))
-                    } else {
-                        rustpython_host_env::signal::double_to_timeval(0.0)
-                    },
-                };
-                let old = rustpython_host_env::signal::setitimer(which, &new_value).map_err(|e| {
-                    crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("setitimer: {e}"),
-                    )
-                })?;
-                let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_float_new(delay),
-                    pyre_object::w_float_new(interval),
-                ]))
+                    let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                    let read_f = |o: pyre_object::PyObjectRef| -> f64 {
+                        unsafe {
+                            if pyre_object::is_float(o) {
+                                pyre_object::w_float_get_value(o)
+                            } else {
+                                pyre_object::w_int_get_value(o) as f64
+                            }
+                        }
+                    };
+                    let new_value = libc::itimerval {
+                        it_value: rustpython_host_env::signal::double_to_timeval(read_f(args[1])),
+                        it_interval: if args.len() >= 3 {
+                            rustpython_host_env::signal::double_to_timeval(read_f(args[2]))
+                        } else {
+                            rustpython_host_env::signal::double_to_timeval(0.0)
+                        },
+                    };
+                    let old = rustpython_host_env::signal::setitimer(which, &new_value)
+                        .map_err(|e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("setitimer: {e}"),
+                            )
+                        })?;
+                    let (delay, interval) =
+                        rustpython_host_env::signal::itimerval_to_tuple(&old);
+                    return Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_float_new(delay),
+                        pyre_object::w_float_new(interval),
+                    ]));
+                }
+                #[cfg(not(feature = "host_env"))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "signal.setitimer requires host_env",
+                    ))
+                }
             }),
         );
         // getitimer(which) -> (delay, interval)
@@ -2547,23 +2559,35 @@ fn init_signal_stub(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "getitimer",
                 |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "getitimer() requires 1 argument",
-                        ));
+                    #[cfg(feature = "host_env")]
+                    {
+                        if args.is_empty() {
+                            return Err(crate::PyError::type_error(
+                                "getitimer() requires 1 argument",
+                            ));
+                        }
+                        let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                        let it =
+                            rustpython_host_env::signal::getitimer(which).map_err(|e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("getitimer: {e}"),
+                                )
+                            })?;
+                        let (delay, interval) =
+                            rustpython_host_env::signal::itimerval_to_tuple(&it);
+                        return Ok(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_float_new(delay),
+                            pyre_object::w_float_new(interval),
+                        ]));
                     }
-                    let which = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                    let it = rustpython_host_env::signal::getitimer(which).map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getitimer: {e}"),
-                        )
-                    })?;
-                    let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&it);
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_float_new(delay),
-                        pyre_object::w_float_new(interval),
-                    ]))
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::runtime_error(
+                            "signal.getitimer requires host_env",
+                        ))
+                    }
                 },
                 1,
             ),
@@ -2575,20 +2599,30 @@ fn init_signal_stub(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "siginterrupt",
                 |args| {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "siginterrupt() requires 2 arguments",
-                        ));
+                    #[cfg(feature = "host_env")]
+                    {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "siginterrupt() requires 2 arguments",
+                            ));
+                        }
+                        let sig = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                        let flag = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
+                        rustpython_host_env::signal::siginterrupt(sig, flag).map_err(|e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("siginterrupt: {e}"),
+                            )
+                        })?;
+                        return Ok(pyre_object::w_none());
                     }
-                    let sig = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-                    let flag = unsafe { pyre_object::w_int_get_value(args[1]) } as i32;
-                    rustpython_host_env::signal::siginterrupt(sig, flag).map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("siginterrupt: {e}"),
-                        )
-                    })?;
-                    Ok(pyre_object::w_none())
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::runtime_error(
+                            "signal.siginterrupt requires host_env",
+                        ))
+                    }
                 },
                 2,
             ),
