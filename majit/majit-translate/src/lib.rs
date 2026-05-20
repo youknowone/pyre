@@ -923,11 +923,17 @@ fn analyze_pipeline_from_parsed(
     // tests feed the full Phase D0 source set the fallback is never
     // exercised and the eval_loop_jit-only identity locks in.
     let default_portal_name = {
-        let eval_loop_jit_path = parse::CallPath::from_segments(["eval_loop_jit"]);
-        if call_control
-            .function_graphs()
-            .contains_key(&eval_loop_jit_path)
-        {
+        // Tolerate module-qualified registrations: `eval_loop_jit` may
+        // land under `["eval", "eval_loop_jit"]` when its file
+        // (`pyre-jit/src/eval.rs`) was parsed with `module_path =
+        // "eval"`.  Suffix-match on the leaf segment covers both shapes.
+        let has_leaf = |leaf: &str| {
+            call_control
+                .function_graphs()
+                .keys()
+                .any(|k| k.segments.last().map(|s| s == leaf).unwrap_or(false))
+        };
+        if has_leaf("eval_loop_jit") {
             "eval_loop_jit"
         } else {
             "execute_opcode_step"
@@ -960,7 +966,51 @@ fn analyze_pipeline_from_parsed(
                 vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
             ),
         };
-    let portal = parse::CallPath::from_segments([portal_name.as_str()]);
+    // Resolve the portal `CallPath` tolerantly so the lookup hits
+    // regardless of how `build_graphs_from_items` qualifies the
+    // function's name.  Free functions registered with a non-empty
+    // `parsed.module_path` land under `["module", "name"]` (e.g.
+    // `["pyopcode", "execute_opcode_step"]`); a bare-leaf alias
+    // (`["execute_opcode_step"]`) is also published for cross-module
+    // bare callsites (`lib.rs:432-448`).  Prefer the module-qualified
+    // canonical key over the bare alias so production parity with
+    // `module_path!()` semantics — and downstream tests asserting
+    // `by_path.contains_key(&["module", "name"])` — match the JitCode
+    // registration shape.  Selection order:
+    //  1. module-qualified key whose leaf matches the portal name and
+    //     is NOT `crate`-prefixed (multi-segment, source-of-truth);
+    //  2. bare leaf (legacy empty-`module_path` fixtures);
+    //  3. any remaining suffix-match (last-resort fallback).
+    let portal = {
+        let bare = parse::CallPath::from_segments([portal_name.as_str()]);
+        let leaf_matches = |k: &&parse::CallPath| {
+            k.segments
+                .last()
+                .map(|s| s == portal_name.as_str())
+                .unwrap_or(false)
+        };
+        let qualified = call_control
+            .function_graphs()
+            .keys()
+            .find(|k| {
+                leaf_matches(k)
+                    && k.segments.len() > 1
+                    && k.segments.first().map(|s| s != "crate").unwrap_or(false)
+            })
+            .cloned();
+        if let Some(qualified) = qualified {
+            qualified
+        } else if call_control.function_graphs().contains_key(&bare) {
+            bare
+        } else {
+            call_control
+                .function_graphs()
+                .keys()
+                .find(leaf_matches)
+                .cloned()
+                .unwrap_or(bare)
+        }
+    };
     if call_control.function_graphs().contains_key(&portal) {
         call_control.setup_jitdriver(
             portal,
@@ -1286,16 +1336,62 @@ mod tests {
         }
     }
 
+    /// Collect `(source, crate-stripped module_path)` per file under `dir`.
+    /// The module_path matches what `module_path!()` would emit at runtime
+    /// minus the leading crate-name segment — `lib.rs` → `""`,
+    /// `baseobjspace.rs` → `"baseobjspace"`, `module/inner.rs` → `"module::inner"`.
+    /// Feeds `parse::parse_source_with_module` so call-site segments
+    /// emitted by `canonical_call_target` for `crate::module::name` paths
+    /// hit the same `module::name` keys the registry collects.
+    fn collect_rs_files_with_modules(
+        dir: &Path,
+        sources: &mut Vec<String>,
+        module_paths: &mut Vec<String>,
+    ) {
+        for entry in WalkDir::new(dir) {
+            let entry = entry.unwrap_or_else(|_| panic!("failed to walk dir {}", dir.display()));
+            let path = entry.path();
+            if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
+                let relative = path
+                    .strip_prefix(dir)
+                    .unwrap_or(path)
+                    .with_extension("");
+                let mut segments: Vec<String> = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                    .collect();
+                // lib.rs / main.rs / mod.rs occupy the parent module path
+                // (no leaf segment), so strip them and let the remaining
+                // ancestor chain stand as the module path.  Empty path
+                // (`lib.rs` at the crate root) registers under the empty
+                // prefix, matching today's behaviour.
+                if matches!(segments.last().map(String::as_str), Some("lib" | "main" | "mod")) {
+                    segments.pop();
+                }
+                sources.push(source);
+                module_paths.push(segments.join("::"));
+            }
+        }
+    }
+
     fn read_all_pyre_sources() -> Vec<String> {
+        let (sources, _module_paths) = read_all_pyre_sources_with_modules();
+        sources
+    }
+
+    fn read_all_pyre_sources_with_modules() -> (Vec<String>, Vec<String>) {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pyre");
         let mut sources = Vec::new();
+        let mut module_paths = Vec::new();
         for dir in [
             base.join("pyre-object/src"),
             base.join("pyre-interpreter/src"),
         ] {
-            collect_rs_files(&dir, &mut sources);
+            collect_rs_files_with_modules(&dir, &mut sources, &mut module_paths);
         }
-        sources
+        (sources, module_paths)
     }
 
     #[test]

@@ -55,7 +55,7 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
     }
 }
 
-use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, descr::descr_identity};
+use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, VecMapExt, descr::descr_identity};
 
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -917,7 +917,8 @@ impl OptHeap {
         // container still escapes a non-constant value.
         if self.is_unescaped(container) && self.is_unescaped(value) {
             self.heapc_deps
-                .entry_or_insert_with(container, Vec::new)
+                .entry(container)
+                .or_insert_with(Vec::new)
                 .push(value);
         } else if !value.is_none() {
             self.escape_box(value);

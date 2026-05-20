@@ -97,12 +97,12 @@ impl Logger {
 
     /// Record a guard failure for the given guard index.
     pub fn log_guard_failure(&mut self, guard_index: u32) {
-        *self.guard_failures.entry_or_default(guard_index) += 1;
+        *self.guard_failures.entry(guard_index).or_default() += 1;
     }
 
     /// Record a loop entry for the given green key.
     pub fn log_loop_entry(&mut self, green_key: u64) {
-        *self.loop_entries.entry_or_default(green_key) += 1;
+        *self.loop_entries.entry(green_key).or_default() += 1;
     }
 
     /// Record a bridge compilation for the given guard index.

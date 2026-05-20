@@ -9,7 +9,7 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
-use majit_ir::VecAssoc;
+use majit_ir::{VecAssoc, VecMapExt};
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.

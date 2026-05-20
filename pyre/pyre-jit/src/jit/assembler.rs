@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use majit_ir::VecAssoc;
+use majit_ir::{VecAssoc, VecMapExt};
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 use vecset::VecSet;
 

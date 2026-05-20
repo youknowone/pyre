@@ -73,7 +73,7 @@ impl Drop for DebugSectionRollback {
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, VecMapExt};
 
 use crate::blackhole::ExceptionState;
 use crate::compile;

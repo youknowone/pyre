@@ -1166,16 +1166,18 @@ pub(crate) fn merge_backend_exit_layouts(
                 })
             });
         let entry: &mut StoredExitLayout =
-            exit_layouts.entry_or_insert_with(layout.fail_index, || StoredExitLayout {
-                source_op_index: layout.source_op_index,
-                gc_ref_slots: layout.gc_ref_slots.clone(),
-                force_token_slots: layout.force_token_slots.clone(),
-                recovery_layout: layout.recovery_layout.clone(),
-                resume_layout: None,
-                storage: storage_from_backend.clone(),
-                descr: descr_from_op.clone(),
-                op_arg_types_for_jump: None,
-            });
+            exit_layouts
+                .entry(layout.fail_index)
+                .or_insert_with(|| StoredExitLayout {
+                    source_op_index: layout.source_op_index,
+                    gc_ref_slots: layout.gc_ref_slots.clone(),
+                    force_token_slots: layout.force_token_slots.clone(),
+                    recovery_layout: layout.recovery_layout.clone(),
+                    resume_layout: None,
+                    storage: storage_from_backend.clone(),
+                    descr: descr_from_op.clone(),
+                    op_arg_types_for_jump: None,
+                });
         entry.source_op_index = layout.source_op_index;
         // Backfill descr if the entry was inserted before `op.descr` was
         // available (or the op walk produced a fresh handle). Keeps
@@ -1451,8 +1453,9 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             })
         });
         let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
-        let entry =
-            terminal_exit_layouts.entry_or_insert_with(layout.op_index, || StoredExitLayout {
+        let entry = terminal_exit_layouts
+            .entry(layout.op_index)
+            .or_insert_with(|| StoredExitLayout {
                 source_op_index: Some(layout.op_index),
                 gc_ref_slots: layout.gc_ref_slots.clone(),
                 force_token_slots: layout.force_token_slots.clone(),

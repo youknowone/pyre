@@ -11,7 +11,9 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type};
+use majit_ir::{
+    ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type, VecMapExt,
+};
 
 // TODO: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs

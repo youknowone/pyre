@@ -2,7 +2,7 @@
 ///
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
-use majit_ir::{VecAssoc, VecSet};
+use majit_ir::{VecAssoc, VecMapExt, VecSet};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7725,14 +7725,16 @@ impl CraneliftBackend {
         // values that ops reference, regardless of namespace.
         let mut constant_types_with_inputargs = constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types_with_inputargs.entry_or_insert_with(ia.index, || ia.tp);
+            constant_types_with_inputargs
+                .entry(ia.index)
+                .or_insert_with(|| ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
             let (result, new_constants, new_constant_types) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             // Merge GC rewriter's new constants into self.constants
             for (k, v) in new_constants {
-                self.constants.entry_or_insert_with(k, || v);
+                self.constants.entry(k).or_insert_with(|| v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -7740,7 +7742,7 @@ impl CraneliftBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry_or_insert_with(k, || tp);
+                self.constant_types.entry(k).or_insert_with(|| tp);
             }
             result
         } else {

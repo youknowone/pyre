@@ -12,7 +12,7 @@
 ///   compute_vars_longevity — regalloc.py:1173
 ///   valid_addressing_size  — regalloc.py:1236
 ///   get_scale              — regalloc.py:1239
-use majit_ir::VecAssoc;
+use majit_ir::{VecAssoc, VecMapExt};
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};

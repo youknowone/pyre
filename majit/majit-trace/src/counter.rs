@@ -1,3 +1,5 @@
+use majit_ir::VecMapExt;
+
 /// counter.py: JitCounter — float-based 5-way associative timetable.
 ///
 /// Direct port of rpython/jit/metainterp/counter.py.

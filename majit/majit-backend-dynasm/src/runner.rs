@@ -1,4 +1,4 @@
-use majit_ir::VecAssoc;
+use majit_ir::{VecAssoc, VecMapExt};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -1109,14 +1109,14 @@ impl DynasmBackend {
         // `constant_types_with_inputargs` build at compiler.rs:7042.
         let mut constant_types = self.constant_types.clone();
         for ia in inputargs.iter() {
-            constant_types.entry_or_insert_with(ia.index, || ia.tp);
+            constant_types.entry(ia.index).or_insert_with(|| ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
             let (result, new_constants, new_constant_types) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
             for (k, v) in new_constants {
-                self.constants.entry_or_insert_with(k, || v);
+                self.constants.entry(k).or_insert_with(|| v);
             }
             for (k, tp) in new_constant_types {
                 // rewrite.py creates fresh ConstInt boxes for sizes, offsets
@@ -1124,7 +1124,7 @@ impl DynasmBackend {
                 // ConstInt object; pyre imports the rewriter's explicit
                 // side-channel type entry instead of guessing from the raw
                 // constant key.
-                self.constant_types.entry_or_insert_with(k, || tp);
+                self.constant_types.entry(k).or_insert_with(|| tp);
             }
             result
         } else {

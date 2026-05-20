@@ -1513,6 +1513,19 @@ pub fn build_semantic_program_with_options(
     // RPython: annotator/rtyper resolves all types in a whole-program pass.
     // We recursively traverse Item::Mod to register module-qualified paths
     // matching the exact callee identity that canonical_call_target produces.
+    //
+    // `parsed.module_path` is the crate-stripped module path for the file
+    // (e.g. `"baseobjspace"`).  Pass 1 keeps prefix="" so existing
+    // `fn_return_types` / struct lookups (most of which key on
+    // bare names or `Type::method`) stay valid; Pass 2 uses
+    // `parsed.module_path` so each free function's `sf.name` carries
+    // the module prefix.  That makes `canonical_function_graphs`
+    // (`lib.rs:494`) register the function under
+    // `["module", "name"]` / `["crate", "module", "name"]`, matching
+    // the segments emitted by `canonical_call_target`
+    // (`front/ast.rs:7841`) for `crate::module::name` paths.  Empty
+    // `parsed.module_path` (legacy `parse_source` fixture) keeps the
+    // bare-name behaviour.
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
     let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
     collect_types_from_items(
@@ -1598,6 +1611,16 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
     // RPython: whole-program — ALL types visible everywhere.
     // Collect struct names from ALL files first, then fields+returns.
+    // Pass 1 keeps prefix="" so existing `fn_return_types` / struct
+    // lookups (which key on bare names or `Type::method`) stay valid;
+    // Pass 2 then uses each file's `parsed.module_path` so the function
+    // graph's `sf.name` carries the module prefix.  The downstream
+    // `canonical_function_graphs` registration (`lib.rs:494`) splits on
+    // `::` and registers under `[module, name]` /
+    // `[crate, module, name]`, matching the segments emitted by
+    // `canonical_call_target` for `crate::module::name` paths.  Empty
+    // `parsed.module_path` (legacy `parse_source` fixture) falls back to
+    // the bare-name behaviour.
     for parsed in parsed_files {
         collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
         collect_trait_names(&parsed.file.items, "", &mut known_trait_names);

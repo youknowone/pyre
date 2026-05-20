@@ -271,10 +271,18 @@ mod tests {
     #[test]
     fn generic_handler_graphs_keep_symbolic_fnaddr_surface() {
         with_all_jitcodes(|reg| {
+            // `execute_opcode_step` is consumed by
+            // `build_canonical_opcode_dispatch` (`lib.rs:965-1027`): each match
+            // arm body is registered as a synthetic graph keyed under
+            // `["__opcode_dispatch__", "<selector>#<arm_id>"]`. The wrapper
+            // function itself is not separately registered; the dispatch arms
+            // are the "generic handler graphs" whose fnaddr surface this test
+            // pins. Pick one arm per representative opcode family (load /
+            // build / pop) to lock the symbolic-fnaddr contract.
             for path in [
-                CallPath::from_segments(["execute_opcode_step"]),
-                CallPath::from_segments(["opcode_load_const"]),
-                CallPath::from_segments(["opcode_build_list"]),
+                CallPath::from_segments(["__opcode_dispatch__", "Instruction::LoadConst#1"]),
+                CallPath::from_segments(["__opcode_dispatch__", "Instruction::BuildList#30"]),
+                CallPath::from_segments(["__opcode_dispatch__", "Instruction::PopTop#14"]),
             ] {
                 let jitcode = reg
                     .by_path
@@ -306,7 +314,12 @@ mod tests {
     #[test]
     fn eval_loop_jit_portal_produces_jitcode_with_handler_closure() {
         with_all_jitcodes(|reg| {
-            let portal = CallPath::from_segments(["eval_loop_jit"]);
+            // Module-qualified paths — see comment on
+            // `generic_handler_graphs_keep_symbolic_fnaddr_surface`.
+            // `pyre-jit/src/eval.rs` is declared under `"eval"` in
+            // `PYRE_JIT_GRAPH_SOURCES`; `pyre-interpreter/src/pyopcode.rs`
+            // under `"pyopcode"`.
+            let portal = CallPath::from_segments(["eval", "eval_loop_jit"]);
             assert!(
                 reg.by_path.contains_key(&portal),
                 "Phase D parity: eval_loop_jit must have a JitCode after \
@@ -315,12 +328,26 @@ mod tests {
                  entry means the portal fallback unexpectedly chose \
                  execute_opcode_step."
             );
+            // `execute_opcode_step` is decomposed by
+            // `build_canonical_opcode_dispatch` (`lib.rs:965-1027`) into
+            // synthetic per-arm graphs keyed under `__opcode_dispatch__`. The
+            // wrapper itself is not registered; the dispatch arms are what
+            // make the BFS surface from `eval_loop_jit` reach individual
+            // opcode handlers. A missing arm here means
+            // `extract_opcode_dispatch_arms` no longer sees the match body, or
+            // the synthetic registration step in
+            // `build_canonical_opcode_dispatch` regressed.
+            let has_arm = reg.by_path.keys().any(|k| {
+                k.segments
+                    .first()
+                    .map(|s| s == "__opcode_dispatch__")
+                    .unwrap_or(false)
+            });
             assert!(
-                reg.by_path
-                    .contains_key(&CallPath::from_segments(["execute_opcode_step"])),
-                "Phase D parity: execute_opcode_step must reach candidate_graphs \
-                 as a BFS callee from eval_loop_jit; a JitCode must be present \
-                 for it."
+                has_arm,
+                "Phase D parity: per-opcode dispatch arms must be registered \
+                 under [\"__opcode_dispatch__\", ...]; absence means the \
+                 eval_loop_jit → execute_opcode_step match arms never landed."
             );
         });
     }

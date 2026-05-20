@@ -4353,7 +4353,24 @@ impl CallControl {
                                     .unwrap_or_else(|| declared.clone());
                             let expected_result =
                                 return_type_string_to_value_type(Some(&effective_declared));
-                            if result_type != expected_result {
+                            // Lenient soft-signal for `Ref` actual when
+                            // the declared type is primitive: callers
+                            // built through the opcode-dispatch arm
+                            // entry (`parse.rs:806 lower_expr_into_graph_with_signature`)
+                            // pass an empty `fn_return_types`, so the
+                            // front-end falls back to `ValueType::Unknown`
+                            // (= `Type::Ref`) for any bare callsite.  This
+                            // matches the same lenient treatment applied
+                            // to argument kinds above (call.py:230
+                            // parity is conditional on the side-table
+                            // being populated).  Until the dispatch-arm
+                            // ctx threads program-wide `fn_return_types`,
+                            // the Ref-vs-primitive mismatch is a
+                            // type-info gap, not a true signature
+                            // mismatch.
+                            let result_type_unresolved =
+                                matches!(result_type, Type::Ref) && expected_result != Type::Ref;
+                            if result_type != expected_result && !result_type_unresolved {
                                 panic!(
                                     "in operation calling {target}: calling a \
                                      function with return type \

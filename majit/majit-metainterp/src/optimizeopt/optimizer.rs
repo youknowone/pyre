@@ -313,7 +313,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
             return;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
-        constants.entry_or_insert_with(key, || value);
+        constants.entry(key).or_insert_with(|| value);
     };
     for op in &ctx.new_operations {
         consider(op);

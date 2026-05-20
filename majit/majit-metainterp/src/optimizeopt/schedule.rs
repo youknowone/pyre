@@ -1128,7 +1128,8 @@ impl VecScheduleState {
         }
         for arg in args {
             self.expanded_map
-                .entry_or_insert_with(*arg, Vec::new)
+                .entry(*arg)
+                .or_insert_with(Vec::new)
                 .push((vecop, index));
             index += 1;
         }

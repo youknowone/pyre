@@ -172,7 +172,8 @@ impl MemoryManager {
             looptoken.generation.set(self.current_generation);
             let key: *const JitCellToken = Arc::as_ptr(looptoken);
             self.alive_loops
-                .entry_or_insert_with(key, || Arc::clone(looptoken));
+                .entry(key)
+                .or_insert_with(|| Arc::clone(looptoken));
         }
     }
 

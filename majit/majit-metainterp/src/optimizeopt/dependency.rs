@@ -557,7 +557,8 @@ impl DependencyGraph {
         for (i, node) in self.nodes.iter().enumerate() {
             if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
                 by_opcode
-                    .entry_or_insert_with(node.op.opcode, Vec::new)
+                    .entry(node.op.opcode)
+                    .or_insert_with(Vec::new)
                     .push(i);
             }
         }
@@ -1036,7 +1037,8 @@ impl DefTracker {
             return;
         }
         self.defs
-            .entry_or_insert_with(arg, Vec::new)
+            .entry(arg)
+            .or_insert_with(Vec::new)
             .push((node_idx, None));
     }
 

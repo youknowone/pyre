@@ -4816,7 +4816,7 @@ impl OptContext {
                     return;
                 };
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4831,7 +4831,7 @@ impl OptContext {
             PtrInfo::Struct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4850,7 +4850,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4869,7 +4869,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4887,7 +4887,7 @@ impl OptContext {
                 let descr = v.descr.clone();
                 let lenbound = v.lenbound.clone();
                 let items = v.items.clone();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound,
@@ -4904,7 +4904,7 @@ impl OptContext {
                 let len = v.items.len() as i64;
                 let items: Vec<FieldEntry> =
                     v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
-                let ci = self.const_infos.entry_or_insert_with(key, || {
+                let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound: IntBound::from_constant(len),
@@ -6949,7 +6949,7 @@ impl OptContext {
         // info.py:722-725: info = optheap.const_infos.get(ref, None)
         //                  if info is None: info = StructPtrInfo(descr)
         //                  optheap.const_infos[ref] = info
-        Some(self.const_infos.entry_or_insert_with(addr, || {
+        Some(self.const_infos.entry(addr).or_insert_with(|| {
             // info.py:724: StructPtrInfo(descr)
             match parent_descr {
                 Some(d) => PtrInfo::struct_ptr(d),
@@ -7004,7 +7004,7 @@ impl OptContext {
             ));
         }
         let addr = gcref.0;
-        Some(self.const_infos.entry_or_insert_with(addr, || {
+        Some(self.const_infos.entry(addr).or_insert_with(|| {
             crate::optimizeopt::info::PtrInfo::array(
                 descr,
                 crate::optimizeopt::intutils::IntBound::nonnegative(),

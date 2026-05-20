@@ -730,7 +730,7 @@ impl RewriteState {
     /// map first (RPython calls `get_box_replacement(op)` here).
     fn delayed_zero_setfields(&mut self, r: OpRef) -> &mut VecSet<i64> {
         let key = self.resolve(r);
-        self._delayed_zero_setfields.entry_or_default(key)
+        self._delayed_zero_setfields.entry(key).or_default()
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
@@ -742,7 +742,8 @@ impl RewriteState {
             .any(|pz| pz.array_ref == array_ref)
         {
             self.initialized_indices
-                .entry_or_default(array_ref)
+                .entry(array_ref)
+                .or_default()
                 .insert(index);
         }
     }
@@ -2718,7 +2719,7 @@ impl GcRewriter for GcRewriterImpl {
         // Merge constant types — RPython's ConstPtr/ConstInt carry type
         // intrinsically; here we inject them into the same map.
         for (&k, &tp) in &self.constant_types {
-            st.result_types.entry_or_insert_with(k, || tp);
+            st.result_types.entry(k).or_insert_with(|| tp);
         }
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this

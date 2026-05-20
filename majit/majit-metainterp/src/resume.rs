@@ -1923,7 +1923,7 @@ impl EncodedResumeData {
         for vinfo in &rd_virtuals {
             for source in vinfo.field_sources() {
                 if let ResumeValueSource::FailArg(index) = source {
-                    box_map.entry_or_insert_with(*index, || {
+                    box_map.entry(*index).or_insert_with(|| {
                         let n = liveboxes.len();
                         liveboxes.push(*index);
                         n
@@ -3099,7 +3099,7 @@ impl ResumeDataLoopMemo {
         match source {
             // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
             ResumeValueSource::FailArg(index) => {
-                let compact = *box_map.entry_or_insert_with(*index, || {
+                let compact = *box_map.entry(*index).or_insert_with(|| {
                     let n = liveboxes.len();
                     liveboxes.push(*index);
                     n
@@ -4165,7 +4165,7 @@ impl ResumeDataLoopMemo {
         for vinfo in &rd_virtuals {
             for source in vinfo.field_sources() {
                 if let ResumeValueSource::FailArg(index) = source {
-                    box_map.entry_or_insert_with(*index, || {
+                    box_map.entry(*index).or_insert_with(|| {
                         let n = liveboxes.len();
                         liveboxes.push(*index);
                         n
