@@ -443,6 +443,30 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::jit_range_iter_new as *const (),
     );
 
+    // `@jit.elidable`-decorated inherent methods that show up as
+    // `residual_call_*` in the codewriter (`call.py:181-187
+    // getfunctionptr(graph)` parity).  Without an entry here
+    // `direct_funcptr_value` (`jtransform.rs:614-623`) falls back to
+    // `symbolic_fnaddr_for_path`, which is a deterministic hash but NOT
+    // a valid function address — invoking it at the walker's
+    // `execute_residual_call` (`jitcode_dispatch.rs:3192-3239`) is an
+    // immediate SEGV.  Path shape matches
+    // `target_to_path` for inherent method calls
+    // (`call.rs:3024-3028 CallPath::for_impl_method(impl_type_joined,
+    // method)`): the `register_macro_helper_trace_fnaddr` string-strip
+    // drops the leading crate segment, leaving `[module, Type, method]`
+    // which is the exact 3-segment shape `for_impl_method` produces.
+    //
+    // PyFrame::nlocals — invoked by `eval.rs:840 pop_value` and is the
+    // funcptr the walker reaches when dispatching `PopTop`'s nested
+    // `pop_value` sub-jitcode.
+    let pyframe_nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::nlocals",
+        pyframe_nlocals as *const (),
+    );
+
     // RPython convention (cross-reference `support.py:255-271` for
     // the C-trunc helpers, `rint.py:398/495` for the Python-floor
     // ones) is to keep the two semantic flavours under DISTINCT

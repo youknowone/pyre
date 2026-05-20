@@ -268,6 +268,28 @@ fn real_main() {
     let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
     std::fs::write(format!("{out_dir}/opcode_descrs.bin"), &descrs_bin).unwrap();
 
+    // RPython's translator AOT-compiles every helper into a single binary, so
+    // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable
+    // at runtime.  Pyre's `majit-translate` runs in `build.rs` — a separate
+    // process from `pyre-dynasm` — so every fnaddr captured here is the
+    // build-script process's address, which ASLR (and the divergent executable
+    // layouts) invalidates at runtime.  Persist the `(path, build_fnaddr)`
+    // table the codewriter consumed so the runtime patcher
+    // (`runtime_fnaddr_patch::patch_constants_i_fnaddrs`) can pair each build
+    // address with the matching runtime address from
+    // `pyre_interpreter::jit_trace_fnaddrs()` and overwrite stale constants
+    // before the walker invokes them.
+    let fnaddr_bindings_owned: Vec<(String, i64)> = fnaddr_bindings
+        .iter()
+        .map(|(p, a)| ((*p).to_string(), *a))
+        .collect();
+    let fnaddr_bindings_bin = bincode::serialize(&fnaddr_bindings_owned).unwrap();
+    std::fs::write(
+        format!("{out_dir}/opcode_fnaddr_bindings.bin"),
+        &fnaddr_bindings_bin,
+    )
+    .unwrap();
+
     // Report
     let arms_with_jitcode = pipeline
         .opcode_dispatch
