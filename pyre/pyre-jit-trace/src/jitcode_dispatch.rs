@@ -117,15 +117,18 @@
 //!       dynamic calldescr builder; live tracer also returns None
 //!       universally (`pyjitpl/mod.rs:11487-11491`). Production reach
 //!       0 — pyre interpreter doesn't expose libffi calls.
-//!    e. Guard recording uses plain `ctx.trace_ctx.record_guard(..., 0)`
-//!       with `rd_resume_position=-1` placeholder. Walker is the
-//!       symbolic shadow validator (`shadow_walker.rs`) and its IR is
-//!       rolled back via `cut_trace`; trait dispatch's
-//!       `capture_resumedata(after_residual_call=True)`
-//!       (`trace_opcode.rs:3214-3253`) emits the actual snapshot,
-//!       auto-detected from the guard opcode
-//!       (`trace_opcode.rs:3072-3078 generate_guard`). Walker has no
-//!       resume-data obligation by design.
+//!    e. Guard recording uses `ctx.trace_ctx.record_guard(..., 0)`
+//!       followed by `walker_capture_snapshot_for_last_guard`
+//!       (`jitcode_dispatch.rs:walker_capture_snapshot_for_last_guard`)
+//!       — the walker-side port of `capture_resumedata(
+//!       after_residual_call=True)` (`pyjitpl.py:2599-2603`).  Each
+//!       residual_call guard (`GuardNotForced`, `GuardNoException`)
+//!       carries a single-frame snapshot keyed by
+//!       `ctx.current_jitcode_index` so the optimizer's
+//!       `store_final_boxes_in_guard` finds populated resume data.
+//!       Active-box narrowing via per-PC liveness is a Phase 4
+//!       follow-up; today's helper conservatively snapshots every
+//!       non-`OpRef::NONE` register across all three banks.
 //!    (Item f from the earlier audit — `_build_allboxes` ABI re-ordering
 //!    — landed in slice 4.x: see [`build_allboxes`].)
 //! 2. `raise/r`'s `GUARD_CLASS` (`pyjitpl.py:1690-1693 opimpl_raise`)
@@ -443,6 +446,26 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// or means the trait-path seeded only the symbolic OpRef without
     /// a concrete (e.g. a synthetic test fixture).
     pub last_exc_value_concrete: ConcreteValue,
+    /// Index of the JitCode currently being walked.  Mirrors RPython
+    /// `metainterp.framestack[-1].jitcode.index` (`pyjitpl.py:2586`
+    /// `capture_resumedata` reads `frame.jitcode.index` from the top of
+    /// the framestack to stamp the snapshot frame).
+    ///
+    /// Pyre's walker has no `framestack` — it threads the current
+    /// jitcode coordinate through `WalkContext` instead.  Production
+    /// entries set this from `entry_jitcode.index()` at
+    /// [`dispatch_via_miframe_at_opcode_entry`]; sub-walks save the
+    /// caller's value, overwrite with the callee's index for the
+    /// nested call, then restore on return.  Test entries through
+    /// [`dispatch_via_miframe`] leave the field at `0` because no
+    /// JitCode index is known at the test fixture level.
+    ///
+    /// Read by [`walker_capture_snapshot_for_last_guard`] when the
+    /// walker emits an `after_residual_call` guard (`GuardNoException` /
+    /// `GuardNotForced`), so the snapshot frame carries the same
+    /// `jitcode_index` the optimizer would otherwise pull from the
+    /// MIFrame framestack.
+    pub current_jitcode_index: u32,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -952,22 +975,24 @@ fn concrete_int_for_switch(
     }
 }
 
-// Walker is the symbolic shadow validator (`shadow_walker.rs`); guards
-// are recorded via plain `ctx.trace_ctx.record_guard(..., 0)` with
-// `rd_resume_position=-1` placeholders.  RPython
-// `pyjitpl.py:2558-2602 generate_guard` pairs every guard with
-// `capture_resumedata(resumepc=orgpc)` walking `metainterp.framestack`
-// and consulting per-opcode liveness (`pyjitpl.py:177
-// get_list_of_active_boxes`) to encode the live `i`/`r`/`f` registers
-// in i→r→f order plus virtualizable / vref boxes.  The walker carries
-// only the typed register banks and has no per-opcode `live` byte
-// reader, so any snapshot constructed here would be a layout
-// approximation strictly worse than no resume because the optimizer's
-// `store_final_boxes_in_guard` would consume it as truth.  By design
-// the trait-driven leg (`MIFrame::execute_opcode_step` in
-// `trace_opcode.rs`) is the source of the RPython-orthodox snapshot;
-// walker IR is rolled back via `cut_trace` so its placeholder resume
-// position never reaches the optimizer.
+// Walker guard recording (`GuardNoException`, `GuardNotForced` after
+// residual_call) pairs every guard with
+// `walker_capture_snapshot_for_last_guard`, the walker-side port of
+// RPython's `capture_resumedata(after_residual_call=True)`
+// (`pyjitpl.py:2599-2603`).  RPython `pyjitpl.py:2558-2602
+// generate_guard` walks `metainterp.framestack` and consults per-opcode
+// liveness (`pyjitpl.py:177 get_list_of_active_boxes`) to encode the
+// live `i`/`r`/`f` registers in i→r→f order plus virtualizable / vref
+// boxes.  Walker's helper today omits per-PC liveness narrowing (Phase 4
+// follow-up: thread the `op_live` byte table through `SubJitCodeBody`)
+// and conservatively snapshots every non-`OpRef::NONE` register —
+// over-capture is correctness-preserving because the optimizer's
+// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) derives
+// `op.fail_args` from the snapshot via `store_final_boxes(liveboxes)`,
+// so dead registers are dropped before they reach the backend.  Walker
+// IR is no longer rolled back via `cut_trace` for the production
+// dispatch (`production_walker_handles` allow-list); the snapshot
+// must therefore be RPython-orthodox.
 
 /// Read a Ref-bank variadic operand list (`R` argcode): 1 length byte
 /// followed by `len` register bytes. Returns the resolved [`OpRef`]s
@@ -1337,6 +1362,7 @@ fn dispatch_switch_id(
             let expected = ctx.trace_ctx.const_int(search_value);
             ctx.trace_ctx
                 .record_guard(OpCode::GuardValue, &[valuebox, expected], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
             ctx.trace_ctx.replace_box(valuebox, expected);
             for slot in ctx.registers_i.iter_mut() {
                 if *slot == valuebox {
@@ -1366,6 +1392,7 @@ fn dispatch_switch_id(
                     .set_opref_concrete(eqbox, majit_ir::Value::Int((v == key) as i64));
             }
             ctx.trace_ctx.record_guard(OpCode::GuardFalse, &[eqbox], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1620,6 +1647,7 @@ pub fn dispatch_via_miframe(
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
+            current_jitcode_index: 0,
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -1718,16 +1746,26 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let trace_ctx = unsafe { &mut *ctx_ptr };
     let sym = unsafe { &mut *sym_ptr };
 
-    let initial_last_exc_value = if sym.last_exc_box.is_none() {
-        None
-    } else {
-        Some(sym.last_exc_box)
-    };
-    let initial_last_exc_value_concrete = if sym.last_exc_value.is_null() {
-        ConcreteValue::Null
-    } else {
-        ConcreteValue::Ref(sym.last_exc_value)
-    };
+    // Per-opcode arm entry: start with `last_exc_value = None`.
+    //
+    // RPython parity: each Python opcode dispatch invokes a self-
+    // contained arm jitcode whose IR body never observes an inherited
+    // `metainterp.last_exc_value`.  The `catch_exception/L` ops the
+    // codewriter emits around a residual_call exist solely to catch
+    // exceptions raised BY that residual_call inside the arm — they
+    // are not meant to fire on a pre-existing pending exception from
+    // a prior Python opcode.  Python-level exception state survives
+    // across opcodes through `sym.last_exc_box` + the runtime's
+    // exception table, which the JIT recorder bridges through the
+    // `exception_target` mechanism rather than `WalkContext.
+    // last_exc_value`.  Seeding to `None` here matches that boundary.
+    //
+    // The post-walk writeback below preserves any pre-existing
+    // `sym.last_exc_box` because it only OVERWRITES when the walker
+    // arm itself produced a `Some(exc)` via `raise/r` — a per-opcode
+    // arm without a `raise/r` leaves `sym.last_exc_box` untouched.
+    let initial_last_exc_value: Option<OpRef> = None;
+    let initial_last_exc_value_concrete = ConcreteValue::Null;
     let frame_opref = sym.frame;
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
@@ -1779,6 +1817,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
+            current_jitcode_index: entry_jitcode.index() as u32,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -2524,6 +2563,7 @@ fn ref_guard_value_record(
     let expected = ctx.trace_ctx.const_ref(ptr as usize as i64);
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc);
     ctx.trace_ctx.replace_box(value, expected);
     for slot in ctx.registers_r.iter_mut() {
         if *slot == value {
@@ -3384,6 +3424,53 @@ fn write_residual_call_result_to_dst(
     Ok(())
 }
 
+/// Walker-side port of `pyjitpl.py:2586-2602 MIFrame.capture_resumedata`
+/// for the `after_residual_call=True` path (`pyjitpl.py:2078-2082
+/// handle_possible_exception`).  Attaches a single-frame snapshot to
+/// the last recorded guard so the optimizer's
+/// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
+/// `rd_resume_position >= 0` and can derive `op.fail_args` from the
+/// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
+///
+/// Active-box collection PRE-EXISTING-ADAPTATION: RPython
+/// `_get_list_of_active_boxes` (`pyjitpl.py:218-225`) reads only
+/// JitCode-liveness-live registers at the resume PC.  Pyre's walker
+/// does not yet thread the `op_live` byte table through `WalkContext`
+/// (the byte table lives on the JitCode body, but the walker only
+/// borrows `JitCodeBody.code` as a slice — Phase 4 follow-up will
+/// surface the table through `SubJitCodeBody`).  Until then this
+/// conservatively snapshots every non-`OpRef::NONE` register across
+/// `registers_r` / `registers_i` / `registers_f`.  Over-capture is
+/// correctness-preserving: `store_final_boxes` selects the actual
+/// `op.fail_args` from the snapshot via the optimizer's liveness
+/// pass, so dead registers in the snapshot are dropped before they
+/// reach the backend.
+fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
+    let mut active = Vec::with_capacity(
+        ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len(),
+    );
+    for r in ctx.registers_r.iter() {
+        if !r.is_none() {
+            active.push(*r);
+        }
+    }
+    for r in ctx.registers_i.iter() {
+        if !r.is_none() {
+            active.push(*r);
+        }
+    }
+    for r in ctx.registers_f.iter() {
+        if !r.is_none() {
+            active.push(*r);
+        }
+    }
+    ctx.trace_ctx.capture_snapshot_for_last_guard(
+        &active,
+        ctx.current_jitcode_index,
+        op_pc as u32,
+    );
+}
+
 fn direct_call_release_gil(
     ctx: &mut WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
@@ -3474,14 +3561,16 @@ fn direct_call_release_gil(
     // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
     // diff would run.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc);
     // pyjitpl.py:2082 handle_possible_exception — emits
-    // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.
-    // PRE-EXISTING-ADAPTATION: walker has no MIFrame liveness /
-    // framestack to feed `capture_resumedata(after_residual_call=True)`
-    // (pyjitpl.py:2082 → 2586), so the guard records with
-    // `rd_resume_position=-1` — matching shape without resume data.
+    // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.  Walker's
+    // `walker_capture_snapshot_for_last_guard` ports
+    // `capture_resumedata(after_residual_call=True)` so the optimizer's
+    // `store_final_boxes_in_guard` finds a populated
+    // `rd_resume_position`.
     if ei.check_can_raise(false) {
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc);
     }
     Ok(())
 }
@@ -3598,11 +3687,18 @@ fn direct_call_release_gil(
 ///     [`dispatch_inline_call_dr_kind`] instead. Adding the path would
 ///     require the codewriter to emit a new `assembler_call` shape, not
 ///     a walker-side change.
-///   - `num_live`-aware `capture_resumedata(after_residual_call=True)`
-///     liveness on the guards (`pyjitpl.py:2078-2082 → 2586`). Walker
-///     guards stay at `rd_resume_position=-1`; without the MIFrame
-///     liveness / framestack walk the only honest snapshot is none.
-///     Convergence: capture_resumedata wire-up epic (multi-session).
+///   - Per-PC liveness narrowing for the snapshot that
+///     `walker_capture_snapshot_for_last_guard` attaches
+///     (`pyjitpl.py:218-225 _get_list_of_active_boxes`). Walker's
+///     helper today snapshots every non-`OpRef::NONE` register across
+///     all three banks; RPython narrows the box list via
+///     `jitcode.get_live_vars_info(pc, op_live)` so dead registers are
+///     pruned before the snapshot.  The walker has no `op_live` byte
+///     reader plumbed through `SubJitCodeBody` yet — Phase 4 follow-up
+///     once the codewriter exposes the per-PC liveness table on the
+///     callee body slice.  Over-capture is correctness-preserving:
+///     `store_final_boxes_in_guard` filters dead boxes from the
+///     snapshot via the optimizer's liveness pass.
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
@@ -3737,14 +3833,18 @@ fn dispatch_residual_call_iRd_kind(
         // diff would run.
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
         // pyjitpl.py:2082 `metainterp.handle_possible_exception()` emits
         // `GUARD_NO_EXCEPTION` whenever the EffectInfo can raise.
-        // Walker has no MIFrame liveness/framestack to feed
-        // `capture_resumedata(after_residual_call=True)` so the guard
-        // records with `rd_resume_position=-1`.
+        // `walker_capture_snapshot_for_last_guard` ports
+        // `capture_resumedata(after_residual_call=True)`
+        // (`pyjitpl.py:2599-2603`) so the optimizer's
+        // `store_final_boxes_in_guard` finds a populated
+        // `rd_resume_position`.
         if can_raise {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
 
         // pyjitpl.py:2109 `heapcache.call_loopinvariant_now_known`:
@@ -3901,9 +4001,11 @@ fn dispatch_residual_call_iIRd_kind(
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
         if can_raise {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
 
         loopinvariant_now_known(ctx, ei, descr_key, funcptr, recorded);
@@ -4022,9 +4124,11 @@ fn dispatch_residual_call_iIRFd_kind(
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
         if can_raise {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
 
         loopinvariant_now_known(ctx, ei, descr_key, funcptr, recorded);
@@ -4165,6 +4269,7 @@ fn dispatch_inline_call_dr_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: sub_index as u32,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4343,6 +4448,7 @@ fn dispatch_inline_call_dir_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: sub_index as u32,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4516,6 +4622,7 @@ fn dispatch_inline_call_dirf_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: sub_index as u32,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4718,6 +4825,7 @@ fn handle(
             // does.
             if !valuebox.is_constant() {
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc);
                 ctx.trace_ctx.replace_box(valuebox, promoted);
                 for slot in ctx.registers_i.iter_mut() {
                     if *slot == valuebox {
@@ -5290,6 +5398,7 @@ fn handle(
                         let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
                         ctx.trace_ctx
                             .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+                        walker_capture_snapshot_for_last_guard(ctx, op.pc);
                         ctx.trace_ctx
                             .heap_cache_mut()
                             .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
@@ -5503,6 +5612,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -5670,6 +5780,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -5711,6 +5822,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -5751,6 +5863,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -5800,6 +5913,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -5841,6 +5955,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -5881,6 +5996,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -6016,6 +6132,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -6169,6 +6286,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -6270,6 +6388,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -6365,6 +6484,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -6449,6 +6569,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -6530,6 +6651,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -6589,6 +6711,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -6630,6 +6753,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -6667,6 +6791,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6712,6 +6837,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6763,6 +6889,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -6809,6 +6936,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -6860,6 +6988,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -6910,6 +7039,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -6964,6 +7094,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -7004,6 +7135,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -7047,6 +7179,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7090,6 +7223,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7181,6 +7315,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -7220,6 +7355,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7271,6 +7407,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7352,6 +7489,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7418,6 +7556,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7475,6 +7614,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -7513,6 +7653,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -8124,6 +8265,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8226,6 +8368,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8279,6 +8422,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8329,6 +8473,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -8370,6 +8515,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8410,6 +8556,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -8471,6 +8618,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8520,6 +8668,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -8560,6 +8709,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8599,6 +8749,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -8648,6 +8799,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -8788,6 +8940,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -8855,6 +9008,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8903,6 +9057,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -8973,6 +9128,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9023,6 +9179,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -9062,6 +9219,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -9103,6 +9261,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -9152,6 +9311,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -9193,6 +9353,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9258,6 +9419,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9308,6 +9470,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -9370,6 +9533,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9449,6 +9613,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -9494,16 +9659,17 @@ mod tests {
             guard_op.num_args() == 0,
             "GuardNoException takes no operand args",
         );
-        // PRE-EXISTING-ADAPTATION: standalone walker has no MIFrame
-        // liveness / framestack to feed `capture_resumedata(orgpc,
-        // after_residual_call=True)` (`pyjitpl.py:2082-2086`).  Until
-        // that infrastructure lands, walker guards record with empty
-        // resume data — better than a wrong-layout snapshot the
-        // optimizer would consume as truth.
-        assert_eq!(
-            guard_op.rd_resume_position.get(),
-            -1,
-            "walker guards stay at rd_resume_position=-1 by design (shadow validator; trait-leg captures resumedata)",
+        // `walker_capture_snapshot_for_last_guard` ports
+        // `capture_resumedata(after_residual_call=True)`
+        // (`pyjitpl.py:2599-2603`).  Every guard emitted by a
+        // residual_call dispatcher now carries a snapshot whose
+        // `rd_resume_position` is the freshly-allocated snapshot id
+        // (`>= 0`), so the optimizer's `store_final_boxes_in_guard`
+        // (`optimizeopt/mod.rs:5033`) finds attached resume data
+        // instead of panicking on the `-1` sentinel.
+        assert!(
+            guard_op.rd_resume_position.get() >= 0,
+            "GuardNoException must carry an attached snapshot (rd_resume_position >= 0) after Phase 4 capture_resumedata port",
         );
     }
 
@@ -9595,6 +9761,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9651,6 +9818,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -9698,6 +9866,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -9740,6 +9909,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9791,6 +9961,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9844,6 +10015,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -9874,15 +10046,15 @@ mod tests {
         // pyjitpl.py:1950 _opimpl_residual_call*: result lands in
         // `registers_*[reg_index]` BEFORE
         // `handle_possible_exception()` records GUARD_NO_EXCEPTION.
-        // A future capture_resumedata(after_residual_call=True) wire-up
-        // would snapshot fail_args from registers_*; the slot
-        // corresponding to `>r` MUST hold the recorded OpRef rather
-        // than its prior value at that moment.  Walker today records
-        // guards with `rd_resume_position=-1`; the structural
-        // invariant we can test is: after dispatch, the dst slot holds
-        // the recorded call op's OpRef, and the recorded sequence is
-        // `[CallR, GuardNoException]` — i.e. the writeback ran on the
-        // record-side BEFORE the guard append.
+        // `walker_capture_snapshot_for_last_guard`
+        // (`pyjitpl.py:2599-2603 capture_resumedata(after_residual_call
+        // =True)`) snapshots the active registers AFTER the writeback,
+        // so the dst slot's recorded OpRef rides the snapshot's
+        // fail_arg list.  The structural invariant tested here is:
+        // after dispatch, the dst slot holds the recorded call op's
+        // OpRef, and the recorded sequence is `[CallR, GuardNoException]`
+        // — i.e. the writeback ran on the record-side BEFORE the
+        // guard append (and therefore before the snapshot capture).
         let residual_byte = *insns_opname_to_byte()
             .get("residual_call_r_r/iRd>r")
             .expect("`residual_call_r_r/iRd>r` must be in insns table");
@@ -9917,6 +10089,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9979,6 +10152,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10040,6 +10214,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -10083,6 +10258,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -10164,6 +10340,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -10238,6 +10415,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -10326,6 +10504,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -10440,6 +10619,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10490,6 +10670,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -10532,6 +10713,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -10598,6 +10780,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -10709,6 +10892,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -10796,6 +10980,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -10882,6 +11067,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -10947,6 +11133,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -11015,6 +11202,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -11081,6 +11269,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -11153,6 +11342,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -11223,6 +11413,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -11281,6 +11472,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11361,6 +11553,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -11418,6 +11611,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -11457,6 +11651,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -11514,6 +11709,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11588,6 +11784,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11655,6 +11852,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -11700,6 +11898,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -11768,6 +11967,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -11816,6 +12016,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11886,6 +12087,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -11942,6 +12144,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
@@ -12006,6 +12209,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12303,6 +12507,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            current_jitcode_index: 0,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
