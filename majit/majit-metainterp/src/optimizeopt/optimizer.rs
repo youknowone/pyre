@@ -1796,6 +1796,16 @@ impl Optimizer {
         }
     }
 
+    /// `virtualize.py:140` fan-out: publish the live `VirtualRefInfo`
+    /// (`MetaInterp.virtualref_info` / RPython
+    /// `metainterp_sd.virtualref_info`) to every pass that consumes it
+    /// (`OptVirtualize`).  Other passes' `set_vrefinfo` is a no-op.
+    pub fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        for pass in &mut self.passes {
+            pass.set_vrefinfo(vrefinfo.clone());
+        }
+    }
+
     /// Mark all passes as Phase 2 (loop body).
     pub fn set_phase2(&mut self, phase2: bool) {
         for pass in &mut self.passes {

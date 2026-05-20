@@ -2719,6 +2719,12 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
+        // `virtualize.py:140` `vrefinfo =
+        // self.optimizer.metainterp_sd.virtualref_info` — install the
+        // live `VirtualRefInfo` from `MetaInterp.virtualref_info` so
+        // OptVirtualize emit sites read the same cpu-attached descrs
+        // PyPy's `cpu.fielddescrof(JIT_VIRTUAL_REF, ...)` would.
+        opt.set_vrefinfo(self.virtualref_info.clone());
         // optimizer.py:787-789: constant_fold — allocate immutable objects
         // at compile time. Uses Box::leak for permanent allocation (immutable
         // objects are never freed, matching RPython's prebuilt constants).

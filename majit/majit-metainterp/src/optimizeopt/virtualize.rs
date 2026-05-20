@@ -302,6 +302,14 @@ pub struct OptVirtualize {
     last_guard_not_forced_2: Option<Op>,
     /// virtualize.py:81 / 84
     finish_guard_op: Option<Op>,
+    /// `virtualize.py:140` `vrefinfo =
+    /// self.optimizer.metainterp_sd.virtualref_info` parity — the
+    /// cached `VirtualRefInfo` whose `descr_forced` /
+    /// `descr_virtual_token` / `descr` Arcs `optimize_virtual_ref` and
+    /// `optimize_virtual_ref_finish` stamp onto SETFIELD_GC ops.
+    /// Cloned cheaply (3 `Arc`s); production passes the live
+    /// `MetaInterp.virtualref_info`, tests use `Default`.
+    vrefinfo: crate::virtualref::VirtualRefInfo,
 }
 
 impl OptVirtualize {
@@ -311,6 +319,7 @@ impl OptVirtualize {
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
             finish_guard_op: None,
+            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
         }
     }
 
@@ -321,7 +330,17 @@ impl OptVirtualize {
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
             finish_guard_op: None,
+            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
         }
+    }
+
+    /// `virtualize.py:140` parity: install the live `VirtualRefInfo`
+    /// from `MetaInterp.virtualref_info` so emit sites read the cached
+    /// `vrefinfo.descr_*` Arcs through this field instead of
+    /// reconstructing them on demand.
+    pub fn with_vrefinfo(mut self, vrefinfo: crate::virtualref::VirtualRefInfo) -> Self {
+        self.vrefinfo = vrefinfo;
+        self
     }
 
     // ── PtrInfo accessors (delegated to ctx) ──
@@ -1387,7 +1406,9 @@ impl OptVirtualize {
     /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
     /// the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_descr: DescrRef = vref_size_descr();
+        // `virtualize.py:140` `vrefinfo = ... metainterp_sd.virtualref_info`
+        // / `virtualize.py:123` `vrefinfo.descr` parity.
+        let vref_descr: DescrRef = self.vrefinfo.descr.clone();
 
         // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = Op::new(OpCode::ForceToken, &[]);
@@ -1514,17 +1535,20 @@ impl OptVirtualize {
 
         // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops.
 
-        // virtualize.py:150-153: set 'forced' to the real object.
+        // virtualize.py:150-153: set 'forced' to the real object via
+        // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
+        // Arc from `virtualref.py:42`).
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
-            set_forced.setdescr(make_vref_field_descr(VREF_FORCED_FIELD_INDEX));
+            set_forced.setdescr(self.vrefinfo.descr_forced.clone());
             ctx.emit_extra(ctx.current_pass_idx, set_forced);
         }
 
-        // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
+        // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
+        // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
-        set_token.setdescr(make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
+        set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
         ctx.emit_extra(ctx.current_pass_idx, set_token);
 
         OptimizationResult::Remove
@@ -1974,6 +1998,10 @@ impl Optimization for OptVirtualize {
 
     fn name(&self) -> &'static str {
         "virtualize"
+    }
+
+    fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        self.vrefinfo = vrefinfo;
     }
 }
 

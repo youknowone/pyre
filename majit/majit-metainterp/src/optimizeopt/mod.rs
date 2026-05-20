@@ -7087,6 +7087,11 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_pureop_historylength(&mut self, _limit: usize) {}
 
+    /// `virtualize.py:140 vrefinfo =
+    /// self.optimizer.metainterp_sd.virtualref_info` parity hook.  Only
+    /// `OptVirtualize` reads this; other passes ignore it.
+    fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
+
     /// optimizer.py:517 propagate_all_forward(trace, call_pure_results, flush).
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
