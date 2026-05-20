@@ -1900,33 +1900,75 @@ fn init_fcntl(ns: &mut DictStorage) {
             }
         }),
     );
-    // Constants (POSIX subset).
+    // `interp_fcntl.py:25-37 constant_names` — POSIX subset always
+    // exposed; Linux-specific block gated below.  I_* (System V
+    // STREAMS) are listed by PyPy but `if value is not None` filters
+    // them out at platform.configure time on every supported platform;
+    // not exposed here.
     #[cfg(unix)]
     {
-        crate::dict_storage_store(ns, "F_GETFD", pyre_object::w_int_new(libc::F_GETFD as i64));
-        crate::dict_storage_store(ns, "F_SETFD", pyre_object::w_int_new(libc::F_SETFD as i64));
-        crate::dict_storage_store(ns, "F_GETFL", pyre_object::w_int_new(libc::F_GETFL as i64));
-        crate::dict_storage_store(ns, "F_SETFL", pyre_object::w_int_new(libc::F_SETFL as i64));
-        crate::dict_storage_store(ns, "F_DUPFD", pyre_object::w_int_new(libc::F_DUPFD as i64));
-        crate::dict_storage_store(ns, "F_GETLK", pyre_object::w_int_new(libc::F_GETLK as i64));
-        crate::dict_storage_store(ns, "F_SETLK", pyre_object::w_int_new(libc::F_SETLK as i64));
-        crate::dict_storage_store(
-            ns,
-            "F_SETLKW",
-            pyre_object::w_int_new(libc::F_SETLKW as i64),
-        );
-        crate::dict_storage_store(ns, "F_RDLCK", pyre_object::w_int_new(libc::F_RDLCK as i64));
-        crate::dict_storage_store(ns, "F_WRLCK", pyre_object::w_int_new(libc::F_WRLCK as i64));
-        crate::dict_storage_store(ns, "F_UNLCK", pyre_object::w_int_new(libc::F_UNLCK as i64));
-        crate::dict_storage_store(
-            ns,
-            "FD_CLOEXEC",
-            pyre_object::w_int_new(libc::FD_CLOEXEC as i64),
-        );
-        crate::dict_storage_store(ns, "LOCK_SH", pyre_object::w_int_new(libc::LOCK_SH as i64));
-        crate::dict_storage_store(ns, "LOCK_EX", pyre_object::w_int_new(libc::LOCK_EX as i64));
-        crate::dict_storage_store(ns, "LOCK_UN", pyre_object::w_int_new(libc::LOCK_UN as i64));
-        crate::dict_storage_store(ns, "LOCK_NB", pyre_object::w_int_new(libc::LOCK_NB as i64));
+        macro_rules! cst {
+            ($name:literal, $val:expr) => {
+                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        cst!("F_GETFD", libc::F_GETFD);
+        cst!("F_SETFD", libc::F_SETFD);
+        cst!("F_GETFL", libc::F_GETFL);
+        cst!("F_SETFL", libc::F_SETFL);
+        cst!("F_DUPFD", libc::F_DUPFD);
+        cst!("F_DUPFD_CLOEXEC", libc::F_DUPFD_CLOEXEC);
+        cst!("F_GETLK", libc::F_GETLK);
+        cst!("F_SETLK", libc::F_SETLK);
+        cst!("F_SETLKW", libc::F_SETLKW);
+        cst!("F_GETOWN", libc::F_GETOWN);
+        cst!("F_SETOWN", libc::F_SETOWN);
+        cst!("F_RDLCK", libc::F_RDLCK);
+        cst!("F_WRLCK", libc::F_WRLCK);
+        cst!("F_UNLCK", libc::F_UNLCK);
+        cst!("FD_CLOEXEC", libc::FD_CLOEXEC);
+        cst!("LOCK_SH", libc::LOCK_SH);
+        cst!("LOCK_EX", libc::LOCK_EX);
+        cst!("LOCK_UN", libc::LOCK_UN);
+        cst!("LOCK_NB", libc::LOCK_NB);
+
+        // Linux-only fcntl constants.  Values for ones libc does not
+        // expose (F_GETSIG/F_SETSIG/F_GETLK64/F_SETLK64/F_SETLKW64/
+        // F_EXLCK/F_SHLCK/LOCK_MAND/LOCK_READ/LOCK_WRITE/LOCK_RW/DN_*)
+        // come straight from Linux <fcntl.h>, matching the hardcoded
+        // overrides at `interp_fcntl.py:48-52`.
+        #[cfg(target_os = "linux")]
+        {
+            cst!("F_SETLEASE", libc::F_SETLEASE);
+            cst!("F_GETLEASE", libc::F_GETLEASE);
+            cst!("F_NOTIFY", libc::F_NOTIFY);
+            cst!("F_GETSIG", 11);
+            cst!("F_SETSIG", 10);
+            cst!("F_GETLK64", 12);
+            cst!("F_SETLK64", 13);
+            cst!("F_SETLKW64", 14);
+            cst!("F_EXLCK", 4);
+            cst!("F_SHLCK", 8);
+            cst!("LOCK_MAND", 32);
+            cst!("LOCK_READ", 64);
+            cst!("LOCK_WRITE", 128);
+            cst!("LOCK_RW", 192);
+            cst!("DN_ACCESS", 1);
+            cst!("DN_MODIFY", 2);
+            cst!("DN_CREATE", 4);
+            cst!("DN_DELETE", 8);
+            cst!("DN_RENAME", 16);
+            cst!("DN_ATTRIB", 32);
+            cst!("DN_MULTISHOT", 0x80000000u32);
+            cst!("F_ADD_SEALS", libc::F_ADD_SEALS);
+            cst!("F_GET_SEALS", libc::F_GET_SEALS);
+            cst!("F_SEAL_SEAL", libc::F_SEAL_SEAL);
+            cst!("F_SEAL_SHRINK", libc::F_SEAL_SHRINK);
+            cst!("F_SEAL_GROW", libc::F_SEAL_GROW);
+            cst!("F_SEAL_WRITE", libc::F_SEAL_WRITE);
+            cst!("F_SETPIPE_SZ", libc::F_SETPIPE_SZ);
+            cst!("F_GETPIPE_SZ", libc::F_GETPIPE_SZ);
+        }
     }
 }
 
