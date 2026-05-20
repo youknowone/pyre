@@ -7535,22 +7535,49 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
 /// conditions exactly (`push_typed_value:1802` and `pop_value:1901,
 /// 1917`).
 fn apply_walker_pop_top(state: &mut MIFrame) {
-    // Minimal sym tracker update: decrement `sym.valuestackdepth`.  The
-    // walker arm body for PopTop emits the IR ops (`setarrayitem_vable_r
-    // (slot, NULL)` + `setfield_vable_i(vsd_descr, depth-1)`) that
-    // mutate both `PyFrame.locals_cells_stack_w` and
-    // `PyFrame.valuestackdepth` at runtime, and routes through
-    // `TraceCtx::vable_setfield` / `vable_setarrayitem_indexed` which
-    // already update `virtualizable_boxes` at the matching flat indices
-    // (`trace_ctx.rs:2284, 2738, 2753`).  So the shadow side-table
-    // entries are already in sync; the only piece the walker does NOT
-    // touch is the standalone `sym.valuestackdepth` counter — that's
-    // this function's responsibility.
-    let s = state.sym_mut();
-    if s.valuestackdepth == 0 {
-        return;
-    }
-    s.valuestackdepth -= 1;
+    // Mirror the trait dispatch's `MIFrame::pop_value`
+    // (`trace_opcode.rs:1845..1928`) **symbolic** bookkeeping.  The
+    // walker arm body for PopTop has already emitted the IR ops
+    // (`setarrayitem_vable_r(slot, NULL)` + `int_sub_ovf` +
+    // `setfield_vable_i(vsd_descr, depth-1)`) that mutate
+    // `PyFrame.locals_cells_stack_w` and `PyFrame.valuestackdepth` at
+    // runtime, and their `vable_setfield` routing has updated
+    // `virtualizable_boxes` at the matching flat indices — but with the
+    // walker's IR-level OpRefs (e.g. the `int_sub_ovf` result) rather
+    // than the const_int trait dispatch uses for `sym.vable_valuestackdepth`.
+    //
+    // Subsequent opcodes' tracers (`fused_compare`, `peek_value`,
+    // `push_typed_value`) consult `sym.valuestackdepth` and
+    // `sym.vable_valuestackdepth` symbolically; without aligning these
+    // here, the counter / shadow drift produces `stack underflow in
+    // fused compare` at the next `CompareOp` (see
+    // `project_issue73_phase4_poptop_blocker.md`).
+    let (owns_vable, new_vsd) = state.with_ctx(|this, ctx| {
+        let s = this.sym();
+        if s.valuestackdepth <= s.nlocals {
+            // Walker arm body emitted IR for a stack pop, but the sym
+            // counter is already at floor — leave the counter alone
+            // and skip the shadow update (mirrors the
+            // `checked_sub(nlocals+1)` floor check in `pop_value`).
+            return (false, s.valuestackdepth);
+        }
+        let s = this.sym_mut();
+        s.valuestackdepth -= 1;
+        let new_vsd = s.valuestackdepth;
+        let owns_vable = s.owns_virtualizable_shadow();
+        if owns_vable {
+            let vsd_op = ctx.const_int(new_vsd as i64);
+            this.sym_mut().vable_valuestackdepth = vsd_op;
+            mirror_vable_static_to_boxes(
+                ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(new_vsd as i64),
+            );
+        }
+        (owns_vable, new_vsd)
+    });
+    let _ = (owns_vable, new_vsd);
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
