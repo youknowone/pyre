@@ -1613,15 +1613,16 @@ fn link_extravar_to_hlvalue(
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_ty_by_result: HashMap<
+    let mut input_by_result: HashMap<
         crate::flowspace::model::Variable,
-        &crate::model::ValueType,
+        (&crate::model::ValueType, &str),
     > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
-            input_ty_by_result.insert(result.clone(), ty);
+        if let (Some(result), OpKind::Input { ty, name }) = (op.result.as_ref(), &op.kind) {
+            input_by_result.insert(result.clone(), (ty, name.as_str()));
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1635,8 +1636,8 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(ty) = input_ty_by_result.get(var) {
-            let shell = valuetype_to_someshell(ty).ok_or_else(|| {
+        if let Some(&(ty, name)) = input_by_result.get(var) {
+            let mut shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
                      ({var:?}) has `ValueType::{ty:?}` (from Input op) whose \
@@ -1644,6 +1645,40 @@ pub(crate) fn derive_subject_inputcells(
                      only `ValueType::Unknown` lacks a SomeValue shell)"
                 ))
             })?;
+            // RPython parity: when the legacy graph carries an impl-block
+            // self-type root (`graph.owner_root`) and the receiver inputarg
+            // is `name == "self"` with `ty == Ref`, project the receiver as
+            // `SomeInstance(Some(getuniqueclassdef(im_class)))` instead of
+            // the abstract `SomeInstance(None)` that `valuetype_to_someshell`
+            // yields for un-narrowed Ref.  Mirrors
+            // `description.py:283-305 FunctionDesc.pycall` lifting `self`
+            // through `bookkeeper.getuniqueclassdef(im_class)` so the
+            // rtyper's `find_attribute` (`rclass.py:556`) can route
+            // `self.<field>` against the actual ClassDef.
+            //
+            // Gate: only activate the narrowing when the resulting
+            // ClassDef has non-empty `attrs` — naive activation against
+            // an empty-attrs ClassDef caused a `fib_recursive` timeout
+            // because the rtyper walks longer paths per failing-attribute
+            // lookup before Skip-classifying.  See [[z25-skip-profile-2026-05-20]].
+            if name == "self"
+                && matches!(ty, crate::model::ValueType::Ref(_))
+                && let Some(bk) = bookkeeper
+                && let Some(owner_root) = legacy.owner_root.as_deref()
+            {
+                if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(owner_root) {
+                    let attrs_populated = !classdef.borrow().attrs.is_empty();
+                    if attrs_populated {
+                        shell = crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(classdef),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        );
+                    }
+                }
+            }
             cells.push(shell);
             continue;
         }
@@ -2535,7 +2570,7 @@ mod tests {
         graph.push_inputarg_var(entry, y_var);
         graph.push_inputarg_var(entry, z_var);
 
-        let cells = derive_subject_inputcells(&graph)
+        let cells = derive_subject_inputcells(&graph, None)
             .expect("typed Input ops must project to definite SomeValue cells");
         assert_eq!(cells.len(), 3);
         assert!(
@@ -2561,7 +2596,7 @@ mod tests {
         let entry = graph.startblock;
         let orphan = graph.alloc_value_var();
         graph.push_inputarg_var(entry, orphan);
-        let err = derive_subject_inputcells(&graph)
+        let err = derive_subject_inputcells(&graph, None)
             .expect_err("inputarg without matching Input op must surface as TyperError");
         let msg = format!("{err}");
         assert!(
@@ -2585,7 +2620,7 @@ mod tests {
             )
             .unwrap();
         graph.push_inputarg_var(entry, var);
-        let err = derive_subject_inputcells(&graph)
+        let err = derive_subject_inputcells(&graph, None)
             .expect_err("ValueType::Unknown has no SomeValue projection");
         let msg = format!("{err}");
         assert!(

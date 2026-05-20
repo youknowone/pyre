@@ -1179,7 +1179,10 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // themselves into `all_blocks`/`annotated` through the same
     // bindinputargs path on first arrival.
     let subject_inputcells =
-        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(legacy)?;
+        crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
+            legacy,
+            Some(call_registry.bookkeeper()),
+        )?;
     let (startblock, exceptblock) = {
         let g = graph.borrow();
         (g.startblock.clone(), g.exceptblock.clone())
