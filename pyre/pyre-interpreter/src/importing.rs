@@ -3762,13 +3762,41 @@ fn init_socket(ns: &mut DictStorage) {
         );
     }
 
-    // Exception aliases.  pyre doesn't yet model exception subclassing
-    // for builtins so these are just type-stubs the stdlib can `isinstance`-
-    // gate without crashing.
-    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "gaierror", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "herror", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "timeout", crate::typedef::w_object());
+    // Exception classes — partial orthodoxy.  PyPy
+    // (pypy/module/_socket/interp_socket.py:1041-1063 SocketAPI):
+    //   error    = w_OSError (alias)
+    //   herror   = subclass of OSError, name "_socket.herror"
+    //   gaierror = subclass of OSError, name "_socket.gaierror"
+    //   timeout  = w_TimeoutError (which is itself an OSError subclass)
+    //
+    // pyre cannot yet construct OSError subclasses from outside
+    // crate::builtins (exc_exception_new is private), so for now each
+    // exception is a DISTINCT named builtin type rooted at `object`.
+    // This still gives `isinstance(e, _socket.gaierror)` a different
+    // answer from `isinstance(e, _socket.herror)`, which the flattened
+    // shared-w_object stub did not.  Proper OSError subclassing tracked
+    // as the framework prerequisite for full _socket orthodox parity
+    // (see project_hostenv_orthodox_audit_2026_05_20.md).
+    crate::dict_storage_store(
+        ns,
+        "error",
+        crate::typedef::make_builtin_type("_socket.error", |_| {}),
+    );
+    crate::dict_storage_store(
+        ns,
+        "gaierror",
+        crate::typedef::make_builtin_type("_socket.gaierror", |_| {}),
+    );
+    crate::dict_storage_store(
+        ns,
+        "herror",
+        crate::typedef::make_builtin_type("_socket.herror", |_| {}),
+    );
+    crate::dict_storage_store(
+        ns,
+        "timeout",
+        crate::typedef::make_builtin_type("_socket.timeout", |_| {}),
+    );
 
     // Default timeout (None) — modulus has a getter/setter; we just stash
     // a None so attribute lookups succeed.
