@@ -982,6 +982,7 @@ mod tests {
             ExcKind::SystemError,
             ExcKind::LookupError,
             ExcKind::UnicodeError,
+            ExcKind::UnicodeTranslateError,
         ] {
             let name = exc_kind_name(kind);
             assert_eq!(

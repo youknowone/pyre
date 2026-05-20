@@ -2126,17 +2126,11 @@ impl<'a> GraphFlattener<'a> {
             // mappers and test-side constant lowering — without
             // building a GraphFlattener.  Wrap the regallocs read /
             // constant lowering in fresh closures at the dispatch site
-            // so the dispatcher signature stays stable.
+            // so the dispatcher signature stays stable; both share the
+            // free `regalloc_color` helper with `getcolor_var` so a
+            // missing color panics uniformly.
             let regallocs = self.regallocs;
-            let mut get_register = |v: Variable| -> Register {
-                let kind = v.kind.unwrap_or(Kind::Ref);
-                let color = regallocs[kind.index()]
-                    .coloring
-                    .get(&v.id)
-                    .copied()
-                    .unwrap_or(u16::MAX);
-                Register::new(kind, color)
-            };
+            let mut get_register = |v: Variable| regalloc_color(regallocs, v);
             let mut lower_constant = flatten_constant_operand;
             if let Some(insn) = try_flatten_retired_family_hlop_to_insn(
                 op,
@@ -2221,13 +2215,7 @@ impl<'a> GraphFlattener<'a> {
     /// Reads `regallocs[kind].coloring[v.id]` directly — matching
     /// upstream's `self.regallocs[kind].getcolor(v)`.
     fn getcolor_var(&self, v: Variable) -> Register {
-        let kind = v.kind.unwrap_or(Kind::Ref);
-        let color = self.regallocs[kind.index()]
-            .coloring
-            .get(&v.id)
-            .copied()
-            .unwrap_or(u16::MAX);
-        Register::new(kind, color)
+        regalloc_color(self.regallocs, v)
     }
 
     /// Lower a graph `Constant` to the typed `Operand` the assembler
@@ -2241,6 +2229,31 @@ impl<'a> GraphFlattener<'a> {
     fn lower_constant_op(&self, c: &Constant) -> Operand {
         flatten_constant_operand(c)
     }
+}
+
+/// Look up the regalloc color for `v` in the per-Kind `regallocs` table
+/// and build the matching `Register`.  Panics if `v` has no entry — a
+/// missing color signals a regalloc invariant violation upstream of the
+/// driver (`flatten.py:88-100 enforce_input_args` is meant to guarantee
+/// every Variable reached by `flatten_space_operation` is colored), and
+/// emitting a synthetic `u16::MAX` register would mask that into
+/// malformed SSA.  Shared by `GraphFlattener::getcolor_var` and the
+/// retired-family HLOp dispatch closure in `flatten_space_operation`.
+fn regalloc_color(
+    regallocs: &[super::regalloc::GraphAllocationResult; 3],
+    v: Variable,
+) -> Register {
+    let kind = v.kind.unwrap_or(Kind::Ref);
+    let color = *regallocs[kind.index()]
+        .coloring
+        .get(&v.id)
+        .unwrap_or_else(|| {
+            panic!(
+                "GraphFlattener: missing regalloc color for variable {:?} of kind {:?}",
+                v.id, kind,
+            )
+        });
+    Register::new(kind, color)
 }
 
 fn is_bool_or_tuple_exitswitch(
@@ -2451,8 +2464,39 @@ pub fn identity_test_regallocs(
                 record(v);
             }
         }
+        match &block_borrow.exitswitch {
+            Some(super::flow::ExitSwitch::Value(value)) => {
+                if let Some(v) = value.as_variable() {
+                    record(v);
+                }
+            }
+            Some(super::flow::ExitSwitch::Tuple(elements)) => {
+                for element in elements {
+                    if let super::flow::ExitSwitchElement::Value(value) = element {
+                        if let Some(v) = value.as_variable() {
+                            record(v);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
         for link in &block_borrow.exits {
-            for arg in &link.borrow().args {
+            let link_borrow = link.borrow();
+            if let Some(v) = link_borrow.last_exception {
+                record(v);
+            }
+            if let Some(v) = link_borrow.last_exc_value {
+                record(v);
+            }
+            if let Some(v) = link_borrow
+                .llexitcase
+                .as_ref()
+                .and_then(FlowValue::as_variable)
+            {
+                record(v);
+            }
+            for arg in &link_borrow.args {
                 if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
                     record(v);
                 }

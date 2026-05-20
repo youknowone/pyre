@@ -2136,6 +2136,61 @@ pub unsafe fn isinstance_str_w(obj: PyObjectRef) -> bool {
     false
 }
 
+/// `space.isinstance_w(w_obj, space.w_int)` — PyPy parity helper for
+/// `space.int_w` callers that should accept `int` and any `int`
+/// subclass (e.g. `bool` and user-defined `class MyInt(int): pass`).
+/// pyre's `pyre_object::is_int` matches `int` + `bool` only.
+pub unsafe fn isinstance_int_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_int(obj) {
+        return true;
+    }
+    if let Some(int_type) = crate::typedef::gettypefor(&pyre_object::INT_TYPE) {
+        return isinstance_w(obj, int_type);
+    }
+    false
+}
+
+/// `space.isinstance_w(w_obj, space.w_bytes)` — accepts `bytes` and
+/// any `bytes` subclass.
+pub unsafe fn isinstance_bytes_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_bytes(obj) {
+        return true;
+    }
+    if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
+        return isinstance_w(obj, bytes_type);
+    }
+    false
+}
+
+/// `space.charbuf_w` admits anything implementing the buffer protocol;
+/// PyPy's `W_UnicodeDecodeError.descr_init` (`interp_exceptions.py:1043`)
+/// uses it for `w_object` and then coerces to `bytes`.  In pyre the
+/// concrete buffer producers are `bytes` and `bytearray` (incl.
+/// subclasses); this helper accepts either.
+pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_bytes_like(obj) {
+        return true;
+    }
+    if let Some(bytes_type) = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE) {
+        if isinstance_w(obj, bytes_type) {
+            return true;
+        }
+    }
+    if let Some(bytearray_type) = crate::typedef::gettypefor(&pyre_object::BYTEARRAY_TYPE) {
+        return isinstance_w(obj, bytearray_type);
+    }
+    false
+}
+
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`

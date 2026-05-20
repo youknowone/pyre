@@ -1568,7 +1568,9 @@ fn handler_entry_state_from_catch_sites(
         if site.handler_py_pc != handler_py_pc {
             continue;
         }
-        let landing_state = site.landing.framestate()?;
+        let Some(landing_state) = site.landing.framestate() else {
+            continue;
+        };
         let candidate = handler_entry_state_from_catch_site(code, graph, &landing_state, site);
         merged = Some(match merged {
             None => candidate,

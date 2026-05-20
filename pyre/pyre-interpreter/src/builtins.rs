@@ -1411,8 +1411,12 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 ///         [w_object, w_start, w_end, w_reason])
 /// ```
 ///
-/// PyPy's `*_w` helpers raise `TypeError` from the typechecks; pyre
-/// mirrors via `PyError::type_error`.
+/// Typechecks go through subclass-accepting `isinstance_*_w` helpers
+/// to match PyPy's `space.utf8_w` / `space.int_w` / `space.realtext_w`
+/// behavior — `class MyStr(str): pass` and `class MyInt(int): pass`
+/// instances satisfy the check.  PyPy's `*_w` helpers raise
+/// `TypeError` from the typechecks; pyre mirrors via
+/// `PyError::type_error`.
 fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
         // first arg is `self`; PyPy reports argcount excluding `self`.
@@ -1426,18 +1430,18 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     let w_end = args[3];
     let w_reason = args[4];
     unsafe {
-        if w_object.is_null() || !pyre_object::is_str(w_object) {
+        if !crate::baseobjspace::isinstance_str_w(w_object) {
             return Err(crate::PyError::type_error(
                 "argument 1 must be str, not other",
             ));
         }
-        if w_start.is_null() || !pyre_object::is_int(w_start) {
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_end.is_null() || !pyre_object::is_int(w_end) {
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
             return Err(crate::PyError::type_error(
                 "argument 4 must be str, not other",
             ));
@@ -1476,27 +1480,34 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_end = args[4];
     let w_reason = args[5];
     unsafe {
-        if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
+        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
             return Err(crate::PyError::type_error(
                 "argument 1 must be str, not other",
             ));
         }
-        if w_object_in.is_null() || !pyre_object::is_bytes_like(w_object_in) {
+        if !crate::baseobjspace::isinstance_bytes_like_w(w_object_in) {
             return Err(crate::PyError::type_error(
                 "argument 2 must be bytes-like, not other",
             ));
         }
-        if w_start.is_null() || !pyre_object::is_int(w_start) {
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_end.is_null() || !pyre_object::is_int(w_end) {
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
             return Err(crate::PyError::type_error(
                 "argument 5 must be str, not other",
             ));
         }
+        // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
+        // `space.newbytes` coerce buffer-protocol producers
+        // (`bytearray`, exact `bytes`, and `bytes` subclasses) to a
+        // canonical `bytes`.  Pyre handles the two concrete cases
+        // pyre's interpreter exposes: `bytearray` → fresh `bytes`
+        // copy, anything else (which `isinstance_bytes_like_w`
+        // already gated to `bytes`-tagged objects) is stored as-is.
         let w_object = if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
             let data = pyre_object::bytes_like_data(w_object_in);
             pyre_object::w_bytes_from_bytes(data)
@@ -1537,23 +1548,23 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_end = args[4];
     let w_reason = args[5];
     unsafe {
-        if w_encoding.is_null() || !pyre_object::is_str(w_encoding) {
+        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
             return Err(crate::PyError::type_error(
                 "argument 1 must be str, not other",
             ));
         }
-        if w_object.is_null() || !pyre_object::is_str(w_object) {
+        if !crate::baseobjspace::isinstance_str_w(w_object) {
             return Err(crate::PyError::type_error(
                 "argument 2 must be str, not other",
             ));
         }
-        if w_start.is_null() || !pyre_object::is_int(w_start) {
+        if !crate::baseobjspace::isinstance_int_w(w_start) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_end.is_null() || !pyre_object::is_int(w_end) {
+        if !crate::baseobjspace::isinstance_int_w(w_end) {
             return Err(crate::PyError::type_error("an integer is required"));
         }
-        if w_reason.is_null() || !pyre_object::is_str(w_reason) {
+        if !crate::baseobjspace::isinstance_str_w(w_reason) {
             return Err(crate::PyError::type_error(
                 "argument 5 must be str, not other",
             ));
