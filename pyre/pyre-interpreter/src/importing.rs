@@ -1831,8 +1831,16 @@ fn init_atexit(ns: &mut DictStorage) {
     );
 }
 
-/// _signal module stub — PyPy: pypy/module/signal/. Provides the signal()
-/// function and SIG_DFL/SIG_IGN constants that signal.py wraps.
+/// _signal module — PyPy: pypy/module/signal/.
+///
+/// signal() / getsignal() / set_wakeup_fd() remain stubs because the
+/// real implementations need interpreter-side trampolines to invoke
+/// Python handlers from a Rust signal context.  alarm / pause /
+/// raise_signal / strsignal / valid_signals are full implementations
+/// backed by `rustpython_host_env::signal`.  Signal-number constants
+/// are sourced from `libc::*` so they match the host's POSIX numbering
+/// (the previous macOS-flavoured hard-coded list disagreed with Linux
+/// for SIGUSR1/SIGUSR2/SIGCHLD).
 fn init_signal_stub(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
@@ -1861,20 +1869,172 @@ fn init_signal_stub(ns: &mut DictStorage) {
         "set_wakeup_fd",
         crate::make_builtin_function("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1))),
     );
+    // ── real host_env-backed entry points ──
+    crate::dict_storage_store(
+        ns,
+        "raise_signal",
+        crate::make_builtin_function_with_arity(
+            "raise_signal",
+            |args| {
+                #[cfg(feature = "host_env")]
+                {
+                    let signum = if let Some(&a) = args.first() {
+                        unsafe { pyre_object::w_int_get_value(a) as i32 }
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "raise_signal() missing argument",
+                        ));
+                    };
+                    match rustpython_host_env::signal::raise_signal(signum) {
+                        Ok(()) => return Ok(pyre_object::w_none()),
+                        Err(e) => return Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("raise_signal: {e}"),
+                        )),
+                    }
+                }
+                #[cfg(not(feature = "host_env"))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "signal.raise_signal requires host_env",
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "strsignal",
+        crate::make_builtin_function_with_arity(
+            "strsignal",
+            |args| {
+                #[cfg(feature = "host_env")]
+                {
+                    let signum = if let Some(&a) = args.first() {
+                        unsafe { pyre_object::w_int_get_value(a) as i32 }
+                    } else {
+                        return Err(crate::PyError::type_error("strsignal() missing argument"));
+                    };
+                    return Ok(rustpython_host_env::signal::strsignal(signum)
+                        .map(|s| pyre_object::w_str_new(&s))
+                        .unwrap_or(pyre_object::w_none()));
+                }
+                #[cfg(not(feature = "host_env"))]
+                {
+                    let _ = args;
+                    Ok(pyre_object::w_none())
+                }
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "valid_signals",
+        crate::make_builtin_function_with_arity(
+            "valid_signals",
+            |_| {
+                #[cfg(feature = "host_env")]
+                {
+                    // PyPy passes NSIG (64) here; we match that bound.
+                    let sigs = rustpython_host_env::signal::valid_signals(64).unwrap_or_default();
+                    let items: Vec<pyre_object::PyObjectRef> = sigs
+                        .into_iter()
+                        .map(|n| pyre_object::w_int_new(n as i64))
+                        .collect();
+                    // CPython returns a frozenset; pyre exposes a plain set for now.
+                    return Ok(pyre_object::w_list_new(items));
+                }
+                #[cfg(not(feature = "host_env"))]
+                Ok(pyre_object::w_list_new(vec![]))
+            },
+            0,
+        ),
+    );
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(
+            ns,
+            "alarm",
+            crate::make_builtin_function_with_arity(
+                "alarm",
+                |args| {
+                    #[cfg(feature = "host_env")]
+                    {
+                        let secs = if let Some(&a) = args.first() {
+                            unsafe { pyre_object::w_int_get_value(a) as u32 }
+                        } else {
+                            return Err(crate::PyError::type_error("alarm() missing argument"));
+                        };
+                        return Ok(pyre_object::w_int_new(
+                            rustpython_host_env::signal::alarm(secs) as i64,
+                        ));
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::runtime_error(
+                            "signal.alarm requires host_env",
+                        ))
+                    }
+                },
+                1,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "pause",
+            crate::make_builtin_function_with_arity(
+                "pause",
+                |_| {
+                    #[cfg(feature = "host_env")]
+                    rustpython_host_env::signal::pause();
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+    }
     crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
-    // Common signal numbers (POSIX subset).
-    crate::dict_storage_store(ns, "SIGINT", pyre_object::w_int_new(2));
-    crate::dict_storage_store(ns, "SIGTERM", pyre_object::w_int_new(15));
-    crate::dict_storage_store(ns, "SIGHUP", pyre_object::w_int_new(1));
-    crate::dict_storage_store(ns, "SIGQUIT", pyre_object::w_int_new(3));
-    crate::dict_storage_store(ns, "SIGKILL", pyre_object::w_int_new(9));
-    crate::dict_storage_store(ns, "SIGUSR1", pyre_object::w_int_new(30));
-    crate::dict_storage_store(ns, "SIGUSR2", pyre_object::w_int_new(31));
-    crate::dict_storage_store(ns, "SIGPIPE", pyre_object::w_int_new(13));
-    crate::dict_storage_store(ns, "SIGALRM", pyre_object::w_int_new(14));
-    crate::dict_storage_store(ns, "SIGCHLD", pyre_object::w_int_new(20));
+    // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap.
     crate::dict_storage_store(ns, "NSIG", pyre_object::w_int_new(64));
+    // Common signal numbers (POSIX subset, sourced from libc so numerics
+    // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(ns, "SIGHUP", pyre_object::w_int_new(libc::SIGHUP as i64));
+        crate::dict_storage_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
+        crate::dict_storage_store(ns, "SIGQUIT", pyre_object::w_int_new(libc::SIGQUIT as i64));
+        crate::dict_storage_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
+        crate::dict_storage_store(ns, "SIGTRAP", pyre_object::w_int_new(libc::SIGTRAP as i64));
+        crate::dict_storage_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
+        crate::dict_storage_store(ns, "SIGBUS", pyre_object::w_int_new(libc::SIGBUS as i64));
+        crate::dict_storage_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
+        crate::dict_storage_store(ns, "SIGKILL", pyre_object::w_int_new(libc::SIGKILL as i64));
+        crate::dict_storage_store(ns, "SIGUSR1", pyre_object::w_int_new(libc::SIGUSR1 as i64));
+        crate::dict_storage_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
+        crate::dict_storage_store(ns, "SIGUSR2", pyre_object::w_int_new(libc::SIGUSR2 as i64));
+        crate::dict_storage_store(ns, "SIGPIPE", pyre_object::w_int_new(libc::SIGPIPE as i64));
+        crate::dict_storage_store(ns, "SIGALRM", pyre_object::w_int_new(libc::SIGALRM as i64));
+        crate::dict_storage_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
+        crate::dict_storage_store(ns, "SIGCHLD", pyre_object::w_int_new(libc::SIGCHLD as i64));
+        crate::dict_storage_store(ns, "SIGCONT", pyre_object::w_int_new(libc::SIGCONT as i64));
+        crate::dict_storage_store(ns, "SIGSTOP", pyre_object::w_int_new(libc::SIGSTOP as i64));
+        crate::dict_storage_store(ns, "SIGTSTP", pyre_object::w_int_new(libc::SIGTSTP as i64));
+        crate::dict_storage_store(ns, "SIGTTIN", pyre_object::w_int_new(libc::SIGTTIN as i64));
+        crate::dict_storage_store(ns, "SIGTTOU", pyre_object::w_int_new(libc::SIGTTOU as i64));
+        crate::dict_storage_store(ns, "SIGURG", pyre_object::w_int_new(libc::SIGURG as i64));
+        crate::dict_storage_store(ns, "SIGXCPU", pyre_object::w_int_new(libc::SIGXCPU as i64));
+        crate::dict_storage_store(ns, "SIGXFSZ", pyre_object::w_int_new(libc::SIGXFSZ as i64));
+        crate::dict_storage_store(ns, "SIGVTALRM", pyre_object::w_int_new(libc::SIGVTALRM as i64));
+        crate::dict_storage_store(ns, "SIGPROF", pyre_object::w_int_new(libc::SIGPROF as i64));
+        crate::dict_storage_store(ns, "SIGWINCH", pyre_object::w_int_new(libc::SIGWINCH as i64));
+        crate::dict_storage_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
+        crate::dict_storage_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+    }
 }
 
 /// itertools stub
