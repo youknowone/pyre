@@ -7503,21 +7503,56 @@ fn init_thread(ns: &mut DictStorage) {
             0,
         ),
     );
-    // _thread.get_native_id() — same source on Unix, only the symbol differs.
+    // _thread.get_native_id() — returns the kernel-level TID, NOT the
+    // pthread handle.  Mirrors rthread.c_get_native_id (rpython/rlib/
+    // rthread.py) used by pypy/module/thread/os_thread.py:204-210.
+    //
+    // host_env::thread::current_thread_id always returns pthread_self
+    // (suitable for get_ident above), so we drop to libc here:
+    //   * Linux/Android: syscall(SYS_gettid) — kernel TID, distinct
+    //     from pthread_self.
+    //   * macOS:         pthread_threadid_np(NULL, &tid) — 64-bit TID.
+    //   * Other Unix:    fall back to pthread_self (best effort; the
+    //     same as get_ident, matching the lack of a true TID concept).
     crate::dict_storage_store(
         ns,
         "get_native_id",
         crate::make_builtin_function_with_arity(
             "get_native_id",
             |_| {
-                #[cfg(feature = "host_env")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                    return Ok(pyre_object::w_int_new(tid as i64));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let mut tid: u64 = 0;
+                    let rc = unsafe {
+                        libc::pthread_threadid_np(0, &mut tid as *mut u64)
+                    };
+                    if rc == 0 {
+                        return Ok(pyre_object::w_int_new(tid as i64));
+                    }
                     return Ok(pyre_object::w_int_new(
-                        rustpython_host_env::thread::current_thread_id() as i64,
+                        unsafe { libc::pthread_self() } as i64,
                     ));
                 }
-                #[cfg(not(feature = "host_env"))]
-                Ok(pyre_object::w_int_new(1))
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "macos",
+                )))]
+                {
+                    #[cfg(unix)]
+                    {
+                        return Ok(pyre_object::w_int_new(
+                            unsafe { libc::pthread_self() } as i64,
+                        ));
+                    }
+                    #[cfg(not(unix))]
+                    Ok(pyre_object::w_int_new(1))
+                }
             },
             0,
         ),
