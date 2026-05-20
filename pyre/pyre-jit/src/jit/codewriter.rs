@@ -2790,11 +2790,10 @@ fn filter_liveness_in_place(
     walker_tracked_pc_live_indices: Option<&[usize]>,
 ) -> Vec<usize> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
-    // Walker-tracked positions are required: per-PC `-live-` markers
-    // need an explicit protection bitmap so `remove_repeated_live`
-    // doesn't merge across PCs, and the post-merge `live_markers`
-    // vector is built by translating the walker-tracked positions
-    // through the `remove_repeated_live` remap.  The walker's
+    // Walker-tracked positions are required: the post-merge
+    // `live_markers` vector is built by translating each walker-
+    // recorded per-PC `-live-` position through the
+    // `remove_repeated_live` remap.  The walker's
     // `walker_pc_live_marker_pos` side-table is the authoritative
     // source since T6.1 Slice 6 retired the per-PC `Insn::Label`
     // emission.
@@ -2806,11 +2805,11 @@ fn filter_liveness_in_place(
         );
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
-    // The protection bitmap + remap plumbing is internal to
-    // `liveness.rs` — `liveness.rs`'s public API (`compute_liveness`,
-    // `remove_repeated_live`) now matches upstream `liveness.py`
-    // exactly; this bridge is the sole pyre NEW-DEVIATION entry,
-    // slated for retirement in Task #124.B/C.
+    // `liveness.rs`'s public API (`compute_liveness`,
+    // `remove_repeated_live`) matches upstream `liveness.py`
+    // exactly — adjacent walker `-live-` markers may fold; the
+    // tolerant filter below handles PCs that resolve to a shared
+    // marker by emitting the UNION of per-PC narrowed sets.
     let live_markers = super::liveness::compute_liveness_with_pc_anchors(ssarepr, walker_tracked);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();

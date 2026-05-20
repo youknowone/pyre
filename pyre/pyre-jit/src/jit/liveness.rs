@@ -41,18 +41,17 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
 /// `walker_tracked_pc_live_indices[py_pc]` is the pre-merge SSARepr
 /// position the walker recorded for Python PC `py_pc`'s `-live-`
 /// marker.  This function:
-/// 1. Builds the protection bitmap so `remove_repeated_live` does not
-///    fold adjacent per-PC `-live-` markers across PC boundaries.
-/// 2. Runs `compute_liveness` (which calls `remove_repeated_live`).
-/// 3. Returns `live_markers[py_pc]` = post-merge SSARepr index of the
+/// 1. Runs `compute_liveness` (which calls `remove_repeated_live`).
+/// 2. Returns `live_markers[py_pc]` = post-merge SSARepr index of the
 ///    surviving `-live-` marker for Python PC `py_pc`, ready to be
 ///    translated to a byte offset by the assembler for runtime
 ///    `pc_map` resolution.
 ///
-/// Slated for retirement once Phase 4's canonical-driver production
-/// flip lands (Task #124.B/C) — the canonical driver emits `-live-`
-/// per block per `flatten.py:106-128`, not per PC, so the protection
-/// + remap plumbing is unneeded.
+/// `remove_repeated_live` may fold adjacent walker-recorded `-live-`
+/// markers into one survivor.  Multiple PCs in such a fold map to
+/// the same post-merge index; `filter_liveness_in_place` emits the
+/// UNION of per-PC narrowed sets at that index, so the shared marker
+/// is a safe conservative superset for any PC in the fold.
 pub(super) fn compute_liveness_with_pc_anchors(
     ssarepr: &mut SSARepr,
     walker_tracked_pc_live_indices: &[usize],
