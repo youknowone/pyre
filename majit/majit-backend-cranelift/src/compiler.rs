@@ -1258,21 +1258,6 @@ thread_local! {
     /// the GC sees its first JITFRAME, cleared when the active GC is
     /// replaced or torn down.
     static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
-    /// Active backend's `fail_descr_registry` handle. Set by
-    /// `execute_token*` entry points around compiled-code dispatch so
-    /// the runtime helper `wrap_call_assembler_deadframe_with_caller_prefix`
-    /// (`compiler.rs:646`) can register the freshly-allocated overlay
-    /// `CraneliftFailDescr` it attaches to the deadframe at line 682.
-    /// Without registration, `Backend::fail_descr_arc_from_addr`
-    /// (`compiler.rs:14200`) panics when the BH callback (`call_jit.rs:1711`)
-    /// looks up the overlay's address. PyPy's `compile.py:701
-    /// descr.handle_fail()` dispatches via descr object identity and has
-    /// no addr→Arc indirection — pyre's Rust C-ABI carries `descr_addr`
-    /// across the FFI boundary so the registry round-trip is needed for
-    /// ABI safety.
-    static CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY: RefCell<
-        Option<Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>>,
-    > = const { RefCell::new(None) };
 }
 
 fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
@@ -1322,24 +1307,6 @@ fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
 
 fn cranelift_gc_active() -> bool {
     CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some())
-}
-
-/// Set/clear the active backend's `fail_descr_registry` handle for the
-/// duration of compiled-code dispatch. Mirrors `set_cranelift_active_gc`.
-fn set_cranelift_active_fail_descr_registry(
-    registry: Option<Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>>,
-) {
-    CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY.with(|cell| *cell.borrow_mut() = registry);
-}
-
-/// RAII guard that clears `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY` on drop.
-/// Used by `execute_token*` so the TLS handle is restored on panic /
-/// early return, not just on the normal-completion path.
-struct FailDescrRegistryGuard;
-impl Drop for FailDescrRegistryGuard {
-    fn drop(&mut self) {
-        set_cranelift_active_fail_descr_registry(None);
-    }
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
@@ -2638,22 +2605,16 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         jf_force_descr != 0,
         "force_token_to_dead_frame: jf_force_descr is null"
     );
-    // Slice 7-Tβ14e: `jf_force_descr` carries the metainterp
-    // `AbstractFailDescr` Arc's data pointer (`history.py:125`
-    // identity).  Recover the live DescrRef from the active backend's
-    // registry — the JIT-baked address must round-trip through
-    // `register_fail_descrs` for this lookup to succeed.
-    let fail_descr = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
-        .with(|cell| {
-            cell.borrow().as_ref().and_then(|reg| {
-                reg.lock()
-                    .ok()
-                    .and_then(|m| m.get(&(jf_force_descr as usize)).cloned())
-            })
-        })
+    // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
+    // parity.  `jf_force_descr` carries the metainterp
+    // `AbstractFailDescr` Arc's data pointer (`history.py:125`).
+    // Resolve via the process-global Weak registry that
+    // `register_fail_descrs` populated alongside the CLT's
+    // `asmmemmgr_gcreftracers` strong root.
+    let fail_descr = crate::guard::lookup_fail_descr_global(jf_force_descr as usize)
         .expect(
             "force_token_to_dead_frame: jf_force_descr address not in \
-             fail_descr_registry — every JIT-baked descr must be registered",
+             FAIL_DESCR_REGISTRY_GLOBAL — every JIT-baked descr must be registered",
         );
     deadframe_from_jitframe(jf_gcref, fail_descr, None)
 }
@@ -3015,24 +2976,15 @@ fn call_assembler_guard_failure_inner(
 
     let target = unsafe { &*fast_lookup_ca_target(token_number) };
 
-    // Slice 7-Tβ14e: `fail_descr_ptr` is the JIT-baked metainterp
-    // `AbstractFailDescr` Arc's data pointer (`history.py:125`).
-    // Resolve via the active backend's registry — `register_fail_descrs`
-    // dual-keys the table on both backend and meta addresses, so this
-    // lookup succeeds whether the runtime stamps the meta pointer
-    // (post-14e) or the backend wrapper pointer (legacy paths).
-    let fail_descr_owned = CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY
-        .with(|cell| {
-            cell.borrow().as_ref().and_then(|reg| {
-                reg.lock()
-                    .ok()
-                    .and_then(|m| m.get(&(fail_descr_ptr as usize)).cloned())
-            })
-        })
+    // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
+    // parity.  `fail_descr_ptr` is the JIT-baked metainterp
+    // `AbstractFailDescr` Arc's data pointer.  Resolve via the
+    // process-global Weak registry populated by `register_fail_descrs`.
+    let fail_descr_owned = crate::guard::lookup_fail_descr_global(fail_descr_ptr as usize)
         .expect(
             "call_assembler helper: fail_descr_ptr not registered in \
-             fail_descr_registry — every JIT-baked descr must round-trip \
-             through register_fail_descrs",
+             FAIL_DESCR_REGISTRY_GLOBAL — every JIT-baked descr must \
+             round-trip through register_fail_descrs",
         );
     let fail_descr_ref: &dyn FailDescr = as_fd(&fail_descr_owned);
 
@@ -6958,10 +6910,6 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
-    /// Native guards carry raw `CraneliftFailDescr` addresses.  Keep the
-    /// corresponding Arcs alive and recoverable across call-assembler
-    /// guard failures, matching PyPy's CPU-held descr object identity.
-    fail_descr_registry: Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>,
 }
 
 impl CraneliftBackend {
@@ -7149,7 +7097,6 @@ impl CraneliftBackend {
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
-            fail_descr_registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -7168,12 +7115,17 @@ impl CraneliftBackend {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
-        let mut registry = self.fail_descr_registry.lock().unwrap();
+        // The trampoline-reachable global Weak registry retains the
+        // addr→`Weak<dyn Descr>` lookup PyPy's
+        // `AbstractDescr.show(cpu, descr_gcref)` does as a direct cast
+        // (`history.py:109-114`); pyre needs the indirection because a
+        // thin `usize` can't reconstruct the fat `Arc<dyn Descr>` vtable.
+        // Eviction is implicit: when the owning CLT drops, the tracer
+        // batch drops, the descr `Arc`s drop, and Weak upgrades return
+        // `None`.
         for descr in descrs {
-            let descr_ref: majit_ir::DescrRef = descr.clone();
-            registry
-                .entry(Arc::as_ptr(descr) as *const () as usize)
-                .or_insert_with(|| descr_ref);
+            let ptr = Arc::as_ptr(descr) as *const () as usize;
+            crate::guard::register_fail_descr_global(ptr, descr);
         }
     }
 
@@ -14507,13 +14459,6 @@ impl majit_backend::Backend for CraneliftBackend {
             });
         }
 
-        // Publish the backend's `fail_descr_registry` handle for the
-        // duration of dispatch so `wrap_call_assembler_deadframe_with_caller_prefix`
-        // can register transient overlay descrs at construction
-        // (compiler.rs:646 — see `register_overlay_in_active_registry`).
-        // RAII guard so a panic in `execute_with_inputs` still clears the TLS.
-        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
-        let _registry_guard = FailDescrRegistryGuard;
         Self::execute_with_inputs(compiled, &inputs)
     }
 
@@ -14525,8 +14470,6 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
-        let _registry_guard = FailDescrRegistryGuard;
         Self::execute_with_inputs(compiled, args)
     }
 
@@ -14542,8 +14485,6 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
-        let _registry_guard = FailDescrRegistryGuard;
 
         // llmodel.py:290-329 `execute_token` parity (raw-output variant).
         // PyPy's `execute_token` performs one `func(ll_frame, ...)` call
@@ -14949,15 +14890,9 @@ impl majit_backend::Backend for CraneliftBackend {
         if force_token.0 == 0 {
             return None;
         }
-        // `force_token_to_dead_frame` resolves `jf_force_descr` via
-        // `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY`. `execute_token*` paths
-        // install this TLS handle via `FailDescrRegistryGuard`, but
-        // `force()` may also be invoked outside an `execute_token*`
-        // scope (e.g. async-forcing / virtualref paths).  Establish the
-        // registry on this thread first so the helper can resolve the
-        // JIT-baked descr address regardless of caller.
-        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
-        let _registry_guard = FailDescrRegistryGuard;
+        // `force_token_to_dead_frame` resolves `jf_force_descr` via the
+        // process-global `FAIL_DESCR_REGISTRY_GLOBAL` (`history.py:109-
+        // 114` `AbstractDescr.show`); no TLS handle needed.
         Some(force_token_to_dead_frame(force_token))
     }
 
@@ -14971,25 +14906,19 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
-        // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity:
-        // every compiled guard descr is registered strongly in
-        // `fail_descr_registry` for the lifetime of its owning machine
-        // code.  Slice X3-D removed the transient CALL_ASSEMBLER overlay
-        // registry — the deadframe's `JitFrameDeadFrame.fail_descr` now
-        // holds the callee's own Arc identity, so addr→Arc lookups
-        // resolve through the regular registry without a Weak side
-        // table.
-        let registry = self
-            .fail_descr_registry
-            .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        registry.get(&descr_addr).cloned().unwrap_or_else(|| {
+        // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
+        // parity.  Pyre routes through the process-global Weak registry
+        // populated by `register_fail_descrs`; the strong refs that
+        // keep entries upgradeable live on `clt.asmmemmgr_gcreftracers`
+        // (`model.py:294`).
+        crate::guard::lookup_fail_descr_global(descr_addr).unwrap_or_else(|| {
             panic!(
                 "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
-                     fail_descr_registry — every emitted FailDescr must be strongly \
-                     registered"
+                 FAIL_DESCR_REGISTRY_GLOBAL — every emitted fail descr must \
+                 be registered before its address reaches the C-ABI guard-fail \
+                 boundary, and its owning CLT must still be live"
             )
-        }) as majit_ir::DescrRef
+        })
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
@@ -15033,40 +14962,12 @@ impl majit_backend::Backend for CraneliftBackend {
     fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.number);
         self.registered_call_assembler_tokens.remove(&token.number);
-        // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
-        // evicted, RPython's GC reclaims the token's compiled code and
-        // every dependent FailDescr naturally because nothing keeps a
-        // strong ref past `alive_loops`.  Pyre's `fail_descr_registry`
-        // holds strong Arcs to every emitted descr for the C-ABI
-        // recovery path (`fail_descr_arc_from_addr` parity with
-        // `cpu.get_latest_descr`), so we must explicitly release the
-        // entries belonging to this token here — otherwise the descrs
-        // (and their `rd_loop_token_clt` chain) outlive their owning
-        // loop and pyre keeps memory PyPy would have freed.
-        //
-        // Sweep strong entries whose owning-JCT upgrade points back at
-        // this token. Ownerless strong entries (`descr_owning_jct == None`)
-        // are PRESERVED: in PyPy these correspond to FINISH descrs
-        // (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
-        // `compile.py:185` skipped via `isinstance(descr, ResumeDescr)`)
-        // which are module-level singletons not subject to per-loop GC.
-        // Transient CALL_ASSEMBLER overlays are not stored here; their
-        // separate Weak registry is swept below.
-        let mut registry = self
-            .fail_descr_registry
-            .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        registry.retain(|_, descr| {
-            let fd = match descr.as_fail_descr() {
-                Some(fd) => fd,
-                None => return true,
-            };
-            match majit_backend::descr_owning_jct(fd) {
-                Some(owner) => owner.number != token.number,
-                None => true,
-            }
-        });
-        drop(registry);
+        // `llmodel.py:252-268 free_loop_and_bridges` parity.  Strong
+        // refs to baked descrs live on `clt.asmmemmgr_gcreftracers`
+        // (`model.py:294`); dropping the CLT releases them, and Weak
+        // entries in `FAIL_DESCR_REGISTRY_GLOBAL` upgrade to `None`
+        // next time someone looks them up.  Nothing to sweep here.
+        let _ = token;
     }
 
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).

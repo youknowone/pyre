@@ -686,15 +686,6 @@ pub struct DynasmBackend {
     descr_attachments: crate::guard::CpuDescrHandle,
     /// ptr → `DescrRef` registry enabling cross-token resolution of
     /// guard fail descriptors. RPython resolves
-    /// `AbstractDescr.show(jf_descr)` via direct pointer dereference,
-    /// so the lookup naturally crosses loop/bridge boundaries. Pyre
-    /// keeps each descr as a `DescrRef` and stores them in per-token
-    /// `asmmemmgr_blocks`, so a bridge that JUMPs into another
-    /// compiled loop can leave the runtime holding a jf_descr whose
-    /// owning token is not the one currently executing. This registry
-    /// is the ptr-indexed view needed to complete that lookup.
-    fail_descr_registry:
-        Arc<std::sync::Mutex<std::collections::HashMap<usize, majit_ir::DescrRef>>>,
     /// Backend-internal side-table mapping a source guard descr's
     /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
     /// patched in for that guard.  PyPy's `AbstractFailDescr._attrs_`
@@ -798,7 +789,6 @@ impl DynasmBackend {
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
             )),
-            fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             arch_cpu_ext: ArchCpuExt::new(),
         }
@@ -930,17 +920,23 @@ impl DynasmBackend {
     /// `free_loop_and_bridges` drops the CLT (`llmodel.py:252-268`).
     pub fn register_fail_descrs(&self, token: &majit_backend::JitCellToken, descrs: &[majit_ir::DescrRef]) {
         // `assembler.py:820-823` parity: each call appends one tracer.
+        // `clt.asmmemmgr_gcreftracers` is the sole lifetime root for the
+        // baked descrs (`model.py:294` / `llmodel.py:252-268
+        // free_loop_and_bridges`).
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
-        let mut reg = self.fail_descr_registry.lock().unwrap();
+        // The trampoline-reachable global Weak registry retains the
+        // addr→`Weak<dyn Descr>` lookup PyPy's
+        // `AbstractDescr.show(cpu, descr_gcref) =
+        // cast_gcref_to_instance(...)` does as a direct cast; pyre needs
+        // the indirection because a thin `usize` can't reconstruct the
+        // fat `Arc<dyn Descr>` vtable.  Eviction is implicit: when the
+        // owning CLT drops, the tracer batch drops, the descr `Arc`s
+        // drop, and Weak upgrades return `None`.
         for descr_ref in descrs {
             let ptr = Arc::as_ptr(descr_ref) as *const () as usize;
-            reg.entry(ptr).or_insert_with(|| descr_ref.clone());
-            // Mirror into the trampoline-reachable global registry as a
-            // `Weak<dyn Descr>` so the JIT helper trampoline can recover
-            // the descr identity without going through a backend instance.
             crate::guard::register_fail_descr_global(ptr, descr_ref);
         }
     }
@@ -1422,10 +1418,10 @@ impl DynasmBackend {
         // currently-executing `token` is still A. RPython's
         // `AbstractDescr.show(jf_descr)` dereferences the pointer directly,
         // so the lookup is inherently global; pyre emulates that with the
-        // per-backend ptr-indexed registry populated by `compile_loop` /
-        // `compile_bridge`.
-        if let Some(found) = self.fail_descr_registry.lock().unwrap().get(&ptr) {
-            return found.clone();
+        // process-global Weak registry populated by `register_fail_descrs`
+        // (strong refs live on `clt.asmmemmgr_gcreftracers`).
+        if let Some(found) = crate::guard::lookup_fail_descr_global(ptr) {
+            return found;
         }
 
         panic!(
@@ -2306,53 +2302,28 @@ impl Backend for DynasmBackend {
         Arc::clone(&data.fail_descr)
     }
 
-    /// `fail_descr_registry` is the `addr → DescrRef` table populated by
-    /// `register_fail_descrs` at compile time, keeping every emitted
-    /// descr alive for the lifetime of its owning compiled code
-    /// (mirroring RPython's `cpu` retaining descr objects).  The cloned
-    /// `DescrRef` lets the CA bridge entry route descr identity into
-    /// `_trace_and_compile_from_bridge` (compile.py:704-709) without
-    /// going through the `(trace_id, fail_index)` surrogate key.
+    /// `llmodel.py:252-268 free_loop_and_bridges` parity.  When the CLT
+    /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
+    /// baked descrs (`clear_gcref_tracer` per tracer); Weak entries in
+    /// the global `FAIL_DESCR_REGISTRY_GLOBAL` upgrade to `None` next
+    /// time someone looks them up.  Only `bridge_addr_by_descr` (a pyre-
+    /// only slot — `history.py:132` `AbstractFailDescr._attrs_` has no
+    /// `bridge_addr`) still requires explicit eviction here; we
+    /// enumerate the token's descrs through the tracer batches and
+    /// remove the matching `bridge_addr_by_descr` entries.
     fn free_loop(&mut self, token: &JitCellToken) {
-        // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
-        // evicted, RPython's GC reclaims the token's compiled code and
-        // every dependent FailDescr naturally because nothing keeps a
-        // strong ref past `alive_loops`.  Pyre's `fail_descr_registry`
-        // holds strong Arcs to every emitted descr for the C-ABI
-        // recovery path (`fail_descr_arc_from_addr` parity with
-        // `cpu.get_latest_descr`), so we must explicitly release the
-        // entries belonging to this token here — otherwise the descrs
-        // (and their `rd_loop_token_clt` chain) outlive their owning
-        // loop and pyre keeps memory PyPy would have freed.
-        //
-        // Sweep entries whose owning-JCT upgrade points back at this
-        // token. Ownerless entries (`descr_owning_jct == None`) are
-        // PRESERVED: in PyPy these correspond to FINISH descrs
-        // (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
-        // `compile.py:185` skipped via `isinstance(descr, ResumeDescr)`)
-        // which are module-level singletons not subject to per-loop GC.
-        // Treating `None` as "delete" would over-shoot PyPy's lifetime
-        // contract.
+        let Some(clt) = token.compiled_loop_token.as_ref() else {
+            return;
+        };
         let mut removed_bridge_addr_keys = Vec::new();
-        let mut registry = self
-            .fail_descr_registry
-            .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        registry.retain(|_, descr| {
-            let dyn_descr = match descr.as_fail_descr() {
-                Some(fd) => fd,
-                None => return true,
-            };
-            match majit_backend::descr_owning_jct(dyn_descr) {
-                Some(owner) if owner.number == token.number => {
-                    removed_bridge_addr_keys.push(Arc::as_ptr(descr) as *const () as usize);
-                    false
+        for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+            if let Some(descrs) = tracer.downcast_ref::<Vec<majit_ir::DescrRef>>() {
+                for descr in descrs {
+                    removed_bridge_addr_keys
+                        .push(Arc::as_ptr(descr) as *const () as usize);
                 }
-                Some(_) => true,
-                None => true,
             }
-        });
-        drop(registry);
+        }
         if !removed_bridge_addr_keys.is_empty() {
             let mut bridge_addrs = self
                 .bridge_addr_by_descr
@@ -2365,24 +2336,20 @@ impl Backend for DynasmBackend {
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
-        // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity: the
-        // dynasm registry holds a strong DescrRef for every emitted
-        // descr through its full lifetime, so a `descr_addr` arriving
-        // from the C-ABI guard-fail path is always present in the
-        // table.  A miss is an invariant violation, not a recoverable
-        // runtime mode.
-        let registry = self
-            .fail_descr_registry
-            .lock()
-            .expect("fail_descr_registry mutex poisoned");
-        let descr = registry.get(&descr_addr).cloned().unwrap_or_else(|| {
+        // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref) =
+        // cast_gcref_to_instance(...)` parity.  Pyre routes through the
+        // process-global Weak registry populated by
+        // `register_fail_descrs`; the strong refs that keep the entries
+        // upgradeable live on `clt.asmmemmgr_gcreftracers`
+        // (`model.py:294`).
+        crate::guard::lookup_fail_descr_global(descr_addr).unwrap_or_else(|| {
             panic!(
                 "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
-                 fail_descr_registry — every emitted fail descr must be \
-                 registered before its address reaches the C-ABI guard-fail boundary"
+                 FAIL_DESCR_REGISTRY_GLOBAL — every emitted fail descr must \
+                 be registered before its address reaches the C-ABI guard-fail \
+                 boundary, and its owning CLT must still be live"
             )
-        });
-        descr as majit_ir::DescrRef
+        })
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
