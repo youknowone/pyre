@@ -7599,6 +7599,162 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_portal_jitcode_summary() {
+        // Phase 9 architecture diagnostic: confirm whether the
+        // portal jitcode (eval_loop_jit's compiled form) exists and
+        // what its body shape is.  If portal contains per-opcode
+        // arms inlined directly, then walking portal at JitCode PC
+        // is the orthodox path.  If portal contains inline_call to
+        // per-arm jitcodes, then pyre's structure is "1+N" (portal +
+        // arms) vs PyPy's "1" (just portal with everything inlined).
+        use crate::jitcode_runtime::{all_jitcodes, decoded_ops, portal_jitcode};
+        let jcs = all_jitcodes();
+        eprintln!("ALL_JITCODES: total={}", jcs.len());
+        let p = portal_jitcode();
+        match p {
+            None => eprintln!("portal_jitcode() = None"),
+            Some(j) => {
+                eprintln!(
+                    "portal_jitcode: name={} code_len={} num_regs_r={} num_regs_i={} num_regs_f={}",
+                    j.name,
+                    j.code.len(),
+                    j.num_regs_r(),
+                    j.num_regs_i(),
+                    j.num_regs_f()
+                );
+                // First 30 ops of the portal.
+                let ops: Vec<_> = decoded_ops(j.code.as_slice()).take(30).collect();
+                for op in &ops {
+                    eprintln!("  pc={:>5}..{:<5} key={:>30}", op.pc, op.next_pc, op.key);
+                }
+                eprintln!("  ... ({} more ops)", decoded_ops(j.code.as_slice()).count().saturating_sub(ops.len()));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_pyframe_pop_jitcode_122() {
+        // dispatch_inline_call_dr_kind for jitcode 122 (PyFrame::pop)
+        // is the second-level recursion inside pop_value's body.
+        // Dump its shape so we can audit the inner residual_calls
+        // for EffectInfo elidability.
+        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
+        let descrs = all_descrs();
+        let jcs = all_jitcodes();
+        for (idx, jc) in jcs.iter().enumerate() {
+            if idx != 122 {
+                continue;
+            }
+            eprintln!(
+                "jitcode_index={} name={} code_len={} num_regs_r={} num_regs_i={}",
+                idx,
+                jc.name,
+                jc.code.len(),
+                jc.num_regs_r(),
+                jc.num_regs_i()
+            );
+            for op in decoded_ops(jc.code.as_slice()) {
+                let operand_bytes = &jc.code[op.pc + 1..op.next_pc];
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>32} operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes
+                );
+                let mut cursor = 0usize;
+                let mut chars = op.argcodes.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'L' => cursor += 2,
+                        'd' | 'j' => {
+                            let didx = u16::from_le_bytes([
+                                operand_bytes[cursor],
+                                operand_bytes[cursor + 1],
+                            ]) as usize;
+                            let info = descrs
+                                .get(didx)
+                                .map(|d| format!("{:?}", d))
+                                .unwrap_or_else(|| "<oor>".to_string());
+                            eprintln!("      descr[{didx}] = {info}");
+                            cursor += 2;
+                        }
+                        'I' | 'R' | 'F' => {
+                            let n = operand_bytes[cursor] as usize;
+                            cursor += 1 + n;
+                        }
+                        '>' => {
+                            chars.next();
+                            cursor += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_pop_value_jitcode_356() {
+        // Phase 4 diagnostic: dump PyFrame::pop_value's body so we
+        // can see whether `nlocals()` is now `residual_call_r_i` or
+        // still `inline_call_r_i` after impl-method-hints fix.
+        use crate::jitcode_runtime::{all_descrs, all_jitcodes, decoded_ops};
+        let descrs = all_descrs();
+        let jcs = all_jitcodes();
+        for (idx, jc) in jcs.iter().enumerate() {
+            if !jc.name.contains("pop_value") {
+                continue;
+            }
+            eprintln!(
+                "jitcode_index={} name={} code_len={} num_regs_r={} num_regs_i={}",
+                idx,
+                jc.name,
+                jc.code.len(),
+                jc.num_regs_r(),
+                jc.num_regs_i()
+            );
+            for op in decoded_ops(jc.code.as_slice()) {
+                let operand_bytes = &jc.code[op.pc + 1..op.next_pc];
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>30} operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes
+                );
+                let mut cursor = 0usize;
+                let mut chars = op.argcodes.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'L' => cursor += 2,
+                        'd' | 'j' => {
+                            let didx = u16::from_le_bytes([
+                                operand_bytes[cursor],
+                                operand_bytes[cursor + 1],
+                            ]) as usize;
+                            let info = descrs
+                                .get(didx)
+                                .map(|d| format!("{:?}", d))
+                                .unwrap_or_else(|| "<oor>".to_string());
+                            eprintln!("      descr[{didx}] = {info}");
+                            cursor += 2;
+                        }
+                        'I' | 'R' | 'F' => {
+                            let n = operand_bytes[cursor] as usize;
+                            cursor += 1 + n;
+                        }
+                        '>' => {
+                            chars.next();
+                            cursor += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_pop_top_arm_bytes() {
         use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
         let jc = jitcode_for_instruction(&Instruction::PopTop)
