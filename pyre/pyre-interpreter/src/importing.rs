@@ -3762,40 +3762,28 @@ fn init_socket(ns: &mut DictStorage) {
         );
     }
 
-    // Exception classes — partial orthodoxy.  PyPy
-    // (pypy/module/_socket/interp_socket.py:1041-1063 SocketAPI):
-    //   error    = w_OSError (alias)
-    //   herror   = subclass of OSError, name "_socket.herror"
-    //   gaierror = subclass of OSError, name "_socket.gaierror"
-    //   timeout  = w_TimeoutError (which is itself an OSError subclass)
-    //
-    // pyre cannot yet construct OSError subclasses from outside
-    // crate::builtins (exc_exception_new is private), so for now each
-    // exception is a DISTINCT named builtin type rooted at `object`.
-    // This still gives `isinstance(e, _socket.gaierror)` a different
-    // answer from `isinstance(e, _socket.herror)`, which the flattened
-    // shared-w_object stub did not.  Proper OSError subclassing tracked
-    // as the framework prerequisite for full _socket orthodox parity
-    // (see project_hostenv_orthodox_audit_2026_05_20.md).
+    // `interp_socket.py:1041-1063 SocketAPI`:
+    //   error    = w_OSError                       (alias)
+    //   herror   = new_exception_class("_socket.herror",   w_OSError)
+    //   gaierror = new_exception_class("_socket.gaierror", w_OSError)
+    //   timeout  = new_exception_class("_socket.timeout",  w_OSError)
+    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+        .expect("OSError must be installed before _socket init");
+    crate::dict_storage_store(ns, "error", w_os_error);
     crate::dict_storage_store(
         ns,
-        "error",
-        crate::typedef::make_builtin_type("_socket.error", |_| {}),
+        "herror",
+        crate::builtins::make_exc_type("_socket.herror", crate::builtins::exc_exception_new, w_os_error),
     );
     crate::dict_storage_store(
         ns,
         "gaierror",
-        crate::typedef::make_builtin_type("_socket.gaierror", |_| {}),
-    );
-    crate::dict_storage_store(
-        ns,
-        "herror",
-        crate::typedef::make_builtin_type("_socket.herror", |_| {}),
+        crate::builtins::make_exc_type("_socket.gaierror", crate::builtins::exc_exception_new, w_os_error),
     );
     crate::dict_storage_store(
         ns,
         "timeout",
-        crate::typedef::make_builtin_type("_socket.timeout", |_| {}),
+        crate::builtins::make_exc_type("_socket.timeout", crate::builtins::exc_exception_new, w_os_error),
     );
 
     // Default timeout (None) — modulus has a getter/setter; we just stash
