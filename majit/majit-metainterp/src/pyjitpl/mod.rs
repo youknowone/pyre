@@ -18458,7 +18458,8 @@ mod tests {
         descr_fd.set_rd_consts(Some(rd_consts));
         descr_fd.set_rd_virtuals(Some(vec![]));
         descr_fd.set_rd_pendingfields(Some(vec![]));
-        backend.register_fail_descrs(&compiled.fail_descrs);
+        let fail_descrs = compiled.fail_descrs.clone();
+        backend.register_fail_descrs(token, &fail_descrs);
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]

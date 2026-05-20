@@ -7158,7 +7158,16 @@ impl CraneliftBackend {
     /// `Arc<dyn Descr>` fat pointer (`history.py:125` identity).
     /// Mirrors dynasm's API: callable from future late-stamp helpers
     /// that need to land entries after the in-codegen call missed them.
-    pub fn register_fail_descrs(&self, descrs: &[DescrRef]) {
+    pub fn register_fail_descrs(&self, token: &majit_backend::JitCellToken, descrs: &[DescrRef]) {
+        // `assembler.py:820-823 gcreftracers.append(tracer)` parity —
+        // each `register_fail_descrs` call appends one tracer that
+        // owns the batch of descr `Arc`s, scoped to the token's
+        // `CompiledLoopToken` lifetime (`model.py:294`,
+        // `llmodel.py:252-268 free_loop_and_bridges`).
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
         let mut registry = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             let descr_ref: majit_ir::DescrRef = descr.clone();
@@ -13995,7 +14004,7 @@ impl majit_backend::Backend for CraneliftBackend {
             return Err(err);
         }
         self.registered_call_assembler_tokens.insert(token.number);
-        self.register_fail_descrs(&compiled.fail_descrs);
+        self.register_fail_descrs(token, &compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -14201,7 +14210,10 @@ impl majit_backend::Backend for CraneliftBackend {
         )?;
         self.registered_call_assembler_bridge_traces
             .insert(compiled.trace_id);
-        self.register_fail_descrs(&compiled.fail_descrs);
+        // `compile.py:183-186 record_loop_or_bridge`: bridge descrs
+        // are scoped to the original loop's CLT, so the tracer batch
+        // lands on `original_token`'s `asmmemmgr_gcreftracers`.
+        self.register_fail_descrs(original_token, &compiled.fail_descrs);
 
         // Attach the bridge to the original guard's fail descriptor so that
         // execute_token can dispatch to it on subsequent guard failures.

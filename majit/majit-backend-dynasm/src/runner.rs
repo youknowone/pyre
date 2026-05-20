@@ -919,7 +919,21 @@ impl DynasmBackend {
     /// table.  Called from `compile_loop` / `compile_bridge` to
     /// populate after codegen.  Re-running is idempotent: existing
     /// entries are preserved via `entry().or_insert_with`.
-    pub fn register_fail_descrs(&self, descrs: &[majit_ir::DescrRef]) {
+    ///
+    /// Lifetime root: `token.compiled_loop_token.asmmemmgr_gcreftracers`
+    /// (`model.py:294`, `llsupport/assembler.py:190-194`
+    /// `get_asmmemmgr_gcreftracers`).  Pushes one tracer per
+    /// `register_fail_descrs` call mirroring
+    /// `assembler.py:822 gcreftracers.append(tracer)`; the tracer owns
+    /// the descr `Arc`s for the lifetime of the compiled loop so the
+    /// addresses baked into machine code stay live until
+    /// `free_loop_and_bridges` drops the CLT (`llmodel.py:252-268`).
+    pub fn register_fail_descrs(&self, token: &majit_backend::JitCellToken, descrs: &[majit_ir::DescrRef]) {
+        // `assembler.py:820-823` parity: each call appends one tracer.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr_ref in descrs {
             let ptr = Arc::as_ptr(descr_ref) as *const () as usize;
@@ -1681,7 +1695,7 @@ impl Backend for DynasmBackend {
         let code_size = compiled.buffer.len();
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token, code_addr);
-        self.register_fail_descrs(&compiled.fail_descrs);
+        self.register_fail_descrs(token, &compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -1976,7 +1990,12 @@ impl Backend for DynasmBackend {
         // when a bridge-internal guard fires.  RPython's asmmemmgr
         // ties code blocks and their resume descriptors to the same
         // compiled_loop_token lifetime.
-        self.register_fail_descrs(&compiled.fail_descrs);
+        //
+        // `compile.py:183-186 record_loop_or_bridge` attaches a
+        // bridge's resume descrs to the original loop's CLT, so the
+        // tracer batch lands on `original_token`'s
+        // `asmmemmgr_gcreftracers` (`model.py:294`).
+        self.register_fail_descrs(original_token, &compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
         // inherit the original loop's CompiledLoopToken.  See the
