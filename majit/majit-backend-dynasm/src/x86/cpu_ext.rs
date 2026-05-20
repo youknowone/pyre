@@ -25,17 +25,16 @@ use dynasmrt::ExecutableBuffer;
 /// `asmmemmgr`, which roots helper buffers on the CPU.
 pub(crate) struct X86CpuExt {
     /// `assembler.py:63 self.malloc_slowpath` parity.  Entry address
-    /// of the fixed-size malloc slowpath helper built by
-    /// `build_malloc_slowpath_fixed`; `_buffer` is the matching RX
-    /// mapping kept for the lifetime of this struct.
+    /// of the shared malloc slowpath trampoline built by
+    /// `build_malloc_slowpath_fixed`.  PyPy's `malloc_cond` (line
+    /// 2554) and `malloc_cond_varsize_frame` (line 2578) both route
+    /// through this single helper; pyre follows that — both call
+    /// sites reach this address via the same `JA slow_path` jump and
+    /// the trampoline's `SUB rdx, rcx` recovers the byte count.
+    /// `_buffer` is the matching RX mapping kept for the lifetime of
+    /// this struct.
     malloc_slowpath_fixed: Option<usize>,
     _malloc_slowpath_fixed_buffer: Option<ExecutableBuffer>,
-    /// `assembler.py:64 self.malloc_slowpath_varsize` analog for
-    /// pyre's `CallMallocNurseryVarsizeFrame`.  Entry address of the
-    /// trampoline built by `build_malloc_slowpath_varsize_frame`;
-    /// shares the per-CPU cache lifetime with the fixed variant.
-    malloc_slowpath_varsize_frame: Option<usize>,
-    _malloc_slowpath_varsize_frame_buffer: Option<ExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath (and, in PyPy,
     /// the stack check slowpath) JMPs to on OOM / propagate.
@@ -48,8 +47,6 @@ impl X86CpuExt {
         Self {
             malloc_slowpath_fixed: None,
             _malloc_slowpath_fixed_buffer: None,
-            malloc_slowpath_varsize_frame: None,
-            _malloc_slowpath_varsize_frame_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
         }
@@ -105,32 +102,6 @@ impl X86CpuExt {
         addr
     }
 
-    /// `assembler.py:231 _build_malloc_slowpath(kind='var')` analog —
-    /// materialise the jitframe-sized malloc slowpath trampoline on
-    /// first use of `CallMallocNurseryVarsizeFrame`.  Same per-CPU
-    /// caching contract as [`ensure_malloc_slowpath_fixed`]; the
-    /// propagate trampoline is built first so the OOM `JMP` immediate
-    /// is final before this trampoline is finalised.
-    pub(crate) fn ensure_malloc_slowpath_varsize_frame(
-        &mut self,
-        cpu_handle: &CpuDescrHandle,
-    ) -> usize {
-        if let Some(addr) = self.malloc_slowpath_varsize_frame {
-            return addr;
-        }
-        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let (buffer, addr) =
-            super::assembler::build_malloc_slowpath_varsize_frame(cpu_handle, propagate_path);
-        debug_assert!(
-            addr != 0,
-            "build_malloc_slowpath_varsize_frame returned NULL entry address — \
-             dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._malloc_slowpath_varsize_frame_buffer = Some(buffer);
-        self.malloc_slowpath_varsize_frame = Some(addr);
-        addr
-    }
-
     /// Whether either trampoline that bakes `propagate_exception_descr`
     /// as an immediate has already been materialised.  Used by
     /// `DynasmBackend::set_propagate_exception_descr` to refuse a
@@ -144,8 +115,6 @@ impl X86CpuExt {
     /// upholds the same invariant by panicking instead of dropping
     /// the buffer.
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
-        self.malloc_slowpath_fixed.is_some()
-            || self.malloc_slowpath_varsize_frame.is_some()
-            || self.propagate_exception_path.is_some()
+        self.malloc_slowpath_fixed.is_some() || self.propagate_exception_path.is_some()
     }
 }

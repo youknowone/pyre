@@ -1655,10 +1655,6 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_varsize_frame = self
-            .arch_cpu_ext
-            .ensure_malloc_slowpath_varsize_frame(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -1671,8 +1667,6 @@ impl Backend for DynasmBackend {
             cpu_handle,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
-            #[cfg(target_arch = "x86_64")]
-            malloc_slowpath_varsize_frame,
             inputargs,
             &prepared_ops,
         );
@@ -1885,10 +1879,6 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
-        let malloc_slowpath_varsize_frame = self
-            .arch_cpu_ext
-            .ensure_malloc_slowpath_varsize_frame(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -1901,8 +1891,6 @@ impl Backend for DynasmBackend {
             cpu_handle,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
-            #[cfg(target_arch = "x86_64")]
-            malloc_slowpath_varsize_frame,
             inputargs,
             &prepared_ops,
         );
@@ -3130,8 +3118,6 @@ impl Backend for DynasmBackend {
                 .ensure_propagate_exception_path(&self.descr_attachments);
             self.arch_cpu_ext
                 .ensure_malloc_slowpath_fixed(&self.descr_attachments);
-            self.arch_cpu_ext
-                .ensure_malloc_slowpath_varsize_frame(&self.descr_attachments);
         }
     }
 

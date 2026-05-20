@@ -1165,6 +1165,18 @@ pub struct MetaInterp<M: Clone> {
     /// `self.history` exists (RPython places resumekey on `MetaInterp`
     /// directly, not on the history object).
     pub(crate) bridge_info: Option<BridgeTraceInfo>,
+    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` ↔ `:2897 /
+    /// :2934 profiler.end_tracing()` pairing flag.  PyPy fires both at
+    /// the entry/finally of `compile_and_run_once` /
+    /// `handle_guard_failure`; pyre fires them at the same structural
+    /// points (`prepare_trace_start_runtime` for roots,
+    /// `start_retrace_from_guard` for bridges) and balances the pair
+    /// via [`leave_profiler_tracing`].  Decoupled from
+    /// `active_trace_session` because the M-ownership lifecycle and
+    /// the profiler event lifecycle do not coincide: the session
+    /// opens later (`begin_trace_session`) and may be drained earlier
+    /// (`take_trace_meta`) than the profiler event scope.
+    pub(crate) profiler_tracing_active: bool,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -1888,6 +1900,7 @@ impl<M: Clone> MetaInterp<M> {
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
+            profiler_tracing_active: false,
         };
         // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
         // now that both sides of the pair exist, publish the
@@ -2042,21 +2055,20 @@ impl<M: Clone> MetaInterp<M> {
     /// RPython's invariant that `self.history` has a single owner per
     /// trace.
     ///
-    /// pyjitpl.py:2890 / 2916 fires `profiler.start_tracing()` at the
-    /// moment a fresh trace session opens — that includes the bridge
-    /// path via `handle_guard_failure`, which pyre routes through
-    /// [`start_retrace_from_guard`] → `begin_trace_session`.  Hosting
-    /// the call here keeps it paired with the eventual
-    /// [`clear_trace_session`] / [`take_trace_meta`] end-of-session
-    /// step regardless of whether the trace closes via root-finish or
-    /// abort.
+    /// Manages only the M-ownership half of the lifecycle; the paired
+    /// `profiler.start_tracing()` ↔ `end_tracing()` events fire at
+    /// PyPy's `compile_and_run_once` / `handle_guard_failure` entry
+    /// and finally — pyre routes those through
+    /// [`enter_profiler_tracing`] (called from
+    /// `prepare_trace_start_runtime` for roots and
+    /// `start_retrace_from_guard` for bridges) and
+    /// [`leave_profiler_tracing`] (called from session-close paths).
     pub fn begin_trace_session(&mut self, trace_meta: M) {
         debug_assert!(
             self.active_trace_session.is_none(),
             "begin_trace_session called while a trace session is already active",
         );
         self.active_trace_session = Some(ActiveTraceSession { trace_meta });
-        self.staticdata.profiler.start_tracing();
     }
 
     /// Attach bridge-origin metadata.  Called once at bridge entry
@@ -2096,9 +2108,16 @@ impl<M: Clone> MetaInterp<M> {
         self.active_trace_session.as_ref().map(|s| &s.trace_meta)
     }
 
-    /// Take ownership of the frontend trace metadata and end the
-    /// session.  Used by the finish-compile helpers that consume `M`
+    /// Drain the frontend trace metadata, leaving the session slot
+    /// empty.  Used by the finish-compile helpers that consume `M`
     /// before calling `recorder.finish()` + backend compile.
+    ///
+    /// Does *not* fire `profiler.end_tracing()`: the profiler event
+    /// scope is owned by [`leave_profiler_tracing`] and matches PyPy's
+    /// `compile_and_run_once` / `handle_guard_failure` `finally`
+    /// boundary, which is reached *after* the finish-compile body
+    /// runs.  Callers fire `leave_profiler_tracing` at the
+    /// finally-equivalent point themselves.
     pub fn take_trace_meta(&mut self) -> Option<M> {
         self.active_trace_session.take().map(|s| s.trace_meta)
     }
@@ -2107,13 +2126,45 @@ impl<M: Clone> MetaInterp<M> {
     /// the abort / cleanup path used when tracing aborts before
     /// finish.  Also clears `bridge_info` — `pyjitpl.py:3105`
     /// `_finish_off_the_metainterp` resets `self.resumekey` together
-    /// with the trace's history.
+    /// with the trace's history, and `pyjitpl.py:2897 / 2934`
+    /// `finally: profiler.end_tracing()` pairs the start fired by
+    /// `prepare_trace_start_runtime` / `start_retrace_from_guard`.
+    /// Both effects are bundled here because every trace-abort path
+    /// reaches `clear_trace_session` (it is the structural close
+    /// point); success paths that drain via [`take_trace_meta`] fire
+    /// [`leave_profiler_tracing`] explicitly at the close-equivalent
+    /// point and reach a no-op here.
     pub fn clear_trace_session(&mut self) {
-        if self.active_trace_session.is_some() {
-            self.staticdata.profiler.end_tracing();
-        }
+        self.leave_profiler_tracing();
         self.active_trace_session = None;
         self.bridge_info = None;
+    }
+
+    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` parity —
+    /// open the tracing profiler event scope.  Idempotent re-entry is
+    /// not allowed (PyPy's compile_and_run_once / handle_guard_failure
+    /// are not re-entrant on the same MetaInterp).
+    pub fn enter_profiler_tracing(&mut self) {
+        debug_assert!(
+            !self.profiler_tracing_active,
+            "enter_profiler_tracing called while tracing profiler event is already open",
+        );
+        self.staticdata.profiler.start_tracing();
+        self.profiler_tracing_active = true;
+    }
+
+    /// `pyjitpl.py:2897 / 2934` `profiler.end_tracing()` parity —
+    /// close the tracing profiler event scope opened by
+    /// [`enter_profiler_tracing`].  No-op if the scope was already
+    /// closed (mirrors PyPy's `finally` semantics: a path that never
+    /// reached `start_tracing` still passes through `finally` without
+    /// firing `end_tracing` because the implicit pairing depends on
+    /// whether the entry method ran past `start_tracing`).
+    pub fn leave_profiler_tracing(&mut self) {
+        if self.profiler_tracing_active {
+            self.staticdata.profiler.end_tracing();
+            self.profiler_tracing_active = false;
+        }
     }
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
@@ -2871,16 +2922,17 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn prepare_trace_start_runtime(&mut self) {
-        // pyjitpl.py:2889-2892 `compile_and_run_once`: `_setup_once`,
-        // `profiler.start_tracing()`, then `try_to_free_some_loops()` before
-        // the trace history is created.  `profiler.start_tracing()` itself
-        // lives on `begin_trace_session` so the bridge path
-        // (`start_retrace_from_guard` → `begin_trace_session`) picks it up
-        // too.  pyjitpl.py:2916 fires the same `start_tracing()` from
-        // `handle_guard_failure`, mirrored by the bridge-side
-        // `begin_trace_session`.
+        // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
+        //   debug_start('jit-tracing')
+        //   self.staticdata._setup_once()
+        //   self.staticdata.profiler.start_tracing()
+        //   self.staticdata.try_to_free_some_loops()
+        // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
+        // bootstrap; it has no PyPy analog (jitlog wiring runs inside
+        // `_setup_once` upstream) and stays idempotent.
         self.warm_state.ensure_jitlog_initialised();
         self.staticdata._setup_once(&mut self.backend);
+        self.enter_profiler_tracing();
         self.try_to_free_some_loops();
     }
 
@@ -3942,12 +3994,11 @@ impl<M: Clone> MetaInterp<M> {
         let constants = std::mem::take(&mut ctx.constants).into_inner();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
-        // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.  The
-        // parity helper consumes `self.tracing` directly; route the
-        // matching end_tracing through `clear_trace_session` so that
-        // a session started via `begin_trace_session` (the only path
-        // that calls `profiler.start_tracing`) doesn't leak a profiler
-        // stack frame.  No-op when no session was begun.
+        // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
+        // `clear_trace_session` bundles `leave_profiler_tracing` with
+        // session/bridge_info cleanup, balancing the `start_tracing`
+        // fired at `prepare_trace_start_runtime` /
+        // `start_retrace_from_guard`.  No-op when no scope was open.
         self.clear_trace_session();
         Some((trace, constants))
     }
@@ -4119,10 +4170,13 @@ impl<M: Clone> MetaInterp<M> {
         let outcome = self.compile_loop_body(jump_args, meta);
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
-        // next `begin_trace_session` sees a clean slate. Cancelled paths
-        // that kept `self.tracing` alive (e.g. `prior_retraced_count ==
-        // MAX` above) fall through harmlessly and keep tracing running.
-        if self.tracing.is_none() && self.active_trace_session.is_some() {
+        // next `begin_trace_session` sees a clean slate, and fire the
+        // `pyjitpl.py:2897 finally: profiler.end_tracing()` pairing for
+        // the `start_tracing` opened by `prepare_trace_start_runtime`.
+        // Cancelled paths that kept `self.tracing` alive (e.g.
+        // `prior_retraced_count == MAX` above) fall through harmlessly
+        // and keep tracing running.
+        if self.tracing.is_none() {
             self.clear_trace_session();
         }
         outcome
@@ -6112,14 +6166,15 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
         // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_loop_result = self.backend.compile_loop(
-            &inputargs,
-            &optimized_ops_rc,
-            Arc::get_mut(&mut token)
-                .expect("JitCellToken must stay uniquely owned until backend compile"),
-        );
-        self.staticdata.profiler.end_backend();
+        let compile_loop_result = {
+            let _backend_guard = self.staticdata.profiler.enter_backend();
+            self.backend.compile_loop(
+                &inputargs,
+                &optimized_ops_rc,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
+        };
         match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
@@ -6465,14 +6520,15 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
         // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_loop_result = self.backend.compile_loop(
-            &inputargs,
-            &compiled_ops_rc,
-            Arc::get_mut(&mut token)
-                .expect("JitCellToken must stay uniquely owned until backend compile"),
-        );
-        self.staticdata.profiler.end_backend();
+        let compile_loop_result = {
+            let _backend_guard = self.staticdata.profiler.enter_backend();
+            self.backend.compile_loop(
+                &inputargs,
+                &compiled_ops_rc,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
+        };
         match compile_loop_result {
             Ok(_) => {
                 self.assign_guard_hashes(token.as_ref());
@@ -9208,12 +9264,32 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
+        // pyjitpl.py:2914-2924 `handle_guard_failure` opening, line-by-line:
+        //   debug_start('jit-tracing')
+        //   self.staticdata.profiler.start_tracing()
+        //   key = resumedescr.get_resumestorage()
+        //   ...
+        //   self.staticdata.try_to_free_some_loops()
+        //   self.create_history(...)
+        // pyre's `compiled_loops` lookup below stands in for
+        // `get_resumestorage`/`loop_token_wref()`; both gate the trace on
+        // the source loop still being live.
+        self.enter_profiler_tracing();
+        self.try_to_free_some_loops();
         // bridgeopt.py:124 frontend_boxes come directly from the guard
         // failure values in fail_arg_types order.
         self.pending_frontend_boxes = Some(fail_values.to_vec());
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
-            None => return None,
+            None => {
+                // Source loop already evicted — bail out of the bridge
+                // before opening the M-ownership session.  Pair the
+                // `start_tracing` fired above so the profiler stack
+                // stays balanced (PyPy's `finally` would run even when
+                // `handle_guard_failure` returns early via `giveup`).
+                self.leave_profiler_tracing();
+                return None;
+            }
         };
 
         let norm_tid = trace_id;
@@ -11937,7 +12013,12 @@ impl<M: Clone> MetaInterp<M> {
             .expect("compile_finish_from_active_session: session must be present");
         let result =
             self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception);
-        self.staticdata.profiler.end_tracing();
+        // pyjitpl.py:2897 `finally: profiler.end_tracing()` — close the
+        // tracing event scope opened by `prepare_trace_start_runtime`
+        // / `start_retrace_from_guard` for the root-finish path.  The
+        // session was drained above; `clear_trace_session` is not
+        // needed because `bridge_info` already cleared at bridge entry.
+        self.leave_profiler_tracing();
         result
     }
 
