@@ -932,26 +932,18 @@ fn collect_cfg_coalesce_pairs(
 ///     source block's `per_block_ssarepr` BEFORE the terminator
 ///     (matches `flatten.py:154 self.insert_renamings(link)` which
 ///     runs BEFORE the recursive `make_bytecode_block(link.target)`).
-///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
-///     exit's renamings are per-edge.  Walker's `goto_if_not` /
-///     `switch` ends the source block; we splice per-link renamings
-///     at the target's entry — but only when the target has a unique
-///     predecessor (otherwise multiple edges' renamings would collide
-///     at the same entry).
-///
-/// **Known incompleteness — multi-predecessor targets.**  Loop
-/// headers, merge blocks, and any other block with `in_degree > 1`
-/// SKIP renamings.  Upstream `flatten.py:306` runs
-/// `insert_renamings(link)` for EVERY link unconditionally, splicing
-/// each link's renamings between its own `Label(link)` and the
-/// recursive `make_bytecode_block(link.target)`.  Pyre's walker
-/// collapses every edge into the target block's entry label, so two
-/// incoming edges with different `(link.arg → target.inputarg)` color
-/// pairings would emit conflicting `<kind>_copy` ops at the same
-/// position.  Faithful upstream parity requires either per-link
-/// trampoline blocks or distinct per-link labels (T6 epic territory);
-/// until that lands, edges that need a copy through a
-/// multi-predecessor target are silently elided here.
+///   * Multi-exit blocks (POP_JUMP_IF_*, canraise switches) with a
+///     unique-predecessor target: splice renamings at the target's
+///     entry (`TargetAfterAnchor`).
+///   * Multi-exit blocks with a multi-predecessor target: emit a
+///     per-link trampoline via
+///     [`emit_trampoline_for_multi_pred_link`].  Mirrors upstream's
+///     `Label(link) + insert_renamings(link)` per-link emission by
+///     either rewriting the source terminator's TLabel onto a
+///     synthetic SpamBlock that runs the renamings then jumps to the
+///     original target (explicit-jump arm), or appending the
+///     renamings + explicit goto to the source's per-block
+///     accumulator (fall-through arm).
 fn walker_post_walk_insert_renamings(
     graph: &mut super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
@@ -1052,30 +1044,24 @@ fn walker_post_walk_insert_renamings(
     }
 
     // Multi-exit blocks (POP_JUMP_IF_*, canraise switches): each
-    // exit's renamings are per-edge.  Walker's goto_if_not / switch
+    // exit's renamings are per-edge.  Walker's `goto_if_not` / switch
     // ends the source block; canonical emits each link's renamings
-    // between `Label(link)` and the target block's body.  For pyre,
-    // splice per-link renamings at the target's entry — but only
-    // when target has unique predecessor (otherwise multiple edges'
-    // renamings would collide at the same entry).  Multi-predecessor
-    // targets remain canonical_unmatched until walker grows distinct
-    // per-link labels (T6 epic) or per-link trampoline blocks.
+    // between `Label(link)` and the target block's body
+    // (`flatten.py:175-205 insert_exits`).  Pyre splice strategy:
     //
-    // Phase 4 endgame slice ε.3 — Per-link trampoline synthesis for
-    // multi-predecessor targets.  Mirrors `flatten.py:175-205` per-link
-    // `Label(link)` + `insert_renamings(link)` emission via a synthetic
-    // SpamBlock appended to `all_walker_blocks`.  The source's
-    // terminator TLabel pointing at the target's block-identity label
-    // is rewritten in place to point at the trampoline's unique label;
-    // the trampoline body contains the per-kind ref_copy/push/pop chain
-    // followed by `goto TLabel(<original target label>)` so the
-    // taken-arm execution lands at the original target after the
-    // renamings.  Natural fallthrough is unaffected because the
-    // trampoline lives at the end of the drain stream, not inline.
+    //   * unique-predecessor target — splice renamings at target's
+    //     entry via `TargetAfterAnchor` (safe because only the link's
+    //     edge reaches the target's entry label);
+    //   * multi-predecessor target — synthesize a per-link trampoline
+    //     via [`emit_trampoline_for_multi_pred_link`].  Explicit-jump
+    //     arm rewrites the source terminator's TLabel + appends a
+    //     synthetic SpamBlock; fall-through arm appends renamings +
+    //     explicit `goto` to the source's per-block accumulator.
     //
-    // `PYRE_PHASE4_DIAGNOSE_ELIDE=1` retains the diagnostic for
-    // measuring residual elisions (e.g., SwitchDictDescr TLabels not
-    // yet rewritten by the in-place name matcher).  Task #122.
+    // `PYRE_PHASE4_DIAGNOSE_ELIDE=1` keeps the residual elide
+    // diagnostic for shapes the trampoline path can't yet handle
+    // (e.g., `SwitchDictDescr` TLabel entries) plus a
+    // `phase4-trampoline` counter line per graph.
     let diagnose_elide = std::env::var_os("PYRE_PHASE4_DIAGNOSE_ELIDE").is_some();
     let mut elided_links: usize = 0;
     let mut elided_links_with_distinct_pairs: usize = 0;
