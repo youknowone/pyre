@@ -466,6 +466,23 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `jitcode_index` the optimizer would otherwise pull from the
     /// MIFrame framestack.
     pub current_jitcode_index: u32,
+    /// Python bytecode PC of the opcode whose per-opcode arm the
+    /// walker is currently executing.  Mirrors `MIFrame.orgpc`
+    /// (`pyjitpl.py:151 setposition` parity in pyre's bytecode-tracer
+    /// layout) — the Python PC pyre's `build_resumed_frames` reads
+    /// from `SnapshotFrame.pc` and feeds into `pyjitcode.
+    /// resume_jitcode_pc_for(py_pc)` to translate back to a JitCode
+    /// position at resume time.  Production entry seeds from
+    /// `miframe.orgpc as u32`; sub-walks inherit the caller's
+    /// `entry_py_pc` (a sub-jitcode invocation does not advance the
+    /// outer Python PC); test fixtures + the test path
+    /// [`dispatch_via_miframe`] leave the field at `0`.
+    ///
+    /// Read by [`walker_capture_snapshot_for_last_guard`] so the
+    /// resume path can route through either the legacy `pc_map[py_pc]`
+    /// fast-path (`call_jit.rs:894-900 cache_valid`) or the new
+    /// snapshot `jitcode_pc` channel — both keyed off this Python PC.
+    pub entry_py_pc: u32,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1507,6 +1524,7 @@ pub fn dispatch_via_miframe(
     // means dereferencing both simultaneously is sound.
     let ctx_ptr = miframe.ctx;
     let sym_ptr = miframe.sym;
+    let entry_py_pc = miframe.orgpc as u32;
     // SAFETY: both pointers were initialized at MIFrame
     // construction time and outlive this call (TraceCtx and
     // PyreSym are pinned by the surrounding tracing session).
@@ -1648,6 +1666,7 @@ pub fn dispatch_via_miframe(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             current_jitcode_index: 0,
+            entry_py_pc,
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -1741,6 +1760,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let ctx_ptr = miframe.ctx;
     let sym_ptr = miframe.sym;
     let concrete_frame_addr = miframe.concrete_frame_addr;
+    let entry_py_pc = miframe.orgpc as u32;
     // SAFETY: both pointers were initialized at MIFrame construction
     // time and outlive this call (parity with dispatch_via_miframe).
     let trace_ctx = unsafe { &mut *ctx_ptr };
@@ -1818,6 +1838,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             current_jitcode_index: entry_jitcode.index() as u32,
+            entry_py_pc,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -3464,11 +3485,25 @@ fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: 
             active.push(*r);
         }
     }
+    // `jitcode_pc: 0` placeholder forces the resume path through
+    // `PyJitCode::resume_jitcode_pc_for(entry_py_pc)` (the legacy
+    // pc_map lookup) instead of the snapshot's jitcode_pc fast-path.
+    //
+    // Why: the walker's `op.pc` indexes the per-opcode arm jitcode
+    // (e.g. PopTop's arm) — a different JitCode than `pyjitcode.
+    // jitcode` (which the resume reader passes to `bh.setposition`
+    // at `call_jit.rs:915`).  An arm-local pc would mis-position the
+    // blackhole interpreter inside the main jitcode bytes.  Phase 9
+    // (`pc_map` retirement) is the structural cleanup that lets the
+    // resume reader address the arm jitcode directly; until then the
+    // walker snapshot rides the pc_map channel like every other
+    // pyre-side guard emitter.
     ctx.trace_ctx.capture_snapshot_for_last_guard(
         &active,
         ctx.current_jitcode_index,
-        op_pc as u32,
+        ctx.entry_py_pc,
     );
+    let _ = op_pc;
 }
 
 fn direct_call_release_gil(
@@ -4270,6 +4305,7 @@ fn dispatch_inline_call_dr_kind(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
+            entry_py_pc: ctx.entry_py_pc,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4449,6 +4485,7 @@ fn dispatch_inline_call_dir_kind(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
+            entry_py_pc: ctx.entry_py_pc,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -4623,6 +4660,7 @@ fn dispatch_inline_call_dirf_kind(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: sub_index as u32,
+            entry_py_pc: ctx.entry_py_pc,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -5613,6 +5651,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -5781,6 +5820,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -5823,6 +5863,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -5864,6 +5905,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -5914,6 +5956,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -5956,6 +5999,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -5997,6 +6041,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -6133,6 +6178,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -6287,6 +6333,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -6389,6 +6436,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -6485,6 +6533,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -6570,6 +6619,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -6652,6 +6702,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -6712,6 +6763,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -6754,6 +6806,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -6792,6 +6845,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6838,6 +6892,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6890,6 +6945,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -6937,6 +6993,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -6989,6 +7046,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -7040,6 +7098,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -7095,6 +7154,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -7136,6 +7196,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -7180,6 +7241,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7224,6 +7286,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7316,6 +7379,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -7356,6 +7420,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7408,6 +7473,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7490,6 +7556,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7557,6 +7624,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7615,6 +7683,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -7654,6 +7723,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -8266,6 +8336,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8369,6 +8440,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -8423,6 +8495,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8474,6 +8547,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -8516,6 +8590,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8557,6 +8632,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -8619,6 +8695,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -8669,6 +8746,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -8710,6 +8788,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -8750,6 +8829,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -8800,6 +8880,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -8941,6 +9022,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9009,6 +9091,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9058,6 +9141,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9129,6 +9213,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -9180,6 +9265,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -9220,6 +9306,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -9262,6 +9349,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -9312,6 +9400,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -9354,6 +9443,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9420,6 +9510,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9471,6 +9562,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -9534,6 +9626,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -9614,6 +9707,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -9762,6 +9856,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9819,6 +9914,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -9867,6 +9963,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -9910,6 +10007,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -9962,6 +10060,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10016,6 +10115,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -10090,6 +10190,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -10153,6 +10254,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10215,6 +10317,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -10259,6 +10362,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -10341,6 +10445,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -10416,6 +10521,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -10505,6 +10611,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -10620,6 +10727,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -10671,6 +10779,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -10714,6 +10823,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -10781,6 +10891,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -10893,6 +11004,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -10981,6 +11093,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -11068,6 +11181,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -11134,6 +11248,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -11203,6 +11318,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -11270,6 +11386,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -11343,6 +11460,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -11414,6 +11532,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -11473,6 +11592,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11554,6 +11674,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -11612,6 +11733,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -11652,6 +11774,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -11710,6 +11833,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11785,6 +11909,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -11853,6 +11978,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -11899,6 +12025,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -11968,6 +12095,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -12017,6 +12145,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12088,6 +12217,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -12145,6 +12275,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
@@ -12210,6 +12341,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -12508,6 +12640,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             current_jitcode_index: 0,
+            entry_py_pc: 0,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),

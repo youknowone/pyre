@@ -1873,6 +1873,34 @@ impl TraceCtx {
         jitcode_index: u32,
         pc: u32,
     ) {
+        // `jitcode_pc: 0` placeholder applies to the segmented-driver +
+        // force-finish callers that have no PyJitCode handle to resolve
+        // `pc_map[py_pc]`; resume through them goes via the legacy
+        // `PyJitCode::resume_jitcode_pc_for` lookup that
+        // `build_resumed_frames` performs at decode time.  Callers that
+        // do know the JitCode PC at recording time (e.g. the
+        // jitcode-bytecode walker) should use
+        // [`capture_snapshot_for_last_guard_with_jitcode_pc`] so the
+        // resume path can short-circuit the `pc_map` lookup.
+        self.capture_snapshot_for_last_guard_with_jitcode_pc(active_boxes, jitcode_index, pc, 0);
+    }
+
+    /// Variant of [`capture_snapshot_for_last_guard`] that records both
+    /// the Python PC (`py_pc`) and the matched JitCode bytecode offset
+    /// (`jitcode_pc`) for the snapshot frame.
+    ///
+    /// Used by the jitcode-bytecode walker: at guard emission time the
+    /// walker knows the JitCode position directly (`op.pc`), so the
+    /// resume path can consume `frame.jitcode_pc` and skip the
+    /// `pc_map[py_pc]` lookup in `build_resumed_frames`
+    /// (`call_jit.rs:894-900 cache_valid` short-circuit).
+    pub fn capture_snapshot_for_last_guard_with_jitcode_pc(
+        &mut self,
+        active_boxes: &[OpRef],
+        jitcode_index: u32,
+        py_pc: u32,
+        jitcode_pc: u32,
+    ) {
         let boxes: Vec<crate::recorder::SnapshotTagged> = active_boxes
             .iter()
             .map(|opref| {
@@ -1892,17 +1920,8 @@ impl TraceCtx {
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
-                pc,
-                // Phase 7a (issue #73): segmented driver path has no
-                // PyJitCode handle to resolve `pc_map[py_pc]`; resume
-                // through this helper still goes via the legacy
-                // `PyJitCode::resume_jitcode_pc_for` lookup that pyre's
-                // `build_resumed_frames` performs at decode time.  This
-                // 0 placeholder is structurally distinct from a real
-                // JitCode offset of 0 (the placeholder applies only to
-                // segmented-driver tests + force-finish guards, neither
-                // of which currently read the field).
-                jitcode_pc: 0,
+                pc: py_pc,
+                jitcode_pc,
                 boxes,
             }],
             vable_boxes: Vec::new(),
