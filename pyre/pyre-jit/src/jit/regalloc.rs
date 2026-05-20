@@ -770,7 +770,9 @@ fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs
 /// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
 /// the three-stage pipeline.
 ///
-/// Dual coalesce source:
+/// Dual coalesce source, ordered to give CFG link priority over the
+/// pyre-only SSARepr scanner when an interference edge forces a
+/// choice between two `try_coalesce` candidates:
 ///   1. CFG-level `(source_slot, target_slot)` pairs from
 ///      `link.args[i] ↔ link.target.inputargs[i]` per
 ///      `regalloc.py:79-96 coalesce_variables`.  The caller derives
@@ -778,14 +780,19 @@ fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs
 ///      assignment for each Variable; passing them in keeps the
 ///      upstream iteration shape even when the walker's chosen
 ///      slots make most pairs trivially equal (`try_coalesce(v, v)`
-///      returns immediately).
+///      returns immediately).  Runs FIRST so a link-driven union
+///      always wins over an SSA-copy union when both would target
+///      the same interference-graph cluster — matching upstream
+///      where CFG `coalesce_variables` is the only coalesce source.
 ///   2. SSARepr `*_copy` scanner — pyre's walker emits intra-block
 ///      `int_copy` / `ref_copy` / `float_copy` ops for stack
 ///      shuffling / STORE_FAST sequences directly into the SSARepr;
 ///      RPython has no analog because `flatten.py:306-334`
 ///      `insert_renamings` places its copies post-coalesce at
 ///      flatten time.  The scanner unions each `*_copy`'s src and
-///      dst so the chordal coloring reuses one color.
+///      dst so the chordal coloring reuses one color.  Runs after
+///      the CFG pass so the pyre-only source defers to upstream's
+///      link-driven priority on conflict.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
@@ -794,15 +801,15 @@ fn perform_register_allocation(
 ) -> RegAllocator {
     let mut alloc = RegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
-    alloc.coalesce_variables(ssarepr, kind);
     // `regalloc.py:79-96` CFG-level coalesce — every Link's
     // `link.args[i] ↔ link.target.inputargs[i]` pair, projected to
-    // the walker's u16 slots.  Runs alongside (not after) the
-    // SSARepr `*_copy` scanner: both feed the same union-find +
-    // depgraph.
+    // the walker's u16 slots.  Runs BEFORE the SSARepr `*_copy`
+    // scanner so the upstream link-driven coalesce wins on
+    // interference-graph conflict.
     for &(src, dst) in cfg_coalesce_pairs {
         alloc.try_coalesce(src, dst);
     }
+    alloc.coalesce_variables(ssarepr, kind);
     alloc.find_node_coloring();
     alloc
 }
