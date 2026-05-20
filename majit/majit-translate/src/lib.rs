@@ -718,12 +718,43 @@ fn analyze_pipeline_from_parsed(
             // on the same `[impl_type, method_name]` path the BFS uses.
             if !method.hints.is_empty() {
                 call_control.register_function_hints_for(path.clone(), method.hints.clone());
+                // Default-method bodies also register under `[trait_name,
+                // method_name]` (see the `register_function_graph(direct_path,
+                // direct_graph)` branch above); mirror the hint registration
+                // so the BFS reaches the same `_reject_function("elidable")`
+                // verdict regardless of which path it walks.
+                if impl_info.for_type.starts_with("<default methods of ") {
+                    let direct_path = crate::parse::CallPath::from_segments([
+                        impl_info.trait_name.as_str(),
+                        method.name.as_str(),
+                    ]);
+                    call_control
+                        .register_function_hints_for(direct_path, method.hints.clone());
+                }
             }
             // RPython: hints bound to graph identity.
+            let default_direct_path = if impl_info.for_type.starts_with("<default methods of ") {
+                Some(crate::parse::CallPath::from_segments([
+                    impl_info.trait_name.as_str(),
+                    method.name.as_str(),
+                ]))
+            } else {
+                None
+            };
             for hint in &method.hints {
                 match hint.as_str() {
-                    "elidable" => call_control.mark_elidable(path.clone()),
-                    "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
+                    "elidable" => {
+                        call_control.mark_elidable(path.clone());
+                        if let Some(ref dp) = default_direct_path {
+                            call_control.mark_elidable(dp.clone());
+                        }
+                    }
+                    "loopinvariant" => {
+                        call_control.mark_loopinvariant(path.clone());
+                        if let Some(ref dp) = default_direct_path {
+                            call_control.mark_loopinvariant(dp.clone());
+                        }
+                    }
                     "close_stack" => call_control.mark_close_stack(path.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
                     "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
