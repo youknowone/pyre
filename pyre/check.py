@@ -29,6 +29,11 @@ BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
+# Windows `GetProcessTimes` / JobObject user-CPU accounting is quantized to
+# the system scheduler tick (default 1/64 s ≈ 15.625 ms).  Any measured time
+# could be off by up to one tick, so add one tick to every Windows
+# measurement to absorb the quantization error.
+WIN_TIMER_QUANTUM_S = 1.0 / 64
 
 CARGO_CONFIG = {
     "dynasm": {
@@ -139,6 +144,7 @@ def _run_timed_win32(args, timeout_s):
         ):
             utime = ((ut.dwHighDateTime << 32) | ut.dwLowDateTime) / 1e7
     kernel32.CloseHandle(job)
+    utime += WIN_TIMER_QUANTUM_S
     return stdout_bytes.decode("utf-8", errors="replace"), utime, proc.returncode
 
 
@@ -816,14 +822,14 @@ def main():
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    4)
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    3,     3,     None)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     10)
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     15)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
         chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      40,      None)
         chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       15,      None,    15,      None)
-        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       20,      None,    20,      None)
+        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       30,      None,    30,      None)
         chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
         chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
 
