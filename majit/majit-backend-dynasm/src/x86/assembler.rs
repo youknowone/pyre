@@ -639,8 +639,10 @@ pub struct Assembler386<'a> {
     pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
-    /// Fail descriptors built during assembly.
-    fail_descrs: Vec<majit_ir::DescrRef>,
+    /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
+    /// so `Arc::as_ptr` is a thin pointer suitable for direct
+    /// `Arc::from_raw` recovery (`history.py:113 AbstractDescr.show`).
+    fail_descrs: Vec<std::sync::Arc<majit_ir::FailDescrCell>>,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -762,8 +764,11 @@ struct GuardToken {
     /// Dynamic label that the guard's Jcc jumps to — bound in
     /// write_pending_failure_recoveries to the recovery stub.
     fail_label: DynamicLabel,
-    /// The fail descriptor for this guard.
-    fail_descr: majit_ir::DescrRef,
+    /// The fail descriptor cell for this guard.  `Arc::as_ptr(&fail_descr)`
+    /// is the thin pointer baked into `jf_descr`; the same cell instance is
+    /// stored on `Assembler386::fail_descrs` so registration on the owning CLT
+    /// keeps it alive while the recovery stub references its address.
+    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
     /// Fail argument OpRefs for recovery (to save to sequential output slots).
     fail_args: Vec<OpRef>,
     /// regalloc parity: snapshot of opref_to_slot at guard emission time.
@@ -787,7 +792,7 @@ pub struct CompiledCode {
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `Assembler386.fail_descrs` Vec.
-    pub fail_descrs: Box<[majit_ir::DescrRef]>,
+    pub fail_descrs: Box<[std::sync::Arc<majit_ir::FailDescrCell>]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
@@ -3877,7 +3882,13 @@ impl<'a> Assembler386<'a> {
                 }
 
                 self._call_footer();
-                self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
+                // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
+                // not the cell pointer.  `handle_fail_done_with_this_frame`
+                // and `handle_fail_exit_frame_with_exception` match by
+                // ptr-equality on the singleton, so the cell only carries
+                // the keep-alive identity for `clt.asmmemmgr_gcreftracers`.
+                self.fail_descrs
+                    .push(majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef));
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -4864,13 +4875,13 @@ impl<'a> Assembler386<'a> {
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
-        // Slice KK/NN: source_op_index uses the dynasm SOURCE_OP_INDEX_TABLE
-        // (kept until source_op_index is removed from FailDescrLayout per
-        // PyPy parity); recovery_layout is no longer cached on the backend —
-        // the metainterp's `StoredExitLayout.recovery_layout`
-        // (populated by `patch_guard_recovery_layouts_for_trace` from
-        // the resume snapshot per `resume.py:450-488`) is the canonical store.
-        crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
+        // Stamp source_op_index directly on the meta descr (UnsafeCell slot
+        // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
+        // resume_guard_descr.rs:166); `layout_for_fail_descr` reads it back
+        // via `fd.source_op_index()` so no side-table is needed.
+        if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
+            descr_fd.set_source_op_index(op_index);
+        }
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
@@ -4885,10 +4896,11 @@ impl<'a> Assembler386<'a> {
         }
         let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);
 
+        let cell = majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef);
         self.pending_guard_tokens.push(GuardToken {
             jump_offset: self.mc.offset(),
             fail_label,
-            fail_descr: descr.clone(),
+            fail_descr: cell.clone(),
             fail_args: op.getfailargs().map(|fa| fa.to_vec()).unwrap_or_default(),
             opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
@@ -4897,7 +4909,7 @@ impl<'a> Assembler386<'a> {
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
         }
-        self.fail_descrs.push(descr.clone());
+        self.fail_descrs.push(cell);
     }
 
     /// Update `rd_locs` on all pending guard descriptors after the
@@ -4944,7 +4956,7 @@ impl<'a> Assembler386<'a> {
         &mut self,
         guard_token: GuardToken,
         save_regs_label: DynamicLabel,
-    ) -> (majit_ir::DescrRef, usize) {
+    ) -> (std::sync::Arc<majit_ir::FailDescrCell>, usize) {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
@@ -4981,7 +4993,7 @@ impl<'a> Assembler386<'a> {
 
     /// assembler.py:1005 write_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
-    fn write_pending_failure_recoveries(&mut self) -> Vec<(majit_ir::DescrRef, usize)> {
+    fn write_pending_failure_recoveries(&mut self) -> Vec<(std::sync::Arc<majit_ir::FailDescrCell>, usize)> {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.  Iterate `ALL_CORE_REGS`
         // / `ALL_FLOAT_REGS` (Win64-aware: R13 dropped from GPRs, XMM5..14
@@ -5025,11 +5037,11 @@ impl<'a> Assembler386<'a> {
     /// buffer-relative offsets to absolute addresses after finalize.
     fn patch_pending_failure_recoveries(
         rawstart: usize,
-        stub_offsets: &[(majit_ir::DescrRef, usize)],
+        stub_offsets: &[(std::sync::Arc<majit_ir::FailDescrCell>, usize)],
     ) {
-        for (descr, stub_offset) in stub_offsets {
+        for (cell, stub_offset) in stub_offsets {
             let abs_addr = rawstart + stub_offset;
-            if let Some(fd) = descr.as_fail_descr() {
+            if let Some(fd) = cell.as_fail_descr() {
                 fd.set_adr_jump_offset(abs_addr);
             }
         }
@@ -5863,7 +5875,10 @@ impl<'a> Assembler386<'a> {
         // Emit epilogue (return jf_ptr).
         self._call_footer();
 
-        self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
+        // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
+        // not the cell pointer (see OpCode::Finish comment above).
+        self.fail_descrs
+            .push(majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef));
     }
 
     // ----------------------------------------------------------------

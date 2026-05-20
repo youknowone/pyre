@@ -18,44 +18,21 @@
 // of truth for both the `_attrs_` set and the backend-only cells.
 use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
-use majit_ir::{Descr, DescrRef, GcRef, Type};
+use majit_ir::{DescrRef, GcRef, Type};
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
-/// `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref) =
-/// cast_gcref_to_instance(...)` parity.  Pyre cannot reconstruct a
-/// fat `Arc<dyn Descr>` from a thin `usize`, so the trampoline-
-/// reachable global Weak registry serves the addr→Arc indirection.
-/// The strong refs that keep entries upgradeable live on the owning
-/// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`,
-/// `llmodel.py:252-268 free_loop_and_bridges`); when the CLT drops,
-/// Weak upgrades return `None` on the next lookup.
-static FAIL_DESCR_REGISTRY_GLOBAL:
-    OnceLock<Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>>> = OnceLock::new();
-
-fn fail_descr_registry_global() -> &'static Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>> {
-    FAIL_DESCR_REGISTRY_GLOBAL.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn register_fail_descr_global(descr_ptr: usize, descr: &DescrRef) {
-    // `insert` (not `entry().or_insert_with`): after the original descr
-    // at this address is dropped, the allocator may reuse the address
-    // for a freshly registered descr.  Leaving the stale `Weak` in
-    // place would route live guard failures into the fallback path.
-    fail_descr_registry_global()
-        .lock()
-        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
-        .insert(descr_ptr, std::sync::Arc::downgrade(descr));
-}
-
-pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
-    fail_descr_registry_global()
-        .lock()
-        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
-        .get(&descr_ptr)
-        .and_then(|w| w.upgrade())
-}
+// Slice 80-G.7 (cranelift mirror of dynasm Slice 80-G.6) — the
+// process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was
+// retired.  `history.py:109-114 AbstractDescr.show(cpu, descr_gcref)
+// = cast_gcref_to_instance(...)` parity is now a pure
+// `Arc::from_raw` against the `FailDescrCell` wrapper baked at
+// codegen time (`majit_ir::recover_fail_descr_cell` in
+// `majit-ir/src/descr.rs`).  The strong refcount lives on
+// `CompiledLoop::fail_descr_cells` / `BridgeData::fail_descr_cells`
+// / `RegisteredLoopTarget::fail_descr_cells` for the life of the
+// CLT they belong to (`model.py:294`,
+// `llmodel.py:252-268 free_loop_and_bridges`).
 
 /// Compiled bridge data attached to a guard's fail descriptor.
 ///
@@ -81,6 +58,11 @@ pub struct BridgeData {
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at construction.
     pub fail_descrs: Box<[DescrRef]>,
+    /// Position-aligned `FailDescrCell` wrappers (see
+    /// `CompiledLoop::fail_descr_cells`).  Each cell pins the strong
+    /// refcount the JIT-baked `jf_descr` address relies on for
+    /// `Arc::from_raw` recovery (`majit_ir::recover_fail_descr_cell`).
+    pub fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
     /// Number of input arguments the bridge expects.
     /// Set to parent guard's fail_arg count (not optimizer-reduced count)
     /// so execute_bridge passes all parent outputs and indices align.

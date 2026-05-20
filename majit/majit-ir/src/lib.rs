@@ -15,9 +15,10 @@ pub mod vec_set;
 // Re-export key types at crate root for convenience.
 pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
-    DescrRef, FailDescr, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr, LLType,
-    LoopTargetDescr, LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
-    SwitchDescr, TargetArgLoc, UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr,
+    DescrRef, FailDescr, FailDescrCell, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr,
+    LLType, LoopTargetDescr, LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr,
+    SizeDescr, SwitchDescr, TargetArgLoc, UnpackAtExitInfo, VableExpansion, descr_identity,
+    make_array_descr, recover_fail_descr_cell,
     make_array_descr_signed, make_call_descr, make_field_descr, make_field_descr_full,
     make_loop_target_descr, make_malloc_array_calldescr, make_malloc_array_nonstandard_calldescr,
     make_malloc_big_fixedsize_calldescr, make_malloc_str_calldescr, make_malloc_unicode_calldescr,

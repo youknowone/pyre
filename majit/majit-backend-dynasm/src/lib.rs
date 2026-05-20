@@ -457,15 +457,15 @@ fn handle_fail_dispatch(
         return handle_fail_propagate_exception(frame_ptr);
     }
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    // Recover the descr identity through the global Weak-registry that
-    // `DynasmBackend::register_fail_descrs` populates in lockstep with
-    // its per-backend table — only the `FailDescr` trait surface is
-    // consumed.  Synthetic test descrs (lib.rs:781 / :803) never
-    // register, so the miss path returns 0, matching the prior
-    // cast-based path's "no blackhole hook installed" exit.
-    let descr_arc = match guard::lookup_fail_descr_global(descr_raw) {
-        Some(arc) => arc,
-        None => return 0,
+    // `history.py:109-114 AbstractDescr.show(cpu, descr_gcref)` parity:
+    // `descr_raw` is the thin pointer of the `FailDescrCell` baked at
+    // codegen time; reconstruct the cell via `Arc::from_raw` and read
+    // the wrapped descr.  No global lookup — the cell's strong refcount
+    // is held by `clt.asmmemmgr_gcreftracers` for the lifetime of the
+    // executing JIT code.
+    let descr_arc = {
+        let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_raw) };
+        cell.descr.clone()
     };
     let descr_fd = match descr_arc.as_fail_descr() {
         Some(fd) => fd,
@@ -791,13 +791,14 @@ mod tests {
         // checking the trampoline reads fail_arg values correctly.
 
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
-        guard::register_fail_descr_global(descr_ptr, &descr);
+        let cell = majit_ir::FailDescrCell::wrap(descr.clone());
+        let descr_ptr = Arc::as_ptr(&cell) as *const () as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[100, 200, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
         // No blackhole registered → returns 0, no crash.
         assert_eq!(result, 0);
+        drop(cell);
         drop(descr);
     }
 
@@ -810,14 +811,15 @@ mod tests {
         // table, so this test simply confirms the trampoline returns
         // the blackhole result (or 0) regardless of bridge presence.
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int]);
-        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
-        guard::register_fail_descr_global(descr_ptr, &descr);
+        let cell = majit_ir::FailDescrCell::wrap(descr.clone());
+        let descr_ptr = Arc::as_ptr(&cell) as *const () as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 99);
         // Helper blackhole-resumes (no blackhole registered → 0), NOT bridge result.
         assert_eq!(result, 0);
 
+        drop(cell);
         drop(descr);
     }
 

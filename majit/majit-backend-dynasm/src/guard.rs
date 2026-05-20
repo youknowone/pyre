@@ -2,79 +2,14 @@
 /// jump offset (`history.py:132 _attrs_` `adr_jump_offset`) lives on the
 /// metainterp `ResumeGuardDescr` (`majit-metainterp/src/compile.rs`) and
 /// is accessed here via `meta_resume_fd()` forwarding.
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use majit_ir::FailDescr;
 
-/// Backend-static side-table mapping a `DynasmFailDescr` Arc's
-/// `Arc::as_ptr` address to the codegen-time `source_op_index`
-/// (the index of the trace op that produced this exit).
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
-/// carry this slot — RPython's `assembler.py` never re-fetches the
-/// op index after codegen.  Pyre keeps it because backend layouts
-/// (`FailDescrLayout::source_op_index`) cross the backend→metainterp
-/// boundary and the metainterp consumer needs to align deadframe
-/// metadata with the trace it came from.  Sharing the same shape
-/// as the cranelift counterpart (`majit-backend-cranelift/src/
-/// guard.rs::SOURCE_OP_INDEX_TABLE`).
-static SOURCE_OP_INDEX_TABLE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-
-fn source_op_index_table() -> &'static Mutex<HashMap<usize, usize>> {
-    SOURCE_OP_INDEX_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn register_source_op_index(descr_ptr: usize, op_index: usize) {
-    source_op_index_table()
-        .lock()
-        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
-        .insert(descr_ptr, op_index);
-}
-
-pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
-    source_op_index_table()
-        .lock()
-        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .copied()
-}
-
-use majit_ir::{Descr, DescrRef, FailDescr};
-
-/// Backend-static descr-by-address registry, mirroring the per-backend
-/// `DynasmBackend::fail_descr_registry` so the `call_assembler_helper_trampoline`
-/// (which has no `&DynasmBackend` reachable from its `extern "C"` body)
-/// can recover the descr identity without dereferencing the raw pointer
-/// as `*const DynasmFailDescr`.  Stored as `Weak<dyn Descr>` so the
-/// global table does not keep evicted descrs alive past their owning
-/// `CompiledLoop`/`CompiledBridge`; the per-backend registry retains a
-/// strong reference for the live set.
-static FAIL_DESCR_REGISTRY_GLOBAL: OnceLock<Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>>> =
-    OnceLock::new();
-
-fn fail_descr_registry_global() -> &'static Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>> {
-    FAIL_DESCR_REGISTRY_GLOBAL.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn register_fail_descr_global(descr_ptr: usize, descr: &DescrRef) {
-    // `insert` (not `entry().or_insert_with`): after the original descr
-    // at this address is dropped, the allocator may reuse the address
-    // for a freshly registered descr.  `or_insert_with` would leave the
-    // stale `Weak` in place and `lookup_fail_descr_global` would keep
-    // upgrading to `None`, dropping live guard failures into the
-    // fallback `handle_fail_dispatch == 0` path.
-    fail_descr_registry_global()
-        .lock()
-        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
-        .insert(descr_ptr, std::sync::Arc::downgrade(descr));
-}
-
-pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
-    fail_descr_registry_global()
-        .lock()
-        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
-        .get(&descr_ptr)
-        .and_then(|w| w.upgrade())
-}
+// Descr-by-address recovery is now a pure `Arc::from_raw` against the
+// `FailDescrCell` wrapper baked at codegen time —
+// `majit_ir::recover_fail_descr_cell(addr)` in `majit-ir/src/descr.rs`.
+// `history.py:113 AbstractDescr.show(cpu, descr_gcref) =
+// cast_gcref_to_instance(...)` parity.  The strong refcount is held by
+// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`).
 
 // RECOVERY_LAYOUT_TABLE removed (Slice NN): `recovery_layout` is not in
 // PyPy `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream resume
@@ -145,7 +80,6 @@ pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle};
 /// must read position from the Vec, not from the descr.
 pub fn layout_for_fail_descr(
     fd: &dyn FailDescr,
-    descr_addr: usize,
     fail_index: u32,
     trace_id: u64,
 ) -> majit_backend::FailDescrLayout {
@@ -159,7 +93,7 @@ pub fn layout_for_fail_descr(
         is_finish: fd.is_finish(),
         is_exception_exit: fd.is_exit_frame_with_exception(),
         trace_id,
-        source_op_index: lookup_source_op_index(descr_addr),
+        source_op_index: fd.source_op_index(),
         // Forward through `FailDescr::is_gc_ref_slot` / `force_token_slots`
         // so concrete descrs that override these (e.g. cranelift descrs
         // that suppress force-token producer slots from GC classification)
