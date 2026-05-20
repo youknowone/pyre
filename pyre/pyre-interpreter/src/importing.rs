@@ -5577,11 +5577,39 @@ extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     rustpython_host_env::faulthandler::signal_default_and_raise(signum);
 }
 
+/// `handler.py:35-49 Handler.get_fileno_and_file` — extract a fileno
+/// from a python file-or-fd-or-None argument.  None → fd 2 (stderr);
+/// int → used directly; any other object → call `.fileno()`.
+fn faulthandler_extract_fd(w_file: pyre_object::PyObjectRef) -> Result<i32, crate::PyError> {
+    if w_file.is_null() || unsafe { pyre_object::is_none(w_file) } {
+        return Ok(2);
+    }
+    if unsafe { pyre_object::is_int(w_file) } {
+        let fd = unsafe { pyre_object::w_int_get_value(w_file) } as i32;
+        if fd < 0 {
+            return Err(crate::PyError::value_error(
+                "file is not a valid file descriptor",
+            ));
+        }
+        return Ok(fd);
+    }
+    let method = crate::baseobjspace::getattr(w_file, "fileno")?;
+    let res = crate::call_function(method, &[]);
+    if res.is_null() || !unsafe { pyre_object::is_int(res) } {
+        return Err(crate::PyError::type_error(
+            "fileno() returned non-integer",
+        ));
+    }
+    Ok(unsafe { pyre_object::w_int_get_value(res) } as i32)
+}
+
 fn init_faulthandler(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "enable",
-        crate::make_builtin_function("enable", |_args| {
+        crate::make_builtin_function("enable", |args| {
+            // `handler.py:141-145 enable` — file=None, all_threads=True.
+            let _fd = faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
             #[cfg(all(unix, feature = "host_env"))]
             {
                 let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
@@ -5669,26 +5697,32 @@ fn init_faulthandler(ns: &mut DictStorage) {
     // Provide a "registered → no-op" pattern: install the handler when
     // registering, restore on unregister.  The handler writes a short
     // "user signal NN delivered" message to fd 2 (no traceback).
+    // `handler.py:115-128 register(signum, file=None, all_threads=True, chain=False)`.
     crate::dict_storage_store(
         ns,
         "register",
         crate::make_builtin_function("register", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("register() missing signal"));
+            }
+            let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+            let fd =
+                faulthandler_extract_fd(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
+            let all_threads = args
+                .get(2)
+                .map(|&a| crate::baseobjspace::is_true(a))
+                .unwrap_or(true);
+            let chain = args
+                .get(3)
+                .map(|&a| crate::baseobjspace::is_true(a))
+                .unwrap_or(false);
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("register() missing signal"));
-                }
-                let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let fd = if args.len() >= 2 {
-                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32
-                } else {
-                    2
-                };
                 rustpython_host_env::faulthandler::register_user_signal(
                     signum,
                     fd,
-                    true,
-                    false,
+                    all_threads,
+                    chain,
                     faulthandler_user_handler,
                 )
                 .map_err(|e| {
@@ -5697,11 +5731,11 @@ fn init_faulthandler(ns: &mut DictStorage) {
                         format!("register: {e}"),
                     )
                 })?;
-                Ok(pyre_object::w_none())
+                return Ok(pyre_object::w_none());
             }
             #[cfg(not(all(unix, feature = "host_env")))]
             {
-                let _ = args;
+                let _ = (fd, all_threads, chain);
                 Ok(pyre_object::w_none())
             }
         }),
@@ -5729,6 +5763,91 @@ fn init_faulthandler(ns: &mut DictStorage) {
                 }
             },
             1,
+        ),
+    );
+
+    // `handler.py:225-245` test-only crash helpers from
+    // `moduledef.py:14-22`.  Each unconditionally takes down the
+    // process — only ever called from test_faulthandler.py in a
+    // subprocess.  Pyre cannot construct an OperationError here
+    // because the abort/segfault leaves no caller to catch it.
+    crate::dict_storage_store(
+        ns,
+        "_read_null",
+        crate::make_builtin_function_with_arity(
+            "_read_null",
+            |_| {
+                // `handler.py:225 read_null` — null-pointer deref.
+                let p: *const u8 = std::ptr::null();
+                let _ = unsafe { p.read_volatile() };
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_sigsegv",
+        crate::make_builtin_function_with_arity(
+            "_sigsegv",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    libc::raise(libc::SIGSEGV);
+                }
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_sigfpe",
+        crate::make_builtin_function_with_arity(
+            "_sigfpe",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    libc::raise(libc::SIGFPE);
+                }
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_sigabrt",
+        crate::make_builtin_function_with_arity(
+            "_sigabrt",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    libc::abort();
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_none())
+            },
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_stack_overflow",
+        crate::make_builtin_function_with_arity(
+            "_stack_overflow",
+            |_| {
+                // `handler.py:240 stack_overflow` — infinite recursion.
+                fn blow() {
+                    let _buf = [0u8; 4096];
+                    blow();
+                    std::hint::black_box(_buf);
+                }
+                blow();
+                #[allow(unreachable_code)]
+                Ok(pyre_object::w_none())
+            },
+            0,
         ),
     );
 }
