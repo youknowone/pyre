@@ -831,6 +831,101 @@ fn fresh_variable_for_state(
     }
 }
 
+/// CFG-level Variable-pair collector for
+/// `RegAllocator.coalesce_variables` — port of
+/// `rpython/tool/algo/regalloc.py:79-96`.
+///
+/// Iterates `graph.iterblocks()` → `block.exits` → paired
+/// `(link.args[i], link.target.inputargs[i])` (matching upstream's
+/// `for i, v in enumerate(link.args): self._try_coalesce(v,
+/// link.target.inputargs[i])`).  Projects each Variable through the
+/// same `walker_slot_for_variable → graph_regallocs[Ref]` fallback
+/// chain the walker's `insert_renamings` helper uses, yielding
+/// `(source_slot, target_slot)` u16 pairs ready for
+/// `RegAllocator::try_coalesce`.
+///
+/// Why Variable-keyed, not FrameState-keyed: RPython has no
+/// FrameState indirection — Variables carry their own UnionFind
+/// identity (`regalloc.py:98-101 isinstance(v, Variable)`).  pyre's
+/// regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
+/// ADAPTATION), so the helper projects Variables back onto slots
+/// at the point of collection.  This avoids the
+/// FrameState/mergeable-index bridge (`collect_link_slot_pairs` in
+/// origin/main) and the `LinkArgPosition` chain (S6 retired
+/// `arg_positions`) — neither has an RPython counterpart.
+///
+/// Filter: only Ref-kind pairs are emitted, matching the per-kind
+/// gate inside `allocate_registers` (`regalloc.rs:670-677`).  Every
+/// `FrameState.mergeable()` position in pyre holds a Ref-kind
+/// Variable (locals, stack, last_exc pair), so Int / Float kinds
+/// never produce CFG pairs in practice.
+///
+/// `last_exception` / `last_exc_value` link args are skipped per
+/// `flatten.py:336-347 generate_last_exc` — those are emitted
+/// separately and don't participate in coalesce.
+fn collect_cfg_coalesce_pairs(
+    graph: &super::flow::FunctionGraph,
+    walker_slot_for_variable: &[Option<u16>],
+    graph_regallocs: &[super::regalloc::GraphAllocationResult; 3],
+) -> Vec<(u16, u16)> {
+    let get_color = |variable: &super::flow::Variable| -> u16 {
+        if let Some(Some(slot)) = walker_slot_for_variable
+            .get(variable.id.0 as usize)
+            .copied()
+        {
+            return slot;
+        }
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        graph_regallocs[kind.index()]
+            .coloring
+            .get(&variable.id)
+            .copied()
+            .unwrap_or(u16::MAX)
+    };
+
+    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    for block in graph.iterblocks() {
+        let block_borrow = block.borrow();
+        for link_ref in &block_borrow.exits {
+            let link_borrow = link_ref.borrow();
+            let Some(target_ref) = link_borrow.target.clone() else {
+                continue;
+            };
+            let target_borrow = target_ref.borrow();
+            if link_borrow.args.len() != target_borrow.inputargs.len() {
+                continue;
+            }
+            for (i, arg) in link_borrow.args.iter().enumerate() {
+                let Some(src_value) = arg.as_ref() else {
+                    continue;
+                };
+                let Some(src_variable) = src_value.as_variable() else {
+                    continue;
+                };
+                let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+                    continue;
+                };
+                if Some(src_variable.clone()) == link_borrow.last_exception
+                    || Some(src_variable.clone()) == link_borrow.last_exc_value
+                {
+                    continue;
+                }
+                let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+                if kind != Kind::Ref {
+                    continue;
+                }
+                let src_slot = get_color(&src_variable);
+                let dst_slot = get_color(&dst_variable);
+                if src_slot == u16::MAX || dst_slot == u16::MAX {
+                    continue;
+                }
+                pairs.push((src_slot, dst_slot));
+            }
+        }
+    }
+    pairs
+}
+
 /// Walker post-walk `insert_renamings` — port of
 /// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
@@ -8680,14 +8775,21 @@ impl CodeWriter {
         // graph remains topology-only until a pre-regalloc Variable
         // environment is introduced.
 
-        // Intra-block `*_copy` coalescing inside
-        // `RegAllocator::coalesce_variables` is pyre's sole coalesce
-        // source today; see `perform_register_allocation` docstring
-        // for why the upstream CFG-level `regalloc.py:79-96` loop is
-        // load-bearing only after the canonical `flatten_graph`
-        // driver takes over SSARepr emission from the walker.
-        let alloc_result =
-            super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
+        // `regalloc.py:79-96 coalesce_variables` CFG-level loop:
+        // every Link's `(link.args[i], link.target.inputargs[i])`
+        // pair is unioned via try_coalesce, alongside the SSARepr
+        // `*_copy` scanner inside `RegAllocator::coalesce_variables`
+        // (intra-block coalesce, pyre walker NEW-DEVIATION because
+        // upstream defers `*_copy` to `flatten.py:306-334`).  Both
+        // sources feed the same union-find + depgraph.
+        let cfg_coalesce_pairs =
+            collect_cfg_coalesce_pairs(&graph, &walker_slot_for_variable, &graph_regallocs);
+        let alloc_result = super::regalloc::allocate_registers(
+            &ssarepr,
+            code.varnames.len(),
+            inputs,
+            &cfg_coalesce_pairs,
+        );
         // Phase 3 (b) Slice 1: run graph-side
         // `perform_graph_register_allocation_all_kinds` +
         // `enforce_input_args_graph` post-walker on every
