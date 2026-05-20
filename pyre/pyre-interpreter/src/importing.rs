@@ -9546,10 +9546,24 @@ fn init_posix(ns: &mut DictStorage) {
         );
 
         // os.sendfile(out_fd, in_fd, offset, count) -> bytes_sent
-        // Linux uses the 4-arg form directly. macOS uses the BSD form with
-        // swapped fd order and i64 count; pyre exposes the simple 4-arg
-        // surface (no headers/trailers).
-        #[cfg(target_os = "linux")]
+        //
+        // Ported from pypy/module/posix/interp_posix.py:2932-2961:
+        //   * 4 positional args: out_fd, in_fd (called "in_" in PyPy because
+        //     "in" is reserved), offset, count.
+        //   * offset == None: linux-only "no-offset" path (NULL pointer);
+        //     non-linux raises TypeError("an integer is required (got None)")
+        //     verbatim from PyPy.
+        //   * offset == int: read as i64 (PyPy uses
+        //     space.gateway_r_longlong_w) and routed through
+        //     rustpython_host_env::posix::sendfile (linux) or the BSD-form
+        //     wrapper (macos).
+        //   * Returns bytes-sent as int (PyPy: space.newint(res)).
+        //
+        // EINTR retry loop intentionally omitted — pyre's other os-syscall
+        // wrappers don't do manual retry (relies on PEP 475 OS-level retry),
+        // matching pyre-wide convention rather than introducing a single
+        // outlier.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         crate::dict_storage_store(
             ns,
             "sendfile",
@@ -9560,41 +9574,57 @@ fn init_posix(ns: &mut DictStorage) {
                 }
                 let out_fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let in_fd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                let offset_raw = unsafe { pyre_object::w_int_get_value(args[2]) };
-                let count = (unsafe { pyre_object::w_int_get_value(args[3]) }) as usize;
-                let out_b = unsafe { BorrowedFd::borrow_raw(out_fd) };
-                let in_b = unsafe { BorrowedFd::borrow_raw(in_fd) };
-                let mut offset: rustpython_host_env::crt_fd::Offset = offset_raw as _;
-                let n = host_posix::sendfile(out_b, in_b, &mut offset, count)
-                    .map_err(|e| io_err(e, ""))?;
-                Ok(pyre_object::w_int_new(n as i64))
-            }),
-        );
-        #[cfg(target_os = "macos")]
-        crate::dict_storage_store(
-            ns,
-            "sendfile",
-            crate::make_builtin_function("sendfile", |args| {
-                use std::os::fd::BorrowedFd;
-                if args.len() < 4 {
-                    return Err(crate::PyError::type_error("sendfile() requires 4 arguments"));
+                let w_offset = args[2];
+                let count_raw = unsafe { pyre_object::w_int_get_value(args[3]) };
+                if unsafe { pyre_object::is_none(w_offset) } {
+                    // linux-only no-offset path; non-linux raises TypeError
+                    // matching interp_posix.py:2946.
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = (out_fd, in_fd, count_raw);
+                        return Err(crate::PyError::type_error(
+                            "an integer is required (got None)",
+                        ));
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // host_env doesn't expose a NULL-offset variant; call
+                        // libc::sendfile directly with a null pointer, matching
+                        // rposix.sendfile_no_offset (rposix.py:3066-3069).
+                        let count = count_raw as libc::size_t;
+                        let res = unsafe {
+                            libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
+                        };
+                        if res < 0 {
+                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                        }
+                        return Ok(pyre_object::w_int_new(res as i64));
+                    }
                 }
-                let out_fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                let in_fd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                let offset_raw = unsafe { pyre_object::w_int_get_value(args[2]) };
-                let count = unsafe { pyre_object::w_int_get_value(args[3]) };
+                let offset_i64 = unsafe { pyre_object::w_int_get_value(w_offset) };
                 let out_b = unsafe { BorrowedFd::borrow_raw(out_fd) };
                 let in_b = unsafe { BorrowedFd::borrow_raw(in_fd) };
-                let (res, written) = host_posix::sendfile(
-                    in_b,
-                    out_b,
-                    offset_raw as rustpython_host_env::crt_fd::Offset,
-                    count,
-                    None,
-                    None,
-                );
-                res.map_err(|e| io_err(e, ""))?;
-                Ok(pyre_object::w_int_new(written))
+                #[cfg(target_os = "linux")]
+                {
+                    let count = count_raw as usize;
+                    let mut offset: rustpython_host_env::crt_fd::Offset = offset_i64 as _;
+                    let n = host_posix::sendfile(out_b, in_b, &mut offset, count)
+                        .map_err(|e| io_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(n as i64));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let (res, written) = host_posix::sendfile(
+                        in_b,
+                        out_b,
+                        offset_i64 as rustpython_host_env::crt_fd::Offset,
+                        count_raw,
+                        None,
+                        None,
+                    );
+                    res.map_err(|e| io_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(written));
+                }
             }),
         );
 
