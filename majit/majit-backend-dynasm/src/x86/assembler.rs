@@ -804,6 +804,8 @@ pub struct CompiledCode {
     /// AtomicUsize for redirect_call_assembler's update_frame_info
     /// parity: may be updated through &CompiledCode (shared ref).
     pub frame_depth: std::sync::atomic::AtomicUsize,
+    /// `None` for root loops; bridges set `(source_trace_id, source_fail_index_per_trace)`.
+    pub source_guard: Option<(u64, u32)>,
 }
 
 impl<'a> Assembler386<'a> {
@@ -2371,6 +2373,7 @@ impl<'a> Assembler386<'a> {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
+            source_guard: None,
         })
     }
 
@@ -2496,6 +2499,7 @@ impl<'a> Assembler386<'a> {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
+            source_guard: Some((fail_descr.trace_id(), fail_descr.fail_index_per_trace())),
         })
     }
 

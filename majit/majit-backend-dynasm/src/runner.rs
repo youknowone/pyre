@@ -700,19 +700,6 @@ pub struct DynasmBackend {
     /// owning backend — matches the lifetime guarantee RPython gets from
     /// `cpu` being a long-lived Python object.
     descr_attachments: crate::guard::CpuDescrHandle,
-    /// ptr → `DescrRef` registry enabling cross-token resolution of
-    /// guard fail descriptors. RPython resolves
-    /// Backend-internal side-table mapping a source guard descr's
-    /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
-    /// patched in for that guard.  PyPy's `AbstractFailDescr._attrs_`
-    /// (`history.py:132`) carries no `bridge_addr` slot; once a bridge is
-    /// patched in, RPython relies on the in-place machine-code JMP and
-    /// recovers structural state from `asmmemmgr_blocks`.  Pyre's
-    /// metainterp queries `store_bridge_guard_hashes` /
-    /// `compiled_bridge_fail_descr_layouts` need to walk back from a
-    /// source descr to its bridge `CompiledCode`; this table is the
-    /// indirection that lets us do that without polluting the descr.
-    bridge_addr_by_descr: Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
     /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
     /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
     /// `self.propagate_exception_path` at `assembler.py:63,344` and
@@ -805,34 +792,29 @@ impl DynasmBackend {
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
             )),
-            bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             arch_cpu_ext: ArchCpuExt::new(),
         }
     }
 
-    /// Bridge entry-pointer registration keyed on the source guard
-    /// descr's `Arc::as_ptr` address.  Called from `compile_bridge`
-    /// immediately after `patch_jump_for_descr` redirects the source
-    /// guard at `runner.rs::compile_bridge` to point at the freshly
-    /// compiled bridge.
-    pub fn register_bridge_addr(&self, source_descr_ptr: usize, bridge_addr: usize) {
-        self.bridge_addr_by_descr
-            .lock()
-            .expect("bridge_addr_by_descr mutex poisoned")
-            .insert(source_descr_ptr, bridge_addr);
-    }
-
-    /// Bridge entry-pointer lookup by source descr `Arc::as_ptr` address.
-    /// Returns `0` when no bridge has been registered for the source
-    /// (PyPy parity: `assembler.py` treats `adr_jump_offset == 0`
-    /// uniformly as "patched / no entry").
-    pub fn lookup_bridge_addr(&self, source_descr_ptr: usize) -> usize {
-        self.bridge_addr_by_descr
-            .lock()
-            .expect("bridge_addr_by_descr mutex poisoned")
-            .get(&source_descr_ptr)
-            .copied()
-            .unwrap_or(0)
+    /// Bridge entry-pointer lookup by source guard `(trace_id, fail_index_per_trace)`.
+    /// Scans `token.asmmemmgr_blocks` for a `CompiledCode` whose `source_guard`
+    /// matches; returns `0` if none — `assembler.py` treats `adr_jump_offset == 0`
+    /// uniformly as "patched / no entry".
+    pub fn lookup_bridge_addr(
+        &self,
+        token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> usize {
+        let blocks = token.asmmemmgr_blocks();
+        for block in blocks.iter() {
+            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
+                if bridge.source_guard == Some((source_trace_id, source_fail_index)) {
+                    return codebuf::buffer_ptr(&bridge.buffer) as usize;
+                }
+            }
+        }
+        0
     }
 
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
@@ -1993,7 +1975,6 @@ impl Backend for DynasmBackend {
         }
         if ajo != 0 {
             Asm::patch_jump_for_descr(guard_fd, bridge_addr);
-            self.register_bridge_addr(Arc::as_ptr(&guard_descr) as *const () as usize, bridge_addr);
         } else {
             majit_ir::debug::log_one(
                 "jit-backend",
@@ -2116,8 +2097,9 @@ impl Backend for DynasmBackend {
         // Debug: verify bridge patches are visible
         if crate::majit_log_enabled() {
             for descr in &compiled.fail_descrs {
-                let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(descr) as *const () as usize);
                 if let Some(fd) = descr.as_fail_descr() {
+                    let bridge_addr =
+                        self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
                     if bridge_addr != 0 && fd.adr_jump_offset() == 0 {
                         eprintln!(
                             "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
@@ -2329,34 +2311,8 @@ impl Backend for DynasmBackend {
     /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
     /// baked descrs (`clear_gcref_tracer` per tracer); Weak entries in
     /// the global `FAIL_DESCR_REGISTRY_GLOBAL` upgrade to `None` next
-    /// time someone looks them up.  Only `bridge_addr_by_descr` (a pyre-
-    /// only slot — `history.py:132` `AbstractFailDescr._attrs_` has no
-    /// `bridge_addr`) still requires explicit eviction here; we
-    /// enumerate the token's descrs through the tracer batches and
-    /// remove the matching `bridge_addr_by_descr` entries.
-    fn free_loop(&mut self, token: &JitCellToken) {
-        let Some(clt) = token.compiled_loop_token.as_ref() else {
-            return;
-        };
-        let mut removed_bridge_addr_keys = Vec::new();
-        for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-            if let Some(descrs) = tracer.downcast_ref::<Vec<majit_ir::DescrRef>>() {
-                for descr in descrs {
-                    removed_bridge_addr_keys
-                        .push(Arc::as_ptr(descr) as *const () as usize);
-                }
-            }
-        }
-        if !removed_bridge_addr_keys.is_empty() {
-            let mut bridge_addrs = self
-                .bridge_addr_by_descr
-                .lock()
-                .expect("bridge_addr_by_descr mutex poisoned");
-            for key in removed_bridge_addr_keys {
-                bridge_addrs.remove(&key);
-            }
-        }
-    }
+    /// time someone looks them up.
+    fn free_loop(&mut self, _token: &JitCellToken) {}
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref) =
@@ -2490,8 +2446,7 @@ impl Backend for DynasmBackend {
         source_fail_index: u32,
         hashes: &[u64],
     ) {
-        let source_descr = Self::find_descr(token, source_trace_id, source_fail_index);
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
+        let bridge_addr = self.lookup_bridge_addr(token, source_trace_id, source_fail_index);
         if bridge_addr == 0 {
             return;
         }
@@ -3047,9 +3002,8 @@ impl Backend for DynasmBackend {
         // by (trace_id, fail_index) and must treat the miss as `None`
         // — match cranelift's `?` semantics in
         // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
-        let source_descr =
-            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
+        let bridge_addr =
+            self.lookup_bridge_addr(original_token, source_trace_id, source_fail_index);
         if bridge_addr == 0 {
             return None;
         }
