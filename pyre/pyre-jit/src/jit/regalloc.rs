@@ -56,10 +56,11 @@ pub struct GraphAllocationResult {
     pub num_colors: u16,
 }
 
-/// Field names follow `rpython/tool/algo/regalloc.py:47-49` exactly —
-/// `_depgraph`, `_unionfind`, `_coloring`.  The union-find is the real
-/// `tool/algo/unionfind.py UnionFind` port (`()` info, matching upstream
-/// `info_factory=None`).
+/// Field names follow `rpython/tool/algo/regalloc.py` — `_depgraph`
+/// (`make_dependencies`, py:77), `_unionfind` (`coalesce_variables`,
+/// py:80), `_coloring` (`find_node_coloring`, py:115).  The union-find
+/// is the real `tool/algo/unionfind.py UnionFind` port (`()` info,
+/// matching upstream `info_factory=None`).
 struct FlowGraphRegAllocator {
     _depgraph: DependencyGraph<ValueId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
