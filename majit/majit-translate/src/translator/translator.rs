@@ -278,6 +278,19 @@ pub struct TranslationContext {
     /// role of upstream `flowcontext.py:847 FlowingError.value`'s
     /// preserved cause channel.
     pub _walker_errors: RefCell<HashMap<HostObject, String>>,
+    /// Per-`HostObject` lift-failure record drained from
+    /// `cutover::populate_call_registry_from_call_graphs`'s Pass 2
+    /// failure arm.  When the eager pre-pass cannot lift a callee
+    /// into a `PyGraph`, the error is stashed here (keyed by the
+    /// callee's `HostObject` identity) so a later `buildflowgraph`
+    /// fallback surfaces the actual lift error instead of the
+    /// generic "missing code object" message.  Mirrors
+    /// [`Self::_walker_errors`]'s role for the rust-source walker —
+    /// preserves the producer-side failure point analogous to
+    /// upstream's lazy `getdesc → newfuncdesc → buildgraph` chain
+    /// (`rpython/annotator/bookkeeper.py:353-409`) where the
+    /// original exception propagates.
+    pub _pyre_lift_errors: RefCell<HashMap<HostObject, String>>,
     /// RPython `self.entry_point_graph`. Set by
     /// `RPythonAnnotator.build_types(main_entry_point=True)`.
     pub entry_point_graph: RefCell<Option<GraphRef>>,
@@ -318,6 +331,7 @@ impl TranslationContext {
             _prebuilt_graphs: RefCell::new(HashMap::new()),
             _walker_pygraphs: RefCell::new(HashMap::new()),
             _walker_errors: RefCell::new(HashMap::new()),
+            _pyre_lift_errors: RefCell::new(HashMap::new()),
             entry_point_graph: RefCell::new(None),
         }
     }
@@ -431,6 +445,23 @@ impl TranslationContext {
             }
             drop(graphs);
             return Ok(pygraph);
+        }
+
+        // If the eager pre-pass at
+        // `cutover::populate_call_registry_from_call_graphs` recorded
+        // a lift failure for this host, surface that error instead of
+        // the generic "missing code object" fallback below.  Mirrors
+        // upstream `bookkeeper.getdesc → newfuncdesc → buildgraph`
+        // where the original construction error propagates from the
+        // lazy `cachedgraph` consumer
+        // (`rpython/annotator/description.py:228`).
+        if let Some(lift_err) = self._pyre_lift_errors.borrow().get(&func).cloned() {
+            return Err(format!(
+                "buildflowgraph({}): pyre-side lift failed during \
+                 populate_call_registry_from_call_graphs (recorded \
+                 lazy-failure error): {lift_err}",
+                graph_func.name,
+            ));
         }
 
         let code = graph_func

@@ -172,18 +172,24 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::LLAddress(_) => ValueType::Int,
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,
-        // RPython `Constant(None)` annotates to `SomeNone`
-        // (`annotator/model.py: SomePBC.lowleveltype` / `rnone.py:
-        // NoneRepr.lowleveltype = Void`), which the rtyper lowers to
-        // LL `Void`.  Pyre's legacy projector previously collapsed
-        // `ConstValue::None` to `Ref` (Python None as a PyObject), which
-        // mis-typed `Link.args = [Constant(None)]` return-block flow as
-        // `Ref` instead of `Void`, blocking the `set_return(_, None)`
-        // orthodox shape.  Returning `Void` aligns with `NoneRepr`'s
-        // LL kind so the orthodox Constant-link-arg matches the
-        // `synthetic_void_return_stays_void` invariant directly.
-        ConstValue::None => ValueType::Void,
-        ConstValue::Atom(_)
+        // RPython `Constant(None)` is annotated as `SomeNone`
+        // (`rpython/annotator/annrpython.py:273 immutablevalue(None)`
+        // → `SomeNone()` per `annotator/model.py:603`), distinct from
+        // `SomeInteger` / `SomeString`.  Pyre's `ValueType` lacks a
+        // dedicated `SomeNone` variant, so collapse to `Ref` — the
+        // closest match for the dominant downstream consumer where
+        // None flows into a `Ptr` target and the rtyper emits
+        // `inputconst(Ptr, None)` per `pairtype(NoneRepr, Repr).
+        // convert_from_to` (`rpython/rtyper/rnone.py:58`).  For the
+        // `Constant(None) → NoneRepr` target case (where the rtyper
+        // returns `inputconst(Void, None)` per `rnone.py:48`),
+        // construction sites such as `set_return` write the target
+        // repr onto `Constant.concretetype`; the rtyping-layer
+        // projection at `legacy_resolve::link_arg_concrete_type` then
+        // honours that hint to materialise `Void` without forcing
+        // every None through the annotation layer as `Void`.
+        ConstValue::None
+        | ConstValue::Atom(_)
         | ConstValue::Dict(_)
         | ConstValue::ByteStr(_)
         | ConstValue::UniStr(_)
@@ -530,13 +536,35 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_void_return_stays_void() {
+    fn synthetic_void_return_carries_void_concretetype() {
+        // `set_return(_, None)` wires `LinkArg::Const(Constant(None,
+        // concretetype=Void))` per `flowcontext.py:687-689` +
+        // `:1232-1236`.  At the annotation layer, `Constant(None)`
+        // projects to `Ref` (pyre's nearest mapping for upstream's
+        // `SomeNone` — see `const_value_type`).  The rtyping-layer
+        // projection at [`super::legacy_resolve::link_arg_concrete_type`]
+        // then honours the construction-site `concretetype=Void` to
+        // materialise `Void` on the returnblock inputarg, matching
+        // `pairtype(Repr, NoneRepr).convert_from_to → inputconst(Void, None)`
+        // (`rpython/rtyper/rnone.py:48`).
+        use super::super::legacy_resolve;
         let mut graph = FunctionGraph::new("void_return");
         let entry = graph.startblock;
         graph.set_return(entry, None);
 
-        let state = annotate(&graph);
+        let annotations = annotate(&graph);
         let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
-        assert_eq!(state.get(ret), ValueType::Void);
+        assert_eq!(
+            annotations.get(ret),
+            ValueType::Ref,
+            "annotation-layer projection of Constant(None) follows SomeNone → Ref",
+        );
+
+        legacy_resolve::resolve_types(&graph, &annotations);
+        assert_eq!(
+            graph.concretetype(ret),
+            crate::jit_codewriter::type_state::ConcreteType::Void,
+            "rtyping-layer projection honours Constant.concretetype=Void from set_return",
+        );
     }
 }

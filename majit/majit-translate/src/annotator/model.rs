@@ -2576,23 +2576,25 @@ impl Eq for AnnotatorError {}
 
 impl fmt::Display for AnnotatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // RPython `AnnotatorError(msg)` always carries a message; the
-        // Rust port models the `block`/`source` slots as `Option` so an
-        // error in flight before `set_annotator_block` runs has neither
-        // populated.  The previous `if let Some(...)` arms silently
-        // suppressed `AnnotatorError` whose `msg`/`source` were both
-        // `None`, surfacing as `compute_at_fixpoint failed: ` (empty
-        // payload) in `cutover::dual_gate_check_with_registry`'s Skip
-        // log.  Always emit a structural tag plus whatever fields are
-        // populated, so propagators (`complete_pending_blocks` /
-        // `compute_at_fixpoint`) carry the producer-side context.
-        let has_msg = self.msg.is_some();
-        let has_source = self.source.is_some();
-        if !has_msg && !has_source {
-            return write!(f, "AnnotatorError{{block:{:?}}}", self.block);
-        }
-        if let Some(msg) = &self.msg {
-            write!(f, "\n\n{msg}")?;
+        // Line-by-line port of `AnnotatorError.__str__`
+        // (`rpython/annotator/model.py:719-725`):
+        //
+        //     def __str__(self):
+        //         s = "\n\n%s" % self.msg
+        //         if self.source is not None:
+        //             s += "\n\n"
+        //             s += self.source
+        //         return s
+        //
+        // Upstream's `%s` formats `None` literally as `"None"` when
+        // `self.msg is None` — pyre matches via `Option::Display`
+        // (None → "None") to keep producer-side telemetry symmetric.
+        // The `block` slot is pyre-only diagnostic state; rendering it
+        // here would deviate from upstream and is the reporting
+        // layer's concern, not the exception's.
+        match &self.msg {
+            Some(msg) => write!(f, "\n\n{msg}")?,
+            None => write!(f, "\n\nNone")?,
         }
         if let Some(source) = &self.source {
             write!(f, "\n\n{source}")?;

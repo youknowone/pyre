@@ -750,18 +750,33 @@ pub fn populate_call_registry_from_call_graphs(
     // `FunctionDesc` is built independently via `newfuncdesc`, and a
     // failure on one callable does NOT abort the bookkeeper's `descs`
     // population for other callables.  Upstream's per-`Constant(pyobj)`
-    // builder is invoked lazily; pyre's eager pre-pass mirrors the same
-    // lazy-failure shape by swallowing the per-callee lift error,
-    // leaving that callee's `FunctionDesc.cache` empty so a later
-    // `cachedgraph` miss surfaces the same failure at use-site
-    // (matching RPython's lazy `newfuncdesc → buildgraph` failure
-    // point).  Without this isolation a single bad leaf (e.g.
-    // `function_write_barrier`'s unregistered
-    // `try_gc_write_barrier` callee) cascades into "missing code
-    // object" for every later-prefilled callee — a NEW-DEVIATION from
-    // upstream's per-callable failure model.
+    // builder is invoked lazily; pyre's eager pre-pass approximates
+    // that lazy shape by isolating per-callee failures here — but
+    // unlike a previous draft that *swallowed* the error outright,
+    // the lift error is now stashed on the entry via
+    // `PyreFunctionEntry::record_lift_error` so the next
+    // `cachedgraph` consumer surfaces the actual producer-side
+    // failure instead of falling through to `buildflowgraph`'s
+    // generic "missing code object" message
+    // (`translator/translator.rs:439`).  This keeps the lazy-failure
+    // *point of observation* aligned with upstream
+    // `description.py:228` while preserving pyre's eager prefill
+    // shape for the success path.  Without per-entry error capture a
+    // single bad leaf (e.g. `function_write_barrier`'s unregistered
+    // `try_gc_write_barrier` callee) would mask its own diagnosis
+    // behind every later use-site's generic fallback — a divergence
+    // from upstream's per-callable failure model where the original
+    // exception propagates.
     let mut lifted: HashSet<*const PyreFunctionEntry> =
         HashSet::with_capacity(by_canonical_path.len());
+    // Each lift failure pushes into the translator's
+    // `_pyre_lift_errors` map keyed by the entry's `HostObject`
+    // identity, making the recorded error visible to
+    // `buildflowgraph` consumers downstream.  Resolved lazily so
+    // test fixtures whose `Bookkeeper` runs without an attached
+    // `RPythonAnnotator` (`bookkeeper.annotator()` panics with
+    // "backlink absent or dropped") only pay the lookup on the
+    // failure path; success paths remain unaffected.
     for (_key, graph, entry) in &pending {
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
@@ -769,10 +784,16 @@ pub fn populate_call_registry_from_call_graphs(
         }
         match lift_callee_to_pygraph(graph, signature_for_graph(graph), registry) {
             Ok(pygraph) => entry.prefill_default_cache(pygraph),
-            Err(_) => {
-                // Leave the entry's cache empty; the use-site lookup
-                // will surface this callee's lift failure when
-                // `FunctionRepr.call` consults `cachedgraph`.
+            Err(e) => {
+                let message = format!("{e}");
+                entry.record_lift_error(message.clone());
+                if let Some(annotator) = registry.bookkeeper().try_annotator() {
+                    annotator
+                        .translator
+                        ._pyre_lift_errors
+                        .borrow_mut()
+                        .insert(entry.host_object.clone(), message);
+                }
             }
         }
     }

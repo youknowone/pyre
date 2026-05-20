@@ -115,6 +115,19 @@ impl FunctionPathKey {
 pub struct PyreFunctionEntry {
     pub host_object: HostObject,
     pub function_desc: Rc<RefCell<FunctionDesc>>,
+    /// Lazy-failure record for the per-entry lift step.  When
+    /// `populate_call_registry_from_call_graphs`'s
+    /// `lift_callee_to_pygraph` fails on this entry, the error is
+    /// stashed here instead of being swallowed — mirrors the upstream
+    /// `Bookkeeper.getdesc` semantics
+    /// (`rpython/annotator/bookkeeper.py:353-409`) where construction
+    /// failures are *not* cached and *not* silently dropped: the
+    /// next consumer that consults the entry must observe the failure.
+    /// Pyre's eager pre-pass differs from upstream's lazy `getdesc`
+    /// only in timing; surfacing the recorded error at `cachedgraph`
+    /// (`description.rs:1029-1051`) keeps the failure point
+    /// observable at the same use-site as upstream's lazy chain.
+    pub lift_error: RefCell<Option<String>>,
 }
 
 impl PyreFunctionEntry {
@@ -140,6 +153,20 @@ impl PyreFunctionEntry {
             .cache
             .borrow_mut()
             .insert(GraphCacheKey::None, pygraph);
+    }
+
+    /// Record a per-entry lift failure so consumers surfacing through
+    /// `cachedgraph` see the producer-side error instead of the
+    /// generic `buildflowgraph: missing code object` fallback.  Called
+    /// from `cutover::populate_call_registry_from_call_graphs`'s Pass
+    /// 2 when `lift_callee_to_pygraph` returns Err.
+    pub fn record_lift_error(&self, message: String) {
+        *self.lift_error.borrow_mut() = Some(message);
+    }
+
+    /// Read the recorded per-entry lift error, if any.
+    pub fn lift_error_message(&self) -> Option<String> {
+        self.lift_error.borrow().clone()
     }
 }
 
@@ -366,6 +393,7 @@ impl PyreCallRegistry {
         let entry = Rc::new(PyreFunctionEntry {
             host_object,
             function_desc,
+            lift_error: RefCell::new(None),
         });
         self.entries.borrow_mut().insert(key, entry.clone());
         entry

@@ -486,6 +486,19 @@ impl Bookkeeper {
             .expect("Bookkeeper.annotator backlink is absent or dropped")
     }
 
+    /// Non-panicking variant of [`Self::annotator`].  Returns `None`
+    /// when the backlink is absent (test fixtures that wire the
+    /// bookkeeper without an `RPythonAnnotator`) or when the
+    /// `Rc<RPythonAnnotator>` has been dropped.  Production callers
+    /// that need the annotator should prefer [`Self::annotator`];
+    /// this variant is for diagnostic side-channels that should
+    /// degrade gracefully when the annotator is not yet attached
+    /// (e.g. lift-error recording from a registry pre-pass that may
+    /// also be exercised in standalone fixture setups).
+    pub fn try_annotator(&self) -> Option<Rc<crate::annotator::annrpython::RPythonAnnotator>> {
+        self.annotator.borrow().upgrade()
+    }
+
     /// RPython `Bookkeeper.warning(self, msg)` (bookkeeper.py:580-581).
     ///
     /// ```python

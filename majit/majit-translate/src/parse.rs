@@ -804,7 +804,9 @@ fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOp
             // each per-opcode handler method receives the
             // dispatcher's parameters in its formal signature.
             crate::front::ast::lower_expr_into_graph_with_signature(
-                &mut graph, &arm.body, Some(sig),
+                &mut graph,
+                &arm.body,
+                Some(sig),
             )
             .unwrap_or_else(|e| {
                 panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")

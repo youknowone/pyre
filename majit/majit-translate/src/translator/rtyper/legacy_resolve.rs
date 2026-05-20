@@ -179,8 +179,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                             .expect("BinOp.rhs has backing ValueId");
                         changed |= maybe_seed_concrete_type(graph, lhs_vid, ConcreteType::Signed);
                         changed |= maybe_seed_concrete_type(graph, rhs_vid, ConcreteType::Signed);
-                        if let Some(result) = op.registered_result_value_id(graph)
-                        {
+                        if let Some(result) = op.registered_result_value_id(graph) {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
                             // `float_add` directly (`rfloat.py
@@ -245,8 +244,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                             .expect("UnaryOp.operand has backing ValueId");
                         changed |=
                             maybe_seed_concrete_type(graph, operand_vid, ConcreteType::Signed);
-                        if let Some(result) = op.registered_result_value_id(graph)
-                        {
+                        if let Some(result) = op.registered_result_value_id(graph) {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
                             // returns Float (`float_neg`).
@@ -294,8 +292,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                         operand,
                         ..
                     } if is_identity_unop(opname) => {
-                        if let Some(result) = op.registered_result_value_id(graph)
-                        {
+                        if let Some(result) = op.registered_result_value_id(graph) {
                             let operand_vid = graph
                                 .value_id_of(operand)
                                 .expect("UnaryOp.operand has backing ValueId");
@@ -409,6 +406,22 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
     let target_block = graph.block(link.target);
     let target_vids = target_block.inputarg_value_ids(graph);
     for (dst, src) in target_vids.iter().zip(link.args.iter()) {
+        // A `LinkArg::Const(_)` whose `concretetype` carries a
+        // construction-site repr (e.g. `set_return`'s
+        // `Constant(None, concretetype=Void)`) is authoritative —
+        // mirrors RPython `_convert_link()` materialising
+        // `inputconst(r_to, value)` whose own `concretetype` is the
+        // destination repr (`rpython/rtyper/rmodel.py:inputconst`
+        // + `rpython/rtyper/rnone.py:48`).  Force-write so an
+        // earlier annotation-derived kind (e.g. `Ref → GcRef` from
+        // `valuetype_to_concrete` on the upstream `SomeNone → Ref`
+        // projection) does not shadow it.
+        if let LinkArg::Const(value) = src
+            && let Some(lltype) = value.concretetype.as_ref()
+        {
+            graph.set_concretetype_inline(*dst, crate::model::getkind(lltype));
+            continue;
+        }
         let _ = maybe_seed_concrete_type(graph, *dst, link_arg_concrete_type(graph, src));
     }
 }
@@ -461,9 +474,15 @@ fn converge_link(graph: &FunctionGraph, link: &Link) -> bool {
                 changed |= maybe_seed_concrete_type(graph, *dst, src_ty);
                 changed |= maybe_seed_concrete_type(graph, src_vid, dst_ty);
             }
-            LinkArg::Const(value) => {
+            LinkArg::Const(_) => {
+                // Route through `link_arg_concrete_type` so the
+                // `Constant.concretetype` construction-site hint
+                // (e.g. `set_return`'s `concretetype=Void`) is
+                // honoured here too — bypassing it would let
+                // `const_value_to_concrete(&value.value)` default
+                // `None → GcRef` and shadow the Void write.
                 changed |=
-                    maybe_seed_concrete_type(graph, *dst, const_value_to_concrete(&value.value));
+                    maybe_seed_concrete_type(graph, *dst, link_arg_concrete_type(graph, src));
             }
         }
     }
@@ -527,7 +546,23 @@ fn link_arg_concrete_type(graph: &FunctionGraph, src: &LinkArg) -> ConcreteType 
             });
             graph.concretetype(vid)
         }
-        LinkArg::Const(value) => const_value_to_concrete(&value.value),
+        // RPython `pairtype(Repr, NoneRepr).convert_from_to`
+        // (`rpython/rtyper/rnone.py:48`) emits `inputconst(Void, None)`
+        // when None flows into a `NoneRepr` target; the symmetric
+        // `pairtype(NoneRepr, Repr).convert_from_to`
+        // (`rpython/rtyper/rnone.py:58`) emits `inputconst(r_to, None)`
+        // which is a null pointer for `Ptr`/ref targets.  Pyre's
+        // construction sites that already know the target repr write
+        // it onto `Constant.concretetype` at the construction site
+        // (e.g. `set_return` wires `Constant(None, concretetype=Void)`
+        // per `flowcontext.py:687-689` + `:1232-1236`); honour that
+        // construction-site hint here.  Falls back to the value-only
+        // default (`getkind(Ptr) == GcRef` for None) when the
+        // construction site did not set a target repr.
+        LinkArg::Const(value) => match value.concretetype.as_ref() {
+            Some(lltype) => crate::model::getkind(lltype),
+            None => const_value_to_concrete(&value.value),
+        },
     }
 }
 
