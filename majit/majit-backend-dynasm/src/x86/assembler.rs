@@ -307,10 +307,84 @@ pub(crate) fn build_malloc_slowpath_fixed(
     // standalone propagate trampoline, not re-baked here.
     let _ = cpu_handle;
     let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
-    let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
     // assembler.py:264 `SUB_rr(edx, ecx)` — recover total_size at runtime.
+    // Only the `kind == 'fixed'` arm preprocesses the size; varsize_frame
+    // receives the frame size in RDX directly from the caller (see
+    // `build_malloc_slowpath_varsize_frame`).
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
+
+    let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
+    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
+
+    let buffer = asm.finalize().expect("malloc_slowpath: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
+/// `assembler.py:231 _build_malloc_slowpath` `kind='var'` analog for
+/// pyre's `CallMallocNurseryVarsizeFrame`.  Same helper trampoline
+/// shape as [`build_malloc_slowpath_fixed`], differing only in the
+/// size-prep step: the caller stages `frame_size` directly into RDX
+/// (no `nursery_free` recovery), so the trampoline skips the
+/// `sub rdx, rcx` and dispatches straight to
+/// `dynasm_nursery_slowpath_jitframe`.
+///
+/// **Calling convention:**
+/// - Entry: `rbp` = jitframe, `rdx` = frame_size (the same value
+///   the caller's fast path computed for the bump-allocator probe).
+///   Caller has published the gcmap to `[rbp + JF_GCMAP_OFS]`.
+/// - Exit: `rcx` = jitframe payload pointer (or `propagate_exception_path`
+///   tail-call on OOM); every other GPR/XMM restored from the
+///   jitframe save area; `rbp` reloaded from the shadow stack top.
+///
+/// Save mask `[ECX, EDX]` is identical to the fixed variant — the
+/// caller's `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101) is the same set
+/// for both variants, so `_pop_all_regs_from_frame` restores the same
+/// register snapshot in both.
+///
+/// Ownership: caller (`X86CpuExt::ensure_malloc_slowpath_varsize_frame`)
+/// owns the returned `ExecutableBuffer` and the entry address is
+/// memoised on the per-CPU `X86CpuExt`, matching PyPy's per-CPU
+/// `self.malloc_slowpath` cache.
+pub(crate) fn build_malloc_slowpath_varsize_frame(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    propagate_path: usize,
+) -> (ExecutableBuffer, usize) {
+    let _ = cpu_handle;
+    let mut asm = Assembler::new().expect("malloc_slowpath_varsize_frame: new Assembler");
+
+    let slowpath_fn =
+        crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64;
+    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
+
+    let buffer = asm
+        .finalize()
+        .expect("malloc_slowpath_varsize_frame: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
+/// Shared body of [`build_malloc_slowpath_fixed`] and
+/// [`build_malloc_slowpath_varsize_frame`].  Emits the
+/// `_push_all_regs_to_frame([ecx, edx])` → CALL helper → reload_frame
+/// → inline WB → OOM check → `MOV ecx, eax` → `_pop_all_regs_from_frame`
+/// → RET sequence shared by both `kind='fixed'` and `kind='var'`
+/// slowpath trampolines.
+///
+/// The caller emits the kind-specific size-prep step (the `SUB rdx, rcx`
+/// for fixed; nothing for varsize_frame, which receives `frame_size`
+/// directly in RDX) and then defers to this helper.
+///
+/// `slowpath_fn` is the absolute address of the GC helper called by
+/// `MOV rax, imm64; CALL rax`.  ABI: size in ARG0 (RCX on Win64, RDI
+/// on SysV).  Result in RAX.
+fn build_malloc_slowpath_body(
+    asm: &mut Assembler,
+    slowpath_fn: i64,
+    propagate_path: usize,
+) {
+    let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
     // assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
     // Saves every managed GPR/XMM except ECX/EDX so the inner CALL's
@@ -318,7 +392,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
     // set (unlike pyre's prior `[EAX, EDX]` mask), preserving any
     // live caller value across the slowpath — the regalloc only
     // promises ECX/EDX clobber to the caller.
-    push_all_regs_to_jitframe_raw(&mut asm, &ignored, true);
+    push_all_regs_to_jitframe_raw(asm, &ignored, true);
 
     // assembler.py:258-261 — reserve Win64 shadow space (if any).  The
     // caller's `call rax` arrives with rsp at 0-mod-16: pyre's JIT
@@ -337,7 +411,6 @@ pub(crate) fn build_malloc_slowpath_fixed(
     #[cfg(not(target_os = "windows"))]
     let arg0_reg: u8 = 7; // rdi
 
-    let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
     if align != 0 {
         dynasm!(asm ; .arch x64 ; sub rsp, align);
     }
@@ -411,14 +484,15 @@ pub(crate) fn build_malloc_slowpath_fixed(
         dynasm!(asm ; .arch x64 ; =>skip_wb);
     }
 
-    // assembler.py:300-322 OOM propagate path — when
-    // `dynasm_nursery_slowpath` returns NULL the underlying
-    // `libc::calloc` ran out of memory.  PyPy emits the test+branch
-    // inside `_build_malloc_slowpath` and tail-JMPs to the standalone
-    // `propagate_exception_path` (line 322).  Pyre threads the
-    // propagate path's address in via `propagate_path` and follows
-    // the same structure: `ADD rsp, 8` to drop the trampoline's
-    // own CALL return address, then JMP to the propagate trampoline.
+    // assembler.py:300-322 OOM propagate path — when the slowpath
+    // helper returns NULL the underlying `libc::calloc` /
+    // `gc.alloc_nursery_*` ran out of memory.  PyPy emits the
+    // test+branch inside `_build_malloc_slowpath` and tail-JMPs to
+    // the standalone `propagate_exception_path` (line 322).  Pyre
+    // threads the propagate path's address in via `propagate_path`
+    // and follows the same structure: `ADD rsp, 8` to drop the
+    // trampoline's own CALL return address, then JMP to the propagate
+    // trampoline.
     //
     // dynasm-rs has no direct rel32-JMP-to-absolute-imm encoding, so
     // we materialise the 64-bit immediate into the scratch reg (R11,
@@ -448,12 +522,8 @@ pub(crate) fn build_malloc_slowpath_fixed(
     dynasm!(asm ; .arch x64 ; mov rcx, rax);
 
     // assembler.py:307 `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
-    pop_all_regs_from_jitframe_raw(&mut asm, &ignored, true);
+    pop_all_regs_from_jitframe_raw(asm, &ignored, true);
     dynasm!(asm ; .arch x64 ; ret);
-
-    let buffer = asm.finalize().expect("malloc_slowpath: finalize");
-    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
-    (buffer, ptr)
 }
 
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
@@ -714,6 +784,14 @@ pub struct Assembler386<'a> {
     /// and passed in at construction time so the emit path bakes
     /// it as a 64-bit immediate without re-touching the backend.
     malloc_slowpath_fixed: usize,
+    /// `x86/assembler.py:64 self.malloc_slowpath_varsize` analog —
+    /// entry pointer of the per-CPU jitframe-sized malloc slowpath
+    /// trampoline, resolved by
+    /// `X86CpuExt::ensure_malloc_slowpath_varsize_frame`.  Used by
+    /// `CallMallocNurseryVarsizeFrame` so the inline save/restore
+    /// machinery lives inside the trampoline (PyPy parity), not at
+    /// the call site.
+    malloc_slowpath_varsize_frame: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -803,6 +881,7 @@ impl<'a> Assembler386<'a> {
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
+        malloc_slowpath_varsize_frame: usize,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -847,6 +926,7 @@ impl<'a> Assembler386<'a> {
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
             malloc_slowpath_fixed,
+            malloc_slowpath_varsize_frame,
         }
     }
 
@@ -3979,38 +4059,63 @@ impl<'a> Assembler386<'a> {
                     );
                 }
                 dynasm!(self.mc ; .arch x64 ; =>slow_path);
-                self.push_all_regs_to_jitframe(&[sizeloc, result_reg], true);
-                self.emit_abi_int_arg_from_reg(0, sizeloc.value as u8);
+                // Trampoline entry convention: frame_size in RDX
+                // (matches PyPy `_build_malloc_slowpath(kind='var')`
+                // which carries the size through EDX).
+                // `MALLOC_NURSERY_CLOBBER` guarantees
+                // `sizeloc ∉ {RCX, RDX}`, so `mov rdx, sizeloc` is
+                // safe; the guard skips the MOV if the regalloc
+                // pre-placed sizeloc in RDX (currently unreachable
+                // but harmless if the clobber set ever flips).
+                if sizeloc.value != crate::regloc::EDX.value {
+                    dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(sv));
+                }
+                // Publish the gcmap before entering the trampoline
+                // (PyPy: "the caller already did push_gcmap(store=True)" —
+                // `_build_malloc_slowpath` reads it via the saved-reg
+                // slot layout encoded in the gcmap).  The trampoline
+                // saves every GPR/XMM except ECX/EDX, so any live Box
+                // the regalloc left in a register survives a minor
+                // collection via the gcmap-described save slots.
                 if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
                     self.push_gcmap(gcmap as *mut usize);
                 } else {
                     let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                     dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 }
+                // Stage the trampoline entry through R11
+                // (X86_64_SCRATCH_REG) so RAX stays caller-live
+                // across the call.  The trampoline's
+                // `push_all_regs_to_jitframe_raw([ECX, EDX], true)`
+                // saves the caller's RAX into the jitframe save area
+                // and the matching pop restores it — loading the
+                // helper address into RAX here would clobber that
+                // value before the save (same fix the fixed-size
+                // variant applied in commit daf25bd5874e).
+                let helper_addr = self.malloc_slowpath_varsize_frame as i64;
+                let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64
+                    ; mov Rq(call_scratch), QWORD helper_addr
+                    ; call Rq(call_scratch)
                 );
-                self.emit_abi_call_rax();
-                // Reload `rbp` first: a minor GC during the slowpath may
-                // have copied the jitframe to old-gen, so the current
-                // `rbp` points at the freed nursery copy. Clearing
-                // `JF_GCMAP_OFS` on it would write garbage and leave the
-                // moved jitframe's gcmap published — a stale gcmap that
-                // a subsequent collecting call would walk.
-                self.reload_frame_if_necessary();
-                // assembler.py:300-322 OOM propagate parity — the
-                // jitframe helper returns NULL on `libc::calloc` /
-                // `gc.alloc_nursery_*` failure; surface that through
-                // `propagate_exception_descr` rather than letting the
-                // caller proceed with a null jitframe.
-                self.emit_propagate_exception_if_zero(0);
+                // Trampoline returns the jitframe payload in RCX
+                // (PyPy line 304 `MOV_rr(ecx, eax)` ahead of
+                // `_pop_all_regs_from_frame([ecx, edx])`).  The
+                // regalloc forces
+                // `result_reg = MALLOC_NURSERY_RESULT = RCX`
+                // (regalloc.rs:105), so the MOV is elided in the
+                // common case.  OOM cases never return here — the
+                // trampoline tail-JMPs to `propagate_exception_path`.
+                if result_reg.value != crate::regloc::ECX.value {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
+                }
+                // Clear gcmap slot.  The trampoline already ran
+                // `_reload_frame_if_necessary` (PyPy assembler.py:1375),
+                // so RBP points at the live (possibly moved) frame
+                // and this write targets the live `JF_GCMAP_OFS`,
+                // not the freed nursery copy.
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
-                if result_reg.value != 0 {
-                    let rv = result_reg.value;
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
-                }
-                self.pop_all_regs_from_jitframe(&[sizeloc, result_reg], true);
                 dynasm!(self.mc ; .arch x64 ; =>done);
                 if !op.pos.get().is_none() {
                     if result_reg.value != 0 {

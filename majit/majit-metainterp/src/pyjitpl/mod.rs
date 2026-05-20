@@ -2055,10 +2055,7 @@ impl<M: Clone> MetaInterp<M> {
             self.active_trace_session.is_none(),
             "begin_trace_session called while a trace session is already active",
         );
-        self.active_trace_session = Some(ActiveTraceSession {
-            trace_meta,
-            bridge: None,
-        });
+        self.active_trace_session = Some(ActiveTraceSession { trace_meta });
         self.staticdata.profiler.start_tracing();
     }
 
