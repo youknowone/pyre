@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use vecset::VecMap;
+use vecset::{VecMap, VecSet};
 
 use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
@@ -4305,7 +4305,7 @@ impl CodeWriter {
                         .framestate()
                         .map_or(true, |fs| fs.next_offset != py_pc)
                     && (canraise_pending
-                        || (branch_target_pcs.get(py_pc).copied().unwrap_or(false)
+                        || (branch_target_pcs.contains(&py_pc)
                             && current_block.block().borrow().exits.is_empty()));
                 let new_block = if needs_fallthrough
                     && (current_state.next_offset != py_pc || force_branch_boundary)
@@ -5425,7 +5425,7 @@ impl CodeWriter {
                     // live_marker_indices_by_pc uses last-wins to resolve
                     // to op2 so blackhole guard-failure resume lands past
                     // the merge point.
-                    if loop_header_pcs.get(py_pc).copied().unwrap_or(false) {
+                    if loop_header_pcs.contains(&py_pc) {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!();
@@ -9264,15 +9264,15 @@ fn compile_jitcode_via_raw_code(
 /// Used by `transform_graph_to_jitcode` to decide where loop markers
 /// belong. Portal classification itself comes from
 /// `CallControl.jitdrivers_sd`, matching codewriter.py:37.
-pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> {
+pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
     let num_instrs = code.instructions.len();
-    let mut loop_header_pcs: Vec<bool> = vec![false; num_instrs];
+    let mut loop_header_pcs: VecSet<usize> = VecSet::new();
     let mut scan_state = OpArgState::default();
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
         if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
             if target < num_instrs {
-                loop_header_pcs[target] = true;
+                loop_header_pcs.insert(target);
             }
         }
     }
@@ -9295,11 +9295,11 @@ pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> {
 /// callers thread those in if they need them in the same set, but
 /// this scan focuses on the bytecode-derived branch destinations
 /// where upstream's `mergeblock` would create candidates.
-pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> {
+pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
     let num_instrs = code.instructions.len();
-    let mut targets: Vec<bool> = vec![false; num_instrs];
+    let mut targets: VecSet<usize> = VecSet::new();
     if num_instrs > 0 {
-        targets[0] = true;
+        targets.insert(0);
     }
     let mut scan_state = OpArgState::default();
     for scan_pc in 0..num_instrs {
@@ -9307,7 +9307,7 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> 
         // Backward jumps reuse the canonical helper.
         if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
             if target < num_instrs {
-                targets[target] = true;
+                targets.insert(target);
             }
         }
         // Forward conditional / unconditional jumps.  Targets compute
@@ -9324,7 +9324,7 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> 
         if let Some(delta) = forward_delta {
             let target = jump_target_forward(code, num_instrs, scan_pc + 1, delta);
             if target < num_instrs {
-                targets[target] = true;
+                targets.insert(target);
             }
             // The fallthrough PC after a conditional branch is also a
             // boundary (the linktrue / linkfalse fallthrough side).
@@ -9341,7 +9341,7 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> 
                     | Instruction::ForIter { .. }
             ) && fallthrough < num_instrs
             {
-                targets[fallthrough] = true;
+                targets.insert(fallthrough);
             }
         }
         // Terminator-after pcs are block entries: PCs immediately
@@ -9359,7 +9359,7 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> Vec<bool> 
         ) {
             let next_pc = scan_pc + 1;
             if next_pc < num_instrs {
-                targets[next_pc] = true;
+                targets.insert(next_pc);
             }
         }
     }
