@@ -1333,8 +1333,17 @@ fn last_op_summary_for_source(
 /// Rewrite the source SpamBlock's terminator `Operand::TLabel(from)`
 /// to `Operand::TLabel(to)`.  Returns `true` iff a matching TLabel was
 /// found in any direct `Insn::Op::args` of the source's per-block
-/// accumulator.  `SwitchDictDescr` TLabel entries are not yet walked
-/// here — the multi-pred elision diagnostic measures any residual.
+/// accumulator or in a `SwitchDictDescr._labels` table reached via an
+/// `Operand::Descr(DescrOperand::SwitchDict(_))` arg.  Mirrors
+/// `liveness.py:76-78` follow-label walk of `SwitchDictDescr._labels`.
+///
+/// Reverse-scans the per-block accumulator so the terminator (the last
+/// `Insn::Op` in the block) is inspected first.  The `Rc<DescrOperand>`
+/// wrapping the switch descr is unwrapped with [`Rc::make_mut`] so the
+/// rewrite mutates a fresh copy if the descr is shared (canonical
+/// emission could clone the same descr across paths; pyre's walker
+/// emits one per terminator today, so `Rc::strong_count == 1` in
+/// production — keep the orthodox unwrap regardless).
 fn rewrite_source_terminator_tlabel(
     source_spam: &SpamBlockRef,
     from: &str,
@@ -1344,11 +1353,28 @@ fn rewrite_source_terminator_tlabel(
     for insn in spam_borrow.per_block_ssarepr.iter_mut().rev() {
         if let super::flatten::Insn::Op { args, .. } = insn {
             for arg in args.iter_mut() {
-                if let super::flatten::Operand::TLabel(tl) = arg {
-                    if tl.name == from {
-                        tl.name = to.to_string();
-                        return true;
+                match arg {
+                    super::flatten::Operand::TLabel(tl) => {
+                        if tl.name == from {
+                            tl.name = to.to_string();
+                            return true;
+                        }
                     }
+                    super::flatten::Operand::Descr(descr_rc) => {
+                        if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
+                            let descr_mut =
+                                std::rc::Rc::make_mut(descr_rc);
+                            if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
+                                for (_key, tl) in sw.labels.iter_mut() {
+                                    if tl.name == from {
+                                        tl.name = to.to_string();
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -11567,5 +11593,74 @@ mod tests {
             "post-non-match block must still carry the first rewrite",
         );
         let _ = FlatLabel::new("unused");
+    }
+
+    /// `rewrite_source_terminator_tlabel` also walks
+    /// `Operand::Descr(DescrOperand::SwitchDict(_))._labels` entries
+    /// per `liveness.py:76-78` — a multi-pred switch-link elision
+    /// must be retargetable onto a trampoline like any other branch.
+    #[test]
+    fn rewrite_source_terminator_tlabel_rewrites_switch_dict_descr_label() {
+        use super::super::flatten::{DescrOperand, Insn, Operand, SwitchDictDescr, TLabel};
+        use std::rc::Rc;
+
+        let target_name = "block_switch_target_7".to_string();
+        let trampoline_name = "epsilon3_link_3".to_string();
+
+        let mut sw = SwitchDictDescr::new();
+        sw.labels
+            .push((0, TLabel::new("block_other_5".to_string())));
+        sw.labels.push((1, TLabel::new(target_name.clone())));
+        sw.labels
+            .push((2, TLabel::new("block_other_9".to_string())));
+
+        let switch_op = Insn::op(
+            "switch",
+            vec![
+                Operand::reg(Kind::Int, 11),
+                Operand::Descr(Rc::new(DescrOperand::SwitchDict(sw))),
+            ],
+        );
+        let source =
+            super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        source.push_insn(switch_op);
+
+        let rewrote = super::rewrite_source_terminator_tlabel(
+            &source,
+            &target_name,
+            &trampoline_name,
+        );
+        assert!(rewrote, "expected rewrite to succeed via SwitchDictDescr");
+
+        let insns = source.per_block_ssarepr();
+        let Insn::Op { args, .. } = &insns[0] else {
+            panic!("expected single switch op");
+        };
+        let descr = args.iter().find_map(|a| match a {
+            Operand::Descr(d) => Some(d.clone()),
+            _ => None,
+        });
+        let descr = descr.expect("switch op must carry a Descr arg");
+        let DescrOperand::SwitchDict(sw) = descr.as_ref() else {
+            panic!("expected SwitchDict descr");
+        };
+        let rewritten = sw
+            .labels
+            .iter()
+            .find(|(k, _)| *k == 1)
+            .map(|(_, tl)| tl.name.clone());
+        assert_eq!(rewritten.as_deref(), Some(trampoline_name.as_str()));
+        let untouched_first = sw
+            .labels
+            .iter()
+            .find(|(k, _)| *k == 0)
+            .map(|(_, tl)| tl.name.clone());
+        assert_eq!(untouched_first.as_deref(), Some("block_other_5"));
+        let untouched_last = sw
+            .labels
+            .iter()
+            .find(|(k, _)| *k == 2)
+            .map(|(_, tl)| tl.name.clone());
+        assert_eq!(untouched_last.as_deref(), Some("block_other_9"));
     }
 }
