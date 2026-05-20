@@ -115,6 +115,28 @@ pub struct JitProfiler {
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
     /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
     pub calls: AtomicUsize,
+    /// jit.py:1438 `Counters.TOTAL_COMPILED_LOOPS`.  jitprof.py:105-106
+    /// reads `self.cpu.tracker.total_compiled_loops` — pyre's backends
+    /// have no shared `cpu.tracker` instance, so this counter lives on
+    /// the per-process profiler and is incremented at the same
+    /// structural points PyPy's `cpu.tracker` is bumped:
+    /// `record_loop_or_bridge` for a freshly-compiled loop
+    /// (`compile.py:213`).
+    pub total_compiled_loops: AtomicUsize,
+    /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  Bumped from the
+    /// bridge close-out path matching PyPy `compile.py:213` /
+    /// `compile.py:601`.
+    pub total_compiled_bridges: AtomicUsize,
+    /// jit.py:1440 `Counters.TOTAL_FREED_LOOPS`.  Bumped from
+    /// `MemoryManager::_kill_old_loops_now` when an evicted token's
+    /// `bridges_count == 0` — PyPy's `cpu.tracker` tracks the loop
+    /// side here.
+    pub total_freed_loops: AtomicUsize,
+    /// jit.py:1441 `Counters.TOTAL_FREED_BRIDGES`.  Bumped from
+    /// `MemoryManager::_kill_old_loops_now` for each bridge attached
+    /// to an evicted token; PyPy's `cpu.tracker.total_freed_bridges`
+    /// is bumped in `cpu.free_loop_and_bridges`.
+    pub total_freed_bridges: AtomicUsize,
     /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
     /// self.profiler.initialized: self.profiler.start(); ...
     /// initialized = True`.  RPython keeps this flag separate from
@@ -227,19 +249,44 @@ impl JitProfiler {
     /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
     /// readback via `Counters.*` id. `None` for unknown ids.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's `get_counter` routes
-    /// `TOTAL_COMPILED_LOOPS` / `TOTAL_COMPILED_BRIDGES` /
-    /// `TOTAL_FREED_LOOPS` / `TOTAL_FREED_BRIDGES`
-    /// (`Counters.* = 22..25`) to `self.cpu.tracker.total_*` on the
-    /// per-CPU tracker (`jitprof.py:105-112`).  Pyre has no global
-    /// per-CPU tracker yet (`majit-backend/src/lib.rs:939-943`), so
-    /// those ids fall through to `field_for_kind` and return `None`.
-    /// The constants are defined in [`crate::pyjitpl::counters`] so
-    /// callers can reference them; the query just doesn't yield a
-    /// count.
+    /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
+    /// readback via `Counters.*` id.  PyPy routes `TOTAL_COMPILED_*` /
+    /// `TOTAL_FREED_*` (ids 22..25) to `self.cpu.tracker.total_*`;
+    /// pyre keeps the same four counters directly on `JitProfiler`
+    /// (no per-CPU tracker in this backend) and routes them through
+    /// [`field_for_kind`] alongside the `Counters.*` slots, so the
+    /// caller sees identical semantics regardless of where the values
+    /// physically live.  Unknown ids return `None`.
     pub fn get_counter(&self, kind: i32) -> Option<usize> {
         self.field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed))
+    }
+
+    /// `cpu.tracker.total_compiled_loops += 1` parity.  Fired from the
+    /// loop close-out path (`record_loop_or_bridge` for a root trace,
+    /// `compile.py:213`).
+    pub fn inc_compiled_loop(&self) {
+        self.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_compiled_bridges += 1` parity.  Fired from the
+    /// bridge close-out path (`record_loop_or_bridge` for a bridge,
+    /// `compile.py:601`).
+    pub fn inc_compiled_bridge(&self) {
+        self.total_compiled_bridges.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
+    /// memory manager when an evicted token represents a root loop.
+    pub fn inc_freed_loop(&self) {
+        self.total_freed_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu.tracker.total_freed_bridges += n` parity.  Fired from the
+    /// memory manager when an evicted token carries `n` bridges; PyPy's
+    /// `cpu.free_loop_and_bridges` bumps the tracker once per bridge.
+    pub fn add_freed_bridges(&self, n: usize) {
+        self.total_freed_bridges.fetch_add(n, Ordering::Relaxed);
     }
 
     /// jitprof.py:115-116 `Profiler.get_times(num)` — seconds.
@@ -405,6 +452,10 @@ impl JitProfiler {
             counters::NVIRTUALS => &self.nvirtuals,
             counters::NVHOLES => &self.nvholes,
             counters::NVREUSED => &self.nvreused,
+            counters::TOTAL_COMPILED_LOOPS => &self.total_compiled_loops,
+            counters::TOTAL_COMPILED_BRIDGES => &self.total_compiled_bridges,
+            counters::TOTAL_FREED_LOOPS => &self.total_freed_loops,
+            counters::TOTAL_FREED_BRIDGES => &self.total_freed_bridges,
             _ => return None,
         })
     }

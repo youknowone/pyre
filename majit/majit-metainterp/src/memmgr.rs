@@ -233,20 +233,17 @@ impl MemoryManager {
     /// debug_stop("jit-mem-collect")
     /// ```
     /// Pyre uses `VecAssoc::retain` to fuse the iterate + delete steps.
-    /// PRE-EXISTING-ADAPTATION: pyre uses a single `MAJIT_LOG` switch
-    /// instead of `rlib/debug.py debug_start/stop` per-channel
-    /// registry.  Channel name embedded in the message prefix
-    /// (`[jit-mem-collect]`) maintains grep-equivalence with upstream
-    /// traces.  Future: port `debug_start/stop` channel registry.
+    /// Output is routed through [`crate::debug`] (`debug_start /
+    /// debug_print / debug_stop`) so the `jit-mem-collect` section
+    /// brackets match PyPy's `rlib/debug.py` wire format and can be
+    /// consumed by `pypy/tool/logparser.py` without prefix munging.
     fn _kill_old_loops_now(&mut self) -> Vec<Arc<JitCellToken>> {
-        let log = crate::majit_log_enabled();
+        let _scope = crate::debug::scope("jit-mem-collect");
+        let log = crate::debug::have_debug_prints();
         let oldtotal = if log { self.alive_loops.len() } else { 0 };
         if log {
-            eprintln!(
-                "[jit-mem-collect] Current generation: {}",
-                self.current_generation
-            );
-            eprintln!("[jit-mem-collect] Loop tokens before: {}", oldtotal);
+            crate::debug::debug_print(&format!("Current generation: {}", self.current_generation));
+            crate::debug::debug_print(&format!("Loop tokens before: {oldtotal}"));
         }
         let max_generation = self.current_generation - (self.max_age - 1);
         // memmgr.py:70-73 `for looptoken in self.alive_loops.keys(): if
@@ -267,11 +264,8 @@ impl MemoryManager {
         });
         if log {
             let newtotal = self.alive_loops.len();
-            eprintln!(
-                "[jit-mem-collect] Loop tokens freed: {}",
-                oldtotal - newtotal
-            );
-            eprintln!("[jit-mem-collect] Loop tokens left: {}", newtotal);
+            crate::debug::debug_print(&format!("Loop tokens freed: {}", oldtotal - newtotal));
+            crate::debug::debug_print(&format!("Loop tokens left: {newtotal}"));
         }
         evicted_tokens
     }
@@ -285,12 +279,8 @@ impl MemoryManager {
     /// debug_stop("jit-mem-releaseall")
     /// ```
     pub fn release_all_loops(&mut self) {
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit-mem-releaseall] Loop tokens cleared: {}",
-                self.alive_loops.len()
-            );
-        }
+        let _scope = crate::debug::scope("jit-mem-releaseall");
+        crate::debug::debug_print(&format!("Loop tokens cleared: {}", self.alive_loops.len()));
         self.alive_loops.clear();
     }
 
