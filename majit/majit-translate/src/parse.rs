@@ -718,7 +718,7 @@ pub fn extract_opcode_dispatch_arms(parsed: &ParsedInterpreter) -> Vec<Extracted
     let Some(opcode_match) = find_opcode_match(func) else {
         return Vec::new();
     };
-    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match))
+    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match, &func.sig))
 }
 
 /// Extract receiver -> trait bounds for `execute_opcode_step`.
@@ -786,7 +786,7 @@ pub fn collect_function_graphs(
 /// a panic rather than silently dropping the arm's graph.  Silently
 /// dropping would let a `PipelineOpcodeArm` reach the codewriter
 /// without the semantic graph the downstream jitcode path depends on.
-fn extract_match_arms(expr: &ExprMatch) -> Vec<ExtractedOpcodeArm> {
+fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOpcodeArm> {
     expr.arms
         .iter()
         .map(|arm| {
@@ -794,7 +794,19 @@ fn extract_match_arms(expr: &ExprMatch) -> Vec<ExtractedOpcodeArm> {
             let selector = extract_opcode_dispatch_selector(&arm.pat);
             let name = selector.canonical_key();
             let mut graph = crate::model::FunctionGraph::new(name.clone());
-            crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body).unwrap_or_else(|e| {
+            // Pre-bind `execute_opcode_step`'s formal parameters as
+            // startblock inputargs so the arm body's `Expr::Path`
+            // references (e.g. `frame`, `instruction`, `executor`)
+            // resolve to those inputargs instead of falling through
+            // to the naked body-`Input` emit that the flowspace
+            // adapter rejects as "adapter cross-block body Input"
+            // (the dominant Cat 2.1 Skip family).  PyPy/RPython parity:
+            // each per-opcode handler method receives the
+            // dispatcher's parameters in its formal signature.
+            crate::front::ast::lower_expr_into_graph_with_signature(
+                &mut graph, &arm.body, Some(sig),
+            )
+            .unwrap_or_else(|e| {
                 panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")
             });
             ExtractedOpcodeArm {

@@ -1534,6 +1534,36 @@ pub fn lower_expr_into_graph(
     graph: &mut FunctionGraph,
     expr: &syn::Expr,
 ) -> Result<(), FlowingError> {
+    lower_expr_into_graph_with_signature(graph, expr, None)
+}
+
+/// Variant of [`lower_expr_into_graph`] that pre-registers a function
+/// signature's formal parameters as startblock `OpKind::Input` ops +
+/// `Block.inputargs` entries + `GraphBuildContext.bind_local_id`
+/// bindings.
+///
+/// Closes the Cat 2.1 "adapter cross-block body Input" Skip family
+/// for `__opcode_dispatch__::*` synthesized arm graphs:
+/// without this pre-binding, an arm body that references
+/// `execute_opcode_step`'s formal parameters (`frame`, `instruction`,
+/// `executor`, ...) falls through to the naked body-`Input` emit at
+/// the `Expr::Path` fallback (`front/ast.rs:4559`), which the
+/// flowspace adapter rejects as a producer-side gap.  Pre-binding
+/// puts each formal parameter at a known startblock inputarg so
+/// same-block reads dedup against the binding and cross-block reads
+/// resolve via `lazy_install_local_at_current_block` — matching the
+/// `RPython`/PyPy shape where every per-opcode handler method has the
+/// dispatcher's parameters in its formal signature.
+///
+/// The parameter-registration loop mirrors [`build_function_graph`]
+/// (`front/ast.rs:3056-3156`) but skips module-prefix / use-imports /
+/// struct / trait registries, since opcode-dispatch arm graphs are
+/// synthesized without whole-program context.
+pub fn lower_expr_into_graph_with_signature(
+    graph: &mut FunctionGraph,
+    expr: &syn::Expr,
+    sig: Option<&syn::Signature>,
+) -> Result<(), FlowingError> {
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
@@ -1547,6 +1577,49 @@ pub fn lower_expr_into_graph(
         &empty_names,
         &empty_trait_names,
     );
+    if let Some(sig) = sig {
+        for param in &sig.inputs {
+            match param {
+                syn::FnArg::Receiver(recv) => {
+                    let self_ty = classify_fn_arg_ty(&recv.ty);
+                    ctx.local_value_types
+                        .insert("self".to_string(), self_ty.clone());
+                    if let Some(vid) = graph.push_op(
+                        block,
+                        OpKind::Input {
+                            name: "self".to_string(),
+                            ty: self_ty,
+                        },
+                        true,
+                    ) {
+                        graph.name_value(vid, "self".to_string());
+                        graph.push_inputarg(block, vid);
+                        ctx.bind_local_id("self".to_string(), vid, block);
+                    }
+                }
+                syn::FnArg::Typed(pat_type) => {
+                    let name = canonical_pat_name(&pat_type.pat);
+                    if let Some(type_root) = type_root_ident(&pat_type.ty) {
+                        ctx.local_type_roots.insert(name.clone(), type_root);
+                    }
+                    let arg_ty = classify_fn_arg_ty(&pat_type.ty);
+                    ctx.local_value_types.insert(name.clone(), arg_ty.clone());
+                    if let Some(vid) = graph.push_op(
+                        block,
+                        OpKind::Input {
+                            name: name.clone(),
+                            ty: arg_ty,
+                        },
+                        true,
+                    ) {
+                        graph.name_value(vid, name.clone());
+                        graph.push_inputarg(block, vid);
+                        ctx.bind_local_id(name, vid, block);
+                    }
+                }
+            }
+        }
+    }
     ctx.assert_stack_empty_at_stmt_boundary("lower_expr_into_graph entry");
     let lowered = lower_expr(
         graph,
