@@ -1059,9 +1059,12 @@ fn walker_post_walk_insert_renamings(
     //     explicit `goto` to the source's per-block accumulator.
     //
     // `PYRE_PHASE4_DIAGNOSE_ELIDE=1` keeps the residual elide
-    // diagnostic for shapes the trampoline path can't yet handle
-    // (e.g., `SwitchDictDescr` TLabel entries) plus a
-    // `phase4-trampoline` counter line per graph.
+    // diagnostic — any residual reflects either a trampoline
+    // `RewriteFailed` (source terminator carries no TLabel matching
+    // the target's block-identity name nor a `SwitchDictDescr` entry
+    // pointing at it) or an in_degree=1 link that bypassed the
+    // multi-pred path — plus a `phase4-trampoline` counter line per
+    // graph.
     let diagnose_elide = std::env::var_os("PYRE_PHASE4_DIAGNOSE_ELIDE").is_some();
     let mut elided_links: usize = 0;
     let mut elided_links_with_distinct_pairs: usize = 0;
@@ -1170,11 +1173,15 @@ fn walker_post_walk_insert_renamings(
 /// renaming body (excluding `Label` / trailing `goto`+`---`) so the
 /// caller can update its diagnostic counters.  `NoPairs` means the
 /// link's `link.args ↔ target.inputargs` mapping reduces to identity
-/// after `get_color` (nothing to copy).  `RewriteFailed` means the
-/// source's terminator does not contain a `TLabel` operand whose name
-/// matches the target's block label (e.g., the dispatch routes the
-/// link through a `SwitchDictDescr` whose entries this in-place
-/// matcher does not yet walk), so the trampoline is not emitted.
+/// after `get_color` (nothing to copy).  `RewriteFailed` means
+/// [`rewrite_source_terminator_tlabel`] could not locate a matching
+/// `TLabel` — neither a direct `Insn::Op` arg nor a
+/// `SwitchDictDescr._labels` entry pointed at the target's block
+/// label.  In the explicit-jump path this would mean the source
+/// terminator's TLabel was already rewritten by an earlier link
+/// (multi-fanout from the same source) or that the source's exit
+/// shape doesn't carry a TLabel for this link (fall-through arm —
+/// handled in the helper's append fallback below).
 enum TrampolineOutcome {
     Emitted { spam: SpamBlockRef, body_len: usize },
     NoPairs,
