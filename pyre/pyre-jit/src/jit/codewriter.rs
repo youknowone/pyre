@@ -2815,145 +2815,186 @@ fn filter_liveness_in_place(
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
-    for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
+    assert!(
+        local_color_map.len() >= nlocals,
+        "local_color_map is shorter than nlocals: {} < {}",
+        local_color_map.len(),
+        nlocals
+    );
+
+    // Snapshot original marker contents BEFORE any mutation so that
+    // when multiple Python PCs share a single post-merge `-live-`
+    // marker (possible once `remove_repeated_live` folds adjacent
+    // markers without protection), each PC's narrowing pass reads
+    // the SSA union — not a previously-narrowed set.
+    let original_markers: Vec<Vec<SsaOperand>> = live_markers
+        .iter()
+        .map(|&idx| {
+            ssarepr
+                .insns
+                .get(idx)
+                .and_then(|i| i.live_args())
+                .map(|args| args.to_vec())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    // Group `(py_pc, insn_idx)` pairs by `insn_idx` so a shared
+    // marker accumulates the UNION of per-PC narrowed sets (resume
+    // from any sharing PC reads a conservative superset, which is
+    // safe — preserving more registers than strictly needed never
+    // causes incorrect resume).
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (py_pc, &insn_idx) in live_markers.iter().enumerate() {
+        if let Some(entry) = groups.iter_mut().find(|(idx, _)| *idx == insn_idx) {
+            entry.1.push(py_pc);
+        } else {
+            groups.push((insn_idx, vec![py_pc]));
+        }
+    }
+
+    let drop_lv = std::env::var_os("MAJIT_PHASE06_DROP_LV").is_some();
+    for (insn_idx, py_pcs) in groups {
+        // Original snapshot is the same for every PC in the group
+        // (they all point at the same marker).
+        let original = &original_markers[py_pcs[0]];
+        let non_register: Vec<SsaOperand> = original
+            .iter()
+            .filter(|op| !matches!(op, SsaOperand::Register(_)))
+            .cloned()
+            .collect();
+
+        let mut any_reachable = false;
+        let mut union_i: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut union_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut union_f: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+
+        for &py_pc in &py_pcs {
+            if !live_vars.is_reachable(py_pc) {
+                continue;
+            }
+            any_reachable = true;
+
+            // Per-PC SSA-live decomposition over the snapshot.
+            // `compute_liveness` emits Registers sorted by `(kind,
+            // index)`, so seen-set dedup keeps the encounter order
+            // stable across runs.
+            //
+            // liveness.py:67-75 `compute_liveness` adds every Register to
+            // the alive set; assembler.py:150-152 splits the `-live-`
+            // args into live_i / live_r / live_f by kind via
+            // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`.
+            let mut seen_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            let mut seen_i: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            let mut seen_f: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            let mut pc_live_r: Vec<u16> = Vec::new();
+            let mut pc_live_i: Vec<u16> = Vec::new();
+            let mut pc_live_f: Vec<u16> = Vec::new();
+            for op in original.iter() {
+                let SsaOperand::Register(reg) = op else {
+                    continue;
+                };
+                match reg.kind {
+                    SsaKind::Ref => {
+                        if seen_r.insert(reg.index) {
+                            pc_live_r.push(reg.index);
+                        }
+                    }
+                    SsaKind::Int => {
+                        if seen_i.insert(reg.index) {
+                            pc_live_i.push(reg.index);
+                        }
+                    }
+                    SsaKind::Float => {
+                        if seen_f.insert(reg.index) {
+                            pc_live_f.push(reg.index);
+                        }
+                    }
+                }
+            }
+
+            // Note: LV∩SSA retain narrows the Ref bank to post-rename
+            // colors that correspond to LV-live Python locals or live
+            // stack slots at this PC.  Scratch registers (temporaries
+            // SSA-live but with no Python-frame slot) remain
+            // `OpRef::NONE` in `registers_r` because no trace-time
+            // writer populates them.  Removing this retain requires
+            // either (a) populating scratch colors during tracing
+            // (Task #158 graph regalloc) or (b) the encoder tolerating
+            // NONE for non-frame live registers.
+            //
+            // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
+            // RPython-orthodox SSA-only `live_r` so probe-A logs in
+            // `consume_one_section` (`call_jit.rs::resume_in_blackhole`)
+            // can capture what BH writes per color when the bank
+            // widens.  Default off — bench / production keep the
+            // retain.
+            let depth = depth_at_pc[py_pc] as usize;
+            let live_stack_colors: std::collections::BTreeSet<u16> =
+                stack_slot_color_map.iter().copied().take(depth).collect();
+            let lv_live: std::collections::BTreeSet<u16> = {
+                let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
+                    .filter(|&idx| live_vars.is_local_live(py_pc, idx))
+                    .map(|idx| local_color_map[idx])
+                    .collect();
+                s.extend(live_stack_colors.iter().copied());
+                // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
+                // reds = ['frame', 'ec']`) reach `live_r` through the
+                // RPython force-alive mechanism (`liveness.py:11-12`):
+                // `emit_live_placeholder!` emits every PC's `-live-` op
+                // with explicit Register args for `portal_frame_reg` /
+                // `portal_ec_reg`.  Gate the portal colors past the
+                // LV∩SSA retain so the retain does not drop the
+                // RPython-tracked live registers.  Portal-bridge
+                // installs sentinel-skip (`u16::MAX`).
+                if portal_frame_reg != u16::MAX {
+                    s.insert(portal_frame_reg);
+                }
+                if portal_ec_reg != u16::MAX {
+                    s.insert(portal_ec_reg);
+                }
+                s
+            };
+            if !drop_lv {
+                pc_live_r.retain(|idx| lv_live.contains(idx));
+            }
+
+            union_i.extend(pc_live_i);
+            union_r.extend(pc_live_r);
+            union_f.extend(pc_live_f);
+        }
+
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
             Some(other) => panic!(
-                "filter_liveness_in_place: expected -live- marker at index {insn_idx}, got {other:?}"
+                "filter_liveness_in_place: expected -live- marker at index {insn_idx}, got \
+                 {other:?}"
             ),
             None => panic!(
                 "filter_liveness_in_place: insn index {insn_idx} out of range (len {})",
                 ssarepr.insns.len()
             ),
         };
-        // Preserve non-Register operands (TLabel) exactly as RPython
-        // `liveness.py:52` keeps them alongside the `alive` set.
-        let mut non_register: Vec<SsaOperand> = Vec::new();
-        for op in existing.iter() {
-            if !matches!(op, SsaOperand::Register(_)) {
-                non_register.push(op.clone());
-            }
-        }
-
-        if !live_vars.is_reachable(py_pc) {
-            existing.clear();
-            existing.extend(non_register);
-            continue;
-        }
-
-        let depth = depth_at_pc[py_pc] as usize;
-        let live_stack_colors: std::collections::BTreeSet<u16> =
-            stack_slot_color_map.iter().copied().take(depth).collect();
-        let mut seen_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        let mut seen_i: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        let mut seen_f: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        let mut live_r: Vec<u16> = Vec::new();
-        let mut live_i: Vec<u16> = Vec::new();
-        let mut live_f: Vec<u16> = Vec::new();
-        // liveness.py:67-75 `compute_liveness` adds every Register to
-        // the alive set; assembler.py:150-152 splits the `-live-` args
-        // into live_i / live_r / live_f by kind via
-        // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. All three
-        // banks mirror that shape — every alive Register of the kind is
-        // pushed in encounter order with seen-set deduplication.
-        for op in existing.iter() {
-            let SsaOperand::Register(reg) = op else {
-                continue;
-            };
-            match reg.kind {
-                SsaKind::Ref => {
-                    if seen_r.insert(reg.index) {
-                        live_r.push(reg.index);
-                    }
-                }
-                SsaKind::Int => {
-                    if seen_i.insert(reg.index) {
-                        live_i.push(reg.index);
-                    }
-                }
-                SsaKind::Float => {
-                    if seen_f.insert(reg.index) {
-                        live_f.push(reg.index);
-                    }
-                }
-            }
-        }
-        // Note: LV∩SSA retain narrows the Ref bank
-        // to the post-rename colors that correspond to LV-live Python
-        // locals or live stack slots at this PC.  After the slice
-        // 3b-2/3b-3 flip the encoder reads `registers_r[color]`
-        // directly, but scratch registers (temporaries that are SSA-
-        // live but have no Python-frame slot) remain `OpRef::NONE` in
-        // `registers_r` because no trace-time writer populates them.
-        // Removing this retain requires either (a) populating scratch
-        // colors during tracing (Task #158 graph regalloc) or (b) the
-        // encoder tolerating NONE for non-frame live registers.
-        //
-        // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
-        // RPython-orthodox SSA-only `live_r` so probe-A logs in
-        // `consume_one_section` (`call_jit.rs::resume_in_blackhole`)
-        // can capture what BH writes per color when the bank widens.
-        // Default off — bench / production keep the retain. Removed
-        // once Task #158 graph regalloc lands a separate scratch
-        // color space; until then this env-var is the only path back
-        // to RPython form.
-        assert!(
-            local_color_map.len() >= nlocals,
-            "local_color_map is shorter than nlocals: {} < {}",
-            local_color_map.len(),
-            nlocals
-        );
-        let lv_live: std::collections::BTreeSet<u16> = {
-            let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
-                .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                .map(|idx| local_color_map[idx])
-                .collect();
-            s.extend(live_stack_colors.iter().copied());
-            // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
-            // reds = ['frame', 'ec']`) reach `live_r` through the RPython
-            // force-alive mechanism (`liveness.py:11-12`): the
-            // `emit_live_placeholder!` macro at codewriter.rs:3773 emits
-            // every PC's `-live-` op with explicit Register args for
-            // `portal_frame_reg` / `portal_ec_reg`, and `compute_liveness`
-            // (`liveness.rs:101-107` line-by-line port of
-            // `liveness.py:46-48`) adds those Register args to the
-            // backward-propagating `alive` set, leaving them in `existing`
-            // as live Register operands by the time this filter runs.
-            //
-            // The LV∩SSA `retain` below is a pyre adaptation for scratch
-            // colors; gate the portal colors past it explicitly so the
-            // retain does not drop the RPython-tracked live registers.
-            // Portal-bridge installs sentinel-skip (`u16::MAX`).
-            if portal_frame_reg != u16::MAX {
-                s.insert(portal_frame_reg);
-            }
-            if portal_ec_reg != u16::MAX {
-                s.insert(portal_ec_reg);
-            }
-            s
-        };
-        if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
-            live_r.retain(|idx| lv_live.contains(idx));
-        }
-
         existing.clear();
-        for &idx in &live_i {
-            existing.push(SsaOperand::Register(super::flatten::Register::new(
-                SsaKind::Int,
-                idx,
-            )));
-        }
-        for &idx in &live_r {
-            existing.push(SsaOperand::Register(super::flatten::Register::new(
-                SsaKind::Ref,
-                idx,
-            )));
-        }
-        for &idx in &live_f {
-            existing.push(SsaOperand::Register(super::flatten::Register::new(
-                SsaKind::Float,
-                idx,
-            )));
+        if any_reachable {
+            for &idx in &union_i {
+                existing.push(SsaOperand::Register(super::flatten::Register::new(
+                    SsaKind::Int,
+                    idx,
+                )));
+            }
+            for &idx in &union_r {
+                existing.push(SsaOperand::Register(super::flatten::Register::new(
+                    SsaKind::Ref,
+                    idx,
+                )));
+            }
+            for &idx in &union_f {
+                existing.push(SsaOperand::Register(super::flatten::Register::new(
+                    SsaKind::Float,
+                    idx,
+                )));
+            }
         }
         existing.extend(non_register);
     }
