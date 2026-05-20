@@ -2190,18 +2190,13 @@ impl TraceCtx {
     /// nullity-aware sites (`_establish_nullity`, KnownClass guards) can
     /// skip their own checks.
     pub fn trace_assert_not_none(&mut self, opref: OpRef, concrete: i64) {
-        // executor.py:344 `do_assert_not_none`:
-        //     if not box.getref_base():
-        //         fatalerror("found during JITting: ll_assert_not_none() failed")
-        // The trace-time executor runs before the record bumps heapcache,
-        // so even a cache-hit path must observe the null operand and
-        // fatal-error — RPython's `count_ops` short-circuit is reached
-        // only when `is_nullity_known` is already true, which itself
-        // implies the operand is non-null in the live trace.
-        assert!(
-            concrete != 0,
-            "do_assert_not_none: ref operand {opref:?} is null at trace time"
-        );
+        // pyjitpl.py:387 `if self.metainterp.heapcache.is_nullity_known(box):`
+        // — cache hit short-circuits BEFORE `self.execute(...)` would
+        // invoke the executor.  RPython's `executor.do_assert_not_none`
+        // (executor.py:344-346) `fatalerror` therefore only fires on
+        // cache miss; pyre's inline null-assert below must match that
+        // ordering to avoid spuriously aborting traces whose first
+        // `assert_not_none` proves nullity for subsequent occurrences.
         let known = self.heap_cache.is_nullity_known(opref, |op| {
             self.constants.get_value(op).and_then(|v| match v {
                 Value::Int(n) => Some(n),
@@ -2216,7 +2211,16 @@ impl TraceCtx {
             );
             return;
         }
+        // pyjitpl.py:390 `self.execute(rop.ASSERT_NOT_NONE, box)` →
+        // executor.py:344-346 `do_assert_not_none(cpu, _, box)`:
+        //     if not box.getref_base():
+        //         fatalerror("found during JITting: ll_assert_not_none() failed")
+        assert!(
+            concrete != 0,
+            "do_assert_not_none: ref operand {opref:?} is null at trace time"
+        );
         self.record_op(OpCode::AssertNotNone, &[opref]);
+        // pyjitpl.py:391 `self.metainterp.heapcache.nullity_now_known(box)`.
         self.heap_cache.nullity_now_known(opref, true);
     }
 
