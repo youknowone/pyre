@@ -1014,6 +1014,14 @@ impl MIFrame {
         // the actual live extent at the current opcode, not the stale
         // symbolic counter.
         let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
+        // Issue #73 Phase 4.5: prefix_len fallback reads
+        // `PyFrame.valuestackdepth` rather than the symbolic mirror.
+        // `capture_pre_opcode_state` runs at the orgpc anchor where
+        // PyFrame holds the pre-opcode state (the interpreter step has
+        // not run yet) — exactly what the prefix snapshot needs.
+        let concrete_vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
         let s = self.sym();
         let owns_shadow = s.owns_virtualizable_shadow();
         let nlocals = s.nlocals;
@@ -1032,7 +1040,7 @@ impl MIFrame {
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
         // operand stack.
-        let prefix_len = portal_vsd.unwrap_or(s.valuestackdepth);
+        let prefix_len = portal_vsd.unwrap_or(concrete_vsd);
         let snapshot = if owns_shadow && prefix_len >= nlocals {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut snapshot = Vec::with_capacity(prefix_len);
