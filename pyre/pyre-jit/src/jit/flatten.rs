@@ -1208,6 +1208,16 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// Production callers populate it via `cpu.lowering_ctx`
     /// (`codewriter.rs::transform_graph_to_jitcode`).
     lowering_ctx: Option<LoweringContext>,
+    /// `rpython/jit/codewriter/flatten.py:76 self.regallocs = regallocs`.
+    ///
+    /// When `Some`, `getcolor_var` reads `regallocs[kind].coloring[id]`
+    /// directly (the upstream-orthodox path); the `get_register`
+    /// closure becomes inert.  When `None`, falls back to the closure
+    /// (legacy path used by test fixtures that have not yet migrated
+    /// to per-kind `GraphAllocationResult` arrays).  Populated by the
+    /// canonical `flatten_graph` entry; production callers always
+    /// route through it.
+    regallocs: Option<&'a [super::regalloc::GraphAllocationResult; 3]>,
 }
 
 impl<'a, F> GraphFlattener<'a, F>
@@ -1226,6 +1236,7 @@ where
             include_all_exc_links: false,
             cpu: None,
             lowering_ctx: None,
+            regallocs: None,
         }
     }
 }
@@ -1251,6 +1262,7 @@ where
             include_all_exc_links: false,
             cpu: None,
             lowering_ctx: None,
+            regallocs: None,
         }
     }
 
@@ -1281,6 +1293,7 @@ where
             include_all_exc_links: false,
             cpu: None,
             lowering_ctx: Some(lowering_ctx),
+            regallocs: None,
         }
     }
 
@@ -1293,6 +1306,20 @@ where
     /// Returns `self` to support builder-style chaining at construction.
     pub fn with_cpu(mut self, cpu: &'a super::cpu::Cpu) -> Self {
         self.cpu = Some(cpu);
+        self
+    }
+
+    /// `flatten.py:76 self.regallocs = regallocs` builder-style equivalent.
+    ///
+    /// Once set, `getcolor_var` reads colors from `regallocs` directly
+    /// instead of routing through the `get_register` closure.  The
+    /// closure remains constructible for back-compat with test fixtures
+    /// that have not migrated.
+    pub fn with_regallocs(
+        mut self,
+        regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
+    ) -> Self {
+        self.regallocs = Some(regallocs);
         self
     }
 
@@ -2242,10 +2269,23 @@ where
     }
 
     /// `flatten.py:382-391 GraphFlattener.getcolor(v)` Variable arm.
-    /// Centralizes the `(self.get_register)(v)` invocation so future
-    /// slices can swap the closure for a `regallocs` field without
-    /// touching internal callers.
+    ///
+    /// When `self.regallocs` is set (production canonical entry path),
+    /// reads `regallocs[kind].coloring[v.id]` directly — matching
+    /// upstream's `self.regallocs[kind].getcolor(v)` exactly.  Falls
+    /// back to the `get_register` closure when `regallocs` is `None`
+    /// (legacy test-fixture path; tracked by the closure-retirement
+    /// epic).
     fn getcolor_var(&mut self, v: Variable) -> Register {
+        if let Some(regallocs) = self.regallocs {
+            let kind = v.kind.unwrap_or(Kind::Ref);
+            let color = regallocs[kind.index()]
+                .coloring
+                .get(&v.id)
+                .copied()
+                .unwrap_or(u16::MAX);
+            return Register::new(kind, color);
+        }
         (self.get_register)(v)
     }
 
@@ -2554,6 +2594,14 @@ pub fn flatten_graph<'a>(
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
+    // `flatten.py:76 self.regallocs = regallocs` — once set, the
+    // closure captured above becomes inert: `getcolor_var` reads
+    // colors directly from `self.regallocs[kind].coloring`.  The
+    // closure is retained only because legacy test fixtures haven't
+    // migrated; the closure-retirement epic deletes both the field
+    // and the bridging closure once every caller routes through
+    // `regallocs`.
+    flattener = flattener.with_regallocs(regallocs);
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
