@@ -709,6 +709,16 @@ fn analyze_pipeline_from_parsed(
                     .return_types
                     .insert(path.clone(), ret_type.clone());
             }
+            // Mirror RPython `func._elidable_function_` / `func._jit_*_`:
+            // `register_trait_method` populates `function_graphs` only, so
+            // the BFS sees hint-less SemanticFunctions for trait methods
+            // and inlines elidable methods that should remain residual.
+            // `register_function_hints_for` is a side-table-only write
+            // (no graph re-insertion) that fills `function_hints` keyed
+            // on the same `[impl_type, method_name]` path the BFS uses.
+            if !method.hints.is_empty() {
+                call_control.register_function_hints_for(path.clone(), method.hints.clone());
+            }
             // RPython: hints bound to graph identity.
             for hint in &method.hints {
                 match hint.as_str() {
@@ -731,7 +741,21 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
-        call_control.register_function_graph(path.clone(), method_info.graph.clone());
+        // Pair the graph with the method's hints so the BFS-driven
+        // `look_inside_graph` synthesises a `SemanticFunction` whose
+        // `_reject_function("elidable")` mirrors RPython's
+        // `getattr(func, "_elidable_function_", False)`.  Without this
+        // the BFS sees impl methods as hint-less and inlines elidable
+        // methods (e.g. `PyFrame::nlocals`) that should remain residual.
+        if method_info.hints.is_empty() {
+            call_control.register_function_graph(path.clone(), method_info.graph.clone());
+        } else {
+            call_control.register_function_graph_with_hints(
+                path.clone(),
+                method_info.graph.clone(),
+                method_info.hints.clone(),
+            );
+        }
         if let Some(ref ret_type) = method_info.return_type {
             call_control
                 .return_types
@@ -797,7 +821,9 @@ fn analyze_pipeline_from_parsed(
             if !func.module_path.is_empty() && segments.len() == 1 {
                 let mut mod_segs: Vec<&str> = func.module_path.split("::").collect();
                 mod_segs.extend(segments.iter().copied());
-                paths.push(crate::parse::CallPath::from_segments(mod_segs.iter().copied()));
+                paths.push(crate::parse::CallPath::from_segments(
+                    mod_segs.iter().copied(),
+                ));
                 let mut crate_mod_segs = vec!["crate"];
                 crate_mod_segs.extend(mod_segs.iter().copied());
                 paths.push(crate::parse::CallPath::from_segments(crate_mod_segs));

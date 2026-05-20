@@ -398,6 +398,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: hints.into_iter().map(|h| h.to_string()).collect(),
+            module_path: String::new(),
             access_directly: false,
         }
     }
@@ -445,6 +446,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: vec![],
+            module_path: String::new(),
             access_directly: false,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
@@ -458,6 +460,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: vec!["unroll_safe".into()],
+            module_path: String::new(),
             access_directly: false,
         };
         assert!(policy.look_inside_graph(&unroll_safe));

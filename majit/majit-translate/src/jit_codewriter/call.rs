@@ -1817,6 +1817,18 @@ impl CallControl {
         }
     }
 
+    /// Side-table-only hint write keyed on the same `CallPath` BFS uses
+    /// at `find_all_graphs_bfs`.  Used by call sites that have already
+    /// registered the graph through a different path (e.g.
+    /// `register_trait_method`) and only need the hint slot populated so
+    /// `look_inside_graph`'s synthesised `SemanticFunction` carries the
+    /// RPython-equivalent `_jit_*_` / `_elidable_function_` flags.
+    pub fn register_function_hints_for(&mut self, path: CallPath, hints: Vec<String>) {
+        if !hints.is_empty() {
+            self.function_hints.insert(path, hints);
+        }
+    }
+
     /// Bind a real helper trace-call address to a canonical CallPath.
     ///
     /// RPython obtains this from `getfunctionptr(graph)`; majit callers
