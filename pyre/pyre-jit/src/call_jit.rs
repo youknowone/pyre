@@ -2674,18 +2674,17 @@ fn jit_ca_handle_guard_failure(
     }
     let frame = unsafe { &mut *frame_ptr };
 
-    // compile.py:786-788 self.start_compiling(): set ST_BUSY_FLAG
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().start_guard_compiling(descr_addr);
+    // `compile.py:786-788` `self.start_compiling()` — direct method
+    // call on the resume-guard descr instance.
+    if let Some(fd) = descr_arc.as_fail_descr() {
+        fd.start_compiling();
     }
 
     let compiled = trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout);
 
-    // compile.py:790-795 self.done_compiling(): clear ST_BUSY_FLAG
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().done_guard_compiling(descr_addr);
+    // `compile.py:790-795` `self.done_compiling()` — direct method call.
+    if let Some(fd) = descr_arc.as_fail_descr() {
+        fd.done_compiling();
     }
 
     if majit_metainterp::majit_log_enabled() {

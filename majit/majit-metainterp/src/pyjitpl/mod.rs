@@ -7970,9 +7970,10 @@ impl<M: Clone> MetaInterp<M> {
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
-        // compile.py:741: self.status — read live status directly from the
-        // failed descriptor object (not a re-lookup by trace_id/fail_index).
-        let status = self.backend.read_descr_status(descr_addr);
+        // `compile.py:741` `status = self.status` — direct field read on
+        // the resume-guard descr.  `descr_fd` is the live `FailDescr`
+        // we already resolved above; no backend round-trip.
+        let status = descr_fd.get_status();
         // compile.py:741-751: decode status to get hash
         let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
             // compile.py:745: common case — TY_NONE, not busy.
@@ -8110,18 +8111,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         None
-    }
-
-    /// compile.py:786-788: self.start_compiling() — set ST_BUSY_FLAG
-    /// on the exact failed descriptor (by descr_addr, not re-lookup).
-    pub fn start_guard_compiling(&self, descr_addr: usize) {
-        self.backend.start_compiling_descr(descr_addr);
-    }
-
-    /// compile.py:790-795: self.done_compiling() — clear ST_BUSY_FLAG
-    /// on the exact failed descriptor (by descr_addr, not re-lookup).
-    pub fn done_guard_compiling(&self, descr_addr: usize) {
-        self.backend.done_compiling_descr(descr_addr);
     }
 
     /// Check whether a bridge was actually compiled and attached for a guard.

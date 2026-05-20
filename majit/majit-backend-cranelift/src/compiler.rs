@@ -14425,45 +14425,6 @@ impl majit_backend::Backend for CraneliftBackend {
         }
     }
 
-    fn read_descr_status(&self, descr_addr: usize) -> u64 {
-        // `compile.py:741 self.status` — route through the registry-backed
-        // `Arc<dyn FailDescr>` so the dispatch is trait-based, mirroring
-        // dynasm.  After the Unified-Descr identity flip, only the
-        // registry value changes; this dispatch chain stays the same.
-        if descr_addr == 0 {
-            return 0;
-        }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
-            .as_fail_descr()
-            .map_or(0, |fd| fd.get_status())
-    }
-
-    fn start_compiling_descr(&self, descr_addr: usize) {
-        // `compile.py:786-788 self.start_compiling()` — trait dispatch.
-        if descr_addr == 0 {
-            return;
-        }
-        if let Some(fd) =
-            <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
-                .as_fail_descr()
-        {
-            fd.start_compiling();
-        }
-    }
-
-    fn done_compiling_descr(&self, descr_addr: usize) {
-        // `compile.py:790-795 self.done_compiling()` — trait dispatch.
-        if descr_addr == 0 {
-            return;
-        }
-        if let Some(fd) =
-            <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
-                .as_fail_descr()
-        {
-            fd.done_compiling();
-        }
-    }
-
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
         let old_compiled = old_token
             .compiled

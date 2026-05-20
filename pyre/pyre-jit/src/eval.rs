@@ -3372,11 +3372,6 @@ fn handle_fail(
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
-    // compile.py:780 `current_object_addr_as_int(self)` — descriptor
-    // identity used by `start_compiling` / `done_compiling` to flip
-    // `ResumeGuardDescr.status`'s ST_BUSY_FLAG.  Recover from the Arc
-    // each call rather than threading it through outer signatures.
-    let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
     // compile.py:702-703: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
@@ -3384,10 +3379,10 @@ fn handle_fail(
             driver.is_tracing()
         };
         if !is_tracing {
-            // compile.py:704: self.start_compiling() (set ST_BUSY_FLAG)
-            {
-                let (driver, _) = driver_pair();
-                driver.meta_interp_mut().start_guard_compiling(descr_addr);
+            // `compile.py:704` `self.start_compiling()` — direct method
+            // call on the resume-guard descr instance.
+            if let Some(fd) = descr_arc.as_fail_descr() {
+                fd.start_compiling();
             }
             // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
             // force_plain_eval prevents concrete calls during bridge
@@ -3401,10 +3396,9 @@ fn handle_fail(
                     exit_layout,
                 )
             };
-            // compile.py:709: done_compiling (clear ST_BUSY_FLAG)
-            {
-                let (driver, _) = driver_pair();
-                driver.meta_interp_mut().done_guard_compiling(descr_addr);
+            // `compile.py:709` `self.done_compiling()` — direct method call.
+            if let Some(fd) = descr_arc.as_fail_descr() {
+                fd.done_compiling();
             }
             if compiled {
                 // compile.py:708: bridge compiled → ContinueRunningNormally.

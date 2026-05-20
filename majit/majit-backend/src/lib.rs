@@ -1674,31 +1674,6 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// compile.py:741: self.status — read status from the failed descriptor
-    /// directly by its raw address (no re-lookup). RPython calls self.status
-    /// on the same descriptor object; descr_addr IS that object's identity.
-    ///
-    /// # Safety
-    /// descr_addr must be a valid pointer returned from a guard failure in
-    /// the same compilation session. The descriptor must still be alive
-    /// (held by compiled_loops or previous_tokens).
-    fn read_descr_status(&self, _descr_addr: usize) -> u64 {
-        0
-    }
-
-    /// compile.py:786-788: `self.start_compiling()`.
-    ///
-    /// RPython calls `self.status |= ST_BUSY_FLAG` directly on the
-    /// descriptor. In Rust, the descriptor is behind a trait object and
-    /// Arc, so we pass `descr_addr` (the Arc's raw pointer from the guard
-    /// failure result) and let the backend cast it back. This is the Rust
-    /// equivalent of RPython's `self` — both identify the exact descriptor.
-    fn start_compiling_descr(&self, _descr_addr: usize) {}
-
-    /// compile.py:790-795: `self.done_compiling()`.
-    /// Same pattern as start_compiling_descr — see above.
-    fn done_compiling_descr(&self, _descr_addr: usize) {}
-
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 
