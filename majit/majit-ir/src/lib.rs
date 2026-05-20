@@ -2,7 +2,6 @@ pub mod bitstring;
 pub mod descr;
 pub mod descr_registry;
 pub mod effectinfo;
-pub mod forwarded;
 pub mod op_descr;
 pub mod op_type_index;
 pub mod resoperation;
@@ -29,10 +28,6 @@ pub use effectinfo::{
     CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, QuasiImmutAnalyzer,
     RandomEffectsAnalyzer, UnsupportedFieldExc, VirtualizableAnalyzer, consider_array,
     consider_struct, frozenset_or_none,
-};
-pub use forwarded::{
-    AbstractInfo, AbstractResOpOrInputArg, AbstractValue as ForwardableValue, Forwarded,
-    get_box_replacement,
 };
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{

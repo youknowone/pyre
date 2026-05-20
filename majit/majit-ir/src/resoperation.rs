@@ -1004,10 +1004,9 @@ pub type OpRc = std::rc::Rc<Op>;
 /// A single IR operation.
 ///
 /// Mirrors `rpython/jit/metainterp/resoperation.py:250` `AbstractResOp`.
-/// `forwarded` is the inline `_forwarded` slot from
-/// `resoperation.py:234` (`AbstractResOpOrInputArg._attrs_ =
-/// ('_forwarded',)`). Cloning resets the slot to `None` to match
-/// `copy_and_change` (`resoperation.py:323`).
+/// The `_forwarded` slot (`resoperation.py:235`) lives on `BoxRef`
+/// (`majit-metainterp/src/box.rs`), which is pyre's mirror of RPython's
+/// `AbstractValue` object identity.
 #[derive(Debug)]
 pub struct Op {
     pub opcode: OpCode,
@@ -1062,19 +1061,9 @@ pub struct Op {
     /// `forwarded_vecinfo(op)` (schedule.py:479-486) writes through the
     /// same `_vector_info` slot every observer sees.
     pub vecinfo: std::cell::RefCell<Option<Box<VectorizationInfo>>>,
-    /// resoperation.py:234 `_forwarded` slot from
-    /// `AbstractResOpOrInputArg`. Carries forwarding targets and
-    /// analysis info during optimization. See
-    /// `crate::forwarded::Forwarded` for the slot variants.
-    pub forwarded: std::cell::RefCell<crate::forwarded::Forwarded>,
 }
 
 impl Clone for Op {
-    /// `resoperation.py:323` `copy_and_change` constructs a fresh
-    /// `ResOperation` whose `_forwarded` is the default (`None`). Pyre's
-    /// `Op::clone()` mirrors that contract — cloning an op produces a
-    /// fresh `Forwarded::None` slot rather than aliasing the source's
-    /// analysis state.
     fn clone(&self) -> Self {
         Op {
             opcode: self.opcode,
@@ -1086,7 +1075,6 @@ impl Clone for Op {
             fail_arg_types: std::cell::RefCell::new(self.fail_arg_types.borrow().clone()),
             rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
-            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 }
@@ -1175,7 +1163,6 @@ impl Op {
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
@@ -1190,7 +1177,6 @@ impl Op {
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         }
     }
 
@@ -1247,9 +1233,6 @@ impl Op {
             // happens unconditionally — None for scalar ops, Some(_) for
             // vector ops which is what RPython's Vector* subclasses do.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
-            // resoperation.py:323 `ResOperation(opnum, args[:], descr)` —
-            // a freshly constructed op starts with `_forwarded = None`.
-            forwarded: std::cell::RefCell::new(crate::forwarded::Forwarded::None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3205,9 +3188,6 @@ mod tests {
                 $($field)*
                 type_: Type::Void,
                 vecinfo: std::cell::RefCell::new(None),
-                forwarded: std::cell::RefCell::new(
-                    crate::forwarded::Forwarded::None,
-                ),
             };
             __op.type_ = __op.opcode.result_type();
             __op

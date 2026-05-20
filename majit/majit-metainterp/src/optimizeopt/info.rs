@@ -5,7 +5,7 @@ pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{AbstractInfo, DescrRef, ForwardableValue, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -154,29 +154,6 @@ impl std::fmt::Debug for OpInfo {
         }
     }
 }
-
-/// `info.py:17` `class AbstractInfo(AbstractValue)`. The Rust trait is a
-/// marker; OpInfo (which collapses RPython's AbstractInfo subclass tree
-/// into one enum) plugs directly into `Forwarded::Info(Rc<dyn
-/// AbstractInfo>)`.
-impl ForwardableValue for OpInfo {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    /// `info.py:20` `is_info_class = True`.
-    fn is_info_class(&self) -> bool {
-        true
-    }
-
-    /// `info.py:706` `ConstPtrInfo.is_constant` / `info.py:851`
-    /// `FloatConstInfo.is_constant` / `intutils.py IntBound.is_constant`.
-    fn is_constant(&self) -> bool {
-        OpInfo::is_constant(self)
-    }
-}
-
-impl AbstractInfo for OpInfo {}
 
 impl OpInfo {
     /// Helper for constructing `OpInfo::Ptr` from owned `PtrInfo` —
