@@ -927,6 +927,27 @@ impl MIFrame {
         self.sym().valuestackdepth
     }
 
+    /// Read `PyFrame.valuestackdepth` directly from the concrete frame at
+    /// `concrete_frame_addr`.  Issue #73 Phase 4.5 slice 1: the orthodox
+    /// PyPy-parity replacement for `self.sym().valuestackdepth`.
+    ///
+    /// RPython has no symbolic mirror of the Python stack — `MIFrame` only
+    /// holds the per-jitcode-invocation register banks (`registers_r/i/f`),
+    /// and the user-side stack lives in `PyFrame.locals_cells_stack_w` /
+    /// `PyFrame.valuestackdepth` accessed via IR `getfield/setfield` on the
+    /// virtualizable.  Pyre's `PyreSym.valuestackdepth` is a newly
+    /// introduced divergence (a symbolic mirror) that drifts from
+    /// `PyFrame.valuestackdepth` whenever the production walker handles an
+    /// opcode that mutates the concrete stack (the walker records the
+    /// residual_call but does not run `MIFrame::pop_value`'s `sym.valuestackdepth -= 1`).
+    ///
+    /// Returns `None` only when `concrete_frame_addr == 0` (i.e. tests
+    /// constructing a sym-only `MIFrame`); production tracer paths always
+    /// seed `concrete_frame_addr` from the live `PyFrame`.
+    pub(crate) fn concrete_valuestackdepth(&self) -> Option<usize> {
+        crate::state::concrete_stack_depth(self.concrete_frame_addr)
+    }
+
     #[doc(hidden)]
     pub fn symbolic_registers_r(&self) -> &[OpRef] {
         &self.sym().registers_r
@@ -1938,14 +1959,25 @@ impl MIFrame {
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        let (top_idx, other_idx) = {
-            let s = self.sym();
-            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-            if depth == 0 || stack_only < depth {
-                return Err(PyError::type_error("stack underflow during trace swap"));
-            }
-            (stack_only - 1, stack_only - depth)
-        };
+        // Issue #73 Phase 4.5 slice 1: read the stack depth from the
+        // concrete `PyFrame` at `concrete_frame_addr` rather than the
+        // symbolic mirror `sym.valuestackdepth`.  This is the first reader
+        // migration toward eliminating the `PyreSym.valuestackdepth`
+        // mirror (a pyre-introduced divergence with no PyPy counterpart —
+        // RPython's `MIFrame` holds only per-jitcode register banks, and
+        // user-side stack state lives on `PyFrame` accessed via IR
+        // getfield/setfield).  Falls back to the symbolic value when the
+        // concrete frame is absent (test harnesses constructing sym-only
+        // `MIFrame`s); production traces always seed `concrete_frame_addr`.
+        let nlocals = self.sym().nlocals;
+        let vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth);
+        let stack_only = vsd.saturating_sub(nlocals);
+        if depth == 0 || stack_only < depth {
+            return Err(PyError::type_error("stack underflow during trace swap"));
+        }
+        let (top_idx, other_idx) = (stack_only - 1, stack_only - depth);
         swap_stack_slots(self.sym_mut(), ctx, top_idx, other_idx);
         Ok(())
     }
