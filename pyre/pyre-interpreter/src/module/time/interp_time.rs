@@ -5,6 +5,9 @@
 use pyre_object::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "host_env")]
+use rustpython_host_env::time as host_time;
+
 /// time.time() → float (seconds since epoch)
 pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
@@ -85,72 +88,30 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(unix)]
+#[cfg(feature = "host_env")]
 fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
-    unsafe {
-        let secs = seconds as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        let p = libc::gmtime_r(&secs, &mut tm);
-        if p.is_null() {
-            None
-        } else {
-            Some(libc_tm_to_c_tm(&tm))
-        }
-    }
+    host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
+        .map(|tm| libc_tm_to_c_tm(&tm))
 }
 
-#[cfg(windows)]
-fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
-    // Windows MSVC CRT: _gmtime64_s(struct tm *result, const __time64_t *time)
-    // Returns 0 on success.  The libc crate on Windows does not expose
-    // gmtime_r, but the MSVC CRT provides _gmtime64_s via an extern.
-    unsafe extern "C" {
-        fn _gmtime64_s(result: *mut MsvcTm, time: *const i64) -> i32;
-    }
-    unsafe {
-        let mut tm: MsvcTm = std::mem::zeroed();
-        let ret = _gmtime64_s(&mut tm, &seconds);
-        if ret != 0 {
-            None
-        } else {
-            Some(msvc_tm_to_c_tm(&tm))
-        }
-    }
+#[cfg(not(feature = "host_env"))]
+fn _c_gmtime(_seconds: time_t) -> Option<c_tm> {
+    None
 }
 
-#[cfg(unix)]
+#[cfg(feature = "host_env")]
 fn _c_localtime(seconds: time_t) -> Option<c_tm> {
-    unsafe {
-        let secs = seconds as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        let p = libc::localtime_r(&secs, &mut tm);
-        if p.is_null() {
-            None
-        } else {
-            Some(libc_tm_to_c_tm(&tm))
-        }
-    }
+    host_time::localtime_from_timestamp(seconds as host_time::TimeT)
+        .map(|tm| libc_tm_to_c_tm(&tm))
 }
 
-#[cfg(windows)]
-fn _c_localtime(seconds: time_t) -> Option<c_tm> {
-    unsafe extern "C" {
-        fn _localtime64_s(result: *mut MsvcTm, time: *const i64) -> i32;
-    }
-    unsafe {
-        let mut tm: MsvcTm = std::mem::zeroed();
-        let ret = _localtime64_s(&mut tm, &seconds);
-        if ret != 0 {
-            None
-        } else {
-            Some(msvc_tm_to_c_tm(&tm))
-        }
-    }
+#[cfg(not(feature = "host_env"))]
+fn _c_localtime(_seconds: time_t) -> Option<c_tm> {
+    None
 }
 
 // ── Unix helpers ────────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
     c_tm {
         tm_sec: tm.tm_sec,
@@ -165,7 +126,6 @@ fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
     }
 }
 
-#[cfg(unix)]
 fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
     unsafe {
         let mut out: libc::tm = std::mem::zeroed();
@@ -426,23 +386,15 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut tm = _gettmarg(args, false)?;
     tm.tm_wday = -1;
 
-    #[cfg(unix)]
+    #[cfg(feature = "host_env")]
     let tt = {
         let mut libc_tm = c_tm_to_libc_tm(&tm);
-        let result = unsafe { libc::mktime(&mut libc_tm) };
+        let result = host_time::mktime(&mut libc_tm);
         tm.tm_wday = libc_tm.tm_wday;
         result as i64
     };
-    #[cfg(windows)]
-    let tt = {
-        unsafe extern "C" {
-            fn _mktime64(timeptr: *mut MsvcTm) -> i64;
-        }
-        let mut msvc_tm = c_tm_to_msvc_tm(&tm);
-        let result = unsafe { _mktime64(&mut msvc_tm) };
-        tm.tm_wday = msvc_tm.tm_wday;
-        result
-    };
+    #[cfg(not(feature = "host_env"))]
+    let tt: i64 = -1;
 
     if tt == -1 && tm.tm_wday == -1 {
         return Err(crate::PyError::overflow_error(
