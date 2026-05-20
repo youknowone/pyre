@@ -64,7 +64,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
         for block in &graph.blocks {
             // Propagate annotations through ops in this block
             for op in &block.operations {
-                if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+                if let Some(result) = op.registered_result_value_id(graph) {
                     let inferred = infer_op_type(&op.kind, &state, graph);
                     let current = state.get(result);
                     let merged = union_type(&current, &inferred);

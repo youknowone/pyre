@@ -832,6 +832,32 @@ pub struct SpaceOperation {
     pub kind: OpKind,
 }
 
+impl SpaceOperation {
+    /// Strict projection of [`Self::result`] onto pyre's `ValueId`
+    /// surface.  Returns `None` only when `result` is `None`
+    /// (intentionally void op).  Panics when `result` is `Some(var)`
+    /// but the Variable is not registered on the graph — a contract
+    /// violation that the inline `self.result.as_ref().and_then(|v|
+    /// graph.value_id_of(v))` idiom would otherwise swallow into the
+    /// same `None` as a genuinely void op, silently dropping
+    /// authoritative type inference for the unregistered ValueId.
+    ///
+    /// Mirrors the panic shape used by
+    /// [`Block::inputarg_value_ids`] and the `ExitSwitch::Value`
+    /// branch of [`remap_control_flow_metadata`].
+    pub fn registered_result_value_id(&self, graph: &FunctionGraph) -> Option<ValueId> {
+        self.result.as_ref().map(|var| {
+            graph.value_id_of(var).unwrap_or_else(|| {
+                panic!(
+                    "SpaceOperation.result ({var:?}) is not registered on \
+                     the graph — malformed op metadata (every result \
+                     Variable must be allocated through the graph allocator)"
+                )
+            })
+        })
+    }
+}
+
 /// RPython `Block.exitswitch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitSwitch {

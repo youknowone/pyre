@@ -67,7 +67,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
             }
         }
         for op in &block.operations {
-            if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+            if let Some(result) = op.registered_result_value_id(graph) {
                 let inferred = infer_concrete_from_op(&op.kind);
                 if inferred != ConcreteType::Unknown {
                     // The op carries authoritative result kind (post-
@@ -179,7 +179,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                             .expect("BinOp.rhs has backing ValueId");
                         changed |= maybe_seed_concrete_type(graph, lhs_vid, ConcreteType::Signed);
                         changed |= maybe_seed_concrete_type(graph, rhs_vid, ConcreteType::Signed);
-                        if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v))
+                        if let Some(result) = op.registered_result_value_id(graph)
                         {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
@@ -245,7 +245,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                             .expect("UnaryOp.operand has backing ValueId");
                         changed |=
                             maybe_seed_concrete_type(graph, operand_vid, ConcreteType::Signed);
-                        if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v))
+                        if let Some(result) = op.registered_result_value_id(graph)
                         {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
@@ -294,7 +294,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
                         operand,
                         ..
                     } if is_identity_unop(opname) => {
-                        if let Some(result) = op.result.as_ref().and_then(|v| graph.value_id_of(v))
+                        if let Some(result) = op.registered_result_value_id(graph)
                         {
                             let operand_vid = graph
                                 .value_id_of(operand)
@@ -346,7 +346,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) {
             for v in crate::inline::op_value_refs(&op.kind, Some(graph)) {
                 seen.insert(v);
             }
-            if let Some(r) = op.result.as_ref().and_then(|v| graph.value_id_of(v)) {
+            if let Some(r) = op.registered_result_value_id(graph) {
                 seen.insert(r);
             }
         }
