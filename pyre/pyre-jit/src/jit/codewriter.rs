@@ -993,16 +993,16 @@ fn walker_post_walk_insert_renamings(
         }
     }
 
-    // Pre-compute in-degree per reachable block (number of incoming
-    // links) to identify unique-predecessor targets for multi-exit
-    // insert_renamings.  Multi-predecessor targets (loop headers,
-    // merge points) need per-link trampoline blocks because canonical
-    // emits each link's renamings between `Label(link)` and
-    // `Label(target_block)`, but pyre's walker collapses link labels
-    // to the target's `pc{N}`, losing the per-edge distinction at
-    // the target's entry.  Splicing per-link renamings at a
-    // multi-predecessor target would mix the renamings of different
-    // edges, breaking semantics.
+    // Pre-compute in-degree per reachable block.  Multi-exit links
+    // dispatch on in_degree of the link's target:
+    //   * in_degree == 1: splice renamings into target's entry via
+    //     `TargetAfterAnchor` (safe since only this edge reaches the
+    //     target's entry label).
+    //   * in_degree > 1: synthesize a per-link trampoline via
+    //     `emit_trampoline_for_multi_pred_link` (mirroring
+    //     `flatten.py:175-205` per-link `Label + insert_renamings`
+    //     emission).  TargetAfterAnchor would otherwise mix
+    //     renamings from multiple incoming edges at the same entry.
     let mut in_degree: Vec<(super::flow::BlockRef, usize)> = Vec::new();
     for b in &reachable {
         for exit in &b.borrow().exits {
@@ -1217,66 +1217,14 @@ where
     F: Fn(&super::flow::Variable) -> u16,
 {
     let pairs = collect_distinct_renaming_pairs(link_ref, get_color);
-    if pairs.is_empty() {
+    let body = build_renaming_insns(pairs);
+    if body.is_empty() {
         return TrampolineOutcome::NoPairs;
     }
     let target_block = match link_ref.borrow().target.clone() {
         Some(t) => t,
         None => return TrampolineOutcome::NoPairs,
     };
-
-    // Group by kind and lower via `reorder_renaming_list` (handles
-    // cycles via `<kind>_push` / `<kind>_pop`).  Mirrors the per-kind
-    // loop in [`emit_link_renamings_into_block`].
-    let mut sorted_pairs = pairs;
-    sorted_pairs.sort_by_key(|(_, dst, _)| *dst);
-    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-    ];
-    for (src, dst, kind) in sorted_pairs {
-        let bucket = &mut renamings[kind.index()];
-        bucket.0.push(src);
-        bucket.1.push(dst);
-    }
-    let mut body: Vec<super::flatten::Insn> = Vec::new();
-    for &kind in &Kind::ALL {
-        let (frm, to) = &renamings[kind.index()];
-        if frm.is_empty() {
-            continue;
-        }
-        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
-            match (src, dst) {
-                (Some(src), Some(dst)) => {
-                    body.push(super::flatten::Insn::op_with_result(
-                        format!("{}_copy", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (Some(src), None) => {
-                    body.push(super::flatten::Insn::op(
-                        format!("{}_push", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                    ));
-                }
-                (None, Some(dst)) => {
-                    body.push(super::flatten::Insn::op_with_result(
-                        format!("{}_pop", kind.as_str()),
-                        Vec::new(),
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (None, None) => unreachable!(
-                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
-                ),
-            }
-        }
-    }
-    if body.is_empty() {
-        return TrampolineOutcome::NoPairs;
-    }
 
     // Locate the source SpamBlock for the in-place terminator rewrite.
     let Some(source_spam) = all_walker_blocks
@@ -1408,14 +1356,79 @@ fn rewrite_source_terminator_tlabel(
     false
 }
 
+/// `flatten.py:312-333 insert_renamings` per-kind emission.  Takes
+/// the distinct-color `(src, dst, kind)` pairs from
+/// [`collect_distinct_renaming_pairs`], groups them per kind in
+/// flatten.py:316-318 order, and lowers each kind via
+/// `reorder_renaming_list` (cycle-aware `<kind>_push` /
+/// `<kind>_pop`).  Returns an empty vec when `pairs` is empty (the
+/// caller treats this as "nothing to splice").
+fn build_renaming_insns(pairs: Vec<(u16, u16, Kind)>) -> Vec<super::flatten::Insn> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = pairs;
+    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+    sorted.sort_by_key(|(_, dst, _)| *dst);
+    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
+    // `Kind::index()` per [[feedback-no-hashmap-ever]].
+    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+        (Vec::new(), Vec::new()),
+    ];
+    for (src, dst, kind) in sorted {
+        let bucket = &mut renamings[kind.index()];
+        bucket.0.push(src);
+        bucket.1.push(dst);
+    }
+    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
+    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
+    for &kind in &Kind::ALL {
+        let (frm, to) = &renamings[kind.index()];
+        if frm.is_empty() {
+            continue;
+        }
+        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
+            match (src, dst) {
+                (Some(src), Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_copy", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (Some(src), None) => {
+                    emitted.push(super::flatten::Insn::op(
+                        format!("{}_push", kind.as_str()),
+                        vec![super::flatten::Operand::reg(kind, src)],
+                    ));
+                }
+                (None, Some(dst)) => {
+                    emitted.push(super::flatten::Insn::op_with_result(
+                        format!("{}_pop", kind.as_str()),
+                        Vec::new(),
+                        super::flatten::Register::new(kind, dst),
+                    ));
+                }
+                (None, None) => unreachable!(
+                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
+                ),
+            }
+        }
+    }
+    emitted
+}
+
 /// `flatten.py:308-311 insert_renamings` pair extraction restricted
 /// to collecting distinct-color pairs that would actually emit a
-/// `<kind>_copy` / `<kind>_push` / `<kind>_pop`.  Mirrors the same
-/// `last_exception` / `last_exc_value` skip and the
-/// `src_color != dst_color` check as
-/// [`emit_link_renamings_into_block`] but without emitting any
-/// insns.  Used by the Phase 4 endgame multi-pred elision
-/// diagnostic (`PYRE_PHASE4_DIAGNOSE_ELIDE=1`).
+/// `<kind>_copy` / `<kind>_push` / `<kind>_pop`.  Skips
+/// `last_exception` / `last_exc_value` (routed through
+/// `generate_last_exc`, `flatten.py:336-347`) and pairs whose
+/// `src_color == dst_color` (no-op copies).  Skips `is_final &&
+/// exits.is_empty()` targets (returnblock/exceptblock) where the
+/// walker's RETURN_VALUE / RAISE handlers already emit `*_return` /
+/// `raise` referencing the source slot directly.
 fn collect_distinct_renaming_pairs<F>(
     link_ref: &super::flow::LinkRef,
     get_color: &F,
@@ -1514,111 +1527,9 @@ fn emit_link_renamings_into_block<F>(
 where
     F: Fn(&super::flow::Variable) -> u16,
 {
-    let link_borrow = link_ref.borrow();
-    let target_ref = link_borrow.target.clone()?;
-    let target_borrow = target_ref.borrow();
-    if link_borrow.args.len() != target_borrow.inputargs.len() {
-        return None;
-    }
-    // Skip blocks whose target is `returnblock`/`exceptblock`
-    // (`is_final && exits.is_empty()`).  Walker's RETURN_VALUE /
-    // RAISE handlers already emit `ref_return` / `raise` INLINE
-    // at the source block referencing the source stack-slot
-    // color (walker NEW-DEVIATION: upstream defers the return op
-    // to `make_return(target.inputargs)` AFTER insert_renamings
-    // copies link.args → target.inputargs).  Splicing a
-    // `ref_copy stack_color → target_inputarg_color` BEFORE
-    // walker's existing `ref_return stack_color` leaves walker's
-    // terminator reading the un-copied source slot and breaks
-    // SSA allocator coalescing on trivial return functions.
-    if target_borrow.is_final && target_borrow.exits.is_empty() {
-        return None;
-    }
-
-    // `flatten.py:308-311` pair extraction.  Skip pairs whose
-    // src is `last_exception` / `last_exc_value` (they route
-    // through `generate_last_exc` separately, flatten.py:336-347).
-    let mut pairs: Vec<(u16, u16, Kind)> = Vec::new();
-    for (i, arg) in link_borrow.args.iter().enumerate() {
-        let Some(src_value) = arg.as_ref() else {
-            continue;
-        };
-        let Some(src_variable) = src_value.as_variable() else {
-            continue;
-        };
-        let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
-            continue;
-        };
-        if Some(src_variable) == link_borrow.last_exception
-            || Some(src_variable) == link_borrow.last_exc_value
-        {
-            continue;
-        }
-        let src_color = get_color(&src_variable);
-        let dst_color = get_color(&dst_variable);
-        let kind = dst_variable.kind.unwrap_or(Kind::Ref);
-        if src_color != dst_color {
-            pairs.push((src_color, dst_color, kind));
-        }
-    }
-    drop(target_borrow);
-    drop(link_borrow);
-
-    if pairs.is_empty() {
-        return None;
-    }
-    // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
-    pairs.sort_by_key(|(_, dst, _)| *dst);
-
-    // `flatten.py:316-318` group by kind; `[T; 3]` indexed by
-    // `Kind::index()` per [[feedback-no-hashmap-ever]].
-    let mut renamings: [(Vec<u16>, Vec<u16>); 3] = [
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-        (Vec::new(), Vec::new()),
-    ];
-    for (src, dst, kind) in pairs {
-        let bucket = &mut renamings[kind.index()];
-        bucket.0.push(src);
-        bucket.1.push(dst);
-    }
-
-    // `flatten.py:319-333` per-kind emit via `reorder_renaming_list`.
-    let mut emitted: Vec<super::flatten::Insn> = Vec::new();
-    for &kind in &Kind::ALL {
-        let (frm, to) = &renamings[kind.index()];
-        if frm.is_empty() {
-            continue;
-        }
-        for (src, dst) in majit_translate::jit_codewriter::flatten::reorder_renaming_list(frm, to) {
-            match (src, dst) {
-                (Some(src), Some(dst)) => {
-                    emitted.push(super::flatten::Insn::op_with_result(
-                        format!("{}_copy", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (Some(src), None) => {
-                    emitted.push(super::flatten::Insn::op(
-                        format!("{}_push", kind.as_str()),
-                        vec![super::flatten::Operand::reg(kind, src)],
-                    ));
-                }
-                (None, Some(dst)) => {
-                    emitted.push(super::flatten::Insn::op_with_result(
-                        format!("{}_pop", kind.as_str()),
-                        Vec::new(),
-                        super::flatten::Register::new(kind, dst),
-                    ));
-                }
-                (None, None) => unreachable!(
-                    "reorder_renaming_list never yields (None, None) per majit/flatten.rs"
-                ),
-            }
-        }
-    }
-
+    let target_ref = link_ref.borrow().target.clone()?;
+    let pairs = collect_distinct_renaming_pairs(link_ref, get_color);
+    let emitted = build_renaming_insns(pairs);
     if emitted.is_empty() {
         return None;
     }
