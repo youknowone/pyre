@@ -178,6 +178,14 @@ impl JitProfiler {
             &self.nvholes,
             &self.nvreused,
             &self.calls,
+            // tracker counters exposed via `get_counter(TOTAL_COMPILED_*
+            // / TOTAL_FREED_*)` — reset on `start()` so a profiler
+            // reused across test setups or explicit restarts does not
+            // report inflated totals carried over from the prior run.
+            &self.total_compiled_loops,
+            &self.total_compiled_bridges,
+            &self.total_freed_loops,
+            &self.total_freed_bridges,
         ] {
             field.store(0, Ordering::Relaxed);
         }
