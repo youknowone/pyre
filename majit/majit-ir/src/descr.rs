@@ -89,12 +89,11 @@
 ///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
 ///   retired.  RPython caches real `Arc<dyn FieldDescr>` /
 ///   `Arc<dyn SizeDescr>` on the equivalent struct
-///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre constructs vref
-///   field descrs on demand at the SETFIELD_GC emit sites
-///   (`optimizeopt/virtualize.rs:1521/1528 make_vref_field_descr`).
-///   Caching them on `VirtualRefInfo` for identity stability is a
-///   separate follow-up (no current pyre call site relied on the
-///   removed u32 placeholders).
+///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre now does the same
+///   with `VirtualRefInfo::{descr, descr_virtual_token, descr_forced}`.
+///   The module-level vref descriptor constructors return the same
+///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
+///   same identities carried by `MetaInterp.virtualref_info`.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
