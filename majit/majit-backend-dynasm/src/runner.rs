@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use majit_ir::VecAssoc;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -61,8 +61,8 @@ struct DynasmCaTarget {
     index_of_virtualizable: i32,
 }
 
-static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, DynasmCaTarget>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<VecAssoc<u64, DynasmCaTarget>>> =
+    LazyLock::new(|| Mutex::new(VecAssoc::new()));
 
 /// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
@@ -1201,13 +1201,13 @@ impl DynasmBackend {
     /// GuardNonnullClass operand seen in `ops`. RPython resolves these on
     /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
-    /// the resolver as a HashMap up front.
+    /// the resolver as a VecAssoc up front.
     fn collect_classptr_typeid_table(
         &self,
         ops: &[Op],
         constants: &majit_ir::VecAssoc<u32, i64>,
-    ) -> std::collections::HashMap<i64, u32> {
-        let mut table = std::collections::HashMap::new();
+    ) -> majit_ir::VecAssoc<i64, u32> {
+        let mut table = majit_ir::VecAssoc::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             // vtable_offset path doesn't need typeid lookups; without a
             // gc_ll_descr there is nothing to resolve anyway.
@@ -1240,8 +1240,8 @@ impl DynasmBackend {
         &self,
         ops: &[Op],
         constants: &majit_ir::VecAssoc<u32, i64>,
-    ) -> std::collections::HashMap<i64, (i64, i64)> {
-        let mut table = std::collections::HashMap::new();
+    ) -> majit_ir::VecAssoc<i64, (i64, i64)> {
+        let mut table = majit_ir::VecAssoc::new();
         if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             return table;
         }
@@ -1525,7 +1525,7 @@ impl DynasmBackend {
         None
     }
 
-    fn call_assembler_targets_snapshot() -> HashMap<u64, usize> {
+    fn call_assembler_targets_snapshot() -> VecAssoc<u64, usize> {
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
@@ -1627,8 +1627,7 @@ impl DynasmBackend {
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .entry(token_number)
-            .or_insert_with(|| DynasmCaTarget {
+            .entry_or_insert_with(token_number, || DynasmCaTarget {
                 code_addr: 0,
                 compiled_loop_token: pending_clt,
                 index_of_virtualizable,

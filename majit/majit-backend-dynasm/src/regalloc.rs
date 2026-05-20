@@ -12,7 +12,7 @@
 ///   compute_vars_longevity — regalloc.py:1173
 ///   valid_addressing_size  — regalloc.py:1236
 ///   get_scale              — regalloc.py:1239
-use std::collections::HashMap;
+use majit_ir::VecAssoc;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -251,16 +251,16 @@ impl FixedRegisterPositions {
 
 /// regalloc.py:1054 LifetimeManager — manages Lifetime info for all variables.
 pub struct LifetimeManager {
-    lifetimes: HashMap<OpRef, Lifetime>,
+    lifetimes: VecAssoc<OpRef, Lifetime>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
-    pub fixed_register_use: HashMap<RegLoc, FixedRegisterPositions>,
+    pub fixed_register_use: VecAssoc<RegLoc, FixedRegisterPositions>,
 }
 
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
-            lifetimes: HashMap::new(),
-            fixed_register_use: HashMap::new(),
+            lifetimes: VecAssoc::new(),
+            fixed_register_use: VecAssoc::new(),
         }
     }
 
@@ -295,8 +295,7 @@ impl LifetimeManager {
             }
         };
         self.fixed_register_use
-            .entry(register)
-            .or_insert_with(|| FixedRegisterPositions::new(register))
+            .entry_or_insert_with(register, || FixedRegisterPositions::new(register))
             .fixed_register(opindex, definition_pos);
     }
 
@@ -1885,7 +1884,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:291 _update_bindings — bind bridge inputargs to their locations.
     fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
-        let mut used: HashMap<RegLoc, ()> = HashMap::new();
+        let mut used: VecAssoc<RegLoc, ()> = VecAssoc::new();
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
@@ -5916,7 +5915,7 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 mod tests {
     use super::*;
     use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
-    use std::collections::HashMap;
+    use majit_ir::VecAssoc;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let mut op = Op::new(opcode, args);
