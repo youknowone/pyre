@@ -9597,6 +9597,230 @@ fn init_posix(ns: &mut DictStorage) {
                 Ok(pyre_object::w_int_new(written))
             }),
         );
+
+        // os.posix_spawn(path, argv, env, *, file_actions=None) -> pid
+        // os.posix_spawnp(file, argv, env, *, file_actions=None) -> pid
+        // Currently supports path/argv/env + the file_actions sequence
+        // ((POSIX_SPAWN_OPEN, fd, path, flags, mode) | (POSIX_SPAWN_CLOSE,
+        // fd) | (POSIX_SPAWN_DUP2, fd, newfd)). Other CPython kwargs
+        // (setpgroup, setsid, setsigmask, setsigdef, resetids, scheduler)
+        // are not yet plumbed.
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+        {
+            fn build_posix_spawn(args: &[pyre_object::PyObjectRef], spawnp: bool)
+                -> Result<pyre_object::PyObjectRef, crate::PyError>
+            {
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                if positional.len() < 3 {
+                    return Err(crate::PyError::type_error(
+                        "posix_spawn() requires path, argv, env",
+                    ));
+                }
+                let path_str = extract_path(positional[0])?;
+                let c_path = std::ffi::CString::new(path_str.as_bytes()).map_err(|_| {
+                    crate::PyError::value_error("posix_spawn: embedded null in path")
+                })?;
+                let argv = collect_cstring_seq(positional[1], "posix_spawn", "argv")?;
+                let env = collect_cstring_seq(positional[2], "posix_spawn", "env")?;
+                let file_actions_obj = crate::builtins::kwarg_get(kwargs, "file_actions");
+                let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
+                    if let Some(fa) = file_actions_obj {
+                        if unsafe { pyre_object::is_none(fa) } {
+                            Vec::new()
+                        } else {
+                            decode_file_actions(fa)?
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                let config = rustpython_host_env::posix::PosixSpawnConfig {
+                    path: c_path.as_c_str(),
+                    args: &argv,
+                    env: &env,
+                    file_actions: &actions,
+                    setsigdef: None,
+                    setpgroup: None,
+                    resetids: false,
+                    setsid: false,
+                    setsigmask: None,
+                    spawnp,
+                };
+                let pid = host_posix::posix_spawn(config).map_err(|e| io_err(e, ""))?;
+                Ok(pyre_object::w_int_new(pid as i64))
+            }
+            fn collect_cstring_seq(
+                obj: pyre_object::PyObjectRef,
+                fn_name: &str,
+                arg_name: &str,
+            ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
+                let items: Vec<pyre_object::PyObjectRef> =
+                    if unsafe { pyre_object::is_list(obj) } {
+                        let n = unsafe { pyre_object::w_list_len(obj) };
+                        (0..n)
+                            .filter_map(|i| unsafe { pyre_object::w_list_getitem(obj, i as i64) })
+                            .collect()
+                    } else if unsafe { pyre_object::is_tuple(obj) } {
+                        let n = unsafe { pyre_object::w_tuple_len(obj) };
+                        (0..n)
+                            .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(obj, i as i64) })
+                            .collect()
+                    } else {
+                        return Err(crate::PyError::type_error(format!(
+                            "{fn_name}(): {arg_name} must be a list or tuple",
+                        )));
+                    };
+                items
+                    .into_iter()
+                    .map(|s| {
+                        let bytes = unsafe {
+                            if pyre_object::is_str(s) {
+                                pyre_object::w_str_get_value(s).as_bytes().to_vec()
+                            } else if pyre_object::is_bytes(s) {
+                                pyre_object::w_bytes_data(s).to_vec()
+                            } else {
+                                return Err(crate::PyError::type_error(format!(
+                                    "{fn_name}(): {arg_name} entries must be str or bytes",
+                                )));
+                            }
+                        };
+                        std::ffi::CString::new(bytes).map_err(|_| {
+                            crate::PyError::value_error(format!(
+                                "{fn_name}(): embedded null in {arg_name}",
+                            ))
+                        })
+                    })
+                    .collect()
+            }
+            fn decode_file_actions(
+                obj: pyre_object::PyObjectRef,
+            ) -> Result<Vec<rustpython_host_env::posix::PosixSpawnFileAction>, crate::PyError>
+            {
+                use rustpython_host_env::posix::PosixSpawnFileAction;
+                let len = if unsafe { pyre_object::is_list(obj) } {
+                    unsafe { pyre_object::w_list_len(obj) }
+                } else if unsafe { pyre_object::is_tuple(obj) } {
+                    unsafe { pyre_object::w_tuple_len(obj) }
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "posix_spawn: file_actions must be a list or tuple",
+                    ));
+                };
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let entry = if unsafe { pyre_object::is_list(obj) } {
+                        unsafe { pyre_object::w_list_getitem(obj, i as i64) }
+                    } else {
+                        unsafe { pyre_object::w_tuple_getitem(obj, i as i64) }
+                    }
+                    .ok_or_else(|| {
+                        crate::PyError::value_error("posix_spawn: file_actions entry missing")
+                    })?;
+                    if unsafe { !pyre_object::is_tuple(entry) } {
+                        return Err(crate::PyError::type_error(
+                            "posix_spawn: each file_actions entry must be a tuple",
+                        ));
+                    }
+                    let tlen = unsafe { pyre_object::w_tuple_len(entry) };
+                    if tlen < 2 {
+                        return Err(crate::PyError::value_error(
+                            "posix_spawn: file_actions entry too short",
+                        ));
+                    }
+                    let op = (unsafe {
+                        pyre_object::w_int_get_value(
+                            pyre_object::w_tuple_getitem(entry, 0).unwrap(),
+                        )
+                    }) as i32;
+                    match op {
+                        0 => {
+                            // POSIX_SPAWN_OPEN: (op, fd, path, flags, mode)
+                            if tlen < 5 {
+                                return Err(crate::PyError::value_error(
+                                    "posix_spawn: OPEN action requires fd, path, flags, mode",
+                                ));
+                            }
+                            let fd = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 1).unwrap(),
+                                )
+                            }) as i32;
+                            let path_obj = unsafe {
+                                pyre_object::w_tuple_getitem(entry, 2).unwrap()
+                            };
+                            let path_str = extract_path(path_obj)?;
+                            let cpath = std::ffi::CString::new(path_str.as_bytes()).map_err(|_| {
+                                crate::PyError::value_error(
+                                    "posix_spawn: embedded null in OPEN path",
+                                )
+                            })?;
+                            let oflag = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 3).unwrap(),
+                                )
+                            }) as i32;
+                            let mode = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 4).unwrap(),
+                                )
+                            }) as u32;
+                            out.push(PosixSpawnFileAction::Open {
+                                fd,
+                                path: cpath,
+                                oflag,
+                                mode,
+                            });
+                        }
+                        1 => {
+                            // POSIX_SPAWN_CLOSE: (op, fd)
+                            let fd = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 1).unwrap(),
+                                )
+                            }) as i32;
+                            out.push(PosixSpawnFileAction::Close { fd });
+                        }
+                        2 => {
+                            // POSIX_SPAWN_DUP2: (op, fd, newfd)
+                            if tlen < 3 {
+                                return Err(crate::PyError::value_error(
+                                    "posix_spawn: DUP2 action requires fd, newfd",
+                                ));
+                            }
+                            let fd = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 1).unwrap(),
+                                )
+                            }) as i32;
+                            let newfd = (unsafe {
+                                pyre_object::w_int_get_value(
+                                    pyre_object::w_tuple_getitem(entry, 2).unwrap(),
+                                )
+                            }) as i32;
+                            out.push(PosixSpawnFileAction::Dup2 { fd, newfd });
+                        }
+                        _ => {
+                            return Err(crate::PyError::value_error(
+                                "posix_spawn: unknown file_actions opcode",
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            crate::dict_storage_store(
+                ns,
+                "posix_spawn",
+                crate::make_builtin_function("posix_spawn", |args| build_posix_spawn(args, false)),
+            );
+            crate::dict_storage_store(
+                ns,
+                "posix_spawnp",
+                crate::make_builtin_function("posix_spawnp", |args| build_posix_spawn(args, true)),
+            );
+            crate::dict_storage_store(ns, "POSIX_SPAWN_OPEN", pyre_object::w_int_new(0));
+            crate::dict_storage_store(ns, "POSIX_SPAWN_CLOSE", pyre_object::w_int_new(1));
+            crate::dict_storage_store(ns, "POSIX_SPAWN_DUP2", pyre_object::w_int_new(2));
+        }
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
