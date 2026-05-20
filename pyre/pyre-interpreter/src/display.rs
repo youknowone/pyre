@@ -467,8 +467,13 @@ unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> Result<i64, String> {
             // least visible.
             return Err("None".to_string());
         }
-        if pyre_object::is_int(stored) {
-            return Ok(pyre_object::w_int_get_value(stored));
+        // `int_w` walks the __int__/__index__ protocol, so int
+        // subclasses with stored intval (`class MyInt(int): pass`,
+        // `True`/`False`) and any object implementing __index__ all
+        // resolve to the numeric value — matching PyPy's
+        // `"%d" % value` semantics.
+        if let Ok(v) = crate::baseobjspace::int_w(stored) {
+            return Ok(v);
         }
         Err(py_str(stored))
     }

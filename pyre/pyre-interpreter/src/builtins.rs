@@ -1504,15 +1504,17 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
         // `space.newbytes` coerce buffer-protocol producers
         // (`bytearray`, exact `bytes`, and `bytes` subclasses) to a
-        // canonical `bytes`.  Pyre handles the two concrete cases
-        // pyre's interpreter exposes: `bytearray` → fresh `bytes`
-        // copy, anything else (which `isinstance_bytes_like_w`
-        // already gated to `bytes`-tagged objects) is stored as-is.
-        let w_object = if pyre_object::bytearrayobject::is_bytearray(w_object_in) {
+        // canonical `bytes`.  Exact `bytes` already IS the canonical
+        // shape; bytearray and `bytes` subclasses (`class
+        // MyBytes(bytes): pass`) are funneled through
+        // `w_bytes_from_bytes(bytes_like_data(...))` so `e.object`
+        // always holds a canonical `bytes` regardless of the input
+        // shape.
+        let w_object = if pyre_object::is_bytes(w_object_in) {
+            w_object_in
+        } else {
             let data = pyre_object::bytes_like_data(w_object_in);
             pyre_object::w_bytes_from_bytes(data)
-        } else {
-            w_object_in
         };
         pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
         pyre_object::excobject::w_exception_set_object(w_self, w_object);
