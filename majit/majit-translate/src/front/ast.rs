@@ -3933,6 +3933,9 @@ fn build_function_graph(
     let previous = CURRENT_LOWERING_FN_NAME.with(|c| c.borrow_mut().replace(fn_name.clone()));
     let _restore_fn = LoweringFnNameGuard { previous };
     let mut graph = FunctionGraph::new(fn_name);
+    if let Some(owner) = &self_ty_root {
+        graph.owner_root = Some(owner.clone());
+    }
     let mut entry = graph.startblock;
     let mut ctx = GraphBuildContext::new(
         struct_fields,

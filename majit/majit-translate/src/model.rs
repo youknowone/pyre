@@ -2590,6 +2590,17 @@ fn ptr_gckind(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
+    /// Impl-block self-type root for graphs produced from `impl <T> { fn m(&self, ...) }`.
+    /// Mirrors PyPy's `graph.func.im_class` access (the bound-method's class
+    /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
+    /// at `description.py:283-305 FunctionDesc.pycall`, then the rtyper resolves
+    /// `self.<field>` against that ClassDef.  Pyre's per-graph
+    /// `derive_subject_inputcells` (`flowspace_adapter.rs:1388`) uses this field
+    /// to project the receiver inputarg as `SomeInstance(Some(classdef))` instead
+    /// of the abstract `SomeInstance(None)` shell that `valuetype_to_someshell(Ref)`
+    /// yields when no class hint is available.  `None` for free functions and
+    /// synthetic test-fixture graphs.
+    pub owner_root: Option<String>,
     pub startblock: BlockId,
     /// RPython `flowspace/model.py:17-18 FunctionGraph.returnblock` —
     /// `Block([return_var])` with `operations=()` and `exits=()`.
@@ -2742,6 +2753,7 @@ impl FunctionGraph {
             variable_to_vid,
             return_type: None,
             source_module: None,
+            owner_root: None,
         }
     }
 
@@ -2764,6 +2776,17 @@ impl FunctionGraph {
     /// resolution (`flowspace_adapter.rs::translate_op` Layer 3).
     pub fn with_source_module(mut self, mp: impl Into<String>) -> Self {
         self.source_module = Some(mp.into());
+        self
+    }
+
+    /// Builder-style setter for `owner_root` — the impl-block self-type
+    /// root for graphs produced from `impl <T> { fn m(&self, ...) }`.
+    /// Front-end production paths set this from `impl_block.self_ty`
+    /// (`front/ast.rs::build_function_graph` callers pass `self_ty_root`);
+    /// `derive_subject_inputcells` consults it to project the receiver
+    /// inputarg as `SomeInstance(Some(getuniqueclassdef(im_class)))`.
+    pub fn with_owner_root(mut self, owner: impl Into<String>) -> Self {
+        self.owner_root = Some(owner.into());
         self
     }
 
