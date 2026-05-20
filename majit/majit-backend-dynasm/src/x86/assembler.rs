@@ -716,6 +716,14 @@ pub struct Assembler386<'a> {
     /// jf_force_descr before the call. Consumed by the subsequent
     /// GUARD_NOT_FORCED guard emission.
     pending_force_descr: Option<majit_ir::DescrRef>,
+    /// Pre-wrapped `FailDescrCell` for the same pending guard.  Codegen
+    /// bakes the cell's thin pointer into `JF_FORCE_DESCR_OFS` so that
+    /// `force_token_to_dead_frame` (cranelift/compiler.rs:2660) can
+    /// recover the descr via `recover_fail_descr_cell` without the
+    /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
+    /// The same cell is consumed by `append_guard_token_with_faillocs`
+    /// so jf_force_descr and jf_descr resolve to the same identity.
+    pending_force_cell: Option<std::sync::Arc<majit_ir::FailDescrCell>>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -887,6 +895,7 @@ impl<'a> Assembler386<'a> {
                 gcmap
             },
             pending_force_descr: None,
+            pending_force_cell: None,
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
@@ -3887,9 +3896,8 @@ impl<'a> Assembler386<'a> {
                 // and `handle_fail_exit_frame_with_exception` match by
                 // ptr-equality on the singleton, so the cell only carries
                 // the keep-alive identity for `clt.asmmemmgr_gcreftracers`.
-                self.fail_descrs.push(majit_ir::FailDescrCell::wrap(
-                    descr.clone() as majit_ir::DescrRef
-                ));
+                self.fail_descrs
+                    .push(majit_ir::FailDescrCell::wrap(descr.clone()));
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -4897,7 +4905,14 @@ impl<'a> Assembler386<'a> {
         }
         let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);
 
-        let cell = majit_ir::FailDescrCell::wrap(descr.clone() as majit_ir::DescrRef);
+        // Reuse the cell pre-allocated by `_store_force_index_if_next_guard`
+        // when this guard is paired with a CALL_ASSEMBLER's force-store —
+        // jf_force_descr and jf_descr then resolve to the same cell, and
+        // `fail_descrs[fail_index]` carries exactly one entry per guard.
+        let cell = self
+            .pending_force_cell
+            .take()
+            .unwrap_or_else(|| majit_ir::FailDescrCell::wrap(descr.clone()));
         self.pending_guard_tokens.push(GuardToken {
             jump_offset: self.mc.offset(),
             fail_label,
@@ -5588,8 +5603,16 @@ impl<'a> Assembler386<'a> {
             }
             fresh
         };
-        let descr_ptr = Arc::as_ptr(&descr) as *const () as i64;
+        // `force_token_to_dead_frame` (cranelift/compiler.rs:2660)
+        // recovers `jf_force_descr` via `recover_fail_descr_cell`, which
+        // requires a `FailDescrCell` thin pointer.  Bake the cell pointer
+        // here (not the bare `Arc<dyn Descr>` fat-pointer data half) and
+        // hand the cell off to `append_guard_token_with_faillocs` so the
+        // inline guard-exit path bakes the same identity into jf_descr.
+        let cell = majit_ir::FailDescrCell::wrap(descr.clone());
+        let descr_ptr = Arc::as_ptr(&cell) as *const () as i64;
         self.pending_force_descr = Some(descr);
+        self.pending_force_cell = Some(cell);
 
         // x86/assembler.py:2210-2222: store descr to jf_force_descr,
         // zero jf_descr.
@@ -5880,9 +5903,8 @@ impl<'a> Assembler386<'a> {
 
         // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
         // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs.push(majit_ir::FailDescrCell::wrap(
-            descr.clone() as majit_ir::DescrRef
-        ));
+        self.fail_descrs
+            .push(majit_ir::FailDescrCell::wrap(descr.clone()));
     }
 
     // ----------------------------------------------------------------

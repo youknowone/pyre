@@ -785,6 +785,13 @@ impl DynasmBackend {
     /// Scans `token.asmmemmgr_blocks` for a `CompiledCode` whose `source_guard`
     /// matches; returns `0` if none — `assembler.py` treats `adr_jump_offset == 0`
     /// uniformly as "patched / no entry".
+    ///
+    /// `asmmemmgr_blocks` is append-only, so retracing the same guard
+    /// leaves multiple matching bridges in place.  Walk in reverse to
+    /// return the most recently compiled bridge — that is the one
+    /// `store_bridge_guard_hashes` / `compiled_bridge_fail_descr_layouts`
+    /// just wrote against and the one subsequent guard failures should
+    /// dispatch into.
     pub fn lookup_bridge_addr(
         &self,
         token: &JitCellToken,
@@ -792,7 +799,7 @@ impl DynasmBackend {
         source_fail_index: u32,
     ) -> usize {
         let blocks = token.asmmemmgr_blocks();
-        for block in blocks.iter() {
+        for block in blocks.iter().rev() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.source_guard == Some((source_trace_id, source_fail_index)) {
                     return codebuf::buffer_ptr(&bridge.buffer) as usize;
@@ -1400,6 +1407,16 @@ impl DynasmBackend {
         // through `Arc::from_raw` against the `FailDescrCell` wrapper that
         // `register_fail_descrs` pinned onto the owning CLT's
         // `asmmemmgr_gcreftracers`.
+        //
+        // A 0 `ptr` here means the JIT-baked code never wrote `jf_descr`
+        // (e.g. a force-token flow that bypassed both
+        // `_store_force_index_if_next_guard` and the inline guard-exit
+        // stub).  `Arc::from_raw(0)` is UB; refuse to recover and surface
+        // the producer-side defect.
+        assert_ne!(
+            ptr, 0,
+            "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
+        );
         let cell = unsafe { majit_ir::recover_fail_descr_cell(ptr) };
         cell.descr.clone()
     }
@@ -2279,7 +2296,18 @@ impl Backend for DynasmBackend {
     /// address would be UB, but the JIT-emitted code holding the address
     /// is also retired when its CLT drops, so no live caller can reach a
     /// stale `descr_addr`.
-    fn free_loop(&mut self, _token: &JitCellToken) {}
+    ///
+    /// `compile_loop` inserts the token into `CALL_ASSEMBLER_TARGETS`
+    /// (`runner.rs:1578`) and that map stores a strong
+    /// `Arc<CompiledLoopToken>`; without removal here the CLT — and the
+    /// fail-descr cells it pins — would live for the entire process
+    /// lifetime.  Drop the entry so the Arc chain unwinds.
+    fn free_loop(&mut self, token: &JitCellToken) {
+        CALL_ASSEMBLER_TARGETS
+            .lock()
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .remove(&token.number);
+    }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // `history.py:109-114 AbstractDescr.show(cpu, descr_gcref) =

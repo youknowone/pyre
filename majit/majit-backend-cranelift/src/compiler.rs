@@ -3424,7 +3424,10 @@ fn call_assembler_shim_inner(
         // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`
         // which requires a `FailDescrCell` thin pointer.  Use the
         // position-aligned cell from `target.fail_descr_cells`; fall back
-        // to a fresh wrap when the index is out-of-bounds (synthetic).
+        // to a fresh wrap when only `fail_descrs` carries the descr.
+        // Both lookups must succeed — `recover_fail_descr_cell(0)` is UB,
+        // so an out-of-range `fail_index` here would corrupt the BH-side
+        // address recovery silently.
         let bh_cell;
         let descr_addr = if let Some(cell) = target.fail_descr_cells.get(fail_index as usize) {
             Arc::as_ptr(cell) as *const () as usize
@@ -3432,7 +3435,13 @@ fn call_assembler_shim_inner(
             bh_cell = majit_ir::FailDescrCell::wrap(fail_descr_arc.clone());
             Arc::as_ptr(&bh_cell) as *const () as usize
         } else {
-            0
+            panic!(
+                "call_assembler BH dispatch: fail_index {} out of range \
+                 (fail_descr_cells.len()={}, fail_descrs.len()={})",
+                fail_index,
+                target.fail_descr_cells.len(),
+                target.fail_descrs.len()
+            );
         };
         if let Some(result) = bh_fn(
             descr_addr,
@@ -6400,10 +6409,9 @@ fn find_fail_descr_in_fail_descrs(
 ///   the owning `CompiledLoop::fail_descr_cells`).
 /// * FINISH emissions bake the metainterp `AbstractFailDescr` Arc's
 ///   data pointer (singleton `DoneWithThisFrame*` /
-///   `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr`).
-///   The caller (`run_compiled_code_inner`) handles attached
-///   metainterp singletons via `match_metainterp_finish_descr` before
-///   reaching this fallback.
+///   `ExitFrameWithExceptionDescrRef`).  The caller
+///   (`run_compiled_code_inner`) handles attached metainterp singletons
+///   via `match_metainterp_finish_descr` before reaching this fallback.
 /// * Backend-only test paths bypass `MetaInterp::attach_descrs_to_cpu`,
 ///   so the FINISH bake falls back to the cranelift-local LazyLock
 ///   singletons via `attached_descr_ptrs_with_fallbacks`.  We MUST
@@ -6411,7 +6419,21 @@ fn find_fail_descr_in_fail_descrs(
 ///   because the LazyLock addresses are bare `Arc<dyn Descr>` data
 ///   pointers, not `FailDescrCell` thin pointers — feeding them to
 ///   `Arc::from_raw` as cells is undefined behavior.
-fn find_fail_descr_by_ptr(_fail_descrs: &[DescrRef], descr_ptr: usize) -> Option<DescrRef> {
+/// * The propagate-exception singleton (`pyjitpl.py:2283
+///   self.cpu.propagate_exception_descr = exc_descr`) is per-cpu
+///   (no cl-local LazyLock fallback).  `run_compiled_code_inner`
+///   rewrites a propagate-pointer in jf_descr to the attached
+///   ExitFrameWithExceptionDescrRef before reaching this lookup
+///   (see line ~6644), but match it here too so any future bake site
+///   that leaves the propagate Arc data pointer in jf_descr cannot
+///   reach `recover_fail_descr_cell` — feeding the metainterp's bare
+///   `Arc<PropagateExceptionDescr>` data pointer to `Arc::from_raw`
+///   as a `FailDescrCell` would be undefined behavior.
+fn find_fail_descr_by_ptr(
+    _fail_descrs: &[DescrRef],
+    descr_ptr: usize,
+    propagate_exception_descr: Option<&DescrRef>,
+) -> Option<DescrRef> {
     if descr_ptr == 0 {
         return None;
     }
@@ -6424,6 +6446,11 @@ fn find_fail_descr_by_ptr(_fail_descrs: &[DescrRef], descr_ptr: usize) -> Option
     ] {
         if Arc::as_ptr(global) as *const () as usize == descr_ptr {
             return Some(global.clone());
+        }
+    }
+    if let Some(propagate) = propagate_exception_descr {
+        if Arc::as_ptr(propagate) as *const () as usize == descr_ptr {
+            return Some(propagate.clone());
         }
     }
     let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_ptr) };
@@ -6712,7 +6739,11 @@ fn run_compiled_code_inner(
         // the resolved Arc via the FailDescr trait — never dereference
         // the raw pointer as a concrete type, since the meta side can
         // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
-        let arc = find_fail_descr_by_ptr(fail_descrs, jf_descr_raw as usize);
+        let arc = find_fail_descr_by_ptr(
+            fail_descrs,
+            jf_descr_raw as usize,
+            attachments.propagate_exception_descr.as_ref(),
+        );
         let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
         // compile.py:665-674 parity: done_with_this_frame_descr is a
         // global singleton — it won't appear in per-trace fail_descrs.
