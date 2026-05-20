@@ -30,7 +30,7 @@ pub use majit_translate::liveness::{
 ///     remove_repeated_live(ssarepr)
 /// ```
 pub fn compute_liveness(ssarepr: &mut SSARepr) {
-    let _ = compute_liveness_with_remap_internal(ssarepr, None);
+    let _ = compute_liveness_with_remap_internal(ssarepr);
 }
 
 /// pyre walker bridge — resolves the post-merge SSARepr index of each
@@ -57,26 +57,22 @@ pub(super) fn compute_liveness_with_pc_anchors(
     ssarepr: &mut SSARepr,
     walker_tracked_pc_live_indices: &[usize],
 ) -> Vec<usize> {
-    let mut protected: Vec<bool> = vec![false; ssarepr.insns.len()];
-    for &idx in walker_tracked_pc_live_indices {
-        if let Some(slot) = protected.get_mut(idx) {
-            *slot = true;
-        }
-    }
-    let remap = compute_liveness_with_remap_internal(ssarepr, Some(protected.as_slice()));
+    // `remove_repeated_live` folds adjacent `-live-` markers freely,
+    // matching upstream `liveness.py` semantics.  Multiple Python PCs
+    // may share a post-merge marker index; `filter_liveness_in_place`
+    // groups PCs by `insn_idx` and writes the UNION of per-PC narrowed
+    // sets, so per-PC pc_map dispatch reads a conservative superset.
+    let remap = compute_liveness_with_remap_internal(ssarepr);
     walker_tracked_pc_live_indices
         .iter()
         .map(|&old| remap[old])
         .collect()
 }
 
-fn compute_liveness_with_remap_internal(
-    ssarepr: &mut SSARepr,
-    protected_per_pc_live: Option<&[bool]>,
-) -> Vec<usize> {
+fn compute_liveness_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize> {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
-    remove_repeated_live_with_remap_internal(ssarepr, protected_per_pc_live)
+    remove_repeated_live_with_remap_internal(ssarepr)
 }
 
 /// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
@@ -292,39 +288,21 @@ impl LiveItem {
 /// `Label` markers) into a single `-live-` whose arguments are the union
 /// of all collapsed markers.
 pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
-    let _ = remove_repeated_live_with_remap_internal(ssarepr, None);
+    let _ = remove_repeated_live_with_remap_internal(ssarepr);
 }
 
-/// Internal `remove_repeated_live` variant taking an optional
-/// per-position protection bitmap and returning a position remap.
-///
-/// `protected_per_pc_live[i] = true` prevents the `-live-` marker at
-/// SSARepr index `i` from being folded into a preceding run.  Used
-/// by `compute_liveness_with_pc_anchors` to break the merge at every
-/// Python PC boundary so each PC retains its own `-live-` for
-/// `pc_map` resolution.
+/// Internal `remove_repeated_live` variant returning a position remap.
 ///
 /// `remap[old_idx] = new_idx`: indices that survived map to their
 /// rebuilt position; indices folded into a preceding `-live-` map to
-/// the surviving marker's new index.
-///
-/// Slated for retirement alongside `compute_liveness_with_pc_anchors`
-/// once Phase 4's canonical-driver flip routes through orthodox
-/// `flatten.py:106-128` per-block `-live-` emission (Task #124.B/C).
-fn remove_repeated_live_with_remap_internal(
-    ssarepr: &mut SSARepr,
-    protected_per_pc_live: Option<&[bool]>,
-) -> Vec<usize> {
+/// the surviving marker's new index.  The remap is consumed by
+/// `compute_liveness_with_pc_anchors` to resolve each Python PC's
+/// post-merge marker offset for `pc_map` dispatch.
+fn remove_repeated_live_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize> {
     // `liveness.py:83-85` `last_i_pos = None; i = 0; res = []`.
     let mut res: Vec<Insn> = Vec::with_capacity(ssarepr.insns.len());
     let mut remap: Vec<usize> = vec![0usize; ssarepr.insns.len()];
     let mut i = 0usize;
-
-    let is_protected = |idx: usize| -> bool {
-        protected_per_pc_live
-            .and_then(|p| p.get(idx).copied())
-            .unwrap_or(false)
-    };
 
     while i < ssarepr.insns.len() {
         // `liveness.py:87` `insn = ssarepr.insns[i]`.
@@ -344,20 +322,9 @@ fn remove_repeated_live_with_remap_internal(
         let mut live_old_positions: Vec<usize> = vec![i - 1];
 
         // `liveness.py:97-106` inner loop.
-        //
-        // `protected_per_pc_live[i]` breaks the merge at walker-recorded
-        // per-PC `-live-` positions so each Python PC retains its own
-        // `-live-` marker (the walker-tracked side-table populates the
-        // bitmap; `filter_liveness_in_place` is the sole production
-        // caller and always supplies it).  Block-identity /
-        // catch-landing / link-target labels keep merging per upstream
-        // `liveness.py:99-100`.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
-                if is_protected(i) {
-                    break;
-                }
                 live_old_positions.push(i);
                 lives.push(next);
                 i += 1;
