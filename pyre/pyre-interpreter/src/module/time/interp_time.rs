@@ -188,8 +188,7 @@ type time_t = i64;
 
 #[cfg(feature = "host_env")]
 fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
-    host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
-        .map(|tm| libc_tm_to_c_tm(&tm))
+    host_time::gmtime_from_timestamp(seconds as host_time::TimeT).map(|tm| libc_tm_to_c_tm(&tm))
 }
 
 #[cfg(not(feature = "host_env"))]
@@ -199,8 +198,7 @@ fn _c_gmtime(_seconds: time_t) -> Option<c_tm> {
 
 #[cfg(feature = "host_env")]
 fn _c_localtime(seconds: time_t) -> Option<c_tm> {
-    host_time::localtime_from_timestamp(seconds as host_time::TimeT)
-        .map(|tm| libc_tm_to_c_tm(&tm))
+    host_time::localtime_from_timestamp(seconds as host_time::TimeT).map(|tm| libc_tm_to_c_tm(&tm))
 }
 
 #[cfg(not(feature = "host_env"))]

@@ -875,12 +875,32 @@ fn init_locale(ns: &mut DictStorage) {
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     #[cfg(unix)]
     {
-        crate::dict_storage_store(ns, "LC_CTYPE", pyre_object::w_int_new(libc::LC_CTYPE as i64));
-        crate::dict_storage_store(ns, "LC_NUMERIC", pyre_object::w_int_new(libc::LC_NUMERIC as i64));
+        crate::dict_storage_store(
+            ns,
+            "LC_CTYPE",
+            pyre_object::w_int_new(libc::LC_CTYPE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LC_NUMERIC",
+            pyre_object::w_int_new(libc::LC_NUMERIC as i64),
+        );
         crate::dict_storage_store(ns, "LC_TIME", pyre_object::w_int_new(libc::LC_TIME as i64));
-        crate::dict_storage_store(ns, "LC_COLLATE", pyre_object::w_int_new(libc::LC_COLLATE as i64));
-        crate::dict_storage_store(ns, "LC_MONETARY", pyre_object::w_int_new(libc::LC_MONETARY as i64));
-        crate::dict_storage_store(ns, "LC_MESSAGES", pyre_object::w_int_new(libc::LC_MESSAGES as i64));
+        crate::dict_storage_store(
+            ns,
+            "LC_COLLATE",
+            pyre_object::w_int_new(libc::LC_COLLATE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LC_MONETARY",
+            pyre_object::w_int_new(libc::LC_MONETARY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LC_MESSAGES",
+            pyre_object::w_int_new(libc::LC_MESSAGES as i64),
+        );
         crate::dict_storage_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
     }
     #[cfg(not(unix))]
@@ -894,7 +914,10 @@ fn init_locale(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "LC_ALL", pyre_object::w_int_new(6));
     }
     crate::dict_storage_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
-    #[cfg(all(unix, not(any(target_os = "ios", target_os = "android", target_os = "redox"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    ))]
     {
         crate::dict_storage_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
     }
@@ -991,23 +1014,20 @@ fn init_locale(ns: &mut DictStorage) {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "setlocale() missing category",
-                    ));
+                    return Err(crate::PyError::type_error("setlocale() missing category"));
                 }
                 let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                let locale_str: Option<String> = if args.len() >= 2
-                    && !unsafe { pyre_object::is_none(args[1]) }
-                {
-                    if !unsafe { pyre_object::is_str(args[1]) } {
-                        return Err(crate::PyError::type_error(
-                            "setlocale: locale must be a string or None",
-                        ));
-                    }
-                    Some(unsafe { pyre_object::w_str_get_value(args[1]).to_string() })
-                } else {
-                    None
-                };
+                let locale_str: Option<String> =
+                    if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
+                        if !unsafe { pyre_object::is_str(args[1]) } {
+                            return Err(crate::PyError::type_error(
+                                "setlocale: locale must be a string or None",
+                            ));
+                        }
+                        Some(unsafe { pyre_object::w_str_get_value(args[1]).to_string() })
+                    } else {
+                        None
+                    };
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())
@@ -1017,9 +1037,7 @@ fn init_locale(ns: &mut DictStorage) {
                 };
                 let out = rustpython_host_env::locale::setlocale(cat, c_locale.as_deref());
                 match out {
-                    Some(bytes) => Ok(pyre_object::w_str_new(
-                        &String::from_utf8_lossy(&bytes),
-                    )),
+                    Some(bytes) => Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes))),
                     None => Err(crate::PyError::os_error("setlocale failed")),
                 }
             }
@@ -1036,11 +1054,11 @@ fn init_locale(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "nl_langinfo",
             |args| {
-                #[cfg(all(unix, feature = "host_env", not(any(
-                    target_os = "ios",
-                    target_os = "android",
-                    target_os = "redox"
-                ))))]
+                #[cfg(all(
+                    unix,
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                ))]
                 {
                     let item = if args.is_empty() {
                         libc::CODESET
@@ -1048,12 +1066,8 @@ fn init_locale(ns: &mut DictStorage) {
                         (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::nl_item
                     };
                     if item == libc::CODESET {
-                        if let Some(bytes) =
-                            rustpython_host_env::locale::nl_langinfo_codeset()
-                        {
-                            return Ok(pyre_object::w_str_new(
-                                &String::from_utf8_lossy(&bytes),
-                            ));
+                        if let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset() {
+                            return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes)));
                         }
                     }
                     let p = unsafe { libc::nl_langinfo(item) };
@@ -1063,11 +1077,11 @@ fn init_locale(ns: &mut DictStorage) {
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
                     return Ok(pyre_object::w_str_new(&s.to_string_lossy()));
                 }
-                #[cfg(not(all(unix, feature = "host_env", not(any(
-                    target_os = "ios",
-                    target_os = "android",
-                    target_os = "redox"
-                )))))]
+                #[cfg(not(all(
+                    unix,
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                )))]
                 {
                     let _ = args;
                     Ok(pyre_object::w_str_new(""))
@@ -1085,9 +1099,7 @@ fn init_locale(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2
-                        || !unsafe {
-                            pyre_object::is_str(args[0]) && pyre_object::is_str(args[1])
-                        }
+                        || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
                     {
                         return Err(crate::PyError::type_error(
                             "strcoll: arguments must be strings",
@@ -1226,10 +1238,12 @@ fn init_pwd(ns: &mut DictStorage) {
                                 uid
                             )));
                         }
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getpwuid: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getpwuid: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1335,10 +1349,12 @@ fn init_grp(ns: &mut DictStorage) {
                                 gid
                             )));
                         }
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getgrgid: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getgrgid: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1372,10 +1388,12 @@ fn init_grp(ns: &mut DictStorage) {
                                 name
                             )));
                         }
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getgrnam: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getgrnam: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1455,10 +1473,12 @@ fn init_resource(ns: &mut DictStorage) {
                     };
                     match rustpython_host_env::resource::getrusage(who) {
                         Ok(r) => return Ok(make_struct_rusage(&r)),
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getrusage: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getrusage: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1498,10 +1518,12 @@ fn init_resource(ns: &mut DictStorage) {
                                 pyre_object::w_int_new(rl.rlim_max as i64),
                             ]));
                         }
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getrlimit: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getrlimit: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1524,7 +1546,9 @@ fn init_resource(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error("setrlimit() requires 2 arguments"));
+                        return Err(crate::PyError::type_error(
+                            "setrlimit() requires 2 arguments",
+                        ));
                     }
                     let res = unsafe {
                         if !pyre_object::is_int(args[0]) {
@@ -1536,7 +1560,8 @@ fn init_resource(ns: &mut DictStorage) {
                     };
                     // limits is a 2-tuple (soft, hard).
                     let (soft, hard) = unsafe {
-                        if !pyre_object::is_tuple(args[1]) || pyre_object::w_tuple_len(args[1]) != 2 {
+                        if !pyre_object::is_tuple(args[1]) || pyre_object::w_tuple_len(args[1]) != 2
+                        {
                             return Err(crate::PyError::type_error(
                                 "setrlimit(): limits should be a tuple of (soft, hard)",
                             ));
@@ -1548,13 +1573,18 @@ fn init_resource(ns: &mut DictStorage) {
                             pyre_object::w_int_get_value(h) as libc::rlim_t,
                         )
                     };
-                    let rl = libc::rlimit { rlim_cur: soft, rlim_max: hard };
+                    let rl = libc::rlimit {
+                        rlim_cur: soft,
+                        rlim_max: hard,
+                    };
                     match rustpython_host_env::resource::setrlimit(res, rl) {
                         Ok(()) => return Ok(pyre_object::w_none()),
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("setrlimit: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("setrlimit: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -1571,20 +1601,72 @@ fn init_resource(ns: &mut DictStorage) {
     // ── Constants (POSIX subset matching CPython) ──
     #[cfg(unix)]
     {
-        crate::dict_storage_store(ns, "RUSAGE_SELF", pyre_object::w_int_new(libc::RUSAGE_SELF as i64));
-        crate::dict_storage_store(ns, "RUSAGE_CHILDREN", pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64));
-        crate::dict_storage_store(ns, "RLIMIT_CPU", pyre_object::w_int_new(libc::RLIMIT_CPU as i64));
-        crate::dict_storage_store(ns, "RLIMIT_FSIZE", pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64));
-        crate::dict_storage_store(ns, "RLIMIT_DATA", pyre_object::w_int_new(libc::RLIMIT_DATA as i64));
-        crate::dict_storage_store(ns, "RLIMIT_STACK", pyre_object::w_int_new(libc::RLIMIT_STACK as i64));
-        crate::dict_storage_store(ns, "RLIMIT_CORE", pyre_object::w_int_new(libc::RLIMIT_CORE as i64));
-        crate::dict_storage_store(ns, "RLIMIT_NOFILE", pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64));
-        crate::dict_storage_store(ns, "RLIMIT_AS", pyre_object::w_int_new(libc::RLIMIT_AS as i64));
-        crate::dict_storage_store(ns, "RLIMIT_RSS", pyre_object::w_int_new(libc::RLIMIT_RSS as i64));
-        crate::dict_storage_store(ns, "RLIMIT_NPROC", pyre_object::w_int_new(libc::RLIMIT_NPROC as i64));
-        crate::dict_storage_store(ns, "RLIMIT_MEMLOCK", pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64));
+        crate::dict_storage_store(
+            ns,
+            "RUSAGE_SELF",
+            pyre_object::w_int_new(libc::RUSAGE_SELF as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RUSAGE_CHILDREN",
+            pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_CPU",
+            pyre_object::w_int_new(libc::RLIMIT_CPU as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_FSIZE",
+            pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_DATA",
+            pyre_object::w_int_new(libc::RLIMIT_DATA as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_STACK",
+            pyre_object::w_int_new(libc::RLIMIT_STACK as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_CORE",
+            pyre_object::w_int_new(libc::RLIMIT_CORE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_NOFILE",
+            pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_AS",
+            pyre_object::w_int_new(libc::RLIMIT_AS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_RSS",
+            pyre_object::w_int_new(libc::RLIMIT_RSS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_NPROC",
+            pyre_object::w_int_new(libc::RLIMIT_NPROC as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RLIMIT_MEMLOCK",
+            pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64),
+        );
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        crate::dict_storage_store(ns, "RLIM_INFINITY", pyre_object::w_int_new(libc::RLIM_INFINITY as i64));
+        crate::dict_storage_store(
+            ns,
+            "RLIM_INFINITY",
+            pyre_object::w_int_new(libc::RLIM_INFINITY as i64),
+        );
     }
 }
 
@@ -1675,9 +1757,7 @@ fn init_fcntl(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "flock() requires 2 arguments",
-                        ));
+                        return Err(crate::PyError::type_error("flock() requires 2 arguments"));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -1730,12 +1810,12 @@ fn init_fcntl(ns: &mut DictStorage) {
                 };
                 match rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence) {
                     Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
-                    Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => Err(
-                        crate::PyError::value_error("lockf: invalid cmd"),
-                    ),
-                    Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => Err(
-                        crate::PyError::value_error(format!("lockf: overflow: {s}")),
-                    ),
+                    Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
+                        Err(crate::PyError::value_error("lockf: invalid cmd"))
+                    }
+                    Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => {
+                        Err(crate::PyError::value_error(format!("lockf: overflow: {s}")))
+                    }
                     Err(rustpython_host_env::fcntl::LockfError::Io(e)) => {
                         Err(crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
@@ -1763,11 +1843,19 @@ fn init_fcntl(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "F_DUPFD", pyre_object::w_int_new(libc::F_DUPFD as i64));
         crate::dict_storage_store(ns, "F_GETLK", pyre_object::w_int_new(libc::F_GETLK as i64));
         crate::dict_storage_store(ns, "F_SETLK", pyre_object::w_int_new(libc::F_SETLK as i64));
-        crate::dict_storage_store(ns, "F_SETLKW", pyre_object::w_int_new(libc::F_SETLKW as i64));
+        crate::dict_storage_store(
+            ns,
+            "F_SETLKW",
+            pyre_object::w_int_new(libc::F_SETLKW as i64),
+        );
         crate::dict_storage_store(ns, "F_RDLCK", pyre_object::w_int_new(libc::F_RDLCK as i64));
         crate::dict_storage_store(ns, "F_WRLCK", pyre_object::w_int_new(libc::F_WRLCK as i64));
         crate::dict_storage_store(ns, "F_UNLCK", pyre_object::w_int_new(libc::F_UNLCK as i64));
-        crate::dict_storage_store(ns, "FD_CLOEXEC", pyre_object::w_int_new(libc::FD_CLOEXEC as i64));
+        crate::dict_storage_store(
+            ns,
+            "FD_CLOEXEC",
+            pyre_object::w_int_new(libc::FD_CLOEXEC as i64),
+        );
         crate::dict_storage_store(ns, "LOCK_SH", pyre_object::w_int_new(libc::LOCK_SH as i64));
         crate::dict_storage_store(ns, "LOCK_EX", pyre_object::w_int_new(libc::LOCK_EX as i64));
         crate::dict_storage_store(ns, "LOCK_UN", pyre_object::w_int_new(libc::LOCK_UN as i64));
@@ -1897,37 +1985,149 @@ fn init_syslog(ns: &mut DictStorage) {
     // Priorities + facilities (POSIX subset matching CPython).
     #[cfg(unix)]
     {
-        crate::dict_storage_store(ns, "LOG_EMERG", pyre_object::w_int_new(libc::LOG_EMERG as i64));
-        crate::dict_storage_store(ns, "LOG_ALERT", pyre_object::w_int_new(libc::LOG_ALERT as i64));
-        crate::dict_storage_store(ns, "LOG_CRIT", pyre_object::w_int_new(libc::LOG_CRIT as i64));
+        crate::dict_storage_store(
+            ns,
+            "LOG_EMERG",
+            pyre_object::w_int_new(libc::LOG_EMERG as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_ALERT",
+            pyre_object::w_int_new(libc::LOG_ALERT as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_CRIT",
+            pyre_object::w_int_new(libc::LOG_CRIT as i64),
+        );
         crate::dict_storage_store(ns, "LOG_ERR", pyre_object::w_int_new(libc::LOG_ERR as i64));
-        crate::dict_storage_store(ns, "LOG_WARNING", pyre_object::w_int_new(libc::LOG_WARNING as i64));
-        crate::dict_storage_store(ns, "LOG_NOTICE", pyre_object::w_int_new(libc::LOG_NOTICE as i64));
-        crate::dict_storage_store(ns, "LOG_INFO", pyre_object::w_int_new(libc::LOG_INFO as i64));
-        crate::dict_storage_store(ns, "LOG_DEBUG", pyre_object::w_int_new(libc::LOG_DEBUG as i64));
+        crate::dict_storage_store(
+            ns,
+            "LOG_WARNING",
+            pyre_object::w_int_new(libc::LOG_WARNING as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_NOTICE",
+            pyre_object::w_int_new(libc::LOG_NOTICE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_INFO",
+            pyre_object::w_int_new(libc::LOG_INFO as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_DEBUG",
+            pyre_object::w_int_new(libc::LOG_DEBUG as i64),
+        );
         crate::dict_storage_store(ns, "LOG_PID", pyre_object::w_int_new(libc::LOG_PID as i64));
-        crate::dict_storage_store(ns, "LOG_CONS", pyre_object::w_int_new(libc::LOG_CONS as i64));
-        crate::dict_storage_store(ns, "LOG_NDELAY", pyre_object::w_int_new(libc::LOG_NDELAY as i64));
-        crate::dict_storage_store(ns, "LOG_NOWAIT", pyre_object::w_int_new(libc::LOG_NOWAIT as i64));
-        crate::dict_storage_store(ns, "LOG_PERROR", pyre_object::w_int_new(libc::LOG_PERROR as i64));
-        crate::dict_storage_store(ns, "LOG_KERN", pyre_object::w_int_new(libc::LOG_KERN as i64));
-        crate::dict_storage_store(ns, "LOG_USER", pyre_object::w_int_new(libc::LOG_USER as i64));
-        crate::dict_storage_store(ns, "LOG_MAIL", pyre_object::w_int_new(libc::LOG_MAIL as i64));
-        crate::dict_storage_store(ns, "LOG_DAEMON", pyre_object::w_int_new(libc::LOG_DAEMON as i64));
-        crate::dict_storage_store(ns, "LOG_AUTH", pyre_object::w_int_new(libc::LOG_AUTH as i64));
+        crate::dict_storage_store(
+            ns,
+            "LOG_CONS",
+            pyre_object::w_int_new(libc::LOG_CONS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_NDELAY",
+            pyre_object::w_int_new(libc::LOG_NDELAY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_NOWAIT",
+            pyre_object::w_int_new(libc::LOG_NOWAIT as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_PERROR",
+            pyre_object::w_int_new(libc::LOG_PERROR as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_KERN",
+            pyre_object::w_int_new(libc::LOG_KERN as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_USER",
+            pyre_object::w_int_new(libc::LOG_USER as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_MAIL",
+            pyre_object::w_int_new(libc::LOG_MAIL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_DAEMON",
+            pyre_object::w_int_new(libc::LOG_DAEMON as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_AUTH",
+            pyre_object::w_int_new(libc::LOG_AUTH as i64),
+        );
         crate::dict_storage_store(ns, "LOG_LPR", pyre_object::w_int_new(libc::LOG_LPR as i64));
-        crate::dict_storage_store(ns, "LOG_NEWS", pyre_object::w_int_new(libc::LOG_NEWS as i64));
-        crate::dict_storage_store(ns, "LOG_UUCP", pyre_object::w_int_new(libc::LOG_UUCP as i64));
-        crate::dict_storage_store(ns, "LOG_CRON", pyre_object::w_int_new(libc::LOG_CRON as i64));
-        crate::dict_storage_store(ns, "LOG_SYSLOG", pyre_object::w_int_new(libc::LOG_SYSLOG as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL0", pyre_object::w_int_new(libc::LOG_LOCAL0 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL1", pyre_object::w_int_new(libc::LOG_LOCAL1 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL2", pyre_object::w_int_new(libc::LOG_LOCAL2 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL3", pyre_object::w_int_new(libc::LOG_LOCAL3 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL4", pyre_object::w_int_new(libc::LOG_LOCAL4 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL5", pyre_object::w_int_new(libc::LOG_LOCAL5 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL6", pyre_object::w_int_new(libc::LOG_LOCAL6 as i64));
-        crate::dict_storage_store(ns, "LOG_LOCAL7", pyre_object::w_int_new(libc::LOG_LOCAL7 as i64));
+        crate::dict_storage_store(
+            ns,
+            "LOG_NEWS",
+            pyre_object::w_int_new(libc::LOG_NEWS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_UUCP",
+            pyre_object::w_int_new(libc::LOG_UUCP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_CRON",
+            pyre_object::w_int_new(libc::LOG_CRON as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_SYSLOG",
+            pyre_object::w_int_new(libc::LOG_SYSLOG as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL0",
+            pyre_object::w_int_new(libc::LOG_LOCAL0 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL1",
+            pyre_object::w_int_new(libc::LOG_LOCAL1 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL2",
+            pyre_object::w_int_new(libc::LOG_LOCAL2 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL3",
+            pyre_object::w_int_new(libc::LOG_LOCAL3 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL4",
+            pyre_object::w_int_new(libc::LOG_LOCAL4 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL5",
+            pyre_object::w_int_new(libc::LOG_LOCAL5 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL6",
+            pyre_object::w_int_new(libc::LOG_LOCAL6 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "LOG_LOCAL7",
+            pyre_object::w_int_new(libc::LOG_LOCAL7 as i64),
+        );
     }
 }
 
@@ -1953,7 +2153,9 @@ fn init_select(ns: &mut DictStorage) {
                     ));
                 }
 
-                fn collect_fds(seq: pyre_object::PyObjectRef) -> Result<Vec<(pyre_object::PyObjectRef, i32)>, crate::PyError> {
+                fn collect_fds(
+                    seq: pyre_object::PyObjectRef,
+                ) -> Result<Vec<(pyre_object::PyObjectRef, i32)>, crate::PyError> {
                     unsafe {
                         let is_list = pyre_object::is_list(seq);
                         let is_tuple = pyre_object::is_tuple(seq);
@@ -1974,7 +2176,9 @@ fn init_select(ns: &mut DictStorage) {
                             } else {
                                 pyre_object::w_tuple_getitem(seq, i as i64)
                             }
-                            .ok_or_else(|| crate::PyError::value_error("select() sequence item missing"))?;
+                            .ok_or_else(|| {
+                                crate::PyError::value_error("select() sequence item missing")
+                            })?;
                             if !pyre_object::is_int(item) {
                                 return Err(crate::PyError::type_error(
                                     "argument must be an int, or have a fileno() method",
@@ -2278,9 +2482,7 @@ fn init_termios(ns: &mut DictStorage) {
             "tcdrain",
             |args| {
                 if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "tcdrain() requires 1 argument",
-                    ));
+                    return Err(crate::PyError::type_error("tcdrain() requires 1 argument"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 host_termios::tcdrain(fd).map_err(|e| {
@@ -2302,9 +2504,7 @@ fn init_termios(ns: &mut DictStorage) {
             "tcflush",
             |args| {
                 if args.len() < 2 {
-                    return Err(crate::PyError::type_error(
-                        "tcflush() requires 2 arguments",
-                    ));
+                    return Err(crate::PyError::type_error("tcflush() requires 2 arguments"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let q = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -2327,9 +2527,7 @@ fn init_termios(ns: &mut DictStorage) {
             "tcflow",
             |args| {
                 if args.len() < 2 {
-                    return Err(crate::PyError::type_error(
-                        "tcflow() requires 2 arguments",
-                    ));
+                    return Err(crate::PyError::type_error("tcflow() requires 2 arguments"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let action = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -2349,83 +2547,363 @@ fn init_termios(ns: &mut DictStorage) {
     crate::dict_storage_store(ns, "B0", pyre_object::w_int_new(host_termios::B0 as i64));
     crate::dict_storage_store(ns, "B50", pyre_object::w_int_new(host_termios::B50 as i64));
     crate::dict_storage_store(ns, "B75", pyre_object::w_int_new(host_termios::B75 as i64));
-    crate::dict_storage_store(ns, "B110", pyre_object::w_int_new(host_termios::B110 as i64));
-    crate::dict_storage_store(ns, "B134", pyre_object::w_int_new(host_termios::B134 as i64));
-    crate::dict_storage_store(ns, "B150", pyre_object::w_int_new(host_termios::B150 as i64));
-    crate::dict_storage_store(ns, "B200", pyre_object::w_int_new(host_termios::B200 as i64));
-    crate::dict_storage_store(ns, "B300", pyre_object::w_int_new(host_termios::B300 as i64));
-    crate::dict_storage_store(ns, "B600", pyre_object::w_int_new(host_termios::B600 as i64));
-    crate::dict_storage_store(ns, "B1200", pyre_object::w_int_new(host_termios::B1200 as i64));
-    crate::dict_storage_store(ns, "B1800", pyre_object::w_int_new(host_termios::B1800 as i64));
-    crate::dict_storage_store(ns, "B2400", pyre_object::w_int_new(host_termios::B2400 as i64));
-    crate::dict_storage_store(ns, "B4800", pyre_object::w_int_new(host_termios::B4800 as i64));
-    crate::dict_storage_store(ns, "B9600", pyre_object::w_int_new(host_termios::B9600 as i64));
-    crate::dict_storage_store(ns, "B19200", pyre_object::w_int_new(host_termios::B19200 as i64));
-    crate::dict_storage_store(ns, "B38400", pyre_object::w_int_new(host_termios::B38400 as i64));
-    crate::dict_storage_store(ns, "B57600", pyre_object::w_int_new(host_termios::B57600 as i64));
-    crate::dict_storage_store(ns, "B115200", pyre_object::w_int_new(host_termios::B115200 as i64));
-    crate::dict_storage_store(ns, "B230400", pyre_object::w_int_new(host_termios::B230400 as i64));
+    crate::dict_storage_store(
+        ns,
+        "B110",
+        pyre_object::w_int_new(host_termios::B110 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B134",
+        pyre_object::w_int_new(host_termios::B134 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B150",
+        pyre_object::w_int_new(host_termios::B150 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B200",
+        pyre_object::w_int_new(host_termios::B200 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B300",
+        pyre_object::w_int_new(host_termios::B300 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B600",
+        pyre_object::w_int_new(host_termios::B600 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B1200",
+        pyre_object::w_int_new(host_termios::B1200 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B1800",
+        pyre_object::w_int_new(host_termios::B1800 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B2400",
+        pyre_object::w_int_new(host_termios::B2400 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B4800",
+        pyre_object::w_int_new(host_termios::B4800 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B9600",
+        pyre_object::w_int_new(host_termios::B9600 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B19200",
+        pyre_object::w_int_new(host_termios::B19200 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B38400",
+        pyre_object::w_int_new(host_termios::B38400 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B57600",
+        pyre_object::w_int_new(host_termios::B57600 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B115200",
+        pyre_object::w_int_new(host_termios::B115200 as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "B230400",
+        pyre_object::w_int_new(host_termios::B230400 as i64),
+    );
 
-    crate::dict_storage_store(ns, "BRKINT", pyre_object::w_int_new(host_termios::BRKINT as i64));
-    crate::dict_storage_store(ns, "CLOCAL", pyre_object::w_int_new(host_termios::CLOCAL as i64));
-    crate::dict_storage_store(ns, "CREAD", pyre_object::w_int_new(host_termios::CREAD as i64));
+    crate::dict_storage_store(
+        ns,
+        "BRKINT",
+        pyre_object::w_int_new(host_termios::BRKINT as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "CLOCAL",
+        pyre_object::w_int_new(host_termios::CLOCAL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "CREAD",
+        pyre_object::w_int_new(host_termios::CREAD as i64),
+    );
     crate::dict_storage_store(ns, "CS5", pyre_object::w_int_new(host_termios::CS5 as i64));
     crate::dict_storage_store(ns, "CS6", pyre_object::w_int_new(host_termios::CS6 as i64));
     crate::dict_storage_store(ns, "CS7", pyre_object::w_int_new(host_termios::CS7 as i64));
     crate::dict_storage_store(ns, "CS8", pyre_object::w_int_new(host_termios::CS8 as i64));
-    crate::dict_storage_store(ns, "CSIZE", pyre_object::w_int_new(host_termios::CSIZE as i64));
-    crate::dict_storage_store(ns, "CSTOPB", pyre_object::w_int_new(host_termios::CSTOPB as i64));
-    crate::dict_storage_store(ns, "ECHO", pyre_object::w_int_new(host_termios::ECHO as i64));
-    crate::dict_storage_store(ns, "ECHOE", pyre_object::w_int_new(host_termios::ECHOE as i64));
-    crate::dict_storage_store(ns, "ECHOK", pyre_object::w_int_new(host_termios::ECHOK as i64));
-    crate::dict_storage_store(ns, "ECHONL", pyre_object::w_int_new(host_termios::ECHONL as i64));
-    crate::dict_storage_store(ns, "HUPCL", pyre_object::w_int_new(host_termios::HUPCL as i64));
-    crate::dict_storage_store(ns, "ICANON", pyre_object::w_int_new(host_termios::ICANON as i64));
-    crate::dict_storage_store(ns, "ICRNL", pyre_object::w_int_new(host_termios::ICRNL as i64));
-    crate::dict_storage_store(ns, "IEXTEN", pyre_object::w_int_new(host_termios::IEXTEN as i64));
-    crate::dict_storage_store(ns, "IGNBRK", pyre_object::w_int_new(host_termios::IGNBRK as i64));
-    crate::dict_storage_store(ns, "IGNCR", pyre_object::w_int_new(host_termios::IGNCR as i64));
-    crate::dict_storage_store(ns, "IGNPAR", pyre_object::w_int_new(host_termios::IGNPAR as i64));
-    crate::dict_storage_store(ns, "INLCR", pyre_object::w_int_new(host_termios::INLCR as i64));
-    crate::dict_storage_store(ns, "INPCK", pyre_object::w_int_new(host_termios::INPCK as i64));
-    crate::dict_storage_store(ns, "ISIG", pyre_object::w_int_new(host_termios::ISIG as i64));
-    crate::dict_storage_store(ns, "ISTRIP", pyre_object::w_int_new(host_termios::ISTRIP as i64));
-    crate::dict_storage_store(ns, "IXANY", pyre_object::w_int_new(host_termios::IXANY as i64));
-    crate::dict_storage_store(ns, "IXOFF", pyre_object::w_int_new(host_termios::IXOFF as i64));
-    crate::dict_storage_store(ns, "IXON", pyre_object::w_int_new(host_termios::IXON as i64));
-    crate::dict_storage_store(ns, "NOFLSH", pyre_object::w_int_new(host_termios::NOFLSH as i64));
-    crate::dict_storage_store(ns, "OCRNL", pyre_object::w_int_new(host_termios::OCRNL as i64));
-    crate::dict_storage_store(ns, "ONLCR", pyre_object::w_int_new(host_termios::ONLCR as i64));
-    crate::dict_storage_store(ns, "ONLRET", pyre_object::w_int_new(host_termios::ONLRET as i64));
-    crate::dict_storage_store(ns, "ONOCR", pyre_object::w_int_new(host_termios::ONOCR as i64));
-    crate::dict_storage_store(ns, "OPOST", pyre_object::w_int_new(host_termios::OPOST as i64));
-    crate::dict_storage_store(ns, "PARENB", pyre_object::w_int_new(host_termios::PARENB as i64));
-    crate::dict_storage_store(ns, "PARMRK", pyre_object::w_int_new(host_termios::PARMRK as i64));
-    crate::dict_storage_store(ns, "PARODD", pyre_object::w_int_new(host_termios::PARODD as i64));
+    crate::dict_storage_store(
+        ns,
+        "CSIZE",
+        pyre_object::w_int_new(host_termios::CSIZE as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "CSTOPB",
+        pyre_object::w_int_new(host_termios::CSTOPB as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ECHO",
+        pyre_object::w_int_new(host_termios::ECHO as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ECHOE",
+        pyre_object::w_int_new(host_termios::ECHOE as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ECHOK",
+        pyre_object::w_int_new(host_termios::ECHOK as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ECHONL",
+        pyre_object::w_int_new(host_termios::ECHONL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "HUPCL",
+        pyre_object::w_int_new(host_termios::HUPCL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ICANON",
+        pyre_object::w_int_new(host_termios::ICANON as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ICRNL",
+        pyre_object::w_int_new(host_termios::ICRNL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IEXTEN",
+        pyre_object::w_int_new(host_termios::IEXTEN as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IGNBRK",
+        pyre_object::w_int_new(host_termios::IGNBRK as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IGNCR",
+        pyre_object::w_int_new(host_termios::IGNCR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IGNPAR",
+        pyre_object::w_int_new(host_termios::IGNPAR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "INLCR",
+        pyre_object::w_int_new(host_termios::INLCR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "INPCK",
+        pyre_object::w_int_new(host_termios::INPCK as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ISIG",
+        pyre_object::w_int_new(host_termios::ISIG as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ISTRIP",
+        pyre_object::w_int_new(host_termios::ISTRIP as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IXANY",
+        pyre_object::w_int_new(host_termios::IXANY as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IXOFF",
+        pyre_object::w_int_new(host_termios::IXOFF as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "IXON",
+        pyre_object::w_int_new(host_termios::IXON as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "NOFLSH",
+        pyre_object::w_int_new(host_termios::NOFLSH as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "OCRNL",
+        pyre_object::w_int_new(host_termios::OCRNL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ONLCR",
+        pyre_object::w_int_new(host_termios::ONLCR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ONLRET",
+        pyre_object::w_int_new(host_termios::ONLRET as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "ONOCR",
+        pyre_object::w_int_new(host_termios::ONOCR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "OPOST",
+        pyre_object::w_int_new(host_termios::OPOST as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "PARENB",
+        pyre_object::w_int_new(host_termios::PARENB as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "PARMRK",
+        pyre_object::w_int_new(host_termios::PARMRK as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "PARODD",
+        pyre_object::w_int_new(host_termios::PARODD as i64),
+    );
 
-    crate::dict_storage_store(ns, "TCIFLUSH", pyre_object::w_int_new(host_termios::TCIFLUSH as i64));
-    crate::dict_storage_store(ns, "TCOFLUSH", pyre_object::w_int_new(host_termios::TCOFLUSH as i64));
-    crate::dict_storage_store(ns, "TCIOFLUSH", pyre_object::w_int_new(host_termios::TCIOFLUSH as i64));
-    crate::dict_storage_store(ns, "TCIOFF", pyre_object::w_int_new(host_termios::TCIOFF as i64));
-    crate::dict_storage_store(ns, "TCION", pyre_object::w_int_new(host_termios::TCION as i64));
-    crate::dict_storage_store(ns, "TCOOFF", pyre_object::w_int_new(host_termios::TCOOFF as i64));
-    crate::dict_storage_store(ns, "TCOON", pyre_object::w_int_new(host_termios::TCOON as i64));
-    crate::dict_storage_store(ns, "TCSANOW", pyre_object::w_int_new(host_termios::TCSANOW as i64));
-    crate::dict_storage_store(ns, "TCSADRAIN", pyre_object::w_int_new(host_termios::TCSADRAIN as i64));
-    crate::dict_storage_store(ns, "TCSAFLUSH", pyre_object::w_int_new(host_termios::TCSAFLUSH as i64));
-    crate::dict_storage_store(ns, "TOSTOP", pyre_object::w_int_new(host_termios::TOSTOP as i64));
+    crate::dict_storage_store(
+        ns,
+        "TCIFLUSH",
+        pyre_object::w_int_new(host_termios::TCIFLUSH as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCOFLUSH",
+        pyre_object::w_int_new(host_termios::TCOFLUSH as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCIOFLUSH",
+        pyre_object::w_int_new(host_termios::TCIOFLUSH as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCIOFF",
+        pyre_object::w_int_new(host_termios::TCIOFF as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCION",
+        pyre_object::w_int_new(host_termios::TCION as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCOOFF",
+        pyre_object::w_int_new(host_termios::TCOOFF as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCOON",
+        pyre_object::w_int_new(host_termios::TCOON as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCSANOW",
+        pyre_object::w_int_new(host_termios::TCSANOW as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCSADRAIN",
+        pyre_object::w_int_new(host_termios::TCSADRAIN as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TCSAFLUSH",
+        pyre_object::w_int_new(host_termios::TCSAFLUSH as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "TOSTOP",
+        pyre_object::w_int_new(host_termios::TOSTOP as i64),
+    );
 
-    crate::dict_storage_store(ns, "VEOF", pyre_object::w_int_new(host_termios::VEOF as i64));
-    crate::dict_storage_store(ns, "VEOL", pyre_object::w_int_new(host_termios::VEOL as i64));
-    crate::dict_storage_store(ns, "VERASE", pyre_object::w_int_new(host_termios::VERASE as i64));
-    crate::dict_storage_store(ns, "VINTR", pyre_object::w_int_new(host_termios::VINTR as i64));
-    crate::dict_storage_store(ns, "VKILL", pyre_object::w_int_new(host_termios::VKILL as i64));
-    crate::dict_storage_store(ns, "VMIN", pyre_object::w_int_new(host_termios::VMIN as i64));
-    crate::dict_storage_store(ns, "VQUIT", pyre_object::w_int_new(host_termios::VQUIT as i64));
-    crate::dict_storage_store(ns, "VSTART", pyre_object::w_int_new(host_termios::VSTART as i64));
-    crate::dict_storage_store(ns, "VSTOP", pyre_object::w_int_new(host_termios::VSTOP as i64));
-    crate::dict_storage_store(ns, "VSUSP", pyre_object::w_int_new(host_termios::VSUSP as i64));
-    crate::dict_storage_store(ns, "VTIME", pyre_object::w_int_new(host_termios::VTIME as i64));
+    crate::dict_storage_store(
+        ns,
+        "VEOF",
+        pyre_object::w_int_new(host_termios::VEOF as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VEOL",
+        pyre_object::w_int_new(host_termios::VEOL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VERASE",
+        pyre_object::w_int_new(host_termios::VERASE as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VINTR",
+        pyre_object::w_int_new(host_termios::VINTR as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VKILL",
+        pyre_object::w_int_new(host_termios::VKILL as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VMIN",
+        pyre_object::w_int_new(host_termios::VMIN as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VQUIT",
+        pyre_object::w_int_new(host_termios::VQUIT as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VSTART",
+        pyre_object::w_int_new(host_termios::VSTART as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VSTOP",
+        pyre_object::w_int_new(host_termios::VSTOP as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VSUSP",
+        pyre_object::w_int_new(host_termios::VSUSP as i64),
+    );
+    crate::dict_storage_store(
+        ns,
+        "VTIME",
+        pyre_object::w_int_new(host_termios::VTIME as i64),
+    );
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());
 }
@@ -2441,11 +2919,7 @@ fn init_termios(_ns: &mut DictStorage) {}
 unsafe extern "C" {
     fn inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
     fn inet_ntoa(addr: libc::in_addr) -> *mut libc::c_char;
-    fn inet_pton(
-        af: libc::c_int,
-        src: *const libc::c_char,
-        dst: *mut libc::c_void,
-    ) -> libc::c_int;
+    fn inet_pton(af: libc::c_int, src: *const libc::c_char, dst: *mut libc::c_void) -> libc::c_int;
     fn inet_ntop(
         af: libc::c_int,
         src: *const libc::c_void,
@@ -2454,10 +2928,7 @@ unsafe extern "C" {
     ) -> *const libc::c_char;
     fn gethostname(name: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
     fn gethostbyname(name: *const libc::c_char) -> *mut HostentRaw;
-    fn getservbyname(
-        name: *const libc::c_char,
-        proto: *const libc::c_char,
-    ) -> *mut ServentRaw;
+    fn getservbyname(name: *const libc::c_char, proto: *const libc::c_char) -> *mut ServentRaw;
     fn getservbyport(port: libc::c_int, proto: *const libc::c_char) -> *mut ServentRaw;
 }
 
@@ -2505,101 +2976,361 @@ fn init_socket(ns: &mut DictStorage) {
     #[cfg(unix)]
     {
         // Address families
-        crate::dict_storage_store(ns, "AF_UNSPEC", pyre_object::w_int_new(libc::AF_UNSPEC as i64));
+        crate::dict_storage_store(
+            ns,
+            "AF_UNSPEC",
+            pyre_object::w_int_new(libc::AF_UNSPEC as i64),
+        );
         crate::dict_storage_store(ns, "AF_UNIX", pyre_object::w_int_new(libc::AF_UNIX as i64));
         crate::dict_storage_store(ns, "AF_INET", pyre_object::w_int_new(libc::AF_INET as i64));
-        crate::dict_storage_store(ns, "AF_INET6", pyre_object::w_int_new(libc::AF_INET6 as i64));
+        crate::dict_storage_store(
+            ns,
+            "AF_INET6",
+            pyre_object::w_int_new(libc::AF_INET6 as i64),
+        );
         // Socket types
-        crate::dict_storage_store(ns, "SOCK_STREAM", pyre_object::w_int_new(libc::SOCK_STREAM as i64));
-        crate::dict_storage_store(ns, "SOCK_DGRAM", pyre_object::w_int_new(libc::SOCK_DGRAM as i64));
-        crate::dict_storage_store(ns, "SOCK_RAW", pyre_object::w_int_new(libc::SOCK_RAW as i64));
-        crate::dict_storage_store(ns, "SOCK_RDM", pyre_object::w_int_new(libc::SOCK_RDM as i64));
-        crate::dict_storage_store(ns, "SOCK_SEQPACKET", pyre_object::w_int_new(libc::SOCK_SEQPACKET as i64));
+        crate::dict_storage_store(
+            ns,
+            "SOCK_STREAM",
+            pyre_object::w_int_new(libc::SOCK_STREAM as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SOCK_DGRAM",
+            pyre_object::w_int_new(libc::SOCK_DGRAM as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SOCK_RAW",
+            pyre_object::w_int_new(libc::SOCK_RAW as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SOCK_RDM",
+            pyre_object::w_int_new(libc::SOCK_RDM as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SOCK_SEQPACKET",
+            pyre_object::w_int_new(libc::SOCK_SEQPACKET as i64),
+        );
         // Protocols
-        crate::dict_storage_store(ns, "IPPROTO_IP", pyre_object::w_int_new(libc::IPPROTO_IP as i64));
-        crate::dict_storage_store(ns, "IPPROTO_TCP", pyre_object::w_int_new(libc::IPPROTO_TCP as i64));
-        crate::dict_storage_store(ns, "IPPROTO_UDP", pyre_object::w_int_new(libc::IPPROTO_UDP as i64));
-        crate::dict_storage_store(ns, "IPPROTO_ICMP", pyre_object::w_int_new(libc::IPPROTO_ICMP as i64));
-        crate::dict_storage_store(ns, "IPPROTO_ICMPV6", pyre_object::w_int_new(libc::IPPROTO_ICMPV6 as i64));
-        crate::dict_storage_store(ns, "IPPROTO_RAW", pyre_object::w_int_new(libc::IPPROTO_RAW as i64));
-        crate::dict_storage_store(ns, "IPPROTO_IPV6", pyre_object::w_int_new(libc::IPPROTO_IPV6 as i64));
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_IP",
+            pyre_object::w_int_new(libc::IPPROTO_IP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_TCP",
+            pyre_object::w_int_new(libc::IPPROTO_TCP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_UDP",
+            pyre_object::w_int_new(libc::IPPROTO_UDP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_ICMP",
+            pyre_object::w_int_new(libc::IPPROTO_ICMP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_ICMPV6",
+            pyre_object::w_int_new(libc::IPPROTO_ICMPV6 as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_RAW",
+            pyre_object::w_int_new(libc::IPPROTO_RAW as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPPROTO_IPV6",
+            pyre_object::w_int_new(libc::IPPROTO_IPV6 as i64),
+        );
         // Special addresses (host byte order — Python keeps them this way)
-        crate::dict_storage_store(ns, "INADDR_ANY", pyre_object::w_int_new(libc::INADDR_ANY as i64));
-        crate::dict_storage_store(ns, "INADDR_LOOPBACK", pyre_object::w_int_new(libc::INADDR_LOOPBACK as i64));
-        crate::dict_storage_store(ns, "INADDR_BROADCAST", pyre_object::w_int_new(libc::INADDR_BROADCAST as i64));
-        crate::dict_storage_store(ns, "INADDR_NONE", pyre_object::w_int_new(libc::INADDR_NONE as i64));
+        crate::dict_storage_store(
+            ns,
+            "INADDR_ANY",
+            pyre_object::w_int_new(libc::INADDR_ANY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "INADDR_LOOPBACK",
+            pyre_object::w_int_new(libc::INADDR_LOOPBACK as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "INADDR_BROADCAST",
+            pyre_object::w_int_new(libc::INADDR_BROADCAST as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "INADDR_NONE",
+            pyre_object::w_int_new(libc::INADDR_NONE as i64),
+        );
         // setsockopt levels and options
-        crate::dict_storage_store(ns, "SOL_SOCKET", pyre_object::w_int_new(libc::SOL_SOCKET as i64));
-        crate::dict_storage_store(ns, "SO_REUSEADDR", pyre_object::w_int_new(libc::SO_REUSEADDR as i64));
-        crate::dict_storage_store(ns, "SO_KEEPALIVE", pyre_object::w_int_new(libc::SO_KEEPALIVE as i64));
-        crate::dict_storage_store(ns, "SO_BROADCAST", pyre_object::w_int_new(libc::SO_BROADCAST as i64));
-        crate::dict_storage_store(ns, "SO_DEBUG", pyre_object::w_int_new(libc::SO_DEBUG as i64));
-        crate::dict_storage_store(ns, "SO_DONTROUTE", pyre_object::w_int_new(libc::SO_DONTROUTE as i64));
-        crate::dict_storage_store(ns, "SO_LINGER", pyre_object::w_int_new(libc::SO_LINGER as i64));
-        crate::dict_storage_store(ns, "SO_OOBINLINE", pyre_object::w_int_new(libc::SO_OOBINLINE as i64));
-        crate::dict_storage_store(ns, "SO_RCVBUF", pyre_object::w_int_new(libc::SO_RCVBUF as i64));
-        crate::dict_storage_store(ns, "SO_SNDBUF", pyre_object::w_int_new(libc::SO_SNDBUF as i64));
-        crate::dict_storage_store(ns, "SO_RCVTIMEO", pyre_object::w_int_new(libc::SO_RCVTIMEO as i64));
-        crate::dict_storage_store(ns, "SO_SNDTIMEO", pyre_object::w_int_new(libc::SO_SNDTIMEO as i64));
-        crate::dict_storage_store(ns, "SO_RCVLOWAT", pyre_object::w_int_new(libc::SO_RCVLOWAT as i64));
-        crate::dict_storage_store(ns, "SO_SNDLOWAT", pyre_object::w_int_new(libc::SO_SNDLOWAT as i64));
-        crate::dict_storage_store(ns, "SO_ERROR", pyre_object::w_int_new(libc::SO_ERROR as i64));
+        crate::dict_storage_store(
+            ns,
+            "SOL_SOCKET",
+            pyre_object::w_int_new(libc::SOL_SOCKET as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_REUSEADDR",
+            pyre_object::w_int_new(libc::SO_REUSEADDR as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_KEEPALIVE",
+            pyre_object::w_int_new(libc::SO_KEEPALIVE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_BROADCAST",
+            pyre_object::w_int_new(libc::SO_BROADCAST as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_DEBUG",
+            pyre_object::w_int_new(libc::SO_DEBUG as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_DONTROUTE",
+            pyre_object::w_int_new(libc::SO_DONTROUTE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_LINGER",
+            pyre_object::w_int_new(libc::SO_LINGER as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_OOBINLINE",
+            pyre_object::w_int_new(libc::SO_OOBINLINE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_RCVBUF",
+            pyre_object::w_int_new(libc::SO_RCVBUF as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_SNDBUF",
+            pyre_object::w_int_new(libc::SO_SNDBUF as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_RCVTIMEO",
+            pyre_object::w_int_new(libc::SO_RCVTIMEO as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_SNDTIMEO",
+            pyre_object::w_int_new(libc::SO_SNDTIMEO as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_RCVLOWAT",
+            pyre_object::w_int_new(libc::SO_RCVLOWAT as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_SNDLOWAT",
+            pyre_object::w_int_new(libc::SO_SNDLOWAT as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SO_ERROR",
+            pyre_object::w_int_new(libc::SO_ERROR as i64),
+        );
         crate::dict_storage_store(ns, "SO_TYPE", pyre_object::w_int_new(libc::SO_TYPE as i64));
-        crate::dict_storage_store(ns, "SO_ACCEPTCONN", pyre_object::w_int_new(libc::SO_ACCEPTCONN as i64));
+        crate::dict_storage_store(
+            ns,
+            "SO_ACCEPTCONN",
+            pyre_object::w_int_new(libc::SO_ACCEPTCONN as i64),
+        );
         // TCP-level
-        crate::dict_storage_store(ns, "TCP_NODELAY", pyre_object::w_int_new(libc::TCP_NODELAY as i64));
-        crate::dict_storage_store(ns, "TCP_MAXSEG", pyre_object::w_int_new(libc::TCP_MAXSEG as i64));
+        crate::dict_storage_store(
+            ns,
+            "TCP_NODELAY",
+            pyre_object::w_int_new(libc::TCP_NODELAY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "TCP_MAXSEG",
+            pyre_object::w_int_new(libc::TCP_MAXSEG as i64),
+        );
         // TCP_KEEPIDLE is Linux-only at the libc-crate level; macOS exposes
         // TCP_KEEPALIVE for the same role.  Provide whichever the platform
         // defines under the conventional Python name.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            crate::dict_storage_store(ns, "TCP_KEEPIDLE", pyre_object::w_int_new(libc::TCP_KEEPIDLE as i64));
-            crate::dict_storage_store(ns, "TCP_KEEPINTVL", pyre_object::w_int_new(libc::TCP_KEEPINTVL as i64));
-            crate::dict_storage_store(ns, "TCP_KEEPCNT", pyre_object::w_int_new(libc::TCP_KEEPCNT as i64));
+            crate::dict_storage_store(
+                ns,
+                "TCP_KEEPIDLE",
+                pyre_object::w_int_new(libc::TCP_KEEPIDLE as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "TCP_KEEPINTVL",
+                pyre_object::w_int_new(libc::TCP_KEEPINTVL as i64),
+            );
+            crate::dict_storage_store(
+                ns,
+                "TCP_KEEPCNT",
+                pyre_object::w_int_new(libc::TCP_KEEPCNT as i64),
+            );
         }
         #[cfg(target_os = "macos")]
         {
-            crate::dict_storage_store(ns, "TCP_KEEPALIVE", pyre_object::w_int_new(libc::TCP_KEEPALIVE as i64));
+            crate::dict_storage_store(
+                ns,
+                "TCP_KEEPALIVE",
+                pyre_object::w_int_new(libc::TCP_KEEPALIVE as i64),
+            );
         }
         // IP-level
         crate::dict_storage_store(ns, "IP_TTL", pyre_object::w_int_new(libc::IP_TTL as i64));
         crate::dict_storage_store(ns, "IP_TOS", pyre_object::w_int_new(libc::IP_TOS as i64));
-        crate::dict_storage_store(ns, "IP_MULTICAST_TTL", pyre_object::w_int_new(libc::IP_MULTICAST_TTL as i64));
-        crate::dict_storage_store(ns, "IP_MULTICAST_LOOP", pyre_object::w_int_new(libc::IP_MULTICAST_LOOP as i64));
-        crate::dict_storage_store(ns, "IP_ADD_MEMBERSHIP", pyre_object::w_int_new(libc::IP_ADD_MEMBERSHIP as i64));
-        crate::dict_storage_store(ns, "IP_DROP_MEMBERSHIP", pyre_object::w_int_new(libc::IP_DROP_MEMBERSHIP as i64));
+        crate::dict_storage_store(
+            ns,
+            "IP_MULTICAST_TTL",
+            pyre_object::w_int_new(libc::IP_MULTICAST_TTL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IP_MULTICAST_LOOP",
+            pyre_object::w_int_new(libc::IP_MULTICAST_LOOP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IP_ADD_MEMBERSHIP",
+            pyre_object::w_int_new(libc::IP_ADD_MEMBERSHIP as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IP_DROP_MEMBERSHIP",
+            pyre_object::w_int_new(libc::IP_DROP_MEMBERSHIP as i64),
+        );
         // IPv6
-        crate::dict_storage_store(ns, "IPV6_V6ONLY", pyre_object::w_int_new(libc::IPV6_V6ONLY as i64));
-        crate::dict_storage_store(ns, "IPV6_MULTICAST_HOPS", pyre_object::w_int_new(libc::IPV6_MULTICAST_HOPS as i64));
-        crate::dict_storage_store(ns, "IPV6_MULTICAST_LOOP", pyre_object::w_int_new(libc::IPV6_MULTICAST_LOOP as i64));
+        crate::dict_storage_store(
+            ns,
+            "IPV6_V6ONLY",
+            pyre_object::w_int_new(libc::IPV6_V6ONLY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPV6_MULTICAST_HOPS",
+            pyre_object::w_int_new(libc::IPV6_MULTICAST_HOPS as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "IPV6_MULTICAST_LOOP",
+            pyre_object::w_int_new(libc::IPV6_MULTICAST_LOOP as i64),
+        );
         // shutdown how
         crate::dict_storage_store(ns, "SHUT_RD", pyre_object::w_int_new(libc::SHUT_RD as i64));
         crate::dict_storage_store(ns, "SHUT_WR", pyre_object::w_int_new(libc::SHUT_WR as i64));
-        crate::dict_storage_store(ns, "SHUT_RDWR", pyre_object::w_int_new(libc::SHUT_RDWR as i64));
+        crate::dict_storage_store(
+            ns,
+            "SHUT_RDWR",
+            pyre_object::w_int_new(libc::SHUT_RDWR as i64),
+        );
         // Message flags
         crate::dict_storage_store(ns, "MSG_OOB", pyre_object::w_int_new(libc::MSG_OOB as i64));
-        crate::dict_storage_store(ns, "MSG_PEEK", pyre_object::w_int_new(libc::MSG_PEEK as i64));
-        crate::dict_storage_store(ns, "MSG_DONTROUTE", pyre_object::w_int_new(libc::MSG_DONTROUTE as i64));
-        crate::dict_storage_store(ns, "MSG_WAITALL", pyre_object::w_int_new(libc::MSG_WAITALL as i64));
+        crate::dict_storage_store(
+            ns,
+            "MSG_PEEK",
+            pyre_object::w_int_new(libc::MSG_PEEK as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MSG_DONTROUTE",
+            pyre_object::w_int_new(libc::MSG_DONTROUTE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MSG_WAITALL",
+            pyre_object::w_int_new(libc::MSG_WAITALL as i64),
+        );
         // Address-info flags
-        crate::dict_storage_store(ns, "AI_PASSIVE", pyre_object::w_int_new(libc::AI_PASSIVE as i64));
-        crate::dict_storage_store(ns, "AI_CANONNAME", pyre_object::w_int_new(libc::AI_CANONNAME as i64));
-        crate::dict_storage_store(ns, "AI_NUMERICHOST", pyre_object::w_int_new(libc::AI_NUMERICHOST as i64));
-        crate::dict_storage_store(ns, "AI_NUMERICSERV", pyre_object::w_int_new(libc::AI_NUMERICSERV as i64));
-        crate::dict_storage_store(ns, "AI_ADDRCONFIG", pyre_object::w_int_new(libc::AI_ADDRCONFIG as i64));
-        crate::dict_storage_store(ns, "AI_V4MAPPED", pyre_object::w_int_new(libc::AI_V4MAPPED as i64));
+        crate::dict_storage_store(
+            ns,
+            "AI_PASSIVE",
+            pyre_object::w_int_new(libc::AI_PASSIVE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "AI_CANONNAME",
+            pyre_object::w_int_new(libc::AI_CANONNAME as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "AI_NUMERICHOST",
+            pyre_object::w_int_new(libc::AI_NUMERICHOST as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "AI_NUMERICSERV",
+            pyre_object::w_int_new(libc::AI_NUMERICSERV as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "AI_ADDRCONFIG",
+            pyre_object::w_int_new(libc::AI_ADDRCONFIG as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "AI_V4MAPPED",
+            pyre_object::w_int_new(libc::AI_V4MAPPED as i64),
+        );
         crate::dict_storage_store(ns, "AI_ALL", pyre_object::w_int_new(libc::AI_ALL as i64));
         // Name-info flags
-        crate::dict_storage_store(ns, "NI_NUMERICHOST", pyre_object::w_int_new(libc::NI_NUMERICHOST as i64));
-        crate::dict_storage_store(ns, "NI_NUMERICSERV", pyre_object::w_int_new(libc::NI_NUMERICSERV as i64));
-        crate::dict_storage_store(ns, "NI_NOFQDN", pyre_object::w_int_new(libc::NI_NOFQDN as i64));
-        crate::dict_storage_store(ns, "NI_NAMEREQD", pyre_object::w_int_new(libc::NI_NAMEREQD as i64));
-        crate::dict_storage_store(ns, "NI_DGRAM", pyre_object::w_int_new(libc::NI_DGRAM as i64));
-        crate::dict_storage_store(ns, "NI_MAXHOST", pyre_object::w_int_new(libc::NI_MAXHOST as i64));
-        crate::dict_storage_store(ns, "NI_MAXSERV", pyre_object::w_int_new(libc::NI_MAXSERV as i64));
+        crate::dict_storage_store(
+            ns,
+            "NI_NUMERICHOST",
+            pyre_object::w_int_new(libc::NI_NUMERICHOST as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_NUMERICSERV",
+            pyre_object::w_int_new(libc::NI_NUMERICSERV as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_NOFQDN",
+            pyre_object::w_int_new(libc::NI_NOFQDN as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_NAMEREQD",
+            pyre_object::w_int_new(libc::NI_NAMEREQD as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_DGRAM",
+            pyre_object::w_int_new(libc::NI_DGRAM as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_MAXHOST",
+            pyre_object::w_int_new(libc::NI_MAXHOST as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "NI_MAXSERV",
+            pyre_object::w_int_new(libc::NI_MAXSERV as i64),
+        );
         // socket-level cap
-        crate::dict_storage_store(ns, "SOMAXCONN", pyre_object::w_int_new(libc::SOMAXCONN as i64));
+        crate::dict_storage_store(
+            ns,
+            "SOMAXCONN",
+            pyre_object::w_int_new(libc::SOMAXCONN as i64),
+        );
     }
 
     // ── htons / htonl / ntohs / ntohl ──
@@ -2674,9 +3405,7 @@ fn init_socket(ns: &mut DictStorage) {
                 "inet_aton",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "inet_aton() missing argument",
-                        ));
+                        return Err(crate::PyError::type_error("inet_aton() missing argument"));
                     }
                     let s = unsafe {
                         if !pyre_object::is_str(args[0]) {
@@ -2686,9 +3415,8 @@ fn init_socket(ns: &mut DictStorage) {
                         }
                         pyre_object::w_str_get_value(args[0]).to_string()
                     };
-                    let c = std::ffi::CString::new(s.as_bytes()).map_err(|_| {
-                        crate::PyError::value_error("embedded null in argument")
-                    })?;
+                    let c = std::ffi::CString::new(s.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in argument"))?;
                     let mut addr: libc::in_addr = unsafe { std::mem::zeroed() };
                     let r = unsafe { inet_aton(c.as_ptr(), &mut addr) };
                     if r == 0 {
@@ -2709,9 +3437,7 @@ fn init_socket(ns: &mut DictStorage) {
                 "inet_ntoa",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "inet_ntoa() missing argument",
-                        ));
+                        return Err(crate::PyError::type_error("inet_ntoa() missing argument"));
                     }
                     let data = unsafe {
                         if !pyre_object::bytesobject::is_bytes_like(args[0]) {
@@ -2776,9 +3502,7 @@ fn init_socket(ns: &mut DictStorage) {
                         x if x == libc::AF_INET => 4,
                         x if x == libc::AF_INET6 => 16,
                         _ => {
-                            return Err(crate::PyError::value_error(
-                                "unknown address family",
-                            ));
+                            return Err(crate::PyError::value_error("unknown address family"));
                         }
                     };
                     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf[..n]))
@@ -2812,9 +3536,7 @@ fn init_socket(ns: &mut DictStorage) {
                         x if x == libc::AF_INET => 4,
                         x if x == libc::AF_INET6 => 16,
                         _ => {
-                            return Err(crate::PyError::value_error(
-                                "unknown address family",
-                            ));
+                            return Err(crate::PyError::value_error("unknown address family"));
                         }
                     };
                     if data.len() != expected {
@@ -2849,9 +3571,8 @@ fn init_socket(ns: &mut DictStorage) {
                 "gethostname",
                 |_| {
                     let mut buf = [0u8; 256];
-                    let r = unsafe {
-                        gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-                    };
+                    let r =
+                        unsafe { gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
                     if r != 0 {
                         return Err(crate::PyError::os_error_with_errno(
                             std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
@@ -2859,9 +3580,9 @@ fn init_socket(ns: &mut DictStorage) {
                         ));
                     }
                     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                    Ok(pyre_object::w_str_new(
-                        &String::from_utf8_lossy(&buf[..end]),
-                    ))
+                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(
+                        &buf[..end],
+                    )))
                 },
                 0,
             ),
@@ -2931,9 +3652,7 @@ fn init_socket(ns: &mut DictStorage) {
                     unsafe {
                         let h = &*he;
                         if h.h_length != 4 || (*h.h_addr_list).is_null() {
-                            return Err(crate::PyError::os_error(
-                                "gethostbyname: no IPv4 address",
-                            ));
+                            return Err(crate::PyError::os_error("gethostbyname: no IPv4 address"));
                         }
                         let addr_ptr = *h.h_addr_list;
                         let addr = libc::in_addr {
@@ -2969,17 +3688,16 @@ fn init_socket(ns: &mut DictStorage) {
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(args[1]) }
-                {
-                    let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| crate::PyError::value_error("embedded null"))?,
-                    )
-                } else {
-                    None
-                };
+                let proto_c: Option<std::ffi::CString> =
+                    if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
+                        let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                        Some(
+                            std::ffi::CString::new(p.as_bytes())
+                                .map_err(|_| crate::PyError::value_error("embedded null"))?,
+                        )
+                    } else {
+                        None
+                    };
                 let p = unsafe {
                     getservbyname(
                         c_name.as_ptr(),
@@ -3010,17 +3728,16 @@ fn init_socket(ns: &mut DictStorage) {
                     ));
                 }
                 let port = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(args[1]) }
-                {
-                    let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| crate::PyError::value_error("embedded null"))?,
-                    )
-                } else {
-                    None
-                };
+                let proto_c: Option<std::ffi::CString> =
+                    if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
+                        let p = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                        Some(
+                            std::ffi::CString::new(p.as_bytes())
+                                .map_err(|_| crate::PyError::value_error("embedded null"))?,
+                        )
+                    } else {
+                        None
+                    };
                 let p = unsafe {
                     getservbyport(
                         port.to_be() as libc::c_int,
@@ -3035,8 +3752,11 @@ fn init_socket(ns: &mut DictStorage) {
                         "port/proto not found: {port}"
                     )));
                 }
-                let name =
-                    unsafe { std::ffi::CStr::from_ptr((*p).s_name).to_string_lossy().into_owned() };
+                let name = unsafe {
+                    std::ffi::CStr::from_ptr((*p).s_name)
+                        .to_string_lossy()
+                        .into_owned()
+                };
                 Ok(pyre_object::w_str_new(&name))
             }),
         );
@@ -3143,10 +3863,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
 
 #[cfg(unix)]
 fn socket_io_err(e: std::io::Error) -> crate::PyError {
-    crate::PyError::os_error_with_errno(
-        e.raw_os_error().unwrap_or(0),
-        format!("socket: {e}"),
-    )
+    crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("socket: {e}"))
 }
 
 #[cfg(unix)]
@@ -3262,7 +3979,10 @@ fn pack_inet_addr(
                 sin.sin_addr.s_addr = *(addr_ptr as *const u32);
             }
         }
-        Ok((storage, core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t))
+        Ok((
+            storage,
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ))
     } else if family == libc::AF_INET6 {
         let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
         sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
@@ -3291,7 +4011,10 @@ fn pack_inet_addr(
                 sin6.sin6_scope_id = unsafe { pyre_object::w_int_get_value(v) } as u32;
             }
         }
-        Ok((storage, core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t))
+        Ok((
+            storage,
+            core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        ))
     } else if family == libc::AF_UNIX {
         // Special-case: AF_UNIX takes a bare string path, not a tuple.
         // The original parsing above already extracted host_obj from
@@ -3408,15 +4131,16 @@ fn init_socket_type(ns: &mut DictStorage) {
             } else {
                 unsafe { pyre_object::w_int_get_value(after_cls[2]) as libc::c_int }
             };
-            let fileno: libc::c_int = if after_cls.len() < 4 || unsafe { pyre_object::is_none(after_cls[3]) } {
-                let fd = unsafe { libc::socket(family, ty, proto) };
-                if fd < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
-                fd
-            } else {
-                unsafe { pyre_object::w_int_get_value(after_cls[3]) as libc::c_int }
-            };
+            let fileno: libc::c_int =
+                if after_cls.len() < 4 || unsafe { pyre_object::is_none(after_cls[3]) } {
+                    let fd = unsafe { libc::socket(family, ty, proto) };
+                    if fd < 0 {
+                        return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                    fd
+                } else {
+                    unsafe { pyre_object::w_int_get_value(after_cls[3]) as libc::c_int }
+                };
             Ok(socket_from_fd(fileno, family, ty, proto))
         }),
     );
@@ -3524,21 +4248,15 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 // AF_UNIX uses a bare string instead of a (host, port) tuple;
                 // wrap it in a 1-tuple so pack_inet_addr can reuse host_obj.
-                let addr_obj = if family == libc::AF_UNIX
-                    && unsafe { pyre_object::is_str(args[1]) }
+                let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(args[1]) }
                 {
                     pyre_object::w_tuple_new(vec![args[1]])
                 } else {
                     args[1]
                 };
                 let (storage, slen) = pack_inet_addr(family, addr_obj)?;
-                let r = unsafe {
-                    libc::bind(
-                        fd,
-                        &storage as *const _ as *const libc::sockaddr,
-                        slen,
-                    )
-                };
+                let r =
+                    unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, slen) };
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
                 }
@@ -3551,23 +4269,20 @@ fn init_socket_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "listen",
-        crate::make_builtin_function(
-            "listen",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = socket_fd(obj)?;
-                let backlog = if args.len() >= 2 {
-                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int
-                } else {
-                    128
-                };
-                let r = unsafe { libc::listen(fd, backlog) };
-                if r != 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
-                Ok(pyre_object::w_none())
-            },
-        ),
+        crate::make_builtin_function("listen", |args| {
+            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            let fd = socket_fd(obj)?;
+            let backlog = if args.len() >= 2 {
+                (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int
+            } else {
+                128
+            };
+            let r = unsafe { libc::listen(fd, backlog) };
+            if r != 0 {
+                return Err(socket_io_err(std::io::Error::last_os_error()));
+            }
+            Ok(pyre_object::w_none())
+        }),
     );
 
     crate::dict_storage_store(
@@ -3584,11 +4299,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = unsafe {
-                    libc::accept(
-                        fd,
-                        &mut storage as *mut _ as *mut libc::sockaddr,
-                        &mut slen,
-                    )
+                    libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
                 };
                 if cfd < 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
@@ -3613,8 +4324,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let addr_obj = if family == libc::AF_UNIX
-                    && unsafe { pyre_object::is_str(args[1]) }
+                let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(args[1]) }
                 {
                     pyre_object::w_tuple_new(vec![args[1]])
                 } else {
@@ -3622,11 +4332,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 };
                 let (storage, slen) = pack_inet_addr(family, addr_obj)?;
                 let r = unsafe {
-                    libc::connect(
-                        fd,
-                        &storage as *const _ as *const libc::sockaddr,
-                        slen,
-                    )
+                    libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
                 };
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
@@ -3640,110 +4346,98 @@ fn init_socket_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "send",
-        crate::make_builtin_function(
-            "send",
-            |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("send() missing buffer"));
+        crate::make_builtin_function("send", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("send() missing buffer"));
+            }
+            let obj = args[0];
+            let fd = socket_fd(obj)?;
+            let buf = unsafe {
+                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                    return Err(crate::PyError::type_error(
+                        "send: buffer must be bytes-like",
+                    ));
                 }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let buf = unsafe {
-                    if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                        return Err(crate::PyError::type_error(
-                            "send: buffer must be bytes-like",
-                        ));
-                    }
-                    pyre_object::bytesobject::bytes_like_data(args[1])
-                };
-                let flags = if args.len() >= 3 {
-                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-                } else {
-                    0
-                };
-                let n = unsafe {
-                    libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                };
-                if n < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
-                Ok(pyre_object::w_int_new(n as i64))
-            },
-        ),
+                pyre_object::bytesobject::bytes_like_data(args[1])
+            };
+            let flags = if args.len() >= 3 {
+                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+            } else {
+                0
+            };
+            let n =
+                unsafe { libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+            if n < 0 {
+                return Err(socket_io_err(std::io::Error::last_os_error()));
+            }
+            Ok(pyre_object::w_int_new(n as i64))
+        }),
     );
 
     crate::dict_storage_store(
         ns,
         "sendall",
-        crate::make_builtin_function(
-            "sendall",
-            |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("sendall() missing buffer"));
+        crate::make_builtin_function("sendall", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("sendall() missing buffer"));
+            }
+            let obj = args[0];
+            let fd = socket_fd(obj)?;
+            let buf = unsafe {
+                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
+                    return Err(crate::PyError::type_error(
+                        "sendall: buffer must be bytes-like",
+                    ));
                 }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let buf = unsafe {
-                    if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                        return Err(crate::PyError::type_error(
-                            "sendall: buffer must be bytes-like",
-                        ));
-                    }
-                    pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
+                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
+            };
+            let flags = if args.len() >= 3 {
+                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+            } else {
+                0
+            };
+            let mut off = 0usize;
+            while off < buf.len() {
+                let n = unsafe {
+                    libc::send(
+                        fd,
+                        buf[off..].as_ptr() as *const libc::c_void,
+                        buf.len() - off,
+                        flags,
+                    )
                 };
-                let flags = if args.len() >= 3 {
-                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-                } else {
-                    0
-                };
-                let mut off = 0usize;
-                while off < buf.len() {
-                    let n = unsafe {
-                        libc::send(
-                            fd,
-                            buf[off..].as_ptr() as *const libc::c_void,
-                            buf.len() - off,
-                            flags,
-                        )
-                    };
-                    if n < 0 {
-                        return Err(socket_io_err(std::io::Error::last_os_error()));
-                    }
-                    off += n as usize;
+                if n < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
                 }
-                Ok(pyre_object::w_none())
-            },
-        ),
+                off += n as usize;
+            }
+            Ok(pyre_object::w_none())
+        }),
     );
 
     crate::dict_storage_store(
         ns,
         "recv",
-        crate::make_builtin_function(
-            "recv",
-            |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("recv() missing size"));
-                }
-                let obj = args[0];
-                let fd = socket_fd(obj)?;
-                let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
-                let flags = if args.len() >= 3 {
-                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-                } else {
-                    0
-                };
-                let mut buf = vec![0u8; n];
-                let got = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags)
-                };
-                if got < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
-                buf.truncate(got as usize);
-                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
-            },
-        ),
+        crate::make_builtin_function("recv", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("recv() missing size"));
+            }
+            let obj = args[0];
+            let fd = socket_fd(obj)?;
+            let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
+            let flags = if args.len() >= 3 {
+                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+            } else {
+                0
+            };
+            let mut buf = vec![0u8; n];
+            let got = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags) };
+            if got < 0 {
+                return Err(socket_io_err(std::io::Error::last_os_error()));
+            }
+            buf.truncate(got as usize);
+            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
+        }),
     );
 
     crate::dict_storage_store(
@@ -3752,7 +4446,9 @@ fn init_socket_type(ns: &mut DictStorage) {
         crate::make_builtin_function("sendto", |args| {
             // sendto(buffer, [flags,] address)
             if args.len() < 3 {
-                return Err(crate::PyError::type_error("sendto() needs buffer + address"));
+                return Err(crate::PyError::type_error(
+                    "sendto() needs buffer + address",
+                ));
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
@@ -3776,9 +4472,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 )
             };
             let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-            let addr_obj = if family == libc::AF_UNIX
-                && unsafe { pyre_object::is_str(addr_obj) }
-            {
+            let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(addr_obj) } {
                 pyre_object::w_tuple_new(vec![addr_obj])
             } else {
                 addr_obj
@@ -3872,11 +4566,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let r = unsafe {
-                    libc::getsockname(
-                        fd,
-                        &mut storage as *mut _ as *mut libc::sockaddr,
-                        &mut slen,
-                    )
+                    libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
                 };
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
@@ -3897,11 +4587,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let r = unsafe {
-                    libc::getpeername(
-                        fd,
-                        &mut storage as *mut _ as *mut libc::sockaddr,
-                        &mut slen,
-                    )
+                    libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
                 };
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
@@ -4019,9 +4705,7 @@ fn init_socket_type(ns: &mut DictStorage) {
             "setblocking",
             |args| {
                 if args.len() < 2 {
-                    return Err(crate::PyError::type_error(
-                        "setblocking() missing argument",
-                    ));
+                    return Err(crate::PyError::type_error("setblocking() missing argument"));
                 }
                 let fd = socket_fd(args[0])?;
                 let blocking = unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
@@ -4347,9 +5031,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 let (p, len) = mmap_ptr(obj)?;
                 let access = mmap_get_attr_i64(obj, "_access");
                 if access == MMAP_ACCESS_READ {
-                    return Err(crate::PyError::type_error(
-                        "mmap is read-only",
-                    ));
+                    return Err(crate::PyError::type_error("mmap is read-only"));
                 }
                 let buf = unsafe {
                     if !pyre_object::bytesobject::is_bytes_like(args[1]) {
@@ -4361,12 +5043,14 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 };
                 let pos = mmap_get_attr_i64(obj, "_pos") as usize;
                 if pos + buf.len() > len {
-                    return Err(crate::PyError::value_error(
-                        "data out of range",
-                    ));
+                    return Err(crate::PyError::value_error("data out of range"));
                 }
                 unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len()) };
-                mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + buf.len()) as i64));
+                mmap_set_attr(
+                    obj,
+                    "_pos",
+                    pyre_object::w_int_new((pos + buf.len()) as i64),
+                );
                 Ok(pyre_object::w_int_new(buf.len() as i64))
             },
             2,
@@ -4572,23 +5256,83 @@ fn init_mmap(ns: &mut DictStorage) {
     {
         // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
         // Python ACCESS_* aliases.
-        crate::dict_storage_store(ns, "MAP_SHARED", pyre_object::w_int_new(libc::MAP_SHARED as i64));
-        crate::dict_storage_store(ns, "MAP_PRIVATE", pyre_object::w_int_new(libc::MAP_PRIVATE as i64));
-        crate::dict_storage_store(ns, "MAP_ANON", pyre_object::w_int_new(libc::MAP_ANON as i64));
-        crate::dict_storage_store(ns, "MAP_ANONYMOUS", pyre_object::w_int_new(libc::MAP_ANON as i64));
-        crate::dict_storage_store(ns, "PROT_READ", pyre_object::w_int_new(libc::PROT_READ as i64));
-        crate::dict_storage_store(ns, "PROT_WRITE", pyre_object::w_int_new(libc::PROT_WRITE as i64));
-        crate::dict_storage_store(ns, "PROT_EXEC", pyre_object::w_int_new(libc::PROT_EXEC as i64));
-        crate::dict_storage_store(ns, "PROT_NONE", pyre_object::w_int_new(libc::PROT_NONE as i64));
-        crate::dict_storage_store(ns, "ACCESS_DEFAULT", pyre_object::w_int_new(MMAP_ACCESS_DEFAULT));
+        crate::dict_storage_store(
+            ns,
+            "MAP_SHARED",
+            pyre_object::w_int_new(libc::MAP_SHARED as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MAP_PRIVATE",
+            pyre_object::w_int_new(libc::MAP_PRIVATE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MAP_ANON",
+            pyre_object::w_int_new(libc::MAP_ANON as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MAP_ANONYMOUS",
+            pyre_object::w_int_new(libc::MAP_ANON as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PROT_READ",
+            pyre_object::w_int_new(libc::PROT_READ as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PROT_WRITE",
+            pyre_object::w_int_new(libc::PROT_WRITE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PROT_EXEC",
+            pyre_object::w_int_new(libc::PROT_EXEC as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "PROT_NONE",
+            pyre_object::w_int_new(libc::PROT_NONE as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "ACCESS_DEFAULT",
+            pyre_object::w_int_new(MMAP_ACCESS_DEFAULT),
+        );
         crate::dict_storage_store(ns, "ACCESS_READ", pyre_object::w_int_new(MMAP_ACCESS_READ));
-        crate::dict_storage_store(ns, "ACCESS_WRITE", pyre_object::w_int_new(MMAP_ACCESS_WRITE));
+        crate::dict_storage_store(
+            ns,
+            "ACCESS_WRITE",
+            pyre_object::w_int_new(MMAP_ACCESS_WRITE),
+        );
         crate::dict_storage_store(ns, "ACCESS_COPY", pyre_object::w_int_new(MMAP_ACCESS_COPY));
-        crate::dict_storage_store(ns, "MADV_NORMAL", pyre_object::w_int_new(libc::MADV_NORMAL as i64));
-        crate::dict_storage_store(ns, "MADV_RANDOM", pyre_object::w_int_new(libc::MADV_RANDOM as i64));
-        crate::dict_storage_store(ns, "MADV_SEQUENTIAL", pyre_object::w_int_new(libc::MADV_SEQUENTIAL as i64));
-        crate::dict_storage_store(ns, "MADV_WILLNEED", pyre_object::w_int_new(libc::MADV_WILLNEED as i64));
-        crate::dict_storage_store(ns, "MADV_DONTNEED", pyre_object::w_int_new(libc::MADV_DONTNEED as i64));
+        crate::dict_storage_store(
+            ns,
+            "MADV_NORMAL",
+            pyre_object::w_int_new(libc::MADV_NORMAL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MADV_RANDOM",
+            pyre_object::w_int_new(libc::MADV_RANDOM as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MADV_SEQUENTIAL",
+            pyre_object::w_int_new(libc::MADV_SEQUENTIAL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MADV_WILLNEED",
+            pyre_object::w_int_new(libc::MADV_WILLNEED as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "MADV_DONTNEED",
+            pyre_object::w_int_new(libc::MADV_DONTNEED as i64),
+        );
 
         // Page-related constants (sys.PAGESIZE in CPython mmap module).
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -4643,11 +5387,7 @@ fn init_mmap(ns: &mut DictStorage) {
                     _ => (flags_arg, prot_arg),
                 };
                 // fileno == -1 → anonymous mapping.
-                let real_fd = if fd == -1 {
-                    -1
-                } else {
-                    fd
-                };
+                let real_fd = if fd == -1 { -1 } else { fd };
                 let final_flags = if real_fd == -1 {
                     flags | libc::MAP_ANON
                 } else {
@@ -4701,8 +5441,8 @@ thread_local! {
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     // Stay async-signal-safe: write to fd 2 with raw libc::write and
     // restore the default disposition before reraising.
-    let name = rustpython_host_env::faulthandler::fatal_signal_name(signum)
-        .unwrap_or("unknown signal");
+    let name =
+        rustpython_host_env::faulthandler::fatal_signal_name(signum).unwrap_or("unknown signal");
     let msg = format!("Fatal Python error: {name}\n");
     rustpython_host_env::faulthandler::write_fd(2, msg.as_bytes());
     rustpython_host_env::faulthandler::signal_default_and_raise(signum);
@@ -4807,9 +5547,7 @@ fn init_faulthandler(ns: &mut DictStorage) {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "register() missing signal",
-                    ));
+                    return Err(crate::PyError::type_error("register() missing signal"));
                 }
                 let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                 let fd = if args.len() >= 2 {
@@ -4848,12 +5586,9 @@ fn init_faulthandler(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "unregister() missing signal",
-                        ));
+                        return Err(crate::PyError::type_error("unregister() missing signal"));
                     }
-                    let signum =
-                        (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                    let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     return Ok(pyre_object::w_bool_from(
                         rustpython_host_env::faulthandler::unregister_user_signal(signum),
                     ));
@@ -4893,10 +5628,26 @@ fn init_ctypes(ns: &mut DictStorage) {
         use rustpython_host_env::ctypes as host_ctypes;
 
         // dlopen flags (POSIX).
-        crate::dict_storage_store(ns, "RTLD_LOCAL", pyre_object::w_int_new(libc::RTLD_LOCAL as i64));
-        crate::dict_storage_store(ns, "RTLD_GLOBAL", pyre_object::w_int_new(libc::RTLD_GLOBAL as i64));
-        crate::dict_storage_store(ns, "RTLD_LAZY", pyre_object::w_int_new(libc::RTLD_LAZY as i64));
-        crate::dict_storage_store(ns, "RTLD_NOW", pyre_object::w_int_new(libc::RTLD_NOW as i64));
+        crate::dict_storage_store(
+            ns,
+            "RTLD_LOCAL",
+            pyre_object::w_int_new(libc::RTLD_LOCAL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RTLD_GLOBAL",
+            pyre_object::w_int_new(libc::RTLD_GLOBAL as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RTLD_LAZY",
+            pyre_object::w_int_new(libc::RTLD_LAZY as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "RTLD_NOW",
+            pyre_object::w_int_new(libc::RTLD_NOW as i64),
+        );
         crate::dict_storage_store(
             ns,
             "DEFAULT_MODE",
@@ -4910,9 +5661,7 @@ fn init_ctypes(ns: &mut DictStorage) {
             "dlopen",
             crate::make_builtin_function("dlopen", |args| {
                 if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "dlopen() missing library name",
-                    ));
+                    return Err(crate::PyError::type_error("dlopen() missing library name"));
                 }
                 let name = unsafe {
                     if pyre_object::is_none(args[0]) {
@@ -4922,11 +5671,9 @@ fn init_ctypes(ns: &mut DictStorage) {
                         } else {
                             libc::RTLD_NOW
                         };
-                        let ptr = rustpython_host_env::ctypes::dlopen_self(mode).map_err(|e| {
-                            crate::PyError::os_error(format!("dlopen(None): {e}"))
-                        })?;
-                        let h =
-                            rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
+                        let ptr = rustpython_host_env::ctypes::dlopen_self(mode)
+                            .map_err(|e| crate::PyError::os_error(format!("dlopen(None): {e}")))?;
+                        let h = rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
                         return Ok(pyre_object::w_int_new(h as i64));
                     }
                     if !pyre_object::is_str(args[0]) {
@@ -4961,9 +5708,7 @@ fn init_ctypes(ns: &mut DictStorage) {
                     let h = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
                     let name = unsafe {
                         if !pyre_object::is_str(args[1]) {
-                            return Err(crate::PyError::type_error(
-                                "dlsym: name must be a string",
-                            ));
+                            return Err(crate::PyError::type_error("dlsym: name must be a string"));
                         }
                         pyre_object::w_str_get_value(args[1]).to_string()
                     };
@@ -5113,9 +5858,7 @@ fn init_ctypes(ns: &mut DictStorage) {
                 "memset",
                 |args| {
                     if args.len() < 3 {
-                        return Err(crate::PyError::type_error(
-                            "memset() needs (dst, c, count)",
-                        ));
+                        return Err(crate::PyError::type_error("memset() needs (dst, c, count)"));
                     }
                     let dst = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize
                         as *mut libc::c_void;
@@ -5142,8 +5885,8 @@ fn init_ctypes(ns: &mut DictStorage) {
                 } else {
                     -1
                 };
-                let bytes = rustpython_host_env::ctypes::string_at(ptr, size as isize)
-                    .map_err(|e| {
+                let bytes =
+                    rustpython_host_env::ctypes::string_at(ptr, size as isize).map_err(|e| {
                         use rustpython_host_env::ctypes::StringAtError as S;
                         let msg = match e {
                             S::NullPointer => "NULL pointer access",
@@ -5161,9 +5904,7 @@ fn init_ctypes(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "SIZEOF_TIME_T",
-            pyre_object::w_int_new(
-                rustpython_host_env::ctypes::SIZEOF_TIME_T as i64,
-            ),
+            pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64),
         );
     }
 
@@ -5207,8 +5948,7 @@ fn init_posixshmem(ns: &mut DictStorage) {
                     }
                     pyre_object::w_str_get_value(args[0]).to_string()
                 };
-                let flags =
-                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                let flags = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
                 let mode = if args.len() >= 3 {
                     (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_uint
                 } else {
@@ -5216,13 +5956,12 @@ fn init_posixshmem(ns: &mut DictStorage) {
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                let fd = rustpython_host_env::shm::shm_open(&c_name, flags, mode)
-                    .map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("shm_open: {e}"),
-                        )
-                    })?;
+                let fd = rustpython_host_env::shm::shm_open(&c_name, flags, mode).map_err(|e| {
+                    crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("shm_open: {e}"),
+                    )
+                })?;
                 Ok(pyre_object::w_int_new(fd as i64))
             }),
         );
@@ -5233,9 +5972,7 @@ fn init_posixshmem(ns: &mut DictStorage) {
                 "shm_unlink",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "shm_unlink() needs path",
-                        ));
+                        return Err(crate::PyError::type_error("shm_unlink() needs path"));
                     }
                     let name = unsafe {
                         if !pyre_object::is_str(args[0]) {
@@ -5359,11 +6096,7 @@ fn init_semlock_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_count",
-        crate::make_builtin_function_with_arity(
-            "_count",
-            |_| Ok(pyre_object::w_int_new(0)),
-            1,
-        ),
+        crate::make_builtin_function_with_arity("_count", |_| Ok(pyre_object::w_int_new(0)), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -5441,22 +6174,17 @@ fn init_multiprocessing(ns: &mut DictStorage) {
                         "SemLock() needs (kind, value, maxvalue, name, unlink)",
                     ));
                 }
-                let value =
-                    (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_uint;
+                let value = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_uint;
                 let name = unsafe {
                     if !pyre_object::is_str(args[3]) {
-                        return Err(crate::PyError::type_error(
-                            "SemLock: name must be a string",
-                        ));
+                        return Err(crate::PyError::type_error("SemLock: name must be a string"));
                     }
                     pyre_object::w_str_get_value(args[3]).to_string()
                 };
                 let unlink = unsafe { pyre_object::w_int_get_value(args[4]) } != 0;
                 let (handle, _kept_name) =
-                    rustpython_host_env::multiprocessing::SemHandle::create(
-                        &name, value, unlink,
-                    )
-                    .map_err(|_| crate::PyError::os_error("SemLock create failed"))?;
+                    rustpython_host_env::multiprocessing::SemHandle::create(&name, value, unlink)
+                        .map_err(|_| crate::PyError::os_error("SemLock create failed"))?;
                 let raw = handle.as_ptr();
                 // Leak the SemHandle wrapper so its Drop doesn't close the fd;
                 // we'll sem_close manually if needed.  This matches CPython's
@@ -5471,11 +6199,7 @@ fn init_multiprocessing(ns: &mut DictStorage) {
                             "_handle",
                             pyre_object::w_int_new(raw as usize as i64),
                         );
-                        pyre_object::w_dict_setitem_str(
-                            d,
-                            "name",
-                            pyre_object::w_str_new(&name),
-                        );
+                        pyre_object::w_dict_setitem_str(d, "name", pyre_object::w_str_new(&name));
                     }
                 }
                 Ok(obj)
@@ -5489,9 +6213,7 @@ fn init_multiprocessing(ns: &mut DictStorage) {
                 "sem_unlink",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "sem_unlink() needs name",
-                        ));
+                        return Err(crate::PyError::type_error("sem_unlink() needs name"));
                     }
                     let name = unsafe {
                         if !pyre_object::is_str(args[0]) {
@@ -5512,9 +6234,7 @@ fn init_multiprocessing(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "SEM_VALUE_MAX",
-            pyre_object::w_int_new(
-                rustpython_host_env::multiprocessing::sem_value_max() as i64,
-            ),
+            pyre_object::w_int_new(rustpython_host_env::multiprocessing::sem_value_max() as i64),
         );
 
         // _multiprocessing exposes RECURSIVE_MUTEX / SEMAPHORE kind tags.
@@ -5617,10 +6337,12 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     };
                     match rustpython_host_env::signal::raise_signal(signum) {
                         Ok(()) => return Ok(pyre_object::w_none()),
-                        Err(e) => return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("raise_signal: {e}"),
-                        )),
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("raise_signal: {e}"),
+                            ));
+                        }
                     }
                 }
                 #[cfg(not(feature = "host_env"))]
@@ -5756,15 +6478,14 @@ fn init_signal_stub(ns: &mut DictStorage) {
                             rustpython_host_env::signal::double_to_timeval(0.0)
                         },
                     };
-                    let old = rustpython_host_env::signal::setitimer(which, &new_value)
-                        .map_err(|e| {
+                    let old =
+                        rustpython_host_env::signal::setitimer(which, &new_value).map_err(|e| {
                             crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
                                 format!("setitimer: {e}"),
                             )
                         })?;
-                    let (delay, interval) =
-                        rustpython_host_env::signal::itimerval_to_tuple(&old);
+                    let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
                     return Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_float_new(delay),
                         pyre_object::w_float_new(interval),
@@ -5794,13 +6515,12 @@ fn init_signal_stub(ns: &mut DictStorage) {
                             ));
                         }
                         let which = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                        let it =
-                            rustpython_host_env::signal::getitimer(which).map_err(|e| {
-                                crate::PyError::os_error_with_errno(
-                                    e.raw_os_error().unwrap_or(0),
-                                    format!("getitimer: {e}"),
-                                )
-                            })?;
+                        let it = rustpython_host_env::signal::getitimer(which).map_err(|e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("getitimer: {e}"),
+                            )
+                        })?;
                         let (delay, interval) =
                             rustpython_host_env::signal::itimerval_to_tuple(&it);
                         return Ok(pyre_object::w_tuple_new(vec![
@@ -5870,6 +6590,141 @@ fn init_signal_stub(ns: &mut DictStorage) {
             "ITIMER_PROF",
             pyre_object::w_int_new(libc::ITIMER_PROF as i64),
         );
+        // pthread_sigmask(how, mask) -> previous mask (set of signums)
+        crate::dict_storage_store(
+            ns,
+            "pthread_sigmask",
+            crate::make_builtin_function_with_arity(
+                "pthread_sigmask",
+                |args| {
+                    #[cfg(feature = "host_env")]
+                    {
+                        if args.len() < 2 {
+                            return Err(crate::PyError::type_error(
+                                "pthread_sigmask() requires 2 arguments",
+                            ));
+                        }
+                        let how = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                        let mask_arg = args[1];
+                        let items: Vec<pyre_object::PyObjectRef> =
+                            if unsafe { pyre_object::is_list(mask_arg) } {
+                                let n = unsafe { pyre_object::w_list_len(mask_arg) };
+                                (0..n)
+                                    .filter_map(|i| unsafe {
+                                        pyre_object::w_list_getitem(mask_arg, i as i64)
+                                    })
+                                    .collect()
+                            } else if unsafe { pyre_object::is_tuple(mask_arg) } {
+                                let n = unsafe { pyre_object::w_tuple_len(mask_arg) };
+                                (0..n)
+                                    .filter_map(|i| unsafe {
+                                        pyre_object::w_tuple_getitem(mask_arg, i as i64)
+                                    })
+                                    .collect()
+                            } else if unsafe { pyre_object::is_set_or_frozenset(mask_arg) } {
+                                unsafe { pyre_object::w_set_items(mask_arg) }
+                            } else {
+                                return Err(crate::PyError::type_error(
+                                    "pthread_sigmask: mask must be a list, tuple, or set",
+                                ));
+                            };
+                        let mut set = rustpython_host_env::signal::sigemptyset().map_err(|e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("sigemptyset: {e}"),
+                            )
+                        })?;
+                        for it in items {
+                            let signum = (unsafe { pyre_object::w_int_get_value(it) }) as i32;
+                            rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
+                                |e| {
+                                    crate::PyError::os_error_with_errno(
+                                        e.raw_os_error().unwrap_or(0),
+                                        format!("sigaddset: {e}"),
+                                    )
+                                },
+                            )?;
+                        }
+                        let prev = rustpython_host_env::signal::pthread_sigmask(how, &set)
+                            .map_err(|e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("pthread_sigmask: {e}"),
+                                )
+                            })?;
+                        let out: Vec<pyre_object::PyObjectRef> = (1..=64)
+                            .filter(|s| {
+                                rustpython_host_env::signal::sigset_contains(&prev, *s as i32)
+                            })
+                            .map(|s| pyre_object::w_int_new(s as i64))
+                            .collect();
+                        return Ok(pyre_object::w_set_from_items(&out));
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = args;
+                        Err(crate::PyError::runtime_error(
+                            "signal.pthread_sigmask requires host_env",
+                        ))
+                    }
+                },
+                2,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SIG_BLOCK",
+            pyre_object::w_int_new(libc::SIG_BLOCK as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SIG_UNBLOCK",
+            pyre_object::w_int_new(libc::SIG_UNBLOCK as i64),
+        );
+        crate::dict_storage_store(
+            ns,
+            "SIG_SETMASK",
+            pyre_object::w_int_new(libc::SIG_SETMASK as i64),
+        );
+        // pidfd_send_signal(pidfd, sig, siginfo=None, flags=0) - Linux-only
+        #[cfg(target_os = "linux")]
+        crate::dict_storage_store(
+            ns,
+            "pidfd_send_signal",
+            crate::make_builtin_function("pidfd_send_signal", |args| {
+                #[cfg(feature = "host_env")]
+                {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "pidfd_send_signal() requires at least 2 arguments",
+                        ));
+                    }
+                    let pidfd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                    let flags = if args.len() >= 4 {
+                        (unsafe { pyre_object::w_int_get_value(args[3]) }) as u32
+                    } else {
+                        0
+                    };
+                    rustpython_host_env::signal::pidfd_send_signal(pidfd, sig, flags).map_err(
+                        |e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("pidfd_send_signal: {e}"),
+                            )
+                        },
+                    )?;
+                    return Ok(pyre_object::w_none());
+                }
+                #[cfg(not(feature = "host_env"))]
+                {
+                    let _ = args;
+                    Err(crate::PyError::runtime_error(
+                        "signal.pidfd_send_signal requires host_env",
+                    ))
+                }
+            }),
+        );
     }
     crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
@@ -5903,9 +6758,17 @@ fn init_signal_stub(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "SIGURG", pyre_object::w_int_new(libc::SIGURG as i64));
         crate::dict_storage_store(ns, "SIGXCPU", pyre_object::w_int_new(libc::SIGXCPU as i64));
         crate::dict_storage_store(ns, "SIGXFSZ", pyre_object::w_int_new(libc::SIGXFSZ as i64));
-        crate::dict_storage_store(ns, "SIGVTALRM", pyre_object::w_int_new(libc::SIGVTALRM as i64));
+        crate::dict_storage_store(
+            ns,
+            "SIGVTALRM",
+            pyre_object::w_int_new(libc::SIGVTALRM as i64),
+        );
         crate::dict_storage_store(ns, "SIGPROF", pyre_object::w_int_new(libc::SIGPROF as i64));
-        crate::dict_storage_store(ns, "SIGWINCH", pyre_object::w_int_new(libc::SIGWINCH as i64));
+        crate::dict_storage_store(
+            ns,
+            "SIGWINCH",
+            pyre_object::w_int_new(libc::SIGWINCH as i64),
+        );
         crate::dict_storage_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
         crate::dict_storage_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
     }
@@ -7656,30 +8519,60 @@ fn init_posix(ns: &mut DictStorage) {
                         },
                     );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "sysname", pyre_object::w_str_new(&info.sysname));
+                        wrapper,
+                        "sysname",
+                        pyre_object::w_str_new(&info.sysname),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "nodename", pyre_object::w_str_new(&info.nodename));
+                        wrapper,
+                        "nodename",
+                        pyre_object::w_str_new(&info.nodename),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "release", pyre_object::w_str_new(&info.release));
+                        wrapper,
+                        "release",
+                        pyre_object::w_str_new(&info.release),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "version", pyre_object::w_str_new(&info.version));
+                        wrapper,
+                        "version",
+                        pyre_object::w_str_new(&info.version),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "machine", pyre_object::w_str_new(&info.machine));
+                        wrapper,
+                        "machine",
+                        pyre_object::w_str_new(&info.machine),
+                    );
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let sysname = std::env::consts::OS.to_string();
                     let machine = std::env::consts::ARCH.to_string();
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "sysname", pyre_object::w_str_new(&sysname));
+                        wrapper,
+                        "sysname",
+                        pyre_object::w_str_new(&sysname),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "nodename", pyre_object::w_str_new(""));
+                        wrapper,
+                        "nodename",
+                        pyre_object::w_str_new(""),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "release", pyre_object::w_str_new(""));
+                        wrapper,
+                        "release",
+                        pyre_object::w_str_new(""),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "version", pyre_object::w_str_new(""));
+                        wrapper,
+                        "version",
+                        pyre_object::w_str_new(""),
+                    );
                     let _ = crate::baseobjspace::setattr(
-                        wrapper, "machine", pyre_object::w_str_new(&machine));
+                        wrapper,
+                        "machine",
+                        pyre_object::w_str_new(&machine),
+                    );
                 }
                 Ok(wrapper)
             },
@@ -7965,9 +8858,7 @@ fn init_posix(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "getlogin",
                 |_| match host_posix::getlogin() {
-                    Some(name) => Ok(pyre_object::w_str_new(
-                        name.to_string_lossy().as_ref(),
-                    )),
+                    Some(name) => Ok(pyre_object::w_str_new(name.to_string_lossy().as_ref())),
                     None => Err(crate::PyError::os_error_with_errno(
                         std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
                         "getlogin",
@@ -8008,8 +8899,8 @@ fn init_posix(ns: &mut DictStorage) {
                         ));
                     }
                     let policy = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                    let m = host_posix::sched_get_priority_max(policy)
-                        .map_err(|e| io_err(e, ""))?;
+                    let m =
+                        host_posix::sched_get_priority_max(policy).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(m as i64))
                 },
                 1,
@@ -8029,8 +8920,8 @@ fn init_posix(ns: &mut DictStorage) {
                         ));
                     }
                     let policy = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                    let m = host_posix::sched_get_priority_min(policy)
-                        .map_err(|e| io_err(e, ""))?;
+                    let m =
+                        host_posix::sched_get_priority_min(policy).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(m as i64))
                 },
                 1,
@@ -8346,8 +9237,7 @@ fn init_posix(ns: &mut DictStorage) {
                     let path = extract_path(args[0])?;
                     let c_path = std::ffi::CString::new(path.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    let info = host_posix::statvfs_path(&c_path)
-                        .map_err(|e| io_err(e, &path))?;
+                    let info = host_posix::statvfs_path(&c_path).map_err(|e| io_err(e, &path))?;
                     Ok(statvfs_to_obj(info))
                 },
                 1,
@@ -8361,9 +9251,7 @@ fn init_posix(ns: &mut DictStorage) {
                 "fstatvfs",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "fstatvfs() requires 1 argument",
-                        ));
+                        return Err(crate::PyError::type_error("fstatvfs() requires 1 argument"));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let info = host_posix::statvfs_fd(fd).map_err(|e| io_err(e, ""))?;
@@ -8467,8 +9355,16 @@ fn init_posix(ns: &mut DictStorage) {
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let uid_raw = unsafe { pyre_object::w_int_get_value(args[1]) };
                     let gid_raw = unsafe { pyre_object::w_int_get_value(args[2]) };
-                    let uid = if uid_raw < 0 { None } else { Some(uid_raw as u32) };
-                    let gid = if gid_raw < 0 { None } else { Some(gid_raw as u32) };
+                    let uid = if uid_raw < 0 {
+                        None
+                    } else {
+                        Some(uid_raw as u32)
+                    };
+                    let gid = if gid_raw < 0 {
+                        None
+                    } else {
+                        Some(gid_raw as u32)
+                    };
                     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
                     host_posix::fchown(bfd, uid, gid).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -8491,8 +9387,7 @@ fn init_posix(ns: &mut DictStorage) {
                         ));
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                    let inherit =
-                        unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
+                    let inherit = unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
                     let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
                     host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -8526,9 +9421,7 @@ fn init_posix(ns: &mut DictStorage) {
                 "chroot",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "chroot() requires 1 argument",
-                        ));
+                        return Err(crate::PyError::type_error("chroot() requires 1 argument"));
                     }
                     let path = extract_path(args[0])?;
                     host_posix::chroot(std::path::Path::new(&path))
@@ -8546,8 +9439,8 @@ fn init_posix(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "getloadavg",
                 |_| {
-                    let [l1, l5, l15] = rustpython_host_env::time::getloadavg()
-                        .map_err(|e| io_err(e, ""))?;
+                    let [l1, l5, l15] =
+                        rustpython_host_env::time::getloadavg().map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_float_new(l1),
                         pyre_object::w_float_new(l5),
@@ -8566,8 +9459,8 @@ fn init_posix(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "times",
                 |_| {
-                    let t = rustpython_host_env::time::process_times()
-                        .map_err(|e| io_err(e, ""))?;
+                    let t =
+                        rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
                     let wrapper = pyre_object::w_instance_new(stat_result_type());
                     let _ = crate::baseobjspace::setattr(
                         wrapper,
@@ -8632,9 +9525,7 @@ fn init_posix(ns: &mut DictStorage) {
                 "system",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "system() requires 1 argument",
-                        ));
+                        return Err(crate::PyError::type_error("system() requires 1 argument"));
                     }
                     let cmd = unsafe {
                         if pyre_object::is_str(args[0]) {
