@@ -75,4 +75,61 @@ pub fn init(ns: &mut DictStorage) {
             pyre_object::w_str_new("UTC"),
         ]),
     );
+
+    // POSIX clock identifiers + clock_gettime / clock_getres
+    // (Unix host_env path only — Windows path uses different timers and
+    // CPython exposes a different surface there.)
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        dict_storage_store(
+            ns,
+            "clock_gettime",
+            make_builtin_function("clock_gettime", interp_time::clock_gettime),
+        );
+        dict_storage_store(
+            ns,
+            "clock_gettime_ns",
+            make_builtin_function("clock_gettime_ns", interp_time::clock_gettime_ns),
+        );
+        #[cfg(not(target_os = "redox"))]
+        dict_storage_store(
+            ns,
+            "clock_getres",
+            make_builtin_function("clock_getres", interp_time::clock_getres),
+        );
+        dict_storage_store(
+            ns,
+            "CLOCK_REALTIME",
+            pyre_object::w_int_new(libc::CLOCK_REALTIME as i64),
+        );
+        dict_storage_store(
+            ns,
+            "CLOCK_MONOTONIC",
+            pyre_object::w_int_new(libc::CLOCK_MONOTONIC as i64),
+        );
+        #[cfg(not(any(
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "openbsd",
+            target_os = "wasi",
+        )))]
+        dict_storage_store(
+            ns,
+            "CLOCK_PROCESS_CPUTIME_ID",
+            pyre_object::w_int_new(libc::CLOCK_PROCESS_CPUTIME_ID as i64),
+        );
+        #[cfg(not(any(
+            target_os = "illumos",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "openbsd",
+            target_os = "redox",
+        )))]
+        dict_storage_store(
+            ns,
+            "CLOCK_THREAD_CPUTIME_ID",
+            pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64),
+        );
+    }
 }

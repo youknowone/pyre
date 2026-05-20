@@ -39,15 +39,28 @@ pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.monotonic() → float
+///
+/// Prefers `clock_gettime(CLOCK_MONOTONIC)` on Unix so callers see a
+/// true monotonic clock; falls back to the wall-clock duration when
+/// host_env is off or the syscall errors.
 pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    // Simplified: use system time as monotonic approximation
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+            return Ok(floatobject::w_float_new(d.as_secs_f64()));
+        }
+    }
     Ok(floatobject::w_float_new(
         duration_since_epoch().as_secs_f64(),
     ))
 }
 
 /// time.sleep(seconds)
+///
+/// Routes through `host_env::time::nanosleep` on Unix when available so
+/// that signal-driven wakeups propagate; falls back to
+/// `std::thread::sleep` otherwise.
 pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "sleep() takes exactly one argument");
     let secs = unsafe {
@@ -59,17 +72,92 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             0.0
         }
     };
-    #[cfg(feature = "host_env")]
-    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-    Ok(w_none())
+    if secs <= 0.0 {
+        return Ok(w_none());
+    }
+    let dur = std::time::Duration::from_secs_f64(secs);
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        let _ = host_time::nanosleep(dur);
+        return Ok(w_none());
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        std::thread::sleep(dur);
+        Ok(w_none())
+    }
 }
 
 /// time.perf_counter() → float
+///
+/// Same MONOTONIC-preferred path as `monotonic`; CPython documents the
+/// two as different clocks but pyre's wall-clock fallback is identical
+/// either way.
 pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+            return Ok(floatobject::w_float_new(d.as_secs_f64()));
+        }
+    }
     Ok(floatobject::w_float_new(
         duration_since_epoch().as_secs_f64(),
     ))
+}
+
+/// time.clock_gettime(clk_id) → float seconds
+#[cfg(all(unix, feature = "host_env"))]
+pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "clock_gettime() missing argument",
+        ));
+    }
+    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
+        crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("clock_gettime: {e}"),
+        )
+    })?;
+    Ok(floatobject::w_float_new(d.as_secs_f64()))
+}
+
+/// time.clock_gettime_ns(clk_id) → int nanoseconds
+#[cfg(all(unix, feature = "host_env"))]
+pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "clock_gettime_ns() missing argument",
+        ));
+    }
+    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
+        crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("clock_gettime_ns: {e}"),
+        )
+    })?;
+    Ok(w_int_new(d.as_nanos() as i64))
+}
+
+/// time.clock_getres(clk_id) → float seconds
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "clock_getres() missing argument",
+        ));
+    }
+    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let d = host_time::clock_getres(host_time::ClockId::from_raw(id)).map_err(|e| {
+        crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("clock_getres: {e}"),
+        )
+    })?;
+    Ok(floatobject::w_float_new(d.as_secs_f64()))
 }
 
 // ── libc tm helpers ──────────────────────────────────────────────────
