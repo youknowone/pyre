@@ -11533,4 +11533,64 @@ mod tests {
         assert!(mainjitcode.is_populated());
         assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
     }
+
+    /// `rewrite_source_terminator_tlabel` finds the last `Insn::Op`
+    /// whose args contain `Operand::TLabel(from)` and renames it in
+    /// place to `to`.  Used by [`emit_trampoline_for_multi_pred_link`]
+    /// to redirect the source block's branch onto a trampoline.
+    #[test]
+    fn rewrite_source_terminator_tlabel_renames_last_matching_tlabel() {
+        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
+
+        let target_name = "block_target_42".to_string();
+        let trampoline_name = "epsilon3_link_0".to_string();
+        let live = Insn::live(Vec::new());
+        let goto_if_not = Insn::op(
+            "goto_if_not",
+            vec![
+                Operand::reg(Kind::Int, 5),
+                Operand::TLabel(TLabel::new(target_name.clone())),
+            ],
+        );
+        let source =
+            super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        source.push_insn(live);
+        source.push_insn(goto_if_not);
+
+        let rewrote = super::rewrite_source_terminator_tlabel(
+            &source,
+            &target_name,
+            &trampoline_name,
+        );
+        assert!(rewrote, "expected rewrite to succeed");
+
+        let insns = source.per_block_ssarepr();
+        match &insns[1] {
+            Insn::Op { opname, args, .. } => {
+                assert_eq!(opname, "goto_if_not");
+                let tl = args.iter().find_map(|a| match a {
+                    Operand::TLabel(t) => Some(t.name.clone()),
+                    _ => None,
+                });
+                assert_eq!(tl.as_deref(), Some(trampoline_name.as_str()));
+            }
+            other => panic!("expected goto_if_not at index 1, got {other:?}"),
+        }
+        // Spurious test of the non-match path: rename of an absent
+        // TLabel reports failure and does not mutate the block.
+        let absent = "block_absent_99".to_string();
+        let new_name = "epsilon3_link_99".to_string();
+        let rewrote2 = super::rewrite_source_terminator_tlabel(&source, &absent, &new_name);
+        assert!(!rewrote2, "expected rewrite to report no match");
+
+        // Ensures the absent-rename did not corrupt the prior rewrite.
+        let insns_after = source.per_block_ssarepr();
+        assert!(
+            matches!(&insns_after[1],
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == trampoline_name))),
+            "post-non-match block must still carry the first rewrite",
+        );
+        let _ = FlatLabel::new("unused");
+    }
 }
