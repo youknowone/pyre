@@ -2730,6 +2730,12 @@ mod tests {
 
         let mut ops = vec![get_array_ptr, get_item, get_item_again];
         assign_positions(&mut ops);
+        // Route raw array reads through the GetfieldRawI result so
+        // resolve_array_source() sees the producing OpRef, not the bare vable
+        // inputarg.
+        let array_ptr_ref = ops[0].pos.get();
+        ops[1].setarg(0, array_ptr_ref);
+        ops[2].setarg(0, array_ptr_ref);
 
         for op in &ops {
             let mut resolved = op.clone();
