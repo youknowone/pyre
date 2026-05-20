@@ -1273,22 +1273,6 @@ fn append_exit_tagged(
     block.borrow_mut().exits.push(link.clone());
 }
 
-/// Atomically append `link` to `block.exits` and snapshot
-/// `source_state` into `link_exit_states`.  The HashMap consumer
-/// (`collect_link_slot_pairs`) was retired (slot pairs are trivially
-/// equal by `getoutputargs_with_positions` construction); the
-/// snapshot capture chain remains pending S4 retirement to keep the
-/// slice diffs small.
-fn append_exit_with_state(
-    block: &super::flow::BlockRef,
-    link: super::flow::LinkRef,
-    source_state: &FrameState,
-    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
-) {
-    link_exit_states.insert(link.clone(), source_state.clone());
-    append_exit(block, link);
-}
-
 fn output_link(
     source_state: &FrameState,
     target_state: &FrameState,
@@ -1543,7 +1527,6 @@ fn make_next_block(
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
-    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
@@ -1557,11 +1540,9 @@ fn make_next_block(
     // order their emits reached the program-wide `ssarepr.insns`.
     all_walker_blocks.push(newblock.clone());
     newblock.block().borrow_mut().inputargs = newstate.getvariables();
-    append_exit_with_state(
+    append_exit(
         &currentblock.block(),
         output_link(currentstate, &newstate, newblock.block()),
-        currentstate,
-        link_exit_states,
     );
     // flowcontext.py:472 `self.pendingblocks.append(newblock)`.
     pendingblocks.push_back(newblock.clone());
@@ -1575,7 +1556,6 @@ fn mergeblock(
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
-    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
@@ -1590,11 +1570,9 @@ fn mergeblock(
             continue;
         };
         if newstate.matches(&block_state) {
-            append_exit_with_state(
+            append_exit(
                 &currentblock.block(),
                 output_link(currentstate, &newstate, block.block()),
-                currentstate,
-                link_exit_states,
             );
             // Pyre-only head-of-list promotion.  Upstream
             // `flowcontext.py:438-441` returns the matched block
@@ -1631,11 +1609,9 @@ fn mergeblock(
         // supersede-newblock in walker-visit order.
         all_walker_blocks.push(newblock.clone());
         newblock.block().borrow_mut().inputargs = newstate.getvariables();
-        append_exit_with_state(
+        append_exit(
             &currentblock.block(),
             output_link(currentstate, &newstate, newblock.block()),
-            currentstate,
-            link_exit_states,
         );
 
         // flowcontext.py:455-463 supersede.  The line-by-line port:
@@ -1657,7 +1633,6 @@ fn mergeblock(
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
         let supersede_link = output_link(&block_state, &newstate, newblock.block());
-        link_exit_states.insert(supersede_link.clone(), block_state.clone());
         block.block().recloseblock(vec![supersede_link]);
 
         candidates.remove(index);
@@ -1674,7 +1649,6 @@ fn mergeblock(
         currentblock,
         currentstate,
         next_offset,
-        link_exit_states,
         pendingblocks,
         all_walker_blocks,
     );
@@ -2367,7 +2341,6 @@ fn attach_catch_exception_edge(
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
     source_state: &FrameState,
-    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> super::flow::LinkRef {
     // `flowcontext.py:148-149 guessexception` sets
     // `block.exitswitch = c_last_exception` before the link is
@@ -2429,7 +2402,8 @@ fn attach_catch_exception_edge(
         .with_arg_positions(arg_positions);
     link.extravars(Some(exc_type), Some(exc_value));
     let link = link.into_ref();
-    append_exit_with_state(block, link.clone(), source_state, link_exit_states);
+    let _ = source_state;
+    append_exit(block, link.clone());
     link
 }
 
@@ -3624,14 +3598,6 @@ impl CodeWriter {
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, &mut graph, code, num_instrs);
         let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); num_instrs];
-        // Walker snapshots `currentstate` into `link_exit_states` at
-        // each terminator.  The HashMap consumer
-        // (`collect_link_slot_pairs`) was retired in S3 because the
-        // slot pairs it produced were trivially equal by
-        // `getoutputargs_with_positions` construction; the producer
-        // chain stays for now to keep slice diffs small and will
-        // retire in S4.
-        let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
         let start_state = entry_frame_state(code, is_portal);
         // Collect every walker-created block in walker-visit order so the
         // post-walk drain can iterate per-block accumulators in the same
@@ -3983,13 +3949,7 @@ impl CodeWriter {
                 let link =
                     super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None)
                         .into_ref();
-                // snapshot the EXIT FrameState.
-                append_exit_with_state(
-                    &current_block.block(),
-                    link,
-                    &current_state,
-                    &mut link_exit_states,
-                );
+                append_exit(&current_block.block(), link);
                 needs_fallthrough = false;
             }};
         }
@@ -4024,7 +3984,6 @@ impl CodeWriter {
                         branch_state
                     },
                     target_py_pc,
-                    &mut link_exit_states,
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
@@ -4128,12 +4087,8 @@ impl CodeWriter {
                     None,
                 );
                 let link = link.into_ref();
-                append_exit_with_state(
-                    &current_block.block(),
-                    link,
-                    &edge_state,
-                    &mut link_exit_states,
-                );
+                let _ = edge_state;
+                append_exit(&current_block.block(), link);
                 needs_fallthrough = false;
             }};
         }
@@ -4176,14 +4131,7 @@ impl CodeWriter {
                 // link.last_exc_value]` matches and emits `reraise`.
                 link.extravars(Some(etype), Some(evalue));
                 let link = link.into_ref();
-                // snapshot the EXIT state (same
-                // reasoning as `emit_raise!`).
-                append_exit_with_state(
-                    &current_block.block(),
-                    link,
-                    &current_state,
-                    &mut link_exit_states,
-                );
+                append_exit(&current_block.block(), link);
                 needs_fallthrough = false;
             }};
         }
@@ -4226,7 +4174,6 @@ impl CodeWriter {
                     &current_block.block(),
                     &landing,
                     &current_state,
-                    &mut link_exit_states,
                 );
             }};
         }
@@ -4262,7 +4209,7 @@ impl CodeWriter {
                 // first iteration of the inner `for py_pc in
                 // start_pc..` would call `mergeblock(currentblock=
                 // pending_block, py_pc=start_pc)` — a no-op transition
-                // whose only side-effect is to `append_exit_with_state`
+                // whose only side-effect is to `append_exit`
                 // a `pending_block → pending_block` self-loop, leaving
                 // every empty pending block with two outgoing edges
                 // (the self-loop + the next PC's fallthrough) and no
@@ -4339,7 +4286,6 @@ impl CodeWriter {
                         &current_block,
                         &current_state,
                         py_pc,
-                        &mut link_exit_states,
                         &mut pendingblocks,
                         &mut all_walker_blocks,
                     );
@@ -4603,7 +4549,6 @@ impl CodeWriter {
                         branch_state
                     },
                     py_pc,
-                    &mut link_exit_states,
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
@@ -4639,7 +4584,6 @@ impl CodeWriter {
                         branch_state
                     },
                     py_pc,
-                    &mut link_exit_states,
                     &mut pendingblocks,
                     &mut all_walker_blocks,
                 );
@@ -6290,7 +6234,6 @@ impl CodeWriter {
                                         branch_state
                                     },
                                     fallthrough_py_pc,
-                                    &mut link_exit_states,
                                     &mut pendingblocks,
                                     &mut all_walker_blocks,
                                 );
@@ -6402,7 +6345,6 @@ impl CodeWriter {
                                         branch_state
                                     },
                                     target_py_pc,
-                                    &mut link_exit_states,
                                     &mut pendingblocks,
                                     &mut all_walker_blocks,
                                 );
@@ -10791,7 +10733,6 @@ mod tests {
         let mut graph = new_shadow_graph(&code);
         let catch_block = graph.new_block(Vec::new());
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
-        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
 
@@ -10800,7 +10741,6 @@ mod tests {
             &startblock_ref,
             &catch_ref,
             &source_state,
-            &mut link_exit_states,
         );
         let startblock = graph.startblock.borrow();
 
@@ -10824,7 +10764,6 @@ mod tests {
         let mut graph = new_shadow_graph(&code);
         let catch_block = graph.new_block(Vec::new());
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
-        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let source_state = FrameState::new(
             vec![Some(Variable::new(VariableId(0), Kind::Ref).into())],
             Vec::new(),
@@ -10839,7 +10778,6 @@ mod tests {
             &startblock_ref,
             &catch_ref,
             &source_state,
-            &mut link_exit_states,
         );
 
         let link_borrow = link.borrow();
@@ -10851,7 +10789,6 @@ mod tests {
             .framestate()
             .expect("catch landing should acquire a FrameState");
         assert!(catch_state.last_exception.is_some());
-        assert_eq!(link_exit_states.get(&link), Some(&source_state));
     }
 
     #[test]
@@ -10860,7 +10797,6 @@ mod tests {
         let mut graph = new_shadow_graph(&code);
         let catch_block = graph.new_block(Vec::new());
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
-        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let local = Variable::new(VariableId(0), Kind::Ref);
         let source_state =
             FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
@@ -10876,7 +10812,6 @@ mod tests {
             &startblock_ref,
             &catch_ref,
             &source_state,
-            &mut link_exit_states,
         );
 
         let inputargs = catch_block.borrow().inputargs.clone();
@@ -10939,7 +10874,6 @@ mod tests {
         );
         let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 2];
         joinpoints[1] = vec![target_block.clone()];
-        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
@@ -10950,7 +10884,6 @@ mod tests {
             &current_block,
             &current_state,
             1,
-            &mut link_exit_states,
             &mut pendingblocks,
             &mut all_walker_blocks,
         );
@@ -11007,7 +10940,6 @@ mod tests {
         );
         let mut joinpoints: Vec<Vec<SpamBlockRef>> = vec![Vec::new(); 3];
         joinpoints[2] = vec![existing_block.clone()];
-        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
@@ -11018,7 +10950,6 @@ mod tests {
             &current_block,
             &source_state,
             2,
-            &mut link_exit_states,
             &mut pendingblocks,
             &mut all_walker_blocks,
         );
