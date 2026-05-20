@@ -3,37 +3,48 @@
 //! PyPy equivalent: pypy/module/time/interp_time.py
 
 use pyre_object::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "host_env")]
 use rustpython_host_env::time as host_time;
+#[cfg(not(feature = "host_env"))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Wall-clock seconds since the unix epoch, falling back to 0 on
+/// `SystemTimeError`.  Routes through `host_env::time` when enabled.
+fn duration_since_epoch() -> std::time::Duration {
+    #[cfg(feature = "host_env")]
+    {
+        host_time::duration_since_system_now().unwrap_or_default()
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+    }
+}
 
 /// time.time() → float (seconds since epoch)
 pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Ok(floatobject::w_float_new(now.as_secs_f64()))
+    Ok(floatobject::w_float_new(
+        duration_since_epoch().as_secs_f64(),
+    ))
 }
 
 /// time.time_ns() → int (nanoseconds since epoch)
 pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Ok(w_int_new(now.as_nanos() as i64))
+    Ok(w_int_new(duration_since_epoch().as_nanos() as i64))
 }
 
 /// time.monotonic() → float
 pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     // Simplified: use system time as monotonic approximation
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Ok(floatobject::w_float_new(now.as_secs_f64()))
+    Ok(floatobject::w_float_new(
+        duration_since_epoch().as_secs_f64(),
+    ))
 }
 
 /// time.sleep(seconds)
@@ -56,10 +67,9 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// time.perf_counter() → float
 pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Ok(floatobject::w_float_new(now.as_secs_f64()))
+    Ok(floatobject::w_float_new(
+        duration_since_epoch().as_secs_f64(),
+    ))
 }
 
 // ── libc tm helpers ──────────────────────────────────────────────────
@@ -218,10 +228,7 @@ fn _get_seconds(args: &[PyObjectRef]) -> time_t {
             }
         }
     }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as time_t)
-        .unwrap_or(0)
+    duration_since_epoch().as_secs() as time_t
 }
 
 /// Extract a `c_tm` from a Python time tuple argument.
