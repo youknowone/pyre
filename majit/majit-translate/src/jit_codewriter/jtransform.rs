@@ -61,11 +61,35 @@ impl VirtualizableFieldDescriptor {
     }
 
     fn matches(&self, field: &FieldDescriptor) -> bool {
-        self.name == field.name
-            && self
-                .owner_root
-                .as_ref()
-                .is_none_or(|owner| field.owner_root.as_ref() == Some(owner))
+        if self.name != field.name {
+            return false;
+        }
+        let Some(cfg_owner) = self.owner_root.as_ref() else {
+            return true;
+        };
+        let Some(field_owner) = field.owner_root.as_ref() else {
+            return false;
+        };
+        // RPython `jtransform.py:982 self.callcontrol.get_vinfo(
+        // v_virtualizable.concretetype)` compares lltype object IDENTITY
+        // — a single `Ptr(GcStruct(...))` instance per type, looked up
+        // by the call control's `vinfos` dict.  Pyre carries the same
+        // identity as a string `owner_root`; the canonical form is
+        // `"<module_path>::<bare_name>"` (see
+        // `descr.rs canonical_struct_name`).  Helpers built from
+        // `impl OpcodeStepExecutor for PyFrame` in `pyre-interpreter`
+        // resolve `self` to `"pyframe::PyFrame"`; the vable config
+        // (`virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT`) ships the
+        // bare `"PyFrame"` for symmetry with `lib.rs`'s fixture-side
+        // vable_fields registrations.  Compare against the canonical
+        // form so both shapes match without mutating either source of
+        // truth.
+        if cfg_owner == field_owner {
+            return true;
+        }
+        let cfg_canonical = majit_ir::descr::canonical_struct_name(cfg_owner);
+        let field_canonical = majit_ir::descr::canonical_struct_name(field_owner);
+        cfg_canonical == field_canonical
     }
 }
 

@@ -2490,7 +2490,7 @@ fn getfield_vable_via_metainterp(
         ConcreteValue::Null => 0,
         ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
     };
-    let (result, _value) = match dst_bank {
+    let (result, _shadow_value) = match dst_bank {
         'i' => ctx
             .trace_ctx
             .vable_getfield_int(pc, obj, vable_struct_ptr, descr),

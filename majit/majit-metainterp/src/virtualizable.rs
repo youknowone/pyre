@@ -334,14 +334,32 @@ impl VirtualizableInfo {
             })
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
+        // RPython's dict[descr] is identity-keyed on the unique FieldDescr
+        // object `cpu.fielddescrof(VTYPE, name)` returned to both vinfo
+        // and the codewriter.  Pyre splits that role: vinfo carries
+        // offset/size-bearing SimpleFieldDescr instances (used by
+        // `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
+        // to emit GETFIELD_GC at loop entry), while the codewriter emits
+        // the `vable_static_field_descr(idx)` singleton in
+        // `BhDescr::VableField` (codewriter/assembler.rs:1626).  Both
+        // refer to the same logical (vable, field), so register BOTH
+        // arc identities under the same idx — `vable_getfield_int`'s
+        // identity lookup then resolves whichever descr the walker
+        // hands it.
         self.static_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, d) in self._static_field_descrs.iter().enumerate() {
             self.static_field_by_descrs.insert(descr_identity(d), i);
+            let canonical = majit_ir::descr::vable_static_field_descr(i as u16);
+            self.static_field_by_descrs
+                .insert(descr_identity(&canonical), i);
         }
         // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
         self.array_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, d) in self._array_field_descrs.iter().enumerate() {
             self.array_field_by_descrs.insert(descr_identity(d), i);
+            let canonical = majit_ir::descr::vable_array_field_descr(i as u16);
+            self.array_field_by_descrs
+                .insert(descr_identity(&canonical), i);
         }
     }
 
