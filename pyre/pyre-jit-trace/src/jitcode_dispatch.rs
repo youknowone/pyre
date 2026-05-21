@@ -1365,11 +1365,16 @@ fn dispatch_switch_id(
 /// dispatch wholesale.
 ///
 /// Field plumbing:
-/// * `registers_r/i/f` — borrowed mutably from `miframe.sym`'s
-///   per-bank vectors. Walker handlers writing dst slots
-///   (`int_copy`, `binop_int_record`, etc.) mutate them in place,
-///   matching how `MIFrame::execute_opcode_step` mutates the same
-///   fields today.
+/// * `registers_r/i/f` — allocated fresh per call sized to
+///   `top_num_regs_* + top_constants_*.len()`, then populated by
+///   the inline `setup_call` from `argboxes_*` and constant slots.
+///   PyPy parity: `pyjitpl.py:171-176 MIFrame.__init__` allocates
+///   the bank vectors at frame construction; `:188 setup_call`
+///   populates slots `[0..argboxes.len())` from the caller's
+///   argboxes. Walker handlers writing dst slots (`int_copy`,
+///   `binop_int_record`, etc.) mutate them in place; the banks are
+///   dropped when this function returns (matching PyPy's per-frame
+///   lifetime).
 /// * `trace_ctx` — borrowed mutably from `miframe.ctx`'s
 ///   `TraceCtx`. Recording (`record_op`, `finish`, etc.) goes
 ///   through this.
@@ -1407,6 +1412,7 @@ fn dispatch_switch_id(
 /// **Production wiring**: `crate::shadow_walker::shadow_validate_pre`
 /// is the first caller; it passes `is_top_level: false` for per-opcode
 /// shadow validation.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
     jitcode_code: &[u8],
@@ -1419,6 +1425,32 @@ pub fn dispatch_via_miframe(
     done_with_this_frame_descr_void: DescrRef,
     exit_frame_with_exception_descr_ref: DescrRef,
     is_top_level: bool,
+    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: the
+    // top-level jitcode's per-bank register count.  `dispatch_via_miframe`
+    // allocates fresh `Vec<OpRef>`s sized to `top_num_regs_* +
+    // top_constants_*.len()` — replacing the prior NEW-DEVIATION that
+    // reused `sym.registers_r` (a Python locals/stack mirror) as the
+    // MIFrame register file.  The codewriter-compiled arm jitcode
+    // expects `R[0]_r = handler = MIFrame self ptr`, which the
+    // `argboxes_*` parameters supply via the `setup_call` analog
+    // below.
+    top_num_regs_r: usize,
+    top_num_regs_i: usize,
+    top_num_regs_f: usize,
+    // Top-level jitcode's per-bank constant pool — seeded into
+    // register slots `[num_regs_*, num_regs_* + constants_*.len())`
+    // per `pyjitpl.py:98-119 copy_constants`.
+    top_constants_r: &[i64],
+    top_constants_i: &[i64],
+    top_constants_f: &[i64],
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog.
+    // `argboxes_*[i]` is written to `registers_*[i]` before walking.
+    // Production callers supply `argboxes_r = [const_ref(miframe_ptr)]`
+    // so the codewriter-compiled arm finds the MIFrame self ptr at
+    // `R[0]_r`.
+    argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Extract raw pointers before any borrow. `miframe.ctx` and
     // `miframe.sym` are `*mut`, distinct objects (the trace
@@ -1451,41 +1483,75 @@ pub fn dispatch_via_miframe(
         Some(sym.last_exc_box)
     };
 
-    // M4.Cutover Step 1: snapshot concrete shadow for `registers_r`.
-    // `sym.registers_r` is the semantic frame mirror (locals first,
-    // then stack); the parallel concrete shadow lives split across
-    // `sym.concrete_locals` (size = nlocals) + `sym.concrete_stack`
-    // (size = current stack depth). Concatenate into a single
-    // semantic-slot indexed Vec sized to `registers_r.len()` so
-    // walker handlers can read by the same byte-indexed reg number.
-    // Any tail slots beyond `concrete_locals + concrete_stack` get
-    // `ConcreteValue::Null` (matches `concrete_value_at`'s fallback
-    // at `state.rs:3225`).
-    let mut concrete_r_snapshot: Vec<ConcreteValue> = {
-        let total = sym.registers_r.len();
-        let nlocals = sym.concrete_locals.len();
-        (0..total)
-            .map(|i| {
-                if i < nlocals {
-                    sym.concrete_locals[i]
-                } else {
-                    sym.concrete_stack
-                        .get(i - nlocals)
-                        .copied()
-                        .unwrap_or(ConcreteValue::Null)
-                }
-            })
-            .collect()
-    };
-    // Task #75.B: allocate Int-bank concrete shadow sized to
-    // `sym.registers_i.len()`, all slots seeded with
-    // `ConcreteValue::Null` since pyre's PyreSym holds Python ints
-    // boxed in `concrete_locals` (Ref bank) — the Int bank is for
-    // unboxed intermediate values produced by walker handlers like
-    // `int_add/iiR>i`, which lazily populate `concrete_registers_i`
-    // (Task #75.C+).  No semantic-slot seed exists at trace entry.
-    let mut concrete_i_snapshot: Vec<ConcreteValue> =
-        vec![ConcreteValue::Null; sym.registers_i.len()];
+    // PyPy `pyjitpl.py:171-176 MIFrame.__init__` analog: allocate
+    // fresh per-bank register vectors sized to `top_num_regs_* +
+    // top_constants_*.len()`.  This replaces the prior NEW-DEVIATION
+    // that reused `sym.registers_r` (a Python locals/stack mirror,
+    // whose `[0]` slot is Python local 0) as the MIFrame register
+    // file.  The codewriter-compiled arm jitcode emits getfield
+    // chains rooted at `R[0] = handler = MIFrame self ptr`; the
+    // `argboxes_r` parameter supplies that handler ptr below via the
+    // `setup_call` analog.
+    let total_r = top_num_regs_r + top_constants_r.len();
+    let total_i = top_num_regs_i + top_constants_i.len();
+    let total_f = top_num_regs_f + top_constants_f.len();
+    let mut top_regs_r = vec![OpRef::NONE; total_r];
+    let mut top_regs_i = vec![OpRef::NONE; total_i];
+    let mut top_regs_f = vec![OpRef::NONE; total_f];
+    let mut top_concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut top_concrete_i = vec![ConcreteValue::Null; total_i];
+
+    // PyPy `pyjitpl.py:98-119 copy_constants` analog: seed each
+    // constant into the upper slot range `[num_regs_*, total_*)`.
+    // `box_value` resolves these via `TraceCtx::constants` so
+    // downstream getfield chains see the constant's `Value::*`.
+    for (i, &v) in top_constants_i.iter().enumerate() {
+        top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
+        top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
+    }
+    for (i, &v) in top_constants_r.iter().enumerate() {
+        top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
+        if v != 0 {
+            top_concrete_r[top_num_regs_r + i] =
+                ConcreteValue::Ref(v as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &v) in top_constants_f.iter().enumerate() {
+        top_regs_f[top_num_regs_f + i] = trace_ctx.const_float(v);
+    }
+
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog: write
+    // each argbox into the leading register slot.  The concrete
+    // shadow is derived from `box_value(box)` — for `ConstRef(ptr)`
+    // (the common case: argbox=miframe self ptr), this is
+    // `Some(Value::Ref(GcRef(ptr)))` resolved via the constant pool;
+    // for non-const argboxes it consults the `opref_concrete` stamp
+    // table.
+    for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        if i >= top_num_regs_r {
+            break;
+        }
+        top_regs_r[i] = box_ref;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
+            top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
+    for (i, &box_ref) in argboxes_i.iter().enumerate() {
+        if i >= top_num_regs_i {
+            break;
+        }
+        top_regs_i[i] = box_ref;
+        if let Some(majit_ir::Value::Int(v)) = trace_ctx.box_value(box_ref) {
+            top_concrete_i[i] = ConcreteValue::Int(v);
+        }
+    }
+    for (i, &box_ref) in argboxes_f.iter().enumerate() {
+        if i >= top_num_regs_f {
+            break;
+        }
+        top_regs_f[i] = box_ref;
+    }
+
     // M4.Cutover Step 2.2: seed last_exc_value_concrete from
     // sym.last_exc_value (the live PyObjectRef written by trait-side
     // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
@@ -1496,61 +1562,13 @@ pub fn dispatch_via_miframe(
         ConcreteValue::Ref(sym.last_exc_value)
     };
 
-    // Task #165 + #165.B: stamp the OpRef-keyed `opref_concrete` table
-    // from the live `locals_cells_stack_w` heap pointers so
-    // `TraceCtx::box_value` / `concrete_of_opref` surface the actual
-    // PyObjectRef the codewriter-emitted `getfield_gc_i` would read
-    // from.
-    //
-    // Reading from the heap PyFrame (rather than the slot-keyed
-    // `concrete_r_snapshot`) is load-bearing for the unboxed-small-int
-    // case: when a Python int local is shadowed as
-    // `ConcreteValue::Int(n)`, the heap pointer (PyLong*) is the only
-    // value the walker's getfield handler can use for
-    // `field_sanity_load`.  RPython parity: `BoxPtr(value)` carries the
-    // raw struct ptr; pyre's unboxing is the deviation, and walker
-    // entry must recover the heap view to bridge it.
-    //
-    // The slot-keyed `concrete_r_snapshot` stays as-is — handlers reading
-    // it via `read_ref_reg_concrete` get the unboxed view (useful for
-    // int math); `box_value(opref)` returns the heap-pointer view
-    // (useful for heap-field reads).
-    let concrete_frame = sym.concrete_vable_ptr as usize;
-    if concrete_frame != 0 {
-        for (i, opref) in sym.registers_r.iter().copied().enumerate() {
-            if opref.is_constant() {
-                continue;
-            }
-            if let Some(obj) = crate::state::concrete_stack_value(concrete_frame, i) {
-                if !obj.is_null() {
-                    trace_ctx.set_opref_concrete(
-                        opref,
-                        majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),
-                    );
-                }
-            }
-        }
-    } else {
-        // Test fixtures may instantiate WalkContext without a backing
-        // PyFrame; fall back to the slot-keyed snapshot's Ref subset.
-        for (i, opref) in sym.registers_r.iter().copied().enumerate() {
-            if opref.is_constant() {
-                continue;
-            }
-            if let ConcreteValue::Ref(ptr) = concrete_r_snapshot[i] {
-                trace_ctx
-                    .set_opref_concrete(opref, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            }
-        }
-    }
-
     let result = {
         let mut wc = WalkContext {
-            registers_r: &mut sym.registers_r,
-            registers_i: &mut sym.registers_i,
-            registers_f: &mut sym.registers_f,
-            concrete_registers_r: &mut concrete_r_snapshot,
-            concrete_registers_i: &mut concrete_i_snapshot,
+            registers_r: &mut top_regs_r,
+            registers_i: &mut top_regs_i,
+            registers_f: &mut top_regs_f,
+            concrete_registers_r: &mut top_concrete_r,
+            concrete_registers_i: &mut top_concrete_i,
             descr_refs,
             trace_ctx,
             done_with_this_frame_descr_ref,
@@ -11432,6 +11450,11 @@ mod tests {
             .expect("`ref_return/r` must be in insns table");
         let code = [ret_byte, 0x02];
         let descr = make_fail_descr(1);
+        // PyPy `setup_call(argboxes)` analog: stamp `expected_arg` at
+        // `R[2]_r` so the `ref_return r2` walker handler picks it up
+        // from the fresh top-level register file.  Slots 0/1 stay
+        // `OpRef::NONE` since this fixture exercises only slot 2.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, expected_arg];
         let (outcome, end_pc) = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11444,6 +11467,15 @@ mod tests {
             make_fail_descr(103),
             make_fail_descr(2),
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("dispatch_via_miframe must succeed for ref_return r2");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -11505,6 +11537,9 @@ mod tests {
         let code = [raise_byte, 0x03];
         let descr_done = make_fail_descr(1);
         let descr_exc = make_fail_descr(99);
+        // Setup_call argbox at R[3]_r: `raise/r` reads its exc operand
+        // from this slot in the fresh top-level register file.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, OpRef::NONE, exc_oprep];
         let (outcome, _) = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11517,6 +11552,15 @@ mod tests {
             make_fail_descr(103),
             descr_exc,
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("dispatch_via_miframe must succeed for raise r3");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -11574,6 +11618,9 @@ mod tests {
             .get("ref_return/r")
             .expect("`ref_return/r` must be in insns table");
         let code = [ret_byte, 0x02];
+        // Setup_call argbox at R[2]_r — the `ref_return r2` walker
+        // handler picks it up from the fresh top-level register file.
+        let argboxes_r = [OpRef::NONE, OpRef::NONE, value];
         let _ = dispatch_via_miframe(
             &mut miframe,
             &code,
@@ -11586,6 +11633,15 @@ mod tests {
             make_fail_descr(103),
             make_fail_descr(2),
             true,
+            8,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &argboxes_r,
+            &[],
+            &[],
         )
         .expect("ref_return walk must succeed");
         drop(miframe);

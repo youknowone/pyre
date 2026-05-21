@@ -310,6 +310,17 @@ pub fn shadow_validate_pre(
     // surfaces as `SubReturn` to the dispatcher (no FINISH). The trait
     // dispatch path doesn't emit a per-opcode FINISH either, so shadow
     // mode must run the walker as a sub-frame to match.
+    //
+    // PyPy `pyjitpl.py:188-200 setup_call(argboxes)` analog: the
+    // codewriter-compiled arm `opcode_<name><H>(handler: &mut H)`
+    // expects `R[0]_r = handler = MIFrame self ptr`.  Mint a fresh
+    // `ConstRef(miframe as i64)` so `box_value(arg)` resolves to
+    // `Value::Ref(GcRef(miframe_ptr))` via the const pool, then pass
+    // it as the sole ref-bank argbox.  Int/Float banks have no args
+    // for opcode arm bodies.
+    let miframe_self_ptr = miframe as *mut MIFrame as i64;
+    let miframe_box = miframe.ctx().const_ref(miframe_self_ptr);
+    let argboxes_r = [miframe_box];
     let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
         miframe,
         jitcode.code.as_slice(),
@@ -322,6 +333,15 @@ pub fn shadow_validate_pre(
         done_void,
         exit_exc_ref,
         false,
+        jitcode.num_regs_r() as usize,
+        jitcode.num_regs_i() as usize,
+        jitcode.num_regs_f() as usize,
+        jitcode.constants_r.as_slice(),
+        jitcode.constants_i.as_slice(),
+        jitcode.constants_f.as_slice(),
+        &argboxes_r,
+        &[],
+        &[],
     );
     if let Err(e) = walk_result {
         panic!(
