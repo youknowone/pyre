@@ -1717,3 +1717,85 @@ pub fn execute_pure_call(
         majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
     }
 }
+
+#[cfg(test)]
+mod execute_pure_call_tests {
+    use super::*;
+    use majit_ir::descr::SimpleCallDescr;
+    use majit_ir::{EffectInfo, ExtraEffect, Type};
+
+    extern "C" fn double_i64(x: i64) -> i64 {
+        x.wrapping_mul(2)
+    }
+
+    extern "C" fn add3_i64(a: i64, b: i64, c: i64) -> i64 {
+        a.wrapping_add(b).wrapping_add(c)
+    }
+
+    extern "C" fn pack_float_to_bits(x: i64) -> i64 {
+        let f = f64::from_bits(x as u64) * 2.0;
+        f.to_bits() as i64
+    }
+
+    extern "C" fn void_no_op(_x: i64) {}
+
+    fn make_descr(arg_types: Vec<Type>, result_type: Type) -> SimpleCallDescr {
+        let mut effect = EffectInfo::default();
+        effect.extraeffect = ExtraEffect::ElidableCannotRaise;
+        SimpleCallDescr::new(0, arg_types, result_type, false, 8, effect)
+    }
+
+    #[test]
+    fn executes_single_int_arg_and_returns_doubled_result() {
+        let descr = make_descr(vec![Type::Int], Type::Int);
+        let result = execute_pure_call(&descr, double_i64 as *const () as i64, &[21]);
+        assert_eq!(result, 42, "double_i64(21) must return 42");
+    }
+
+    #[test]
+    fn executes_three_int_args_routing_through_call_int_function() {
+        let descr = make_descr(vec![Type::Int, Type::Int, Type::Int], Type::Int);
+        let result = execute_pure_call(&descr, add3_i64 as *const () as i64, &[100, 20, 3]);
+        assert_eq!(result, 123, "add3_i64(100, 20, 3) must return 123");
+    }
+
+    #[test]
+    fn float_result_routes_through_call_int_function_with_bits_packing() {
+        let descr = make_descr(vec![Type::Float], Type::Float);
+        let input_bits = 3.5_f64.to_bits() as i64;
+        let result = execute_pure_call(
+            &descr,
+            pack_float_to_bits as *const () as i64,
+            &[input_bits],
+        );
+        let result_f = f64::from_bits(result as u64);
+        assert_eq!(result_f, 7.0, "3.5 * 2.0 must equal 7.0");
+    }
+
+    #[test]
+    fn void_return_routes_through_call_void_function_and_returns_zero_sentinel() {
+        let descr = make_descr(vec![Type::Int], Type::Void);
+        let result = execute_pure_call(&descr, void_no_op as *const () as i64, &[99]);
+        assert_eq!(result, 0, "void execute_pure_call returns the 0 sentinel");
+    }
+
+    #[test]
+    #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
+    fn non_elidable_ei_panics_debug_assertion() {
+        let mut effect = EffectInfo::default();
+        effect.extraeffect = ExtraEffect::CannotRaise;
+        let descr =
+            SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
+        let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
+    fn elidable_can_raise_panics_debug_assertion() {
+        let mut effect = EffectInfo::default();
+        effect.extraeffect = ExtraEffect::ElidableCanRaise;
+        let descr =
+            SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
+        let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
+    }
+}
