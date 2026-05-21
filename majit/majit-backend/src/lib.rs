@@ -18,6 +18,20 @@ use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 /// `cpu.tracker` chain collapses to one process-global instance
 /// reachable via [`cpu_tracker`].
 ///
+/// **STRUCTURAL ADAPTATION — process-global vs per-instance.**  PyPy
+/// reads totals via `Profiler.get_counter(TOTAL_*)` →
+/// `getattr(self.cpu.tracker, ...)` so each `AbstractCPU` instance owns
+/// its own counts.  Pyre's `cpu_tracker()` collapses that to one
+/// `OnceLock<CpuTotalTracker>`; if pyre later supports multiple
+/// `Backend` instances in one process (e.g. cross-isolate JIT, parallel
+/// translation tests holding their own backend), counts will be shared
+/// across them — diverging from PyPy where each CPU has private
+/// totals.  Until that scenario materialises, the single tracker is
+/// the simplest faithful port; the lift to per-`Backend` ownership
+/// only needs to (a) move the field onto `Backend`, (b) thread a
+/// `&CpuTotalTracker` into `CompiledLoopToken::new`/`compiling_a_bridge`,
+/// and (c) give `JitProfiler` an `Arc<CpuTotalTracker>` to read.
+///
 /// Each field is an [`AtomicUsize`] because PyPy's GIL-protected
 /// `+= 1` on a Python int becomes a cross-thread mutation in pyre — the
 /// backend may compile loops/bridges from worker threads while another

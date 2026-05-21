@@ -2678,18 +2678,15 @@ fn jit_ca_handle_guard_failure(
     }
     let frame = unsafe { &mut *frame_ptr };
 
-    // `compile.py:786-788` `self.start_compiling()` — direct method
-    // call on the resume-guard descr instance.
-    if let Some(fd) = descr_arc.as_fail_descr() {
-        fd.start_compiling();
-    }
-
-    let compiled = trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout);
-
-    // `compile.py:790-795` `self.done_compiling()` — direct method call.
-    if let Some(fd) = descr_arc.as_fail_descr() {
-        fd.done_compiling();
-    }
+    // compile.py:704-709 try/finally: `start_compiling()` before
+    // bridge, `done_compiling()` on every unwind path.  RAII guard
+    // dispatches both via `descr.as_fail_descr()` (instance-method
+    // dispatch per `compile.py:786-795`); drop pairs `done_compiling`
+    // with the matching `start_compiling` even on panic.
+    let compiled = {
+        let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
+        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout)
+    };
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(

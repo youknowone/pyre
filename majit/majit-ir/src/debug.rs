@@ -19,6 +19,47 @@
 //! backends — use [`log_one`], which opens a single-line section,
 //! emits the body, and closes the section in one call.  Multi-message
 //! pairs use [`scope`] (RAII) wrapping repeated [`debug_print`] calls.
+//!
+//! # Known divergences from `rpython/rlib/debug.py` / PYPYLOG
+//!
+//! The wire format matches, but four behaviours are deliberately
+//! reduced versions of upstream — each marked here so callers know
+//! what to expect:
+//!
+//! 1. **No category-prefix filter.**  PyPy's
+//!    `PYPYLOG=jit-tracing,jit-backend:filename` parses a comma list of
+//!    accepted category prefixes; only matching `debug_start` sections
+//!    are emitted.  Pyre's [`majit_log_enabled`] is a single all-or-
+//!    nothing switch — any value of `MAJIT_LOG` turns *every* category
+//!    on.  [`have_debug_prints_for`] preserves the upstream signature
+//!    so a future category parser can drop in without touching
+//!    callers.
+//!
+//! 2. **No translated/untranslated split.**  RPython's
+//!    `_log_capture` versus `_log` distinction (`rlib/debug.py:24-30`,
+//!    `60-67`) lets untranslated tests assert against captured
+//!    sections without writing to stderr.  Pyre always writes to
+//!    `stderr` via `eprintln!` — tests that need to assert on log
+//!    output redirect `stderr` at the OS level.
+//!
+//! 3. **Strict `debug_stop` nesting.**  RPython's
+//!    `DebugLog.debug_stop` (`rpython/rlib/debug.py:30`) raises on
+//!    mismatch; Pyre [`debug_stop`] panics with the same intent.  This
+//!    is intentional, but it does mean a mid-stack panic propagates
+//!    through any `debug_start`/`debug_stop` pair that was already
+//!    opened (the RAII [`scope`] guard absorbs this by closing in
+//!    `Drop`; bare `debug_start`/`debug_stop` callers must use
+//!    `try/finally`-equivalent unwind discipline).
+//!
+//! 4. **Single-file output, no `:filename` sink.**  PyPy's
+//!    `PYPYLOG=…:my.log` redirects to a file; pyre always uses
+//!    `stderr`.  External tools that consume PYPYLOG-formatted output
+//!    can capture pyre's `stderr` directly — the wire format is
+//!    identical.
+//!
+//! The first three are revisit candidates if pyre gains category-
+//! scoped log filtering or a per-test capture sink.  Until then
+//! `MAJIT_LOG=1` is the only knob.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;

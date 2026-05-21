@@ -213,14 +213,15 @@ impl JitProfiler {
     ///
     /// `kind` is a [`crate::pyjitpl::counters`] id. Unknown ids are a
     /// silent no-op (see field doc).  `TOTAL_COMPILED_*` /
-    /// `TOTAL_FREED_*` route through [`majit_backend::cpu_tracker`] to
-    /// match PyPy's per-cpu tracker storage; pyre callers never bump
-    /// these via `count_ops` in practice, but the route is wired so
-    /// stray callers stay consistent with `get_counter`.
+    /// `TOTAL_FREED_*` are accepted but discarded — PyPy
+    /// `Profiler.count_ops` bumps `self.counters[kind]` for these slots
+    /// while [`get_counter`](Self::get_counter) reads from
+    /// `self.cpu.tracker`, so the bump is write-only into an unread
+    /// slot.  Routing them to `cpu_tracker()` here would let a stray
+    /// caller inflate the global tracker; matching PyPy's
+    /// disconnected-storage shape means the discard is intentional.
     pub fn count_ops(&self, opnum: OpCode, kind: i32) {
-        if let Some(field) = cpu_tracker_field_for_kind(kind) {
-            field.fetch_add(1, Ordering::Relaxed);
-        } else if let Some(field) = self.field_for_kind(kind) {
+        if let Some(field) = self.field_for_kind(kind) {
             field.fetch_add(1, Ordering::Relaxed);
         }
         if opnum.is_call() && kind == counters::RECORDED_OPS {
@@ -237,13 +238,15 @@ impl JitProfiler {
     ///
     /// Used for non-op events (ABORT_*, NV*, OPT_VECTORIZE_*, ...).
     /// Unknown ids are a silent no-op (matching the OPS variant above).
-    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` route through
-    /// [`majit_backend::cpu_tracker`] (PyPy stores them on
-    /// `self.cpu.tracker`, not `self.counters`).
+    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` are accepted but discarded
+    /// — PyPy `Profiler.count` bumps `self.counters[kind]` while
+    /// [`get_counter`](Self::get_counter) reads from `self.cpu.tracker`,
+    /// so the bump is write-only into an unread slot.  Use
+    /// [`majit_backend::cpu_tracker`] directly (or
+    /// [`Self::inc_freed_loop`] / [`Self::add_freed_bridges`]) when a
+    /// tracker bump is actually intended.
     pub fn count(&self, kind: i32, inc: usize) {
-        if let Some(field) = cpu_tracker_field_for_kind(kind) {
-            field.fetch_add(inc, Ordering::Relaxed);
-        } else if let Some(field) = self.field_for_kind(kind) {
+        if let Some(field) = self.field_for_kind(kind) {
             field.fetch_add(inc, Ordering::Relaxed);
         }
     }
@@ -322,13 +325,30 @@ impl JitProfiler {
         }
     }
 
-    /// Panic-safe RAII pairing for `start_tracing` / `end_tracing`.
-    /// `compile.py:532-546/589-599` wraps the backend compile in a
-    /// `start_backend()`/`end_backend()` pair via `try/finally`; the
-    /// pyre equivalent is this guard, which fires `end_*` from `Drop`
-    /// so panics inside the body still unwind through `end_event` and
-    /// the `current` stack stays balanced.
+    /// Panic-safe RAII pairing for `debug_start("jit-tracing")` +
+    /// `start_tracing` / `end_tracing` + `debug_stop("jit-tracing")`.
+    /// PyPy keeps the debug section and the profiler call separate at
+    /// the metainterp caller (`pyjitpl.py:1907-1925`):
+    ///
+    /// ```python
+    /// debug_start("jit-tracing")
+    /// self.staticdata.profiler.start_tracing()
+    /// try:
+    ///     ...
+    /// finally:
+    ///     self.staticdata.profiler.end_tracing()
+    ///     debug_stop("jit-tracing")
+    /// ```
+    ///
+    /// Pyre folds both layers into one RAII guard: construction fires
+    /// `debug_start` then `start_event`, drop fires `end_event` then
+    /// `debug_stop` (LIFO unwind order matching the try/finally above).
+    /// Panics inside the body still unwind through both, so the
+    /// `current` stack and the debug section stay balanced.
     pub fn enter_tracing(&self) -> ProfilerEventGuard<'_> {
+        if let Some(channel) = debug_channel_for_event(counters::TRACING) {
+            crate::debug::debug_start(channel);
+        }
         self.start_tracing();
         ProfilerEventGuard {
             profiler: self,
@@ -336,11 +356,17 @@ impl JitProfiler {
         }
     }
 
-    /// Panic-safe RAII pairing for `start_backend` / `end_backend`.
+    /// Panic-safe RAII pairing for `debug_start("jit-backend")` +
+    /// `start_backend` / `end_backend` + `debug_stop("jit-backend")`.
     /// Wraps `backend.compile_loop` / `backend.compile_bridge` call
-    /// sites with the same semantics as PyPy's `compile.py:532-546`
-    /// `try: ... finally: end_backend()`.
+    /// sites with the same try/finally shape as PyPy
+    /// `compile.py:532-546` (debug section outside, profiler call
+    /// inside).  See [`enter_tracing`](Self::enter_tracing) for the
+    /// detailed unwind order.
     pub fn enter_backend(&self) -> ProfilerEventGuard<'_> {
+        if let Some(channel) = debug_channel_for_event(counters::BACKEND) {
+            crate::debug::debug_start(channel);
+        }
         self.start_backend();
         ProfilerEventGuard {
             profiler: self,
@@ -349,7 +375,10 @@ impl JitProfiler {
     }
 
     fn start_event(&self, event: i32) {
-        // `jitprof.py:75-81 _start(event)`:
+        // `jitprof.py:75-81 _start(event)` — profiler bookkeeping only.
+        // The matching `debug_start(channel)` lives at the caller
+        // (PyPy convention; mirrored by [`enter_tracing`] /
+        // [`enter_backend`]).
         //   t0 = self.t1
         //   self.t1 = self.timer()
         //   if self.current:
@@ -357,30 +386,19 @@ impl JitProfiler {
         //   self.counters[event] += 1
         //   self.current.append(event)
         let now = Instant::now();
-        {
-            let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
-            if let (Some(t1), Some(&top_event)) = (state.t1, state.current.last()) {
-                self.add_time(top_event, now.saturating_duration_since(t1));
-            }
-            state.t1 = Some(now);
-            self.count(event, 1);
-            state.current.push(event);
+        let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+        if let (Some(t1), Some(&top_event)) = (state.t1, state.current.last()) {
+            self.add_time(top_event, now.saturating_duration_since(t1));
         }
-        // PyPy keeps `debug_start("jit-tracing"|"jit-backend")` separate
-        // from `_start`/`_end` (it lives at the `compile.py:541` caller
-        // around the `start_tracing()/end_tracing()` pair).  Pyre folds
-        // the two together here so the metainterp callers only have
-        // to hold one RAII guard ([`enter_tracing`]/[`enter_backend`]);
-        // the debug-section pairing stays balanced because [`end_event`]
-        // only fires `debug_stop` on the success branch where the
-        // matching pop happened.
-        if let Some(channel) = debug_channel_for_event(event) {
-            crate::debug::debug_start(channel);
-        }
+        state.t1 = Some(now);
+        self.count(event, 1);
+        state.current.push(event);
     }
 
     fn end_event(&self, event: i32) {
         // `jitprof.py:83-93 _end(event)` — pop-first, then validate.
+        // The matching `debug_stop(channel)` lives at the caller
+        // (PyPy convention; mirrored by [`ProfilerEventGuard::drop`]).
         //   t0 = self.t1
         //   self.t1 = self.timer()
         //   if not self.current:
@@ -404,20 +422,10 @@ impl JitProfiler {
         }
         if popped_event != event {
             crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
-            // Note: the matching `debug_start` (if any) was issued for
-            // `popped_event`'s channel, not `event`'s — closing
-            // `event`'s channel here would mis-pair against the
-            // strict `debug_stop` nesting guard
-            // (`majit-ir/src/debug.rs:84-`).  Leave the section open;
-            // the broken-data log line is the externally-visible
-            // signal that something went wrong.
             return;
         }
         if let Some(t1) = t0 {
             self.add_time(popped_event, now.saturating_duration_since(t1));
-        }
-        if let Some(channel) = debug_channel_for_event(event) {
-            crate::debug::debug_stop(channel);
         }
     }
 
@@ -467,8 +475,11 @@ impl JitProfiler {
 
 /// RAII guard returned by [`JitProfiler::enter_tracing`] /
 /// [`JitProfiler::enter_backend`].  Drops by firing the matching
-/// `end_*` so the profiler stack stays balanced even when the
-/// surrounding body panics — the PyPy `try/finally` equivalent.
+/// `end_*` then `debug_stop(channel)` so the profiler stack and the
+/// debug section stay balanced even when the surrounding body panics
+/// — the PyPy `try/finally` equivalent
+/// (`debug_start; profiler.start; try: ...; finally:
+/// profiler.end; debug_stop`).
 #[must_use = "drop the guard to fire the paired end_* event"]
 pub struct ProfilerEventGuard<'a> {
     profiler: &'a JitProfiler,
@@ -477,7 +488,17 @@ pub struct ProfilerEventGuard<'a> {
 
 impl Drop for ProfilerEventGuard<'_> {
     fn drop(&mut self) {
+        // Unwind order matches PyPy's nested `try/finally`: inner
+        // (`profiler.end_*`) before outer (`debug_stop`).  If
+        // `end_event` detects a mismatch (broken-data path) we still
+        // emit `debug_stop` because the matching `debug_start` was
+        // already published in [`enter_tracing`] / [`enter_backend`];
+        // skipping it would leave the section open against the
+        // strict nesting guard in [`crate::debug::debug_stop`].
         self.profiler.end_event(self.event);
+        if let Some(channel) = debug_channel_for_event(self.event) {
+            crate::debug::debug_stop(channel);
+        }
     }
 }
 

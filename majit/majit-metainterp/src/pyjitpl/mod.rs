@@ -7334,10 +7334,21 @@ impl<M: Clone> MetaInterp<M> {
             // counter side: PyPy's `LoopToken.__del__` runs that
             // routine, which on its way out bumps
             // `cpu.tracker.total_freed_loops += 1` plus
-            // `total_freed_bridges += loop.bridges_count`.  Pyre's
-            // backend has no global `cpu.tracker`; we keep the same
-            // four counters on the per-process `JitProfiler` and
-            // increment them here, where the eviction is observed.
+            // `total_freed_bridges += loop.bridges_count`.  Pyre routes
+            // both bumps through `majit_backend::cpu_tracker` via
+            // `JitProfiler::inc_freed_loop` / `add_freed_bridges`.
+            //
+            // **TIMING DIVERGENCE.**  RPython fires `__del__` exactly
+            // when the GC collects the LoopToken — Rust's `Arc`
+            // cannot match that timing because the last strong ref
+            // may be held by a guard-failure path that hasn't dropped
+            // yet.  Pyre instead bumps the counters at memmgr
+            // eviction (memmgr.py:73 `_kill_old_loops_now`), which is
+            // strictly upstream of `__del__` in PyPy: every evicted
+            // token will eventually `__del__`, but the counter is
+            // bumped at observe-time, not at the (later, unpredictable)
+            // Arc-drop time.  The observable difference is a small
+            // lead in the counter relative to actual memory release.
             // `compiled_loop_token` is None before backend compile
             // completes — never reachable on an evicted token, but
             // guarded for safety.
