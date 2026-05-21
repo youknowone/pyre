@@ -595,12 +595,28 @@ pub struct BoxPool {
 }
 
 impl BoxPool {
+    /// Defensive bound on `idx`/`capacity` passed to `set`/`with_capacity`/
+    /// `from_slots`.  A leaked constant-namespace OpRef (raw `>= CONST_BIT
+    /// = 1 << 31`) or `TempVar` sentinel (`raw >= 0xFFFF_0000`) reaching
+    /// these entry points would otherwise resize the underlying
+    /// `Vec<Option<BoxRef>>` to multi-GiB.  Real traces top out at
+    /// `O(10^5)` ops; `10_000_000` is ~3 orders of magnitude of headroom
+    /// while still much smaller than `CONST_BIT`, so any namespace bleed
+    /// panics immediately instead of OOMing.
+    const SANE_IDX_BOUND: usize = 10_000_000;
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Preallocate the slot table with `capacity` entries reserved.
     pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity < Self::SANE_IDX_BOUND,
+            "BoxPool::with_capacity({capacity}) exceeds SANE_IDX_BOUND ({}); \
+             caller likely passed a raw OpRef payload with CONST_BIT/sentinel set",
+            Self::SANE_IDX_BOUND
+        );
         Self {
             inner: Vec::with_capacity(capacity),
         }
@@ -624,6 +640,12 @@ impl BoxPool {
     /// `box_pool[idx] = Some(value)`; extends with `None` padding to
     /// reach `idx`. Returns a clone of the installed BoxRef.
     pub fn set(&mut self, idx: usize, value: BoxRef) -> BoxRef {
+        assert!(
+            idx < Self::SANE_IDX_BOUND,
+            "BoxPool::set(idx={idx}) exceeds SANE_IDX_BOUND ({}); \
+             caller likely passed a raw OpRef payload with CONST_BIT/sentinel set",
+            Self::SANE_IDX_BOUND
+        );
         if idx >= self.inner.len() {
             self.inner.resize(idx + 1, None);
         }
@@ -661,6 +683,13 @@ impl BoxPool {
 
     /// Build from a `Vec<Option<BoxRef>>` snapshot table.
     pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
+        assert!(
+            slots.len() < Self::SANE_IDX_BOUND,
+            "BoxPool::from_slots(len={}) exceeds SANE_IDX_BOUND ({}); \
+             slot table likely indexed by raw OpRef payload with CONST_BIT/sentinel set",
+            slots.len(),
+            Self::SANE_IDX_BOUND
+        );
         Self { inner: slots }
     }
 
