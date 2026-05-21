@@ -14078,6 +14078,15 @@ impl majit_backend::Backend for CraneliftBackend {
         ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/assembler.py:514` parity — bump
+        // `cpu.tracker.total_compiled_loops` and open the
+        // `jit-mem-looptoken-alloc` debug section at the same point
+        // PyPy's `assemble_loop` creates the `CompiledLoopToken`.  See
+        // `majit_backend::record_compiled_loop_token` for the
+        // eager-vs-lazy CLT adaptation note.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            majit_backend::record_compiled_loop_token(clt);
+        }
         // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();

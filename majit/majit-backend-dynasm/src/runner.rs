@@ -1641,6 +1641,16 @@ impl Backend for DynasmBackend {
         ops: &[OpRc],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        // `x86/assembler.py:514` parity: PyPy creates the
+        // `CompiledLoopToken` inside `assemble_loop`, and that's where
+        // the `cpu.tracker.total_compiled_loops` bump and the
+        // `jit-mem-looptoken-alloc` debug section fire.  Pyre's eager
+        // CLT creation makes that point unreachable from
+        // `CompiledLoopToken::new`; defer both to here so the counter
+        // matches PyPy at the same structural moment.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            majit_backend::record_compiled_loop_token(clt);
+        }
         // Deep-clone Op out of OpRc for the internal pipeline. Backend
         // stages do not depend on shared `_forwarded` identity with the
         // trace; the optimizer has already resolved forwarding by the

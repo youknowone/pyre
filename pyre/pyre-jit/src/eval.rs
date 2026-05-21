@@ -3367,6 +3367,20 @@ pub(crate) struct GuardCompilingScope {
 
 impl GuardCompilingScope {
     pub(crate) fn new(descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Self {
+        // `compile.py:786-795 ResumeGuardDescr.start_compiling` is an
+        // instance method on `FailDescr` upstream — PyPy structurally
+        // cannot reach this code path with a non-fail descriptor (the
+        // `handle_fail` caller is itself a method on `FailDescr`).
+        // Pyre takes a `&Arc<dyn Descr>` to avoid an upfront downcast
+        // at the call site; assert here so a programmer error that
+        // routes a non-fail descr into the guard fires in debug
+        // builds instead of silently skipping `start_compiling` /
+        // `done_compiling`.
+        debug_assert!(
+            descr.as_fail_descr().is_some(),
+            "GuardCompilingScope built on a non-fail descr; PyPy can \
+             only reach handle_fail through a FailDescr instance",
+        );
         if let Some(fd) = descr.as_fail_descr() {
             fd.start_compiling();
         }

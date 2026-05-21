@@ -2146,12 +2146,34 @@ impl<M: Clone> MetaInterp<M> {
     /// matching close lives in [`leave_profiler_tracing`]; both halves
     /// must move as a pair to keep the `debug_start`/`debug_stop`
     /// nesting balanced (PyPy convention).
+    ///
+    /// Use [`open_profiler_tracing_inner`](Self::open_profiler_tracing_inner)
+    /// instead when the caller needs `_setup_once` to run *inside*
+    /// the debug section but *before* the profiler event (PyPy
+    /// `compile_and_run_once` order at `pyjitpl.py:2888-2892`).
     pub fn enter_profiler_tracing(&mut self) {
         debug_assert!(
             !self.profiler_tracing_active,
             "enter_profiler_tracing called while tracing profiler event is already open",
         );
         crate::debug::debug_start("jit-tracing");
+        self.staticdata.profiler.start_tracing();
+        self.profiler_tracing_active = true;
+    }
+
+    /// Open the profiler tracing event scope assuming the
+    /// `jit-tracing` debug section has *already* been opened upstream
+    /// by the caller.  Used by [`prepare_trace_start_runtime`] so the
+    /// debug section can wrap `_setup_once` while the profiler event
+    /// only opens after `_setup_once` completes — matching the
+    /// `debug_start; _setup_once; start_tracing` order at
+    /// `pyjitpl.py:2888-2892`.  The matching close still routes
+    /// through [`leave_profiler_tracing`].
+    pub fn open_profiler_tracing_inner(&mut self) {
+        debug_assert!(
+            !self.profiler_tracing_active,
+            "open_profiler_tracing_inner called while tracing profiler event is already open",
+        );
         self.staticdata.profiler.start_tracing();
         self.profiler_tracing_active = true;
     }
@@ -2930,16 +2952,29 @@ impl<M: Clone> MetaInterp<M> {
 
     fn prepare_trace_start_runtime(&mut self) {
         // pyjitpl.py:2884-2892 `compile_and_run_once` body, line-by-line:
-        //   debug_start('jit-tracing')
+        //   debug_start('jit-tracing')                  # OUTER open
         //   self.staticdata._setup_once()
-        //   self.staticdata.profiler.start_tracing()
+        //   self.staticdata.profiler.start_tracing()    # INNER open
         //   self.staticdata.try_to_free_some_loops()
         // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
         // bootstrap; it has no PyPy analog (jitlog wiring runs inside
         // `_setup_once` upstream) and stays idempotent.
+        //
+        // The debug section wraps `_setup_once` upstream so any
+        // `debug_print` inside the one-shot bootstrap (vector-ext
+        // setup, jitlog handshake, etc.) lands inside the
+        // `jit-tracing` PYPYLOG section.  Pyre matches that by opening
+        // the debug section *before* `_setup_once` and the profiler
+        // event *after*, splitting the work that
+        // [`enter_profiler_tracing`] would normally combine.
         self.warm_state.ensure_jitlog_initialised();
+        crate::debug::debug_start("jit-tracing");
         self.staticdata._setup_once(&mut self.backend);
-        self.enter_profiler_tracing();
+        // Profiler event opens after `_setup_once`, matching PyPy
+        // line 2890.  `open_profiler_tracing_inner` is the
+        // debug_start-skipping variant of `enter_profiler_tracing`
+        // since the section is already open above.
+        self.open_profiler_tracing_inner();
         self.try_to_free_some_loops();
     }
 

@@ -213,14 +213,19 @@ impl JitProfiler {
     ///
     /// `kind` is a [`crate::pyjitpl::counters`] id. Unknown ids are a
     /// silent no-op (see field doc).  `TOTAL_COMPILED_*` /
-    /// `TOTAL_FREED_*` are accepted but discarded — PyPy
-    /// `Profiler.count_ops` bumps `self.counters[kind]` for these slots
-    /// while [`get_counter`](Self::get_counter) reads from
-    /// `self.cpu.tracker`, so the bump is write-only into an unread
-    /// slot.  Routing them to `cpu_tracker()` here would let a stray
-    /// caller inflate the global tracker; matching PyPy's
-    /// disconnected-storage shape means the discard is intentional.
+    /// `TOTAL_FREED_*` are debug-asserted out — PyPy
+    /// `Profiler.counters` is sized `Counters.ncounters = 22` and
+    /// `count(TOTAL_*)` would raise `IndexError`.  Pyre flags the
+    /// same misuse via `debug_assert!`, then silently no-ops in
+    /// release so a single stray caller cannot turn into a hard
+    /// crash in production.
     pub fn count_ops(&self, opnum: OpCode, kind: i32) {
+        debug_assert!(
+            !is_cpu_tracker_kind(kind),
+            "Profiler.count_ops({kind}) called with a CPU-total id; \
+             use majit_backend::cpu_tracker() directly (PyPy raises \
+             IndexError here)",
+        );
         if let Some(field) = self.field_for_kind(kind) {
             field.fetch_add(1, Ordering::Relaxed);
         }
@@ -238,14 +243,20 @@ impl JitProfiler {
     ///
     /// Used for non-op events (ABORT_*, NV*, OPT_VECTORIZE_*, ...).
     /// Unknown ids are a silent no-op (matching the OPS variant above).
-    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` are accepted but discarded
-    /// — PyPy `Profiler.count` bumps `self.counters[kind]` while
-    /// [`get_counter`](Self::get_counter) reads from `self.cpu.tracker`,
-    /// so the bump is write-only into an unread slot.  Use
-    /// [`majit_backend::cpu_tracker`] directly (or
-    /// [`Self::inc_freed_loop`] / [`Self::add_freed_bridges`]) when a
-    /// tracker bump is actually intended.
+    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` are debug-asserted out —
+    /// PyPy `self.counters[TOTAL_*]` is out-of-range
+    /// (`Counters.ncounters = 22`) and raises `IndexError`.  Pyre
+    /// signals the same misuse through `debug_assert!` and silently
+    /// no-ops in release.  Use [`majit_backend::cpu_tracker`] directly
+    /// (or [`Self::inc_freed_loop`] / [`Self::add_freed_bridges`])
+    /// when a tracker bump is actually intended.
     pub fn count(&self, kind: i32, inc: usize) {
+        debug_assert!(
+            !is_cpu_tracker_kind(kind),
+            "Profiler.count({kind}) called with a CPU-total id; \
+             use majit_backend::cpu_tracker() directly (PyPy raises \
+             IndexError here)",
+        );
         if let Some(field) = self.field_for_kind(kind) {
             field.fetch_add(inc, Ordering::Relaxed);
         }
@@ -325,26 +336,22 @@ impl JitProfiler {
         }
     }
 
-    /// Panic-safe RAII pairing for `debug_start("jit-tracing")` +
-    /// `start_tracing` / `end_tracing` + `debug_stop("jit-tracing")`.
-    /// PyPy keeps the debug section and the profiler call separate at
-    /// the metainterp caller (`pyjitpl.py:1907-1925`):
+    /// Panic-safe RAII pairing matching `pyjitpl.py:2884-2898 / 2914-2935`:
     ///
     /// ```python
-    /// debug_start("jit-tracing")
-    /// self.staticdata.profiler.start_tracing()
+    /// debug_start('jit-tracing')      # outer
+    /// profiler.start_tracing()        # inner
     /// try:
     ///     ...
     /// finally:
-    ///     self.staticdata.profiler.end_tracing()
-    ///     debug_stop("jit-tracing")
+    ///     profiler.end_tracing()      # inner close
+    ///     debug_stop('jit-tracing')   # outer close
     /// ```
     ///
-    /// Pyre folds both layers into one RAII guard: construction fires
-    /// `debug_start` then `start_event`, drop fires `end_event` then
-    /// `debug_stop` (LIFO unwind order matching the try/finally above).
-    /// Panics inside the body still unwind through both, so the
-    /// `current` stack and the debug section stay balanced.
+    /// Construction fires `debug_start` then `start_tracing`; drop
+    /// fires `end_tracing` then `debug_stop`.  Panics inside the body
+    /// still unwind through both layers, so the `current` stack and
+    /// the debug section stay balanced.
     pub fn enter_tracing(&self) -> ProfilerEventGuard<'_> {
         if let Some(channel) = debug_channel_for_event(counters::TRACING) {
             crate::debug::debug_start(channel);
@@ -353,24 +360,36 @@ impl JitProfiler {
         ProfilerEventGuard {
             profiler: self,
             event: counters::TRACING,
+            nesting: GuardNesting::DebugOuter,
         }
     }
 
-    /// Panic-safe RAII pairing for `debug_start("jit-backend")` +
-    /// `start_backend` / `end_backend` + `debug_stop("jit-backend")`.
-    /// Wraps `backend.compile_loop` / `backend.compile_bridge` call
-    /// sites with the same try/finally shape as PyPy
-    /// `compile.py:532-546` (debug section outside, profiler call
-    /// inside).  See [`enter_tracing`](Self::enter_tracing) for the
-    /// detailed unwind order.
+    /// Panic-safe RAII pairing matching `compile.py:532-546 / 589-599`:
+    ///
+    /// ```python
+    /// metainterp_sd.profiler.start_backend()   # outer
+    /// debug_start('jit-backend')               # inner
+    /// try:
+    ///     ...
+    /// finally:
+    ///     debug_stop('jit-backend')            # inner close
+    /// metainterp_sd.profiler.end_backend()     # outer close
+    /// ```
+    ///
+    /// Note that backend nesting is **reversed** relative to tracing:
+    /// `profiler.start_backend()` opens the outer scope here, while
+    /// `debug_start('jit-tracing')` opens the outer scope in
+    /// [`enter_tracing`].  PyPy uses both orders depending on the
+    /// callsite — this guard matches each one exactly.
     pub fn enter_backend(&self) -> ProfilerEventGuard<'_> {
+        self.start_backend();
         if let Some(channel) = debug_channel_for_event(counters::BACKEND) {
             crate::debug::debug_start(channel);
         }
-        self.start_backend();
         ProfilerEventGuard {
             profiler: self,
             event: counters::BACKEND,
+            nesting: GuardNesting::ProfilerOuter,
         }
     }
 
@@ -473,33 +492,72 @@ impl JitProfiler {
     }
 }
 
+/// Which scope is the outer one — tracing wraps `debug_start` around
+/// the profiler call (`pyjitpl.py:2884-2898`), backend wraps the
+/// profiler call around `debug_start` (`compile.py:532-546`).
+/// [`ProfilerEventGuard::drop`] dispatches the LIFO close order based
+/// on this flag so each callsite matches its PyPy counterpart exactly.
+enum GuardNesting {
+    /// `debug_start` is outer, `profiler.start_*` is inner.  Used by
+    /// [`JitProfiler::enter_tracing`].
+    DebugOuter,
+    /// `profiler.start_*` is outer, `debug_start` is inner.  Used by
+    /// [`JitProfiler::enter_backend`].
+    ProfilerOuter,
+}
+
 /// RAII guard returned by [`JitProfiler::enter_tracing`] /
-/// [`JitProfiler::enter_backend`].  Drops by firing the matching
-/// `end_*` then `debug_stop(channel)` so the profiler stack and the
-/// debug section stay balanced even when the surrounding body panics
-/// — the PyPy `try/finally` equivalent
-/// (`debug_start; profiler.start; try: ...; finally:
-/// profiler.end; debug_stop`).
+/// [`JitProfiler::enter_backend`].  Drops by firing both the
+/// profiler-event close and the `debug_stop` close in the LIFO order
+/// dictated by [`GuardNesting`], so the profiler stack and the debug
+/// section stay balanced even when the surrounding body panics.
 #[must_use = "drop the guard to fire the paired end_* event"]
 pub struct ProfilerEventGuard<'a> {
     profiler: &'a JitProfiler,
     event: i32,
+    nesting: GuardNesting,
 }
 
 impl Drop for ProfilerEventGuard<'_> {
     fn drop(&mut self) {
-        // Unwind order matches PyPy's nested `try/finally`: inner
-        // (`profiler.end_*`) before outer (`debug_stop`).  If
-        // `end_event` detects a mismatch (broken-data path) we still
-        // emit `debug_stop` because the matching `debug_start` was
-        // already published in [`enter_tracing`] / [`enter_backend`];
-        // skipping it would leave the section open against the
-        // strict nesting guard in [`crate::debug::debug_stop`].
-        self.profiler.end_event(self.event);
-        if let Some(channel) = debug_channel_for_event(self.event) {
-            crate::debug::debug_stop(channel);
+        // LIFO close: inner scope first, then outer.  If `end_event`
+        // detects a mismatch (broken-data path) we still emit
+        // `debug_stop` because the matching `debug_start` was already
+        // published; skipping it would leave the section open against
+        // the strict nesting guard in [`crate::debug::debug_stop`].
+        let channel = debug_channel_for_event(self.event);
+        match self.nesting {
+            // tracing: inner = profiler, outer = debug.
+            GuardNesting::DebugOuter => {
+                self.profiler.end_event(self.event);
+                if let Some(ch) = channel {
+                    crate::debug::debug_stop(ch);
+                }
+            }
+            // backend: inner = debug, outer = profiler.
+            GuardNesting::ProfilerOuter => {
+                if let Some(ch) = channel {
+                    crate::debug::debug_stop(ch);
+                }
+                self.profiler.end_event(self.event);
+            }
         }
     }
+}
+
+/// `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` (jit.py:1438-1441)
+/// — the four ids PyPy reads via `cpu.tracker` instead of
+/// `self.counters`.  Used by [`JitProfiler::count`] /
+/// [`JitProfiler::count_ops`] `debug_assert!` to flag callers that
+/// would land an out-of-range write upstream.
+fn is_cpu_tracker_kind(kind: i32) -> bool {
+    matches!(
+        kind,
+        counters::TOTAL_COMPILED_LOOPS
+            | counters::TOTAL_COMPILED_BRIDGES
+            | counters::TOTAL_FREED_LOOPS
+            | counters::TOTAL_FREED_BRIDGES
+    )
 }
 
 /// Route `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` ids

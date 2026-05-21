@@ -951,20 +951,41 @@ pub struct CompiledLoopToken {
     pub _ll_initial_locs: parking_lot::Mutex<Vec<i32>>,
 }
 
+/// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
+/// `jit-mem-looptoken-alloc` debug section and bumps
+/// `cpu.tracker.total_compiled_loops` at the point where the CLT is
+/// created — `x86/assembler.py:514` and the per-backend equivalents do
+/// that *inside* `assemble_loop`.  Pyre's [`CompiledLoopToken::new`]
+/// runs eagerly from [`JitCellToken::new`] (line 1265 documents the
+/// eager-vs-lazy adaptation), so doing the bump there would
+/// over-count loops whose JitCellToken is allocated but never reaches
+/// `backend.compile_loop` (the `register_pending_target` path in
+/// `dynasm/runner.rs` is one such caller).
+///
+/// Each backend's `compile_loop` calls this helper as its first act so
+/// the bump fires at the same structural point PyPy does, matching
+/// `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` line-for-line.
+pub fn record_compiled_loop_token(clt: &CompiledLoopToken) {
+    cpu_tracker()
+        .total_compiled_loops
+        .fetch_add(1, Ordering::Relaxed);
+    majit_ir::debug::log_one(
+        "jit-mem-looptoken-alloc",
+        &format!("allocating Loop # {}", clt.number),
+    );
+}
+
 impl CompiledLoopToken {
     /// `model.py:296-307` `__init__(self, cpu, number)`. The `cpu` is
     /// implicit in pyre — the owning `Backend` holds the token lifetime.
-    /// Bumps [`cpu_tracker().total_compiled_loops`](cpu_tracker) and emits
-    /// the `jit-mem-looptoken-alloc` debug section line-for-line with
-    /// upstream (`model.py:297, 305-307`).
+    ///
+    /// **Counter / debug-section moved.**  PyPy bumps
+    /// `cpu.tracker.total_compiled_loops` and emits the
+    /// `jit-mem-looptoken-alloc` debug section here.  Pyre defers both
+    /// to [`record_compiled_loop_token`] called at the
+    /// [`Backend::compile_loop`] entry — see that helper's doc for the
+    /// eager-CLT rationale.
     pub fn new(number: u64) -> Self {
-        cpu_tracker()
-            .total_compiled_loops
-            .fetch_add(1, Ordering::Relaxed);
-        majit_ir::debug::log_one(
-            "jit-mem-looptoken-alloc",
-            &format!("allocating Loop # {}", number),
-        );
         CompiledLoopToken {
             number,
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
