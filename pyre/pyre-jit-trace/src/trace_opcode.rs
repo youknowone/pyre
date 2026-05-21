@@ -1634,7 +1634,12 @@ impl MIFrame {
             let portal_frame_reg = jc.payload.metadata.portal_frame_reg as u32;
             let portal_ec_reg = jc.payload.metadata.portal_ec_reg as u32;
             let sym_frame = self.sym().frame;
-            let sym_ec = self.sym().execution_context;
+            // [frame, ec] portal-reds contract: `sym.execution_context`
+            // may be OpRef::NONE on adapter paths (CALL_ASSEMBLER bridge
+            // attach, bridge-from-guard). `ensure_execution_context`
+            // recovers it via GETFIELD_GC(frame, execution_context_descr)
+            // when needed; otherwise returns the seeded value.
+            let sym_ec = self.ensure_execution_context(ctx);
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
                 let opref = if reg_idx == portal_frame_reg {
@@ -2872,6 +2877,10 @@ impl MIFrame {
         // current pc so `stack_only` reflects the actual JUMP-source
         // stack depth instead of the stale symbolic counter.
         let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
+        // [frame, ec] portal-reds contract: recover ec before the sym()
+        // snapshot below so JUMP args never carry OpRef::NONE in the ec
+        // slot on adapter / bridge-from-guard paths.
+        let recovered_ec = self.ensure_execution_context(ctx);
         let (
             frame,
             execution_context,
@@ -2959,7 +2968,7 @@ impl MIFrame {
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
             (
                 s.frame,
-                s.execution_context,
+                recovered_ec,
                 s.vable_last_instr,
                 s.vable_pycode,
                 s.vable_valuestackdepth,
@@ -3227,13 +3236,17 @@ impl MIFrame {
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
+        // [frame, ec] portal-reds contract. Recover ec before snapshotting
+        // sym fields so guard fail_args never carry OpRef::NONE in the ec
+        // slot (adapter/bridge-from-guard paths).
+        let ec = self.ensure_execution_context(ctx);
         let s = self.sym();
         let mut fa =
             Vec::with_capacity(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + active_boxes.len());
         fa.push(s.frame);
         // NUM_EXTRA_REDS == 1 (crate const-assert in `lib.rs`).
         // `interp_jit.py:67 reds = ['frame', 'ec']`.
-        fa.push(s.execution_context);
+        fa.push(ec);
         fa.extend_from_slice(&[
             s.vable_last_instr,
             s.vable_pycode,
