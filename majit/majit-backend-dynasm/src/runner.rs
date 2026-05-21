@@ -889,25 +889,20 @@ impl DynasmBackend {
         Arc::clone(&self.descr_attachments)
     }
 
-    /// Add a newly-compiled loop/bridge's fail_descrs to the ptr-indexed
-    /// registry. Called after every `compile_loop` / `compile_bridge`
-    /// returns so subsequent `resolve_latest_descr` lookups can cross
-    /// token boundaries — required when a bridge JUMPs into another
-    /// compiled loop and that loop's guard fires before control returns
-    /// to the bridge's owning token.
-
-    /// Register `DescrRef` instances into the addr→`DescrRef` lookup
-    /// table.  Called from `compile_loop` / `compile_bridge` to
-    /// populate after codegen.  Re-running is idempotent: existing
-    /// entries are preserved via `entry().or_insert_with`.
+    /// Pin a newly compiled loop/bridge's baked `FailDescrCell`s on the
+    /// owning CLT.  Called after every `compile_loop` / `compile_bridge`
+    /// returns so `recover_fail_descr_cell` can safely recover a descr
+    /// even when a bridge JUMPs into another compiled loop and that
+    /// loop's guard fires before control returns to the bridge's owning
+    /// token.
     ///
     /// Lifetime root: `token.compiled_loop_token.asmmemmgr_gcreftracers`
     /// (`model.py:294`, `llsupport/assembler.py:190-194`
     /// `get_asmmemmgr_gcreftracers`).  Pushes one tracer per
     /// `register_fail_descrs` call mirroring
     /// `assembler.py:822 gcreftracers.append(tracer)`; the tracer owns
-    /// the descr `Arc`s for the lifetime of the compiled loop so the
-    /// addresses baked into machine code stay live until
+    /// the cell `Arc`s for the lifetime of the compiled loop so the
+    /// `FailDescrCell` addresses baked into machine code stay live until
     /// `free_loop_and_bridges` drops the CLT (`llmodel.py:252-268`).
     pub fn register_fail_descrs(
         &self,
@@ -2207,7 +2202,6 @@ impl Backend for DynasmBackend {
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
-        let descr_addr = Arc::as_ptr(&descr) as *const () as usize;
         let descr_fd = descr
             .as_fail_descr()
             .expect("find_descr_by_ptr result must implement FailDescr");
@@ -2267,7 +2261,6 @@ impl Backend for DynasmBackend {
             is_finish: descr_fd.is_finish(),
             is_exit_frame_with_exception: descr_fd.is_exit_frame_with_exception(),
             status: descr_fd.get_status(),
-            descr_addr,
             descr_arc,
         }
     }
@@ -2415,17 +2408,6 @@ impl Backend for DynasmBackend {
                 }
             }
         }
-    }
-
-    fn get_guard_status(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> (u64, usize) {
-        let descr = Self::find_descr(token, trace_id, fail_index);
-        let fd = descr.as_fail_descr().expect("descr is FailDescr");
-        (fd.get_status(), Arc::as_ptr(&descr) as *const () as usize)
     }
 
     fn store_bridge_guard_hashes(

@@ -1801,9 +1801,10 @@ fn jit_blackhole_resume_from_guard(
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)` parity:
     // recover the failed descr from `descr_addr` (history.py:125
     // `cpu.get_latest_descr` is the C-ABI carrier) and derive
-    // (trace_id, fail_index) from descr identity.  The lookup is
-    // infallible — `Backend::fail_descr_arc_from_addr` panics on a
-    // registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
+    // (trace_id, fail_index) from descr identity.  The recovery is
+    // infallible for live JIT code — `Backend::fail_descr_arc_from_addr`
+    // panics if the raw value is not a live `FailDescrCell` pointer,
+    // matching RPython's `cpu.get_latest_descr(deadframe)`
     // (warmspot.py:1021) which has no failure mode.
     use majit_backend::Backend;
     let (driver, _) = crate::eval::driver_pair();
@@ -2342,8 +2343,9 @@ pub fn trace_and_compile_from_bridge(
     // (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge entry
     // (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc available
     // before reaching this function (T-CA + T-CA.cranelift gave both
-    // backends the `Backend::fail_descr_arc_from_addr` registry), so the
-    // surrogate `(green_key, trace_id, fail_index)` parameters retired
+    // backends `Backend::fail_descr_arc_from_addr` recovery from
+    // `FailDescrCell` thin pointers), so the surrogate
+    // `(green_key, trace_id, fail_index)` parameters retired
     // in T-final.B.
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     frame: &mut PyFrame,
@@ -2613,10 +2615,12 @@ fn jit_ca_handle_guard_failure(
     // crosses the backend boundary with only the raw descr pointer; recover
     // the backend FailDescr Arc before any guard-failure routing so identity
     // is read from the descr just like PyPy reads `resumedescr`.  The
-    // lookup is infallible — `Backend::fail_descr_arc_from_addr` panics
-    // on a registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
-    // (warmspot.py:1021) which has no failure mode.  T-final.B made
-    // `trace_and_compile_from_bridge` itself descr-only.
+    // recovery is infallible for live JIT code —
+    // `Backend::fail_descr_arc_from_addr` panics if the raw value is not
+    // a live `FailDescrCell` pointer, matching RPython's
+    // `cpu.get_latest_descr(deadframe)` (warmspot.py:1021) which has no
+    // failure mode.  T-final.B made `trace_and_compile_from_bridge`
+    // itself descr-only.
     let descr_arc: std::sync::Arc<dyn majit_ir::Descr> = {
         use majit_backend::Backend;
         let (driver, _) = crate::eval::driver_pair();

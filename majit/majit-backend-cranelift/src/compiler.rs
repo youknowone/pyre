@@ -705,9 +705,9 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> Dea
     // on demand.  The deadframe's `fail_descr` keeps the callee's own
     // Arc identity, so `cpu.get_latest_descr(deadframe)` returns the
     // callee descr (`llmodel.py:411-419` get_latest_descr parity), and
-    // the raw `jf_descr` slot still carries an address that's resolvable
-    // through the regular `fail_descr_registry` (no overlay registry
-    // needed).
+    // the raw `jf_descr` slot still carries a `FailDescrCell` thin
+    // pointer resolvable via `recover_fail_descr_cell` (Slice 80-G.7),
+    // with no overlay descr needed.
     let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() else {
         // Fallback: return as-is (should not happen after FrameData removal).
         return frame;
@@ -7227,11 +7227,14 @@ impl CraneliftBackend {
         }
     }
 
-    /// Register metainterp `AbstractFailDescr` Arcs into the addr→Arc
-    /// lookup table keyed on the data-pointer half of each
-    /// `Arc<dyn Descr>` fat pointer (`history.py:125` identity).
-    /// Mirrors dynasm's API: callable from future late-stamp helpers
-    /// that need to land entries after the in-codegen call missed them.
+    /// Pin the metainterp descr Arcs referenced by this compiled trace
+    /// onto the owning CLT's `asmmemmgr_gcreftracers` (`model.py:294`,
+    /// `assembler.py:820-823 gcreftracers.append(tracer)`).  The raw
+    /// addresses baked into JIT code are `FailDescrCell` thin pointers,
+    /// kept alive separately by `CompiledLoop::fail_descr_cells` /
+    /// `BridgeData::fail_descr_cells`; this tracer pins the inner descrs
+    /// those cells dereference for the same CLT lifetime.  Mirrors
+    /// dynasm's API for late-stamp helpers.
     pub fn register_fail_descrs(&self, token: &majit_backend::JitCellToken, descrs: &[DescrRef]) {
         // `assembler.py:820-823 gcreftracers.append(tracer)` parity —
         // each `register_fail_descrs` call appends one tracer that
@@ -13739,7 +13742,7 @@ fn collect_guards(
         // `Arc<ExitFrameWithExceptionDescrRef>` for FINISH, or the
         // metainterp `Arc<ResumeGuardDescr>` (op.descr or synthesized)
         // for guards.  No CraneliftFailDescr wrapper between codegen
-        // and the runtime registry.  Matches PyPy's single-descr
+        // and the runtime descr identity.  Matches PyPy's single-descr
         // identity (`history.py:121`: one ResumeGuardDescr per guard,
         // shared between metainterp and backend).
         let descr: DescrRef = if is_finish {
@@ -14431,29 +14434,6 @@ impl majit_backend::Backend for CraneliftBackend {
         Ok(info)
     }
 
-    fn get_guard_status(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> (u64, usize) {
-        let compiled = token
-            .compiled
-            .as_ref()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
-        if let Some(compiled) = compiled {
-            if let Some(descr) =
-                find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
-            {
-                return (
-                    as_fd(&descr).get_status(),
-                    std::sync::Arc::as_ptr(&descr) as *const () as usize,
-                );
-            }
-        }
-        (0, 0)
-    }
-
     /// resume.py:1143-1188 parity — publish `metainterp.staticdata.
     /// callinfocollection` so the guard-exit recovery builder at
     /// `collect_guards` can resolve OS_STR_CONCAT / OS_UNI_CONCAT /
@@ -14707,7 +14687,6 @@ impl majit_backend::Backend for CraneliftBackend {
                         }
                     }
                 }
-                let descr_addr = Arc::as_ptr(&descr_arc) as *const () as usize;
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
@@ -14720,7 +14699,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: descr.is_finish(),
                     is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                     status: descr.get_status(),
-                    descr_addr,
                     descr_arc,
                 };
             }
@@ -14796,7 +14774,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let descr_addr = Arc::as_ptr(&fail_descr_arc) as *const () as usize;
                 let fail_descr_ref: DescrRef = fail_descr_arc.clone();
                 let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
@@ -14811,7 +14788,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: true,
                     is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                     status: fail_descr_fd.get_status(),
-                    descr_addr,
                     descr_arc: fail_descr_arc.clone(),
                 };
             }
@@ -14859,7 +14835,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let descr_addr = Arc::as_ptr(&fail_descr_arc) as *const () as usize;
             let fail_descr_ref: DescrRef = fail_descr_arc.clone();
             let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
@@ -14874,7 +14849,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                 status: fail_descr_fd.get_status(),
-                descr_addr,
                 descr_arc: fail_descr_arc.clone(),
             };
         }
@@ -15033,9 +15007,10 @@ impl majit_backend::Backend for CraneliftBackend {
         if force_token.0 == 0 {
             return None;
         }
-        // `force_token_to_dead_frame` resolves `jf_force_descr` via the
-        // process-global `FAIL_DESCR_REGISTRY_GLOBAL` (`history.py:109-
-        // 114` `AbstractDescr.show`); no TLS handle needed.
+        // `force_token_to_dead_frame` resolves `jf_force_descr` via
+        // `recover_fail_descr_cell` (`history.py:109-114
+        // AbstractDescr.show` = pure cast against the per-emission
+        // `FailDescrCell` baked at codegen).
         Some(force_token_to_dead_frame(force_token))
     }
 
@@ -15102,10 +15077,11 @@ impl majit_backend::Backend for CraneliftBackend {
         unregister_call_assembler_target(token.number);
         self.registered_call_assembler_tokens.remove(&token.number);
         // `llmodel.py:252-268 free_loop_and_bridges` parity.  Strong
-        // refs to baked descrs live on `clt.asmmemmgr_gcreftracers`
-        // (`model.py:294`); dropping the CLT releases them, and Weak
-        // entries in `FAIL_DESCR_REGISTRY_GLOBAL` upgrade to `None`
-        // next time someone looks them up.  Nothing to sweep here.
+        // refs to baked `FailDescrCell` Arcs live on
+        // `clt.asmmemmgr_gcreftracers` (`model.py:294`); dropping the
+        // CLT releases them, and the JIT-emitted code that holds the
+        // baked `FailDescrCell` thin pointers is retired in lockstep,
+        // so no live caller can reach a stale pointer.
         let _ = token;
     }
 

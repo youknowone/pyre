@@ -65,14 +65,11 @@ pub struct RawExecResult {
     pub is_exit_frame_with_exception: bool,
     /// compile.py:741-745: ResumeGuardDescr.status at guard failure time.
     pub status: u64,
-    /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
-    pub descr_addr: usize,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
     /// `compile.py:701`) — the runtime descr Arc owning this exit.
-    /// Always set: routes through `Backend::get_latest_descr_arc`
-    /// rather than the `fail_descr_addr` registry, so FINISH /
-    /// `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
-    /// singletons return their global Arc identity instead of `None`.
+    /// Always set: routes through `Backend::get_latest_descr_arc`, so
+    /// FINISH / `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
+    /// singletons return their attached Arc identity directly.
     /// Bridge consumers (`start_bridge_tracing`,
     /// `_trace_and_compile_from_bridge`) call `descr_arc.as_fail_descr()`
     /// to read `rd_loop_token_clt` / `fail_index_per_trace` directly.
@@ -1627,19 +1624,6 @@ pub trait Backend: Send {
     /// no-op — bridges are attached to the guard's machine code directly.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
-    /// compile.py:741-745: look up (status, descr_addr) for a guard.
-    /// Uses (trace_id, fail_index) to find the exact descriptor, including
-    /// bridge guards and previous tokens — matching start_guard_compiling's
-    /// find_fail_descr_in_fail_descrs pattern.
-    fn get_guard_status(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _fail_index: u32,
-    ) -> (u64, usize) {
-        (0, 0)
-    }
-
     /// compile.py:826-830 store_hash: assign jitcounter hashes to guards.
     /// Called after compile_loop/compile_bridge with hashes from
     /// jitcounter.fetch_next_hash(). Skips guards that already have
@@ -1725,7 +1709,6 @@ pub trait Backend: Send {
                 }
             }
         }
-        let descr_addr = Arc::as_ptr(&descr_arc) as *const () as usize;
         RawExecResult {
             outputs,
             typed_outputs,
@@ -1738,7 +1721,6 @@ pub trait Backend: Send {
             is_finish: descr.is_finish(),
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
-            descr_addr,
             descr_arc,
         }
     }
@@ -1913,25 +1895,28 @@ pub trait Backend: Send {
     /// be transported as a raw `usize` (`descr_addr`) and recovered here
     /// via this method.
     ///
-    /// `descr_addr` is the `usize` identity captured at native-code emission
-    /// time (e.g. embedded in a recovery stub or stamped into `jf_descr`).
-    /// Backends that maintain an `addr → Arc` registry (mirroring RPython's
-    /// `cpu` keeping descr objects alive while their pointers are live in
-    /// emitted code) override this to upgrade the raw address back to its
-    /// owning Arc.
+    /// `descr_addr` is the thin pointer of a `majit_ir::FailDescrCell`
+    /// baked at code-emission time (`history.py:109-114
+    /// AbstractDescr.show` = pure cast against the cell).  Backends
+    /// recover via `majit_ir::recover_fail_descr_cell` (`Arc::from_raw`
+    /// + `Arc::increment_strong_count`); strong refs live on
+    /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`,
+    /// `assembler.py:820-823 gcreftracers.append(tracer)`).  Singletons
+    /// without a cell wrapper (FINISH `DoneWithThisFrame*`,
+    /// `ExitFrameWithExceptionDescrRef`, `PropagateExceptionDescr`) are
+    /// pointer-matched at higher layers before reaching this method.
     ///
     /// `warmspot.py:1021 cpu.get_latest_descr(deadframe)` has no failure
     /// mode — every live deadframe carries a valid descr handle.  Pyre
-    /// backends mirror this contract by holding strong `Arc` refs in the
-    /// registry for the full lifetime of every emitted FailDescr; the
-    /// lookup is therefore infallible.  Default panics so backends that
-    /// receive C-ABI guard-fail callbacks must opt in explicitly;
+    /// backends mirror this contract via the CLT-pinned cell lifetime;
+    /// the recovery is therefore infallible.  Default panics so backends
+    /// that receive C-ABI guard-fail callbacks must opt in explicitly;
     /// `SyntheticCpu` and `wasm` never reach this path.
     fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> majit_ir::DescrRef {
         panic!(
             "Backend::fail_descr_arc_from_addr default invoked: backend wired into a runtime \
-             guard-fail path must register every emitted FailDescr in an addr→Arc table and \
-             override this method (warmspot.py:1021 cpu.get_latest_descr parity)"
+             guard-fail path must bake FailDescrCell thin pointers at emission and override \
+             this method (warmspot.py:1021 cpu.get_latest_descr parity)"
         )
     }
 

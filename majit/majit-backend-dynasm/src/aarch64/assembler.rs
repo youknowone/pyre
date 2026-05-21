@@ -3488,15 +3488,14 @@ impl<'a> AssemblerARM64<'a> {
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
-        // Slice KK/NN: source_op_index uses SOURCE_OP_INDEX_TABLE (kept
-        // pending source_op_index removal); recovery_layout caching is
-        // removed — the metainterp's `StoredExitLayout.recovery_layout`
-        // (populated by `patch_guard_recovery_layouts_for_trace`)
-        // is the canonical store per `resume.py:450-488`.
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs:166); `layout_for_fail_descr` reads it back
         // via `fd.source_op_index()` so no side-table is needed.
+        // Recovery layouts are owned by the metainterp's
+        // `StoredExitLayout.recovery_layout` (populated by
+        // `patch_guard_recovery_layouts_for_trace`) per
+        // `resume.py:450-488`; the backend keeps no parallel cache.
         if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
             descr_fd.set_source_op_index(op_index);
         }

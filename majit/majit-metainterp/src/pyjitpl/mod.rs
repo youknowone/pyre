@@ -8083,35 +8083,6 @@ impl<M: Clone> MetaInterp<M> {
         );
     }
 
-    /// compile.py:741-745: look up (status, descr_addr) for a guard.
-    /// Search current token + previous_tokens by (trace_id, fail_index)
-    /// to find the exact descriptor — same pattern as start_guard_compiling.
-    /// Returns None if descriptor not found (no tick should happen).
-    pub fn get_guard_status(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(u64, usize)> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let tid = trace_id;
-        if let Some(token) = compiled.live_token() {
-            let (s, a) = self.backend.get_guard_status(&token, tid, fail_index);
-            if a != 0 {
-                return Some((s, a));
-            }
-        }
-        for prev in &compiled.previous_tokens {
-            if let Some(prev) = prev.upgrade() {
-                let (s, a) = self.backend.get_guard_status(&prev, tid, fail_index);
-                if a != 0 {
-                    return Some((s, a));
-                }
-            }
-        }
-        None
-    }
-
     /// Check whether a bridge was actually compiled and attached for a guard.
     /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
     /// compilation from trace abort (RPython pyjitpl.py:2906-2907 parity).
@@ -18445,11 +18416,14 @@ mod tests {
                     .map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
             })
             .expect("fail descr");
-        // After backend struct deletion, the `fail_descrs` vec stores
-        // `Arc<ResumeGuardDescr>` directly (production guards use op.descr;
-        // test scaffolds where op.descr is None mint a fresh metainterp
-        // ResumeGuardDescr at codegen time).  Either way, the rd_* setters
-        // route through the FailDescr trait surface on the descr Arc.
+        // After Slice 80-G.7 the `fail_descrs` vec stores
+        // `Arc<FailDescrCell>` thin wrappers (the cell is the JIT-baked
+        // identity in `jf_descr`).  The inner descr is reached via
+        // `FailDescrCell::Deref<Target = dyn Descr>`, so `.as_fail_descr()`
+        // auto-derefs to the trait surface on the metainterp's
+        // `Arc<ResumeGuardDescr>` (production: op.descr; test scaffolds
+        // where op.descr is None mint a fresh ResumeGuardDescr at codegen
+        // time).
         let descr_fd = descr_ref
             .as_fail_descr()
             .expect("descr must implement FailDescr");
