@@ -1496,30 +1496,51 @@ pub fn dispatch_via_miframe(
         ConcreteValue::Ref(sym.last_exc_value)
     };
 
-    // Task #165: stamp the OpRef-keyed `opref_concrete` table from the
-    // slot-keyed snapshots so `TraceCtx::box_value` / `concrete_of_opref`
-    // surface the same Ref/Int concretes that `concrete_registers_*`
-    // already carry.  Without this, downstream `getfield_gc_i` /
-    // `getfield_vable_i` callers reach `box_value(obj) -> None` and the
-    // recorded result OpRef gets no `set_opref_concrete` stamp — the
-    // chain breaks at the first `int_le` / `goto_if_not/iL` that reads
-    // an Int derived from a heap field.  RPython parity: `BoxInt(value)`
-    // / `BoxPtr(value)` constructors populate `Box.value` at the OpRef's
-    // record site; pyre's split between slot-keyed (Ref bank shadow)
-    // and OpRef-keyed (Box.value) needs an explicit bridge at walker
-    // entry.
-    for (i, opref) in sym.registers_r.iter().copied().enumerate() {
-        if opref.is_constant() {
-            continue;
-        }
-        match concrete_r_snapshot[i] {
-            ConcreteValue::Ref(ptr) => {
-                trace_ctx.set_opref_concrete(
-                    opref,
-                    majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
-                );
+    // Task #165 + #165.B: stamp the OpRef-keyed `opref_concrete` table
+    // from the live `locals_cells_stack_w` heap pointers so
+    // `TraceCtx::box_value` / `concrete_of_opref` surface the actual
+    // PyObjectRef the codewriter-emitted `getfield_gc_i` would read
+    // from.
+    //
+    // Reading from the heap PyFrame (rather than the slot-keyed
+    // `concrete_r_snapshot`) is load-bearing for the unboxed-small-int
+    // case: when a Python int local is shadowed as
+    // `ConcreteValue::Int(n)`, the heap pointer (PyLong*) is the only
+    // value the walker's getfield handler can use for
+    // `field_sanity_load`.  RPython parity: `BoxPtr(value)` carries the
+    // raw struct ptr; pyre's unboxing is the deviation, and walker
+    // entry must recover the heap view to bridge it.
+    //
+    // The slot-keyed `concrete_r_snapshot` stays as-is — handlers reading
+    // it via `read_ref_reg_concrete` get the unboxed view (useful for
+    // int math); `box_value(opref)` returns the heap-pointer view
+    // (useful for heap-field reads).
+    let concrete_frame = sym.concrete_vable_ptr as usize;
+    if concrete_frame != 0 {
+        for (i, opref) in sym.registers_r.iter().copied().enumerate() {
+            if opref.is_constant() {
+                continue;
             }
-            ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Null => {}
+            if let Some(obj) = crate::state::concrete_stack_value(concrete_frame, i) {
+                if !obj.is_null() {
+                    trace_ctx.set_opref_concrete(
+                        opref,
+                        majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),
+                    );
+                }
+            }
+        }
+    } else {
+        // Test fixtures may instantiate WalkContext without a backing
+        // PyFrame; fall back to the slot-keyed snapshot's Ref subset.
+        for (i, opref) in sym.registers_r.iter().copied().enumerate() {
+            if opref.is_constant() {
+                continue;
+            }
+            if let ConcreteValue::Ref(ptr) = concrete_r_snapshot[i] {
+                trace_ctx
+                    .set_opref_concrete(opref, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            }
         }
     }
 
@@ -3792,8 +3813,13 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if args.len() > sub_body.num_regs_r {
         return Err(DispatchError::InlineCallArityMismatch {
@@ -3955,8 +3981,13 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -4113,8 +4144,13 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
-        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
+    let (
+        mut callee_regs_r,
+        mut callee_regs_i,
+        mut callee_regs_f,
+        mut callee_concrete_r,
+        mut callee_concrete_i,
+    ) = allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {

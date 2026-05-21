@@ -1118,8 +1118,7 @@ fn walker_post_walk_insert_renamings(
                                         format!("{}:{}->{}", kind.as_str(), src, dst)
                                     })
                                     .collect();
-                                let target_label =
-                                    super::flatten::block_label_name(&target_ref);
+                                let target_label = super::flatten::block_label_name(&target_ref);
                                 let source_terminator =
                                     last_op_summary_for_source(block_ref, all_walker_blocks);
                                 elided_distinct_pair_records.push(format!(
@@ -1174,7 +1173,7 @@ fn walker_post_walk_insert_renamings(
 /// caller can update its diagnostic counters.  `NoPairs` means the
 /// link's `link.args ↔ target.inputargs` mapping reduces to identity
 /// after `get_color` (nothing to copy).  `RewriteFailed` means
-/// [`rewrite_source_terminator_tlabel`] could not locate a matching
+/// [`rewrite_source_terminator_for_link`] could not locate a matching
 /// `TLabel` — neither a direct `Insn::Op` arg nor a
 /// `SwitchDictDescr._labels` entry pointed at the target's block
 /// label.  In the explicit-jump path this would mean the source
@@ -1243,37 +1242,46 @@ where
     };
     let target_label = super::flatten::block_label_name(&target_block);
     let trampoline_name = format!("epsilon3_link_{}", *trampoline_counter);
-    if rewrite_source_terminator_tlabel(&source_spam, &target_label, &trampoline_name) {
-        *trampoline_counter += 1;
-        // Explicit-jump arm: the source's terminator (`goto_if_not`,
-        // `goto_if_not_int_is_zero`, ...) carried a `TLabel` matching
-        // the target block label.  Synthesize a new SpamBlock for the
-        // trampoline so the rewritten terminator lands at
-        // `Label(<trampoline>)`, runs the ref_copies, then jumps to
-        // the original target.  The block has no graph reachability,
-        // so the post-walk DFS reorder leaves it in append-order at
-        // the tail of `all_walker_blocks`.
-        let synthetic_block = graph.new_block(Vec::new());
-        let trampoline_spam = SpamBlockRef::new(synthetic_block, None);
-        trampoline_spam.push_insn(super::flatten::Insn::Label(super::flatten::Label::new(
-            trampoline_name,
-        )));
-        let body_len = body.len();
-        for insn in body {
-            trampoline_spam.push_insn(insn);
+    match rewrite_source_terminator_for_link(
+        &source_spam,
+        link_ref,
+        &target_label,
+        &trampoline_name,
+    ) {
+        TerminatorRewrite::Rewritten => {
+            *trampoline_counter += 1;
+            // Explicit-jump arm: the source's terminator (`goto_if_not`,
+            // `goto_if_not_int_is_zero`, `switch`, ...) carried this
+            // link's branch target.  Synthesize a new SpamBlock for the
+            // trampoline so the rewritten terminator lands at
+            // `Label(<trampoline>)`, runs the ref_copies, then jumps to
+            // the original target.  The block has no graph reachability,
+            // so the post-walk DFS reorder leaves it in append-order at
+            // the tail of `all_walker_blocks`.
+            let synthetic_block = graph.new_block(Vec::new());
+            let trampoline_spam = SpamBlockRef::new(synthetic_block, None);
+            trampoline_spam.push_insn(super::flatten::Insn::Label(super::flatten::Label::new(
+                trampoline_name,
+            )));
+            let body_len = body.len();
+            for insn in body {
+                trampoline_spam.push_insn(insn);
+            }
+            trampoline_spam.push_insn(super::flatten::Insn::op(
+                "goto",
+                vec![super::flatten::Operand::TLabel(
+                    super::flatten::TLabel::new(target_label),
+                )],
+            ));
+            trampoline_spam.push_insn(super::flatten::Insn::Unreachable);
+            all_walker_blocks.push(trampoline_spam.clone());
+            return TrampolineOutcome::Emitted {
+                spam: trampoline_spam,
+                body_len,
+            };
         }
-        trampoline_spam.push_insn(super::flatten::Insn::op(
-            "goto",
-            vec![super::flatten::Operand::TLabel(super::flatten::TLabel::new(
-                target_label,
-            ))],
-        ));
-        trampoline_spam.push_insn(super::flatten::Insn::Unreachable);
-        all_walker_blocks.push(trampoline_spam.clone());
-        return TrampolineOutcome::Emitted {
-            spam: trampoline_spam,
-            body_len,
-        };
+        TerminatorRewrite::FallthroughOrDefault => {}
+        TerminatorRewrite::Missing => return TrampolineOutcome::RewriteFailed,
     }
 
     // Fall-through arm fallback: when no terminator TLabel matched the
@@ -1296,9 +1304,9 @@ where
     }
     insns.push(super::flatten::Insn::op(
         "goto",
-        vec![super::flatten::Operand::TLabel(super::flatten::TLabel::new(
-            target_label,
-        ))],
+        vec![super::flatten::Operand::TLabel(
+            super::flatten::TLabel::new(target_label),
+        )],
     ));
     insns.push(super::flatten::Insn::Unreachable);
     drop(spam_borrow);
@@ -1337,51 +1345,125 @@ fn last_op_summary_for_source(
     "<no Op>".to_string()
 }
 
-/// Rewrite the source SpamBlock's terminator `Operand::TLabel(from)`
-/// to `Operand::TLabel(to)`.  Returns `true` iff a matching TLabel was
-/// found in any direct `Insn::Op::args` of the source's per-block
-/// accumulator or in a `SwitchDictDescr._labels` table reached via an
-/// `Operand::Descr(DescrOperand::SwitchDict(_))` arg.  Mirrors
-/// `liveness.py:76-78` follow-label walk of `SwitchDictDescr._labels`.
-///
-/// Reverse-scans the per-block accumulator so the terminator (the last
-/// `Insn::Op` in the block) is inspected first.  The `Rc<DescrOperand>`
-/// wrapping the switch descr is unwrapped with [`Rc::make_mut`] so the
-/// rewrite mutates a fresh copy if the descr is shared (canonical
-/// emission could clone the same descr across paths; pyre's walker
-/// emits one per terminator today, so `Rc::strong_count == 1` in
-/// production — keep the orthodox unwrap regardless).
-fn rewrite_source_terminator_tlabel(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminatorRewrite {
+    Rewritten,
+    FallthroughOrDefault,
+    Missing,
+}
+
+/// Rewrite the source SpamBlock's terminator for one concrete
+/// flowspace `Link`.  PyPy emits `TLabel(linkfalse)` for bool false
+/// branches and `SwitchDictDescr._labels.append((key, TLabel(switch)))`
+/// for switch cases (`flatten.py:240-304`); matching only the target
+/// block label is not link-specific enough when multiple exits from
+/// the same source converge on the same target block.
+fn rewrite_source_terminator_for_link(
     source_spam: &SpamBlockRef,
-    from: &str,
+    link_ref: &super::flow::LinkRef,
+    target_label: &str,
     to: &str,
-) -> bool {
+) -> TerminatorRewrite {
+    let link = link_ref.borrow();
+    if is_default_link_exitcase(&link.exitcase) {
+        return TerminatorRewrite::FallthroughOrDefault;
+    }
+    match &link.llexitcase {
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Bool(false),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, 0, to) {
+                TerminatorRewrite::Rewritten
+            } else if rewrite_direct_terminator_tlabel(source_spam, target_label, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Bool(true),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, 1, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::FallthroughOrDefault
+            }
+        }
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Signed(key),
+            ..
+        })) => {
+            if rewrite_switch_dict_label_for_key(source_spam, *key, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+        _ => {
+            if rewrite_direct_terminator_tlabel(source_spam, target_label, to) {
+                TerminatorRewrite::Rewritten
+            } else {
+                TerminatorRewrite::Missing
+            }
+        }
+    }
+}
+
+fn is_default_link_exitcase(exitcase: &Option<super::flow::FlowValue>) -> bool {
+    matches!(
+        exitcase,
+        Some(super::flow::FlowValue::Constant(super::flow::Constant {
+            value: super::flow::ConstantValue::Str(value),
+            ..
+        })) if value == "default"
+    )
+}
+
+/// Rewrite a direct branch target (`goto_if_not`, `goto`, exception
+/// mismatch branches) from the target block label to the trampoline.
+/// Reverse-scans so the terminator is considered before any earlier op.
+fn rewrite_direct_terminator_tlabel(source_spam: &SpamBlockRef, from: &str, to: &str) -> bool {
     let mut spam_borrow = source_spam.0.borrow_mut();
     for insn in spam_borrow.per_block_ssarepr.iter_mut().rev() {
         if let super::flatten::Insn::Op { args, .. } = insn {
             for arg in args.iter_mut() {
-                match arg {
-                    super::flatten::Operand::TLabel(tl) => {
-                        if tl.name == from {
-                            tl.name = to.to_string();
-                            return true;
-                        }
+                if let super::flatten::Operand::TLabel(tl) = arg {
+                    if tl.name == from {
+                        tl.name = to.to_string();
+                        return true;
                     }
-                    super::flatten::Operand::Descr(descr_rc) => {
-                        if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
-                            let descr_mut =
-                                std::rc::Rc::make_mut(descr_rc);
-                            if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
-                                for (_key, tl) in sw.labels.iter_mut() {
-                                    if tl.name == from {
-                                        tl.name = to.to_string();
-                                        return true;
-                                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Rewrite a `SwitchDictDescr._labels` entry by its PyPy switch key,
+/// not by target label.  The key is the edge identity in
+/// `flatten.py:294-298`; using the target label would conflate two
+/// different switch cases that jump to the same block with different
+/// renamings.  `Rc::make_mut` keeps the mutation local if a descr is
+/// shared.
+fn rewrite_switch_dict_label_for_key(source_spam: &SpamBlockRef, key: i64, to: &str) -> bool {
+    let mut spam_borrow = source_spam.0.borrow_mut();
+    for insn in spam_borrow.per_block_ssarepr.iter_mut().rev() {
+        if let super::flatten::Insn::Op { args, .. } = insn {
+            for arg in args.iter_mut() {
+                if let super::flatten::Operand::Descr(descr_rc) = arg {
+                    if let super::flatten::DescrOperand::SwitchDict(_) = descr_rc.as_ref() {
+                        let descr_mut = std::rc::Rc::make_mut(descr_rc);
+                        if let super::flatten::DescrOperand::SwitchDict(sw) = descr_mut {
+                            for (label_key, tl) in sw.labels.iter_mut() {
+                                if *label_key == key {
+                                    tl.name = to.to_string();
+                                    return true;
                                 }
                             }
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -9856,12 +9938,11 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
-        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkRef, SpaceOperationArg,
-        Variable, VariableId, c_last_exception,
+        Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, SpaceOperationArg, Variable,
+        VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     /// Tail-strip pass folds a `goto + Unreachable` tail into the
@@ -11542,17 +11623,15 @@ mod tests {
         assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
     }
 
-    /// `rewrite_source_terminator_tlabel` finds the last `Insn::Op`
-    /// whose args contain `Operand::TLabel(from)` and renames it in
-    /// place to `to`.  Used by [`emit_trampoline_for_multi_pred_link`]
-    /// to redirect the source block's branch onto a trampoline.
+    /// Bool branches must be selected by their `llexitcase`, not by
+    /// target block label.  If true and false both target the same
+    /// block, only the false link owns the `goto_if_not` TLabel; the
+    /// true link is PyPy's fallthrough arm (`flatten.py:260-267`).
     #[test]
-    fn rewrite_source_terminator_tlabel_renames_last_matching_tlabel() {
-        use super::super::flatten::{Insn, Label as FlatLabel, Operand, TLabel};
+    fn rewrite_source_terminator_for_link_keeps_bool_true_fallthrough() {
+        use super::super::flatten::{Insn, Operand, TLabel};
 
         let target_name = "block_target_42".to_string();
-        let trampoline_name = "epsilon3_link_0".to_string();
-        let live = Insn::live(Vec::new());
         let goto_if_not = Insn::op(
             "goto_if_not",
             vec![
@@ -11560,66 +11639,70 @@ mod tests {
                 Operand::TLabel(TLabel::new(target_name.clone())),
             ],
         );
-        let source =
-            super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
-        source.push_insn(live);
+        let source = super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        source.push_insn(Insn::live(Vec::new()));
         source.push_insn(goto_if_not);
 
-        let rewrote = super::rewrite_source_terminator_tlabel(
+        let target = super::super::flow::Block::shared(Vec::new());
+        let true_link = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target.clone()),
+            Some(super::super::flow::Constant::bool(true).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::bool(true).into())
+        .into_ref();
+        let false_link = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target),
+            Some(super::super::flow::Constant::bool(false).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::bool(false).into())
+        .into_ref();
+
+        let true_result = super::rewrite_source_terminator_for_link(
             &source,
+            &true_link,
             &target_name,
-            &trampoline_name,
+            "epsilon3_link_true",
         );
-        assert!(rewrote, "expected rewrite to succeed");
-
-        let insns = source.per_block_ssarepr();
-        match &insns[1] {
-            Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "goto_if_not");
-                let tl = args.iter().find_map(|a| match a {
-                    Operand::TLabel(t) => Some(t.name.clone()),
-                    _ => None,
-                });
-                assert_eq!(tl.as_deref(), Some(trampoline_name.as_str()));
-            }
-            other => panic!("expected goto_if_not at index 1, got {other:?}"),
-        }
-        // Spurious test of the non-match path: rename of an absent
-        // TLabel reports failure and does not mutate the block.
-        let absent = "block_absent_99".to_string();
-        let new_name = "epsilon3_link_99".to_string();
-        let rewrote2 = super::rewrite_source_terminator_tlabel(&source, &absent, &new_name);
-        assert!(!rewrote2, "expected rewrite to report no match");
-
-        // Ensures the absent-rename did not corrupt the prior rewrite.
-        let insns_after = source.per_block_ssarepr();
+        assert_eq!(true_result, super::TerminatorRewrite::FallthroughOrDefault);
         assert!(
-            matches!(&insns_after[1],
+            matches!(&source.per_block_ssarepr()[1],
                 Insn::Op { args, .. }
-                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == trampoline_name))),
-            "post-non-match block must still carry the first rewrite",
+                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == target_name))),
+            "true-link fallthrough must not steal the false branch label",
         );
-        let _ = FlatLabel::new("unused");
+
+        let false_result = super::rewrite_source_terminator_for_link(
+            &source,
+            &false_link,
+            &target_name,
+            "epsilon3_link_false",
+        );
+        assert_eq!(false_result, super::TerminatorRewrite::Rewritten);
+        assert!(
+            matches!(&source.per_block_ssarepr()[1],
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::TLabel(t) if t.name == "epsilon3_link_false"))),
+            "false link must rewrite the explicit goto_if_not label",
+        );
     }
 
-    /// `rewrite_source_terminator_tlabel` also walks
-    /// `Operand::Descr(DescrOperand::SwitchDict(_))._labels` entries
-    /// per `liveness.py:76-78` — a multi-pred switch-link elision
-    /// must be retargetable onto a trampoline like any other branch.
+    /// Switch branches must be selected by `(key, TLabel(link))`.
+    /// Two different switch cases may jump to the same target block
+    /// with different renamings, so target-label matching alone can
+    /// attach the trampoline to the wrong case.
     #[test]
-    fn rewrite_source_terminator_tlabel_rewrites_switch_dict_descr_label() {
+    fn rewrite_source_terminator_for_link_rewrites_switch_by_key() {
         use super::super::flatten::{DescrOperand, Insn, Operand, SwitchDictDescr, TLabel};
         use std::rc::Rc;
 
         let target_name = "block_switch_target_7".to_string();
-        let trampoline_name = "epsilon3_link_3".to_string();
+        let trampoline_name = "epsilon3_link_case3".to_string();
 
         let mut sw = SwitchDictDescr::new();
-        sw.labels
-            .push((0, TLabel::new("block_other_5".to_string())));
         sw.labels.push((1, TLabel::new(target_name.clone())));
-        sw.labels
-            .push((2, TLabel::new("block_other_9".to_string())));
+        sw.labels.push((3, TLabel::new(target_name.clone())));
 
         let switch_op = Insn::op(
             "switch",
@@ -11628,16 +11711,25 @@ mod tests {
                 Operand::Descr(Rc::new(DescrOperand::SwitchDict(sw))),
             ],
         );
-        let source =
-            super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
+        let source = super::SpamBlockRef::new(super::super::flow::Block::shared(Vec::new()), None);
         source.push_insn(switch_op);
 
-        let rewrote = super::rewrite_source_terminator_tlabel(
+        let target = super::super::flow::Block::shared(Vec::new());
+        let link_case3 = super::super::flow::Link::new(
+            Vec::new(),
+            Some(target),
+            Some(super::super::flow::Constant::signed(3).into()),
+        )
+        .with_llexitcase(super::super::flow::Constant::signed(3).into())
+        .into_ref();
+
+        let rewrote = super::rewrite_source_terminator_for_link(
             &source,
+            &link_case3,
             &target_name,
             &trampoline_name,
         );
-        assert!(rewrote, "expected rewrite to succeed via SwitchDictDescr");
+        assert_eq!(rewrote, super::TerminatorRewrite::Rewritten);
 
         let insns = source.per_block_ssarepr();
         let Insn::Op { args, .. } = &insns[0] else {
@@ -11654,20 +11746,14 @@ mod tests {
         let rewritten = sw
             .labels
             .iter()
-            .find(|(k, _)| *k == 1)
+            .find(|(k, _)| *k == 3)
             .map(|(_, tl)| tl.name.clone());
         assert_eq!(rewritten.as_deref(), Some(trampoline_name.as_str()));
-        let untouched_first = sw
+        let untouched_case1 = sw
             .labels
             .iter()
-            .find(|(k, _)| *k == 0)
+            .find(|(k, _)| *k == 1)
             .map(|(_, tl)| tl.name.clone());
-        assert_eq!(untouched_first.as_deref(), Some("block_other_5"));
-        let untouched_last = sw
-            .labels
-            .iter()
-            .find(|(k, _)| *k == 2)
-            .map(|(_, tl)| tl.name.clone());
-        assert_eq!(untouched_last.as_deref(), Some("block_other_9"));
+        assert_eq!(untouched_case1.as_deref(), Some(target_name.as_str()));
     }
 }
