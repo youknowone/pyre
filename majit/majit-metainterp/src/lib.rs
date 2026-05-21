@@ -93,9 +93,9 @@ pub use pyjitpl::{
     StandaloneFrameStack, build_state_field_snapshot, call_int_function, call_ref_function,
     call_void_function, consume_observed_float_call, consume_observed_int_call,
     consume_observed_ref_call, consume_observed_void_call, counters, observer_arg_to_i64,
-    observer_i64_to_value, trace_jitcode, trace_jitcode_observer,
-    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    observer_i64_to_value, trace_jitcode, trace_jitcode_observer, trace_jitcode_observer_with_args,
+    trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::MergePoint;

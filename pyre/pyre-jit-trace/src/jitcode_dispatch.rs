@@ -567,9 +567,8 @@ fn build_parent_frames_for_subwalk(
     ctx: &WalkContext<'_, '_>,
     call_site_jitcode_pc: usize,
 ) -> Vec<WalkerFrameInfo> {
-    let mut active_boxes = Vec::with_capacity(
-        ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len(),
-    );
+    let mut active_boxes =
+        Vec::with_capacity(ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len());
     for r in ctx.registers_r.iter() {
         if !r.is_none() {
             active_boxes.push(*r);
@@ -1926,9 +1925,8 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     } else {
         unsafe { (*sym.jitcode).index as u32 }
     };
-    let mut outer_active_boxes = Vec::with_capacity(
-        sym.registers_r.len() + sym.registers_i.len() + sym.registers_f.len(),
-    );
+    let mut outer_active_boxes =
+        Vec::with_capacity(sym.registers_r.len() + sym.registers_i.len() + sym.registers_f.len());
     for r in sym.registers_r.iter() {
         if !r.is_none() {
             outer_active_boxes.push(*r);
@@ -2490,7 +2488,7 @@ fn getfield_vable_via_metainterp(
         ConcreteValue::Null => 0,
         ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
     };
-    let (result, _shadow_value) = match dst_bank {
+    let (result, shadow_value) = match dst_bank {
         'i' => ctx
             .trace_ctx
             .vable_getfield_int(pc, obj, vable_struct_ptr, descr),
@@ -2502,6 +2500,23 @@ fn getfield_vable_via_metainterp(
             .vable_getfield_float(pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
+    // RPython `opimpl_getfield_vable_{i,r,f}` returns
+    // `virtualizable_boxes[index]` (`pyjitpl.py:1186`) — a Box whose
+    // `_resint`/`_resref`/`_resfloat` is filled at construction time.
+    // `box.getint()` returns the live value without any side-lookup.
+    // Pyre splits OpRef↔concrete into a side table; mirror the Box.value
+    // contract by stamping the read result's concrete into
+    // `opref_concrete` so `concrete_of_opref(result)` honors the same
+    // contract for downstream consumers (`goto_if_not/iL`,
+    // `switch/id`, `int_*` arithmetic).  The non-standard heapcache
+    // path inside `vable_getfield_int` already does the same stamp
+    // (trace_ctx.rs:2384); the standard path returns the cached
+    // `(opref, value)` pair without stamping.  `Value::Void` means no
+    // live concrete is available for this slot — skip to match the
+    // heapcache path's gating.
+    if !matches!(shadow_value, Value::Void) {
+        ctx.trace_ctx.set_opref_concrete(result, shadow_value);
+    }
 
     let dst = code[op.pc + 4] as usize;
     // Task #75.E: derive shadow concrete via `concrete_of_opref`.  The
@@ -8105,7 +8120,12 @@ mod tests {
                 for op in &ops {
                     eprintln!("  pc={:>5}..{:<5} key={:>30}", op.pc, op.next_pc, op.key);
                 }
-                eprintln!("  ... ({} more ops)", decoded_ops(j.code.as_slice()).count().saturating_sub(ops.len()));
+                eprintln!(
+                    "  ... ({} more ops)",
+                    decoded_ops(j.code.as_slice())
+                        .count()
+                        .saturating_sub(ops.len())
+                );
             }
         }
     }

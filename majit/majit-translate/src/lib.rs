@@ -728,8 +728,7 @@ fn analyze_pipeline_from_parsed(
                         impl_info.trait_name.as_str(),
                         method.name.as_str(),
                     ]);
-                    call_control
-                        .register_function_hints_for(direct_path, method.hints.clone());
+                    call_control.register_function_hints_for(direct_path, method.hints.clone());
                 }
             }
             // RPython: hints bound to graph identity.

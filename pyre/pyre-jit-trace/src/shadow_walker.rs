@@ -105,31 +105,15 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // panics under `MAJIT_SHADOW_WALKER=1`.
     // Phase 5.A (issue #73, 2026-05-20): the Nop family of 5 zero-op
     // opcodes has been production-flipped to walker dispatch via
-    // `production_walker_handles` in trace_opcode.rs.  Shadow validation
-    // is now moot for those because there is no parallel trait dispatch
-    // to compare against — the walker IS production.  PopTop remains
-    // shadow-blocked by the structural limit (non-elidable pop_value)
-    // and gets production-flipped in Phase 5.B once the
-    // `check_is_elidable` gate drops.  See
-    // `[[project-issue73-phase5-design]]` for the cutover sequencing.
-    //
-    // 2026-05-21 (Task #165): PopTop's outer arm is clean, but its
-    // `inline_call_r_r` recurses 4 levels deep into Rust helper bodies
-    // (`pop_value` → checked_sub → field access).  At depth 4,
-    // `getfield_gc_i` reads ref reg 0 (the Python local being popped);
-    // when the local is a small Python int the slot-keyed shadow holds
-    // `ConcreteValue::Int(n)` and `box_value(obj)` returns
-    // `Value::Int(n)` — not `Value::Ref(struct_ptr)`, so
-    // `field_sanity_load` skips and the result OpRef gets no
-    // `set_opref_concrete` stamp.  The downstream `int_le` +
-    // `goto_if_not/iL` (`pop_value`'s `checked_sub` bound check) then
-    // surfaces `GotoIfNotValueNotConcrete` on raise_catch_loop +
-    // synth/set_membership.  Other benches' PopTop sites happen to pop
-    // non-int Refs and survive.  Real fix requires the walker to
-    // translate small-int unboxed concretes into the heap-pointer view
-    // the codewriter expects (or to short-circuit `getfield_gc_i` on
-    // Int concretes via a different path).  Tracked as Task #165.
-    matches!(instruction, Instruction::PopTop)
+    // `production_walker_handles` in trace_opcode.rs.  Phase 5.B
+    // (2026-05-21) added PopTop to the same set.  Shadow validation is
+    // now moot for those because there is no parallel trait dispatch to
+    // compare against — the walker IS production.  See
+    // `[[project-issue73-phase5-design]]` for the cutover sequencing
+    // and `[[project_issue73_phase4_poptop_vable_getfield_blocker]]` for
+    // the small-int unboxed concrete vs heap-pointer view residual gap.
+    let _ = instruction;
+    false
     // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
     // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
     // codewriter-emitted LoadFastCheck arm body contains a

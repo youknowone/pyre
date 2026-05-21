@@ -2284,6 +2284,19 @@ impl MIFrame {
     /// All guards within this opcode will use orgpc as their resume PC.
     pub(crate) fn set_orgpc(&mut self, pc: usize) {
         self.orgpc = pc;
+        // Pyre-only shadow refresh.  RPython's metainterp owns every opcode
+        // boundary so `metainterp.virtualizable_boxes` stays in lockstep with
+        // heap automatically.  Pyre splits dispatch between the walker (which
+        // mirrors via `vable_setfield → synchronize_virtualizable`) and
+        // `execute_opcode_step` (which mutates the heap PyFrame directly via
+        // `PyFrame::push` / `PyFrame::pop` etc.), so the shadow can lag the
+        // heap between opcodes.  Pull the heap values into the shadow at the
+        // opcode boundary so any walker arm body that reads `getfield_vable_*`
+        // or that triggers `synchronize_virtualizable` sees the up-to-date
+        // values rather than a seed-time stale copy.  When dispatch unification
+        // retires `execute_opcode_step`, this call becomes a no-op and can be
+        // removed.
+        self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
         self.publish_last_instr_to_vable(pc);
     }
 
@@ -3045,9 +3058,7 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let nlocals = s.nlocals;
-            let stack_only = portal_vsd
-                .unwrap_or(concrete_vsd)
-                .saturating_sub(s.nlocals);
+            let stack_only = portal_vsd.unwrap_or(concrete_vsd).saturating_sub(s.nlocals);
             // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
             // `reached_loop_header`: `virtualizable_boxes` length is the
             // target vable array capacity (`nlocals + ncells + co_stacksize`),
@@ -4050,8 +4061,7 @@ impl MIFrame {
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;
         let symbolic_stack_len = if self.pre_opcode_registers_r.is_some() {
-            self.pre_opcode_concrete_depth()
-                .saturating_sub(sym.nlocals)
+            self.pre_opcode_concrete_depth().saturating_sub(sym.nlocals)
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
@@ -6511,8 +6521,8 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
-        let jitcode = crate::jitcode_runtime::jitcode_for_instruction(instruction)
-            .unwrap_or_else(|| {
+        let jitcode =
+            crate::jitcode_runtime::jitcode_for_instruction(instruction).unwrap_or_else(|| {
                 panic!(
                     "dispatch_via_walker_for_opcode: production-walker allow-listed \
                      instruction has no codewriter arm: {:?}",
@@ -6520,47 +6530,40 @@ impl MIFrame {
                 )
             });
 
-        let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
-            let sd = self.ctx().metainterp_sd();
-            let void = sd
-                .done_with_this_frame_descr_void
-                .clone()
-                .expect("done_with_this_frame_descr_void must be wired before production walker");
-            let int = sd
-                .done_with_this_frame_descr_int
-                .clone()
-                .expect("done_with_this_frame_descr_int must be wired before production walker");
-            let ref_ = sd
-                .done_with_this_frame_descr_ref
-                .clone()
-                .expect("done_with_this_frame_descr_ref must be wired before production walker");
-            let float = sd
-                .done_with_this_frame_descr_float
-                .clone()
-                .expect("done_with_this_frame_descr_float must be wired before production walker");
-            let exc = sd
-                .exit_frame_with_exception_descr_ref
-                .clone()
-                .expect(
+        let (done_void, done_int, done_ref, done_float, exit_exc_ref) =
+            {
+                let sd = self.ctx().metainterp_sd();
+                let void = sd.done_with_this_frame_descr_void.clone().expect(
+                    "done_with_this_frame_descr_void must be wired before production walker",
+                );
+                let int = sd.done_with_this_frame_descr_int.clone().expect(
+                    "done_with_this_frame_descr_int must be wired before production walker",
+                );
+                let ref_ = sd.done_with_this_frame_descr_ref.clone().expect(
+                    "done_with_this_frame_descr_ref must be wired before production walker",
+                );
+                let float = sd.done_with_this_frame_descr_float.clone().expect(
+                    "done_with_this_frame_descr_float must be wired before production walker",
+                );
+                let exc = sd.exit_frame_with_exception_descr_ref.clone().expect(
                     "exit_frame_with_exception_descr_ref must be wired before production walker",
                 );
-            (void, int, ref_, float, exc)
-        };
-
-        let sub_jitcode_lookup =
-            |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
-                let all = crate::jitcode_runtime::all_jitcodes();
-                all.get(idx)
-                    .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                        code: jc.code.as_slice(),
-                        num_regs_r: jc.num_regs_r() as usize,
-                        num_regs_i: jc.num_regs_i() as usize,
-                        num_regs_f: jc.num_regs_f() as usize,
-                        constants_i: jc.constants_i.as_slice(),
-                        constants_r: jc.constants_r.as_slice(),
-                        constants_f: jc.constants_f.as_slice(),
-                    })
+                (void, int, ref_, float, exc)
             };
+
+        let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+            let all = crate::jitcode_runtime::all_jitcodes();
+            all.get(idx)
+                .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                    code: jc.code.as_slice(),
+                    num_regs_r: jc.num_regs_r() as usize,
+                    num_regs_i: jc.num_regs_i() as usize,
+                    num_regs_f: jc.num_regs_f() as usize,
+                    constants_i: jc.constants_i.as_slice(),
+                    constants_r: jc.constants_r.as_slice(),
+                    constants_f: jc.constants_f.as_slice(),
+                })
+        };
 
         // Issue #73 Phase 5.B: per-opcode arm entry allocates fresh
         // per-jitcode register banks and seeds r0 = sym.frame.  This
@@ -7491,6 +7494,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
+            | Instruction::PopTop
     )
 }
 
@@ -7832,7 +7836,6 @@ impl TraceHelperAccess for MIFrame {
 // (see majit/majit-translate/src/codegen.rs::generate_trait_impls).
 
 impl OpcodeStepExecutor for MIFrame {
-
     fn pop_jump_if_none(&mut self, target: usize) -> Result<(), PyError> {
         let value = SharedOpcodeHandler::pop_value(self)?;
         if self.value_type(value.opref) != Type::Ref {

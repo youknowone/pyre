@@ -510,8 +510,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // type segment + method segment).  `register_macro_helper_trace_fnaddr`
     // strips the leading crate segment, so the input string must have
     // exactly 3 segments to produce the desired 2-segment canonical form.
-    let pyerror_type_error: fn(String) -> crate::PyError =
-        |msg| crate::PyError::type_error(msg);
+    let pyerror_type_error: fn(String) -> crate::PyError = |msg| crate::PyError::type_error(msg);
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::PyError::type_error",

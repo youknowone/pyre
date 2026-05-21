@@ -707,7 +707,6 @@ pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
 }
 
 pub trait OpcodeStepExecutor: SharedOpcodeHandler {
-
     fn load_const(&mut self, constant: &ConstantData) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
@@ -791,12 +790,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_load_name(self, name, nameindex)
     }
 
-    fn load_global(
-        &mut self,
-        name: &str,
-        nameindex: usize,
-        push_null: bool,
-    ) -> Result<(), PyError>
+    fn load_global(&mut self, name: &str, nameindex: usize, push_null: bool) -> Result<(), PyError>
     where
         Self: NamespaceOpcodeHandler,
     {
@@ -932,9 +926,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_call(self, nargs)
     }
 
-    fn return_value(
-        &mut self,
-    ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>
+    fn return_value(&mut self) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>
     where
         Self: ControlFlowOpcodeHandler,
     {
@@ -1138,10 +1130,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn build_set(&mut self, _count: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("build_set not implemented").into())
     }
-    fn build_slice(
-        &mut self,
-        _argc: crate::bytecode::BuildSliceArgCount,
-    ) -> Result<(), PyError> {
+    fn build_slice(&mut self, _argc: crate::bytecode::BuildSliceArgCount) -> Result<(), PyError> {
         Err(crate::PyError::type_error("build_slice not implemented").into())
     }
     fn build_string(&mut self, _count: usize) -> Result<(), PyError> {
@@ -1248,10 +1237,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn format_with_spec(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("format_with_spec not implemented").into())
     }
-    fn convert_value(
-        &mut self,
-        _conv: crate::bytecode::ConvertValueOparg,
-    ) -> Result<(), PyError> {
+    fn convert_value(&mut self, _conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
 
@@ -1360,10 +1346,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
         Err(crate::PyError::type_error("list_to_tuple not implemented").into())
     }
-    fn print_expr(
-        &mut self,
-        _val: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<(), PyError> {
+    fn print_expr(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<(), PyError> {
         Err(crate::PyError::type_error("print_expr not implemented").into())
     }
     fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {

@@ -1657,7 +1657,6 @@ impl ConstantOpcodeHandler for PyFrame {
 }
 
 impl OpcodeStepExecutor for PyFrame {
-
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
     /// (typeobject.py auto-fills the slot at class creation, but the
@@ -1723,10 +1722,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── LoadCommonConstant ──
-    fn load_common_constant(
-        &mut self,
-        cc: crate::bytecode::CommonConstant,
-    ) -> Result<(), PyError> {
+    fn load_common_constant(&mut self, cc: crate::bytecode::CommonConstant) -> Result<(), PyError> {
         use crate::bytecode::CommonConstant;
         let val = match cc {
             CommonConstant::AssertionError => {
@@ -2079,10 +2075,7 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── ConvertValue (repr/str/ascii conversion) ──
-    fn convert_value(
-        &mut self,
-        conv: crate::bytecode::ConvertValueOparg,
-    ) -> Result<(), PyError> {
+    fn convert_value(&mut self, conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
         let val = self.pop();
         let s = match conv {
             crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
@@ -3069,10 +3062,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BuildSlice ──
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
-    fn build_slice(
-        &mut self,
-        argc: crate::bytecode::BuildSliceArgCount,
-    ) -> Result<(), PyError> {
+    fn build_slice(&mut self, argc: crate::bytecode::BuildSliceArgCount) -> Result<(), PyError> {
         use crate::bytecode::BuildSliceArgCount;
         let step = match argc {
             BuildSliceArgCount::Three => self.pop(),
