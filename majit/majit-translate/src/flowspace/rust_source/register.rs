@@ -3914,6 +3914,76 @@ mod tests {
         syn::parse_str::<ItemFn>(src).expect("test fixture must parse")
     }
 
+    /// Verify that `build_host_class_from_struct` populates the
+    /// `REGISTERED_STRUCT_FIELD_ATTRS` side-table with one entry per
+    /// named field, projected to the expected `ValueType`.  Skips
+    /// other test cases' state by using a uniquely-named struct.
+    #[test]
+    fn struct_field_attrs_snapshot_carries_named_field_value_types() {
+        let item: ItemStruct = syn::parse_str(
+            "struct PyreFieldStubProbe { count: i64, name: String, flag: bool }",
+        )
+        .expect("test fixture must parse");
+        let _ = build_host_class_from_struct(&item);
+        let snap = struct_field_attrs_snapshot("PyreFieldStubProbe")
+            .expect("registration must publish under the struct's local name");
+        assert_eq!(snap.len(), 3, "every named field must round-trip");
+        assert_eq!(
+            snap.get("count"),
+            Some(&crate::model::ValueType::Int),
+            "i64 field must project to ValueType::Int"
+        );
+        assert_eq!(
+            snap.get("name"),
+            Some(&crate::model::ValueType::Ref),
+            "user-typed (String) field must project to ValueType::Ref"
+        );
+        assert_eq!(
+            snap.get("flag"),
+            Some(&crate::model::ValueType::Bool),
+            "bool field must project to ValueType::Bool"
+        );
+    }
+
+    /// Verify that re-registering the same struct name overwrites
+    /// the prior field set (last-writer-wins on the outer key).
+    #[test]
+    fn struct_field_attrs_snapshot_re_registration_overwrites() {
+        let first: ItemStruct =
+            syn::parse_str("struct PyreFieldStubOverwriteProbe { a: i64 }")
+                .expect("fixture parses");
+        let second: ItemStruct =
+            syn::parse_str("struct PyreFieldStubOverwriteProbe { b: bool, c: f64 }")
+                .expect("fixture parses");
+        let _ = build_host_class_from_struct(&first);
+        let _ = build_host_class_from_struct(&second);
+        let snap = struct_field_attrs_snapshot("PyreFieldStubOverwriteProbe").unwrap();
+        assert_eq!(snap.len(), 2, "second registration replaces first");
+        assert!(snap.contains_key("b"));
+        assert!(snap.contains_key("c"));
+        assert!(!snap.contains_key("a"), "first walk's `a` must be evicted");
+    }
+
+    /// Tuple structs and unit structs have no named fields, so the
+    /// side-table must not be populated for them.
+    #[test]
+    fn struct_field_attrs_snapshot_skips_unnamed_field_structs() {
+        let tuple: ItemStruct = syn::parse_str("struct PyreFieldStubTupleProbe(i64, bool);")
+            .expect("fixture parses");
+        let unit: ItemStruct =
+            syn::parse_str("struct PyreFieldStubUnitProbe;").expect("fixture parses");
+        let _ = build_host_class_from_struct(&tuple);
+        let _ = build_host_class_from_struct(&unit);
+        assert!(
+            struct_field_attrs_snapshot("PyreFieldStubTupleProbe").is_none(),
+            "tuple structs do not publish field stubs"
+        );
+        assert!(
+            struct_field_attrs_snapshot("PyreFieldStubUnitProbe").is_none(),
+            "unit structs do not publish field stubs"
+        );
+    }
+
     /// Test helper: lookup `name` in `module_id`'s slice of the
     /// module-globals registry and unwrap the expected
     /// `ConstValue::HostObject` shape. Per-module scoping (Issue
