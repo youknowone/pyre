@@ -2136,29 +2136,40 @@ impl<M: Clone> MetaInterp<M> {
         self.bridge_info = None;
     }
 
-    /// `pyjitpl.py:2890 / 2916` `profiler.start_tracing()` parity —
-    /// open the tracing profiler event scope.  Idempotent re-entry is
-    /// not allowed (PyPy's compile_and_run_once / handle_guard_failure
-    /// are not re-entrant on the same MetaInterp).
+    /// `pyjitpl.py:2890 / 2916`
+    /// `debug_start("jit-tracing"); profiler.start_tracing()` parity —
+    /// open the tracing debug section and profiler event scope.
+    /// Idempotent re-entry is not allowed (PyPy's
+    /// `compile_and_run_once` / `handle_guard_failure` are not
+    /// re-entrant on the same MetaInterp).  The debug section and
+    /// profiler event are issued together here because the
+    /// matching close lives in [`leave_profiler_tracing`]; both halves
+    /// must move as a pair to keep the `debug_start`/`debug_stop`
+    /// nesting balanced (PyPy convention).
     pub fn enter_profiler_tracing(&mut self) {
         debug_assert!(
             !self.profiler_tracing_active,
             "enter_profiler_tracing called while tracing profiler event is already open",
         );
+        crate::debug::debug_start("jit-tracing");
         self.staticdata.profiler.start_tracing();
         self.profiler_tracing_active = true;
     }
 
-    /// `pyjitpl.py:2897 / 2934` `profiler.end_tracing()` parity —
-    /// close the tracing profiler event scope opened by
-    /// [`enter_profiler_tracing`].  No-op if the scope was already
-    /// closed (mirrors PyPy's `finally` semantics: a path that never
-    /// reached `start_tracing` still passes through `finally` without
-    /// firing `end_tracing` because the implicit pairing depends on
-    /// whether the entry method ran past `start_tracing`).
+    /// `pyjitpl.py:2897 / 2934`
+    /// `profiler.end_tracing(); debug_stop("jit-tracing")` parity —
+    /// close the profiler event scope opened by
+    /// [`enter_profiler_tracing`], then the matching debug section
+    /// (LIFO unwind matching PyPy's nested `try/finally`).  No-op if
+    /// the scope was already closed (mirrors PyPy's `finally`
+    /// semantics: a path that never reached `start_tracing` still
+    /// passes through `finally` without firing `end_tracing` because
+    /// the implicit pairing depends on whether the entry method ran
+    /// past `start_tracing`).
     pub fn leave_profiler_tracing(&mut self) {
         if self.profiler_tracing_active {
             self.staticdata.profiler.end_tracing();
+            crate::debug::debug_stop("jit-tracing");
             self.profiler_tracing_active = false;
         }
     }
@@ -4823,18 +4834,22 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend.compile_loop(
-                &inputargs,
-                &compiled_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        // `enter_backend` RAII guard pairs the debug section + profiler
+        // event; drop fires end_backend then debug_stop in LIFO order.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backend.compile_loop(
+                    &inputargs,
+                    &compiled_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
@@ -5656,23 +5671,25 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Wrap to `Vec<OpRc>` for the backend's trait boundary.
-            let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
-                .iter()
-                .map(|op| std::rc::Rc::new(op.clone()))
-                .collect();
-            self.backend.compile_loop(
-                &inputargs,
-                &combined_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Wrap to `Vec<OpRc>` for the backend's trait boundary.
+                let combined_ops_rc: Vec<majit_ir::OpRc> = combined_ops
+                    .iter()
+                    .map(|op| std::rc::Rc::new(op.clone()))
+                    .collect();
+                self.backend.compile_loop(
+                    &inputargs,
+                    &combined_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => {
@@ -6196,8 +6213,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -6552,8 +6570,9 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -8536,22 +8555,24 @@ impl<M: Clone> MetaInterp<M> {
             token_mut.num_scalar_inputargs = self.num_scalar_inputargs;
         }
 
-        // compile.py:532-546 `profiler.start_backend() ... try: do_compile_loop
-        // ... finally: ... profiler.end_backend()`.
-        self.staticdata.profiler.start_backend();
-        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
-                .iter()
-                .map(|op| std::rc::Rc::new(op.clone()))
-                .collect();
-            self.backend.compile_loop(
-                bridge_inputargs,
-                &optimized_ops_rc,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
-        }));
-        self.staticdata.profiler.end_backend();
+        // compile.py:532-546 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_loop ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let compile_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let optimized_ops_rc: Vec<majit_ir::OpRc> = optimized_ops
+                    .iter()
+                    .map(|op| std::rc::Rc::new(op.clone()))
+                    .collect();
+                self.backend.compile_loop(
+                    bridge_inputargs,
+                    &optimized_ops_rc,
+                    Arc::get_mut(&mut token)
+                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                )
+            }))
+        };
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(_) => return false,
@@ -9116,20 +9137,23 @@ impl<M: Clone> MetaInterp<M> {
                 .iter()
                 .map(|op| std::rc::Rc::new(op.clone()))
                 .collect();
-            // compile.py:589-599 `profiler.start_backend() ... try:
-            // do_compile_bridge ... finally: ... profiler.end_backend()`.
-            self.staticdata.profiler.start_backend();
-            let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backend.compile_bridge(
-                    fail_descr,
-                    bridge_inputargs,
-                    &optimized_ops_rc_for_bridge,
-                    &source_jct,
-                    previous_tokens,
-                    caller_recovery_layout.as_ref(),
-                )
-            }));
-            self.staticdata.profiler.end_backend();
+            // compile.py:589-599 `debug_start("jit-backend") +
+            // profiler.start_backend() ... try: do_compile_bridge ...
+            // finally: ... profiler.end_backend() +
+            // debug_stop("jit-backend")`.
+            let bridge_result = {
+                let _backend_scope = self.staticdata.profiler.enter_backend();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.backend.compile_bridge(
+                        fail_descr,
+                        bridge_inputargs,
+                        &optimized_ops_rc_for_bridge,
+                        &source_jct,
+                        previous_tokens,
+                        caller_recovery_layout.as_ref(),
+                    )
+                }))
+            };
             match bridge_result {
                 Ok(r) => r,
                 Err(e) => {
