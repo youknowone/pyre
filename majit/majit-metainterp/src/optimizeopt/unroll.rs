@@ -17,7 +17,6 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
@@ -43,9 +42,9 @@ fn is_trace_runtime_ref(
 }
 
 fn p1_full_prefix_from_box_pool_snapshot(
-    snapshot: Option<&[Option<crate::r#box::BoxRef>]>,
-) -> Option<Vec<Option<crate::r#box::BoxRef>>> {
-    snapshot.map(|pool| pool.to_vec())
+    snapshot: Option<&crate::r#box::BoxPool>,
+) -> Option<crate::r#box::BoxPool> {
+    snapshot.cloned()
 }
 
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
@@ -245,7 +244,7 @@ impl UnrollOptimizer {
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
-        let result = optimizer.optimize_with_constants(ops, constants);
+        let result = optimizer.optimize_with_constants(ops, constants, crate::r#box::BoxPool::new());
         let sp = crate::optimizeopt::shortpreamble::extract_short_preamble(&result);
         if !sp.is_empty() {
             self.short_preamble = Some(sp);
@@ -333,7 +332,7 @@ impl UnrollOptimizer {
             // raw position alignment (inputargs + emit ops) reproduces
             // that identity here.
             let prefix =
-                p1_full_prefix_from_box_pool_snapshot(pre_imported.box_pool_snapshot.as_deref());
+                p1_full_prefix_from_box_pool_snapshot(pre_imported.box_pool_snapshot.as_ref());
             (pre_imported, constants.clone(), Vec::new(), prefix)
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
@@ -419,9 +418,12 @@ impl UnrollOptimizer {
             // (`history.py:220` ConstInt(value) per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared
             // `constants` map (`optimizer.rs:1944`).
-            opt_p1.set_pending_box_pool(p1_iter.box_pool.clone());
-            let p1_ops =
-                opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
+            let p1_ops = opt_p1.optimize_with_constants_and_inputs(
+                &p1_ops_in,
+                &mut consts_p1,
+                num_inputs,
+                p1_iter.box_pool.clone(),
+            );
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
             // class pointers). These live on the BoxRef forwarded chain
@@ -531,16 +533,16 @@ impl UnrollOptimizer {
                     // `next_pos` when Phase 1 dropped/folded ops (the iterator
                     // advanced `_fresh` past those positions while
                     // `OptContext::next_pos` only counts `new_operations`).
-                    // `p1_iter.box_pool` was seeded into opt_p1 via
-                    // `set_pending_box_pool` so `final_ctx.box_pool` carries
+                    // `p1_iter.box_pool` was threaded into
+                    // `optimize_with_constants_and_inputs` so `final_ctx.box_pool` carries
                     // the iterator's full allocation range; transferring up to
                     // `box_pool.len()` ensures Phase 2 chain walks observe the
                     // real Phase 1 BoxRefs at every reachable position rather
                     // than Type::Void placeholders.
-                    let p1_full_prefix: Option<Vec<Option<crate::r#box::BoxRef>>> = opt_p1
+                    let p1_full_prefix: Option<crate::r#box::BoxPool> = opt_p1
                         .final_ctx
                         .as_ref()
-                        .map(|c| c.box_pool.as_slots().to_vec());
+                        .map(|c| c.box_pool.clone());
                     (state, consts_p1, p1_ops, p1_full_prefix)
                 }
                 None => {
@@ -785,13 +787,13 @@ impl UnrollOptimizer {
         //
         // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
         // `const_pool` via `BoxRef::new_const(value)`, no dedup.
-        opt_p2.set_pending_box_pool(iter.box_pool.clone());
         let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
             body_num_inputs,
             phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
             p2_high_water,
+            iter.box_pool.clone(),
         );
         // RPython optimizer.py:614-625 freezes op arguments during
         // `_emit_operation`; optimizer.py:598-612 may then install a Const
@@ -1707,7 +1709,7 @@ pub struct ExportedState {
     /// retrace attempt (test fixtures, in-flight construction). Populated
     /// only by `export_state_with_bounds` at the canonical Phase 1 export
     /// site.
-    pub box_pool_snapshot: Option<Vec<Option<crate::r#box::BoxRef>>>,
+    pub(crate) box_pool_snapshot: Option<crate::r#box::BoxPool>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -2009,11 +2011,7 @@ impl ExportedState {
         // _forwarded info; if GC moves a Ref between Phase 1 export and
         // retrace those reads see a stale handle.
         if let Some(snapshot) = &self.box_pool_snapshot {
-            for (i, b) in snapshot
-                .iter()
-                .enumerate()
-                .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
-            {
+            for (i, b) in snapshot.iter_indexed() {
                 let forwarded = b.get_forwarded();
                 if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &*forwarded {
                     let info = rc.borrow();
@@ -2152,7 +2150,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
+                        && let Some(b) = snapshot.get(*i)
                     {
                         // RPython object identity: mutate the live Rc<RefCell<PtrInfo>>
                         // in place so any other handle sharing it sees the post-GC
@@ -2173,7 +2171,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
+                        && let Some(b) = snapshot.get(*i)
                     {
                         let rc = match &*b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
@@ -2192,7 +2190,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolBoxConstRef(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i).and_then(|o| o.as_ref())
+                        && let Some(b) = snapshot.get(*i)
                     {
                         // BoxKind::Const is immutable, so swap in a fresh
                         // ConstRef BoxRef carrying the updated handle.
@@ -2202,38 +2200,30 @@ impl ExportedState {
                         // / InputArg here. Preserve the original Const's
                         // `const_index` so the chain walker can keep
                         // reconstructing `OpRef::const_ptr(idx)` after GC.
-                        let swap_idx: Option<Option<u32>> = {
+                        // After `make_constant` rewrite (optimizer.py:432
+                        // shape), every Const target in box_pool carries a
+                        // `const_index`. Extract it as a single Option that
+                        // unwraps as "Const Ref target carrying a const_index"
+                        // — both inner cases are required in production.
+                        let orig_idx: Option<u32> = {
                             let f = b.get_forwarded();
-                            if let crate::r#box::Forwarded::Box(target) = &*f {
-                                if target.is_constant()
-                                    && matches!(target.const_value(), Some(Value::Ref(_)))
-                                {
-                                    Some(target.const_index())
-                                } else {
-                                    None
-                                }
+                            if let crate::r#box::Forwarded::Box(target) = &*f
+                                && target.is_constant()
+                                && matches!(target.const_value(), Some(Value::Ref(_)))
+                            {
+                                let idx = target.const_index().expect(
+                                    "BoxPoolBoxConstRef refresh: Const Ref target missing const_index",
+                                );
+                                Some(idx)
                             } else {
                                 None
                             }
                         };
-                        if let Some(orig_idx) = swap_idx {
-                            // After `make_constant` rewrite (optimizer.py:432
-                            // shape), every Const target in box_pool carries
-                            // a `const_index`. The `None` arm only fires for
-                            // legacy `BoxRef::new_const(value)` plants from
-                            // pre-rewrite test fixtures.
-                            debug_assert!(
-                                orig_idx.is_some(),
-                                "BoxPoolBoxConstRef refresh: Const target without const_index — legacy fixture path",
-                            );
-                            let new_target = match orig_idx {
-                                Some(idx) => crate::r#box::BoxRef::new_const_with_index(
-                                    Value::Ref(updated),
-                                    idx,
-                                ),
-                                None => crate::r#box::BoxRef::new_const(Value::Ref(updated)),
-                            };
-                            b.set_forwarded_box(new_target);
+                        if let Some(idx) = orig_idx {
+                            b.set_forwarded_box(crate::r#box::BoxRef::new_const_with_index(
+                                Value::Ref(updated),
+                                idx,
+                            ));
                         }
                     }
                 }
@@ -2724,7 +2714,7 @@ impl OptUnroll {
         // to recreate that observation across the in-memory ExportedState
         // hand-off. Each entry is `Rc::clone` cheap; vec retention is
         // bounded by `ExportedState` lifetime.
-        state.box_pool_snapshot = Some(ctx.box_pool.as_slots().to_vec());
+        state.box_pool_snapshot = Some(ctx.box_pool.clone());
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -2789,7 +2779,7 @@ impl OptUnroll {
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
-        let resolved_box = ctx.get_box_replacement_box(resolved);
+        let resolved_box = ctx.get_box_replacement_box(arg);
         let has_fields = matches!(
             resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
             Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
@@ -3090,9 +3080,8 @@ impl OptUnroll {
             // from the original label arg (before forwarding).
             if let Some(label) = current_label_args {
                 for (i, &jump_arg) in short_jump_args.iter().enumerate() {
-                    let resolved = ctx.get_box_replacement(jump_arg);
                     let resolved_has_info = ctx
-                        .get_box_replacement_box(resolved)
+                        .get_box_replacement_box(jump_arg)
                         .as_ref()
                         .map_or(false, |b| ctx.has_ptr_info(b));
                     if !resolved_has_info {
@@ -3102,7 +3091,7 @@ impl OptUnroll {
                             if let Some(info) =
                                 label_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
                             {
-                                ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
+                                ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                             }
                         }
                     }
@@ -3270,9 +3259,8 @@ impl OptUnroll {
                 // has info from Phase 1 export) to the resolved jump_arg.
                 // shortpreamble.py:414-425 parity: propagate PtrInfo from
                 // Phase 1 export to jump_args so guards are redundant.
-                let resolved = ctx.get_box_replacement(jump_arg);
                 let resolved_has_info = ctx
-                    .get_box_replacement_box(resolved)
+                    .get_box_replacement_box(jump_arg)
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 if !resolved_has_info {
@@ -3289,7 +3277,7 @@ impl OptUnroll {
                                 .and_then(|opt| opt.clone())
                         });
                     if let Some(info) = info {
-                        ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
+                        ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                     }
                 }
             }
@@ -3778,7 +3766,8 @@ impl OptUnroll {
         // make_constant mirrors optimizer.py:432 as `Forwarded::Box(constbox)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
-        if let Some(b) = ctx.get_box_replacement_box(resolved) {
+        let resolved_box = ctx.get_box_replacement_box(opref);
+        if let Some(b) = resolved_box.as_ref() {
             if b.is_constant() {
                 if let Some(value) = b.const_value() {
                     return synthesize_const_info(value);
@@ -3791,7 +3780,6 @@ impl OptUnroll {
         // `OptIntBounds::export_arg_int_bounds`, which already filters by
         // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
         // lookup here cannot pull a bound for a ref/float box.
-        let resolved_box = ctx.get_box_replacement_box(resolved);
         if let Some(handle) = resolved_box.as_ref().and_then(|b| b.ptr_info_handle()) {
             // RPython object identity: re-export the same Rc handle so
             // downstream `setinfo_from_preamble` sees the live cell, not
@@ -5001,22 +4989,22 @@ mod tests {
 
     #[test]
     fn test_retrace_box_pool_snapshot_preserves_inputargs_for_p1_full_prefix() {
-        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, Some(0));
-        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, Some(1));
+        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, 0);
+        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, 1);
         let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
         let emit3 = crate::r#box::BoxRef::new_resop(Type::Int, 3);
-        let snapshot = vec![
+        let snapshot = crate::r#box::BoxPool::from_slots(vec![
             Some(input0.clone()),
             Some(input1.clone()),
             Some(emit2.clone()),
             Some(emit3.clone()),
-        ];
+        ]);
 
         let prefix =
             p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
 
         assert_eq!(
-            prefix,
+            prefix.into_slots(),
             vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
         );
     }
@@ -5058,7 +5046,7 @@ mod tests {
                 .unwrap_or_default()
         });
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
     }
 
     // ── Basic peeling ─────────────────────────────────────────────────
@@ -5499,7 +5487,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -5605,13 +5593,16 @@ mod tests {
         let mut unroll_opt = UnrollOptimizer::new();
         // IntAdd operates on Int-typed inputs — seed the inner phase1/2
         // optimizers' trace_inputarg_types via UnrollOptimizer so the
-        // intbounds pass sees Int on OpRef::int_op(0), OpRef::void_op(1).
+        // intbounds pass sees Int on the two inputargs.
         unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
         // Use optimize_trace_with_constants_and_inputs to properly set
-        // num_inputs so input args don't collide with op positions.
+        // num_inputs so input args don't collide with op positions. Args
+        // address inputarg slots via `InputArg*` OpRef variants so the
+        // BoxRef shape (`with_inputarg_types` plants `BoxRef::new_inputarg`)
+        // and the orthodox `_forwarded` mirror agree on the namespace.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::void_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]),
+            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5741,8 +5732,7 @@ mod tests {
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_resolved = ctx2.get_box_replacement(OpRef::int_op(10));
-        let obj_box = ctx2.get_box_replacement_box(obj_resolved).unwrap();
+        let obj_box = ctx2.get_box_replacement_box(OpRef::int_op(10)).unwrap();
         let pop = ctx2
             .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
             .flatten();

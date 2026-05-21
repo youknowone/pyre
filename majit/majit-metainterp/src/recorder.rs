@@ -141,7 +141,7 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            box_pool: Vec::with_capacity(256).into(),
+            box_pool: crate::r#box::BoxPool::with_capacity(256),
         }
     }
 
@@ -185,7 +185,7 @@ impl Trace {
         };
         // H-2.1 parallel BoxRef: `AbstractInputArg` mirror with position.
         self.box_pool
-            .push(BoxRef::new_inputarg(tp, Some(self.op_count)));
+            .push(BoxRef::new_inputarg(tp, self.op_count));
         self.op_count += 1;
         self.box_count += 1;
         opref
@@ -471,17 +471,19 @@ impl Trace {
         self.ops.iter().find(|op| op.pos.get().raw() == raw)
     }
 
-    /// H-2.1: BoxRef for the value recorded at `position` (= `op_count`
-    /// at the time of recording). H-2.1 has no production reader; this
-    /// accessor exists for transition validation and future H-3 readers.
+    /// BoxRef for the value recorded at `position` (= `op_count` at
+    /// the time of recording). Test-only — used to assert Box invariants
+    /// in recorder tests.
+    #[cfg(test)]
     pub fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
         self.box_pool.get(position as usize)
     }
 
-    /// H-2.1: full BoxRef pool snapshot — borrows the sparse slot
-    /// table (`None` for skipped positions).
-    pub fn box_pool(&self) -> &[Option<BoxRef>] {
-        self.box_pool.as_slots()
+    /// Full BoxRef pool snapshot — borrows the sparse slot table
+    /// (`None` for skipped positions). Test-only.
+    #[cfg(test)]
+    pub fn box_pool(&self) -> &crate::r#box::BoxPool {
+        &self.box_pool
     }
 }
 
@@ -560,7 +562,7 @@ mod tests {
             let b = rec.box_for_position(raw).expect("inputarg slot");
             assert!(b.is_inputarg());
             assert_eq!(b.type_(), expect_tp);
-            assert_eq!(b.inputarg_position(), Some(raw));
+            assert_eq!(b.position(), Some(raw));
         }
 
         // record_op typed (Int result)

@@ -354,7 +354,7 @@ pub struct TraceCtx {
     /// `HeapBox::new(opref, value)` through `concrete_of_opref(opref)`
     /// so the cached `currfieldbox.value` parity is preserved even
     /// when the carrier OpRef is non-Const.
-    pub(crate) opref_concrete: std::collections::HashMap<u32, Value>,
+    pub(crate) opref_concrete: majit_ir::vec_assoc::VecAssoc<u32, Value>,
     /// `pyjitpl.py:3389-3390` `raise SwitchToBlackhole(ABORT_ESCAPE,
     /// raising_exception=True)` — RPython surfaces the abort reason and
     /// the `raising_exception` flag as a real Python exception that
@@ -1015,7 +1015,7 @@ impl TraceCtx {
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
-            opref_concrete: std::collections::HashMap::new(),
+            opref_concrete: majit_ir::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -1078,7 +1078,7 @@ impl TraceCtx {
             cpu: None,
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
-            opref_concrete: std::collections::HashMap::new(),
+            opref_concrete: majit_ir::vec_assoc::VecAssoc::new(),
         }
     }
 

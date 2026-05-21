@@ -548,8 +548,7 @@ impl StrPtrInfo {
             VStringVariant::Plain(info) => {
                 let mut chars = Vec::with_capacity(info._chars.len());
                 for ch in &info._chars {
-                    let ch = ctx.get_box_replacement((*ch)?);
-                    chars.push(ctx.get_constant_int(ch)?);
+                    chars.push(ctx.get_constant_int((*ch)?)?);
                 }
                 Some(chars)
             }
@@ -1434,9 +1433,9 @@ impl PtrInfo {
     fn force_box_impl(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         use majit_ir::{Op, OpCode};
 
-        fn force_child(value_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let value_box = ctx.get_box_replacement_box(value_ref);
+        fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
+            let value_ref = ctx.get_box_replacement(orig_ref);
+            let value_box = ctx.get_box_replacement_box(orig_ref);
             if value_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
                 let value_box = value_box.expect("recorder-populated");
                 let mut info = ctx.take_ptr_info(&value_box).unwrap();
@@ -1484,8 +1483,7 @@ impl PtrInfo {
                         // info.py:144: _force_elements_immutable
                         // Write constant field values directly to the allocated memory.
                         for &(field_idx, val_ref) in fields.iter() {
-                            let resolved = ctx.get_box_replacement(val_ref);
-                            if let Some(value) = ctx.get_constant(resolved) {
+                            if let Some(value) = ctx.get_constant(val_ref) {
                                 if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
                                     if let Some(field_d) = fd.as_field_descr() {
                                         let offset = field_d.offset();
@@ -1677,9 +1675,8 @@ impl PtrInfo {
                     // new_const_item returns CONST_0/CONST_NULL/CONST_ZERO_FLOAT
                     // (all raw=0).
                     if clear {
-                        let resolved = ctx.get_box_replacement(item_ref);
                         let is_default = ctx
-                            .get_box_replacement_box(resolved)
+                            .get_box_replacement_box(item_ref)
                             .as_ref()
                             .and_then(|b| ctx.getconst(b))
                             .map_or(false, |(raw, _)| raw == 0);
@@ -1830,7 +1827,6 @@ impl PtrInfo {
                 // raw-slice identity and mis-route any later
                 // `get_virtual_fields` / raw-guard path.
                 let parent_forced = force_child(slice.parent, ctx);
-                let parent_forced = ctx.get_box_replacement(parent_forced);
                 let offset_ref = ctx.emit_constant_int(slice.offset as i64);
                 let mut add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
                 add_op.pos.set(opref);
@@ -2469,10 +2465,9 @@ impl PtrInfo {
             return false;
         }
         for &(_, val) in fields {
-            let resolved = ctx.get_box_replacement(val);
-            if !ctx.is_constant(resolved) {
+            if !ctx.is_constant(val) {
                 // Check if it's a virtual that is also immutable+constant
-                let resolved_box = ctx.get_box_replacement_box(resolved);
+                let resolved_box = ctx.get_box_replacement_box(val);
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
                         continue;

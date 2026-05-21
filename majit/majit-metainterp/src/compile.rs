@@ -27,7 +27,6 @@ use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op,
     OpCode, OpRef, RdVirtualInfo, Type, Value,
 };
-use std::collections::HashMap;
 
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;

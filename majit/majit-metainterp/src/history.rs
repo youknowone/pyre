@@ -64,7 +64,7 @@ pub struct TreeLoop {
     /// (same Python objects, same `_forwarded` slot). The Rust pool
     /// preserves that identity by carrying the same `Rc<Box>` allocations
     /// from the recorder through to the optimizer.
-    pub box_pool: crate::r#box::BoxPool,
+    pub(crate) box_pool: crate::r#box::BoxPool,
 }
 
 impl TreeLoop {
@@ -109,13 +109,13 @@ impl TreeLoop {
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: impl Into<crate::r#box::BoxPool>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
         TreeLoop {
             inputargs,
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
-            box_pool: box_pool.into(),
+            box_pool,
         }
     }
 
@@ -129,13 +129,13 @@ impl TreeLoop {
         inputargs: Vec<InputArg>,
         ops: Vec<OpRc>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: impl Into<crate::r#box::BoxPool>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
         TreeLoop {
             inputargs,
             ops,
             snapshots,
-            box_pool: box_pool.into(),
+            box_pool,
         }
     }
 
@@ -487,10 +487,11 @@ impl TreeLoop {
         // PtrInfo / IntBound / Const exclusively through these BoxRefs,
         // so retrace baselines must arrive with the pool seeded. Total
         // length: `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
-        let mut box_pool: crate::r#box::BoxPool =
-            Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len()).into();
+        let mut box_pool = crate::r#box::BoxPool::with_capacity(
+            new_ia_boxes.len() + op_escaped.len() + cut_ops.len(),
+        );
         for (i, &tp) in new_ia_types.iter().enumerate() {
-            box_pool.push(BoxRef::new_inputarg(tp, Some(i as u32)));
+            box_pool.push(BoxRef::new_inputarg(tp, i as u32));
         }
         for &r in op_escaped.iter() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;

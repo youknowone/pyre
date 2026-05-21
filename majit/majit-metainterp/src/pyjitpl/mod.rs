@@ -14,7 +14,6 @@ pub(crate) use dispatch::{call_int_function, call_ref_function, call_void_functi
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
@@ -453,8 +452,8 @@ struct PreparedBridgeTrace {
     /// Per-iter `BoxRef` pool from the bridge `TraceIterator`, mirroring
     /// `opencoder.py:259-262`'s fresh `inputarg_from_tp` / `cls()` allocation
     /// for the bridge's disjoint Box identity set. The optimizer consumes it
-    /// via `set_pending_box_pool` so BoxRef-routing readers see the bridge's
-    /// own boxes, not the parent loop's.
+    /// via the `box_pool` parameter on `optimize_bridge` so BoxRef-routing
+    /// readers see the bridge's own boxes, not the parent loop's.
     box_pool: crate::r#box::BoxPool,
 }
 
@@ -4551,16 +4550,17 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
                         simple_opt.call_pure_results = call_pure_results.clone();
-                        // H-3.0b: forward the recorder's BoxRef pool — the
-                        // retry path uses the same upstream `Rc<Box>`
-                        // allocations from the original trace.
-                        simple_opt.set_pending_box_pool(trace.box_pool.clone());
+                        // Forward the recorder's BoxRef pool — the retry path
+                        // uses the same upstream `Rc<Box>` allocations from
+                        // the original trace.
+                        let retry_box_pool = trace.box_pool.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
                                     &trace_ops_snapshot,
                                     &mut retry_constants,
                                     num_trace_inputargs,
+                                    retry_box_pool,
                                 )
                             }));
                         match retry_result {
@@ -6045,11 +6045,11 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // H-3.0b: hand the recorder's BoxRef pool to the optimizer so
-        // mirror writes (H-3.1) reach the same `Rc<Box>` allocations.
-        // RPython parity: PyPy's `AbstractValue` objects from tracing
-        // flow unchanged into optimization.
-        optimizer.set_pending_box_pool(trace.box_pool.clone());
+        // Hand the recorder's BoxRef pool to the optimizer so writes reach
+        // the same `Rc<Box>` allocations. RPython parity: PyPy's
+        // `AbstractValue` objects from tracing flow unchanged into
+        // optimization.
+        let trace_box_pool = trace.box_pool.clone();
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
@@ -6058,6 +6058,7 @@ impl<M: Clone> MetaInterp<M> {
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
+                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -6443,15 +6444,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // H-3.0b: simple-loop path — same recorder BoxRef pool plumb as
-        // the unrolled loop entry above.
-        optimizer.set_pending_box_pool(trace.box_pool.clone());
+        // Simple-loop path — same recorder BoxRef pool plumb as the
+        // unrolled loop entry above.
+        let trace_box_pool = trace.box_pool.clone();
 
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             optimizer.optimize_with_constants_and_inputs(
                 &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
+                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -8387,7 +8389,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer reads through `BoxRef::_forwarded` for `getptrinfo` /
         // `getintbound` callsites; the pool must be plumbed through for
         // those readers to hit non-empty BoxRefs.
-        optimizer.set_pending_box_pool(prepared.box_pool);
+        let bridge_box_pool = prepared.box_pool;
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -8425,6 +8427,7 @@ impl<M: Clone> MetaInterp<M> {
                     None,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
+                    bridge_box_pool,
                 )
             }))
         };
@@ -8909,7 +8912,7 @@ impl<M: Clone> MetaInterp<M> {
         // Per-iter bridge `BoxRef` pool — see the sibling compile_bridge entry
         // earlier for the rationale. Both bridge entries (descriptor=None and
         // descriptor=Some) need the plumb so BoxRef readers stay primary.
-        optimizer.set_pending_box_pool(prepared.box_pool);
+        let bridge_box_pool = prepared.box_pool;
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
@@ -8969,6 +8972,7 @@ impl<M: Clone> MetaInterp<M> {
                     pending_bridge_rd,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
+                    bridge_box_pool,
                 )
             }))
         };

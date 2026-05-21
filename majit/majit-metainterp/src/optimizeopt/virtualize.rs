@@ -346,8 +346,7 @@ impl OptVirtualize {
     // ── PtrInfo accessors (delegated to ctx) ──
 
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
-        let resolved = ctx.get_box_replacement(opref);
-        ctx.get_box_replacement_box(resolved)
+        ctx.get_box_replacement_box(opref)
             .as_ref()
             .map_or(false, |b| ctx.is_virtual(b))
     }
@@ -419,7 +418,7 @@ impl OptVirtualize {
     /// the cumulative byte offset. Returns `(parent, total_offset)` when the
     /// chain ends in a `VirtualRawBuffer`, or `None` otherwise.
     fn resolve_raw_slice(opref: OpRef, ctx: &OptContext) -> Option<(OpRef, i64)> {
-        let mut current = ctx.get_box_replacement(opref);
+        let mut current = opref;
         let mut total_offset: i64 = 0;
         loop {
             let current_box = ctx.get_box_replacement_box(current);
@@ -431,7 +430,7 @@ impl OptVirtualize {
                     // signed addends is always representable. In Rust we
                     // bail on i64 overflow rather than wrap.
                     total_offset = total_offset.checked_add(slice.offset)?;
-                    current = ctx.get_box_replacement(slice.parent);
+                    current = slice.parent;
                 }
                 Some(PtrInfo::VirtualRawBuffer(_)) => return Some((current, total_offset)),
                 _ => return None,
@@ -1038,7 +1037,7 @@ impl OptVirtualize {
         let Some(offset) = ctx.get_constant_int(op.arg(1)) else {
             return OptimizationResult::PassOn;
         };
-        let arg0_box = ctx.get_box_replacement_box(arg0);
+        let arg0_box = ctx.get_box_replacement_box(op.arg(0));
         let info = arg0_box.as_ref().and_then(|b| ctx.peek_ptr_info(b));
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
@@ -1050,7 +1049,7 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_box_replacement(op.arg(0));
+        let buf_ref = op.arg(0);
         let offset_ref = op.arg(1);
 
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
@@ -1617,8 +1616,7 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return false;
         }
-        let vref = ctx.get_box_replacement(op.arg(1));
-        let vref_box = ctx.get_box_replacement_box(vref);
+        let vref_box = ctx.get_box_replacement_box(op.arg(1));
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
         let (token_ref, forced_ref) = match vref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(PtrInfo::Virtual(vinfo)) => {
@@ -1654,7 +1652,7 @@ impl OptVirtualize {
             _ => return false,
         };
         let forced_resolved = ctx.get_box_replacement(forced_ref);
-        let forced_box = ctx.get_box_replacement_box(forced_resolved);
+        let forced_box = ctx.get_box_replacement_box(forced_ref);
         let forced_ok = match forced_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(info) => !info.is_null(),
             None => false,
@@ -1884,8 +1882,7 @@ impl Optimization for OptVirtualize {
                         if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
                             && op.num_args() >= 3
                         {
-                            let target = ctx.get_box_replacement(op.arg(2));
-                            if Self::is_virtual(target, ctx) {
+                            if Self::is_virtual(op.arg(2), ctx) {
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1951,8 +1948,7 @@ impl Optimization for OptVirtualize {
                             //       return
                             //   return self.emit(op)
                             if op.num_args() >= 2 {
-                                let target = ctx.get_box_replacement(op.arg(1));
-                                if Self::is_virtual(target, ctx) {
+                                if Self::is_virtual(op.arg(1), ctx) {
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2288,7 +2284,6 @@ mod tests {
     use super::*;
     use crate::optimizeopt::info::VirtualRawBufferInfo;
     use crate::optimizeopt::optimizer::Optimizer;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     // ── Test descriptors ──
@@ -2612,7 +2607,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
@@ -2620,7 +2615,7 @@ mod tests {
         opt.trace_inputarg_types = vec![Type::Ref; 1024];
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
     }
 
     fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
@@ -2635,7 +2630,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
@@ -3052,7 +3047,7 @@ mod tests {
 
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
         let jump = result
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
@@ -3320,7 +3315,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -3778,7 +3773,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
         assert_eq!(
             result.len(),
             1,
@@ -4365,7 +4360,7 @@ mod tests {
         ops[2].pos.set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
         // which forces the virtual New to be materialized.
@@ -4473,7 +4468,7 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(7));
         constants.insert(101u32, majit_ir::Value::Int(11));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         let new_positions: Vec<_> = result
             .iter()
