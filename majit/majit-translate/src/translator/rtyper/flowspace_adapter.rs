@@ -677,6 +677,48 @@ pub fn translate_op(
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
 
+        // ─── pyre-only `OpKind::Abort` marker ───
+        // Front-end `lower_expr::stop_unsupported` / `continue_with_unknown`
+        // emit this when the surface Rust DSL hits an unsupported
+        // expression form (unsupported lit, ForLoop, Closure, Macro,
+        // …).  RPython upstream raises `FlowingError`
+        // (`flowspace/flowcontext.py:258,417`) and drops the function
+        // before annotator/rtyper see it, so there is no upstream
+        // analogue.  The Slice 10C `SomeInstance(None) -> Ptr -> GcRef`
+        // synthesis was reverted because the `classdef=None` result
+        // tripped downstream `find_attribute` lookups.
+        //
+        // Post-Path A (REGISTERED_STRUCT_FIELD_ATTRS pre-population,
+        // commit 0891421811) impl-method `self` narrows to a populated
+        // ClassDef, so the original classdef:None cascade is no longer
+        // triggered by the receiver projection.  Abort's own
+        // result_var is still un-narrowed, but every front-end
+        // emit-site falls into one of two shapes:
+        //
+        //   (a) `stop_unsupported` — pushes Abort and returns
+        //       `Err(FlowingError::Unsupported)`; the parent `?`
+        //       ladder aborts the body before any operand reads the
+        //       result_var.  No downstream consumer ⇒ skipping is
+        //       safe.
+        //
+        //   (b) `continue_with_unknown` — pushes Abort and returns
+        //       the result_var as a `Lowered.value`.  Callers may
+        //       consume it; for those, the absent translate output
+        //       leaves the result_var unmapped in `value_to_var`,
+        //       and the first consumer surfaces a fail-loud
+        //       "undefined operand ValueId" message that
+        //       `is_known_unported` classifies as Skip — same
+        //       outcome as the prior "post-rtyper jtransform
+        //       variant" Skip, just at a more localised site.
+        //
+        // Convergence: each emit-site is retired by lowering the
+        // specific expression form properly (per-variant epic —
+        // `ConstStr`, `Range`, `Closure`, etc.).  Until then this
+        // arm absorbs the placeholder silently so the dual-gate
+        // doesn't have to round-trip through a TyperError just to
+        // re-classify as Skip.
+        OpKind::Abort { .. } => Ok(Vec::new()),
+
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
         // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).
@@ -1330,14 +1372,13 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
         // `OpKind::Abort` is pyre-only — RPython raises `FlowingError`
         // (`flowspace/flowcontext.py:258,417`) and drops the function
-        // before reaching the rtyper.  No real-path lowering exists;
-        // the dual-gate Skip-classifies the graph and the legacy path
-        // covers it.  The ratchet that synthesised a
-        // `SomeInstance(None) -> Ptr -> GcRef` projection was a
-        // deviation (no upstream peer) and has been reverted —
-        // closing this entry requires retiring every Abort emit-site
-        // in the front-end (Expr::ForLoop placeholder, etc.) and
-        // replacing them with proper RPython-orthodox lowerings.
+        // before reaching the rtyper.  Now handled by an explicit
+        // `Ok(Vec::new())` arm in `translate_op`, but the diagnostic
+        // name is retained here so the post-rtyper variant table can
+        // still surface the marker if a leak ever reaches it.
+        // Convergence path remains per-variant retirement of the
+        // front-end's `stop_unsupported` / `continue_with_unknown`
+        // emit-sites (`ConstStr`, `Range`, `Closure`, etc.).
         OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
         _ => return None,
     })
