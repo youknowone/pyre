@@ -1566,6 +1566,13 @@ pub(crate) fn infer_terminal_exit_layout(
         .getarglist()
         .iter()
         .map(|opref| {
+            // `OpRef::NONE` represents a null-ref placeholder per
+            // `fail_arg_type`; preserve `Type::Ref` so downstream
+            // `gc_ref_slots` + `decode_values_with_layout` see the same
+            // null-Ref typing the rest of the resume path uses.
+            if opref.is_none() {
+                return Type::Ref;
+            }
             type_index
                 .opref_type_at(*opref, op_index)
                 .unwrap_or(Type::Int)
