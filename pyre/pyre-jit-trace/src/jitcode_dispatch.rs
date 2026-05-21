@@ -1390,6 +1390,15 @@ pub fn dispatch_via_miframe(
             })
             .collect()
     };
+    // Task #75.B: allocate Int-bank concrete shadow sized to
+    // `sym.registers_i.len()`, all slots seeded with
+    // `ConcreteValue::Null` since pyre's PyreSym holds Python ints
+    // boxed in `concrete_locals` (Ref bank) — the Int bank is for
+    // unboxed intermediate values produced by walker handlers like
+    // `int_add/iiR>i`, which lazily populate `concrete_registers_i`
+    // (Task #75.C+).  No semantic-slot seed exists at trace entry.
+    let mut concrete_i_snapshot: Vec<ConcreteValue> =
+        vec![ConcreteValue::Null; sym.registers_i.len()];
     // M4.Cutover Step 2.2: seed last_exc_value_concrete from
     // sym.last_exc_value (the live PyObjectRef written by trait-side
     // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
@@ -1406,7 +1415,7 @@ pub fn dispatch_via_miframe(
             registers_i: &mut sym.registers_i,
             registers_f: &mut sym.registers_f,
             concrete_registers_r: &mut concrete_r_snapshot,
-            concrete_registers_i: &mut [],
+            concrete_registers_i: &mut concrete_i_snapshot,
             descr_refs,
             trace_ctx,
             done_with_this_frame_descr_ref,
@@ -3646,14 +3655,24 @@ fn dispatch_residual_call_iIRFd_kind(
 /// `const_float`, matching RPython
 /// `pyjitpl.py:98-119 MIFrame.copy_constants`.
 ///
-/// Also returns a Ref-bank concrete shadow sized to match
-/// `registers_r` (constant slots seeded with `ConcreteValue::Null` —
-/// concrete propagation for the const pool would need a backing
-/// `PyObjectRef` materialisation that the sub-walk doesn't yet drive).
+/// Also returns Ref- and Int-bank concrete shadows sized to match
+/// `registers_r` / `registers_i`.  Ref-bank constant slots seed
+/// `ConcreteValue::Null` (concrete propagation for the const pool
+/// would need a backing `PyObjectRef` materialisation that the
+/// sub-walk doesn't yet drive); Int-bank constant slots seed
+/// `ConcreteValue::Int(v)` directly from `body.constants_i` so a
+/// future `goto_if_not/iL` reading a constant input finds a non-Null
+/// concrete and can fold the branch.
 fn allocate_callee_register_banks(
     body: &SubJitCodeBody,
     trace_ctx: &mut TraceCtx,
-) -> (Vec<OpRef>, Vec<OpRef>, Vec<OpRef>, Vec<ConcreteValue>) {
+) -> (
+    Vec<OpRef>,
+    Vec<OpRef>,
+    Vec<OpRef>,
+    Vec<ConcreteValue>,
+    Vec<ConcreteValue>,
+) {
     let total_r = body.num_regs_r + body.constants_r.len();
     let total_i = body.num_regs_i + body.constants_i.len();
     let total_f = body.num_regs_f + body.constants_f.len();
@@ -3661,8 +3680,10 @@ fn allocate_callee_register_banks(
     let mut regs_i = vec![OpRef::NONE; total_i];
     let mut regs_f = vec![OpRef::NONE; total_f];
     let concrete_r = vec![ConcreteValue::Null; total_r];
+    let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in body.constants_i.iter().enumerate() {
         regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
+        concrete_i[body.num_regs_i + i] = ConcreteValue::Int(v);
     }
     for (i, &v) in body.constants_r.iter().enumerate() {
         regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
@@ -3670,7 +3691,7 @@ fn allocate_callee_register_banks(
     for (i, &v) in body.constants_f.iter().enumerate() {
         regs_f[body.num_regs_f + i] = trace_ctx.const_float(v);
     }
-    (regs_r, regs_i, regs_f, concrete_r)
+    (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
 /// Operand layout `dR>X`:
@@ -3715,7 +3736,7 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
         allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if args.len() > sub_body.num_regs_r {
@@ -3738,7 +3759,7 @@ fn dispatch_inline_call_dr_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut [],
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3886,7 +3907,7 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
         allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
@@ -3919,7 +3940,7 @@ fn dispatch_inline_call_dir_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut [],
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -4056,7 +4077,7 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r, mut callee_concrete_i) =
         allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
     if int_args.len() > sub_body.num_regs_i {
@@ -4099,7 +4120,7 @@ fn dispatch_inline_call_dirf_kind(
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut [],
+            concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
