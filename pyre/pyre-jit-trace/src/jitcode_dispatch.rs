@@ -2137,24 +2137,19 @@ fn unop_int_record(
     let a = read_int_reg(code, op, 0, ctx)?;
     let result = ctx.trace_ctx.record_op(opcode, &[a]);
     // Box(value) parity: stamp the unary result from the operand's
-    // Box.value carrier (matches dispatch.rs trace_unary_i).
-    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+    // Box.value carrier (matches dispatch.rs trace_unary_i).  The
+    // folded value also feeds the slot-keyed shadow via
+    // [`write_int_reg`].
+    let concrete = if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
         let folded = majit_metainterp::eval_unary_i(opcode, n);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+        ConcreteValue::Int(folded)
+    } else {
+        ConcreteValue::Null
+    };
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
