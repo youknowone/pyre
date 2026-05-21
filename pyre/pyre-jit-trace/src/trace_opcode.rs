@@ -8265,6 +8265,7 @@ mod tests {
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
@@ -8341,6 +8342,7 @@ mod tests {
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
             pre_opcode_semantic_depth: Some(3),
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
