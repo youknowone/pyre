@@ -3756,7 +3756,7 @@ impl OptContext {
             }
             _ => crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32),
         };
-        Some(self.box_pool.set(idx, placeholder))
+        Some(self.box_pool.set(opref, placeholder))
     }
 
     /// `optimizer.py:1009 getptrinfo + info.is_virtual()` BoxRef-routing

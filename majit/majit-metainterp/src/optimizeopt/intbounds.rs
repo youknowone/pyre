@@ -4431,7 +4431,12 @@ mod tests {
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

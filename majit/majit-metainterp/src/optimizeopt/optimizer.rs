@@ -1807,7 +1807,11 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new(), crate::r#box::BoxPool::new())
+        self.optimize_with_constants(
+            ops,
+            &mut majit_ir::VecAssoc::new(),
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -4655,8 +4659,12 @@ mod tests {
             OpCode::IntAdd,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -4675,8 +4683,12 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         ops[0].pos.set(OpRef::int_op(2));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(
             hits.get(),
@@ -4724,8 +4736,12 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         let call_count = result
             .iter()
@@ -4858,8 +4874,12 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -4905,8 +4925,12 @@ mod tests {
             op.pos
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -4931,7 +4955,12 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
         assert_eq!(
@@ -4968,7 +4997,12 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result[0].pos.get(), OpRef::int_op(5));
         assert_eq!(result[1].pos.get(), OpRef::int_op(6));
@@ -4994,7 +5028,12 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos.get(), OpRef::int_op(3));
@@ -5014,7 +5053,12 @@ mod tests {
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            3,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos.get(), OpRef::int_op(3));
@@ -5035,7 +5079,12 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -5072,8 +5121,12 @@ mod tests {
         }
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -5091,8 +5144,12 @@ mod tests {
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            0,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -5137,7 +5194,12 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
         let new_count = result.iter().filter(|op| op.opcode == OpCode::New).count();
@@ -5203,7 +5265,12 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             let alloc_ref = set_op.arg(0);
@@ -5251,7 +5318,12 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5299,7 +5371,12 @@ mod tests {
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5368,8 +5445,12 @@ mod tests {
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -5432,7 +5513,14 @@ mod tests {
         ));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs_at(
+            &[],
+            &mut constants,
+            3,
+            0,
+            0,
+            crate::r#box::BoxPool::new(),
+        );
 
         assert!(result.is_empty());
         // Empty trace, no emitted ops — carry must be empty. Inputarg
@@ -5753,8 +5841,12 @@ mod tests {
             vec![OpRef::int_op(100), OpRef::int_op(101)]
         });
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         let guard = result
             .iter()
