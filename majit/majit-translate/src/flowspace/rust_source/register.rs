@@ -3110,8 +3110,37 @@ fn eval_binop(
 /// fork; named-field bindings then emit `getattr(scrutinee, "x")` on
 /// the *instance* (not the class object) — the empty class dict
 /// matches that semantic exactly.
+///
+/// Side effect: each `syn::Fields::Named` entry is also projected to
+/// the [`REGISTERED_STRUCT_FIELD_ATTRS`] side-table so
+/// `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs` with
+/// the field's typed `Attribute` shell.  Mirrors
+/// `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) but data-
+/// driven by the parsed struct declaration instead of a hard-coded
+/// table.
 fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
     let name = item_struct.ident.to_string();
+    // Z2.5 Path A — project the declared named fields into the
+    // REGISTERED_STRUCT_FIELD_ATTRS side-table so
+    // `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs`
+    // with the field's typed `Attribute` shell.  Mirrors
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) but data-
+    // driven by the parsed struct declaration instead of a hard-coded
+    // table.
+    if let syn::Fields::Named(named) = &item_struct.fields {
+        let mut stubs: Vec<(String, crate::model::ValueType)> = Vec::new();
+        for field in &named.named {
+            let Some(ident) = field.ident.as_ref() else {
+                continue;
+            };
+            let field_name = ident.to_string();
+            let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+            stubs.push((field_name, ty));
+        }
+        if !stubs.is_empty() {
+            register_struct_field_attrs(&name, stubs);
+        }
+    }
     let host = HostObject::new_class(&name, vec![]);
     if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
         // Same-scope struct registry — later structs in the same scope
@@ -3570,6 +3599,60 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
         _ => return None,
     };
     Some(ll)
+}
+
+// ---------------------------------------------------------------------------
+// REGISTERED_STRUCT_FIELD_ATTRS — Rust struct field annotation side-table.
+// ---------------------------------------------------------------------------
+
+/// Process-global mapping from struct qualname to its declared named
+/// fields, projected to [`crate::model::ValueType`].
+///
+/// Populated by [`build_host_class_from_struct`] at Rust-source
+/// registration time.  Consumed by
+/// `crate::annotator::classdesc::ClassDesc::_init_classdef` (via
+/// [`struct_field_attrs_snapshot`]) so the resulting `ClassDef.attrs`
+/// table carries a typed `Attribute` shell for every named struct
+/// field before any annotator pass sees the class.  Matches RPython
+/// `FORCE_ATTRIBUTES_INTO_CLASSES` semantics (classdesc.py:957-961),
+/// but the data source is the Rust struct declaration parsed by
+/// [`build_host_class_from_struct`] rather than a hard-coded table.
+///
+/// Last-writer-wins on the outer key.  Two `register_rust_module`
+/// walks that register a struct under the same local name converge
+/// to the most recent walk's field set; this mirrors
+/// [`super::host_env::HOST_RUST_MODULE_GLOBALS`]'s per-module
+/// last-writer-wins semantics for shared top-level names.
+static REGISTERED_STRUCT_FIELD_ATTRS: std::sync::LazyLock<
+    std::sync::Mutex<indexmap::IndexMap<String, indexmap::IndexMap<String, crate::model::ValueType>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(indexmap::IndexMap::new()));
+
+fn register_struct_field_attrs(
+    struct_name: &str,
+    fields: Vec<(String, crate::model::ValueType)>,
+) {
+    let mut table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
+    let entry = table.entry(struct_name.to_string()).or_default();
+    entry.clear();
+    for (name, ty) in fields {
+        entry.insert(name, ty);
+    }
+}
+
+/// Snapshot the registered field-attr stubs for `struct_name`.
+///
+/// Returns `None` when no struct of that name has been registered.
+/// Returns an empty map only if a struct was registered with zero
+/// named fields, which the producer skips — so an empty map
+/// indicates a producer bug, not a normal state.
+///
+/// Consumed by `crate::annotator::classdesc::ClassDesc::_init_classdef`
+/// after the static `FORCE_ATTRIBUTES_INTO_CLASSES` block.
+pub fn struct_field_attrs_snapshot(
+    struct_name: &str,
+) -> Option<indexmap::IndexMap<String, crate::model::ValueType>> {
+    let table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
+    table.get(struct_name).cloned()
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the

@@ -1146,6 +1146,39 @@ impl ClassDesc {
             }
         }
 
+        // PRE-EXISTING-ADAPTATION: Rust struct field stubs.
+        // `register_rust_module` projects each `ItemStruct.fields` named
+        // entry to a `(field_name, ValueType)` pair in the
+        // `REGISTERED_STRUCT_FIELD_ATTRS` side-table.  Pre-populate
+        // `ClassDef.attrs` with the typed `Attribute` shell here so
+        // `derive_subject_inputcells`'s impl-method-self narrowing gate
+        // (`flowspace_adapter.rs::derive_subject_inputcells`) flips for
+        // structs whose fields are statically known at registration
+        // time.  Mirrors the `FORCE_ATTRIBUTES_INTO_CLASSES` semantics
+        // above but data-driven by parsed Rust source.
+        if let Some(field_stubs) =
+            crate::flowspace::rust_source::register::struct_field_attrs_snapshot(qualname.as_str())
+        {
+            for (attr_name, vt) in &field_stubs {
+                let Some(s_value) =
+                    crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
+                else {
+                    continue;
+                };
+                ClassDef::generalize_attr(&classdef, attr_name, Some(s_value))?;
+                let owner = ClassDef::locate_attribute(&classdef, attr_name)?;
+                let mut owner_mut = owner.borrow_mut();
+                let attr = owner_mut.attrs.get_mut(attr_name).ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "_init_classdef: attribute {:?} missing after generalize \
+                         (Rust struct field stub)",
+                        attr_name
+                    ))
+                })?;
+                attr.modified(Some(&classdef))?;
+            }
+        }
+
         // classdesc.py:686-689 — classsources = {attr: self for attr in classdict}.
         let source = AttrSource::Class(Rc::downgrade(this));
         let attr_names: Vec<String> = this.borrow().classdict.keys().cloned().collect();
