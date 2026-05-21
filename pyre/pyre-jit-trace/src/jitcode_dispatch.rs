@@ -1234,25 +1234,21 @@ fn binop_int_record(
     let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
     // Box(value) parity: stamp the result from the operands' Box.value
     // carriers (BoxInt(value) — matches dispatch.rs trace_binop_i).
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
+    // The folded value also feeds the slot-keyed `concrete_registers_i`
+    // shadow via [`write_int_reg`] so handlers that read the slot
+    // (Ref-bank symmetry) see the same concrete as the OpRef channel.
+    let concrete = if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.trace_ctx.box_value(a), ctx.trace_ctx.box_value(b))
     {
         let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
         ctx.trace_ctx
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+        ConcreteValue::Int(folded)
+    } else {
+        ConcreteValue::Null
+    };
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
