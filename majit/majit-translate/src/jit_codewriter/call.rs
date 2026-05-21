@@ -3128,14 +3128,84 @@ impl CallControl {
                 // Multiple matches mean genuine ambiguity — leave it
                 // unresolved so the BFS / call-control walker surfaces
                 // it as a registry miss rather than silently picking one.
+                // Restrict leaf-match to the cross-module
+                // bare-callsite shape: segments produced by
+                // `canonical_call_target` qualifying a single-ident
+                // path with caller's `module_prefix` always have
+                // length ≤ 2 (`["bare"]` or `["caller_module",
+                // "bare"]`).  Three-plus-segment paths
+                // (`["std", "ptr", "copy"]`,
+                // `["pyre_interpreter", "module", "name"]`) come from
+                // explicitly qualified callsites and must NOT fuzzy-
+                // match — they either resolve verbatim (registered
+                // graph) or fall through to `Residual` (external host
+                // call).  Without this guard, `std::ptr::copy(s,d,n)`
+                // would leaf-match unrelated 2-arg `copy` impl methods
+                // and corrupt `getcalldescr`'s arity check.  PyPy
+                // parity: `flowcontext.py:845-866 LOAD_GLOBAL` only
+                // applies to bare-name references; qualified
+                // `module.func` reaches the bookkeeper through its
+                // explicit attribute lookup, not the f_globals fallback.
+                if segments.len() > 2 {
+                    return Some(path);
+                }
                 if let Some(leaf) = segments.last() {
+                    // Restrict leaf-match to FREE-FUNCTION graphs
+                    // (`FunctionGraph.owner_root.is_none()`).  Impl-method
+                    // graphs registered via `lib.rs:747
+                    // for_impl_method(impl_type, name)` share the same
+                    // `function_graphs` HashMap but their leaf
+                    // (`copy`/`new`/etc.) collides with arbitrary
+                    // free-function names — without this filter, a
+                    // bare callsite would match every same-leaf impl
+                    // method.  RPython parity: `bookkeeper.getdesc(
+                    // callable)` resolves free functions through
+                    // `FunctionDesc` (host object id) and methods
+                    // through the receiver's `ClassDesc`, never
+                    // crossing the two namespaces.
                     let matches: Vec<&CallPath> = self
                         .function_graphs
-                        .keys()
-                        .filter(|k| k.segments.last().map(|s| s == leaf).unwrap_or(false))
+                        .iter()
+                        .filter(|(k, g)| {
+                            g.owner_root.is_none()
+                                && k.segments.last().map(|s| s == leaf).unwrap_or(false)
+                        })
+                        .map(|(k, _)| k)
                         .collect();
                     if matches.len() == 1 {
                         return Some(matches[0].clone());
+                    }
+                    // Multi-match: pyre's free-function registration
+                    // dual-publishes each graph under `[module, name]`,
+                    // `["crate", module, name]`, and `[crate_alias,
+                    // module, name]` aliases (`lib.rs:465-502
+                    // register_function_graph_alias` chain), so a bare
+                    // callsite (`use crate::X; X();`) producing
+                    // `[caller_module, X]` will leaf-match every alias
+                    // simultaneously even though all aliases point at
+                    // copies of the same source graph.  Disambiguate by
+                    // FunctionGraph.name (the qualified source name set
+                    // by `lib.rs:1342 sf.name = format!("{prefix}::{name}")`,
+                    // identical across alias clones).  PyPy parity:
+                    // `bookkeeper.getdesc(callable)` keys on function-
+                    // object identity, so multi-alias publications of
+                    // the same desc converge on a single resolution.
+                    if !matches.is_empty() {
+                        let first_name = self
+                            .function_graphs
+                            .get(matches[0])
+                            .map(|g| g.name.as_str());
+                        if let Some(name) = first_name {
+                            let all_same = matches.iter().all(|p| {
+                                self.function_graphs
+                                    .get(*p)
+                                    .map(|g| g.name == name)
+                                    .unwrap_or(false)
+                            });
+                            if all_same {
+                                return Some(matches[0].clone());
+                            }
+                        }
                     }
                 }
                 Some(path)

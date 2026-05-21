@@ -989,14 +989,27 @@ fn analyze_pipeline_from_parsed(
                 .map(|s| s == portal_name.as_str())
                 .unwrap_or(false)
         };
+        // Prefer the shortest qualified path among aliases — the
+        // canonical `[module, name]` shape (length 2) over the
+        // `[crate_alias, module, name]` shape (length 3+).  HashMap
+        // iteration order is non-deterministic, so `find()` without
+        // tie-breaking would silently flip between aliases across
+        // builds, making downstream tests (e.g.
+        // `generated::tests::eval_loop_jit_portal_*`) flake on the
+        // by_path key shape.  Choosing the shortest path mirrors
+        // `lib.rs:465-471 register_function_graph_alias` order: the
+        // `[module, name]` form is registered FIRST and is the
+        // source-of-truth canonical name for the graph; the longer
+        // forms are crate-prefixed aliases for cross-crate callsites.
         let qualified = call_control
             .function_graphs()
             .keys()
-            .find(|k| {
+            .filter(|k| {
                 leaf_matches(k)
                     && k.segments.len() > 1
                     && k.segments.first().map(|s| s != "crate").unwrap_or(false)
             })
+            .min_by_key(|k| k.segments.len())
             .cloned();
         if let Some(qualified) = qualified {
             qualified

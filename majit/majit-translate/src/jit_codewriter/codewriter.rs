@@ -324,6 +324,22 @@ impl CodeWriter {
                         graph.name,
                     );
                 }
+                // Reset all annotation cells before re-running the
+                // legacy walker.  The real-path attempt inside
+                // `dual_gate_check_with_registry` may have partially
+                // populated cells before panicking on a known-unported
+                // shape (`SomeInstance.getattr` on classdef-less
+                // instance, `Cannot find attribute`, etc.) — those
+                // residue annotations propagate here and trip the
+                // monotonicity assert at `legacy_annotator::setbinding
+                // :158` (new value Integer does not contain previous
+                // value Instance(classdef=None)).  PyPy parity:
+                // `RPythonAnnotator.__init__` starts with `bindings =
+                // {}`, equivalent to clearing every cell to `None`
+                // before the iterative fixpoint loop.
+                for (_, var) in graph.iter_variables() {
+                    *var.annotation.borrow_mut() = None;
+                }
                 crate::translator::rtyper::legacy_annotator::annotate(graph);
                 // `resolve_types` commits per-Variable concretetype
                 // cells at the resolver boundary.  Skip arm has no
