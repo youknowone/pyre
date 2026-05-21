@@ -2194,17 +2194,8 @@ fn binop_ref_to_int_record(
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2241,17 +2232,8 @@ fn ptr_nonzero_record(
             .set_opref_concrete(result, majit_ir::Value::Int((r.0 != 0) as i64));
     }
     let dst = code[op.pc + 2] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2344,17 +2326,8 @@ fn binop_float_to_int_record(
             .set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     let dst = code[op.pc + 3] as usize;
-    let len = ctx.registers_i.len();
-    let slot = ctx
-        .registers_i
-        .get_mut(dst)
-        .ok_or(DispatchError::RegisterOutOfRange {
-            pc: op.pc,
-            reg: dst,
-            len,
-            bank: "i",
-        })?;
-    *slot = result;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -3843,28 +3816,20 @@ fn dispatch_inline_call_dr_kind(
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
             }
             let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+            // inline_call_* dst writeback — `value` is the callee's
+            // SubReturn OpRef.  The callee's matching concrete shadow
+            // was dropped at sub-walk exit; `concrete_of_opref` still
+            // sees through to `constants.get_value` for callees that
+            // return a constant (e.g. `LoadConst` tail), so route via
+            // the unified shadow channel.  Non-constant returns surface
+            // as the sentinel `GcRef(usize::MAX)` → Null fallback.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 _ => unreachable!(
                     "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
@@ -4022,28 +3987,16 @@ fn dispatch_inline_call_dir_kind(
             // dst register byte sits after descr (2B) + I-list (int_width)
             // + R-list (ref_width) bytes.
             let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+            // See dispatch_inline_call_dr_kind: route the SubReturn
+            // OpRef through the unified shadow channel so constant
+            // return values propagate.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"),
             }
@@ -4200,28 +4153,16 @@ fn dispatch_inline_call_dirf_kind(
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
             }
             let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+            // See dispatch_inline_call_dr_kind: route the SubReturn
+            // OpRef through the unified shadow channel so constant
+            // return values propagate.
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
             match dst_bank {
                 'i' => {
-                    let len = ctx.registers_i.len();
-                    let slot =
-                        ctx.registers_i
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "i",
-                            })?;
-                    *slot = value;
+                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'r' => {
-                    // inline_call_* dst writeback — `value` is the
-                    // callee's SubReturn OpRef.  The callee's matching
-                    // concrete lived in the sub-walk's concrete shadow
-                    // which has been dropped; future work could thread
-                    // the last concrete through SubReturn (M4.Cutover
-                    // Step 2.3).  Null is safe — downstream gates skip.
-                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
+                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
                 }
                 'f' => {
                     let len = ctx.registers_f.len();
@@ -4591,17 +4532,8 @@ fn handle(
                     .set_opref_concrete(result, majit_ir::Value::Int(r.0 as i64));
             }
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
