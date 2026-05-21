@@ -3696,28 +3696,35 @@ impl<S: JitState> JitDriver<S> {
         // bridge tracing runs synchronously within start_bridge_tracing's
         // caller scope, so self.meta outlives the callback.
         let meta_ptr = &self.meta as *const _ as *const ();
-        if let Some(ref mut ctx) = self.meta.tracing {
-            ctx.header_pc = resume_pc;
-            // pyjitpl.py:2978 `if not self.partial_trace:` — bridge
-            // entry sets the explicit flag so close-loop consumers
-            // can apply bridge-only behavior without overloading
-            // `has_compiled_targets_fn` presence.
-            ctx.is_bridge_trace = true;
-            ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
-                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-                meta.has_compiled_targets(gk)
-            }));
-            // pyjitpl.py:1551 first-iteration auto loop-header
-            // `if self.metainterp.portal_call_depth: return` parity —
-            // sample the live counter through the same self.meta
-            // pointer.  Same lifetime invariant as
-            // `has_compiled_targets_fn` (bridge tracing runs
-            // synchronously within `start_bridge_tracing`'s scope).
-            ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
-                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-                meta.portal_call_depth
-            }));
-        }
+        // `start_retrace_from_guard` above sets `self.meta.tracing = Some(..)`
+        // on success (pyjitpl.py:9415). Fail loud rather than skipping bridge
+        // header_pc / is_bridge_trace / has_compiled_targets_fn wiring
+        // silently.
+        let ctx = self
+            .meta
+            .tracing
+            .as_mut()
+            .expect("bridge: tracing context must be live after start_retrace_from_guard");
+        ctx.header_pc = resume_pc;
+        // pyjitpl.py:2978 `if not self.partial_trace:` — bridge
+        // entry sets the explicit flag so close-loop consumers
+        // can apply bridge-only behavior without overloading
+        // `has_compiled_targets_fn` presence.
+        ctx.is_bridge_trace = true;
+        ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+            meta.has_compiled_targets(gk)
+        }));
+        // pyjitpl.py:1551 first-iteration auto loop-header
+        // `if self.metainterp.portal_call_depth: return` parity —
+        // sample the live counter through the same self.meta
+        // pointer.  Same lifetime invariant as
+        // `has_compiled_targets_fn` (bridge tracing runs
+        // synchronously within `start_bridge_tracing`'s scope).
+        ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+            meta.portal_call_depth
+        }));
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
         // resume.py:945-956 getvirtual_ptr parity: when frame.values contains
@@ -3739,18 +3746,27 @@ impl<S: JitState> JitDriver<S> {
                 .pending_frontend_boxes_ref()
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
-            if let (Some(ref mut sym), Some(ref mut ctx)) =
-                (self.sym.as_mut(), self.meta.tracing.as_mut())
-            {
-                S::setup_bridge_sym(
-                    sym,
-                    ctx,
-                    bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
-                    &raw_values,
-                    &retrace.fail_types,
-                );
-            }
+            // Both `self.sym` (set above via `self.sym = Some(sym)`) and
+            // `self.meta.tracing` (set by `start_retrace_from_guard`) must be
+            // live by construction at this point. Skipping `setup_bridge_sym`
+            // silently would leave the bridge sym uninitialized.
+            let sym = self
+                .sym
+                .as_mut()
+                .expect("bridge: sym must be live after S::create_sym");
+            let ctx = self
+                .meta
+                .tracing
+                .as_mut()
+                .expect("bridge: tracing context must be live");
+            S::setup_bridge_sym(
+                sym,
+                ctx,
+                bfm,
+                retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
+                &raw_values,
+                &retrace.fail_types,
+            );
         }
         self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
@@ -3794,9 +3810,12 @@ impl<S: JitState> JitDriver<S> {
             });
         // RPython pyjitpl.py:2908 — bridge traces start with empty
         // current_merge_points (no loop header to match against).
-        if let Some(ref mut ctx) = self.meta.tracing {
-            ctx.clear_merge_points();
-        }
+        let ctx = self
+            .meta
+            .tracing
+            .as_mut()
+            .expect("bridge: tracing context must be live");
+        ctx.clear_merge_points();
 
         // RPython pyjitpl.py:3101 _prepare_exception_resumption parity:
         // For exception guard bridges, the caller should emit
