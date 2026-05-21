@@ -1069,6 +1069,66 @@ fn write_ref_reg(
     Ok(())
 }
 
+/// Int-bank twin of [`read_ref_reg_concrete`] (Task #75.C).
+/// Reads the Int-bank slot at the operand index from
+/// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
+/// out-of-range reads — the only legal time the slice is shorter than
+/// `registers_i` is at test fixtures that pass `&mut []`, and those
+/// don't trigger `goto_if_not/iL` / `switch/id` paths.
+fn read_int_reg_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> ConcreteValue {
+    let byte_pc = op.pc + 1 + operand_offset;
+    let reg = code[byte_pc] as usize;
+    ctx.concrete_registers_i
+        .get(reg)
+        .copied()
+        .unwrap_or(ConcreteValue::Null)
+}
+
+/// Int-bank twin of [`write_ref_reg`] (Task #75.C).  Writes an Int
+/// register and its concrete shadow in lock-step.  Mirrors the
+/// Ref-bank contract: every walker handler that writes
+/// `registers_i[dst]` MUST also write `concrete_registers_i[dst]` so
+/// downstream `goto_if_not/iL` / `switch/id` can fold the branch.
+///
+/// `concrete` semantics:
+/// * `ConcreteValue::Int(v)` — the handler knows the concrete result
+///   (e.g. `int_copy/i>i` propagating from the source slot's shadow,
+///   an `int_<binop>` fold of two concrete inputs).
+/// * `ConcreteValue::Null` — the handler doesn't know (e.g. residual
+///   `Call*I`, `getfield_gc_i` cache miss).  Downstream consumers
+///   surface `GotoIfNotValueNotConcrete` for unknown branch inputs.
+fn write_int_reg(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = value;
+    // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
+    // an empty `concrete_registers_i` slice; production callers
+    // (Task #75.B) size it to `registers_i.len()` at dispatch entry.
+    if let Some(c_slot) = ctx.concrete_registers_i.get_mut(dst) {
+        *c_slot = concrete;
+    }
+    Ok(())
+}
+
 /// Read concrete shadow values for a Ref-bank variadic operand list
 /// (M4.Cutover Step 1). Parallels [`read_ref_var_list`] — reads the
 /// same byte indices but resolves through `ctx.concrete_registers_r`.
@@ -4677,19 +4737,18 @@ fn handle(
             // register, write the same OpRef into the dst slot. Pypy
             // records *no* IR op for a copy — pure SSA-level rename.
             // Operand layout `i>i`: 1B src + 1B dst.
+            //
+            // Task #75.C: propagate the source slot's Int-bank concrete
+            // shadow alongside the symbolic OpRef, mirroring the
+            // `ref_copy/r>r` Step 2.2 chain.  Without this, a
+            // `goto_if_not/iL` reading the dst slot wouldn't see the
+            // concrete and would surface `GotoIfNotValueNotConcrete`
+            // even when the source had a known concrete (e.g. a
+            // constant Int seeded by `allocate_callee_register_banks`).
             let src_val = read_int_reg(code, op, 0, ctx)?;
+            let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = src_val;
+            write_int_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "float_copy/f>f" => {
