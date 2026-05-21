@@ -1057,31 +1057,12 @@ fn walker_post_walk_insert_renamings(
     //     arm rewrites the source terminator's TLabel + appends a
     //     synthetic SpamBlock; fall-through arm appends renamings +
     //     explicit `goto` to the source's per-block accumulator.
-    //
-    // `PYRE_PHASE4_DIAGNOSE_ELIDE=1` keeps the residual elide
-    // diagnostic — any residual reflects either a trampoline
-    // `RewriteFailed` (source terminator carries no TLabel matching
-    // the target's block-identity name nor a `SwitchDictDescr` entry
-    // pointing at it) or an in_degree=1 link that bypassed the
-    // multi-pred path — plus a `phase4-trampoline` counter line per
-    // graph.
-    let diagnose_elide = std::env::var_os("PYRE_PHASE4_DIAGNOSE_ELIDE").is_some();
-    let mut elided_links: usize = 0;
-    let mut elided_links_with_distinct_pairs: usize = 0;
-    let mut elided_distinct_pair_records: Vec<String> = Vec::new();
     let mut trampoline_counter: usize = 0;
-    let mut trampoline_records: Vec<(SpamBlockRef, usize)> = Vec::new();
     for block_ref in &reachable {
         let exits = block_ref.borrow().exits.clone();
         if exits.len() < 2 {
             continue;
         }
-        let source_pc = block_ref
-            .borrow()
-            .operations
-            .first()
-            .map(|op| op.offset)
-            .unwrap_or(-1);
         for link_ref in exits {
             let Some(target_ref) = link_ref.borrow().target.clone() else {
                 continue;
@@ -1096,39 +1077,26 @@ fn walker_post_walk_insert_renamings(
                     &mut trampoline_counter,
                 );
                 match outcome {
-                    TrampolineOutcome::Emitted { spam, body_len } => {
-                        trampoline_records.push((spam, body_len));
-                    }
-                    TrampolineOutcome::NoPairs => {}
+                    TrampolineOutcome::Emitted { .. } | TrampolineOutcome::NoPairs => {}
                     TrampolineOutcome::RewriteFailed => {
-                        if diagnose_elide {
-                            let pairs = collect_distinct_renaming_pairs(&link_ref, &get_color);
-                            elided_links += 1;
-                            if !pairs.is_empty() {
-                                elided_links_with_distinct_pairs += 1;
-                                let target_pc = target_ref
-                                    .borrow()
-                                    .operations
-                                    .first()
-                                    .map(|op| op.offset)
-                                    .unwrap_or(-1);
-                                let pair_strs: Vec<String> = pairs
-                                    .iter()
-                                    .map(|(src, dst, kind)| {
-                                        format!("{}:{}->{}", kind.as_str(), src, dst)
-                                    })
-                                    .collect();
-                                let target_label = super::flatten::block_label_name(&target_ref);
-                                let source_terminator =
-                                    last_op_summary_for_source(block_ref, all_walker_blocks);
-                                elided_distinct_pair_records.push(format!(
-                                    "src_pc={source_pc} dst_pc={target_pc} \
-                                     pairs=[{}] target_label={target_label} \
-                                     terminator={source_terminator}",
-                                    pair_strs.join(",")
-                                ));
-                            }
-                        }
+                        let pairs = collect_distinct_renaming_pairs(&link_ref, &get_color);
+                        let target_label = super::flatten::block_label_name(&target_ref);
+                        let pair_strs: Vec<String> = pairs
+                            .iter()
+                            .map(|(src, dst, kind)| {
+                                format!("{}:{}->{}", kind.as_str(), src, dst)
+                            })
+                            .collect();
+                        panic!(
+                            "walker_post_walk_insert_renamings: trampoline rewrite \
+                             failed for graph={} target_label={} pairs=[{}] — \
+                             source terminator carries no TLabel matching the \
+                             target's block-identity name nor a SwitchDictDescr \
+                             entry pointing at it",
+                            graph.name,
+                            target_label,
+                            pair_strs.join(","),
+                        );
                     }
                 }
                 continue;
@@ -1142,27 +1110,6 @@ fn walker_post_walk_insert_renamings(
             ) {
                 shift_walker_pc_tracked_offsets(walker_pc_live_marker_pos, &shift);
             }
-        }
-    }
-    if diagnose_elide {
-        if elided_links > 0 {
-            let name = &graph.name;
-            let pairs_total: usize = elided_distinct_pair_records.len();
-            eprintln!(
-                "[phase4-elide] graph={name} elided_links={elided_links} \
-                 elided_with_distinct_pairs={elided_links_with_distinct_pairs} \
-                 elided_distinct_pair_records={pairs_total}",
-            );
-            for record in &elided_distinct_pair_records {
-                eprintln!("[phase4-elide]   {record}");
-            }
-        }
-        if !trampoline_records.is_empty() {
-            let name = &graph.name;
-            eprintln!(
-                "[phase4-trampoline] graph={name} trampolines_emitted={}",
-                trampoline_records.len()
-            );
         }
     }
 }
@@ -1314,35 +1261,6 @@ where
         spam: source_spam,
         body_len,
     }
-}
-
-/// Summarize the last `Insn::Op` (opname + TLabel names) of the source
-/// block's per-block accumulator for the `PYRE_PHASE4_DIAGNOSE_ELIDE`
-/// probe.  Used to pin down `RewriteFailed` cases.
-fn last_op_summary_for_source(
-    source_block: &super::flow::BlockRef,
-    all_walker_blocks: &[SpamBlockRef],
-) -> String {
-    let Some(spam) = all_walker_blocks
-        .iter()
-        .find(|s| !s.dead() && s.block() == *source_block)
-    else {
-        return "<no spam>".to_string();
-    };
-    let spam_borrow = spam.0.borrow();
-    for insn in spam_borrow.per_block_ssarepr.iter().rev() {
-        if let super::flatten::Insn::Op { opname, args, .. } = insn {
-            let tlabels: Vec<String> = args
-                .iter()
-                .filter_map(|a| match a {
-                    super::flatten::Operand::TLabel(t) => Some(t.name.clone()),
-                    _ => None,
-                })
-                .collect();
-            return format!("{opname}(tlabels=[{}])", tlabels.join(","));
-        }
-    }
-    "<no Op>".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9140,70 +9058,6 @@ impl CodeWriter {
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
-            // Phase 4 endgame slice ε.4 — post-strip goto over-emit
-            // diagnostic (Task #111).  After `strip_walker_block_
-            // boundary_goto` elides the fall-through `goto + ---`
-            // pairs, any remaining `goto + ---` either corresponds to
-            // a canonical-equivalent emit (back-edge / explicit JUMP /
-            // ε.3 trampoline tail) or is walker over-emit.  Classify
-            // by target-name prefix and dump counts under
-            // `PYRE_PHASE4_DIAGNOSE_GOTO=1`.
-            if std::env::var_os("PYRE_PHASE4_DIAGNOSE_GOTO").is_some() {
-                let mut total_goto: usize = 0;
-                let mut by_prefix: Vec<(&'static str, usize)> = vec![
-                    ("pc", 0),
-                    ("block", 0),
-                    ("epsilon3_link_", 0),
-                    ("catch_landing_", 0),
-                    ("link", 0),
-                    ("other", 0),
-                ];
-                for window in ssarepr.insns.windows(2) {
-                    let super::flatten::Insn::Op { opname, args, .. } = &window[0] else {
-                        continue;
-                    };
-                    if opname != "goto" || args.len() != 1 {
-                        continue;
-                    }
-                    let Some(target_name) = args.iter().find_map(|a| match a {
-                        super::flatten::Operand::TLabel(t) => Some(t.name.as_str()),
-                        _ => None,
-                    }) else {
-                        continue;
-                    };
-                    if !matches!(window[1], super::flatten::Insn::Unreachable) {
-                        continue;
-                    }
-                    total_goto += 1;
-                    let prefix = if target_name.starts_with("epsilon3_link_") {
-                        "epsilon3_link_"
-                    } else if target_name.starts_with("catch_landing_") {
-                        "catch_landing_"
-                    } else if target_name.starts_with("pc") {
-                        "pc"
-                    } else if target_name.starts_with("block") {
-                        "block"
-                    } else if target_name.starts_with("link") {
-                        "link"
-                    } else {
-                        "other"
-                    };
-                    if let Some(slot) = by_prefix.iter_mut().find(|(p, _)| *p == prefix) {
-                        slot.1 += 1;
-                    }
-                }
-                let categories: Vec<String> = by_prefix
-                    .iter()
-                    .filter(|(_, n)| *n > 0)
-                    .map(|(p, n)| format!("{p}={n}"))
-                    .collect();
-                eprintln!(
-                    "[phase4-goto] graph={} total_goto_pairs={} {}",
-                    graph.name,
-                    total_goto,
-                    categories.join(" "),
-                );
-            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
