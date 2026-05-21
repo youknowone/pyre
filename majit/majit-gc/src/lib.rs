@@ -506,13 +506,17 @@ pub trait GcRewriter: Send {
     /// Rewrite with access to the constant pool.
     /// Returns (rewritten ops, merged constants, type annotations for
     /// constants minted by the rewriter).
+    ///
+    /// The default impl forwards to `rewrite_for_gc` and preserves the
+    /// caller's constants verbatim. `rewrite_for_gc` may leave `Const*`
+    /// operands untouched, so returning an empty map would silently strand
+    /// downstream readers that resolve `ConstInt.raw()` against this table.
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
         constants: &VecAssoc<u32, i64>,
     ) -> (Vec<Op>, VecAssoc<u32, i64>, VecAssoc<u32, Type>) {
-        let _ = constants;
-        (self.rewrite_for_gc(ops), VecAssoc::new(), VecAssoc::new())
+        (self.rewrite_for_gc(ops), constants.clone(), VecAssoc::new())
     }
 }
 

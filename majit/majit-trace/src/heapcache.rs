@@ -1521,8 +1521,10 @@ impl HeapCache {
                     let dst_index = dststart + i;
                     let entry = self
                         .heap_array_cache
-                        .entry(descr).or_default()
-                        .entry(dst_index).or_insert_with(CacheEntry::new);
+                        .entry(descr)
+                        .or_default()
+                        .entry(dst_index)
+                        .or_insert_with(CacheEntry::new);
                     // heapcache.py:90-94 `do_write_with_aliasing` —
                     // canonicalise dest, then `_clear_cache_on_write(seen_alloc)`
                     // BEFORE the insert so aliasing entries from prior
@@ -1693,8 +1695,10 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
-            .entry(descr).or_default()
-            .entry(index_value).or_insert_with(CacheEntry::new);
+            .entry(descr)
+            .or_default()
+            .entry(index_value)
+            .or_insert_with(CacheEntry::new);
         // CacheEntry.do_write_with_aliasing internally canonicalises
         // ConstPtr operands via `_unique_const_heuristic`, replicating
         // heapcache.py:577 `indexcache.do_write_with_aliasing(box, ...)`.
@@ -1719,8 +1723,10 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
-            .entry(descr).or_default()
-            .entry(index_value).or_insert_with(CacheEntry::new);
+            .entry(descr)
+            .or_default()
+            .entry(index_value)
+            .or_insert_with(CacheEntry::new);
         let array = entry._unique_const_heuristic(array, oracle);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }
