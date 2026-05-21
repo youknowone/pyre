@@ -23,7 +23,7 @@ use crate::value::{GcRef, Type};
 /// This keeps the disjoint RPython Box classes disjoint even when Pyre's
 /// flat encoding reuses the same raw position across InputArg / ResOp /
 /// Const namespaces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum OpRef {
     /// Sentinel for missing/absent reference; `OpRef::NONE` aliases this.
     /// RPython has no equivalent — missing values are Python `None`.

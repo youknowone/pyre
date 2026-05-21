@@ -11,3 +11,4 @@ majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
 smallvec = "1"
+vecset = { workspace = true }
