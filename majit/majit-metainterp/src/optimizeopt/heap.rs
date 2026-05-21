@@ -185,12 +185,11 @@ impl CachedField {
         }
         let descr_idx = OptHeap::field_slot_index(descr);
         for &obj in &self.cached_structs {
-            let resolved = ctx.get_box_replacement(obj);
-            if let Some(b) = ctx.ensure_box(resolved) {
+            if let Some(b) = ctx.ensure_box(obj) {
                 ctx.with_ptr_info_mut(&b, |info| info.clear_field(descr_idx));
             }
             // Clear existing const_infos slot if present; do NOT create.
-            if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
+            if let Some(info) = ctx.get_const_info_mut_if_exists(obj) {
                 info.clear_field(descr_idx);
             }
         }
@@ -347,7 +346,7 @@ impl CachedField {
             if structbox.is_none() {
                 continue;
             }
-            let structbox_box = ctx.get_box_replacement_box(structbox);
+            let structbox_box = ctx.get_box_replacement_box(cached);
             let cached_val = match structbox_box
                 .as_ref()
                 .and_then(|b| ctx.peek_ptr_info(b))
@@ -491,13 +490,12 @@ impl ArrayCachedItem {
     fn invalidate(&mut self, ctx: &mut OptContext) {
         let index = self.index as usize;
         for &obj in &self.cached_structs {
-            let resolved = ctx.get_box_replacement(obj);
-            if let Some(b) = ctx.ensure_box(resolved) {
+            if let Some(b) = ctx.ensure_box(obj) {
                 ctx.with_ptr_info_mut(&b, |info| info.clear_item(index));
             }
             // info.py:728 ConstPtrInfo._get_array_info — only clear
             // an existing ArrayPtrInfo slot; do NOT create on miss.
-            if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
+            if let Some(info) = ctx.get_const_info_mut_if_exists(obj) {
                 info.clear_item(index);
             }
         }
@@ -873,8 +871,7 @@ impl OptHeap {
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
         let array = ctx.get_box_replacement(op.arg(0));
-        let index_ref = ctx.get_box_replacement(op.arg(1));
-        let index_val = ctx.get_constant_int(index_ref)?;
+        let index_val = ctx.get_constant_int(op.arg(1))?;
         Some((array, descr.index(), index_val))
     }
 
@@ -1017,13 +1014,11 @@ impl OptHeap {
     /// Emit a lazy SetfieldGc. If the value is virtual, return false (the
     /// caller should handle it via pendingfields / rd_pendingfields).
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
-        let orig_val = ctx.get_box_replacement(op.arg(1));
-
         // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
         // Virtual values are skipped — handled by rd_pendingfields at guard
         // time or dropped at JUMP.
         let orig_is_virtual = ctx
-            .get_box_replacement_box(orig_val)
+            .get_box_replacement_box(op.arg(1))
             .as_ref()
             .map_or(false, |b| ctx.is_virtual(b));
         if orig_is_virtual {
@@ -1163,9 +1158,8 @@ impl OptHeap {
             .collect();
         for (field_idx, descr, obj, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
-            let value_ref = ctx.get_box_replacement(op.arg(1));
             let is_virtual = ctx
-                .get_box_replacement_box(value_ref)
+                .get_box_replacement_box(op.arg(1))
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             if is_virtual {
@@ -1219,9 +1213,8 @@ impl OptHeap {
             .collect();
         for (descr_idx, index, _obj, mut op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
-            let value_ref = ctx.get_box_replacement(op.arg(2));
             let is_virtual = ctx
-                .get_box_replacement_box(value_ref)
+                .get_box_replacement_box(op.arg(2))
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             if is_virtual {
@@ -1357,7 +1350,7 @@ impl OptHeap {
                     if let Some(b) = ctx.ensure_box(dest_resolved) {
                         ctx.with_ptr_info_mut(&b, |info| info.clear_item(idx));
                     }
-                    if let Some(info) = ctx.get_const_info_mut_if_exists(dest_resolved) {
+                    if let Some(info) = ctx.get_const_info_mut_if_exists(dest_ref) {
                         info.clear_item(idx);
                     }
                 }
@@ -1449,9 +1442,9 @@ impl OptHeap {
         if let Some(&res_v) = d.get(&key) {
             // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
             if flag != FLAG_LOOKUP {
-                let resolved = ctx.get_box_replacement(res_v);
-                let bound = ctx.get_int_bound(resolved);
-                let known_ge_zero = bound.map_or(false, |b| b.known_ge_const(0));
+                let known_ge_zero = ctx
+                    .get_int_bound(res_v)
+                    .map_or(false, |b| b.known_ge_const(0));
                 if !known_ge_zero {
                     return false;
                 }
@@ -1895,10 +1888,9 @@ impl OptHeap {
                 //     if cf._cannot_alias_via_classes_or_lengths(...): return CANNOT_ALIAS
                 //     if cf._cannot_alias_via_content(...): return CANNOT_ALIAS
                 //     return UNKNOWN_ALIAS
-                let lazy_obj_resolved = ctx.get_box_replacement(*lazy_obj);
                 let cannot_alias =
-                    CachedField::_cannot_alias_via_classes_or_lengths(lazy_obj_resolved, obj, ctx)
-                        || CachedField::_cannot_alias_via_content(lazy_obj_resolved, obj, ctx);
+                    CachedField::_cannot_alias_via_classes_or_lengths(*lazy_obj, obj, ctx)
+                        || CachedField::_cannot_alias_via_content(*lazy_obj, obj, ctx);
                 if !cannot_alias {
                     // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
                     force_lazy = true;
@@ -3337,15 +3329,14 @@ impl Optimization for OptHeap {
                 }
                 // heap.py:838-839: structinfo = cf.cached_infos[i]
                 //                  box2 = structinfo.getfield(descr)
-                let resolved = ctx.get_box_replacement(obj);
-                let resolved_box = ctx.get_box_replacement_box(resolved);
+                let resolved_box = ctx.get_box_replacement_box(obj);
                 let Some(val) = resolved_box
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b))
                     .and_then(|info| info.getfield(*field_idx))
                     .map(|entry| entry.as_seen_opref())
                     .or_else(|| {
-                        ctx.get_const_info_mut(resolved, parent.clone())
+                        ctx.get_const_info_mut(obj, parent.clone())
                             .and_then(|info| info.getfield(*field_idx))
                             .map(|entry| entry.as_seen_opref())
                     })
@@ -3398,7 +3389,7 @@ impl Optimization for OptHeap {
             //             structinfo.init_fields(parent_descr, descr.get_index())
             //             box1.set_forwarded(structinfo)
             let resolved_is_virtual = ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_box(*box1)
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx.is_constant(resolved) && !resolved_is_virtual;
@@ -3455,8 +3446,7 @@ impl Optimization for OptHeap {
                     if index >= (1 << 15) {
                         continue;
                     }
-                    let resolved = ctx.get_box_replacement(obj);
-                    let resolved_box = ctx.get_box_replacement_box(resolved);
+                    let resolved_box = ctx.get_box_replacement_box(obj);
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
                     let Some(val) = resolved_box
                         .as_ref()
@@ -3464,7 +3454,7 @@ impl Optimization for OptHeap {
                         .and_then(|info| info.getitem(index as usize))
                         .map(|entry| entry.as_seen_opref())
                         .or_else(|| {
-                            ctx.get_const_info_array_mut(resolved, descr.clone())
+                            ctx.get_const_info_array_mut(obj, descr.clone())
                                 .and_then(|info| info.getitem(index as usize))
                                 .map(|entry| entry.as_seen_opref())
                         })
@@ -3509,7 +3499,7 @@ impl Optimization for OptHeap {
             //             arrayinfo = info.ArrayPtrInfo(descr)
             //             box1.set_forwarded(arrayinfo)
             let resolved_is_virtual = ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_box(*box1)
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx.is_constant(resolved) && !resolved_is_virtual;
@@ -3947,7 +3937,7 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -6482,7 +6472,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)

@@ -9,3 +9,4 @@ description = "Intermediate representation for majit JIT compiler"
 [dependencies]
 smallvec = { workspace = true }
 serde = { workspace = true }
+vecmap_rs = { workspace = true }

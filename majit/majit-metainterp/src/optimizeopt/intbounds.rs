@@ -3234,12 +3234,7 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            // BoxRef shim — peek_intbound_box takes &BoxRef.
-            let bound = ctx
-                .get_box_replacement_box(resolved)
-                .as_ref()
-                .and_then(|b| ctx.peek_intbound_box(b));
-            if let Some(bound) = bound {
+            if let Some(bound) = ctx.get_int_bound(arg) {
                 if bound.is_unbounded() {
                     continue;
                 }
@@ -4436,7 +4431,7 @@ mod tests {
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

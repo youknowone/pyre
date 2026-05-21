@@ -128,8 +128,8 @@ pub enum Forwarded {
 /// `is`-based default `__eq__` on `AbstractValue` (covers `ResOp` /
 /// `InputArg` / `Const`). PyPy's value-based comparison for constants is
 /// the explicit `same_box` / `same_constant` method (`history.py:204`),
-/// not `__eq__`. Callers that need value comparison on constants must use
-/// `BoxRef::same_constant`.
+/// not `__eq__`. Callers that need value comparison on constants compare
+/// `const_value()` outputs directly.
 pub struct BoxRef(Rc<Box>);
 
 impl BoxRef {
@@ -288,14 +288,6 @@ impl BoxRef {
     pub fn const_value(&self) -> Option<Value> {
         match self.0.kind {
             BoxKind::Const { value, .. } => Some(value),
-            _ => None,
-        }
-    }
-
-    /// Extract `AbstractInputArg.position`.
-    pub fn inputarg_position(&self) -> Option<u32> {
-        match self.0.kind {
-            BoxKind::InputArg { position } => Some(position),
             _ => None,
         }
     }
@@ -510,8 +502,7 @@ impl Clone for BoxRef {
 ///
 /// Carries an `Rc` clone of the live `Rc<RefCell<PtrInfo>>` together
 /// with a shared `RefCell` borrow into it.  `Deref<Target = PtrInfo>`
-/// gives ergonomic read-only access; callers needing identity can read
-/// `.handle()` to obtain the underlying `Rc` for `Rc::ptr_eq` checks.
+/// gives ergonomic read-only access.
 ///
 /// SAFETY: The inner `Ref<'static, PtrInfo>` is constructed by widening
 /// a `Ref` whose true lifetime is bounded by `_rc` (the `Rc` clone we
@@ -530,11 +521,6 @@ impl PtrInfoBorrow {
         let r: std::cell::Ref<'static, crate::optimizeopt::info::PtrInfo> =
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
-    }
-
-    /// Return the underlying handle for identity / sharing.
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
-        Rc::clone(&self._rc)
     }
 }
 
@@ -568,10 +554,6 @@ impl PtrInfoBorrowMut {
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>> {
-        Rc::clone(&self._rc)
-    }
 }
 
 impl std::ops::Deref for PtrInfoBorrowMut {
@@ -601,10 +583,6 @@ impl IntBoundBorrow {
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
-        Rc::clone(&self._rc)
-    }
 }
 
 impl std::ops::Deref for IntBoundBorrow {
@@ -631,10 +609,6 @@ impl IntBoundBorrowMut {
         let r: std::cell::RefMut<'static, crate::optimizeopt::intutils::IntBound> =
             unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
-    }
-
-    pub fn handle(&self) -> Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>> {
-        Rc::clone(&self._rc)
     }
 }
 
@@ -706,6 +680,13 @@ impl BoxPool {
         Self::default()
     }
 
+    /// Preallocate the slot table with `capacity` entries reserved.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -759,41 +740,24 @@ impl BoxPool {
         self.inner.truncate(new_len);
     }
 
-    pub fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    /// Index into the slot returning `&Option<BoxRef>` for callers that
-    /// need to distinguish out-of-bounds (`None` from `inner.get`) from
-    /// materialized vs tombstoned. Rarely needed.
-    pub fn slot(&self, idx: usize) -> Option<&Option<BoxRef>> {
-        self.inner.get(idx)
-    }
-
-    /// Borrow the raw `Vec<Option<BoxRef>>` slot table. Used by
-    /// snapshot/replay paths that need to preserve None tombstones
-    /// alongside materialized boxes.
-    pub fn as_slots(&self) -> &[Option<BoxRef>] {
-        &self.inner
-    }
-
-    /// Take ownership of the raw `Vec<Option<BoxRef>>` slot table.
-    pub fn into_slots(self) -> Vec<Option<BoxRef>> {
-        self.inner
-    }
-
-    /// Build from a `Vec<Option<BoxRef>>` snapshot — reverse of
-    /// `into_slots()`.
+    /// Build from a `Vec<Option<BoxRef>>` snapshot table.
     pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
         Self { inner: slots }
     }
+
+    /// Consume the pool and return its raw `Vec<Option<BoxRef>>` slot
+    /// table. Inverse of [`Self::from_slots`].
+    pub fn into_slots(self) -> Vec<Option<BoxRef>> {
+        self.inner
+    }
 }
 
+#[cfg(test)]
 impl From<Vec<BoxRef>> for BoxPool {
     fn from(inner: Vec<BoxRef>) -> Self {
-        Self {
-            inner: inner.into_iter().map(Some).collect(),
-        }
+        let mut slots = Vec::with_capacity(inner.len());
+        slots.extend(inner.into_iter().map(Some));
+        Self { inner: slots }
     }
 }
 
@@ -905,7 +869,7 @@ mod tests {
     fn inputarg_position_preserved() {
         let arg = BoxRef::new_inputarg(Type::Ref, 3);
         assert!(arg.is_inputarg());
-        assert_eq!(arg.inputarg_position(), Some(3));
+        assert_eq!(arg.position(), Some(3));
         assert_eq!(arg.type_(), Type::Ref);
     }
 
@@ -948,7 +912,6 @@ mod tests {
         // the round-trip mirrors that contract.
         let arg = BoxRef::new_inputarg(Type::Ref, 7);
         assert_eq!(arg.position(), Some(7));
-        assert_eq!(arg.inputarg_position(), Some(7));
     }
 
     #[test]

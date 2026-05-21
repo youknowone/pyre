@@ -194,16 +194,6 @@ pub struct Optimizer {
     pub(crate) opt_ops_emitted: usize,
     pub(crate) opt_guards_emitted: usize,
     pub(crate) opt_guards_shared_emitted: usize,
-    /// Epic H H-3.0b: per-position BoxRef pool inherited from
-    /// `TreeLoop.box_pool` (= `recorder::Trace.box_pool`). Set via
-    /// `set_pending_box_pool` before calling
-    /// `optimize_with_constants_and_inputs_at`; the entry transfers
-    /// ownership to `OptContext.box_pool`.
-    ///
-    /// Empty only for synthetic callers that never set the pool (tests,
-    /// retrace helpers without recorder). Production parity paths route
-    /// optimizer info through BoxRef `_forwarded`.
-    pending_box_pool: crate::r#box::BoxPool,
     /// `optimizer.cpu` (`rpython/jit/backend/model.py:39 AbstractCPU`)
     /// backref.  Hosts `cls_of_box(box)` (model.py:199-201) and other
     /// backend services every Optimization sub-class reaches via
@@ -225,7 +215,7 @@ pub struct Optimizer {
     /// to verify an OpRef refers to an actually-emitted op before
     /// reasoning about descriptor-shared guards or other emit-bound
     /// metadata.
-    pub emitted_operations: std::collections::HashSet<OpRef>,
+    pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
 }
 
 /// Lower a typed-`Value` constants pool into the dense
@@ -1057,8 +1047,7 @@ impl Optimizer {
                     });
                 *label_slot += 1;
                 Self::apply_imported_virtual_state(info, opref, ctx);
-                let resolved = ctx.get_box_replacement(opref);
-                resolved
+                ctx.get_box_replacement(opref)
             }
         }
     }
@@ -1104,19 +1093,9 @@ impl Optimizer {
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
-            pending_box_pool: crate::r#box::BoxPool::new(),
             cpu: crate::cpu::default_cpu(),
-            emitted_operations: std::collections::HashSet::new(),
+            emitted_operations: majit_ir::vec_set::VecSet::new(),
         }
-    }
-
-    /// H-3.0b: stage the recorder's BoxRef pool so the next
-    /// `optimize_with_constants_and_inputs_at` call transfers it into
-    /// `OptContext.box_pool`. Production callers invoke this after
-    /// extracting `treeloop.box_pool`. Calling it more than once before
-    /// optimization replaces the staged pool.
-    pub fn set_pending_box_pool(&mut self, box_pool: impl Into<crate::r#box::BoxPool>) {
-        self.pending_box_pool = box_pool.into();
     }
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
@@ -1469,7 +1448,7 @@ impl Optimizer {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
-        let resolved_box = ctx.get_box_replacement_box(resolved);
+        let resolved_box = ctx.get_box_replacement_box(opref);
         if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
@@ -1486,9 +1465,7 @@ impl Optimizer {
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
-            let resolved_box = ctx
-                .get_box_replacement_box(resolved)
-                .expect("recorder-populated");
+            let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);
@@ -1527,7 +1504,7 @@ impl Optimizer {
             // optimizer.py:307-313 — `box.type == 'r'` path.
             Some(majit_ir::Type::Ref) => {
                 let resolved_is_virtual = ctx
-                    .get_box_replacement_box(resolved)
+                    .get_box_replacement_box(opref)
                     .as_ref()
                     .map_or(false, |b| ctx.is_virtual(b));
                 if resolved_is_virtual {
@@ -1544,7 +1521,7 @@ impl Optimizer {
             // attached to an Int-typed OpRef.
             Some(majit_ir::Type::Int) => {
                 let resolved_has_info = ctx
-                    .get_box_replacement_box(resolved)
+                    .get_box_replacement_box(opref)
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 if resolved_has_info {
@@ -1573,7 +1550,7 @@ impl Optimizer {
         rec: &mut majit_ir::vec_set::VecSet<OpRef>,
     ) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        let resolved_box = ctx.get_box_replacement_box(resolved);
+        let resolved_box = ctx.get_box_replacement_box(opref);
         let Some(mut info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) else {
             return resolved;
         };
@@ -1614,8 +1591,8 @@ impl Optimizer {
             info.force_at_the_end_of_preamble(|child| {
                 self.force_at_the_end_of_preamble_rec(child, ctx, rec)
             });
-            if let Some(b) = ctx.get_box_replacement_box(resolved) {
-                ctx.set_ptr_info(&b, info);
+            if let Some(b) = resolved_box.as_ref() {
+                ctx.set_ptr_info(b, info);
             }
             return resolved;
         }
@@ -1830,7 +1807,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
+        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new(), crate::r#box::BoxPool::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1847,8 +1824,9 @@ impl Optimizer {
         &mut self,
         ops: &[Op],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
-        self.optimize_with_constants_and_inputs(ops, constants, 0)
+        self.optimize_with_constants_and_inputs(ops, constants, 0, box_pool)
     }
 
     /// Like `optimize_with_constants`, but also takes `num_inputs` so that
@@ -1864,6 +1842,7 @@ impl Optimizer {
         ops: &[Op],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
+        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
@@ -1876,7 +1855,14 @@ impl Optimizer {
             .max()
             .unwrap_or(0);
         let start_next_pos = ((max_pos as u32) + 1).max(num_inputs as u32);
-        self.optimize_with_constants_and_inputs_at(ops, constants, num_inputs, 0, start_next_pos)
+        self.optimize_with_constants_and_inputs_at(
+            ops,
+            constants,
+            num_inputs,
+            0,
+            start_next_pos,
+            box_pool,
+        )
     }
 
     /// opencoder.py:271 _index parity entry point.
@@ -1894,6 +1880,7 @@ impl Optimizer {
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
+        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
         // Test-only: auto-seed `trace_inputarg_types` when unit tests
@@ -1907,7 +1894,6 @@ impl Optimizer {
         }
         self.imported_label_args = None;
         self.terminal_op = None;
-        let _export_runtime_boxes = self.runtime_boxes.clone();
         self.runtime_boxes.clear();
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
@@ -1920,11 +1906,11 @@ impl Optimizer {
         );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
-        // H-3.0b: hand the pending BoxRef pool to the OptContext so
-        // mirror writes (H-3.1) can reach the same `Rc<Box>` allocations
-        // the recorder produced. RPython parity: the optimizer sees the
-        // identical AbstractValue objects flowing in from the tracer.
-        ctx.box_pool = std::mem::take(&mut self.pending_box_pool);
+        // Hand the recorder's BoxRef pool to the OptContext so writes
+        // reach the same `Rc<Box>` allocations the recorder produced.
+        // RPython parity: the optimizer sees the identical AbstractValue
+        // objects flowing in from the tracer.
+        ctx.box_pool = box_pool;
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
@@ -2311,7 +2297,7 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .get_box_replacement_box(resolved)
+                    .get_box_replacement_box(arg)
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
@@ -2742,13 +2728,12 @@ impl Optimizer {
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
-                let resolved = ctx.get_box_replacement(opref);
                 let resolved_is_virtual = ctx
-                    .get_box_replacement_box(resolved)
+                    .get_box_replacement_box(opref)
                     .as_ref()
                     .map_or(false, |b| ctx.is_virtual(b));
                 if resolved_is_virtual {
-                    self.force_box_for_end_of_preamble(resolved, &mut ctx);
+                    self.force_box_for_end_of_preamble(opref, &mut ctx);
                 }
             }
         }
@@ -2899,7 +2884,7 @@ impl Optimizer {
             // land at `remap[old_idx]`. Stale unused slots (no remap
             // entry, position() returns the old idx) are dropped — empty
             // slots in the new pool are filled with Void placeholders
-            // matching `ensure_box_at` semantics so any reader still
+            // matching `ensure_box`'s lazy-alloc shape so any reader still
             // indexing those slots sees `Forwarded::None` instead of
             // stale forwarding fragments.
             {
@@ -3128,6 +3113,7 @@ impl Optimizer {
         // base into `optimize_with_constants_and_inputs_at` so step 3
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
+        box_pool: crate::r#box::BoxPool,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
@@ -3172,6 +3158,7 @@ impl Optimizer {
             num_inputs,
             bridge_inputarg_base,
             start_next_pos,
+            box_pool,
         );
 
         // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
@@ -3675,8 +3662,7 @@ impl Optimizer {
 
         // optimizer.py:623-625: force_box on every arg unconditionally.
         for i in 0..op.num_args() {
-            let arg = ctx.get_box_replacement(op.arg(i));
-            op.setarg(i, self.force_box(arg, ctx));
+            op.setarg(i, self.force_box(op.arg(i), ctx));
         }
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
         // Pyre defers the fold into JitStatsCounters via update_counters
@@ -3793,7 +3779,7 @@ impl Optimizer {
             let replaced = ctx.get_box_replacement(emitted);
             // BoxRef shim — peek_intbound_box takes &BoxRef per optimizer.py:99-113.
             let bound = ctx
-                .get_box_replacement_box(replaced)
+                .get_box_replacement_box(emitted)
                 .as_ref()
                 .and_then(|b| ctx.peek_intbound_box(b));
             if let Some(bound) = bound {
@@ -4263,12 +4249,11 @@ impl Optimizer {
     fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
-        let arg0_resolved = ctx.get_box_replacement(arg0);
-        if ctx.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
+        if ctx.opref_type(arg0) != Some(majit_ir::Type::Int) {
             return op;
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
-        let b = ctx.getintbound(arg0_resolved);
+        let b = ctx.getintbound(arg0);
         if !b.is_bool() {
             return op;
         }
@@ -4359,29 +4344,6 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
-
-    /// H-3.0b invariant: `set_pending_box_pool` stages a pool that is
-    /// transferred into `OptContext.box_pool` on the next call to
-    /// `optimize_with_constants_and_inputs_at`. The Optimizer's own
-    /// pending field is drained (`take`) so a second optimization run
-    /// without setting the pool again starts with an empty `ctx.box_pool`.
-    #[test]
-    fn h3_0b_pending_box_pool_transfers_to_ctx() {
-        use crate::r#box::BoxRef;
-        let mut opt = Optimizer::default_pipeline();
-        let b0 = BoxRef::new_inputarg(Type::Int, 0);
-        let pool = vec![b0.clone()];
-        opt.set_pending_box_pool(pool);
-        let ops: Vec<Op> = Vec::new();
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
-        // Pending pool drained.
-        assert!(opt.pending_box_pool.is_empty());
-        // Final ctx (if observable) would have held the box; here we just
-        // confirm the take semantics by running a second pass with no set.
-        let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 0);
-        assert!(opt.pending_box_pool.is_empty());
-    }
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
     struct AddZeroElimination;
@@ -4694,7 +4656,7 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -4714,7 +4676,7 @@ mod tests {
         )];
         ops[0].pos.set(OpRef::int_op(2));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2, crate::r#box::BoxPool::new());
 
         assert_eq!(
             hits.get(),
@@ -4763,7 +4725,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3, crate::r#box::BoxPool::new());
 
         let call_count = result
             .iter()
@@ -4897,7 +4859,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3, crate::r#box::BoxPool::new());
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -4944,7 +4906,7 @@ mod tests {
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -4969,7 +4931,7 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
 
         let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
         assert_eq!(
@@ -5006,7 +4968,7 @@ mod tests {
         ops[3].pos.set(OpRef::int_op(6));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
 
         assert_eq!(result[0].pos.get(), OpRef::int_op(5));
         assert_eq!(result[1].pos.get(), OpRef::int_op(6));
@@ -5032,7 +4994,7 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos.get(), OpRef::int_op(3));
@@ -5052,7 +5014,7 @@ mod tests {
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos.get(), OpRef::int_op(3));
@@ -5073,7 +5035,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -5111,7 +5073,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -5130,7 +5092,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0, crate::r#box::BoxPool::new());
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -5175,7 +5137,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
         let new_count = result.iter().filter(|op| op.opcode == OpCode::New).count();
@@ -5241,7 +5203,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             let alloc_ref = set_op.arg(0);
@@ -5289,7 +5251,7 @@ mod tests {
         ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5337,7 +5299,7 @@ mod tests {
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5407,7 +5369,7 @@ mod tests {
         }
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -5470,7 +5432,7 @@ mod tests {
         ));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0);
+        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, crate::r#box::BoxPool::new());
 
         assert!(result.is_empty());
         // Empty trace, no emitted ops — carry must be empty. Inputarg
@@ -5792,7 +5754,7 @@ mod tests {
         });
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
 
         let guard = result
             .iter()

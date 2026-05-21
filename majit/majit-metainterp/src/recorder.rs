@@ -147,7 +147,7 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            box_pool: Vec::with_capacity(256).into(),
+            box_pool: crate::r#box::BoxPool::with_capacity(256),
         }
     }
 
@@ -486,10 +486,11 @@ impl Trace {
         self.box_pool.get(position as usize)
     }
 
-    /// H-2.1: full BoxRef pool snapshot — borrows the sparse slot
-    /// table (`None` for skipped positions).
-    pub fn box_pool(&self) -> &[Option<BoxRef>] {
-        self.box_pool.as_slots()
+    /// Full BoxRef pool snapshot — borrows the sparse slot table
+    /// (`None` for skipped positions). Test-only.
+    #[cfg(test)]
+    pub fn box_pool(&self) -> &crate::r#box::BoxPool {
+        &self.box_pool
     }
 }
 
@@ -568,7 +569,7 @@ mod tests {
             let b = rec.box_for_position(raw).expect("inputarg slot");
             assert!(b.is_inputarg());
             assert_eq!(b.type_(), expect_tp);
-            assert_eq!(b.inputarg_position(), Some(raw));
+            assert_eq!(b.position(), Some(raw));
         }
 
         // record_op typed (Int result)
