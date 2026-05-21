@@ -3465,7 +3465,8 @@ fn init_socket(ns: &mut DictStorage) {
         cst!("NI_NAMEREQD", libc::NI_NAMEREQD);
         cst!("NI_DGRAM", libc::NI_DGRAM);
         cst!("NI_MAXHOST", libc::NI_MAXHOST);
-        cst!("NI_MAXSERV", libc::NI_MAXSERV);
+        // POSIX <netdb.h> NI_MAXSERV = 32; libc crate omits it on linux-gnu
+        cst!("NI_MAXSERV", 32);
         // ── EAI_* (gai_strerror codes) ──
         cst!("EAI_AGAIN", libc::EAI_AGAIN);
         cst!("EAI_BADFLAGS", libc::EAI_BADFLAGS);
