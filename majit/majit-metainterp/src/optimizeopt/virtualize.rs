@@ -2607,7 +2607,12 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
+        opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
@@ -2615,7 +2620,12 @@ mod tests {
         opt.trace_inputarg_types = vec![Type::Ref; 1024];
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
+        opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
@@ -2630,7 +2640,12 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
+        opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
@@ -3047,7 +3062,12 @@ mod tests {
 
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            3,
+            crate::r#box::BoxPool::new(),
+        );
         let jump = result
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
@@ -3315,7 +3335,12 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -3773,7 +3798,12 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         assert_eq!(
             result.len(),
             1,
@@ -4360,7 +4390,12 @@ mod tests {
         ops[2].pos.set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
         // which forces the virtual New to be materialized.
@@ -4468,7 +4503,12 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(7));
         constants.insert(101u32, majit_ir::Value::Int(11));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            2,
+            crate::r#box::BoxPool::new(),
+        );
 
         let new_positions: Vec<_> = result
             .iter()

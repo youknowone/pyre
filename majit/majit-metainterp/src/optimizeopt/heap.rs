@@ -4117,7 +4117,12 @@ mod tests {
         opt.trace_inputarg_types = types;
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
+        opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -6651,8 +6656,12 @@ mod tests {
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)

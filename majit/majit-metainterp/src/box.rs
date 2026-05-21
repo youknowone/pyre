@@ -24,7 +24,7 @@
 use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 
-use majit_ir::{Type, Value};
+use majit_ir::{OpRef, Type, Value};
 
 use crate::optimizeopt::info::OpInfo;
 
@@ -637,13 +637,37 @@ impl BoxPool {
         self.inner.get(idx)?.as_ref()
     }
 
-    /// `box_pool[idx] = Some(value)`; extends with `None` padding to
-    /// reach `idx`. Returns a clone of the installed BoxRef.
-    pub fn set(&mut self, idx: usize, value: BoxRef) -> BoxRef {
+    /// `box_pool[opref] = Some(value)`; extends with `None` padding to
+    /// reach the slot. Returns a clone of the installed BoxRef.
+    ///
+    /// Takes an `OpRef` rather than raw `usize` so the namespace
+    /// invariants are enforced at the type level: only body and
+    /// InputArg variants reach the underlying `Vec`. A constant or
+    /// `TempVar` reaching this entry point would otherwise resize the
+    /// Vec to multi-GiB (raw payload >= `CONST_BIT = 1 << 31` or
+    /// `SENTINEL_BASE = 0xFFFF_0000`).
+    pub fn set(&mut self, opref: OpRef, value: BoxRef) -> BoxRef {
+        let idx = match opref {
+            OpRef::IntOp(p)
+            | OpRef::FloatOp(p)
+            | OpRef::RefOp(p)
+            | OpRef::VoidOp(p)
+            | OpRef::InputArgInt(p)
+            | OpRef::InputArgFloat(p)
+            | OpRef::InputArgRef(p) => p as usize,
+            OpRef::ConstInt(_) | OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => panic!(
+                "BoxPool::set rejects constant OpRefs ({opref:?}); \
+                 constants live in `const_pool`, not the box pool"
+            ),
+            OpRef::TempVar(_) => panic!(
+                "BoxPool::set rejects TempVar OpRefs ({opref:?}); \
+                 TempVars are regalloc-only and have no Box identity"
+            ),
+            OpRef::None => panic!("BoxPool::set rejects OpRef::None"),
+        };
         assert!(
             idx < Self::SANE_IDX_BOUND,
-            "BoxPool::set(idx={idx}) exceeds SANE_IDX_BOUND ({}); \
-             caller likely passed a raw OpRef payload with CONST_BIT/sentinel set",
+            "BoxPool::set({opref:?}, idx={idx}) exceeds SANE_IDX_BOUND ({})",
             Self::SANE_IDX_BOUND
         );
         if idx >= self.inner.len() {

@@ -1067,7 +1067,12 @@ mod tests {
         opt.add_pass(Box::new(OptGuard::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new())
+        opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        )
     }
 
     // ── Redundant Guard Removal ─────────────────────────────────────────
@@ -1407,8 +1412,12 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
@@ -1473,7 +1482,12 @@ mod tests {
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024, crate::r#box::BoxPool::new());
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut constants,
+            1024,
+            crate::r#box::BoxPool::new(),
+        );
 
         // GUARD_VALUE should be replaced with GUARD_TRUE
         assert!(
