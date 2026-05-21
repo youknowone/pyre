@@ -1496,6 +1496,33 @@ pub fn dispatch_via_miframe(
         ConcreteValue::Ref(sym.last_exc_value)
     };
 
+    // Task #165: stamp the OpRef-keyed `opref_concrete` table from the
+    // slot-keyed snapshots so `TraceCtx::box_value` / `concrete_of_opref`
+    // surface the same Ref/Int concretes that `concrete_registers_*`
+    // already carry.  Without this, downstream `getfield_gc_i` /
+    // `getfield_vable_i` callers reach `box_value(obj) -> None` and the
+    // recorded result OpRef gets no `set_opref_concrete` stamp — the
+    // chain breaks at the first `int_le` / `goto_if_not/iL` that reads
+    // an Int derived from a heap field.  RPython parity: `BoxInt(value)`
+    // / `BoxPtr(value)` constructors populate `Box.value` at the OpRef's
+    // record site; pyre's split between slot-keyed (Ref bank shadow)
+    // and OpRef-keyed (Box.value) needs an explicit bridge at walker
+    // entry.
+    for (i, opref) in sym.registers_r.iter().copied().enumerate() {
+        if opref.is_constant() {
+            continue;
+        }
+        match concrete_r_snapshot[i] {
+            ConcreteValue::Ref(ptr) => {
+                trace_ctx.set_opref_concrete(
+                    opref,
+                    majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+                );
+            }
+            ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Null => {}
+        }
+    }
+
     let result = {
         let mut wc = WalkContext {
             registers_r: &mut sym.registers_r,
