@@ -3030,25 +3030,19 @@ fn write_residual_call_result_to_dst(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
+    // Task #75.F: route the shadow write through `concrete_of_opref`
+    // so a CallPure* descr whose argboxes are all constant (do_residual_call
+    // path that lands a constant result via the executor.execute_varargs
+    // stamp) propagates concrete to the dst slot.  Falls back to Null when
+    // the result has no recorded concrete (matches the pre-#75.F shape for
+    // every non-elidable call).
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'r' => {
-            // Residual call result — walker doesn't execute the call,
-            // so the concrete return value is unknown.  Null in shadow
-            // means downstream GUARD_CLASS gates skip.
-            write_ref_reg(ctx, pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, pc, dst, result, concrete_for_shadow)?;
         }
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
