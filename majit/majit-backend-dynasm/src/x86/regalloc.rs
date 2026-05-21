@@ -240,8 +240,14 @@ impl<'a> RegAlloc<'a> {
     ) {
         if rhs.is_constant() {
             let val = self.const_value(rhs);
-            if fits_in_32bits(-val) {
-                return self._consider_lea_j2(dst, lhs, rhs, i, output);
+            // PyPy `rx86.fits_in_32bits(-y.value)` (regalloc.py:577) is safe
+            // because Python ints are arbitrary precision; Rust `-i64::MIN`
+            // overflows. `checked_neg` returns None for that single edge
+            // case and falls back to the normal SUB path.
+            if let Some(neg) = val.checked_neg() {
+                if fits_in_32bits(neg) {
+                    return self._consider_lea_j2(dst, lhs, rhs, i, output);
+                }
             }
         }
         self.consider_binop_j2(dst, lhs, rhs, i, output);
