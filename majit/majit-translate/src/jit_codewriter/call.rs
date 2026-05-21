@@ -3108,7 +3108,37 @@ impl CallControl {
     pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
             CallTarget::FunctionPath { segments } => {
-                Some(CallPath::from_segments(segments.iter().map(String::as_str)))
+                let path = CallPath::from_segments(segments.iter().map(String::as_str));
+                if self.function_graphs.contains_key(&path) {
+                    return Some(path);
+                }
+                // Cross-module reference fallback.  `canonical_call_target`
+                // (`front/ast.rs:7888-7896`) qualifies single-segment paths
+                // with the *caller's* `module_prefix`, but the callee may
+                // live in another module — `use foo::bar; bar();` inside
+                // module `caller` produces the target `["caller", "bar"]`
+                // while the registry has `["foo", "bar"]`.  Bare callsites
+                // that the caller's prefix couldn't qualify hit the same
+                // shape with `segments.len() == 1`.  PyPy's bookkeeper
+                // resolves the equivalent name through `frame.f_globals`
+                // (`flowcontext.py:845-866 LOAD_GLOBAL`), which consults
+                // imports.  Pyre's analogue: when the as-is path misses,
+                // search registered keys by leaf match; if exactly one
+                // registered key has the same last segment, use that.
+                // Multiple matches mean genuine ambiguity — leave it
+                // unresolved so the BFS / call-control walker surfaces
+                // it as a registry miss rather than silently picking one.
+                if let Some(leaf) = segments.last() {
+                    let matches: Vec<&CallPath> = self
+                        .function_graphs
+                        .keys()
+                        .filter(|k| k.segments.last().map(|s| s == leaf).unwrap_or(false))
+                        .collect();
+                    if matches.len() == 1 {
+                        return Some(matches[0].clone());
+                    }
+                }
+                Some(path)
             }
             CallTarget::Method {
                 name,

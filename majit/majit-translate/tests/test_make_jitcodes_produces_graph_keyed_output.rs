@@ -30,7 +30,7 @@
 //! the plan specifies by name, with focused assertions that detect
 //! any future drift toward variant-keyed output schemas.
 
-use majit_translate::{CallPath, generated::with_all_jitcodes, jitcode::JitCode};
+use majit_translate::{generated::with_all_jitcodes, jitcode::JitCode};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -92,13 +92,24 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
             reg.in_order.len()
         );
 
-        // Invariant 4: registry contains the portal (`execute_opcode_step`).
-        // RPython `call.py:145-148 grab_initial_jitcodes` seeds it first.
-        let execute_opcode_step_path = CallPath::from_segments(["execute_opcode_step"]);
+        // Invariant 4: registry contains per-opcode-arm dispatch JitCodes,
+        // produced by `build_canonical_opcode_dispatch` (lib.rs:965-1027)
+        // from the decomposed `execute_opcode_step` match arms. The portal
+        // selector itself is not separately registered; each arm becomes
+        // one `__opcode_dispatch__::<selector>#<arm_id>` JitCode mirroring
+        // RPython's per-opcode handler graphs at `call.py:145-148
+        // grab_initial_jitcodes`.
+        let has_arm = reg.by_path.keys().any(|k| {
+            k.segments
+                .first()
+                .map(|s| s == "__opcode_dispatch__")
+                .unwrap_or(false)
+        });
         assert!(
-            reg.by_path.contains_key(&execute_opcode_step_path),
-            "portal `execute_opcode_step` missing from `by_path` — \
-             `grab_initial_jitcodes` (call.py:145-148) did not seed it"
+            has_arm,
+            "per-opcode dispatch arms missing from `by_path` — \
+             `build_canonical_opcode_dispatch` (lib.rs:965-1027) did not seed any \
+             `__opcode_dispatch__::<selector>#<arm_id>` JitCode"
         );
     });
 
