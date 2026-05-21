@@ -1512,8 +1512,7 @@ pub fn dispatch_via_miframe(
     for (i, &v) in top_constants_r.iter().enumerate() {
         top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
         if v != 0 {
-            top_concrete_r[top_num_regs_r + i] =
-                ConcreteValue::Ref(v as pyre_object::PyObjectRef);
+            top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
         }
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
@@ -4820,6 +4819,23 @@ fn handle(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
+            // PyPy `box.value = result` parity at the frame boundary:
+            // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
+            // carries the live PyObject pointer; mirror it onto the
+            // OpRef-keyed `opref_concrete` channel so the caller's
+            // `concrete_from_recorded_opref` (in `dispatch_inline_call_*_kind`)
+            // sees the stamped Box.value.  Skips constants — `TraceCtx::constants
+            // .get_value` is the authoritative shadow for those.
+            if !result.is_constant() {
+                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                    if !ptr.is_null() {
+                        ctx.trace_ctx.set_opref_concrete(
+                            result,
+                            majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+                        );
+                    }
+                }
+            }
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[result], ctx.done_with_this_frame_descr_ref.clone());
@@ -4842,6 +4858,14 @@ fn handle(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
+            // PyPy `box.value = result` parity at the frame boundary —
+            // see `ref_return/r` comment above for rationale.
+            if !result.is_constant() {
+                if let ConcreteValue::Int(v) = read_int_reg_concrete(code, op, 0, ctx) {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Int(v));
+                }
+            }
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
