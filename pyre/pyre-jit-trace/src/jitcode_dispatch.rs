@@ -1129,6 +1129,37 @@ fn write_int_reg(
     Ok(())
 }
 
+/// Derive a `ConcreteValue` for shadow write-back from a freshly
+/// recorded `OpRef` via `concrete_of_opref` (Task #75.E).
+///
+/// RPython parity: `pyjitpl.py:execute_with_descr` /
+/// `rpython/jit/metainterp/executor.py` stamps `box.value` on every
+/// executed op result through the per-opcode LLOp executor — `Box.value`
+/// IS the load-bearing concrete channel.  Pyre's `concrete_of_opref`
+/// table-lookup is the orthodox shadow of that channel: constant pool
+/// (`history.py:220/261/307`), virtualizable boxes
+/// (`pyjitpl.py:3400-3430`), `set_opref_concrete` stamps from
+/// `binop_int_record` / `unop_int_record`, and standard virtualizable
+/// box hits all surface here.
+///
+/// Returns `ConcreteValue::Null` when the table has no entry — the
+/// caller's downstream `goto_if_not/iL` / GUARD_CLASS dispatch treats
+/// Null as "skip the fold / skip the guard".  The sentinel
+/// `Value::Ref(GcRef(usize::MAX))` (`trace_ctx.rs:1461`) is mapped to
+/// Null since it signals "no concrete known" rather than an actual
+/// pointer.
+#[inline]
+fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> ConcreteValue {
+    match ctx.trace_ctx.concrete_of_opref(opref) {
+        Value::Int(v) => ConcreteValue::Int(v),
+        Value::Float(v) => ConcreteValue::Float(v),
+        Value::Ref(r) if r != majit_ir::GcRef(usize::MAX) => {
+            ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
+        }
+        _ => ConcreteValue::Null,
+    }
+}
+
 /// Read concrete shadow values for a Ref-bank variadic operand list
 /// (M4.Cutover Step 1). Parallels [`read_ref_var_list`] — reads the
 /// same byte indices but resolves through `ctx.concrete_registers_r`.
@@ -1646,26 +1677,19 @@ fn getarrayitem_gc_via_heapcache_with_index_bank(
     };
 
     let dst = code[op.pc + 5] as usize;
+    // Task #75.E: derive shadow concrete from the recorded result's
+    // `concrete_of_opref` entry instead of inventing Null.  Constant
+    // arraybox + constant index hits land in `constants.get_value`;
+    // virtualizable hits surface via `standard_virtualizable_box`;
+    // `set_opref_concrete` stamps from upstream `binop_int_record`
+    // flow back here too.  Null fallback preserves the prior contract.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1933,26 +1957,20 @@ fn getfield_gc_via_heapcache(
     };
 
     let dst = code[op.pc + 4] as usize;
+    // Task #75.E: derive shadow concrete via `concrete_of_opref` so a
+    // constant-folded predecessor (e.g. `binop_int_record` having
+    // stamped this OpRef in Task #75.D) propagates through.  RPython
+    // `Box.value` parity: `pyjitpl.py:executor.py` per-opcode LLOp
+    // stamps `box.value` post-exec; pyre's `concrete_of_opref` reads
+    // that channel.  Null fallback preserves the prior unknown-result
+    // behaviour for cache-miss recorded ops.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -2034,26 +2052,19 @@ fn getfield_vable_via_metainterp(
     };
 
     let dst = code[op.pc + 4] as usize;
+    // Task #75.E: derive shadow concrete via `concrete_of_opref`.  The
+    // `vable_getfield_*` helpers in `TraceCtx` already populate the
+    // concrete shadow for virtualizable-resident fields via the
+    // `standard_virtualizable_box()`/`virtualizable_boxes` channel,
+    // and feed `set_opref_concrete` on the GETFIELD_GC fallback for
+    // non-vable structs — both surface through this lookup.
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
-            // Recorded op result — walker doesn't compute the concrete
-            // (would need executing against the live heap), so pass
-            // Null.  Downstream raise/r GUARD_CLASS treats Null as
-            // "no info, skip the guard".
-            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
