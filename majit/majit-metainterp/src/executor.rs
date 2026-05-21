@@ -1666,3 +1666,54 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
         _ => None,
     }
 }
+
+/// Narrow [`execute_varargs`] carve-out usable without `&mut MetaInterp`.
+///
+/// RPython `executor.execute_varargs(cpu, ..., exc=False)`
+/// (`executor.py:75-78`) skips the `metainterp.execute_raised` coordination
+/// when the helper provably cannot raise — `pyjitpl.py:_record_helper_pure`
+/// (`pyjitpl.py:1346-1400`) reaches this path for every `EF_ELIDABLE_CANNOT_RAISE`
+/// callee. Pyre's walker (`pyre-jit-trace::jitcode_dispatch::
+/// dispatch_residual_call_*`) cannot thread `&mut MetaInterp` through the
+/// trace recorder seam, so this helper exposes the `exc=False` shape via
+/// direct `call_int_function` / `call_void_function` dispatch.
+///
+/// **Caller contract** (debug-asserted): `descr.get_extra_info()` must report
+/// both `check_is_elidable()` true AND `check_can_raise(false)` false.  Any
+/// other EI risks landing in `BH_LAST_EXC_VALUE` with no metainterp around
+/// to transcribe it, which would silently swallow the exception.
+///
+/// `args` follows `_build_allboxes` (`pyjitpl.py:1960-1993`) layout
+/// **excluding** the funcbox: the funcbox concrete int is `func_ptr` and the
+/// remaining concrete operand values pass straight through to the host ABI
+/// dispatcher (`pyjitpl::call_int_function` / `call_void_function`).  Up to
+/// `MAX_HOST_CALL_ARITY` (16) operand slots.
+pub fn execute_pure_call(
+    descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    args: &[i64],
+) -> i64 {
+    debug_assert!(
+        descr.get_extra_info().check_is_elidable()
+            && !descr.get_extra_info().check_can_raise(false),
+        "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI"
+    );
+    let func_ptr = func_ptr as *const ();
+    match descr.result_type() {
+        // RPython dispatches Int and Ref through the same backend primitive
+        // `cpu.bh_call_i` (returns i64); pyre's `call_int_function` does
+        // the same — Ref is bit-identical to Int at the ABI level.
+        majit_ir::Type::Int | majit_ir::Type::Ref => {
+            crate::pyjitpl::call_int_function(func_ptr, args)
+        }
+        majit_ir::Type::Void => {
+            crate::pyjitpl::call_void_function(func_ptr, args);
+            0
+        }
+        // See `execute_varargs`'s Float arm for the i64-bits ABI rationale:
+        // `#[jit_module]` Float helpers expose `concrete_ptr` as
+        // `extern "C" fn(...) -> i64` with the f64 pre-packed via
+        // `f64::to_bits`; routing through `call_int_function` is bit-identical.
+        majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
+    }
+}

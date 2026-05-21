@@ -2814,6 +2814,119 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
     }
 }
 
+/// `pyjitpl.py:_record_helper_pure` (`pyjitpl.py:1346-1400`) parity for the
+/// walker layer: when a residual_call routes to `CallPure*` (elidable +
+/// cannot-raise EI per [`select_residual_call_opcode`]) AND every
+/// argument in `allboxes` has a known concrete value
+/// (`TraceCtx::box_value` returns `Some`), execute the helper at trace
+/// time via [`majit_metainterp::executor::execute_pure_call`] and stamp
+/// `recorded` with the result.
+///
+/// RPython upstream `_record_helper_pure` invokes
+/// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
+/// which dispatches to `cpu.bh_call_*` and stores the result on
+/// `result_box.value` (`pyjitpl.py:1392`).  Pyre's walker observes the
+/// same effect through the `set_opref_concrete` stamp — downstream walker
+/// chain (sub-jitcode bodies that consume the call result via
+/// `concrete_of_opref`) folds end-to-end instead of stalling at
+/// `RefOp/IntOp(N)` unknown values.
+///
+/// **Caller contract**:
+/// * `call_opcode` must be one of `CallPureI`/`CallPureR`/`CallPureF`/
+///   `CallPureN` — the `select_residual_call_opcode` elidable arm
+///   (`pyjitpl.py:2126` proper, `dispatch.rs:2688-2690`).  Other call
+///   shapes (`CallMayForce*`, `CallLoopinvariant*`, `Call*`) carry
+///   `can_raise=true` or escape semantics that require the full
+///   `execute_varargs` MetaInterp seam — they MUST NOT route here.
+/// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
+///   remaining slots are user args in `descr.arg_types()` ABI order.
+///
+/// Best-effort: returns silently when any operand lacks a concrete
+/// `box_value` (the walker has no way to read the runtime value), or
+/// when the arity exceeds `MAX_HOST_CALL_ARITY` (16) — the trace still
+/// has the recorded `CallPure*` op for the optimizer to consume later,
+/// just without the per-record fold.
+fn try_fold_pure_call_via_executor(
+    ctx: &mut WalkContext<'_, '_>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    recorded: OpRef,
+) {
+    if !matches!(
+        call_opcode,
+        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
+    ) {
+        return;
+    }
+    // pyjitpl.py:1351-1352 — `_record_helper_pure` only fires for
+    // `EF_ELIDABLE_CANNOT_RAISE`. `select_residual_call_opcode` returns
+    // `CallPure*` whenever `check_is_elidable()` is true (including
+    // `EF_ELIDABLE_CAN_RAISE`), so re-check the can-raise predicate here
+    // before dispatching through the `execute_pure_call` no-metainterp
+    // carve-out.  A `EF_ELIDABLE_CAN_RAISE` callee would silently swallow
+    // the exception via `BH_LAST_EXC_VALUE` with no metainterp to
+    // transcribe it.
+    let ei = call_descr.get_extra_info();
+    if ei.check_can_raise(false) {
+        return;
+    }
+    if allboxes.is_empty() {
+        return;
+    }
+    // pyjitpl.py:1960-1993 `_build_allboxes`: slot 0 is funcbox, slots
+    // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
+    // [`build_allboxes`] preserves the same layout.
+    let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
+    let func_ptr = match funcptr_val {
+        Some(majit_ir::Value::Int(addr)) => addr,
+        _ => return,
+    };
+    // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
+    // panic on excess arity).  `allboxes.len() - 1` is the arg count
+    // (funcbox doesn't pass through).
+    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+        return;
+    }
+    let mut args = Vec::with_capacity(allboxes.len() - 1);
+    for &arg in &allboxes[1..] {
+        let v = match ctx.trace_ctx.box_value(arg) {
+            Some(majit_ir::Value::Int(n)) => n,
+            Some(majit_ir::Value::Ref(r)) => {
+                // `usize::MAX` sentinel from `concrete_of_opref` means
+                // "no concrete known" — never reach this path because
+                // `box_value` returns `None` for un-stamped OpRefs, but
+                // belt-and-suspenders against future plumbing.
+                if r == majit_ir::GcRef(usize::MAX) {
+                    return;
+                }
+                r.as_usize() as i64
+            }
+            Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
+            Some(majit_ir::Value::Void) => 0,
+            None => return,
+        };
+        args.push(v);
+    }
+    let result_i64 = majit_metainterp::executor::execute_pure_call(call_descr, func_ptr, &args);
+    // pyjitpl.py:1392 `result_box.value = result`: stamp the recorded
+    // OpRef with the executed concrete so downstream
+    // `concrete_of_opref` / `box_value` consumers see the folded value.
+    let result_value = match call_descr.result_type() {
+        majit_ir::Type::Int => majit_ir::Value::Int(result_i64),
+        majit_ir::Type::Ref => {
+            majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize))
+        }
+        majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+        // void callees discard the result upstream too (`bh_call_v` has
+        // no return value); `CallPureN` is included in the matched set
+        // only to mirror PyPy's `_record_helper_pure` handling of all
+        // pure shapes — skip the stamp for void.
+        majit_ir::Type::Void => return,
+    };
+    ctx.trace_ctx.set_opref_concrete(recorded, result_value);
+}
+
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
 /// Sub-case of the forces-virtual-or-virtualizable branch
 /// (`pyjitpl.py:2063` `if effectinfo.is_call_release_gil()`): when the
@@ -3419,6 +3532,15 @@ fn dispatch_residual_call_iRd_kind(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity: for
+        // `CallPure*` whose every argbox carries a known `box_value`,
+        // execute the helper now and stamp `recorded` with the result so
+        // downstream walker chain (sub-jitcode bodies that consume the
+        // result via `concrete_of_opref`) folds end-to-end.  No-op when
+        // any argbox is symbolic, when the EI can raise, or for non-pure
+        // call opcodes.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity: every
         // recorded varargs op invalidates the heapcache via
         // `heapcache.invalidate_caches_varargs(opnum, descr,
@@ -3598,6 +3720,10 @@ fn dispatch_residual_call_iIRd_kind(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
+        // `dispatch_residual_call_iRd_kind` for the upstream walk.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+
         // pyjitpl.py:2659 `_record_helper_varargs` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.  Same invalidation semantics; only the
@@ -3721,6 +3847,10 @@ fn dispatch_residual_call_iIRFd_kind(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+
+        // pyjitpl.py:1346-1400 `_record_helper_pure` parity — see
+        // `dispatch_residual_call_iRd_kind` for the upstream walk.
+        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
         ctx.trace_ctx
             .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
