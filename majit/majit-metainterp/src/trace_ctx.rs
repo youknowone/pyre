@@ -1312,6 +1312,21 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Whether the recorder contains any `Call*` family op at or after
+    /// position `start`. Used by `handle_possible_exception` to decide
+    /// if the current bytecode actually performed a residual call that
+    /// could have set the exception flag; absent any such call no
+    /// `GUARD_NO_EXCEPTION` need be recorded (PyPy parity: `do_residual_call`
+    /// pyjitpl.py:2082 is the only emit site).
+    pub fn any_call_recorded_since(&self, start: u32) -> bool {
+        let start = start as usize;
+        let ops = self.recorder.ops();
+        if start >= ops.len() {
+            return false;
+        }
+        ops[start..].iter().any(|op| op.opcode.is_call())
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()

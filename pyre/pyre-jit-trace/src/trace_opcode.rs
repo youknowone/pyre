@@ -770,6 +770,7 @@ impl MIFrame {
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
             suppress_guard_no_exception_for_opcode: false,
+            pre_opcode_op_count: None,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -6353,6 +6354,14 @@ impl MIFrame {
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         self.suppress_guard_no_exception_for_opcode = false;
+        // Snapshot op count so handle_possible_exception can detect
+        // whether this bytecode emitted any CALL_* family op. PyPy
+        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
+        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
+        // that gating so inlined primitive bodies (int_*_ovf + boxing
+        // + guards) don't accrete orphan exception guards.
+        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
+        self.pre_opcode_op_count = Some(pre_op_count);
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -6585,10 +6594,32 @@ impl MIFrame {
             // RERAISE-issuing site is the only producer of reraise_lasti.
             self.finishframe_exception(code, pc, -1)
         } else {
-            // pyjitpl.py:3397: GUARD_NO_EXCEPTION
-            self.with_ctx(|this, ctx| {
-                this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
-            });
+            // pyjitpl.py:3397: GUARD_NO_EXCEPTION.
+            //
+            // PyPy emits `GUARD_NO_EXCEPTION` only inside `do_residual_call`
+            // (pyjitpl.py:2082), so the guard exists only when the bytecode
+            // actually recorded a CALL_* family op that could have set the
+            // exception flag. Pyre's `handle_possible_exception` runs at
+            // every may-raise bytecode end regardless of the inner
+            // dispatch's structure, which leaves orphan exception guards
+            // after bytecodes whose body inlined entirely to primitives
+            // (e.g., `int_mul_ovf` + boxing/guards from `mul(x, x)`). Skip
+            // the emit when the bytecode's recording window contains no
+            // CALL_* op — mirrors PyPy's structural invariant at recording
+            // time, avoiding the post-opt `optimize_GUARD_NO_EXCEPTION`
+            // dependency on the `last_emitted_operation is REMOVED`
+            // sentinel (optimizeopt/heap.py:692) which pyre's per-pass
+            // `last_emitted_was_removed` flag cannot preserve across
+            // intermediate is_always_pure ops.
+            let skip = match self.pre_opcode_op_count {
+                Some(start) => self.with_ctx(|_this, ctx| !ctx.any_call_recorded_since(start)),
+                None => false,
+            };
+            if !skip {
+                self.with_ctx(|this, ctx| {
+                    this.generate_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                });
+            }
             TraceAction::Continue
         }
     }
@@ -6858,6 +6889,14 @@ impl MIFrame {
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         self.suppress_guard_no_exception_for_opcode = false;
+        // Snapshot op count so handle_possible_exception can detect
+        // whether this bytecode emitted any CALL_* family op. PyPy
+        // records GUARD_NO_EXCEPTION only inside `do_residual_call`
+        // (pyjitpl.py:2082); pyre's end-of-bytecode emit must replicate
+        // that gating so inlined primitive bodies (int_*_ovf + boxing
+        // + guards) don't accrete orphan exception guards.
+        let pre_op_count = self.with_ctx(|_this, ctx| ctx.num_ops() as u32);
+        self.pre_opcode_op_count = Some(pre_op_count);
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
