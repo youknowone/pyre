@@ -4558,6 +4558,17 @@ fn handle(
                     });
                 }
             };
+            // pyjitpl.py:514 `assert switchcase == 1` — codewriter
+            // invariant: every condbox feeding GOTO_IF_NOT was produced
+            // by an int_is_* family op, so the only non-zero value
+            // possible is 1. Fail loud on any other truthy value rather
+            // than silently coercing.
+            assert!(
+                switchcase == 0 || switchcase == 1,
+                "opimpl_goto_if_not: switchcase must be 0 or 1, got {} (pc={})",
+                switchcase,
+                op.pc
+            );
             let (opcode, promoted) = if switchcase != 0 {
                 (OpCode::GuardTrue, ctx.trace_ctx.const_int(1))
             } else {
