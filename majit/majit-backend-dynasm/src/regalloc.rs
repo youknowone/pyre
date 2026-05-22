@@ -4924,9 +4924,10 @@ impl<'a> RegAlloc<'a> {
             arglocs.push(self.loc(arg, tp));
         }
 
+        let can_collect = calldescr.get_extra_info().check_can_collect();
         let save_regs = if save_all_regs {
             SAVE_ALL_REGS
-        } else if calldescr.get_extra_info().check_can_collect() {
+        } else if can_collect {
             SAVE_GCREF_REGS
         } else {
             SAVE_DEFAULT_REGS
@@ -4954,6 +4955,16 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
 
+        // Same gcmap snapshot as `consider_call` above. The j2 dispatch
+        // handles the same Call*/CallMayForce*/CallReleaseGil* opcodes,
+        // so a collecting callee must record the live Ref slots that
+        // before_call just synced to the jitframe.
+        let gcmap = if can_collect {
+            Some(self.get_gcmap(&[], false) as usize)
+        } else {
+            None
+        };
+
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
             let dst = dst.unwrap_or(op.pos.get());
@@ -4968,7 +4979,11 @@ impl<'a> RegAlloc<'a> {
         };
         arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
 
-        self.perform(i, arglocs, result_loc, output);
+        if let Some(gcmap) = gcmap {
+            self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
+        } else {
+            self.perform(i, arglocs, result_loc, output);
+        }
     }
 
     /// llsupport/regalloc.py:894 locs_for_call_assembler parity.
