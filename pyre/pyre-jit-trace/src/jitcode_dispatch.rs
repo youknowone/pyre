@@ -1788,14 +1788,13 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let frame_opref = sym.frame;
 
     // Snapshot the outer PyFrame state for walker-emitted guards.
-    // RPython's `pyjitpl.py:218-225 _get_list_of_active_boxes` reads
-    // `MIFrame.registers_{i,r,f}` filtered by JitCode-liveness; pyre's
-    // walker has no per-PC liveness narrowing yet (Phase 4 follow-up),
-    // so this conservatively snapshots every non-`OpRef::NONE` slot
-    // across all three banks of `sym`.  Over-capture is
-    // correctness-preserving — the optimizer's
-    // `store_final_boxes_in_guard` filters dead boxes from the
-    // snapshot.
+    // `pyjitpl.py:218-225 _get_list_of_active_boxes` reads
+    // `MIFrame.registers_{i,r,f}` filtered by JitCode-liveness for the
+    // outer `(jitcode_index, pc)`.  `frame_liveness_reg_indices_by_bank_at`
+    // resolves the same `all_liveness` byte stream the decoder consumes
+    // at resume (`state::frame_value_count_at` /
+    // `frame_liveness_reg_indices_by_bank_at`), so encoder and decoder
+    // agree byte-for-byte on which register slots populate the snapshot.
     //
     // Outer pyjitcode index: `sym.jitcode` points at the
     // `majit_metainterp::jitcode::JitCode` for the user Python
@@ -1811,23 +1810,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     } else {
         unsafe { (*sym.jitcode).index as u32 }
     };
-    let mut outer_active_boxes =
-        Vec::with_capacity(sym.registers_r.len() + sym.registers_i.len() + sym.registers_f.len());
-    for r in sym.registers_r.iter() {
-        if !r.is_none() {
-            outer_active_boxes.push(*r);
-        }
-    }
-    for r in sym.registers_i.iter() {
-        if !r.is_none() {
-            outer_active_boxes.push(*r);
-        }
-    }
-    for r in sym.registers_f.iter() {
-        if !r.is_none() {
-            outer_active_boxes.push(*r);
-        }
-    }
+    let outer_active_boxes = collect_outer_active_boxes(sym, outer_jitcode_index, entry_py_pc);
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
     // `copy_constants(registers, constants, num_regs_X, ConstClass)`.
@@ -3504,6 +3487,55 @@ fn write_residual_call_result_to_dst(
     Ok(())
 }
 
+/// `pyjitpl.py:218-225 _get_list_of_active_boxes` parity for the
+/// walker-emitted snapshot: read each live register from its
+/// kind-specific bank in (int, ref, float) order, dropping non-live
+/// slots regardless of whether the OpRef happens to be set.  The
+/// liveness lookup matches the decoder side
+/// (`state::frame_value_count_at` /
+/// `frame_liveness_reg_indices_by_bank_at`), so encoder and decoder
+/// agree byte-for-byte on the snapshot shape consumed at resume.
+///
+/// Returns an empty vector when no liveness is registered for the
+/// `(jitcode_index, pc)` pair (skeleton payload or out-of-range PC);
+/// the downstream optimizer surfaces the empty snapshot as a no-op.
+fn collect_outer_active_boxes(
+    sym: &crate::state::PyreSym,
+    outer_jitcode_index: u32,
+    entry_py_pc: u32,
+) -> Vec<OpRef> {
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+        outer_jitcode_index as i32,
+        entry_py_pc as i32,
+    );
+    let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
+    for &idx in &banks.int {
+        active.push(
+            sym.registers_i
+                .get(idx as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    for &idx in &banks.ref_ {
+        active.push(
+            sym.registers_r
+                .get(idx as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    for &idx in &banks.float {
+        active.push(
+            sym.registers_f
+                .get(idx as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    active
+}
+
 /// Walker-side port of `pyjitpl.py:2586-2602 MIFrame.capture_resumedata`
 /// for the `after_residual_call=True` path (`pyjitpl.py:2078-2082
 /// handle_possible_exception`).  Attaches a single-frame snapshot to
@@ -3511,20 +3543,6 @@ fn write_residual_call_result_to_dst(
 /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
 /// `rd_resume_position >= 0` and can derive `op.fail_args` from the
 /// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
-///
-/// Active-box collection PRE-EXISTING-ADAPTATION: RPython
-/// `_get_list_of_active_boxes` (`pyjitpl.py:218-225`) reads only
-/// JitCode-liveness-live registers at the resume PC.  Pyre's walker
-/// does not yet thread the `op_live` byte table through `WalkContext`
-/// (the byte table lives on the JitCode body, but the walker only
-/// borrows `JitCodeBody.code` as a slice — Phase 4 follow-up will
-/// surface the table through `SubJitCodeBody`).  Until then this
-/// conservatively snapshots every non-`OpRef::NONE` register across
-/// `registers_r` / `registers_i` / `registers_f`.  Over-capture is
-/// correctness-preserving: `store_final_boxes` selects the actual
-/// `op.fail_args` from the snapshot via the optimizer's liveness
-/// pass, so dead registers in the snapshot are dropped before they
-/// reach the backend.
 fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
