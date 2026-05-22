@@ -3906,8 +3906,12 @@ fn collect_local_names(item_fn: &ItemFn, argnames_in_order: &[String]) -> Vec<St
 /// adapter needs `Hlvalue`s for the startblock, while this helper needs
 /// the plain `String` names for `HostCode::co_varnames`.
 fn extract_argnames(item_fn: &ItemFn) -> Result<Vec<String>, AdapterError> {
+    extract_argnames_from_sig(&item_fn.sig)
+}
+
+fn extract_argnames_from_sig(sig: &syn::Signature) -> Result<Vec<String>, AdapterError> {
     let mut out = Vec::new();
-    for input in &item_fn.sig.inputs {
+    for input in &sig.inputs {
         let ident = match input {
             FnArg::Receiver(_) => "self".to_string(),
             FnArg::Typed(pat_type) => match &*pat_type.pat {
@@ -3929,12 +3933,157 @@ fn extract_argnames(item_fn: &ItemFn) -> Result<Vec<String>, AdapterError> {
     Ok(out)
 }
 
+/// Z2.5 Path C slice 1 — walk a parsed `syn::File` to collect
+/// `(path-segments, Signature)` pairs for every top-level `unsafe fn`
+/// and unsafe impl-method.  These callees cannot lower their bodies via
+/// the adapter (`build_flow.rs:215` rejects `sig.unsafety.is_some()`
+/// because the bodies access raw pointers that the flowspace adapter
+/// does not model), but downstream `OpKind::Call::FunctionPath` sites
+/// still need their signature registered in `PyreCallRegistry` —
+/// otherwise the dual gate Skips with "not registered in
+/// PyreCallRegistry" at `flowspace_adapter.rs:1059`.
+///
+/// `prefix` is the module-path stem the caller derived from the source
+/// filename (`pyobject` for `pyre/pyre-object/src/pyobject.rs`); each
+/// free-fn key becomes `[prefix, ident]` (or `[ident]` when prefix is
+/// empty, matching the bare-name registration path in
+/// `front/ast.rs::collect_fn_returns`).  Impl-methods key as
+/// `[ImplTy, method]` regardless of prefix, mirroring how
+/// `lib.rs::register_function_graph` keys impl methods today.
+///
+/// Pure-extract — no registration, no side effects.  The slice 3
+/// consumer (`cutover.rs::populate_call_registry_from_call_graphs`)
+/// drives the registration once the slice 2 stub PyGraph builder is in
+/// place; until then, calling this helper is a no-op observable only
+/// through the return Vec.  Returns an empty Vec when `file` contains
+/// no unsafe fns / methods.
+pub fn extract_unsafe_fn_signatures(
+    file: &File,
+    prefix: &str,
+) -> Vec<(Vec<String>, crate::flowspace::argument::Signature)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Fn(func) if func.sig.unsafety.is_some() => {
+                let Ok(argnames) = extract_argnames(func) else {
+                    continue;
+                };
+                let mut segments = Vec::with_capacity(2);
+                if !prefix.is_empty() {
+                    segments.push(prefix.to_string());
+                }
+                segments.push(func.sig.ident.to_string());
+                out.push((segments, Signature::new(argnames, None, None)));
+            }
+            Item::Impl(impl_block) => {
+                let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
+                    continue;
+                };
+                let Some(target_ident) = target_path.last().cloned() else {
+                    continue;
+                };
+                for sub in &impl_block.items {
+                    let syn::ImplItem::Fn(method) = sub else {
+                        continue;
+                    };
+                    if method.sig.unsafety.is_none() {
+                        continue;
+                    }
+                    let Ok(argnames) = extract_argnames_from_sig(&method.sig) else {
+                        continue;
+                    };
+                    out.push((
+                        vec![target_ident.clone(), method.sig.ident.to_string()],
+                        Signature::new(argnames, None, None),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(src: &str) -> ItemFn {
         syn::parse_str::<ItemFn>(src).expect("test fixture must parse")
+    }
+
+    fn parse_file(src: &str) -> File {
+        syn::parse_str::<File>(src).expect("test fixture must parse as syn::File")
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_empty_file_returns_empty() {
+        let file = parse_file("");
+        assert!(extract_unsafe_fn_signatures(&file, "anyprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_safe_fn_skipped() {
+        let file = parse_file("pub fn safe_helper(x: i64) -> i64 { x + 1 }");
+        assert!(extract_unsafe_fn_signatures(&file, "modprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_free_unsafe_fn_prefixed() {
+        let file = parse_file(
+            "pub unsafe fn is_none(obj: *const u8) -> bool { obj.is_null() }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1);
+        let (segments, sig) = &pairs[0];
+        assert_eq!(segments, &vec!["pyobject".to_string(), "is_none".to_string()]);
+        assert_eq!(sig.argnames, vec!["obj".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_empty_prefix_emits_bare_name() {
+        let file = parse_file("pub unsafe fn bare_unsafe(x: i64) {}");
+        let pairs = extract_unsafe_fn_signatures(&file, "");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        assert_eq!(segments, &vec!["bare_unsafe".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_impl_unsafe_method_keys_by_impl_type() {
+        let file = parse_file(
+            "impl Foo { pub unsafe fn method_a(&self, x: i64) -> bool { true } pub fn safe(&self) {} }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1, "safe method must be filtered out");
+        let (segments, sig) = &pairs[0];
+        assert_eq!(segments, &vec!["Foo".to_string(), "method_a".to_string()]);
+        assert_eq!(sig.argnames, vec!["self".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_trait_impl_unsafe_method_keys_by_self_type() {
+        let file = parse_file(
+            "impl SomeTrait for Bar { unsafe fn op(&self) -> i64 { 0 } }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        assert_eq!(segments, &vec!["Bar".to_string(), "op".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_mixed_file_returns_all_unsafe_entries() {
+        let file = parse_file(
+            "pub fn safe_a() {} pub unsafe fn unsafe_a(p: i64) {} impl Cls { pub unsafe fn m(&self) -> bool { true } pub fn safe_m(&self) {} }",
+        );
+        let pairs = extract_unsafe_fn_signatures(&file, "modx");
+        assert_eq!(pairs.len(), 2);
+        let segments_set: std::collections::HashSet<Vec<String>> =
+            pairs.iter().map(|(s, _)| s.clone()).collect();
+        assert!(segments_set.contains(&vec!["modx".to_string(), "unsafe_a".to_string()]));
+        assert!(segments_set.contains(&vec!["Cls".to_string(), "m".to_string()]));
     }
 
     /// Verify that `build_host_class_from_struct` populates the
