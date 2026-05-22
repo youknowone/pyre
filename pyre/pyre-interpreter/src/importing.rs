@@ -1594,8 +1594,8 @@ fn init_resource(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "resource.getrusage requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "resource.getrusage requires host_env feature",
                     ))
                 }
             },
@@ -1639,8 +1639,8 @@ fn init_resource(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "resource.getrlimit requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "resource.getrlimit requires host_env feature",
                     ))
                 }
             },
@@ -1715,8 +1715,8 @@ fn init_resource(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "resource.setrlimit requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "resource.setrlimit requires host_env feature",
                     ))
                 }
             },
