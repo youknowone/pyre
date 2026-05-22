@@ -5899,7 +5899,7 @@ impl CodeWriter {
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
-                            let portal_regallocs = [
+                            let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: std::collections::HashMap::new(),
                                     num_colors: 0,
@@ -5913,7 +5913,7 @@ impl CodeWriter {
                                     num_colors: 0,
                                 },
                             ];
-                            GraphFlattener::new(&mut ssarepr, &portal_regallocs)
+                            GraphFlattener::new(&mut ssarepr, &mut portal_regallocs)
                                 .serialize_op(&graph_op);
                             for insn in ssarepr.insns[pre_len..].iter().cloned() {
                                 current_block.push_insn(insn);

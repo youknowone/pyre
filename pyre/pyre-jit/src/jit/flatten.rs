@@ -1210,7 +1210,12 @@ pub struct GraphFlattener<'a> {
     ///
     /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
     /// matching upstream's `self.regallocs[kind].getcolor(v)`.
-    regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
+    ///
+    /// Stored as `&mut` so `enforce_input_args` (`flatten.py:88-100`)
+    /// can `swapcolors` in place, matching upstream's
+    /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
+    /// reborrow immutably via `&*self.regallocs`.
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
 }
 
 impl<'a> GraphFlattener<'a> {
@@ -1223,7 +1228,7 @@ impl<'a> GraphFlattener<'a> {
     /// methods to keep the common no-options construction concise.
     pub fn new(
         ssarepr: &'a mut SSARepr,
-        regallocs: &'a [super::regalloc::GraphAllocationResult; 3],
+        regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
     ) -> Self {
         Self {
             ssarepr,
@@ -2043,6 +2048,16 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
+    /// `rpython/jit/codewriter/flatten.py:88-100
+    /// GraphFlattener.enforce_input_args` — rotate `self.regallocs[kind]`
+    /// inputarg colors into `0..n-1` via `swapcolors`.  Upstream stores
+    /// `graph` on `self.graph`; pyre threads it per-call because
+    /// `make_bytecode_block` (the only other downstream consumer)
+    /// already takes the block argument directly.
+    pub fn enforce_input_args(&mut self, graph: &super::flow::FunctionGraph) {
+        super::regalloc::enforce_input_args(graph, self.regallocs);
+    }
+
     /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
     /// reset `seen_blocks` and recurse from `graph.startblock`.  Upstream
     /// stores `graph` as `self.graph`; pyre threads it through because
@@ -2129,7 +2144,7 @@ impl<'a> GraphFlattener<'a> {
             // so the dispatcher signature stays stable; both share the
             // free `regalloc_color` helper with `getcolor_var` so a
             // missing color panics uniformly.
-            let regallocs = self.regallocs;
+            let regallocs: &[super::regalloc::GraphAllocationResult; 3] = &*self.regallocs;
             let mut get_register = |v: Variable| regalloc_color(regallocs, v);
             let mut lower_constant = flatten_constant_operand;
             if let Some(insn) = try_flatten_retired_family_hlop_to_insn(
@@ -2215,7 +2230,7 @@ impl<'a> GraphFlattener<'a> {
     /// Reads `regallocs[kind].coloring[v.id]` directly — matching
     /// upstream's `self.regallocs[kind].getcolor(v)`.
     fn getcolor_var(&self, v: Variable) -> Register {
-        regalloc_color(self.regallocs, v)
+        regalloc_color(&*self.regallocs, v)
     }
 
     /// Lower a graph `Constant` to the typed `Operand` the assembler
@@ -2527,8 +2542,8 @@ pub fn identity_test_regallocs(
 /// generate_ssa_form`.  Skips `enforce_input_args` because identity
 /// coloring is a fixed-point for id-ordered inputargs.
 pub fn flatten_graph_for_test(graph: &super::flow::FunctionGraph, ssarepr: &mut SSARepr) {
-    let regallocs = identity_test_regallocs(graph);
-    let mut flattener = GraphFlattener::new(ssarepr, &regallocs);
+    let mut regallocs = identity_test_regallocs(graph);
+    let mut flattener = GraphFlattener::new(ssarepr, &mut regallocs);
     flattener.generate_ssa_form(graph);
 }
 
@@ -2542,8 +2557,9 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
     lowering_ctx: LoweringContext,
     cpu: Option<&'a super::cpu::Cpu>,
 ) {
-    let regallocs = identity_test_regallocs(graph);
-    let mut flattener = GraphFlattener::new(ssarepr, &regallocs).with_lowering_ctx(lowering_ctx);
+    let mut regallocs = identity_test_regallocs(graph);
+    let mut flattener =
+        GraphFlattener::new(ssarepr, &mut regallocs).with_lowering_ctx(lowering_ctx);
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
@@ -2583,12 +2599,6 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream's
-    // `enforce_input_args` is a `GraphFlattener` method that mutates
-    // `self.regallocs` via `swapcolors`.  Pyre runs the equivalent
-    // here as a free function so the post-swap regallocs can be
-    // borrowed immutably by `GraphFlattener::new` below.
-    super::regalloc::enforce_input_args(graph, regallocs);
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
@@ -2603,6 +2613,8 @@ pub fn flatten_graph<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
+    // `flatten.py:68 flattener.enforce_input_args()`.
+    flattener.enforce_input_args(graph);
     // `flatten.py:69 flattener.generate_ssa_form()`.
     flattener.generate_ssa_form(graph);
     ssarepr
@@ -4379,8 +4391,8 @@ mod tests {
     fn graph_flattener_emits_loop_header_from_graph_op() {
         let op = SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 17);
         let mut ssarepr = SSARepr::new("test");
-        let empty_regallocs = empty_regallocs();
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &empty_regallocs);
+        let mut empty_regallocs = empty_regallocs();
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut empty_regallocs);
 
         flattener.serialize_op(&op);
 
@@ -4432,7 +4444,7 @@ mod tests {
         let mut ref_coloring = std::collections::HashMap::new();
         ref_coloring.insert(frame.id, 10u16);
         ref_coloring.insert(ec.id, 11u16);
-        let regallocs = [
+        let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
                 coloring: std::collections::HashMap::new(),
                 num_colors: 0,
@@ -4446,7 +4458,7 @@ mod tests {
                 num_colors: 0,
             },
         ];
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut regallocs);
 
         flattener.serialize_op(&op);
 
@@ -4994,7 +5006,7 @@ mod tests {
         let mut ref_coloring = std::collections::HashMap::new();
         ref_coloring.insert(src.id, 0u16);
         ref_coloring.insert(dst.id, 1u16);
-        let regallocs = [
+        let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
                 coloring: std::collections::HashMap::new(),
                 num_colors: 0,
@@ -5008,7 +5020,7 @@ mod tests {
                 num_colors: 0,
             },
         ];
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &regallocs);
+        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut regallocs);
 
         flattener.serialize_op(&op);
 
