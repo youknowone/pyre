@@ -6866,8 +6866,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                 #[cfg(not(feature = "host_env"))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "signal.raise_signal requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "signal.raise_signal requires host_env feature",
                     ))
                 }
             },
@@ -6949,8 +6949,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     #[cfg(not(feature = "host_env"))]
                     {
                         let _ = args;
-                        Err(crate::PyError::runtime_error(
-                            "signal.alarm requires host_env",
+                        Err(crate::PyError::not_implemented(
+                            "signal.alarm requires host_env feature",
                         ))
                     }
                 },
@@ -7016,8 +7016,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                 #[cfg(not(feature = "host_env"))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "signal.setitimer requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "signal.setitimer requires host_env feature",
                     ))
                 }
             }),
@@ -7053,8 +7053,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     #[cfg(not(feature = "host_env"))]
                     {
                         let _ = args;
-                        Err(crate::PyError::runtime_error(
-                            "signal.getitimer requires host_env",
+                        Err(crate::PyError::not_implemented(
+                            "signal.getitimer requires host_env feature",
                         ))
                     }
                 },
@@ -7088,8 +7088,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     #[cfg(not(feature = "host_env"))]
                     {
                         let _ = args;
-                        Err(crate::PyError::runtime_error(
-                            "signal.siginterrupt requires host_env",
+                        Err(crate::PyError::not_implemented(
+                            "signal.siginterrupt requires host_env feature",
                         ))
                     }
                 },
@@ -7185,8 +7185,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     #[cfg(not(feature = "host_env"))]
                     {
                         let _ = args;
-                        Err(crate::PyError::runtime_error(
-                            "signal.pthread_sigmask requires host_env",
+                        Err(crate::PyError::not_implemented(
+                            "signal.pthread_sigmask requires host_env feature",
                         ))
                     }
                 },
@@ -7241,8 +7241,8 @@ fn init_signal_stub(ns: &mut DictStorage) {
                 #[cfg(not(feature = "host_env"))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "signal.pidfd_send_signal requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "signal.pidfd_send_signal requires host_env feature",
                     ))
                 }
             }),
