@@ -9192,9 +9192,21 @@ fn member_name(member: &syn::Member) -> String {
 }
 
 /// RPython: direct_call carries the exact callee graph identity.
-/// Qualify single-segment bare function names with module prefix so that
-/// `helper()` inside `mod a` produces `["a", "helper"]`, matching the
-/// registered graph path.
+/// Qualify single-segment bare function names per the lexical scope of
+/// the caller, matching PyPy's `flowcontext.py:845 find_global`:
+///
+/// 1. **`use foo::bar; bar();`** — single-ident `bar` whose alias
+///    appears in `ctx.use_imports` expands to the full registered
+///    path (`["foo", "bar"]`) verbatim.  Eliminates the need for the
+///    cross-module leaf-match fallback in
+///    `call.rs::target_to_path` for the common imported-callable
+///    case.  PyPy parity: `bookkeeper.getdesc(value)` resolves the
+///    alias to the source function identity directly.
+/// 2. **Same-module bare call** — when no `use` alias matches and the
+///    caller has a non-empty `module_prefix`, qualify with the
+///    caller's prefix (`["caller_mod", "bar"]`).  Matches the
+///    same-module registration shape that `lib.rs` publishes for
+///    `Item::Fn` graphs declared in the same file.
 fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarget {
     match expr {
         syn::Expr::Path(path) => {

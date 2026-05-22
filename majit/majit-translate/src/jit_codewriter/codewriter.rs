@@ -337,7 +337,7 @@ impl CodeWriter {
                 // `RPythonAnnotator.__init__` starts with `bindings =
                 // {}`, equivalent to clearing every cell to `None`
                 // before the iterative fixpoint loop.
-                for (_, var) in graph.iter_variables() {
+                for (_, var) in graph.iter_variable_slots() {
                     *var.annotation.borrow_mut() = None;
                 }
                 crate::translator::rtyper::legacy_annotator::annotate(graph);

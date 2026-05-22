@@ -3113,40 +3113,42 @@ impl CallControl {
                     return Some(path);
                 }
                 // Cross-module reference fallback.  `canonical_call_target`
-                // (`front/ast.rs:7888-7896`) qualifies single-segment paths
-                // with the *caller's* `module_prefix`, but the callee may
-                // live in another module — `use foo::bar; bar();` inside
-                // module `caller` produces the target `["caller", "bar"]`
-                // while the registry has `["foo", "bar"]`.  Bare callsites
-                // that the caller's prefix couldn't qualify hit the same
-                // shape with `segments.len() == 1`.  PyPy's bookkeeper
-                // resolves the equivalent name through `frame.f_globals`
-                // (`flowcontext.py:845-866 LOAD_GLOBAL`), which consults
-                // imports.  Pyre's analogue: when the as-is path misses,
-                // search registered keys by leaf match; if exactly one
-                // registered key has the same last segment, use that.
-                // Multiple matches mean genuine ambiguity — leave it
-                // unresolved so the BFS / call-control walker surfaces
-                // it as a registry miss rather than silently picking one.
-                // Restrict leaf-match to the cross-module
-                // bare-callsite shape: segments produced by
-                // `canonical_call_target` qualifying a single-ident
-                // path with caller's `module_prefix` always have
-                // length ≤ 2 (`["bare"]` or `["caller_module",
-                // "bare"]`).  Three-plus-segment paths
-                // (`["std", "ptr", "copy"]`,
-                // `["pyre_interpreter", "module", "name"]`) come from
-                // explicitly qualified callsites and must NOT fuzzy-
-                // match — they either resolve verbatim (registered
-                // graph) or fall through to `Residual` (external host
-                // call).  Without this guard, `std::ptr::copy(s,d,n)`
-                // would leaf-match unrelated 2-arg `copy` impl methods
-                // and corrupt `getcalldescr`'s arity check.  PyPy
-                // parity: `flowcontext.py:845-866 LOAD_GLOBAL` only
+                // (`front/ast.rs::canonical_call_target`) now expands
+                // single-ident callsites through the caller's
+                // `use_imports` *first*, so `use foo::bar; bar();`
+                // resolves verbatim to `["foo", "bar"]` against the
+                // registry.  The remaining case the leaf-match needs to
+                // cover is the bare callsite the caller's
+                // `use_imports` could not resolve directly — typically
+                // a same-file declaration whose registration spelling
+                // diverges from the `module_prefix` qualification (e.g.
+                // `lib.rs::register_function_graph_alias` chains).
+                //
+                // PyPy parity: `flowcontext.py:845-866 LOAD_GLOBAL`
                 // applies to bare-name references; qualified
                 // `module.func` reaches the bookkeeper through its
-                // explicit attribute lookup, not the f_globals fallback.
+                // explicit attribute lookup, not the `f_globals`
+                // fallback.  Mirror that by restricting leaf-match to
+                // the cross-module bare-callsite shape — `segments`
+                // produced by `canonical_call_target` is `["bare"]` or
+                // `["caller_module", "bare"]` (length ≤ 2).  Three-
+                // plus-segment paths (`["std", "ptr", "copy"]`,
+                // `["pyre_interpreter", "module", "name"]`) come from
+                // explicitly qualified callsites and must NOT fuzzy-
+                // match — they either resolve verbatim or fall through
+                // to `Residual` (external host call).  Without this
+                // guard, `std::ptr::copy(s,d,n)` would leaf-match
+                // unrelated 2-arg `copy` impl methods and corrupt
+                // `getcalldescr`'s arity check.
+                //
+                // `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables
+                // the leaf-match outright so a CI sweep can quantify
+                // how often the cross-module fallback fires.  Production
+                // runs leave the env var unset.
                 if segments.len() > 2 {
+                    return Some(path);
+                }
+                if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_some() {
                     return Some(path);
                 }
                 if let Some(leaf) = segments.last() {
@@ -3259,12 +3261,19 @@ impl CallControl {
                     // falls through to the trait resolution path, which mirrors
                     // Rust's name-resolution ambiguity error rather than
                     // silently picking one.
-                    match self
-                        .method_suffix_index
-                        .get(&(receiver.to_string(), name.to_string()))
-                    {
-                        Some(SuffixMatch::Unique(path)) => return Some(path.clone()),
-                        Some(SuffixMatch::Ambiguous) | None => {}
+                    //
+                    // `PYRE_STRICT_TARGET_TO_PATH=1` disables the
+                    // receiver-leaf fallback alongside the FunctionPath
+                    // branch above so audit sweeps observe both fallback
+                    // surfaces consistently.
+                    if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_none() {
+                        match self
+                            .method_suffix_index
+                            .get(&(receiver.to_string(), name.to_string()))
+                        {
+                            Some(SuffixMatch::Unique(path)) => return Some(path.clone()),
+                            Some(SuffixMatch::Ambiguous) | None => {}
+                        }
                     }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
@@ -4453,23 +4462,44 @@ impl CallControl {
                                     .unwrap_or_else(|| declared.clone());
                             let expected_result =
                                 return_type_string_to_value_type(Some(&effective_declared));
-                            // Lenient soft-signal for `Ref` actual when
-                            // the declared type is primitive: callers
-                            // built through the opcode-dispatch arm
-                            // entry (`parse.rs:806 lower_expr_into_graph_with_signature`)
-                            // pass an empty `fn_return_types`, so the
-                            // front-end falls back to `ValueType::Unknown`
-                            // (= `Type::Ref`) for any bare callsite.  This
-                            // matches the same lenient treatment applied
-                            // to argument kinds above (call.py:230
-                            // parity is conditional on the side-table
-                            // being populated).  Until the dispatch-arm
-                            // ctx threads program-wide `fn_return_types`,
-                            // the Ref-vs-primitive mismatch is a
-                            // type-info gap, not a true signature
-                            // mismatch.
-                            let result_type_unresolved =
-                                matches!(result_type, Type::Ref) && expected_result != Type::Ref;
+                            // RPython call.py:230-234 hard-fails when
+                            // `RESULT != FUNC.RESULT`.  Pyre's
+                            // type-info pipeline has one narrow gap that
+                            // necessarily widens the check: the
+                            // opcode-dispatch arm entry
+                            // (`parse.rs:806
+                            // lower_expr_into_graph_with_signature`)
+                            // passes an empty `fn_return_types`, so the
+                            // front-end falls back to
+                            // `ValueType::Unknown` (= `Type::Ref`) for
+                            // any bare callsite of a function whose
+                            // return type the front-end could not
+                            // resolve.  Under that gap a callee declared
+                            // as a primitive (`Int` / `Float`) gets a
+                            // caller-side `Type::Ref` actual —
+                            // observably indistinguishable from a real
+                            // signature mismatch, but driven entirely by
+                            // the missing side-table.  Restrict the
+                            // leniency to that exact shape and hard-fail
+                            // everything else.  `Type::Void` declared
+                            // never originates from the
+                            // `Unknown→Ref` fallback (the front-end has
+                            // a real `()` return spelling and emits
+                            // `Type::Void` directly), so Ref-vs-Void
+                            // remains a hard fail that the lenient gate
+                            // does not protect.
+                            //
+                            // The strict-mode override
+                            // `PYRE_STRICT_GETCALLDESCR=1` (audit-only)
+                            // disables the leniency outright so a CI
+                            // sweep can quantify how often the gap
+                            // fires.  Production runs leave the env var
+                            // unset.
+                            let strict_mode =
+                                std::env::var_os("PYRE_STRICT_GETCALLDESCR").is_some();
+                            let result_type_unresolved = !strict_mode
+                                && matches!(result_type, Type::Ref)
+                                && matches!(expected_result, Type::Int | Type::Float);
                             if result_type != expected_result && !result_type_unresolved {
                                 panic!(
                                     "in operation calling {target}: calling a \
