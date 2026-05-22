@@ -2478,8 +2478,8 @@ fn init_select(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "select.select requires host_env on a Unix platform",
+                Err(crate::PyError::not_implemented(
+                    "select.select requires host_env feature on a Unix platform",
                 ))
             }
         }),
