@@ -3646,13 +3646,37 @@ fn register_struct_field_attrs(
 /// named fields, which the producer skips — so an empty map
 /// indicates a producer bug, not a normal state.
 ///
+/// Lookup order:
+///
+/// 1. Literal `struct_name` match against the registered keys.
+/// 2. **Bare-leaf fallback** — if `struct_name` carries a `::`
+///    separator and the literal lookup missed, retry against the
+///    segment after the final `::`.  `register_rust_module` walks
+///    each file independently and stores field stubs under the bare
+///    `ItemStruct.ident` (no module prefix is threaded into the
+///    walker), so callers that derived their key from a
+///    module-qualified `owner_root` (e.g. trait-impl methods whose
+///    `parse.rs::collect_trait_impls_from_items` qualifies the self
+///    type through `qualify_type_name_with_imports`) would otherwise
+///    miss the registration.  The bare leaf is the canonical bridge
+///    until producer-side prefix threading lands.
+///
 /// Consumed by `crate::annotator::classdesc::ClassDesc::_init_classdef`
 /// after the static `FORCE_ATTRIBUTES_INTO_CLASSES` block.
 pub fn struct_field_attrs_snapshot(
     struct_name: &str,
 ) -> Option<indexmap::IndexMap<String, crate::model::ValueType>> {
     let table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
-    table.get(struct_name).cloned()
+    if let Some(hit) = table.get(struct_name) {
+        return Some(hit.clone());
+    }
+    if let Some(idx) = struct_name.rfind("::") {
+        let bare = &struct_name[idx + "::".len()..];
+        if let Some(hit) = table.get(bare) {
+            return Some(hit.clone());
+        }
+    }
+    None
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the
@@ -3962,6 +3986,44 @@ mod tests {
         assert!(snap.contains_key("b"));
         assert!(snap.contains_key("c"));
         assert!(!snap.contains_key("a"), "first walk's `a` must be evicted");
+    }
+
+    /// Bare-leaf fallback: a registered bare `Foo` must resolve a
+    /// lookup that carries a module-qualified `mod::Foo` key.
+    /// Producer registers under the bare `ItemStruct.ident`; the
+    /// trait-impl path in `parse.rs::collect_trait_impls_from_items`
+    /// derives the consumer's `owner_root` via
+    /// `qualify_type_name_with_imports`, which prepends the module
+    /// prefix.  The snapshot helper bridges by stripping to the leaf
+    /// after the final `::`.
+    #[test]
+    fn struct_field_attrs_snapshot_bare_leaf_fallback_for_qualified_key() {
+        let item: ItemStruct = syn::parse_str(
+            "struct PyreFieldStubBareLeafProbe { count: i64, name: String }",
+        )
+        .expect("fixture parses");
+        let _ = build_host_class_from_struct(&item);
+        // Sanity: bare lookup hits.
+        assert!(
+            struct_field_attrs_snapshot("PyreFieldStubBareLeafProbe").is_some(),
+            "bare-name lookup must hit the registered entry"
+        );
+        // Qualified lookup falls back to the bare leaf.
+        let snap = struct_field_attrs_snapshot("mymod::PyreFieldStubBareLeafProbe")
+            .expect("qualified lookup must fall back to the bare leaf");
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.get("count"), Some(&crate::model::ValueType::Int));
+        assert_eq!(snap.get("name"), Some(&crate::model::ValueType::Ref));
+        // Multi-segment qualified lookup also falls back.
+        let snap_nested =
+            struct_field_attrs_snapshot("outer::inner::PyreFieldStubBareLeafProbe")
+                .expect("multi-segment qualified lookup must fall back to the bare leaf");
+        assert_eq!(snap_nested.len(), 2);
+        // Unknown qualified key remains a miss.
+        assert!(
+            struct_field_attrs_snapshot("mymod::PyreFieldStubBareLeafProbeAbsent").is_none(),
+            "absent struct must not resolve via the fallback"
+        );
     }
 
     /// Tuple structs and unit structs have no named fields, so the
