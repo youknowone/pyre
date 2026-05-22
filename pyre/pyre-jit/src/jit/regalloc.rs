@@ -55,13 +55,13 @@ pub struct GraphAllocationResult {
 /// py:80), `_coloring` (`find_node_coloring`, py:115).  The union-find
 /// is the real `tool/algo/unionfind.py UnionFind` port (`()` info,
 /// matching upstream `info_factory=None`).
-struct FlowGraphRegAllocator {
+struct RegAllocator {
     _depgraph: DependencyGraph<super::flow::VariableId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
     _coloring: HashMap<super::flow::VariableId, u16>,
 }
 
-impl FlowGraphRegAllocator {
+impl RegAllocator {
     fn new() -> Self {
         Self {
             _depgraph: DependencyGraph::new(),
@@ -281,7 +281,7 @@ pub(super) fn perform_graph_register_allocation(
     graph: &FlowGraph,
     kind: Kind,
 ) -> GraphAllocationResult {
-    let mut allocator = FlowGraphRegAllocator::new();
+    let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, kind);
     allocator.coalesce_variables(graph, kind);
     allocator.find_node_coloring();
@@ -628,9 +628,10 @@ pub(super) fn allocate_registers(
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
     //   regallocs[kind] = perform_register_allocation(graph, kind)`.
-    // `[RegAllocator; 3]` indexed by `Kind::index()` per
+    // `[SSAReprRegAllocator; 3]` indexed by `Kind::index()` per
     // [[feedback-no-hashmap-ever]].
-    let mut allocators: [RegAllocator; 3] = std::array::from_fn(|_| RegAllocator::new());
+    let mut allocators: [SSAReprRegAllocator; 3] =
+        std::array::from_fn(|_| SSAReprRegAllocator::new());
     for &kind in &Kind::ALL {
         let mut external: Vec<u16> = Vec::new();
         if kind == Kind::Ref {
@@ -718,7 +719,11 @@ pub(super) fn allocate_registers(
 /// trace-side Python-local mirror) followed by the portal red args
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
-fn enforce_input_args(allocators: &mut [RegAllocator; 3], nlocals: usize, inputs: &ExternalInputs) {
+fn enforce_input_args(
+    allocators: &mut [SSAReprRegAllocator; 3],
+    nlocals: usize,
+    inputs: &ExternalInputs,
+) {
     let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
     // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
@@ -785,8 +790,8 @@ fn perform_register_allocation(
     kind: Kind,
     external_inputs: &[u16],
     cfg_coalesce_pairs: &[(u16, u16)],
-) -> RegAllocator {
-    let mut alloc = RegAllocator::new();
+) -> SSAReprRegAllocator {
+    let mut alloc = SSAReprRegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
     // `regalloc.py:79-96` CFG-level coalesce — every Link's
     // `link.args[i] ↔ link.target.inputargs[i]` pair, projected to
@@ -801,9 +806,25 @@ fn perform_register_allocation(
     alloc
 }
 
-/// `tool/algo/regalloc.py:18-143` `RegAllocator`.
+/// Pyre-only SSARepr-side allocator (NEW DEVIATION).
 ///
-/// RPython:
+/// PyPy has exactly one allocator at `rpython/tool/algo/regalloc.py:18`
+/// (`RegAllocator`), driven by a `FunctionGraph`.  Pyre's walker emits
+/// SSARepr inline rather than building a graph it later flattens, so
+/// this companion allocator works directly over the populated
+/// `SSARepr` via a backward live-set walk.  Method bodies still follow
+/// `RegAllocator`'s contract line-by-line (`make_dependencies`,
+/// `coalesce_variables`, `find_node_coloring`, `find_num_colors`,
+/// `getcolor`, `swapcolors`) so that — once the walker defers SSARepr
+/// emission to the canonical `flatten_graph` driver (Phase 4 endgame,
+/// task #9) — this whole struct retires and the sibling `RegAllocator`
+/// at the top of this module is the sole allocator, matching upstream
+/// exactly.
+///
+/// The `SSARepr` prefix marks this as the deviation pending retirement.
+///
+/// RPython equivalent (`rpython/tool/algo/regalloc.py:18-143
+/// RegAllocator`):
 /// ```python
 /// class RegAllocator(object):
 ///     def __init__(self, graph, consider_var, ListOfKind): ...
@@ -814,7 +835,7 @@ fn perform_register_allocation(
 ///     def getcolor(self, v): ...
 ///     def swapcolors(self, col1, col2): ...
 /// ```
-struct RegAllocator {
+struct SSAReprRegAllocator {
     depgraph: DependencyGraph<u16>,
     /// Union-find over register indices (RPython
     /// `tool.algo.unionfind.UnionFind.link_to_parent`). Created
@@ -825,7 +846,7 @@ struct RegAllocator {
     coloring: HashMap<u16, u16>,
 }
 
-impl RegAllocator {
+impl SSAReprRegAllocator {
     fn new() -> Self {
         Self {
             depgraph: DependencyGraph::new(),
@@ -1459,7 +1480,7 @@ mod tests {
 
     #[test]
     fn union_keeps_heavier_partition_as_representative() {
-        let mut alloc = RegAllocator::new();
+        let mut alloc = SSAReprRegAllocator::new();
 
         assert_eq!(alloc.union(10, 11), 10);
         assert_eq!(alloc.find_rep(10), 10);
@@ -1551,7 +1572,7 @@ mod tests {
 
     #[test]
     fn weighted_union_prefers_heavier_partition() {
-        let mut alloc = RegAllocator::new();
+        let mut alloc = SSAReprRegAllocator::new();
         assert_eq!(alloc.union(1, 2), 1);
         assert_eq!(alloc.union(3, 4), 3);
         assert_eq!(alloc.union(3, 5), 3);

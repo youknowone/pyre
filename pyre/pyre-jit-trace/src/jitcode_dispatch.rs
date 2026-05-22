@@ -7456,8 +7456,8 @@ mod tests {
         let instr = Instruction::LoadFastCheck {
             var_num: Arg::marker(),
         };
-        let jc = jitcode_for_instruction(&instr)
-            .expect("LoadFastCheck must resolve to an arm jitcode");
+        let jc =
+            jitcode_for_instruction(&instr).expect("LoadFastCheck must resolve to an arm jitcode");
         let code = jc.code.as_slice();
         eprintln!(
             "LoadFastCheck arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",

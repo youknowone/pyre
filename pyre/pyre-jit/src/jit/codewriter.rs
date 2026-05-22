@@ -841,26 +841,26 @@ fn fresh_variable_for_state(
     }
 }
 
-/// CFG-level Variable-pair collector for
-/// `RegAllocator.coalesce_variables` — port of
-/// `rpython/tool/algo/regalloc.py:79-96`.
+/// CFG-level Variable-pair collector for the SSARepr-side
+/// `SSAReprRegAllocator::coalesce_variables` consumer — port of
+/// `rpython/tool/algo/regalloc.py:79-96 RegAllocator.coalesce_variables`.
 ///
 /// Iterates `graph.iterblocks()` → `block.exits` → paired
 /// `(link.args[i], link.target.inputargs[i])` (matching upstream's
 /// `for i, v in enumerate(link.args): self._try_coalesce(v,
 /// link.target.inputargs[i])`).  Projects each Variable through
 /// `walker_slot_for_variable`, yielding `(source_slot, target_slot)`
-/// u16 pairs ready for `RegAllocator::try_coalesce`.
+/// u16 pairs ready for `SSAReprRegAllocator::try_coalesce`.
 ///
 /// Why Variable-keyed, not FrameState-keyed: RPython has no
 /// FrameState indirection — Variables carry their own UnionFind
 /// identity (`regalloc.py:98-101 isinstance(v, Variable)`).  pyre's
-/// regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
+/// SSARepr-side regalloc is u16-keyed (`regalloc.rs:1-30` PRE-EXISTING-
 /// ADAPTATION), so the helper projects Variables back onto walker
 /// SSA slots at the point of collection.  It must not fall back to
 /// graph-regalloc colors: those are post-coalescing color IDs, not
 /// pre-regalloc SSA slots, and feeding them back into
-/// `RegAllocator::try_coalesce` would mix two different domains.
+/// `SSAReprRegAllocator::try_coalesce` would mix two different domains.
 ///
 /// Filter: only Ref-kind pairs are emitted, matching the per-kind
 /// gate inside `allocate_registers` (`regalloc.rs:670-677`).  Every
@@ -2128,7 +2128,7 @@ fn duplicate_shadow_tos(
 /// SSARepr emission has not yet been replaced with a `flatten_graph` pass
 /// (Task #214).  Until it is, each opcode handler must populate both
 /// streams — the SSARepr byte stream that backend/blackhole consume, and
-/// the graph that `FlowGraphRegAllocator` consumes.
+/// the graph that `RegAllocator` consumes.
 ///
 /// Delete this helper once Task #214 lands and the SSARepr stream is
 /// generated from the graph by `flatten_graph`.
@@ -9134,10 +9134,11 @@ impl CodeWriter {
         // `regalloc.py:79-96 coalesce_variables` CFG-level loop:
         // every Link's `(link.args[i], link.target.inputargs[i])`
         // pair is unioned via try_coalesce, alongside the SSARepr
-        // `*_copy` scanner inside `RegAllocator::coalesce_variables`
-        // (intra-block coalesce, pyre walker NEW-DEVIATION because
-        // upstream defers `*_copy` to `flatten.py:306-334`).  Both
-        // sources feed the same union-find + depgraph.
+        // `*_copy` scanner inside
+        // `SSAReprRegAllocator::coalesce_variables` (intra-block
+        // coalesce, pyre walker NEW-DEVIATION because upstream defers
+        // `*_copy` to `flatten.py:306-334`).  Both sources feed the
+        // same union-find + depgraph.
         let cfg_coalesce_pairs = collect_cfg_coalesce_pairs(&graph, &walker_slot_for_variable);
         let alloc_result = super::regalloc::allocate_registers(
             &ssarepr,
