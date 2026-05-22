@@ -1161,7 +1161,48 @@ impl Insn {
 /// Expand this helper as more ops move from `codewriter.rs` into the
 /// flow-graph + flatten pipeline.
 pub struct GraphFlattener<'a> {
+    // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
+
+    /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
+    ///
+    /// `enforce_input_args` reads `self.graph.startblock.inputargs`
+    /// (`flatten.py:89`) and `generate_ssa_form` recurses from
+    /// `self.graph.startblock` (`flatten.py:104`).
+    graph: &'a super::flow::FunctionGraph,
+    /// `rpython/jit/codewriter/flatten.py:78 self.regallocs = regallocs`.
+    ///
+    /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
+    /// matching upstream's `self.regallocs[kind].getcolor(v)`.
+    ///
+    /// Stored as `&mut` so `enforce_input_args` (`flatten.py:88-100`)
+    /// can `swapcolors` in place, matching upstream's
+    /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
+    /// reborrow immutably via `&*self.regallocs`.
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
+    ///
+    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
+    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
+    /// can read `self.cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
+    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
+    /// as a borrow; production callers thread `CodeWriter::cpu()`
+    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
+    /// the overflow path leave it `None`, matching upstream's
+    /// `cpu=None` default at `flatten.py:64`.
+    cpu: Option<&'a super::cpu::Cpu>,
+    /// `rpython/jit/codewriter/flatten.py:80
+    /// self._include_all_exc_links = _include_all_exc_links`.
+    include_all_exc_links: bool,
+    /// `rpython/jit/codewriter/flatten.py:86 self.ssarepr = SSARepr(name)`.
+    ///
+    /// Upstream owns the SSARepr; pyre's caller owns it and passes a
+    /// borrow so the `serialize_op` test fixture sites can reuse an
+    /// existing SSARepr (the upstream entry returns a fresh SSARepr).
     ssarepr: &'a mut SSARepr,
+
+    // ─── pyre-only fields (no PyPy counterpart) ───
+
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
@@ -1181,19 +1222,6 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
-    include_all_exc_links: bool,
-    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
-    ///
-    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
-    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
-    /// can read `self.cpu.rtyper.exceptiondata.
-    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
-    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
-    /// as a borrow; production callers thread `CodeWriter::cpu()`
-    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
-    /// the overflow path leave it `None`, matching upstream's
-    /// `cpu=None` default at `flatten.py:64`.
-    cpu: Option<&'a super::cpu::Cpu>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1206,22 +1234,6 @@ pub struct GraphFlattener<'a> {
     /// Production callers populate it via `cpu.lowering_ctx`
     /// (`codewriter.rs::transform_graph_to_jitcode`).
     lowering_ctx: Option<LoweringContext>,
-    /// `rpython/jit/codewriter/flatten.py:76 self.regallocs = regallocs`.
-    ///
-    /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
-    /// matching upstream's `self.regallocs[kind].getcolor(v)`.
-    ///
-    /// Stored as `&mut` so `enforce_input_args` (`flatten.py:88-100`)
-    /// can `swapcolors` in place, matching upstream's
-    /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
-    /// reborrow immutably via `&*self.regallocs`.
-    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
-    /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
-    ///
-    /// `enforce_input_args` reads `self.graph.startblock.inputargs`
-    /// (`flatten.py:89`) and `generate_ssa_form` recurses from
-    /// `self.graph.startblock` (`flatten.py:104`).
-    graph: &'a super::flow::FunctionGraph,
 }
 
 impl<'a> GraphFlattener<'a> {
@@ -1240,16 +1252,18 @@ impl<'a> GraphFlattener<'a> {
         graph: &'a super::flow::FunctionGraph,
     ) -> Self {
         Self {
+            // PyPy-mirror fields (`flatten.py:77-86 __init__` order).
+            graph,
+            regallocs,
+            cpu: None,
+            include_all_exc_links: false,
             ssarepr,
+            // pyre-only fields.
             seen_blocks: Vec::new(),
             block_names: Vec::new(),
             link_names: Vec::new(),
             next_label_id: 0,
-            include_all_exc_links: false,
-            cpu: None,
             lowering_ctx: None,
-            regallocs,
-            graph,
         }
     }
 
