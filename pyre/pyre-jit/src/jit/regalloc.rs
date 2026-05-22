@@ -95,28 +95,37 @@ impl GraphAllocationResult {
     }
 }
 
-/// Field names follow `rpython/tool/algo/regalloc.py` — `_depgraph`
-/// (`make_dependencies`, py:77), `_unionfind` (`coalesce_variables`,
-/// py:80), `_coloring` (`find_node_coloring`, py:115).  The union-find
-/// is the real `tool/algo/unionfind.py UnionFind` port (`()` info,
-/// matching upstream `info_factory=None`).
-struct RegAllocator {
+/// Field names follow `rpython/tool/algo/regalloc.py:21-24` —
+/// `self.graph = graph` (py:22), `self.consider_var = consider_var`
+/// (py:23 — pyre uses a `kind: Kind` filter because `Kind` is a closed
+/// enum), `_depgraph` (`make_dependencies`, py:77), `_unionfind`
+/// (`coalesce_variables`, py:80), `_coloring` (`find_node_coloring`,
+/// py:115).  `self.ListOfKind` is omitted because pyre has exactly one
+/// such type (`FlowListOfKind`).  The union-find is the real
+/// `tool/algo/unionfind.py UnionFind` port (`()` info, matching
+/// upstream `info_factory=None`).
+struct RegAllocator<'a> {
+    graph: &'a FlowGraph,
+    kind: Kind,
     _depgraph: DependencyGraph<super::flow::VariableId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
     _coloring: HashMap<super::flow::VariableId, u16>,
 }
 
-impl RegAllocator {
-    fn new() -> Self {
+impl<'a> RegAllocator<'a> {
+    fn new(graph: &'a FlowGraph, kind: Kind) -> Self {
         Self {
+            graph,
+            kind,
             _depgraph: DependencyGraph::new(),
             _unionfind: UnionFind::new(|_| ()),
             _coloring: HashMap::new(),
         }
     }
 
-    fn make_dependencies(&mut self, graph: &FlowGraph, kind: Kind) {
-        for block in graph.iterblocks() {
+    fn make_dependencies(&mut self) {
+        let kind = self.kind;
+        for block in self.graph.iterblocks() {
             let block_borrow = block.borrow();
             let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::new();
             for arg in &block_borrow.inputargs {
@@ -208,8 +217,9 @@ impl RegAllocator {
         }
     }
 
-    fn coalesce_variables(&mut self, graph: &FlowGraph, kind: Kind) {
-        let mut pendingblocks = graph.iterblocks();
+    fn coalesce_variables(&mut self) {
+        let kind = self.kind;
+        let mut pendingblocks = self.graph.iterblocks();
         while let Some(block) = pendingblocks.pop() {
             // Match `rpython/tool/algo/regalloc.py:82-86`: walk from the
             // end of the graph first because resume/blackhole execution
@@ -240,14 +250,14 @@ impl RegAllocator {
                     let Some(dst) = target_input.as_variable() else {
                         continue;
                     };
-                    self.try_coalesce(src, dst, kind);
+                    self.try_coalesce(src, dst);
                 }
             }
         }
     }
 
-    fn try_coalesce(&mut self, v: Variable, w: Variable, kind: Kind) {
-        if v.kind != Some(kind) || w.kind != Some(kind) {
+    fn try_coalesce(&mut self, v: Variable, w: Variable) {
+        if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
         }
         let v0 = self._unionfind.find_rep(v.id);
@@ -323,9 +333,14 @@ impl RegAllocator {
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
 pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> GraphAllocationResult {
-    let mut allocator = RegAllocator::new();
-    allocator.make_dependencies(graph, kind);
-    allocator.coalesce_variables(graph, kind);
+    // `rpython/tool/algo/regalloc.py:11-15`:
+    //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
+    //     regalloc.make_dependencies()
+    //     regalloc.coalesce_variables()
+    //     regalloc.find_node_coloring()
+    let mut allocator = RegAllocator::new(graph, kind);
+    allocator.make_dependencies();
+    allocator.coalesce_variables();
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::new();
