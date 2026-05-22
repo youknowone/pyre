@@ -1974,6 +1974,7 @@ impl HostEnv {
         // walker when it lands.
         let std_ptr = HostObject::new_module("std.ptr");
         std_ptr.module_set("null_mut", HostObject::new_builtin_callable("std.ptr.null_mut"));
+        std_ptr.module_set("eq", HostObject::new_builtin_callable("std.ptr.eq"));
         std_ptr.module_set(
             "copy_nonoverlapping",
             HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
@@ -1982,6 +1983,16 @@ impl HostEnv {
         std_mem.module_set("align_of", HostObject::new_builtin_callable("std.mem.align_of"));
         let std_alloc = HostObject::new_module("std.alloc");
         std_alloc.module_set("dealloc", HostObject::new_builtin_callable("std.alloc.dealloc"));
+
+        // `BigInt::from(v)` callsites in `pyre-object` (longobject /
+        // tupleobject etc.) emit `["BigInt", "from"]` as the canonical
+        // call target.  Surface this as a module-shaped entry so
+        // Branch 3b in `flowspace_adapter::translate_op` resolves the
+        // 2-segment callsite verbatim; the analyzer doesn't model
+        // arbitrary-precision arithmetic, but the registry surface is
+        // enough to retire the Skip path.
+        let bigint = HostObject::new_module("BigInt");
+        bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
@@ -1997,6 +2008,7 @@ impl HostEnv {
         mods.insert("std.ptr".into(), std_ptr);
         mods.insert("std.mem".into(), std_mem);
         mods.insert("std.alloc".into(), std_alloc);
+        mods.insert("BigInt".into(), bigint);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
