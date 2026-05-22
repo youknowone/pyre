@@ -1239,17 +1239,18 @@ pub struct GraphFlattener<'a> {
 impl<'a> GraphFlattener<'a> {
     /// `rpython/jit/codewriter/flatten.py:73-86 GraphFlattener.__init__`.
     ///
-    /// Upstream takes `(graph, regallocs, _include_all_exc_links, cpu)`.
-    /// Pyre takes `(ssarepr, regallocs, graph)` here and exposes
-    /// `_include_all_exc_links` / `cpu` / `lowering_ctx` via builder
-    /// methods to keep the common no-options construction concise.
-    /// `ssarepr` precedes `regallocs` because pyre's caller owns the
-    /// SSARepr (upstream constructs it inline at
-    /// `flatten.py:82-86 self.ssarepr = SSARepr(name)`).
+    /// Upstream takes `(graph, regallocs, _include_all_exc_links=False,
+    /// cpu=None)`.  Pyre matches the first two positional arguments
+    /// `(graph, regallocs)` and trails them with `ssarepr` (the pyre-
+    /// specific borrow — upstream constructs the SSARepr inline at
+    /// `flatten.py:82-86 self.ssarepr = SSARepr(name)`).  The two
+    /// keyword arguments `_include_all_exc_links` / `cpu` (and pyre's
+    /// `lowering_ctx` extension) are exposed via builder methods to
+    /// keep the common no-options construction concise.
     pub fn new(
-        ssarepr: &'a mut SSARepr,
-        regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
         graph: &'a super::flow::FunctionGraph,
+        regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+        ssarepr: &'a mut SSARepr,
     ) -> Self {
         Self {
             // PyPy-mirror fields (`flatten.py:77-86 __init__` order).
@@ -2555,7 +2556,7 @@ pub fn identity_test_regallocs(
 /// coloring is a fixed-point for id-ordered inputargs.
 pub fn flatten_graph_for_test(graph: &super::flow::FunctionGraph, ssarepr: &mut SSARepr) {
     let mut regallocs = identity_test_regallocs(graph);
-    let mut flattener = GraphFlattener::new(ssarepr, &mut regallocs, graph);
+    let mut flattener = GraphFlattener::new(graph, &mut regallocs, ssarepr);
     flattener.generate_ssa_form();
 }
 
@@ -2571,7 +2572,7 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
 ) {
     let mut regallocs = identity_test_regallocs(graph);
     let mut flattener =
-        GraphFlattener::new(ssarepr, &mut regallocs, graph).with_lowering_ctx(lowering_ctx);
+        GraphFlattener::new(graph, &mut regallocs, ssarepr).with_lowering_ctx(lowering_ctx);
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
@@ -2615,7 +2616,7 @@ pub fn flatten_graph<'a>(
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
-    let mut flattener = GraphFlattener::new(&mut ssarepr, regallocs, graph);
+    let mut flattener = GraphFlattener::new(graph, regallocs, &mut ssarepr);
     if let Some(ctx) = lowering_ctx {
         flattener = flattener.with_lowering_ctx(ctx);
     }
@@ -4405,7 +4406,7 @@ mod tests {
         let mut ssarepr = SSARepr::new("test");
         let mut empty_regallocs = empty_regallocs();
         let graph = stub_graph();
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut empty_regallocs, &graph);
+        let mut flattener = GraphFlattener::new(&graph, &mut empty_regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 
@@ -4472,7 +4473,7 @@ mod tests {
             },
         ];
         let graph = stub_graph();
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut regallocs, &graph);
+        let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 
@@ -5035,7 +5036,7 @@ mod tests {
             },
         ];
         let graph = stub_graph();
-        let mut flattener = GraphFlattener::new(&mut ssarepr, &mut regallocs, &graph);
+        let mut flattener = GraphFlattener::new(&graph, &mut regallocs, &mut ssarepr);
 
         flattener.serialize_op(&op);
 

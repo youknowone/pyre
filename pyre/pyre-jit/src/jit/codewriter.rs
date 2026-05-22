@@ -5913,7 +5913,7 @@ impl CodeWriter {
                                     num_colors: 0,
                                 },
                             ];
-                            GraphFlattener::new(&mut ssarepr, &mut portal_regallocs, &graph)
+                            GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
                             for insn in ssarepr.insns[pre_len..].iter().cloned() {
                                 current_block.push_insn(insn);
