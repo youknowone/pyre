@@ -7494,7 +7494,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
-            | Instruction::PopTop
     )
 }
 
@@ -7526,6 +7525,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
 /// `dis.stack_effect` parity).  Walker-handled opcodes must remain a
 /// closed set listed here AND in `production_walker_handles`.
 fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
+    let _ = state;
     match instruction {
         Instruction::Nop
         | Instruction::ExtendedArg
@@ -7534,99 +7534,12 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::NotTaken => {
             // delta = 0, no shadow mutation.
         }
-        Instruction::PopTop => apply_walker_pop_top(state),
         other => panic!(
             "apply_walker_stack_effect: missing handler for {:?}; every entry \
              in production_walker_handles must list its symbolic effect here",
             other,
         ),
     }
-}
-
-/// PopTop: `pyframe.popvalue_maybe_none()` parity.  Decrement
-/// `sym.valuestackdepth` by 1 and mirror the trait dispatch's
-/// `pop_value` (trace_opcode.rs:1844..1927) shadow updates:
-///
-/// * Clear `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` to
-///   the const-NULL OpRef so subsequent snapshot reads do not pick up
-///   a stale OpRef above the new stack depth (matches the
-///   `setarrayitem_vable_r(NULL)` IR op the walker just emitted).
-/// * Update `sym.vable_valuestackdepth = const_int(new_vsd)` and mirror
-///   the new vsd into the boxes shadow (matches
-///   `setfield_vable_i(vsd_descr, depth-1)` parity).
-///
-/// The shadow updates are gated on `owns_virtualizable_shadow()` /
-/// `is_active_vable_owner` to match the trait dispatch's gate
-/// conditions exactly (`push_typed_value:1802` and `pop_value:1901,
-/// 1917`).
-fn apply_walker_pop_top(state: &mut MIFrame) {
-    // Mirror the trait dispatch's `MIFrame::pop_value`
-    // (`trace_opcode.rs:1845..1928`) **symbolic** bookkeeping.  The
-    // walker arm body for PopTop has already emitted the IR ops
-    // (`setarrayitem_vable_r(slot, NULL)` + `int_sub_ovf` +
-    // `setfield_vable_i(vsd_descr, depth-1)`) that mutate
-    // `PyFrame.locals_cells_stack_w` and `PyFrame.valuestackdepth` at
-    // runtime, and their `vable_setfield` routing has updated
-    // `virtualizable_boxes` at the matching flat indices — but with the
-    // walker's IR-level OpRefs (e.g. the `int_sub_ovf` result) rather
-    // than the const_int trait dispatch uses for `sym.vable_valuestackdepth`.
-    //
-    // Subsequent opcodes' tracers (`fused_compare`, `peek_value`,
-    // `push_typed_value`) consult `sym.valuestackdepth` and
-    // `sym.vable_valuestackdepth` symbolically; without aligning these
-    // here, the counter / shadow drift produces `stack underflow in
-    // fused compare` at the next `CompareOp` (see
-    // `project_issue73_phase4_poptop_blocker.md`).
-    let (owns_vable, new_vsd) = state.with_ctx(|this, ctx| {
-        let (stack_idx, semantic_idx) = {
-            let s = this.sym();
-            if s.valuestackdepth <= s.nlocals {
-                // Walker arm body emitted IR for a stack pop, but the sym
-                // counter is already at floor — leave the counter alone
-                // and skip the shadow update (mirrors the
-                // `checked_sub(nlocals+1)` floor check in `pop_value`).
-                return (false, s.valuestackdepth);
-            }
-            let stack_idx = s.valuestackdepth - s.nlocals - 1;
-            (stack_idx, s.nlocals + stack_idx)
-        };
-        let (is_active, owns_vable, new_vsd) = {
-            let s = this.sym_mut();
-            s.valuestackdepth -= 1;
-            (
-                s.is_active_vable_owner,
-                s.owns_virtualizable_shadow(),
-                s.valuestackdepth,
-            )
-        };
-        let _ = stack_idx;
-        // pyframe.py:411-417 `popvalue_maybe_none`: clear the popped
-        // slot in `locals_cells_stack_w` to NULL.  Trait dispatch's
-        // `pop_value` does this via `set_virtualizable_entry_at(NULL)`
-        // (`trace_opcode.rs:1901-1906`); the walker arm body already
-        // emits the IR `setarrayitem_vable_r(slot, NULL)` that runs at
-        // runtime + writes the shadow box, but the slot's OpRef-side
-        // sym must be cleared too so `read_stack_slot` for a future
-        // semantic_idx does not pick up the popped slot's pre-pop OpRef.
-        if is_active {
-            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
-            let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
-            let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
-            ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
-        }
-        if owns_vable {
-            let vsd_op = ctx.const_int(new_vsd as i64);
-            this.sym_mut().vable_valuestackdepth = vsd_op;
-            mirror_vable_static_to_boxes(
-                ctx,
-                "valuestackdepth",
-                vsd_op,
-                Value::Int(new_vsd as i64),
-            );
-        }
-        (owns_vable, new_vsd)
-    });
-    let _ = (owns_vable, new_vsd);
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
