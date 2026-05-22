@@ -55,7 +55,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::flowspace::argument::Signature;
-use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
+use crate::flowspace::model::{
+    Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
+};
 use crate::flowspace::pygraph::PyGraph;
 #[cfg(test)]
 use crate::front;
@@ -962,6 +964,103 @@ pub(crate) fn lift_callee_to_pygraph(
         access_directly: Cell::new(false),
     });
     Ok(pygraph)
+}
+
+/// Z2.5 Path C slice 2 — synthesize a minimal flowed `PyGraph` for a
+/// callee whose real body cannot be lowered through the adapter
+/// (`unsafe fn` in `pyre-object` / `pyre-interpreter`).  The stub has
+/// a single Link from `startblock` to `returnblock` carrying a
+/// `Constant(default_for_<return_lltype>)` so the annotator's
+/// `flowin` projects the callsite result to the declared return type
+/// without touching the (non-modellable) body.
+///
+/// `name` becomes the synthetic graph's `FunctionGraph.name`.
+/// `signature.argnames` are turned into named `Variable`s on the
+/// startblock; `return_lltype` is projected to a default-value
+/// `ConstValue` by [`default_constvalue_for_lltype`] and carried on
+/// the Link to the returnblock.  Returns `None` when the return type
+/// has no representable default (`Func` / `Struct` / `Array` /
+/// `Opaque` / `ForwardReference` / `FixedSizeArray` / `InteriorPtr`)
+/// — the caller skips registration for that fn and the original
+/// "not registered in PyreCallRegistry" Skip path covers it.
+///
+/// Mirrors how `description.py:193-203` test fixtures build a
+/// `FunctionDesc` with a minimal `PyGraph` body — the upstream
+/// equivalent is `Translator._prebuilt_graphs[entry_point] = pygraph`
+/// where `pygraph` is hand-constructed without going through
+/// `build_flow`.  Pure constructor — no annotator / rtyper side
+/// effects.
+pub(crate) fn build_stub_pygraph_for_unsafe_fn(
+    name: String,
+    signature: Signature,
+    return_lltype: LowLevelType,
+) -> Option<Rc<PyGraph>> {
+    let return_const_value = default_constvalue_for_lltype(&return_lltype)?;
+    let inputargs: Vec<Hlvalue> = signature
+        .argnames
+        .iter()
+        .map(|n| Hlvalue::Variable(Variable::named(n)))
+        .collect();
+    let startblock = Block::shared(inputargs);
+    let func = GraphFunc::new(name.clone(), Constant::new(ConstValue::Dict(HashMap::new())));
+    let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
+    graph_inner.func = Some(func.clone());
+    let return_constant = Hlvalue::Constant(Constant::with_concretetype(
+        return_const_value,
+        return_lltype,
+    ));
+    let link = Rc::new(RefCell::new(Link::new(
+        vec![return_constant],
+        Some(graph_inner.returnblock.clone()),
+        None,
+    )));
+    startblock.closeblock(vec![link]);
+    Some(Rc::new(PyGraph {
+        graph: Rc::new(RefCell::new(graph_inner)),
+        func,
+        signature: RefCell::new(signature),
+        defaults: RefCell::new(Some(Vec::new())),
+        access_directly: Cell::new(false),
+    }))
+}
+
+/// Project a `LowLevelType` to a default `ConstValue` suitable for the
+/// stub-graph return Constant ([`build_stub_pygraph_for_unsafe_fn`]).
+/// Mirrors the per-lltype "zero / null" choice the C backend would
+/// emit for an uninitialised local of that type:
+///
+/// - integer family (Signed / Unsigned / longlong / longlonglong /
+///   Char / UniChar / Bool / Address) → `ConstValue::Int(0)`
+///   (Address represents `NULL` per `llmemory.py:650`; the boolean
+///   `false` projection matches upstream's "Bool is integer-encoded
+///   at the backend" model)
+/// - float family (Float / SingleFloat / LongFloat) →
+///   `ConstValue::float(0.0)`
+/// - `Void` → `ConstValue::None` (sentinel matching
+///   `RPython rtype_void_constant` semantics — Void carries no value
+///   at runtime but `Constant.value` needs a placeholder)
+/// - `Ptr(_)` → `ConstValue::None` (the flowspace placeholder for a
+///   null pointer; the rtyper later widens this via
+///   `rptr.py::rtype_pointer_arg`)
+///
+/// Returns `None` for compound types (`Func` / `Struct` / `Array` /
+/// `Opaque` / `ForwardReference` / `FixedSizeArray` / `InteriorPtr`) —
+/// these would need full layout-aware constant construction, which
+/// is outside slice 2's scope.  Slice 3's caller treats `None` as
+/// "skip this fn"; the unported path then surfaces the original
+/// "not registered" Skip.
+pub(crate) fn default_constvalue_for_lltype(lltype: &LowLevelType) -> Option<ConstValue> {
+    use LowLevelType::*;
+    match lltype {
+        Void => Some(ConstValue::None),
+        Signed | Unsigned | SignedLongLong | SignedLongLongLong | UnsignedLongLong
+        | UnsignedLongLongLong | Char | UniChar | Address => Some(ConstValue::Int(0)),
+        Bool => Some(ConstValue::Bool(false)),
+        Float | SingleFloat | LongFloat => Some(ConstValue::float(0.0)),
+        Ptr(_) => Some(ConstValue::None),
+        Func(_) | Struct(_) | Array(_) | FixedSizeArray(_) | Opaque(_) | ForwardReference(_)
+        | InteriorPtr(_) => None,
+    }
 }
 
 /// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
@@ -2926,4 +3025,91 @@ fn cross_block(x: i64, cond: bool) -> i64 {
     // annotator.  Per-session annotator construction inside
     // `specialize_legacy_graph_with_registry_returning_value_to_var`
     // is the only remaining production lifecycle.
+
+    // ─── Z2.5 Path C slice 2 helpers ───
+    #[test]
+    fn default_constvalue_for_lltype_integer_family_yields_int_zero() {
+        for ll in [
+            LowLevelType::Signed,
+            LowLevelType::Unsigned,
+            LowLevelType::SignedLongLong,
+            LowLevelType::UnsignedLongLong,
+            LowLevelType::Char,
+            LowLevelType::UniChar,
+            LowLevelType::Address,
+        ] {
+            assert!(
+                matches!(default_constvalue_for_lltype(&ll), Some(ConstValue::Int(0))),
+                "{ll:?} must project to ConstValue::Int(0)"
+            );
+        }
+    }
+
+    #[test]
+    fn default_constvalue_for_lltype_bool_yields_bool_false() {
+        assert!(matches!(
+            default_constvalue_for_lltype(&LowLevelType::Bool),
+            Some(ConstValue::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn default_constvalue_for_lltype_void_yields_none() {
+        assert!(matches!(
+            default_constvalue_for_lltype(&LowLevelType::Void),
+            Some(ConstValue::None)
+        ));
+    }
+
+    #[test]
+    fn default_constvalue_for_lltype_float_family_yields_float_zero() {
+        for ll in [
+            LowLevelType::Float,
+            LowLevelType::SingleFloat,
+            LowLevelType::LongFloat,
+        ] {
+            let cv = default_constvalue_for_lltype(&ll).expect("float lltype must project");
+            assert!(matches!(cv, ConstValue::Float(_)), "{ll:?}: {cv:?}");
+        }
+    }
+
+    #[test]
+    fn build_stub_pygraph_carries_signature_and_links_to_returnblock() {
+        let sig = Signature::new(vec!["obj".to_string()], None, None);
+        let pygraph = build_stub_pygraph_for_unsafe_fn(
+            "is_none".to_string(),
+            sig.clone(),
+            LowLevelType::Bool,
+        )
+        .expect("Bool return must produce a stub pygraph");
+        assert_eq!(*pygraph.signature.borrow(), sig);
+        let graph = pygraph.graph.borrow();
+        assert_eq!(graph.name, "is_none");
+        let start = graph.startblock.borrow();
+        assert_eq!(start.inputargs.len(), 1, "argname must map to a single inputarg");
+        assert_eq!(start.exits.len(), 1, "stub must Link directly to returnblock");
+        let link = start.exits[0].borrow();
+        assert_eq!(link.args.len(), 1, "stub Link carries exactly the return constant");
+        // The link's target must be the graph's returnblock.
+        let link_target = link.target.as_ref().expect("Link must target a block");
+        assert!(
+            std::rc::Rc::ptr_eq(link_target, &graph.returnblock),
+            "stub Link must target the graph's returnblock"
+        );
+    }
+
+    #[test]
+    fn build_stub_pygraph_returns_none_for_compound_lltype() {
+        // Compound lltypes have no representable default; the helper
+        // must return `None` so slice 3's caller skips registration.
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let func_ll = LowLevelType::Func(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+        ));
+        let result = build_stub_pygraph_for_unsafe_fn("synth".to_string(), sig, func_ll);
+        assert!(result.is_none(), "Func lltype must surface as None");
+    }
 }
