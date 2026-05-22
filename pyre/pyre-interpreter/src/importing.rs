@@ -1129,29 +1129,11 @@ fn init_locale(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Ok(pyre_object::w_int_new(0))
+                    // Sandbox semantics: no host_env → no locale collation.
+                    Err(crate::PyError::not_implemented(
+                        "_locale.strcoll requires host_env feature",
+                    ))
                 }
-            },
-            2,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "strcoll",
-        crate::make_builtin_function_with_arity(
-            "strcoll",
-            |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_int_new(0));
-                }
-                unsafe {
-                    if pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) {
-                        let a = pyre_object::w_str_get_value(args[0]);
-                        let b = pyre_object::w_str_get_value(args[1]);
-                        return Ok(pyre_object::w_int_new(a.cmp(b) as i64));
-                    }
-                }
-                Ok(pyre_object::w_int_new(0))
             },
             2,
         ),

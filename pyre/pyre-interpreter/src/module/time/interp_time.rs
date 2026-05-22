@@ -78,8 +78,12 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let dur = std::time::Duration::from_secs_f64(secs);
     #[cfg(all(unix, feature = "host_env"))]
     {
-        let _ = host_time::nanosleep(dur);
-        return Ok(w_none());
+        return host_time::nanosleep(dur).map(|_| w_none()).map_err(|e| {
+            crate::PyError::os_error_with_errno(
+                e.raw_os_error().unwrap_or(0),
+                format!("sleep: {e}"),
+            )
+        });
     }
     #[cfg(not(all(unix, feature = "host_env")))]
     {
