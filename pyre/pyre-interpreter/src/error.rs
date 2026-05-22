@@ -927,13 +927,18 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
         return None;
     }
     #[cfg(feature = "host_env")]
-    let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
+    {
+        let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
+        content
+            .lines()
+            .nth((lineno - 1) as usize)
+            .map(|s| s.to_string())
+    }
     #[cfg(not(feature = "host_env"))]
-    let content = std::fs::read_to_string(filename).ok()?;
-    content
-        .lines()
-        .nth((lineno - 1) as usize)
-        .map(|s| s.to_string())
+    {
+        let _ = (filename, lineno);
+        None
+    }
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {
