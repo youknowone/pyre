@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type Mode = libc::mode_t;
+// vfs.py mirrors stat-module bitmasks that are POSIX-standard regardless of
+// host OS, so the constants are hard-coded here rather than pulled from
+// libc (which omits these symbols on Windows targets).
+pub type Mode = u32;
 pub type FsNode = Rc<dyn FSObject>;
 pub type VfsResult<T> = Result<T, VfsError>;
 
@@ -23,19 +26,19 @@ pub const CTIME: i64 = 0;
 // vfs.py:7
 static INO_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const S_IFDIR: Mode = libc::S_IFDIR as Mode;
-const S_IFREG: Mode = libc::S_IFREG as Mode;
-const S_IFMT: Mode = libc::S_IFMT as Mode;
-const S_IWUSR: Mode = libc::S_IWUSR as Mode;
-const S_IRUSR: Mode = libc::S_IRUSR as Mode;
-const S_IRGRP: Mode = libc::S_IRGRP as Mode;
-const S_IROTH: Mode = libc::S_IROTH as Mode;
-const S_IXUSR: Mode = libc::S_IXUSR as Mode;
-const S_IXGRP: Mode = libc::S_IXGRP as Mode;
-const S_IXOTH: Mode = libc::S_IXOTH as Mode;
-const S_IRWXO: Mode = libc::S_IRWXO as Mode;
-const S_IRWXU: Mode = libc::S_IRWXU as Mode;
-const S_IRWXG: Mode = libc::S_IRWXG as Mode;
+const S_IFDIR: Mode = 0o040000;
+const S_IFREG: Mode = 0o100000;
+const S_IFMT: Mode = 0o170000;
+const S_IWUSR: Mode = 0o000200;
+const S_IRUSR: Mode = 0o000400;
+const S_IRGRP: Mode = 0o000040;
+const S_IROTH: Mode = 0o000004;
+const S_IXUSR: Mode = 0o000100;
+const S_IXGRP: Mode = 0o000010;
+const S_IXOTH: Mode = 0o000001;
+const S_IRWXO: Mode = 0o000007;
+const S_IRWXU: Mode = 0o000700;
+const S_IRWXG: Mode = 0o000070;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatResult {
