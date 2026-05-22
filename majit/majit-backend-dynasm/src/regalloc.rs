@@ -2559,13 +2559,18 @@ impl<'a> RegAlloc<'a> {
         match kind {
             IntBinKind::Add => self.consider_int_add_j2(dst, lhs, rhs, i, output),
             IntBinKind::Sub => self.consider_int_sub_j2(dst, lhs, rhs, i, output),
-            IntBinKind::AddOvf
-            | IntBinKind::Mul
+            // x86 routes AddOvf/SubOvf to _consider_binop{,_symm} because
+            // LEA can't set flags; aarch64 routes to prepare_int_ri /
+            // prepare_op_int_sub because adds/subs accept #imm12. Each
+            // backend implements consider_int_{add,sub}_ovf_j2 with the
+            // arch-correct semantics.
+            IntBinKind::AddOvf => self.consider_int_add_ovf_j2(dst, lhs, rhs, i, output),
+            IntBinKind::SubOvf => self.consider_int_sub_ovf_j2(dst, lhs, rhs, i, output),
+            IntBinKind::Mul
             | IntBinKind::MulOvf
             | IntBinKind::And
             | IntBinKind::Or
             | IntBinKind::Xor => self.consider_binop_symm_j2(dst, lhs, rhs, i, output),
-            IntBinKind::SubOvf => self.consider_binop_j2(dst, lhs, rhs, i, output),
             IntBinKind::LShift | IntBinKind::RShift | IntBinKind::URShift => {
                 self.consider_int_lshift_j2(dst, lhs, rhs, i, output)
             }

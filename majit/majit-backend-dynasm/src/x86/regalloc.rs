@@ -282,6 +282,35 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc1, loc2], Some(loc1), output);
     }
 
+    /// x86/regalloc.py:589 `consider_int_add_ovf = _consider_binop_symm`.
+    /// Distinct from `consider_int_add` because the LEA shortcut does
+    /// not set CPU flags and cannot be used when the trace needs the
+    /// overflow condition.
+    pub(crate) fn consider_int_add_ovf_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// x86/regalloc.py:588 `consider_int_sub_ovf = _consider_binop`.
+    /// LEA cannot set flags, so SUB-via-LEA is unavailable for the
+    /// overflow form.
+    pub(crate) fn consider_int_sub_ovf_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
     /// x86/regalloc.py:612 `consider_int_neg` / `consider_int_invert`
     /// — `NEG dst` and `NOT dst` overwrite their argument register.
     pub(crate) fn consider_unary_int_j2(

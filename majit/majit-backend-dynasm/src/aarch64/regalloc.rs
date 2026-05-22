@@ -14,6 +14,20 @@ use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::{Loc, RegLoc};
 use majit_ir::{OpRef, Type};
 
+/// aarch64/regalloc.py:159 `DEFAULT_IMM_SIZE = 4096`.
+const DEFAULT_IMM_SIZE: i64 = 4096;
+
+/// aarch64/regalloc.py:169 `check_imm_box`. PyPy accepts only
+/// `ConstInt` values in the AArch64 immediate range; non-Int
+/// constants (ConstFloat/ConstPtr) and box references fall through
+/// to the register form.
+fn check_imm_box(arg: OpRef, val: i64) -> bool {
+    if !matches!(arg, OpRef::ConstInt(_)) {
+        return false;
+    }
+    val >= 0 && val < DEFAULT_IMM_SIZE
+}
+
 /// aarch64/registers.py:14
 ///   `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
 pub fn all_core_regs() -> Vec<RegLoc> {
@@ -100,6 +114,9 @@ pub const MALLOC_NURSERY_RESULT: RegLoc = RegLoc {
 impl<'a> RegAlloc<'a> {
     /// aarch64/regalloc.py:362 `prepare_op_int_mul`. 3-operand form:
     /// both operands in registers, result allocated separately.
+    /// PyPy passes the full `boxes = op.getarglist()` as
+    /// `forbidden_vars` for both `make_sure_var_in_reg` calls
+    /// (regalloc.py:366-367), not just the opposite operand.
     pub(crate) fn consider_binop_j2(
         &mut self,
         dst: OpRef,
@@ -108,8 +125,9 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
-        let rhs_loc = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
+        let boxes = [lhs, rhs];
+        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
+        let rhs_loc = self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false);
         self.possibly_free_var(lhs, Type::Int);
         self.possibly_free_var(rhs, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
@@ -146,10 +164,11 @@ impl<'a> RegAlloc<'a> {
         self.consider_int_ri_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:344 `prepare_op_int_sub`. `lhs` may be
-    /// constant only if it can be materialised into the scratch
-    /// register; the immediate path applies to `rhs` (encoded as
-    /// `sub Rd, Rn, #imm12`).
+    /// aarch64/regalloc.py:344 `prepare_op_int_sub`. `lhs` always
+    /// becomes Rn; `rhs` accepts the `sub Rd, Rn, #imm12` immediate
+    /// form only when it is a `ConstInt` in `[0, 4096)`
+    /// (`check_imm_box`). Other constants (ConstFloat/ConstPtr) and
+    /// out-of-range ints fall through to the register form.
     pub(crate) fn consider_int_sub_j2(
         &mut self,
         dst: OpRef,
@@ -158,17 +177,46 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        // sub is asymmetric: lhs always becomes Rn.
-        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
-        let rhs_loc = if rhs.is_constant() {
+        let boxes = [lhs, rhs];
+        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
+        let rhs_loc = if imm_rhs {
             self.loc(rhs, Type::Int)
         } else {
-            self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false)
+            self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false)
         };
         self.possibly_free_var(lhs, Type::Int);
         self.possibly_free_var(rhs, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
         self.perform(i, vec![lhs_loc, rhs_loc], Some(Loc::Reg(res)), output);
+    }
+
+    /// aarch64/regalloc.py:877 `prepare_comp_op_int_add_ovf =
+    /// prepare_int_ri`. The overflow form shares the immediate-friendly
+    /// preparation with `int_add` because `adds` accepts `#imm12`.
+    pub(crate) fn consider_int_add_ovf_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_int_ri_j2(dst, lhs, rhs, i, output);
+    }
+
+    /// aarch64/regalloc.py:358 `prepare_comp_op_int_sub_ovf =
+    /// prepare_op_int_sub`. Shares preparation with `int_sub` since
+    /// `subs Rd, Rn, #imm12` accepts an immediate `rhs`.
+    pub(crate) fn consider_int_sub_ovf_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_int_sub_j2(dst, lhs, rhs, i, output);
     }
 
     /// aarch64/regalloc.py:362 — shifts piggy-back on `prepare_op_int_mul`.
@@ -213,9 +261,11 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// Internal helper for add: try the `add Rd, Rn, #imm12` immediate
-    /// form when one operand is a constant that fits, otherwise the
-    /// register form.  `lhs`/`rhs` are commutative for add.
+    /// aarch64/regalloc.py:321 `prepare_int_ri`. Either operand may
+    /// take the `add Rd, Rn, #imm12` immediate form when it is a
+    /// `ConstInt` in `[0, 4096)` (`check_imm_box`). Non-Int constants
+    /// (ConstFloat/ConstPtr) and out-of-range ints fall through to
+    /// the register form.
     fn consider_int_ri_j2(
         &mut self,
         dst: OpRef,
@@ -224,20 +274,22 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let imm_lhs = lhs.is_constant();
-        let imm_rhs = rhs.is_constant();
-        let (l0, l1) = if imm_lhs && !imm_rhs {
-            // add Rd, Rn, #imm — swap so the immediate stays on the RHS
-            let r0 = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
-            let r1 = self.loc(lhs, Type::Int);
-            (r0, r1)
-        } else if !imm_lhs && imm_rhs {
-            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
+        let boxes = [lhs, rhs];
+        let imm_lhs = check_imm_box(lhs, self.const_value(lhs));
+        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let (l0, l1) = if !imm_lhs && imm_rhs {
+            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
             let r1 = self.loc(rhs, Type::Int);
             (r0, r1)
+        } else if imm_lhs && !imm_rhs {
+            // PyPy regalloc.py:329-331 swaps so the immediate stays on
+            // the Rn slot; aarch64 `add` is commutative.
+            let r1 = self.loc(lhs, Type::Int);
+            let r0 = self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false);
+            (r0, r1)
         } else {
-            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &[rhs], None, false);
-            let r1 = self.make_sure_var_in_reg(rhs, Type::Int, &[lhs], None, false);
+            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
+            let r1 = self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false);
             (r0, r1)
         };
         self.possibly_free_var(lhs, Type::Int);
