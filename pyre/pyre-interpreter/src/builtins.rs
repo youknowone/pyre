@@ -4519,10 +4519,16 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let reading = mode.contains('r') || !writing;
 
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
+        #[cfg(not(feature = "host_env"))]
+        {
+            let _ = (binary, &path);
+            return Err(crate::PyError::not_implemented(
+                "open() for reading requires host_env feature",
+            ));
+        }
         #[cfg(feature = "host_env")]
         let read_result = rustpython_host_env::fs::read(&path);
-        #[cfg(not(feature = "host_env"))]
-        let read_result = std::fs::read(&path);
+        #[cfg(feature = "host_env")]
         match read_result {
             Ok(bytes) => {
                 if binary {
