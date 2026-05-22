@@ -3372,18 +3372,15 @@ impl GuardCompilingScope {
         // cannot reach this code path with a non-fail descriptor (the
         // `handle_fail` caller is itself a method on `FailDescr`).
         // Pyre takes a `&Arc<dyn Descr>` to avoid an upfront downcast
-        // at the call site; assert here so a programmer error that
-        // routes a non-fail descr into the guard fires in debug
-        // builds instead of silently skipping `start_compiling` /
-        // `done_compiling`.
-        debug_assert!(
-            descr.as_fail_descr().is_some(),
-            "GuardCompilingScope built on a non-fail descr; PyPy can \
-             only reach handle_fail through a FailDescr instance",
-        );
-        if let Some(fd) = descr.as_fail_descr() {
-            fd.start_compiling();
-        }
+        // at the call site; PyPy raises `AttributeError` on a non-fail
+        // descr at the very first `start_compiling` lookup, so we
+        // panic in both debug and release builds via `expect` to match
+        // that fail-fast contract instead of silently skipping the
+        // start/done pair.
+        let fd = descr
+            .as_fail_descr()
+            .expect("GuardCompilingScope built on a non-fail descr; PyPy can only reach handle_fail through a FailDescr instance");
+        fd.start_compiling();
         Self {
             descr: std::sync::Arc::clone(descr),
         }
@@ -3392,9 +3389,15 @@ impl GuardCompilingScope {
 
 impl Drop for GuardCompilingScope {
     fn drop(&mut self) {
-        if let Some(fd) = self.descr.as_fail_descr() {
-            fd.done_compiling();
-        }
+        // The constructor's `expect` guarantees the underlying
+        // concrete type behind `dyn Descr` is a `FailDescr`; that
+        // type does not change for the lifetime of the Arc, so the
+        // downcast on the unwind path must also succeed.
+        let fd = self
+            .descr
+            .as_fail_descr()
+            .expect("GuardCompilingScope dropped with a descr that lost its FailDescr identity");
+        fd.done_compiling();
     }
 }
 

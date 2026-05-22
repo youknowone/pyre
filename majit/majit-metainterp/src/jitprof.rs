@@ -17,8 +17,8 @@
 //! `Mutex<TimingState>` so concurrent threads sharing the profiler via
 //! `Arc` serialize on the same lock the GIL gives PyPy.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use majit_backend::CpuTotalTracker;
@@ -228,14 +228,16 @@ impl JitProfiler {
     ///
     /// `kind` is a [`crate::pyjitpl::counters`] id. Unknown ids are a
     /// silent no-op (see field doc).  `TOTAL_COMPILED_*` /
-    /// `TOTAL_FREED_*` are debug-asserted out — PyPy
-    /// `Profiler.counters` is sized `Counters.ncounters = 22` and
-    /// `count(TOTAL_*)` would raise `IndexError`.  Pyre flags the
-    /// same misuse via `debug_assert!`, then silently no-ops in
-    /// release so a single stray caller cannot turn into a hard
-    /// crash in production.
+    /// `TOTAL_FREED_*` panic in both debug and release: PyPy
+    /// `Profiler.counters` is sized `Counters.ncounters = 22` so
+    /// `self.counters[TOTAL_*]` raises `IndexError`.  Pyre uses
+    /// `assert!` so the release path crashes too — the unknown-id
+    /// silent no-op below is for truly out-of-range ids, while
+    /// `TOTAL_*` has a well-defined alternate sink (the backend's
+    /// [`CpuTotalTracker`]); silently routing a stray write to
+    /// nowhere would mask the bug.
     pub fn count_ops(&self, opnum: OpCode, kind: i32) {
-        debug_assert!(
+        assert!(
             !is_cpu_tracker_kind(kind),
             "Profiler.count_ops({kind}) called with a CPU-total id; \
              route through CpuTotalTracker directly (PyPy raises \
@@ -258,16 +260,15 @@ impl JitProfiler {
     ///
     /// Used for non-op events (ABORT_*, NV*, OPT_VECTORIZE_*, ...).
     /// Unknown ids are a silent no-op (matching the OPS variant above).
-    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` are debug-asserted out —
-    /// PyPy `self.counters[TOTAL_*]` is out-of-range
-    /// (`Counters.ncounters = 22`) and raises `IndexError`.  Pyre
-    /// signals the same misuse through `debug_assert!` and silently
-    /// no-ops in release.  Use the backend's [`CpuTotalTracker`]
-    /// directly (or [`Self::inc_freed_loop`] /
-    /// [`Self::add_freed_bridges`]) when a tracker bump is actually
-    /// intended.
+    /// `TOTAL_COMPILED_*` / `TOTAL_FREED_*` panic in both debug and
+    /// release: PyPy `self.counters[TOTAL_*]` is out-of-range
+    /// (`Counters.ncounters = 22`) and raises `IndexError`, so pyre
+    /// uses `assert!` to crash on both build profiles.  Use the
+    /// backend's [`CpuTotalTracker`] directly (or
+    /// [`Self::inc_freed_loop`] / [`Self::add_freed_bridges`]) when a
+    /// tracker bump is actually intended.
     pub fn count(&self, kind: i32, inc: usize) {
-        debug_assert!(
+        assert!(
             !is_cpu_tracker_kind(kind),
             "Profiler.count({kind}) called with a CPU-total id; \
              route through CpuTotalTracker directly (PyPy raises \
@@ -285,7 +286,9 @@ impl JitProfiler {
     /// `self` for everything else.  Unknown ids return `None`.
     pub fn get_counter(&self, kind: i32) -> Option<usize> {
         if is_cpu_tracker_kind(kind) {
-            return Some(self.with_cpu_tracker(|t| cpu_tracker_field(t, kind).load(Ordering::Relaxed)));
+            return Some(
+                self.with_cpu_tracker(|t| cpu_tracker_field(t, kind).load(Ordering::Relaxed)),
+            );
         }
         self.field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed))
@@ -871,6 +874,26 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "PyPy raises IndexError")]
+    fn count_panics_on_total_compiled_loops_id() {
+        // jitprof.py:101 `self.counters[kind] += inc` raises
+        // `IndexError` when `kind` is `TOTAL_COMPILED_LOOPS` (id 22)
+        // because `self.counters` is sized `Counters.ncounters = 22`.
+        // Pyre uses `assert!` (not `debug_assert!`) so the panic
+        // fires in release builds too, matching upstream's crash on
+        // a programmer-error caller.
+        let prof = JitProfiler::default();
+        prof.count(counters::TOTAL_COMPILED_LOOPS, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "PyPy raises IndexError")]
+    fn count_ops_panics_on_total_freed_bridges_id() {
+        let prof = JitProfiler::default();
+        prof.count_ops(OpCode::IntAdd, counters::TOTAL_FREED_BRIDGES);
+    }
+
+    #[test]
     fn set_cpu_tracker_routes_total_counters_to_bound_tracker() {
         // jitprof.py:105-106 contract: `Counters.TOTAL_*` reads go
         // through `self.cpu.tracker`.  After `set_cpu_tracker(arc)`,
@@ -891,14 +914,20 @@ mod tests {
         prof_a.add_freed_bridges(7);
 
         assert_eq!(prof_a.get_counter(counters::TOTAL_COMPILED_LOOPS), Some(3));
-        assert_eq!(prof_a.get_counter(counters::TOTAL_COMPILED_BRIDGES), Some(5));
+        assert_eq!(
+            prof_a.get_counter(counters::TOTAL_COMPILED_BRIDGES),
+            Some(5)
+        );
         assert_eq!(prof_a.get_counter(counters::TOTAL_FREED_LOOPS), Some(1));
         assert_eq!(prof_a.get_counter(counters::TOTAL_FREED_BRIDGES), Some(7));
 
         // `prof_b` saw none of those updates because it is bound to a
         // separate `CpuTotalTracker` instance.
         assert_eq!(prof_b.get_counter(counters::TOTAL_COMPILED_LOOPS), Some(0));
-        assert_eq!(prof_b.get_counter(counters::TOTAL_COMPILED_BRIDGES), Some(0));
+        assert_eq!(
+            prof_b.get_counter(counters::TOTAL_COMPILED_BRIDGES),
+            Some(0)
+        );
         assert_eq!(prof_b.get_counter(counters::TOTAL_FREED_LOOPS), Some(0));
         assert_eq!(prof_b.get_counter(counters::TOTAL_FREED_BRIDGES), Some(0));
     }

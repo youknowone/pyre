@@ -971,9 +971,7 @@ pub struct CompiledLoopToken {
 /// same process keep separate totals — matching PyPy's per-CPU
 /// `cpu.tracker`.
 pub fn record_compiled_loop_token(tracker: &CpuTotalTracker, clt: &CompiledLoopToken) {
-    tracker
-        .total_compiled_loops
-        .fetch_add(1, Ordering::Relaxed);
+    tracker.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
     majit_ir::debug::log_one(
         "jit-mem-looptoken-alloc",
         &format!("allocating Loop # {}", clt.number),
