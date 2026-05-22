@@ -1507,13 +1507,30 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         // canonical `bytes`.  Exact `bytes` already IS the canonical
         // shape; bytearray and `bytes` subclasses (`class
         // MyBytes(bytes): pass`) are funneled through
-        // `w_bytes_from_bytes(bytes_like_data(...))` so `e.object`
-        // always holds a canonical `bytes` regardless of the input
-        // shape.
+        // `w_bytes_from_bytes(...)` so `e.object` always holds a
+        // canonical `bytes` regardless of the input shape.
+        //
+        // Codex P1 (PR #89 round 2): `bytes_like_data` dispatches via
+        // exact-type pointer identity (`is_bytes` → `py_type_check`)
+        // and silently reads the operand through the `W_BytearrayObject`
+        // layout for any non-exact-bytes input — including `bytes`
+        // subclasses, whose underlying struct IS `W_BytesObject`.
+        // `isinstance_w(obj, bytes)` is subclass-aware, so once exact
+        // `bytes` is filtered the remaining branches split cleanly:
+        // bytes subclass → `w_bytes_data` (`W_BytesObject` layout);
+        // bytearray (exact or subclass) → `w_bytearray_data`
+        // (`W_BytearrayObject` layout).
         let w_object = if pyre_object::is_bytes(w_object_in) {
             w_object_in
         } else {
-            let data = pyre_object::bytes_like_data(w_object_in);
+            let bytes_type = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE);
+            let inherits_bytes =
+                bytes_type.is_some_and(|bt| crate::baseobjspace::isinstance_w(w_object_in, bt));
+            let data = if inherits_bytes {
+                pyre_object::bytesobject::w_bytes_data(w_object_in)
+            } else {
+                pyre_object::bytearrayobject::w_bytearray_data(w_object_in)
+            };
             pyre_object::w_bytes_from_bytes(data)
         };
         pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
