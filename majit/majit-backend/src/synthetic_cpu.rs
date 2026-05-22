@@ -74,18 +74,28 @@ pub fn decode_synthetic(fnaddr: i64) -> Option<usize> {
 /// of `~/.claude/plans/pyre-call-family-canonical-migration.md`.
 #[derive(Default)]
 #[allow(dead_code)]
-pub struct SyntheticCpu;
+pub struct SyntheticCpu {
+    /// `model.py:28-29 self.tracker = CPUTotalTracker()` — synthetic
+    /// backends own a private tracker so cross-test/cross-instance
+    /// total counts stay isolated rather than aliasing through the
+    /// process-wide fallback.
+    cpu_tracker: std::sync::Arc<crate::CpuTotalTracker>,
+}
 
 impl SyntheticCpu {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        SyntheticCpu
+        SyntheticCpu::default()
     }
 }
 
 impl crate::Backend for SyntheticCpu {
     fn backend_name(&self) -> &'static str {
         "synthetic"
+    }
+
+    fn cpu_tracker(&self) -> &std::sync::Arc<crate::CpuTotalTracker> {
+        &self.cpu_tracker
     }
 
     /// `rpython/jit/backend/model.py:79-91` declares `compile_loop` on every

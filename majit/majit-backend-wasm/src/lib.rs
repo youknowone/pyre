@@ -125,6 +125,10 @@ fn wasm_gc_owns_object(addr: usize) -> bool {
 }
 
 pub struct WasmBackend {
+    /// `rpython/jit/backend/model.py:28-29 self.tracker =
+    /// CPUTotalTracker()` parity — per-instance `cpu.tracker`
+    /// exposed via [`majit_backend::Backend::cpu_tracker`].
+    cpu_tracker: std::sync::Arc<majit_backend::CpuTotalTracker>,
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
     constants: majit_ir::VecAssoc<u32, i64>,
@@ -135,6 +139,7 @@ pub struct WasmBackend {
 impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
+            cpu_tracker: std::sync::Arc::new(majit_backend::CpuTotalTracker::default()),
             trace_counter: 0,
             constants: majit_ir::VecAssoc::new(),
             vtable_offset: None,
@@ -291,6 +296,10 @@ impl WasmBackend {
 unsafe impl Send for WasmBackend {}
 
 impl majit_backend::Backend for WasmBackend {
+    fn cpu_tracker(&self) -> &std::sync::Arc<majit_backend::CpuTotalTracker> {
+        &self.cpu_tracker
+    }
+
     fn backend_name(&self) -> &'static str {
         "wasm"
     }
@@ -305,7 +314,7 @@ impl majit_backend::Backend for WasmBackend {
         // `cpu.tracker.total_compiled_loops` at the same point PyPy
         // creates the `CompiledLoopToken`.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
-            majit_backend::record_compiled_loop_token(clt);
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;

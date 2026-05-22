@@ -1953,6 +1953,17 @@ impl<M: Clone> MetaInterp<M> {
             .expect("MetaInterpStaticData must be uniquely owned during MetaInterp::new")
             .jit_starting_line = format!("JIT starting ({})", backend.backend_name());
         staticdata.attach_descrs_to_cpu(backend);
+        // jitprof.py:105-106 `self.cpu.tracker` — bind the profiler's
+        // tracker handle to the backend's `CpuTotalTracker` Arc so
+        // `TOTAL_COMPILED_*` / `TOTAL_FREED_*` reads route to the same
+        // per-CPU sink the backend writes via
+        // `record_compiled_loop_token` / `clt.compiling_a_bridge`.
+        // Without this rebind, the freshly-constructed profiler holds
+        // a private tracker disconnected from the backend's, so totals
+        // would silently zero out.
+        staticdata
+            .profiler
+            .set_cpu_tracker(std::sync::Arc::clone(backend.cpu_tracker()));
         this
     }
 
@@ -7440,8 +7451,10 @@ impl<M: Clone> MetaInterp<M> {
             // routine, which on its way out bumps
             // `cpu.tracker.total_freed_loops += 1` plus
             // `total_freed_bridges += loop.bridges_count`.  Pyre routes
-            // both bumps through `majit_backend::cpu_tracker` via
-            // `JitProfiler::inc_freed_loop` / `add_freed_bridges`.
+            // both bumps through the backend's `CpuTotalTracker` Arc
+            // via `JitProfiler::inc_freed_loop` / `add_freed_bridges`
+            // (the profiler is rebound onto that Arc in
+            // `MetaInterp::new`).
             //
             // **TIMING DIVERGENCE.**  RPython fires `__del__` exactly
             // when the GC collects the LoopToken — Rust's `Arc`

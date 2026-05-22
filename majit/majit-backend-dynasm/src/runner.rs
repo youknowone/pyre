@@ -687,6 +687,16 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
 
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
+    /// `rpython/jit/backend/model.py:28-29 self.tracker = CPUTotalTracker()`
+    /// parity — per-instance `cpu.tracker` exposed via
+    /// [`Backend::cpu_tracker`].  Held behind `Arc` so the same
+    /// counters are shared with the paired `JitProfiler` (which
+    /// borrows the same `Arc` during [`crate::pyjitpl::MetaInterp::new`]
+    /// setup in metainterp) — reads through `Profiler.get_counter`
+    /// and writes through [`majit_backend::record_compiled_loop_token`]
+    /// / [`CompiledLoopToken::compiling_a_bridge`] hit one shared
+    /// store.
+    cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     /// Next unique trace ID.
     next_trace_id: u64,
     /// Next header PC (green key).
@@ -792,6 +802,7 @@ impl DynasmBackend {
         // `compile.make_and_attach_done_descrs([self, cpu])` during
         // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
         DynasmBackend {
+            cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             next_trace_id: 1,
             next_header_pc: 0,
             constants: majit_ir::VecAssoc::new(),
@@ -1635,6 +1646,10 @@ impl DynasmBackend {
 }
 
 impl Backend for DynasmBackend {
+    fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
+        &self.cpu_tracker
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
@@ -1649,7 +1664,7 @@ impl Backend for DynasmBackend {
         // `CompiledLoopToken::new`; defer both to here so the counter
         // matches PyPy at the same structural moment.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
-            majit_backend::record_compiled_loop_token(clt);
+            majit_backend::record_compiled_loop_token(&self.cpu_tracker, clt);
         }
         // Deep-clone Op out of OpRc for the internal pipeline. Backend
         // stages do not depend on shared `_forwarded` identity with the
@@ -1875,11 +1890,11 @@ impl Backend for DynasmBackend {
         // `x86/runner.py:100-101` parity:
         //   clt = original_loop_token.compiled_loop_token
         //   clt.compiling_a_bridge()
-        // Bumps `cpu.tracker.total_compiled_bridges`, the per-loop
-        // `bridges_count`, and emits the `jit-mem-looptoken-alloc`
-        // debug section.
+        // Bumps this backend's `cpu.tracker.total_compiled_bridges`,
+        // the per-loop `bridges_count`, and emits the
+        // `jit-mem-looptoken-alloc` debug section.
         if let Some(clt) = original_token.compiled_loop_token.as_ref() {
-            clt.compiling_a_bridge();
+            clt.compiling_a_bridge(&self.cpu_tracker);
         }
         // Deep-clone Op out of OpRc for the internal pipeline (see
         // compile_loop above for rationale).

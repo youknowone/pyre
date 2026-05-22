@@ -17,10 +17,11 @@
 //! `Mutex<TimingState>` so concurrent threads sharing the profiler via
 //! `Arc` serialize on the same lock the GIL gives PyPy.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use majit_backend::CpuTotalTracker;
 use majit_ir::OpCode;
 
 use crate::pyjitpl::counters;
@@ -127,6 +128,20 @@ pub struct JitProfiler {
     /// profiler via `Arc` cannot race on `_start`/`_end`; PyPy's GIL
     /// gives the same exclusion.
     timing: Mutex<TimingState>,
+    /// `self.cpu.tracker` (`jitprof.py:105-106`) — PyPy reads
+    /// `Counters.TOTAL_COMPILED_*` / `TOTAL_FREED_*` via
+    /// `self.cpu.tracker.total_*`.  Pyre's `JitProfiler` holds an
+    /// `Arc<CpuTotalTracker>` so reads through
+    /// [`get_counter`](Self::get_counter) and writes through
+    /// [`inc_freed_loop`](Self::inc_freed_loop) /
+    /// [`add_freed_bridges`](Self::add_freed_bridges) hit the same
+    /// store the paired [`majit_backend::Backend`] writes to via
+    /// [`record_compiled_loop_token`](majit_backend::record_compiled_loop_token).
+    /// `MetaInterp::new` rebinds this field to share the backend's
+    /// `Arc` once both are constructed (see
+    /// [`set_cpu_tracker`](Self::set_cpu_tracker)) so the metainterp
+    /// pair behaves like PyPy's per-CPU tracker.
+    cpu_tracker: Mutex<Arc<CpuTotalTracker>>,
 }
 
 impl JitProfiler {
@@ -163,10 +178,10 @@ impl JitProfiler {
             &self.nvreused,
             &self.calls,
             // `cpu.tracker` counters (`TOTAL_COMPILED_*` /
-            // `TOTAL_FREED_*`) live on `majit_backend::cpu_tracker()`
-            // matching PyPy's instance-on-cpu shape — they survive
-            // `Profiler.start()` (which only resets `self.counters` and
-            // `self.calls`, jitprof.py:55-61).
+            // `TOTAL_FREED_*`) live on the per-instance `cpu_tracker`
+            // Arc bound to the backend's `CpuTotalTracker` — they
+            // survive `Profiler.start()` (which only resets
+            // `self.counters` and `self.calls`, jitprof.py:55-61).
         ] {
             field.store(0, Ordering::Relaxed);
         }
@@ -223,7 +238,7 @@ impl JitProfiler {
         debug_assert!(
             !is_cpu_tracker_kind(kind),
             "Profiler.count_ops({kind}) called with a CPU-total id; \
-             use majit_backend::cpu_tracker() directly (PyPy raises \
+             route through CpuTotalTracker directly (PyPy raises \
              IndexError here)",
         );
         if let Some(field) = self.field_for_kind(kind) {
@@ -247,14 +262,15 @@ impl JitProfiler {
     /// PyPy `self.counters[TOTAL_*]` is out-of-range
     /// (`Counters.ncounters = 22`) and raises `IndexError`.  Pyre
     /// signals the same misuse through `debug_assert!` and silently
-    /// no-ops in release.  Use [`majit_backend::cpu_tracker`] directly
-    /// (or [`Self::inc_freed_loop`] / [`Self::add_freed_bridges`])
-    /// when a tracker bump is actually intended.
+    /// no-ops in release.  Use the backend's [`CpuTotalTracker`]
+    /// directly (or [`Self::inc_freed_loop`] /
+    /// [`Self::add_freed_bridges`]) when a tracker bump is actually
+    /// intended.
     pub fn count(&self, kind: i32, inc: usize) {
         debug_assert!(
             !is_cpu_tracker_kind(kind),
             "Profiler.count({kind}) called with a CPU-total id; \
-             use majit_backend::cpu_tracker() directly (PyPy raises \
+             route through CpuTotalTracker directly (PyPy raises \
              IndexError here)",
         );
         if let Some(field) = self.field_for_kind(kind) {
@@ -265,11 +281,11 @@ impl JitProfiler {
     /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
     /// readback via `Counters.*` id.  PyPy routes `TOTAL_COMPILED_*` /
     /// `TOTAL_FREED_*` (ids 22..25) to `self.cpu.tracker.total_*`; pyre
-    /// reads from [`majit_backend::cpu_tracker`] for the same four ids
-    /// and from `self` for everything else.  Unknown ids return `None`.
+    /// reads from `self.cpu_tracker` for the same four ids and from
+    /// `self` for everything else.  Unknown ids return `None`.
     pub fn get_counter(&self, kind: i32) -> Option<usize> {
-        if let Some(field) = cpu_tracker_field_for_kind(kind) {
-            return Some(field.load(Ordering::Relaxed));
+        if is_cpu_tracker_kind(kind) {
+            return Some(self.with_cpu_tracker(|t| cpu_tracker_field(t, kind).load(Ordering::Relaxed)));
         }
         self.field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed))
@@ -277,20 +293,45 @@ impl JitProfiler {
 
     /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
     /// memory manager when an evicted token represents a root loop.
-    /// Delegates to [`majit_backend::cpu_tracker`].
+    /// Hits `self.cpu_tracker` so the paired backend (rebound via
+    /// [`set_cpu_tracker`]) and profiler share the same per-CPU
+    /// instance.
     pub fn inc_freed_loop(&self) {
-        majit_backend::cpu_tracker()
-            .total_freed_loops
-            .fetch_add(1, Ordering::Relaxed);
+        self.with_cpu_tracker(|t| t.total_freed_loops.fetch_add(1, Ordering::Relaxed));
     }
 
     /// `cpu.tracker.total_freed_bridges += n` parity.  Fired from the
     /// memory manager when an evicted token carries `n` bridges; PyPy's
     /// `cpu.free_loop_and_bridges` bumps the tracker once per bridge.
     pub fn add_freed_bridges(&self, n: usize) {
-        majit_backend::cpu_tracker()
-            .total_freed_bridges
-            .fetch_add(n, Ordering::Relaxed);
+        self.with_cpu_tracker(|t| t.total_freed_bridges.fetch_add(n, Ordering::Relaxed));
+    }
+
+    /// Rebind `self.cpu_tracker` to the backend's
+    /// [`CpuTotalTracker`] so the profiler and backend share one
+    /// counter sink.  `MetaInterp::new` calls this once the backend is
+    /// available, mirroring PyPy where `Profiler` reads through
+    /// `self.cpu.tracker` (jitprof.py:105-106) — `self.cpu` being the
+    /// backend's `AbstractCPU` instance, not a process global.
+    pub fn set_cpu_tracker(&self, tracker: Arc<CpuTotalTracker>) {
+        let mut slot = self.cpu_tracker.lock().expect("cpu_tracker poisoned");
+        *slot = tracker;
+    }
+
+    /// Clone the current `Arc<CpuTotalTracker>` (cheap refcount bump)
+    /// and run `f` against it outside the mutex so the lock is held
+    /// only for the swap window.  Callers (`inc_freed_loop`,
+    /// `add_freed_bridges`, `get_counter`) avoid serialising on the
+    /// mutex during the atomic op itself.
+    fn with_cpu_tracker<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&CpuTotalTracker) -> R,
+    {
+        let tracker = {
+            let slot = self.cpu_tracker.lock().expect("cpu_tracker poisoned");
+            Arc::clone(&slot)
+        };
+        f(&tracker)
     }
 
     /// jitprof.py:115-116 `Profiler.get_times(num)` — seconds.
@@ -612,25 +653,29 @@ fn is_cpu_tracker_kind(kind: i32) -> bool {
 }
 
 /// Route `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` ids
-/// (jit.py:1438-1441) to the matching field on
-/// [`majit_backend::cpu_tracker`].  Mirrors `jitprof.py:105-106`:
+/// (jit.py:1438-1441) to the matching field on a
+/// [`CpuTotalTracker`].  Mirrors `jitprof.py:105-106`:
 ///
 /// ```python
 /// if num >= Counters.TOTAL_COMPILED_LOOPS:
 ///     return getattr(self.cpu.tracker, Counters.counter_names[num])
 /// ```
 ///
-/// Returns `None` for any other id (the per-instance counters on
-/// [`JitProfiler`] handle those).
-fn cpu_tracker_field_for_kind(kind: i32) -> Option<&'static AtomicUsize> {
-    let tracker = majit_backend::cpu_tracker();
-    Some(match kind {
+/// Caller must restrict `kind` to the four `TOTAL_*` ids
+/// ([`is_cpu_tracker_kind`]); other ids panic in debug and silently
+/// route to `total_compiled_loops` in release, but no caller passes
+/// such an id today.
+fn cpu_tracker_field(tracker: &CpuTotalTracker, kind: i32) -> &AtomicUsize {
+    match kind {
         counters::TOTAL_COMPILED_LOOPS => &tracker.total_compiled_loops,
         counters::TOTAL_COMPILED_BRIDGES => &tracker.total_compiled_bridges,
         counters::TOTAL_FREED_LOOPS => &tracker.total_freed_loops,
         counters::TOTAL_FREED_BRIDGES => &tracker.total_freed_bridges,
-        _ => return None,
-    })
+        _ => {
+            debug_assert!(false, "cpu_tracker_field({kind}) — not a TOTAL_* id");
+            &tracker.total_compiled_loops
+        }
+    }
 }
 
 /// debug.py `debug_start("jit-tracing")` / `debug_start("jit-backend")`
@@ -823,6 +868,39 @@ mod tests {
         assert!(snap.backend_time_ns > 0);
         assert!(prof.get_times(counters::TRACING).unwrap() > 0.0);
         assert_eq!(prof.get_times(counters::OPS), None);
+    }
+
+    #[test]
+    fn set_cpu_tracker_routes_total_counters_to_bound_tracker() {
+        // jitprof.py:105-106 contract: `Counters.TOTAL_*` reads go
+        // through `self.cpu.tracker`.  After `set_cpu_tracker(arc)`,
+        // writes to that Arc must be visible to the profiler's
+        // `get_counter` and freed-bump helpers.  Two independent
+        // profilers bound to separate trackers must NOT share state —
+        // this is the regression Codex P2 flagged.
+        let prof_a = JitProfiler::default();
+        let prof_b = JitProfiler::default();
+        let tracker_a = Arc::new(CpuTotalTracker::default());
+        let tracker_b = Arc::new(CpuTotalTracker::default());
+        prof_a.set_cpu_tracker(Arc::clone(&tracker_a));
+        prof_b.set_cpu_tracker(Arc::clone(&tracker_b));
+
+        tracker_a.total_compiled_loops.store(3, Ordering::Relaxed);
+        tracker_a.total_compiled_bridges.store(5, Ordering::Relaxed);
+        prof_a.inc_freed_loop();
+        prof_a.add_freed_bridges(7);
+
+        assert_eq!(prof_a.get_counter(counters::TOTAL_COMPILED_LOOPS), Some(3));
+        assert_eq!(prof_a.get_counter(counters::TOTAL_COMPILED_BRIDGES), Some(5));
+        assert_eq!(prof_a.get_counter(counters::TOTAL_FREED_LOOPS), Some(1));
+        assert_eq!(prof_a.get_counter(counters::TOTAL_FREED_BRIDGES), Some(7));
+
+        // `prof_b` saw none of those updates because it is bound to a
+        // separate `CpuTotalTracker` instance.
+        assert_eq!(prof_b.get_counter(counters::TOTAL_COMPILED_LOOPS), Some(0));
+        assert_eq!(prof_b.get_counter(counters::TOTAL_COMPILED_BRIDGES), Some(0));
+        assert_eq!(prof_b.get_counter(counters::TOTAL_FREED_LOOPS), Some(0));
+        assert_eq!(prof_b.get_counter(counters::TOTAL_FREED_BRIDGES), Some(0));
     }
 
     #[test]

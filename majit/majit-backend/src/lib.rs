@@ -13,24 +13,14 @@ use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 /// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
 /// and bridges created) and by the memory manager (loops and bridges
 /// freed).  PyPy attaches one tracker per `AbstractCPU` instance
-/// (`model.py:28-29 self.tracker = CPUTotalTracker()`); pyre has a
-/// single backend per process (no multi-CPU JIT setup) so the
-/// `cpu.tracker` chain collapses to one process-global instance
-/// reachable via [`cpu_tracker`].
-///
-/// **STRUCTURAL ADAPTATION — process-global vs per-instance.**  PyPy
-/// reads totals via `Profiler.get_counter(TOTAL_*)` →
-/// `getattr(self.cpu.tracker, ...)` so each `AbstractCPU` instance owns
-/// its own counts.  Pyre's `cpu_tracker()` collapses that to one
-/// `OnceLock<CpuTotalTracker>`; if pyre later supports multiple
-/// `Backend` instances in one process (e.g. cross-isolate JIT, parallel
-/// translation tests holding their own backend), counts will be shared
-/// across them — diverging from PyPy where each CPU has private
-/// totals.  Until that scenario materialises, the single tracker is
-/// the simplest faithful port; the lift to per-`Backend` ownership
-/// only needs to (a) move the field onto `Backend`, (b) thread a
-/// `&CpuTotalTracker` into `CompiledLoopToken::new`/`compiling_a_bridge`,
-/// and (c) give `JitProfiler` an `Arc<CpuTotalTracker>` to read.
+/// (`model.py:28-29 self.tracker = CPUTotalTracker()`).  Pyre matches
+/// that shape: each [`Backend`] impl owns an `Arc<CpuTotalTracker>`
+/// exposed via [`Backend::cpu_tracker`], and `MetaInterp::new` rebinds
+/// the paired profiler's tracker handle to the same Arc so reads
+/// through `Profiler.get_counter(TOTAL_*)` hit the same sink the
+/// backend's `compile_loop` / `compile_bridge` write to.  Multiple
+/// backend instances coexisting in one process (e.g. parallel
+/// translation tests) keep their totals isolated.
 ///
 /// Each field is an [`AtomicUsize`] because PyPy's GIL-protected
 /// `+= 1` on a Python int becomes a cross-thread mutation in pyre — the
@@ -59,10 +49,16 @@ pub struct CpuTotalTracker {
     pub total_freed_bridges: AtomicUsize,
 }
 
-/// Process-global [`CpuTotalTracker`] singleton.  Mirrors PyPy's
-/// `cpu.tracker` for the single-backend pyre runtime; reads/writes
-/// share one instance across all profilers and backends.
-pub fn cpu_tracker() -> &'static CpuTotalTracker {
+/// Process-wide fallback [`CpuTotalTracker`] for callers that have no
+/// backend handle in scope.  Should be reserved for legacy/test paths
+/// that pre-date the per-backend [`Backend::cpu_tracker`] hook; the
+/// production path threads each backend's own `Arc<CpuTotalTracker>`
+/// through [`record_compiled_loop_token`] and
+/// [`CompiledLoopToken::compiling_a_bridge`] so PyPy's per-CPU
+/// `cpu.tracker` semantics survive when multiple backends or
+/// `MetaInterpStaticData` instances coexist (e.g. tests that build
+/// fresh fixtures inside one process).
+pub fn fallback_cpu_tracker() -> &'static CpuTotalTracker {
     static TRACKER: std::sync::OnceLock<CpuTotalTracker> = std::sync::OnceLock::new();
     TRACKER.get_or_init(CpuTotalTracker::default)
 }
@@ -969,9 +965,13 @@ pub struct CompiledLoopToken {
 ///
 /// Each backend's `compile_loop` calls this helper as its first act so
 /// the bump fires at the same structural point PyPy does, matching
-/// `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` line-for-line.
-pub fn record_compiled_loop_token(clt: &CompiledLoopToken) {
-    cpu_tracker()
+/// `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` line-for-line.  The
+/// caller passes its own [`CpuTotalTracker`] (via
+/// [`Backend::cpu_tracker`]) so multiple backend instances in the
+/// same process keep separate totals — matching PyPy's per-CPU
+/// `cpu.tracker`.
+pub fn record_compiled_loop_token(tracker: &CpuTotalTracker, clt: &CompiledLoopToken) {
+    tracker
         .total_compiled_loops
         .fetch_add(1, Ordering::Relaxed);
     majit_ir::debug::log_one(
@@ -1022,12 +1022,16 @@ impl CompiledLoopToken {
         self.loop_token_wref.lock().upgrade()
     }
 
-    /// `model.py:309-314` `compiling_a_bridge(self)` — bumps the global
-    /// `total_compiled_bridges` tracker, increments this token's local
-    /// `bridges_count`, and emits the `jit-mem-looptoken-alloc` debug
-    /// section line-for-line with upstream.
-    pub fn compiling_a_bridge(&self) {
-        cpu_tracker()
+    /// `model.py:309-314` `compiling_a_bridge(self)` — bumps the
+    /// owning backend's `total_compiled_bridges` tracker, increments
+    /// this token's local `bridges_count`, and emits the
+    /// `jit-mem-looptoken-alloc` debug section line-for-line with
+    /// upstream.  The `tracker` parameter is the backend's own
+    /// [`CpuTotalTracker`] (via [`Backend::cpu_tracker`]) so multiple
+    /// backend instances stay isolated, matching PyPy's per-CPU
+    /// `cpu.tracker`.
+    pub fn compiling_a_bridge(&self, tracker: &CpuTotalTracker) {
+        tracker
             .total_compiled_bridges
             .fetch_add(1, Ordering::Relaxed);
         let bridges_count = {
@@ -1582,6 +1586,24 @@ pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
 pub trait Backend: Send {
+    /// `rpython/jit/backend/model.py:28-29` `self.tracker =
+    /// CPUTotalTracker()` parity — each backend instance owns its
+    /// own [`CpuTotalTracker`].  [`record_compiled_loop_token`] and
+    /// [`CompiledLoopToken::compiling_a_bridge`] read this through
+    /// `&self` so multi-backend processes (e.g. test fixtures
+    /// creating fresh `MetaInterpStaticData` repeatedly) keep
+    /// counters isolated.  Default returns the process-wide
+    /// [`fallback_cpu_tracker`] so synthetic/test backends that
+    /// haven't migrated continue to behave like the previous
+    /// process-global singleton.
+    fn cpu_tracker(&self) -> &Arc<CpuTotalTracker> {
+        // SAFETY: the fallback Arc is borrowed from a process-global
+        // OnceLock; reading the cached value is sound from any
+        // thread.
+        static FALLBACK: std::sync::OnceLock<Arc<CpuTotalTracker>> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(|| Arc::new(CpuTotalTracker::default()))
+    }
+
     /// Compile a loop trace into native code.
     fn compile_loop(
         &mut self,
