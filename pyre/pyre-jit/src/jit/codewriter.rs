@@ -1093,9 +1093,7 @@ fn walker_post_walk_insert_renamings(
                         let target_label = super::flatten::block_label_name(&target_ref);
                         let pair_strs: Vec<String> = pairs
                             .iter()
-                            .map(|(src, dst, kind)| {
-                                format!("{}:{}->{}", kind.as_str(), src, dst)
-                            })
+                            .map(|(src, dst, kind)| format!("{}:{}->{}", kind.as_str(), src, dst))
                             .collect();
                         panic!(
                             "walker_post_walk_insert_renamings: trampoline rewrite \

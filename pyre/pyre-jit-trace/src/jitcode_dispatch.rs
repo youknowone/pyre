@@ -2955,9 +2955,7 @@ fn try_fold_pure_call_via_executor(
     // `concrete_of_opref` / `box_value` consumers see the folded value.
     let result_value = match call_descr.result_type() {
         majit_ir::Type::Int => majit_ir::Value::Int(result_i64),
-        majit_ir::Type::Ref => {
-            majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize))
-        }
+        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
         majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
         // void callees discard the result upstream too (`bh_call_v` has
         // no return value); `CallPureN` is included in the matched set

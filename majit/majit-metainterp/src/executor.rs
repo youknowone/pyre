@@ -1784,8 +1784,7 @@ mod execute_pure_call_tests {
     fn non_elidable_ei_panics_debug_assertion() {
         let mut effect = EffectInfo::default();
         effect.extraeffect = ExtraEffect::CannotRaise;
-        let descr =
-            SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
+        let descr = SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
         let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
     }
 
@@ -1794,8 +1793,7 @@ mod execute_pure_call_tests {
     fn elidable_can_raise_panics_debug_assertion() {
         let mut effect = EffectInfo::default();
         effect.extraeffect = ExtraEffect::ElidableCanRaise;
-        let descr =
-            SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
+        let descr = SimpleCallDescr::new(0, vec![Type::Int], Type::Int, false, 8, effect);
         let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
     }
 }
