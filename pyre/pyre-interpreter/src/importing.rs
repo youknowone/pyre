@@ -1831,8 +1831,8 @@ fn init_fcntl(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "fcntl.fcntl requires host_env",
+                Err(crate::PyError::not_implemented(
+                    "fcntl.fcntl requires host_env feature",
                 ))
             }
         }),
@@ -1867,8 +1867,8 @@ fn init_fcntl(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "fcntl.ioctl requires host_env",
+                Err(crate::PyError::not_implemented(
+                    "fcntl.ioctl requires host_env feature",
                 ))
             }
         }),
@@ -1897,8 +1897,8 @@ fn init_fcntl(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "fcntl.flock requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "fcntl.flock requires host_env feature",
                     ))
                 }
             },
@@ -1952,8 +1952,8 @@ fn init_fcntl(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "fcntl.lockf requires host_env",
+                Err(crate::PyError::not_implemented(
+                    "fcntl.lockf requires host_env feature",
                 ))
             }
         }),
