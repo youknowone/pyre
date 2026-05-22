@@ -1050,7 +1050,9 @@ fn init_locale(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Ok(pyre_object::w_str_new("C"))
+                Err(crate::PyError::not_implemented(
+                    "_locale.setlocale requires host_env feature",
+                ))
             }
         }),
     );
@@ -5890,7 +5892,9 @@ fn init_faulthandler(ns: &mut DictStorage) {
                 ));
             }
             #[cfg(not(all(unix, feature = "host_env")))]
-            Ok(pyre_object::w_none())
+            Err(crate::PyError::not_implemented(
+                "faulthandler.enable requires host_env feature",
+            ))
         }),
     );
     crate::dict_storage_store(
@@ -6000,7 +6004,9 @@ fn init_faulthandler(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = (fd, all_threads, chain);
-                Ok(pyre_object::w_none())
+                Err(crate::PyError::not_implemented(
+                    "faulthandler.register requires host_env feature",
+                ))
             }
         }),
     );
@@ -6888,7 +6894,9 @@ fn init_signal_stub(ns: &mut DictStorage) {
                 #[cfg(not(feature = "host_env"))]
                 {
                     let _ = args;
-                    Ok(pyre_object::w_none())
+                    Err(crate::PyError::not_implemented(
+                        "signal.strsignal requires host_env feature",
+                    ))
                 }
             },
             1,
@@ -6912,7 +6920,9 @@ fn init_signal_stub(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_list_new(items));
                 }
                 #[cfg(not(feature = "host_env"))]
-                Ok(pyre_object::w_list_new(vec![]))
+                Err(crate::PyError::not_implemented(
+                    "signal.valid_signals requires host_env feature",
+                ))
             },
             0,
         ),
