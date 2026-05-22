@@ -1017,6 +1017,11 @@ fn init_locale(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("setlocale() missing category"));
                 }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "setlocale: category must be an integer",
+                    ));
+                }
                 let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let locale_str: Option<String> =
                     if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
@@ -1064,6 +1069,11 @@ fn init_locale(ns: &mut DictStorage) {
                     let item = if args.is_empty() {
                         libc::CODESET
                     } else {
+                        if !unsafe { pyre_object::is_int(args[0]) } {
+                            return Err(crate::PyError::type_error(
+                                "nl_langinfo: item must be an integer",
+                            ));
+                        }
                         (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::nl_item
                     };
                     if item == libc::CODESET {

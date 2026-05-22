@@ -114,6 +114,9 @@ pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "clock_gettime() missing argument",
         ));
     }
+    if !unsafe { is_int(args[0]) } {
+        return Err(crate::PyError::type_error("clock id must be an integer"));
+    }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
         crate::PyError::os_error_with_errno(
@@ -132,6 +135,9 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             "clock_gettime_ns() missing argument",
         ));
     }
+    if !unsafe { is_int(args[0]) } {
+        return Err(crate::PyError::type_error("clock id must be an integer"));
+    }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
         crate::PyError::os_error_with_errno(
@@ -149,6 +155,9 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Err(crate::PyError::type_error(
             "clock_getres() missing argument",
         ));
+    }
+    if !unsafe { is_int(args[0]) } {
+        return Err(crate::PyError::type_error("clock id must be an integer"));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_getres(host_time::ClockId::from_raw(id)).map_err(|e| {
