@@ -1063,8 +1063,21 @@ fn write_ref_reg(
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
     // OpRef bank if a future caller mis-sizes them.
+    //
+    // Codex P1 (PR #89): collapse non-Ref ConcreteValue (Int / Float)
+    // to Null before storing into the Ref shadow.  `concrete_from_
+    // recorded_opref` returns whatever kind the per-OpRef concrete
+    // table holds; a kind mismatch (e.g. boxed Int returned through a
+    // Ref result slot) would otherwise leak Int/Float bits into
+    // `concrete_registers_r`, breaking ref-only downstream consumers
+    // (`getfield_gc_r` sanity loads, `raise/r` GUARD_CLASS) that
+    // expect `ConcreteValue::Ref(_)` or `Null`.
+    let sanitized = match concrete {
+        ConcreteValue::Ref(_) | ConcreteValue::Null => concrete,
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
+    };
     if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
-        *c_slot = concrete;
+        *c_slot = sanitized;
     }
     Ok(())
 }
@@ -1123,8 +1136,17 @@ fn write_int_reg(
     // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
     // an empty `concrete_registers_i` slice; production callers
     // (Task #75.B) size it to `registers_i.len()` at dispatch entry.
+    //
+    // Codex P1 (PR #89) symmetry with `write_ref_reg`: collapse
+    // non-Int ConcreteValue to Null before storing into the Int
+    // shadow so a kind-mismatched stamp can't leak Ref/Float bits
+    // into `concrete_registers_i`.
+    let sanitized = match concrete {
+        ConcreteValue::Int(_) | ConcreteValue::Null => concrete,
+        ConcreteValue::Ref(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
+    };
     if let Some(c_slot) = ctx.concrete_registers_i.get_mut(dst) {
-        *c_slot = concrete;
+        *c_slot = sanitized;
     }
     Ok(())
 }
@@ -1526,28 +1548,47 @@ pub fn dispatch_via_miframe(
     // `Some(Value::Ref(GcRef(ptr)))` resolved via the constant pool;
     // for non-const argboxes it consults the `opref_concrete` stamp
     // table.
+    //
+    // CodeRabbit Major (PR #89): reject oversized argbox lists up
+    // front instead of silently truncating with a per-loop `break`.
+    // The `_*_arity_mismatch` DispatchError shapes already exist for
+    // the inline-call paths (`InlineCall*ArityMismatch`); reuse them
+    // here so a caller/shape mismatch surfaces as a typed failure
+    // rather than a partially seeded frame.
+    if argboxes_r.len() > top_num_regs_r {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc: position,
+            provided: argboxes_r.len(),
+            callee_num_regs_r: top_num_regs_r,
+        });
+    }
+    if argboxes_i.len() > top_num_regs_i {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc: position,
+            provided: argboxes_i.len(),
+            callee_num_regs_i: top_num_regs_i,
+        });
+    }
+    if argboxes_f.len() > top_num_regs_f {
+        return Err(DispatchError::InlineCallFloatArityMismatch {
+            pc: position,
+            provided: argboxes_f.len(),
+            callee_num_regs_f: top_num_regs_f,
+        });
+    }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
-        if i >= top_num_regs_r {
-            break;
-        }
         top_regs_r[i] = box_ref;
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
             top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
     for (i, &box_ref) in argboxes_i.iter().enumerate() {
-        if i >= top_num_regs_i {
-            break;
-        }
         top_regs_i[i] = box_ref;
         if let Some(majit_ir::Value::Int(v)) = trace_ctx.box_value(box_ref) {
             top_concrete_i[i] = ConcreteValue::Int(v);
         }
     }
     for (i, &box_ref) in argboxes_f.iter().enumerate() {
-        if i >= top_num_regs_f {
-            break;
-        }
         top_regs_f[i] = box_ref;
     }
 
