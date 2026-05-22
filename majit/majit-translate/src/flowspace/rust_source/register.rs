@@ -4005,6 +4005,139 @@ pub fn extract_unsafe_fn_signatures(
     out
 }
 
+/// Z2.5 Path C slice 3a — project a `syn::ReturnType` to a
+/// `LowLevelType` representable by the slice 2 stub-pygraph builder.
+/// Coverage is intentionally narrow at this slice (Bool / Void only) —
+/// it lands the wiring shape early so the dominant `pyre_object::is_*`
+/// predicate family (every `unsafe fn is_X(obj) -> bool`) can hit the
+/// stub-pygraph path immediately.  Other return types surface `None`
+/// and the slice 3c caller skips registration, preserving the original
+/// "not registered" Skip behavior for those fns until a follow-on
+/// widens the projection.
+///
+/// `Default` return (`fn foo()`) projects to `LowLevelType::Void`.
+/// Explicit `() -> ()` does too (single-segment path "()" rejected at
+/// the syn level — `syn::Type::Tuple` with no elements is the parse).
+/// `bool` matches the literal `bool` identifier at the type-path leaf.
+///
+/// Returns `None` when the type is unsupported (any non-`bool` type
+/// path, references, generics, tuples with elements, function
+/// pointers, etc.) — caller treats `None` as "skip this fn".
+pub fn simple_return_type_to_lltype(
+    ret: &syn::ReturnType,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match ret {
+        syn::ReturnType::Default => Some(LowLevelType::Void),
+        syn::ReturnType::Type(_, ty) => match ty.as_ref() {
+            syn::Type::Tuple(tup) if tup.elems.is_empty() => Some(LowLevelType::Void),
+            syn::Type::Path(tp)
+                if tp.qself.is_none()
+                    && tp.path.leading_colon.is_none()
+                    && tp.path.segments.len() == 1 =>
+            {
+                let leaf = &tp.path.segments[0];
+                if !matches!(leaf.arguments, syn::PathArguments::None) {
+                    return None;
+                }
+                match leaf.ident.to_string().as_str() {
+                    "bool" => Some(LowLevelType::Bool),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Z2.5 Path C slice 3b — combine slice 1's argname-extraction with
+/// slice 3a's return-type projection.  Each entry of the returned Vec
+/// is a fully-qualified spec tuple ready for slice 3c's
+/// `register_unsafe_fn_stubs` (cutover.rs): `(path-segments, Signature,
+/// return_lltype)`.
+///
+/// Filters out unsafe fns whose return type slice 3a cannot project —
+/// the caller treats those as "skip" and the original Skip path covers
+/// them.  Mirrors the per-fn discard contract documented on
+/// [`simple_return_type_to_lltype`].
+pub fn extract_unsafe_fn_stubs(
+    file: &File,
+    prefix: &str,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    let pairs = extract_unsafe_fn_signatures(file, prefix);
+    let mut out = Vec::with_capacity(pairs.len());
+    for (segments, signature) in pairs {
+        let Some(ret_ty) = lookup_return_type_for_signature(file, prefix, &segments) else {
+            continue;
+        };
+        let Some(lltype) = simple_return_type_to_lltype(&ret_ty) else {
+            continue;
+        };
+        out.push((segments, signature, lltype));
+    }
+    out
+}
+
+/// Find the `syn::ReturnType` for a registered `(segments, signature)`
+/// pair by re-walking the file.  Each `extract_unsafe_fn_signatures`
+/// entry corresponds to exactly one `Item::Fn` (when `segments`
+/// matches `[prefix?, ident]`) or one `Item::Impl::ImplItem::Fn`
+/// (when `segments` matches `[ImplTy, method]`).
+fn lookup_return_type_for_signature(
+    file: &File,
+    prefix: &str,
+    segments: &[String],
+) -> Option<syn::ReturnType> {
+    if segments.is_empty() {
+        return None;
+    }
+    let method_or_fn_ident = segments.last()?.as_str();
+    // Two cases: `[prefix, ident]` / `[ident]` for free fn, OR
+    // `[ImplTy, method]` for impl methods.  Free-fn case: segments
+    // start with `prefix` (or is single-segment when prefix empty);
+    // impl case: segments[0] is the impl target's last ident.
+    let is_free_fn_segments = if prefix.is_empty() {
+        segments.len() == 1
+    } else {
+        segments.len() == 2 && segments[0] == prefix
+    };
+    for item in &file.items {
+        match item {
+            Item::Fn(func) if is_free_fn_segments => {
+                if func.sig.unsafety.is_some() && func.sig.ident == method_or_fn_ident {
+                    return Some(func.sig.output.clone());
+                }
+            }
+            Item::Impl(impl_block) if !is_free_fn_segments && segments.len() == 2 => {
+                let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
+                    continue;
+                };
+                let Some(target_ident) = target_path.last() else {
+                    continue;
+                };
+                if target_ident != &segments[0] {
+                    continue;
+                }
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
+                        if method.sig.unsafety.is_some()
+                            && method.sig.ident == method_or_fn_ident
+                        {
+                            return Some(method.sig.output.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4084,6 +4217,100 @@ mod tests {
             pairs.iter().map(|(s, _)| s.clone()).collect();
         assert!(segments_set.contains(&vec!["modx".to_string(), "unsafe_a".to_string()]));
         assert!(segments_set.contains(&vec!["Cls".to_string(), "m".to_string()]));
+    }
+
+    // ─── Z2.5 Path C slice 3a/3b ───
+
+    fn parse_return_ty(src: &str) -> syn::ReturnType {
+        let item: ItemFn = syn::parse_str(src).expect("test fixture must parse");
+        item.sig.output
+    }
+
+    #[test]
+    fn simple_return_type_default_yields_void() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() {}");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Void)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_unit_tuple_yields_void() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() -> () {}");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Void)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_bool_yields_bool() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ret = parse_return_ty("fn f() -> bool { true }");
+        assert!(matches!(
+            simple_return_type_to_lltype(&ret),
+            Some(LowLevelType::Bool)
+        ));
+    }
+
+    #[test]
+    fn simple_return_type_unsupported_yields_none() {
+        // Coverage intentionally narrow at this slice — `i64`, `*const u8`,
+        // generic types, references all surface None so the caller skips.
+        for src in [
+            "fn f() -> i64 { 0 }",
+            "fn f() -> u32 { 0 }",
+            "fn f() -> *const u8 { std::ptr::null() }",
+            "fn f() -> Vec<u8> { Vec::new() }",
+            "fn f() -> &'static str { \"\" }",
+        ] {
+            assert!(
+                simple_return_type_to_lltype(&parse_return_ty(src)).is_none(),
+                "unsupported return must surface None: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_unsafe_fn_stubs_keeps_only_supported_return_types() {
+        let file = parse_file(
+            "pub unsafe fn pred(p: *const u8) -> bool { true } \
+             pub unsafe fn malloc(n: usize) -> *mut u8 { std::ptr::null_mut() } \
+             pub unsafe fn unit_helper(p: i64) {}",
+        );
+        let stubs = extract_unsafe_fn_stubs(&file, "mem");
+        let segments_set: std::collections::HashSet<Vec<String>> =
+            stubs.iter().map(|(s, _, _)| s.clone()).collect();
+        assert!(
+            segments_set.contains(&vec!["mem".to_string(), "pred".to_string()]),
+            "bool-returning unsafe fn must produce a stub"
+        );
+        assert!(
+            segments_set.contains(&vec!["mem".to_string(), "unit_helper".to_string()]),
+            "()-returning unsafe fn must produce a stub"
+        );
+        assert!(
+            !segments_set.contains(&vec!["mem".to_string(), "malloc".to_string()]),
+            "*mut u8 return is unsupported at slice 3a, must skip"
+        );
+    }
+
+    #[test]
+    fn extract_unsafe_fn_stubs_resolves_impl_method_return_types() {
+        let file = parse_file(
+            "impl Foo { pub unsafe fn method_b(&self, x: i64) -> bool { true } }",
+        );
+        let stubs = extract_unsafe_fn_stubs(&file, "pyobject");
+        assert_eq!(stubs.len(), 1);
+        let (segments, _, lltype) = &stubs[0];
+        assert_eq!(segments, &vec!["Foo".to_string(), "method_b".to_string()]);
+        assert!(matches!(
+            lltype,
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool
+        ));
     }
 
     /// Verify that `build_host_class_from_struct` populates the

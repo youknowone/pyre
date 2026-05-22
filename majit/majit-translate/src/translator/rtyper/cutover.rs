@@ -1063,6 +1063,50 @@ pub(crate) fn default_constvalue_for_lltype(lltype: &LowLevelType) -> Option<Con
     }
 }
 
+/// Z2.5 Path C slice 3c — register a batch of unsafe-fn stub
+/// `(segments, signature, return_lltype)` specs into `registry`.
+/// Each entry is wrapped through [`build_stub_pygraph_for_unsafe_fn`]
+/// + [`PyreCallRegistry::register_callee`], so subsequent
+/// `flowspace_adapter::translate_op` lookups via
+/// `call_registry.lookup_with_leaf_match` find a registered entry and
+/// the dual gate no longer Skips with "not registered in
+/// PyreCallRegistry" for these paths.
+///
+/// `specs` is typically the output of
+/// `register::extract_unsafe_fn_stubs(file, prefix)` run over every
+/// parsed source file.  Per-fn failures (stub-pygraph builder returns
+/// `None` for compound lltypes, or registry already has the same key
+/// at a conflicting signature) propagate as silent skips — the
+/// upstream "not registered" Skip path then absorbs that specific fn
+/// while the rest of the batch lands.
+///
+/// Mirrors `populate_call_registry_from_call_graphs`'s
+/// "register and prefill" contract (`cutover.rs:856-875`) but feeds
+/// from the syn-AST stub-spec list instead of pyre's
+/// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
+/// unsafe fns by validate_signature rejection).
+pub(crate) fn register_unsafe_fn_stubs(
+    registry: &PyreCallRegistry,
+    specs: &[(Vec<String>, Signature, LowLevelType)],
+) {
+    for (segments, signature, return_lltype) in specs {
+        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
+            segments.last().cloned().unwrap_or_default(),
+            signature.clone(),
+            return_lltype.clone(),
+        ) else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if registry.lookup(&key).is_some() {
+            // Already registered via the function_graphs pass (e.g. a
+            // safe fn with the same path).  Don't overwrite.
+            continue;
+        }
+        registry.register_callee(key, signature.clone(), stub_pygraph);
+    }
+}
+
 /// Derive the canonical `FunctionPathKey` for a `SemanticFunction`.
 ///
 /// Mirrors the front-end's `canonical_call_target`
@@ -3095,6 +3139,84 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         assert!(
             std::rc::Rc::ptr_eq(link_target, &graph.returnblock),
             "stub Link must target the graph's returnblock"
+        );
+    }
+
+    #[test]
+    fn register_unsafe_fn_stubs_registers_each_spec_and_skips_compound_returns() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let specs = vec![
+            (
+                vec!["pyobject".to_string(), "is_none".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                LowLevelType::Bool,
+            ),
+            (
+                vec!["pyobject".to_string(), "is_int".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                LowLevelType::Bool,
+            ),
+            // Compound lltype — slice 2's default_constvalue_for_lltype
+            // returns None and register_unsafe_fn_stubs must skip.
+            (
+                vec!["pyobject".to_string(), "unsupported".to_string()],
+                Signature::new(vec!["x".to_string()], None, None),
+                LowLevelType::Struct(Box::new(
+                    crate::translator::rtyper::lltypesystem::lltype::StructType::new("S", vec![]),
+                )),
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs);
+        assert_eq!(
+            registry.len(),
+            2,
+            "compound-return spec must be skipped, others registered"
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_int".to_string()
+                ]))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn register_unsafe_fn_stubs_does_not_overwrite_existing_entries() {
+        // A path already registered via function_graphs (e.g. a safe fn
+        // wearing the same segments) must NOT be overwritten by a stub.
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["pyobject".to_string(), "shared".to_string()]);
+        let signature = Signature::new(vec!["x".to_string()], None, None);
+        let existing = registry.get_or_register(key.clone(), signature.clone());
+        let existing_host_id = existing.host_object.identity_id();
+        let specs = vec![(
+            vec!["pyobject".to_string(), "shared".to_string()],
+            signature,
+            LowLevelType::Bool,
+        )];
+        register_unsafe_fn_stubs(&registry, &specs);
+        assert_eq!(registry.len(), 1, "no new entry expected");
+        let after = registry.lookup(&key).expect("entry still present");
+        assert_eq!(
+            after.host_object.identity_id(),
+            existing_host_id,
+            "register_unsafe_fn_stubs must not replace an existing entry"
         );
     }
 
