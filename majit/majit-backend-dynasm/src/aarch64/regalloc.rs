@@ -116,7 +116,9 @@ impl<'a> RegAlloc<'a> {
     /// both operands in registers, result allocated separately.
     /// PyPy passes the full `boxes = op.getarglist()` as
     /// `forbidden_vars` for both `make_sure_var_in_reg` calls
-    /// (regalloc.py:366-367), not just the opposite operand.
+    /// (regalloc.py:366-367), and after allocating the result also
+    /// calls `possibly_free_var(op)` (regalloc.py:372) so the result
+    /// register is reclaimable when the op is dead.
     pub(crate) fn consider_binop_j2(
         &mut self,
         dst: OpRef,
@@ -131,6 +133,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(lhs, Type::Int);
         self.possibly_free_var(rhs, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        self.possibly_free_var(dst, Type::Int);
         let res_loc = Loc::Reg(res);
         self.perform(i, vec![lhs_loc, rhs_loc], Some(res_loc), output);
     }
@@ -231,9 +234,13 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// `prepare_op_int_neg` / `int_invert`. `neg X(d), X(s)` and
-    /// `mvn X(d), X(s)` are both 3-operand: result independent of
-    /// source.
+    /// aarch64/regalloc.py:456 `prepare_unary` covers `int_neg`,
+    /// `int_invert`, `int_is_true`, `int_is_zero`. `neg X(d), X(s)`
+    /// and `mvn X(d), X(s)` are 3-operand: result independent of
+    /// source. PyPy asserts `not isinstance(a0, Const)`
+    /// (regalloc.py:458) since the optimizer is expected to have
+    /// folded any const-arg unary into a constant result before this
+    /// point.
     pub(crate) fn consider_unary_int_j2(
         &mut self,
         dst: OpRef,
@@ -241,6 +248,10 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
+        debug_assert!(
+            !arg.is_constant(),
+            "prepare_unary expects a non-const arg; got constant OpRef {arg:?} (should have been folded earlier)"
+        );
         let arg_loc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
         self.possibly_free_var(arg, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
