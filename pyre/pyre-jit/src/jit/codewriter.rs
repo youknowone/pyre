@@ -631,6 +631,15 @@ struct SpamBlock {
     /// every `emit_*!` macro through `push_insn` the shadow becomes
     /// the authoritative source consumed by the post-walk flatten.
     per_block_ssarepr: Vec<super::flatten::Insn>,
+    /// Length of `per_block_ssarepr` at the moment the multi-pred
+    /// trampoline fallthrough fallback first appended `goto + ---`
+    /// (`emit_trampoline_for_multi_pred_link`).  Insns beyond this
+    /// index are trampoline-tail synthetic, not walker-emitted block
+    /// terminators.  Used by `rewrite_direct_terminator_tlabel` to
+    /// cap its reverse scan so a sibling link's explicit-jump rewrite
+    /// targets the original branch terminator instead of a previously
+    /// appended fallthrough `goto TLabel(target)`.
+    original_terminator_end: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +652,7 @@ impl SpamBlockRef {
             framestate,
             dead: false,
             per_block_ssarepr: Vec::new(),
+            original_terminator_end: None,
         })))
     }
 
@@ -1245,6 +1255,14 @@ where
     // the immediate next non-empty block opens with the target label.
     let body_len = body.len();
     let mut spam_borrow = source_spam.0.borrow_mut();
+    // Codex P1 (PR #89): cap a future explicit-jump rewrite's reverse
+    // scan at the pre-append tail so a sibling link to the same target
+    // retargets the ORIGINAL branch terminator, not the goto we are
+    // about to append here.  Record only on the first append — later
+    // appends fall inside the already-tracked trampoline region.
+    if spam_borrow.original_terminator_end.is_none() {
+        spam_borrow.original_terminator_end = Some(spam_borrow.per_block_ssarepr.len());
+    }
     let insns = &mut spam_borrow.per_block_ssarepr;
     for insn in body {
         insns.push(insn);
@@ -1342,9 +1360,20 @@ fn is_default_link_exitcase(exitcase: &Option<super::flow::FlowValue>) -> bool {
 /// Rewrite a direct branch target (`goto_if_not`, `goto`, exception
 /// mismatch branches) from the target block label to the trampoline.
 /// Reverse-scans so the terminator is considered before any earlier op.
+///
+/// Codex P1 (PR #89): when `original_terminator_end` is set, the
+/// reverse scan stops there.  The fallthrough fallback in
+/// [`emit_trampoline_for_multi_pred_link`] appends `body + goto
+/// TLabel(target) + Unreachable` past that anchor; without the cap a
+/// sibling link whose explicit-jump rewrite shares the same target
+/// would retarget the appended fallthrough goto instead of the
+/// original `goto_if_not`/`goto`/exception-mismatch branch terminator.
 fn rewrite_direct_terminator_tlabel(source_spam: &SpamBlockRef, from: &str, to: &str) -> bool {
     let mut spam_borrow = source_spam.0.borrow_mut();
-    for insn in spam_borrow.per_block_ssarepr.iter_mut().rev() {
+    let upper = spam_borrow
+        .original_terminator_end
+        .unwrap_or(spam_borrow.per_block_ssarepr.len());
+    for insn in spam_borrow.per_block_ssarepr[..upper].iter_mut().rev() {
         if let super::flatten::Insn::Op { args, .. } = insn {
             for arg in args.iter_mut() {
                 if let super::flatten::Operand::TLabel(tl) = arg {
