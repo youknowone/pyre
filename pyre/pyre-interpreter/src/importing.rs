@@ -2064,8 +2064,8 @@ fn init_syslog(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "syslog.openlog requires host_env",
+                Err(crate::PyError::not_implemented(
+                    "syslog.openlog requires host_env feature",
                 ))
             }
         }),
@@ -2100,8 +2100,8 @@ fn init_syslog(ns: &mut DictStorage) {
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::runtime_error(
-                    "syslog.syslog requires host_env",
+                Err(crate::PyError::not_implemented(
+                    "syslog.syslog requires host_env feature",
                 ))
             }
         }),
@@ -2141,8 +2141,8 @@ fn init_syslog(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::runtime_error(
-                        "syslog.setlogmask requires host_env",
+                    Err(crate::PyError::not_implemented(
+                        "syslog.setlogmask requires host_env feature",
                     ))
                 }
             },
