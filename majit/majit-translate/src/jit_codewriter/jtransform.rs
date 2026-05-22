@@ -991,6 +991,64 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(ops)
             }
+            // PRE-EXISTING-ADAPTATION (no direct RPython precedent): pyre-
+            // side recovery when integer comparisons reach jtransform with
+            // a Ref-typed operand because the rtyper-equivalent did not
+            // stamp the operand's `concretetype` (or an `lltype.
+            // cast_ptr_to_int` was elided from the SSA chain).  RPython's
+            // rtyper inserts the cast at the rtyper layer
+            // (`rpython/rtyper/rint.py`), so by the time `jtransform.py`
+            // observes the comparison the operands are uniformly `Signed`;
+            // pyre's lighter rtyper leaves the generic `BinOp` in place
+            // with one or both operands defaulting to `'r'` kind, so the
+            // unconditional `int_<op>` prefix at
+            // `assembler.rs:3160` would emit `int_eq/ir>i` /
+            // `int_le/rr>i` / etc. opnames that no RPython blackhole
+            // handler registers (see
+            // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
+            //
+            // `eq` / `ne` over two Ref operands is already handled by the
+            // `ptr_eq` / `ptr_ne` arm above (per
+            // `jtransform.py:1243-1255`); this arm covers the remaining
+            // mixed `i / r` shapes for `eq` / `ne` and any `'r'`-tainted
+            // operand for the strict orderings `lt` / `le` / `gt` / `ge`
+            // (RPython has no `ptr_lt` family).  Mirrors the `mod` /
+            // `floordiv` PRE-EXISTING-ADAPTATION at
+            // `jtransform.rs:1119-1206`.  Convergence is the same: the
+            // proper fix is to find the simplify / inline pass that drops
+            // the `cast_ptr_to_int` and preserve it instead, then narrow
+            // this gate.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
+                && matches!(self.get_value_kind_var(lhs), 'i' | 'r')
+                && matches!(self.get_value_kind_var(rhs), 'i' | 'r')
+                && (self.get_value_kind_var(lhs) == 'r'
+                    || self.get_value_kind_var(rhs) == 'r') =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
+                let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
+                let mut ops = lhs_pre_ops;
+                ops.extend(rhs_pre_ops);
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: binop_name.clone(),
+                        lhs: lhs_var,
+                        rhs: rhs_var,
+                        result_ty: result_ty.clone(),
+                    },
+                });
+                RewriteResult::Replace(ops)
+            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
