@@ -124,7 +124,7 @@
 //!       after_residual_call=True)` (`pyjitpl.py:2599-2603`).  Each
 //!       residual_call guard (`GuardNotForced`, `GuardNoException`)
 //!       carries a single-frame snapshot keyed by
-//!       `ctx.current_jitcode_index` so the optimizer's
+//!       `ctx.outer_jitcode_index` so the optimizer's
 //!       `store_final_boxes_in_guard` finds populated resume data.
 //!       Active-box narrowing via per-PC liveness is a Phase 4
 //!       follow-up; today's helper conservatively snapshots every
@@ -446,70 +446,22 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// or means the trait-path seeded only the symbolic OpRef without
     /// a concrete (e.g. a synthetic test fixture).
     pub last_exc_value_concrete: ConcreteValue,
-    /// Index of the JitCode currently being walked.  Mirrors RPython
-    /// `metainterp.framestack[-1].jitcode.index` (`pyjitpl.py:2586`
-    /// `capture_resumedata` reads `frame.jitcode.index` from the top of
-    /// the framestack to stamp the snapshot frame).
-    ///
-    /// Pyre's walker has no `framestack` — it threads the current
-    /// jitcode coordinate through `WalkContext` instead.  Production
-    /// entries set this from `entry_jitcode.index()` at
-    /// [`dispatch_via_miframe_at_opcode_entry`]; sub-walks save the
-    /// caller's value, overwrite with the callee's index for the
-    /// nested call, then restore on return.  Test entries through
-    /// [`dispatch_via_miframe`] leave the field at `0` because no
-    /// JitCode index is known at the test fixture level.
-    ///
-    /// Read by [`walker_capture_snapshot_for_last_guard`] when the
-    /// walker emits an `after_residual_call` guard (`GuardNoException` /
-    /// `GuardNotForced`), so the snapshot frame carries the same
-    /// `jitcode_index` the optimizer would otherwise pull from the
-    /// MIFrame framestack.
-    pub current_jitcode_index: u32,
     /// Python bytecode PC of the opcode whose per-opcode arm the
     /// walker is currently executing.  Mirrors `MIFrame.orgpc`
-    /// (`pyjitpl.py:151 setposition` parity in pyre's bytecode-tracer
-    /// layout) — the Python PC pyre's `build_resumed_frames` reads
-    /// from `SnapshotFrame.pc` and feeds into `pyjitcode.
-    /// resume_jitcode_pc_for(py_pc)` to translate back to a JitCode
-    /// position at resume time.  Production entry seeds from
-    /// `miframe.orgpc as u32`; sub-walks inherit the caller's
+    /// (`pyjitpl.py:151 setposition` parity).  Production entry seeds
+    /// from `miframe.orgpc as u32`; sub-walks inherit the caller's
     /// `entry_py_pc` (a sub-jitcode invocation does not advance the
-    /// outer Python PC); test fixtures + the test path
-    /// [`dispatch_via_miframe`] leave the field at `0`.
+    /// outer Python PC); test fixtures default to `0`.
     ///
-    /// Read by [`walker_capture_snapshot_for_last_guard`] so the
-    /// resume path can route through either the legacy `pc_map[py_pc]`
-    /// fast-path (`call_jit.rs:894-900 cache_valid`) or the new
-    /// snapshot `jitcode_pc` channel — both keyed off this Python PC.
+    /// Read by [`walker_capture_snapshot_for_last_guard`] to stamp the
+    /// snapshot frame's Python PC.
     pub entry_py_pc: u32,
-    /// Caller frames recorded at sub-walk entry, oldest-first.  Mirrors
-    /// RPython's `metainterp.framestack[0..n-1]` — the chain of paused
-    /// `MIFrame`s under the currently-executing top frame
-    /// (`framestack[-1]`).
-    ///
-    /// `pyjitpl.py:2586 capture_resumedata` walks the framestack
-    /// emitting one `SnapshotFrame` per `MIFrame`: the top via
-    /// `create_top_snapshot(top, vable, vref, after_residual_call,
-    /// is_last=...)`, then each parent via `create_snapshot(back,
-    /// is_last=...)` (`opencoder.py:819-832`).  Pyre's walker has no
-    /// `framestack` — sub-walks are stack-nested function calls — so we
-    /// thread the parent chain explicitly through `WalkContext`.
-    ///
-    /// When `dispatch_inline_call_*` constructs a sub-`WalkContext`, it
-    /// pushes the caller's [`WalkerFrameInfo`] onto a fresh
-    /// `parent_frames` Vec (`caller.parent_frames` clone + caller's own
-    /// frame).  The sub-walk reads the chain on guard emission to build
-    /// a multi-frame snapshot; on sub-walk return the parent_frames
-    /// Vec is dropped along with the sub-`WalkContext`.
-    pub parent_frames: Vec<WalkerFrameInfo>,
     /// JitCode index of the **outer** `PyJitCode.jitcode` — the Python
     /// bytecode jitcode whose Python opcode is currently being
-    /// dispatched.  Distinct from `current_jitcode_index` (which can
-    /// track the arm jitcode or a sub-walk callee in walker-internal
-    /// terms): pyre's blackhole resume only re-enters Python-bytecode
-    /// jitcodes, so guard snapshots must reference the outer pyjitcode
-    /// regardless of how deep the walker's sub-walk nesting is.
+    /// dispatched.  Pyre's blackhole resume only re-enters Python-
+    /// bytecode jitcodes, so guard snapshots must reference the outer
+    /// pyjitcode regardless of how deep the walker's sub-walk nesting
+    /// is.
     ///
     /// Read from `(*sym.jitcode).index()` at production entry
     /// ([`dispatch_via_miframe_at_opcode_entry`]); sub-walks inherit
@@ -529,70 +481,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
-}
-
-/// Frozen frame state recorded at sub-walk entry — one entry per
-/// paused parent frame on the walker's nested call chain.  Mirrors
-/// `MIFrame` snapshot at `framestack[i]` in RPython.
-#[derive(Clone, Debug)]
-pub struct WalkerFrameInfo {
-    /// Jitcode index of the paused parent frame.
-    pub jitcode_index: u32,
-    /// Caller's `entry_py_pc` (the Python PC of the opcode whose arm
-    /// is paused while this sub-walk runs).
-    pub py_pc: u32,
-    /// JitCode bytecode offset of the inline_call instruction in the
-    /// parent's arm jitcode — the position where the sub-walk was
-    /// invoked from.  `pyjitpl.py:2598 create_snapshot(back, ...)`
-    /// reads `back.pc` for the same purpose.
-    pub jitcode_pc: u32,
-    /// Active OpRef boxes captured at sub-walk entry — the parent's
-    /// frozen register file (`registers_r ∪ registers_i.opref ∪
-    /// registers_f.opref`, filtered by `OpRef::NONE`).  Mirrors
-    /// `frame.get_list_of_active_boxes(in_a_call=True, ...)`
-    /// (`opencoder.py:808`).
-    pub active_boxes: Vec<OpRef>,
-}
-
-/// Build the `parent_frames` Vec to pass into a fresh sub-`WalkContext`.
-/// Clones the caller's chain (`ctx.parent_frames`) and appends the
-/// caller's own frozen frame info, so the sub-walk's chain is
-/// `[root, ..., caller's parent, caller]` (oldest-first).
-///
-/// `call_site_jitcode_pc` is the JitCode offset of the `inline_call_*`
-/// instruction in the caller's arm jitcode — the position
-/// `pyjitpl.py:2598 create_snapshot(back, ...)` would read as
-/// `back.pc` if RPython had pyre's split arm-jitcode layout.
-fn build_parent_frames_for_subwalk(
-    ctx: &WalkContext<'_, '_>,
-    call_site_jitcode_pc: usize,
-) -> Vec<WalkerFrameInfo> {
-    let mut active_boxes =
-        Vec::with_capacity(ctx.registers_r.len() + ctx.registers_i.len() + ctx.registers_f.len());
-    for r in ctx.registers_r.iter() {
-        if !r.is_none() {
-            active_boxes.push(*r);
-        }
-    }
-    for r in ctx.registers_i.iter() {
-        if !r.is_none() {
-            active_boxes.push(*r);
-        }
-    }
-    for r in ctx.registers_f.iter() {
-        if !r.is_none() {
-            active_boxes.push(*r);
-        }
-    }
-    let caller_frame = WalkerFrameInfo {
-        jitcode_index: ctx.current_jitcode_index,
-        py_pc: ctx.entry_py_pc,
-        jitcode_pc: call_site_jitcode_pc as u32,
-        active_boxes,
-    };
-    let mut chain = ctx.parent_frames.clone();
-    chain.push(caller_frame);
-    chain
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1775,9 +1663,7 @@ pub fn dispatch_via_miframe(
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
-            current_jitcode_index: 0,
             entry_py_pc,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -1992,9 +1878,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
-            current_jitcode_index: entry_jitcode.index() as u32,
             entry_py_pc,
-            parent_frames: Vec::new(),
             outer_jitcode_index,
             outer_active_boxes,
         };
@@ -3661,17 +3545,14 @@ fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: 
     // only resume point pyre's blackhole can re-enter.
     //
     // Therefore the snapshot is single-frame and points at the outer
-    // pyjitcode coordinates regardless of `ctx.parent_frames` depth.
-    // `ctx.outer_jitcode_index` + `ctx.entry_py_pc` track those
-    // coordinates; `outer_active_boxes` carries the `PyFrame`
-    // state at the Python opcode boundary (snapshotted once at
-    // `dispatch_via_miframe_at_opcode_entry` from
+    // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
+    // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
+    // carries the `PyFrame` state at the Python opcode boundary
+    // (snapshotted once at `dispatch_via_miframe_at_opcode_entry` from
     // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`).
     //
     // `op_pc` (the walker's arm-local PC) is intentionally not used:
     // the arm jitcode has no resume entry point in pyre's blackhole.
-    // The walker's `parent_frames` chain — built for potential future
-    // multi-frame resume support — is similarly inert today.
     let _ = op_pc;
     ctx.trace_ctx.capture_snapshot_for_last_guard(
         &ctx.outer_active_boxes,
@@ -4460,7 +4341,6 @@ fn dispatch_inline_call_dr_kind(
         callee_concrete_r[i] = *concrete;
     }
 
-    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4479,9 +4359,7 @@ fn dispatch_inline_call_dr_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
-            parent_frames: sub_parent_frames,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
@@ -4644,7 +4522,6 @@ fn dispatch_inline_call_dir_kind(
         callee_concrete_r[i] = *concrete;
     }
 
-    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4663,9 +4540,7 @@ fn dispatch_inline_call_dir_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
-            parent_frames: sub_parent_frames,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
@@ -4823,7 +4698,6 @@ fn dispatch_inline_call_dirf_kind(
         callee_concrete_r[i] = *concrete;
     }
 
-    let sub_parent_frames = build_parent_frames_for_subwalk(ctx, op.pc);
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -4842,9 +4716,7 @@ fn dispatch_inline_call_dirf_kind(
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: sub_index as u32,
             entry_py_pc: ctx.entry_py_pc,
-            parent_frames: sub_parent_frames,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
@@ -5836,9 +5708,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6008,9 +5878,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6054,9 +5922,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6099,9 +5965,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6153,9 +6017,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6199,9 +6061,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6244,9 +6104,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6384,9 +6242,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6542,9 +6398,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6648,9 +6502,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6748,9 +6600,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6837,9 +6687,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6923,9 +6771,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -6987,9 +6833,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7033,9 +6877,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7075,9 +6917,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7125,9 +6965,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7181,9 +7019,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7232,9 +7068,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7288,9 +7122,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7343,9 +7175,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7402,9 +7232,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7447,9 +7275,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7495,9 +7321,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7543,9 +7367,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7639,9 +7461,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7683,9 +7503,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7739,9 +7557,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7825,9 +7641,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7896,9 +7710,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -7958,9 +7770,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8001,9 +7811,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8622,9 +8430,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8729,9 +8535,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8787,9 +8591,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8842,9 +8644,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8888,9 +8688,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8933,9 +8731,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -8999,9 +8795,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9053,9 +8847,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9098,9 +8890,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9142,9 +8932,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9196,9 +8984,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9341,9 +9127,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9413,9 +9197,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9466,9 +9248,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9541,9 +9321,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9596,9 +9374,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9640,9 +9416,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9686,9 +9460,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9740,9 +9512,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9786,9 +9556,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9856,9 +9624,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9911,9 +9677,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -9978,9 +9742,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10062,9 +9824,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10214,9 +9974,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10275,9 +10033,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10327,9 +10083,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10374,9 +10128,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10430,9 +10182,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10488,9 +10238,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10566,9 +10314,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10633,9 +10379,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10699,9 +10443,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10747,9 +10489,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10833,9 +10573,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -10912,9 +10650,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11005,9 +10741,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11124,9 +10858,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11179,9 +10911,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11226,9 +10956,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11297,9 +11025,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11413,9 +11139,7 @@ mod tests {
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11505,9 +11229,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11596,9 +11318,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11666,9 +11386,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11739,9 +11457,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11810,9 +11526,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11887,9 +11601,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -11962,9 +11674,7 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12025,9 +11735,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12110,9 +11818,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12172,9 +11878,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12216,9 +11920,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12278,9 +11980,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12357,9 +12057,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12429,9 +12127,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12479,9 +12175,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12552,9 +12246,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12605,9 +12297,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12680,9 +12370,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12741,9 +12429,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -12810,9 +12496,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
@@ -13112,9 +12796,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            current_jitcode_index: 0,
             entry_py_pc: 0,
-            parent_frames: Vec::new(),
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
         };
