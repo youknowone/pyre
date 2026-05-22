@@ -571,6 +571,31 @@ fn analyze_pipeline_from_parsed(
         }
     }
     call_control.use_imports = use_imports_agg;
+    // Z2.5 Path C — populate the metadata-only `unsafe_fn_stubs`
+    // carrier so the codewriter's `dual_gate_registry` can register
+    // every `unsafe fn` / unsafe impl-method as a stub-pygraph entry
+    // in PyreCallRegistry.  Walks each parsed source file under its
+    // crate-stripped `module_path` prefix, dropping unsafe fns whose
+    // return type the slice 3a projection cannot represent (see
+    // `flowspace::rust_source::register::simple_return_type_to_lltype`).
+    // Closes the bulk of the "not registered in PyreCallRegistry"
+    // Skip cluster (218 events at 2026-05-22 measurement) dominated
+    // by `pyre_object::is_*` predicates whose body lowering is
+    // intentionally rejected at `build_flow.rs:215`.
+    let mut unsafe_stubs: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )> = Vec::new();
+    for parsed in parsed_files {
+        unsafe_stubs.extend(
+            crate::flowspace::rust_source::register::extract_unsafe_fn_stubs(
+                &parsed.file,
+                &parsed.module_path,
+            ),
+        );
+    }
+    call_control.unsafe_fn_stubs = unsafe_stubs;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {

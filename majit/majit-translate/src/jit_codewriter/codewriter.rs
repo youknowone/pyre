@@ -175,6 +175,19 @@ impl CodeWriter {
                 panic!("populate_call_registry_from_call_graphs failed: {msg}");
             }
         }
+        // Z2.5 Path C — register metadata-only stubs for `unsafe fn`
+        // callees that `populate_call_registry_from_call_graphs` could
+        // not see (`build_flow.rs:215` rejects unsafe bodies, so they
+        // never enter `callcontrol.function_graphs()`).  Each spec
+        // wraps through `build_stub_pygraph_for_unsafe_fn` so the
+        // annotator sees a synthetic flowed graph whose return Link
+        // carries a Constant of the declared return lltype.  Idempotent
+        // — re-entry via the cached registry path short-circuits at
+        // `lookup` on each key.
+        crate::translator::rtyper::cutover::register_unsafe_fn_stubs(
+            &registry,
+            &callcontrol.unsafe_fn_stubs,
+        );
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py:69-83`) construct
         // exactly one annotator and one rtyper per Translator and assert

@@ -795,6 +795,23 @@ pub struct CallControl {
     /// [[orthodox-6item-2026-05-17]].  Populated here as the data
     /// carrier so the future resolver lands without re-plumbing.
     pub use_imports: HashMap<(String, String), String>,
+    /// Z2.5 Path C metadata-only registration carrier — `(segments,
+    /// Signature, return_lltype)` for every `unsafe fn` and unsafe
+    /// impl-method discovered in the parsed source set.  These callees
+    /// cannot lower their bodies (`build_flow.rs:215` rejects
+    /// `sig.unsafety.is_some()` because raw-pointer ops are not
+    /// modelled), but `OpKind::Call::FunctionPath` sites still need
+    /// the path registered in `PyreCallRegistry`.  Populated by
+    /// `lib.rs::analyze_pipeline_from_parsed` via
+    /// `flowspace::rust_source::register::extract_unsafe_fn_stubs`;
+    /// consumed by
+    /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
+    /// `dual_gate_registry` after the function-graph populate pass.
+    pub unsafe_fn_stubs: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    )>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -1133,6 +1150,7 @@ impl CallControl {
             immutable_array_types: HashSet::new(),
             parsed_module_paths: Vec::new(),
             use_imports: HashMap::new(),
+            unsafe_fn_stubs: Vec::new(),
         }
     }
 
