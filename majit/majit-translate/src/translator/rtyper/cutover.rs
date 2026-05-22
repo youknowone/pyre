@@ -770,17 +770,33 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // pair, violating upstream's "create once, share thereafter"
     // contract.
     //
-    // The dedupe key strips a leading `crate::` segment so
-    // `crate::a::foo` and `a::foo` collapse to the same canonical key
-    // `[a, foo]`, while genuinely distinct functions like `a::foo` and
-    // `b::foo` keep distinct keys (`[a, foo]` vs `[b, foo]`) and stay
-    // separate.  Bare-name dedupe (`graph.name`) was unsafe because
-    // `FunctionGraph::name` is the function's bare identifier (no
-    // module qualification) so two functions named `foo` in different
-    // modules would have falsely aliased to one HostObject / FunctionDesc.
+    // The dedupe key strips a leading crate-prefix segment so the
+    // five alias-explosion shapes registered by `lib.rs:438-490` for
+    // each free function (`[mod, foo]`, `[crate, mod, foo]`,
+    // `[pyre_interpreter, mod, foo]`, `[pyre_object, mod, foo]`,
+    // `[pyre_jit, mod, foo]`) collapse to a single canonical entry
+    // `[mod, foo]`.  Stripping only `crate` (the previous heuristic)
+    // left the three external crate-name aliases as distinct canonical
+    // entries with distinct `Rc<PyreFunctionEntry>` HostObjects, and
+    // `lookup_with_leaf_match`'s multi-match convergence check
+    // (`all_same` on `host_object` Arc identity) then failed —
+    // callsites like `["crate", "w_str_new"]` (a `use crate::w_str_new`
+    // bare callsite from another module) found four matches with four
+    // distinct hosts and rejected the cluster.  Stripping all four
+    // well-known prefixes preserves the rule that genuinely distinct
+    // functions in different modules (`a::foo` vs `b::foo`) stay
+    // separate (`a` / `b` aren't in the stripped set), and the
+    // bare-name dedupe trap (using `FunctionGraph::name`) is still
+    // avoided because we key on the post-strip segment sequence, not
+    // on the bare leaf.
     fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
+        const CRATE_PREFIXES: &[&str] = &["crate", "pyre_interpreter", "pyre_object", "pyre_jit"];
         let mut segs: Vec<String> = path.segments.iter().cloned().collect();
-        if segs.first().map(String::as_str) == Some("crate") {
+        if segs
+            .first()
+            .map(|s| CRATE_PREFIXES.contains(&s.as_str()))
+            .unwrap_or(false)
+        {
             segs.remove(0);
         }
         segs
