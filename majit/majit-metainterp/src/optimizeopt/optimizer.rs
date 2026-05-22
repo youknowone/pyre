@@ -341,8 +341,7 @@ impl Optimizer {
         ) {
             return false;
         }
-        let idx = op.pos.get().raw() as usize;
-        let Some(b) = box_pool.get(idx) else {
+        let Some(b) = box_pool.get(op.pos.get()) else {
             return false;
         };
         let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() else {

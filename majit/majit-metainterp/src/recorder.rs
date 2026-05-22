@@ -483,7 +483,7 @@ impl Trace {
     /// replaces the retired `opref_concrete` side-table (RPython
     /// `history.py:803-807 *FrontendOp(pos, value)` parity).
     pub(crate) fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
-        self.box_pool.get(position as usize)
+        self.box_pool.get_at_position(position as usize)
     }
 
     /// Full BoxRef pool snapshot — borrows the sparse slot table
@@ -623,9 +623,9 @@ mod tests {
         let pre_box_at_1 = rec.box_for_position(1).unwrap().clone();
         let trace = rec.get_trace();
         assert_eq!(trace.box_pool.len(), 2);
-        assert_eq!(trace.box_pool.get(1).unwrap(), &pre_box_at_1);
-        assert!(trace.box_pool.get(0).unwrap().is_inputarg());
-        assert!(trace.box_pool.get(1).unwrap().is_resop());
+        assert_eq!(trace.box_pool.get_at_position(1).unwrap(), &pre_box_at_1);
+        assert!(trace.box_pool.get_at_position(0).unwrap().is_inputarg());
+        assert!(trace.box_pool.get_at_position(1).unwrap().is_resop());
     }
 
     /// H-2.1 invariant: BoxRef identity is per-allocation. Two record calls

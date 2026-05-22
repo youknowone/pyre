@@ -711,11 +711,39 @@ impl BoxPool {
         self.inner.is_empty()
     }
 
-    /// Read `box_pool[idx]` — returns `Some(&BoxRef)` only for a
-    /// materialized slot; out-of-bounds and tombstoned slots return
-    /// `None`.
-    pub fn get(&self, idx: usize) -> Option<&BoxRef> {
+    /// Read `box_pool[opref]` — returns `Some(&BoxRef)` only for a
+    /// materialized slot in the body/inputarg namespaces. Out-of-bounds
+    /// and tombstoned slots return `None`. OpRefs in Const/TempVar/None
+    /// namespaces — which never have a `box_pool` slot by construction
+    /// (constants live in `const_pool`, TempVars are regalloc-only) —
+    /// also return `None`, so the caller chain falls through to whatever
+    /// fallback was already in place for the absent-slot path.
+    pub fn get(&self, opref: OpRef) -> Option<&BoxRef> {
+        let idx = match opref {
+            OpRef::IntOp(p)
+            | OpRef::FloatOp(p)
+            | OpRef::RefOp(p)
+            | OpRef::VoidOp(p)
+            | OpRef::InputArgInt(p)
+            | OpRef::InputArgFloat(p)
+            | OpRef::InputArgRef(p) => p as usize,
+            OpRef::ConstInt(_)
+            | OpRef::ConstFloat(_)
+            | OpRef::ConstPtr(_)
+            | OpRef::TempVar(_)
+            | OpRef::None => return None,
+        };
         self.inner.get(idx)?.as_ref()
+    }
+
+    /// Positional accessor by raw recording slot — used when the
+    /// caller carries an integer position rather than an `OpRef`
+    /// (recorder tests; GC snapshot rewrite paths that store
+    /// `iter_indexed` slot indices; `allocate_next_pos_raw`'s
+    /// constant-slot probe). Production callers with an `OpRef` in
+    /// scope use `get` instead.
+    pub fn get_at_position(&self, position: usize) -> Option<&BoxRef> {
+        self.inner.get(position)?.as_ref()
     }
 
     /// `box_pool[opref] = Some(value)`; extends with `None` padding to

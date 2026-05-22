@@ -2022,7 +2022,7 @@ impl OptContext {
         // already a constant identity and cannot be reused for a fresh op.
         while self
             .box_pool
-            .get(self.next_pos as usize)
+            .get_at_position(self.next_pos as usize)
             .is_some_and(|b| {
                 matches!(*b.get_forwarded(), crate::r#box::Forwarded::Box(ref t) if t.const_value().is_some())
             })
@@ -2759,7 +2759,7 @@ impl OptContext {
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
             //   `Forwarded::Info(OpInfo::FloatConst(_))` — info.py:851
             //       FloatConstInfo planted via set_preamble_forwarded_info.
-            let b = ctx.box_pool.get(arg.raw() as usize)?;
+            let b = ctx.box_pool.get(arg)?;
             use crate::optimizeopt::info::OpInfo;
             match &*b.get_forwarded() {
                 crate::r#box::Forwarded::Info(OpInfo::Ptr(info)) => {
@@ -2908,15 +2908,14 @@ impl OptContext {
         source: OpRef,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::OpInfo;
-        let idx = source.raw() as usize;
         // BoxRef-authoritative read. PyPy stores the replay op's forwarded
         // info directly on `preamble_op._forwarded`; pyre stores the same
-        // state in the BoxRef slot keyed by `source.raw()`. Non-constant
+        // state in the BoxRef slot keyed by `source`. Non-constant
         // `Forwarded::Box(target)` is a replacement chain and is excluded.
         // Const targets can still appear from legacy bridge/fixture replay
         // paths; normalize them to the OpInfo shape consumed by
         // `setinfo_from_preamble_item_option`.
-        let b = self.box_pool.get(idx).cloned()?;
+        let b = self.box_pool.get(source).cloned()?;
         let result = {
             let fwd = b.get_forwarded();
             match &*fwd {
@@ -3575,8 +3574,7 @@ impl OptContext {
         if opref.is_constant() || opref.is_none() {
             return opref;
         }
-        let idx = opref.raw() as usize;
-        let Some(start) = self.box_pool.get(idx).cloned() else {
+        let Some(start) = self.box_pool.get(opref).cloned() else {
             return opref;
         };
         // resoperation.py:57-68: walk box._forwarded on the box itself.
@@ -3694,8 +3692,7 @@ impl OptContext {
             // tolerated for test fixtures that bypass the recorder; READ
             // sites that need the materialize-always invariant should use
             // `ensure_box` instead. Phase D-2.g audit pending.
-            let idx = opref.raw() as usize;
-            self.box_pool.get(idx).cloned()?
+            self.box_pool.get(opref).cloned()?
         };
         Some(start.get_box_replacement(false))
     }
@@ -3734,7 +3731,6 @@ impl OptContext {
             });
             return Some(crate::r#box::BoxRef::new_const_with_index(value, ci));
         }
-        let idx = opref.raw() as usize;
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
         // only newly materialized placeholders pick the shape AND type from
@@ -3746,9 +3742,10 @@ impl OptContext {
         // synthesize a body-namespace `new_resop` shape and `boxref_to_opref`
         // would round-trip to `op_at(pos)` (None) instead of
         // `inputargs[i]`.
-        if let Some(existing) = self.box_pool.get(idx) {
+        if let Some(existing) = self.box_pool.get(opref) {
             return Some(existing.clone());
         }
+        let idx = opref.raw() as usize;
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
         let placeholder = match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
@@ -4345,11 +4342,10 @@ impl OptContext {
         // IntBound and the constant is Int, validate contains() + make_eq_const().
         // RPython checks ONE authoritative source: box._forwarded.
         if let Value::Int(intval) = value {
-            let ridx = replaced.raw() as usize;
             // BoxRef-authoritative read of IntBound for the contains() +
             // make_eq_const() in-place mutation. IntBound writers populate
             // the BoxRef via `ensure_box`.
-            if let Some(b) = self.box_pool.get(ridx) {
+            if let Some(b) = self.box_pool.get(replaced) {
                 if let Some(mut bound) = b.int_bound_mut() {
                     if !bound.contains(intval as i64) {
                         std::panic::panic_any(crate::optimize::InvalidLoop(
@@ -4588,8 +4584,7 @@ impl OptContext {
         if opref.is_constant() {
             return self.const_pool.get(&opref.const_index()).copied();
         }
-        let idx = opref.raw() as usize;
-        if let Some(b) = self.box_pool.get(idx) {
+        if let Some(b) = self.box_pool.get(opref) {
             if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                 if let Some(value) = target.const_value() {
                     return Some(value);

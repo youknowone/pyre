@@ -2148,7 +2148,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get_at_position(*i)
                     {
                         // RPython object identity: mutate the live Rc<RefCell<PtrInfo>>
                         // in place so any other handle sharing it sees the post-GC
@@ -2169,7 +2169,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get_at_position(*i)
                     {
                         let rc = match &*b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
@@ -2188,7 +2188,7 @@ impl ExportedState {
                 }
                 ExportedGcRefField::BoxPoolBoxConstRef(i) => {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get(*i)
+                        && let Some(b) = snapshot.get_at_position(*i)
                     {
                         // BoxKind::Const is immutable, so swap in a fresh
                         // ConstRef BoxRef carrying the updated handle.
@@ -5003,7 +5003,7 @@ mod tests {
             p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
 
         let prefix_slots: Vec<Option<crate::r#box::BoxRef>> = (0..prefix.len())
-            .map(|i| prefix.get(i).cloned())
+            .map(|i| prefix.get_at_position(i).cloned())
             .collect();
         assert_eq!(
             prefix_slots,
