@@ -66,6 +66,19 @@ pub struct GraphAllocationResult {
 }
 
 impl GraphAllocationResult {
+    /// `rpython/tool/algo/regalloc.py:129-130 RegAllocator.getcolor` —
+    /// return the post-coloring color for a Variable.  Panics when
+    /// `v` is not colored (matches PyPy `_coloring[...]` KeyError).
+    /// Pyre's `enforce_input_args` short-circuits via direct
+    /// `coloring.get` to skip the inputargs-never-referenced case (the
+    /// pyre walker can produce that shape; PyPy's `make_dependencies`
+    /// always adds inputargs as nodes, so the case can't arise there).
+    pub fn getcolor(&self, v: super::flow::VariableId) -> u16 {
+        *self.coloring.get(&v).unwrap_or_else(|| {
+            panic!("GraphAllocationResult::getcolor: missing color for {v:?}");
+        })
+    }
+
     /// `rpython/tool/algo/regalloc.py:138-143 RegAllocator.swapcolors`
     /// — swap every occurrence of `col1` and `col2` across the coloring
     /// dict.  Called by `enforce_input_args` (`flatten.py:88-100`) when

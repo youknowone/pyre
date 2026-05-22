@@ -2262,16 +2262,10 @@ fn regalloc_color(
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
     v: Variable,
 ) -> Register {
+    // `flatten.py:382-386 GraphFlattener.getcolor` — pick the
+    // per-kind allocator and call `regallocs[kind].getcolor(v)`.
     let kind = v.kind.unwrap_or(Kind::Ref);
-    let color = *regallocs[kind.index()]
-        .coloring
-        .get(&v.id)
-        .unwrap_or_else(|| {
-            panic!(
-                "GraphFlattener: missing regalloc color for variable {:?} of kind {:?}",
-                v.id, kind,
-            )
-        });
+    let color = regallocs[kind.index()].getcolor(v.id);
     Register::new(kind, color)
 }
 
