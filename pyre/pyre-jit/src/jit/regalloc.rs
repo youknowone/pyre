@@ -20,11 +20,8 @@
 //!     private methods of the same name.
 //!   * `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
 //!     after coloring, `swapcolors` rotates inputarg colors into
-//!     `0..n-1`. Pyre's analog is `enforce_input_args` below
-//!     (the graph-side entry; the convenience wrapper is named
-//!     differently to disambiguate from the SSARepr-side
-//!     `enforce_input_args` further down — see "Pyre-only deviation"
-//!     below).
+//!     `0..n-1`. Pyre's analog is the `enforce_input_args` free
+//!     function below.
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
 //!     `num_regs[kind] = max(coloring)+1` per kind, packed into the
 //!     `JitCode`. Pyre's analog is `RegAllocator::find_num_colors`
@@ -46,9 +43,8 @@
 //!   * `perform_ssarepr_register_allocation` — builds an
 //!     `SSAReprRegAllocator` and runs the three-stage pipeline,
 //!     mirroring the upstream `perform_register_allocation` body.
-//!   * `enforce_input_args` (SSARepr-side, lowercase `_graph_`-less
-//!     name) — variant of `enforce_input_args` keyed on u16
-//!     register indices instead of Variable identities.
+//!   * `enforce_ssarepr_input_args` — variant of `enforce_input_args`
+//!     keyed on u16 register indices instead of Variable identities.
 //!
 //! The chordal coloring algorithm itself is shared with
 //! `majit-translate`'s flow-graph regalloc through
@@ -374,8 +370,8 @@ pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocat
 
 /// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
 /// at the graph level (sibling to the SSA-side private
-/// `enforce_input_args` further down that handles per-RegAllocator
-/// swapcolors).
+/// `enforce_ssarepr_input_args` further down that handles per-
+/// `SSAReprRegAllocator` swapcolors).
 ///
 /// Walks the startblock's inputargs in source order; for each inputarg
 /// of kind `K` whose current color in `regallocs[K]` does not equal
