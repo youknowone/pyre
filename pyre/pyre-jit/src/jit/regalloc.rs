@@ -21,7 +21,10 @@
 //!   * `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
 //!     after coloring, `swapcolors` rotates inputarg colors into
 //!     `0..n-1`. Pyre's analog is the `enforce_input_args` free
-//!     function below.
+//!     function below (called by `GraphFlattener::enforce_input_args`
+//!     at `flatten.rs` to mirror `flatten.py:68 flattener.enforce_input_args()`,
+//!     and directly by the walker production path until the Phase 4
+//!     production flip retires walker-side SSARepr emission).
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
 //!     `num_regs[kind] = max(coloring)+1` per kind, packed into the
 //!     `JitCode`. Pyre's analog is `RegAllocator::find_num_colors`
