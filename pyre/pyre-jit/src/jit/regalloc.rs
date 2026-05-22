@@ -246,22 +246,22 @@ impl RegAllocator {
     }
 }
 
-/// `rpython/tool/algo/regalloc.py:8-15 perform_register_allocation`.
+/// `rpython/jit/codewriter/regalloc.py:6 perform_register_allocation(graph, kind)`
+/// — thin wrapper over `rpython/tool/algo/regalloc.py:8-15
+/// perform_register_allocation(graph, consider_var, ListOfKind=())`.
 ///
-/// Upstream signature is `(graph, consider_var, ListOfKind=())`.  Pyre
-/// bakes `consider_var` into the single `kind` filter because `Kind` is a
-/// closed enum (Int/Ref/Float) whereas upstream's `consider_var` is an
-/// open predicate over lltype concreteness.  `ListOfKind` is not a
-/// parameter because pyre has exactly one such class (`FlowListOfKind`).
+/// Pyre bakes `consider_var` into the single `kind` filter because
+/// `Kind` is a closed enum (Int/Ref/Float) whereas upstream's
+/// `consider_var` is an open predicate over lltype concreteness.
+/// `ListOfKind` is not a parameter because pyre has exactly one such
+/// class (`FlowListOfKind`).
 ///
-/// The `_graph_` prefix disambiguates from the sibling
-/// `perform_register_allocation` SSARepr scanner further down in this
-/// module.  Invoked from production via
-/// `perform_graph_register_allocation_all_kinds` at
-/// `codewriter.rs:transform_graph_to_jitcode`, where its result feeds
-/// `walker_post_walk_insert_renamings` (the walker's port of
-/// `flatten.py:154 self.insert_renamings(link)`).  The SSARepr scanner
-/// further down still runs alongside this CFG allocator because pyre
+/// Invoked from production via `perform_register_allocation_all_kinds`
+/// at `codewriter.rs:transform_graph_to_jitcode`, where its result
+/// feeds `walker_post_walk_insert_renamings` (the walker's port of
+/// `flatten.py:154 self.insert_renamings(link)`).  The pyre-only
+/// SSARepr-side `perform_ssarepr_register_allocation` further down in
+/// this module still runs alongside this CFG allocator because pyre
 /// has two coalesce sources that cover non-overlapping work:
 ///
 ///   1. This CFG allocator runs `coalesce_variables` over
@@ -277,7 +277,7 @@ impl RegAllocator {
 ///      for STORE_FAST-LOAD_FAST fusions) that have no Link-level
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
-pub(super) fn perform_graph_register_allocation(
+pub(super) fn perform_register_allocation(
     graph: &FlowGraph,
     kind: Kind,
 ) -> GraphAllocationResult {
@@ -330,7 +330,7 @@ pub(super) fn perform_graph_register_allocation(
     }
 }
 
-/// Run `perform_graph_register_allocation` once per `Kind` and collect
+/// Run `perform_register_allocation` once per `Kind` and collect
 /// the per-kind `GraphAllocationResult`s, mirroring
 /// `rpython/jit/codewriter/codewriter.py:44-46`:
 ///
@@ -347,13 +347,13 @@ pub(super) fn perform_graph_register_allocation(
 /// degenerates to a position-indexed array in any RPython-orthodox
 /// port.  This is the input shape that the canonical
 /// `flatten_graph(graph, regallocs, ...)` driver consumes.
-pub fn perform_graph_register_allocation_all_kinds(
+pub fn perform_register_allocation_all_kinds(
     graph: &FlowGraph,
 ) -> [GraphAllocationResult; 3] {
     [
-        perform_graph_register_allocation(graph, Kind::Int),
-        perform_graph_register_allocation(graph, Kind::Ref),
-        perform_graph_register_allocation(graph, Kind::Float),
+        perform_register_allocation(graph, Kind::Int),
+        perform_register_allocation(graph, Kind::Ref),
+        perform_register_allocation(graph, Kind::Float),
     ]
 }
 
@@ -422,7 +422,7 @@ pub fn enforce_input_args_graph(graph: &FlowGraph, regallocs: &mut [GraphAllocat
 /// across every Link in `graph`, using `regallocs[kind].coloring` to
 /// project Variables to register colors.
 ///
-/// Companion to `perform_graph_register_allocation_all_kinds`: with
+/// Companion to `perform_register_allocation_all_kinds`: with
 /// `Block.inputargs` populated at every walker block-creation site
 /// (Phase 4 Session 14), the `link.args ↔ target.inputargs`
 /// correspondence is well-defined for every Link in the graph, so the
@@ -441,7 +441,7 @@ pub(super) fn count_link_renamings_per_kind(
     regallocs: &[GraphAllocationResult; 3],
 ) -> [usize; 3] {
     // Note: the `regallocs` passed in come from
-    // `perform_graph_register_allocation_all_kinds`, which runs the
+    // `perform_register_allocation_all_kinds`, which runs the
     // chordal coloring directly. Upstream `flatten_graph` follows
     // that with `enforce_input_args` (`flatten.py:88-100`), swapping
     // inputarg colors so the startblock's inputargs land at colors
@@ -661,7 +661,7 @@ pub(super) fn allocate_registers(
             &[]
         };
         allocators[kind.index()] =
-            perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
+            perform_ssarepr_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
     }
 
     // flatten.py:88-100 `enforce_input_args` — rotate inputarg colors
@@ -758,9 +758,16 @@ fn enforce_input_args(
     }
 }
 
-/// RPython `regalloc.py:6` `perform_register_allocation(graph, kind)`
-/// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
-/// the three-stage pipeline.
+/// SSARepr-side companion to PyPy's
+/// `rpython/jit/codewriter/regalloc.py:6 perform_register_allocation(graph, kind)`
+/// + `rpython/tool/algo/regalloc.py:8-15`.  Builds an
+/// `SSAReprRegAllocator` and runs the three-stage pipeline.
+///
+/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
+/// pyre's walker emits SSARepr inline, so the consumer is
+/// `SSAReprRegAllocator`, not the orthodox `RegAllocator`.  The
+/// graph-side sibling (`perform_register_allocation`) is the
+/// PyPy-orthodox entry.
 ///
 /// Dual coalesce source, ordered to give CFG link priority over the
 /// pyre-only SSARepr scanner when an interference edge forces a
@@ -785,7 +792,7 @@ fn enforce_input_args(
 ///      dst so the chordal coloring reuses one color.  Runs after
 ///      the CFG pass so the pyre-only source defers to upstream's
 ///      link-driven priority on conflict.
-fn perform_register_allocation(
+fn perform_ssarepr_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
     external_inputs: &[u16],
@@ -1217,7 +1224,7 @@ mod tests {
             Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
 
-        let regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let regallocs = perform_register_allocation_all_kinds(&graph);
         for &kind in &Kind::ALL {
             let result = &regallocs[kind.index()];
             // Each kind has at least one variable (Int: v0 twice via
@@ -1252,7 +1259,7 @@ mod tests {
             Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
 
-        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        let result = perform_register_allocation(&graph, Kind::Int);
         assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
         assert_eq!(result.num_colors, 1);
     }
@@ -1271,7 +1278,7 @@ mod tests {
             Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
 
-        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        let result = perform_register_allocation(&graph, Kind::Int);
         assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
         assert_eq!(result.num_colors, 1);
     }
@@ -1286,7 +1293,7 @@ mod tests {
         link.extravars(Some(exc_type), None);
         start.closeblock(vec![link.into_ref()]);
 
-        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        let result = perform_register_allocation(&graph, Kind::Int);
         assert_eq!(result.coloring.get(&exc_type.id), Some(&0));
         assert_eq!(result.num_colors, 1);
     }
@@ -1319,7 +1326,7 @@ mod tests {
             Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
 
-        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        let result = perform_register_allocation(&graph, Kind::Int);
         assert_ne!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
         assert_eq!(result.num_colors, 2);
     }
@@ -1352,7 +1359,7 @@ mod tests {
             Link::new(vec![r0.into(), i0.into()], Some(next), None).into_ref(),
         ]);
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         enforce_input_args_graph(&graph, &mut regallocs);
 
         let ref_colors = &regallocs[Kind::Ref.index()].coloring;
@@ -1599,7 +1606,7 @@ mod tests {
         start.closeblock(vec![
             Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
-        let regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let regallocs = perform_register_allocation_all_kinds(&graph);
         let counts = count_link_renamings_per_kind(&graph, &regallocs);
         assert_eq!(counts[Kind::Int.index()], 0);
         assert_eq!(counts[Kind::Ref.index()], 0);
@@ -1611,7 +1618,7 @@ mod tests {
         // Synthesize a one-step renaming using a hand-built coloring
         // map so the test pins the helper's pair-emission logic
         // directly (without depending on coalesce/interference
-        // shapes that perform_graph_register_allocation chooses).
+        // shapes that perform_register_allocation chooses).
         // startblock(v_src Int) → next(v_dst Int) via Link args=[v_src].
         let v_src = flow_var(0, Kind::Int);
         let v_dst = flow_var(1, Kind::Int);

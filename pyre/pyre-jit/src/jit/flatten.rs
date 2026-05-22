@@ -5401,7 +5401,7 @@ mod tests {
         // `lower_constant` closure.
         use crate::jit::cpu::Cpu;
         use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let lhs = Variable::new(VariableId(0), Kind::Int);
         let rhs = Variable::new(VariableId(1), Kind::Int);
@@ -5441,7 +5441,7 @@ mod tests {
                 _ => None,
             });
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
         // handling_ovf=true emits `raise <ConstRef(pointer)>` per
@@ -5476,7 +5476,7 @@ mod tests {
         // canonical entry's dispatcher-driven emission.
         use crate::jit::cpu::Cpu;
         use crate::jit::flow::{Block, FunctionGraph, Link};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -5502,7 +5502,7 @@ mod tests {
             portal_frame_reg: u16::MAX,
         });
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
         let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
@@ -5545,7 +5545,7 @@ mod tests {
         // `flatten_graph_with_lowering` path (a per-call
         // `lower_constant` closure handles the resolution).
         use crate::jit::flow::{Block, FunctionGraph, Link};
-        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::regalloc::perform_register_allocation_all_kinds;
 
         let start = Block::shared(Vec::new());
         let graph = FunctionGraph::new("rtyped_canonical", start.clone(), None);
@@ -5562,7 +5562,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, None);
 
         let has_const_ref_feed = ssarepr.insns.iter().any(|insn| {
@@ -7765,7 +7765,7 @@ mod tests {
             .into_ref(),
         ]);
         let mut regallocs =
-            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+            super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
         assert_eq!(ssarepr.name, "orthodox4arg");
         assert!(
@@ -7801,7 +7801,7 @@ mod tests {
         ]);
 
         let mut regallocs =
-            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+            super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         // Use the canonical `flatten_graph(graph, regallocs,
         // include_all_exc_links, cpu)` entry — the loop_header op is a
         // passthrough family and needs no LoweringContext arm to fire.
