@@ -136,17 +136,26 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             // expects (or to short-circuit `getfield_gc_i` on Int
             // concretes via a different path).  Tracked as Task #165.
             | Instruction::PopTop
+            // Task #48 T4 expansion (2026-05-22): LoadFastCheck arm
+            // body (99 bytes, dumped via `dump_load_fast_check_arm_bytes`)
+            // contains `goto_if_not/iL` at pc=52 reading int reg 1
+            // (the `int_lt/ii>i` result at pc=45).  The earlier
+            // (2026-05-17) attempt panicked because `concrete_registers_i`
+            // didn't exist; Task #75 plumbed the Int-bank concrete
+            // shadow + `int_<binop>` result stamping, so the outer-
+            // arm bounds-check folding path now matches
+            // `dispatch_switch_id`'s concrete read.
+            //
+            // Inherits the same depth-N+ sub-jitcode blocker PopTop
+            // has on `raise_catch_loop` + `synth/set_membership`: the
+            // outer arm recurses through `inline_call_r_r → varnames
+            // .get` and `inline_call_ir_r → opcode_load_fast_checked`,
+            // so a deep `getfield_gc_i` against an unboxed-Int-Ref
+            // local surfaces `GotoIfNotValueNotConcrete` the same way.
+            // Allow-list extension is correct for the outer arm; the
+            // sub-jitcode case stays in the Task #165 / #167 epic.
+            | Instruction::LoadFastCheck { .. }
     )
-    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
-    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
-    // codewriter-emitted LoadFastCheck arm body contains a
-    // `goto_if_not/iL` whose value lives in the Int register bank;
-    // walker `dispatch_goto_if_not` falls into the strict-mode
-    // fail-loud path because `concrete_registers_i` doesn't exist.
-    // Blocker is the Int-bank concrete shadow plumbing — see
-    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
-    // for the Int-bank shadow" section.  Allow-list expansion past
-    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it
@@ -523,6 +532,19 @@ mod tests {
         // need Int-bank concrete shadow — task #75), so the LoadFast
         // blocker doesn't apply here.
         assert!(opname_in_shadow_allow_list(&Instruction::PopTop));
+    }
+
+    #[test]
+    fn load_fast_check_is_in_shadow_allow_list() {
+        // Task #48 T4 expansion (2026-05-22): LoadFastCheck arm body
+        // includes `int_lt/ii>i` + `goto_if_not/iL` for the bounds
+        // check.  Both rely on Int-bank concrete shadow (Task #75)
+        // for the walker to read the comparison result back.
+        use pyre_interpreter::bytecode::Arg;
+        let instr = Instruction::LoadFastCheck {
+            var_num: Arg::marker(),
+        };
+        assert!(opname_in_shadow_allow_list(&instr));
     }
 
     #[test]

@@ -7444,6 +7444,69 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_load_fast_check_arm_bytes() {
+        // T4 allow-list extension diagnostic (Task #48): LoadFastCheck's arm
+        // body was the first opcode beyond PopTop blocked on the Int-bank
+        // concrete shadow (`GotoIfNotValueNotConcrete { pc: 28, value:
+        // IntOp(35) }` on fib_loop, 2026-05-17). With Task #75.A-G landed
+        // the concrete_registers_i pool exists, so this dumper is the
+        // first step before re-attempting the allow-list extension.
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        use pyre_interpreter::bytecode::Arg;
+        let instr = Instruction::LoadFastCheck {
+            var_num: Arg::marker(),
+        };
+        let jc = jitcode_for_instruction(&instr)
+            .expect("LoadFastCheck must resolve to an arm jitcode");
+        let code = jc.code.as_slice();
+        eprintln!(
+            "LoadFastCheck arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
+            jc.name,
+            jc.num_regs_r(),
+            jc.num_regs_i(),
+            jc.num_regs_f(),
+            code.len(),
+        );
+        let descrs = all_descrs();
+        for op in decoded_ops(code) {
+            let operand_bytes = &code[op.pc + 1..op.next_pc];
+            eprintln!(
+                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                op.pc, op.next_pc, op.key, operand_bytes,
+            );
+            let mut cursor = 0usize;
+            let mut chars = op.argcodes.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'L' => cursor += 2,
+                    'd' | 'j' => {
+                        let idx =
+                            u16::from_le_bytes([operand_bytes[cursor], operand_bytes[cursor + 1]])
+                                as usize;
+                        let info = descrs
+                            .get(idx)
+                            .map(|d| format!("{:?}", d))
+                            .unwrap_or_else(|| "<oor>".to_string());
+                        eprintln!("      descr[{idx}] = {info}");
+                        cursor += 2;
+                    }
+                    'I' | 'R' | 'F' => {
+                        let n = operand_bytes[cursor] as usize;
+                        cursor += 1 + n;
+                    }
+                    '>' => {
+                        chars.next();
+                        cursor += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_nop_arm_bytes() {
         // Phase D-3 Blocker #2 diagnostic: decode `Instruction::Nop`'s
         // arm jitcode by following per-opname argcode arity (NOT a
