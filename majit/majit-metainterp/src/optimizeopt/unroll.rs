@@ -2196,32 +2196,33 @@ impl ExportedState {
                         // invariant (Const has no _forwarded slot of its
                         // own) for the source, which is a non-Const ResOp
                         // / InputArg here. Preserve the original Const's
-                        // `const_index` so the chain walker can keep
-                        // reconstructing `OpRef::const_ptr(idx)` after GC.
-                        // After `make_constant` rewrite (optimizer.py:432
-                        // shape), every Const target in box_pool carries a
-                        // `const_index`. Extract it as a single Option that
-                        // unwraps as "Const Ref target carrying a const_index"
-                        // — both inner cases are required in production.
-                        let orig_idx: Option<u32> = {
+                        // `const_index` (if any) so the chain walker keeps
+                        // reconstructing `OpRef::const_ptr(idx)` after GC;
+                        // `seed_constant` (optimizer.py:432 body-namespace
+                        // arm) plants `BoxRef::new_const(value)` without an
+                        // index, so the `None` arm is reachable for
+                        // body-position keys whose forwarded slot points
+                        // at an index-less Const.
+                        let swap: Option<(bool, Option<u32>)> = {
                             let f = b.get_forwarded();
                             if let crate::r#box::Forwarded::Box(target) = &*f
                                 && target.is_constant()
                                 && matches!(target.const_value(), Some(Value::Ref(_)))
                             {
-                                let idx = target.const_index().expect(
-                                    "BoxPoolBoxConstRef refresh: Const Ref target missing const_index",
-                                );
-                                Some(idx)
+                                Some((true, target.const_index()))
                             } else {
                                 None
                             }
                         };
-                        if let Some(idx) = orig_idx {
-                            b.set_forwarded_box(crate::r#box::BoxRef::new_const_with_index(
-                                Value::Ref(updated),
-                                idx,
-                            ));
+                        if let Some((_present, orig_idx)) = swap {
+                            let new_target = match orig_idx {
+                                Some(idx) => crate::r#box::BoxRef::new_const_with_index(
+                                    Value::Ref(updated),
+                                    idx,
+                                ),
+                                None => crate::r#box::BoxRef::new_const(Value::Ref(updated)),
+                            };
+                            b.set_forwarded_box(new_target);
                         }
                     }
                 }
