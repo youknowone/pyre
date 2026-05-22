@@ -187,23 +187,33 @@ struct c_tm {
 type time_t = i64;
 
 #[cfg(feature = "host_env")]
-fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
-    host_time::gmtime_from_timestamp(seconds as host_time::TimeT).map(|tm| libc_tm_to_c_tm(&tm))
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
+        .map(|tm| libc_tm_to_c_tm(&tm))
+        .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
 }
 
 #[cfg(not(feature = "host_env"))]
-fn _c_gmtime(_seconds: time_t) -> Option<c_tm> {
-    None
+fn _c_gmtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
+    // Sandbox semantics: no host_env → no OS time conversion available.
+    Err(crate::PyError::not_implemented(
+        "time.gmtime requires host_env feature",
+    ))
 }
 
 #[cfg(feature = "host_env")]
-fn _c_localtime(seconds: time_t) -> Option<c_tm> {
-    host_time::localtime_from_timestamp(seconds as host_time::TimeT).map(|tm| libc_tm_to_c_tm(&tm))
+fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    host_time::localtime_from_timestamp(seconds as host_time::TimeT)
+        .map(|tm| libc_tm_to_c_tm(&tm))
+        .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
 }
 
 #[cfg(not(feature = "host_env"))]
-fn _c_localtime(_seconds: time_t) -> Option<c_tm> {
-    None
+fn _c_localtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
+    // Sandbox semantics: no host_env → no OS time conversion available.
+    Err(crate::PyError::not_implemented(
+        "time.localtime requires host_env feature",
+    ))
 }
 
 // ── Unix helpers ────────────────────────────────────────────────────
@@ -323,8 +333,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
     let tup = if let Some(&arg) = args.first() {
         if unsafe { is_none(arg) } {
             if default_now {
-                return _c_localtime(_get_seconds(&[]))
-                    .ok_or_else(|| crate::PyError::value_error("unconvertible time"));
+                return _c_localtime(_get_seconds(&[]));
             }
             return Err(crate::PyError::type_error(
                 "Tuple or struct_time argument required",
@@ -332,8 +341,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         }
         arg
     } else if default_now {
-        return _c_localtime(_get_seconds(&[]))
-            .ok_or_else(|| crate::PyError::value_error("unconvertible time"));
+        return _c_localtime(_get_seconds(&[]));
     } else {
         return Err(crate::PyError::type_error(
             "Tuple or struct_time argument required",
@@ -384,15 +392,14 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
 /// time.localtime([seconds]) — interp_time.localtime
 pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args);
-    let tm =
-        _c_localtime(seconds).ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+    let tm = _c_localtime(seconds)?;
     Ok(_tm_to_tuple(&tm))
 }
 
 /// time.gmtime([seconds]) — interp_time.gmtime
 pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args);
-    let tm = _c_gmtime(seconds).ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+    let tm = _c_gmtime(seconds)?;
     Ok(_tm_to_tuple(&tm))
 }
 
@@ -487,7 +494,12 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         result as i64
     };
     #[cfg(not(feature = "host_env"))]
-    let tt: i64 = -1;
+    let tt: i64 = {
+        // Sandbox semantics: no host_env → no OS time conversion available.
+        return Err(crate::PyError::not_implemented(
+            "time.mktime requires host_env feature",
+        ));
+    };
 
     if tt == -1 && tm.tm_wday == -1 {
         return Err(crate::PyError::overflow_error(
@@ -538,8 +550,7 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     #[cfg(unix)]
     {
-        let tm = _c_localtime(seconds)
-            .ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+        let tm = _c_localtime(seconds)?;
         _asctime_from_tm(&tm)
     }
     #[cfg(windows)]

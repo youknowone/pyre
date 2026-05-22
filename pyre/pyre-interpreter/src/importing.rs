@@ -1311,7 +1311,10 @@ fn init_pwd(ns: &mut DictStorage) {
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = uid;
-                    Err(crate::PyError::key_error("getpwuid(): uid not found"))
+                    // Sandbox semantics: no host_env → no pwd database access.
+                    Err(crate::PyError::not_implemented(
+                        "pwd.getpwuid requires host_env feature",
+                    ))
                 }
             },
             1,
@@ -1345,7 +1348,13 @@ fn init_pwd(ns: &mut DictStorage) {
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Err(crate::PyError::key_error("getpwnam(): name not found"))
+                {
+                    let _ = &args;
+                    // Sandbox semantics: no host_env → no pwd database access.
+                    Err(crate::PyError::not_implemented(
+                        "pwd.getpwnam requires host_env feature",
+                    ))
+                }
             },
             1,
         ),
@@ -1365,7 +1374,12 @@ fn init_pwd(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_list_new(items));
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Ok(pyre_object::w_list_new(vec![]))
+                {
+                    // Sandbox semantics: no host_env → no pwd database access.
+                    Err(crate::PyError::not_implemented(
+                        "pwd.getpwall requires host_env feature",
+                    ))
+                }
             },
             0,
         ),
@@ -1433,7 +1447,12 @@ fn init_grp(ns: &mut DictStorage) {
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Err(crate::PyError::key_error("getgrgid(): gid not found"))
+                {
+                    let _ = &args;
+                    Err(crate::PyError::not_implemented(
+                        "grp.getgrgid requires host_env feature",
+                    ))
+                }
             },
             1,
         ),
@@ -1472,7 +1491,12 @@ fn init_grp(ns: &mut DictStorage) {
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Err(crate::PyError::key_error("getgrnam(): name not found"))
+                {
+                    let _ = &args;
+                    Err(crate::PyError::not_implemented(
+                        "grp.getgrnam requires host_env feature",
+                    ))
+                }
             },
             1,
         ),
@@ -1492,7 +1516,11 @@ fn init_grp(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_list_new(items));
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Ok(pyre_object::w_list_new(vec![]))
+                {
+                    Err(crate::PyError::not_implemented(
+                        "grp.getgrall requires host_env feature",
+                    ))
+                }
             },
             0,
         ),

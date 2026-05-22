@@ -478,6 +478,16 @@ impl PyError {
         }
     }
 
+    pub fn not_implemented(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::NotImplementedError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::TraceAbort,
