@@ -3624,13 +3624,12 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
 /// [`super::host_env::HOST_RUST_MODULE_GLOBALS`]'s per-module
 /// last-writer-wins semantics for shared top-level names.
 static REGISTERED_STRUCT_FIELD_ATTRS: std::sync::LazyLock<
-    std::sync::Mutex<indexmap::IndexMap<String, indexmap::IndexMap<String, crate::model::ValueType>>>,
+    std::sync::Mutex<
+        indexmap::IndexMap<String, indexmap::IndexMap<String, crate::model::ValueType>>,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(indexmap::IndexMap::new()));
 
-fn register_struct_field_attrs(
-    struct_name: &str,
-    fields: Vec<(String, crate::model::ValueType)>,
-) {
+fn register_struct_field_attrs(struct_name: &str, fields: Vec<(String, crate::model::ValueType)>) {
     let mut table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
     let entry = table.entry(struct_name.to_string()).or_default();
     entry.clear();
@@ -3944,10 +3943,9 @@ mod tests {
     /// other test cases' state by using a uniquely-named struct.
     #[test]
     fn struct_field_attrs_snapshot_carries_named_field_value_types() {
-        let item: ItemStruct = syn::parse_str(
-            "struct PyreFieldStubProbe { count: i64, name: String, flag: bool }",
-        )
-        .expect("test fixture must parse");
+        let item: ItemStruct =
+            syn::parse_str("struct PyreFieldStubProbe { count: i64, name: String, flag: bool }")
+                .expect("test fixture must parse");
         let _ = build_host_class_from_struct(&item);
         let snap = struct_field_attrs_snapshot("PyreFieldStubProbe")
             .expect("registration must publish under the struct's local name");
@@ -3973,9 +3971,8 @@ mod tests {
     /// the prior field set (last-writer-wins on the outer key).
     #[test]
     fn struct_field_attrs_snapshot_re_registration_overwrites() {
-        let first: ItemStruct =
-            syn::parse_str("struct PyreFieldStubOverwriteProbe { a: i64 }")
-                .expect("fixture parses");
+        let first: ItemStruct = syn::parse_str("struct PyreFieldStubOverwriteProbe { a: i64 }")
+            .expect("fixture parses");
         let second: ItemStruct =
             syn::parse_str("struct PyreFieldStubOverwriteProbe { b: bool, c: f64 }")
                 .expect("fixture parses");
@@ -3998,10 +3995,9 @@ mod tests {
     /// after the final `::`.
     #[test]
     fn struct_field_attrs_snapshot_bare_leaf_fallback_for_qualified_key() {
-        let item: ItemStruct = syn::parse_str(
-            "struct PyreFieldStubBareLeafProbe { count: i64, name: String }",
-        )
-        .expect("fixture parses");
+        let item: ItemStruct =
+            syn::parse_str("struct PyreFieldStubBareLeafProbe { count: i64, name: String }")
+                .expect("fixture parses");
         let _ = build_host_class_from_struct(&item);
         // Sanity: bare lookup hits.
         assert!(
@@ -4015,9 +4011,8 @@ mod tests {
         assert_eq!(snap.get("count"), Some(&crate::model::ValueType::Int));
         assert_eq!(snap.get("name"), Some(&crate::model::ValueType::Ref));
         // Multi-segment qualified lookup also falls back.
-        let snap_nested =
-            struct_field_attrs_snapshot("outer::inner::PyreFieldStubBareLeafProbe")
-                .expect("multi-segment qualified lookup must fall back to the bare leaf");
+        let snap_nested = struct_field_attrs_snapshot("outer::inner::PyreFieldStubBareLeafProbe")
+            .expect("multi-segment qualified lookup must fall back to the bare leaf");
         assert_eq!(snap_nested.len(), 2);
         // Unknown qualified key remains a miss.
         assert!(
@@ -4030,8 +4025,8 @@ mod tests {
     /// side-table must not be populated for them.
     #[test]
     fn struct_field_attrs_snapshot_skips_unnamed_field_structs() {
-        let tuple: ItemStruct = syn::parse_str("struct PyreFieldStubTupleProbe(i64, bool);")
-            .expect("fixture parses");
+        let tuple: ItemStruct =
+            syn::parse_str("struct PyreFieldStubTupleProbe(i64, bool);").expect("fixture parses");
         let unit: ItemStruct =
             syn::parse_str("struct PyreFieldStubUnitProbe;").expect("fixture parses");
         let _ = build_host_class_from_struct(&tuple);

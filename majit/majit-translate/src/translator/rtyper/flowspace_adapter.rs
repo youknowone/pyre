@@ -1082,7 +1082,17 @@ pub fn translate_op(
                             )?;
                             module.module_get(&full_segments[full_segments.len() - 1])
                         };
-                    let callable_host = if let Some(entry) = call_registry.lookup(&key) {
+                    let callable_host = if let Some(entry) =
+                        call_registry.lookup_with_leaf_match(&key)
+                    {
+                        // `lookup_with_leaf_match` tries the verbatim key +
+                        // alias indirection (`Self::lookup`), then a cross-
+                        // module leaf-match against free-function entries —
+                        // the registry-build analog of the codewriter-side
+                        // `target_to_path` leaf-match (`call.rs:3043-3104`),
+                        // closing the glob-import gap (`use pyre_object::*;`
+                        // in caller `baseobjspace` referencing a bare name
+                        // with no `use_imports` entry).
                         entry.host_object.clone()
                     } else if segments.len() == 1
                         && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
@@ -1124,10 +1134,10 @@ pub fn translate_op(
                              fixture building the registry directly) must register the path \
                              with its parameter Signature before specialize_legacy_graph \
                              consults the rtyper. Result slot = {}",
-                            segments,
-                            fmt_op_result_slot(graph, op),
-                        )));
-                    };
+                                segments,
+                                fmt_op_result_slot(graph, op),
+                            )));
+                        };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);

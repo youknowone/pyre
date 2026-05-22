@@ -1367,10 +1367,7 @@ mod tests {
             if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(path)
                     .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
-                let relative = path
-                    .strip_prefix(dir)
-                    .unwrap_or(path)
-                    .with_extension("");
+                let relative = path.strip_prefix(dir).unwrap_or(path).with_extension("");
                 let mut segments: Vec<String> = relative
                     .components()
                     .map(|c| c.as_os_str().to_string_lossy().to_string())
@@ -1380,7 +1377,10 @@ mod tests {
                 // ancestor chain stand as the module path.  Empty path
                 // (`lib.rs` at the crate root) registers under the empty
                 // prefix, matching today's behaviour.
-                if matches!(segments.last().map(String::as_str), Some("lib" | "main" | "mod")) {
+                if matches!(
+                    segments.last().map(String::as_str),
+                    Some("lib" | "main" | "mod")
+                ) {
                     segments.pop();
                 }
                 sources.push(source);

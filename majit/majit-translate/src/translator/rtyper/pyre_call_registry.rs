@@ -389,6 +389,76 @@ impl PyreCallRegistry {
         found
     }
 
+    /// Same as [`Self::lookup`] with an additional cross-module leaf-
+    /// match fallback for callsites whose verbatim path missed.
+    ///
+    /// Mirrors `jit_codewriter::call::CallControl::target_to_path`'s
+    /// `FunctionPath` leaf-match heuristic (`call.rs:3043-3104`) but
+    /// applied at the registry-build stage so
+    /// `flowspace_adapter::translate_op`'s `Call` arm can resolve a
+    /// caller-qualified bare-call (`["baseobjspace", "is_int_or_long"]`)
+    /// to a registered alias (`["pyre_object", "is_int_or_long"]`)
+    /// originating from a glob-import (`use pyre_object::*;`).
+    ///
+    /// Restrictions match the codewriter-side leaf-match:
+    ///
+    /// - Only single-segment (`["bare"]`) or two-segment
+    ///   (`["caller_module", "bare"]`) keys participate.  Three-plus-
+    ///   segment paths are explicit qualifications and must NOT
+    ///   fuzzy-match — they either resolve verbatim or surface as a
+    ///   real registry miss.
+    /// - Free-function entries only: the `HostObject` must satisfy
+    ///   `is_user_function()`.  Method-shaped hosts (registered via
+    ///   `[impl_type, method_name]` aliases) keep their identity
+    ///   distinct from a same-leaf free function.
+    /// - Multi-match aliases of the same source (identical
+    ///   `host_object` Arc identity) converge on a single resolution.
+    ///
+    /// `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables the leaf-
+    /// match here as well, keeping the strict-mode envelope
+    /// consistent across registry-build and codewriter call
+    /// resolution.
+    pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
+        if let Some(entry) = self.lookup(key) {
+            return Some(entry);
+        }
+        if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_some() {
+            return None;
+        }
+        let segments = key.segments();
+        if segments.is_empty() || segments.len() > 2 {
+            return None;
+        }
+        let leaf = segments.last()?;
+        let entries_borrow = self.entries.borrow();
+        let matches: Vec<&Rc<PyreFunctionEntry>> = entries_borrow
+            .iter()
+            .filter(|(k, e)| {
+                e.host_object.is_user_function()
+                    && k.segments().last().map(|s| s == leaf).unwrap_or(false)
+            })
+            .map(|(_, e)| e)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].clone());
+        }
+        if !matches.is_empty() {
+            // Multi-alias convergence: free-function registration
+            // dual-publishes each graph under several segment-key
+            // shapes (canonical + crate-stripped + alias).  When all
+            // matches point at the same `host_object` identity
+            // (`HostObject`'s `PartialEq` is Arc-pointer equality at
+            // `flowspace/model.rs:208`), the alias cluster is
+            // unambiguous.
+            let first_host = matches[0].host_object.clone();
+            let all_same = matches.iter().all(|e| e.host_object == first_host);
+            if all_same {
+                return Some(matches[0].clone());
+            }
+        }
+        None
+    }
+
     /// Look up or insert. The first caller for a given path:
     ///
     /// 1. constructs a synthetic `GraphFunc` (`name` = `key.name()`,
