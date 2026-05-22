@@ -312,23 +312,15 @@ impl<'a> TraceIterator<'a> {
         // materialises slots on demand as it pushes its own inputargs
         // and op results. Phase 2 owns the Rc::cloned BoxRefs as its
         // single-writer post-Phase-1-completion (audit memo Risk 1).
-        let p1_prefix_slots = p1_full_prefix.map(|p| p.into_slots()).unwrap_or_default();
-        let p1_end = p1_prefix_slots.len().min(start_fresh as usize);
         // Sparse pool: Phase 1's snapshot already carries `None` for
         // positions never assigned a Box (constant-namespace gap,
         // skipped raw slots); positions past the snapshot stay `None`
         // (no Box exists yet) until a producer materializes via
         // `ensure_box`.
-        let mut box_pool: crate::r#box::BoxPool = crate::r#box::BoxPool::from_slots(
-            p1_prefix_slots
-                .into_iter()
-                .take(p1_end)
-                .chain(std::iter::repeat_n(
-                    None,
-                    (start_fresh as usize).saturating_sub(p1_end),
-                ))
-                .collect(),
-        );
+        let mut box_pool: crate::r#box::BoxPool = p1_full_prefix.unwrap_or_default();
+        let p1_end = box_pool.len().min(start_fresh as usize);
+        box_pool.truncate(p1_end);
+        box_pool.pad_none_to(start_fresh as usize);
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =

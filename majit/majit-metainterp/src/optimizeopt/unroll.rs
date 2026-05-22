@@ -5002,8 +5002,11 @@ mod tests {
         let prefix =
             p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
 
+        let prefix_slots: Vec<Option<crate::r#box::BoxRef>> = (0..prefix.len())
+            .map(|i| prefix.get(i).cloned())
+            .collect();
         assert_eq!(
-            prefix.into_slots(),
+            prefix_slots,
             vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
         );
     }

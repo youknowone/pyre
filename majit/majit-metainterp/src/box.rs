@@ -786,6 +786,22 @@ impl BoxPool {
         self.inner.truncate(new_len);
     }
 
+    /// Grow the slot table with `None` entries until `len() >=
+    /// new_len`. No-op when already at or past `new_len`. Mirrors
+    /// `BoxPool::set` upper-end grow but without planting any BoxRef —
+    /// used by bridge / phase-2 setup that reserves positions before a
+    /// producer materialises them via `ensure_box`.
+    pub fn pad_none_to(&mut self, new_len: usize) {
+        assert!(
+            new_len < Self::SANE_IDX_BOUND,
+            "BoxPool::pad_none_to({new_len}) exceeds SANE_IDX_BOUND ({})",
+            Self::SANE_IDX_BOUND
+        );
+        if new_len > self.inner.len() {
+            self.inner.resize(new_len, None);
+        }
+    }
+
     /// Build from a `Vec<Option<BoxRef>>` snapshot table.
     pub fn from_slots(slots: Vec<Option<BoxRef>>) -> Self {
         assert!(
@@ -796,12 +812,6 @@ impl BoxPool {
             Self::SANE_IDX_BOUND
         );
         Self { inner: slots }
-    }
-
-    /// Consume the pool and return its raw `Vec<Option<BoxRef>>` slot
-    /// table. Inverse of [`Self::from_slots`].
-    pub fn into_slots(self) -> Vec<Option<BoxRef>> {
-        self.inner
     }
 }
 
