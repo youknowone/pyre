@@ -3704,22 +3704,9 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-        // issue #73 Phase 7a: store the JitCode byte offset alongside
-        // the Python PC so resume readers can consume it directly
-        // instead of repeating `PyJitCode::resume_jitcode_pc_for` at
-        // decode time.  The translation comes from the same per-jitcode
-        // `pc_map` the legacy lookup consults.  A miss (None) means the
-        // installed PyJitCode is still a skeleton / portal-bridge with
-        // no populated map — keep `0` so the resume path can detect the
-        // miss against a real offset, since `0` is a valid jitcode
-        // entry point.
-        let top_jitcode_pc = unsafe { &(*self.sym().jitcode).payload }
-            .resume_jitcode_pc_for(top_pc)
-            .unwrap_or(0) as u32;
         let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc as u32,
-            jitcode_pc: top_jitcode_pc,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,
@@ -3729,7 +3716,7 @@ impl MIFrame {
         // opencoder.py:806: parent frames keep their original pc.
         // Snapshot boxes = active boxes only (skip scalar inputarg header).
         for parent in self.parent_frames.clone() {
-            let (parent_types_full, parent_jitcode_index, parent_jitcode_pc, parent_active) =
+            let (parent_types_full, parent_jitcode_index, parent_active) =
                 self.materialize_parent_snapshot_state(ctx, parent);
             let parent_types: &[Type] = if parent_types_full.len() > n {
                 &parent_types_full[n..]
@@ -3739,7 +3726,6 @@ impl MIFrame {
             frames.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent.resume_pc as u32,
-                jitcode_pc: parent_jitcode_pc,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
@@ -3811,7 +3797,7 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         parent: ResumeFrameState,
     ) -> (Vec<Type>, u32) {
-        let (full_types, jitcode_index, _jitcode_pc, _active_boxes) =
+        let (full_types, jitcode_index, _active_boxes) =
             self.materialize_parent_snapshot_state(ctx, parent);
         (full_types, jitcode_index)
     }
@@ -3820,7 +3806,7 @@ impl MIFrame {
         &mut self,
         ctx: &mut TraceCtx,
         parent: ResumeFrameState,
-    ) -> (Vec<Type>, u32, u32, Vec<OpRef>) {
+    ) -> (Vec<Type>, u32, Vec<OpRef>) {
         // pyjitpl.py:2586 capture_resumedata parity: parent frames
         // contribute only their per-frame regular boxes (locals + stack)
         // to the snapshot.  The virtualizable scalars are emitted once
@@ -3850,13 +3836,7 @@ impl MIFrame {
         let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false);
         let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
         let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
-        // issue #73 Phase 7a: parent frames record their `resume_pc`
-        // (Python PC) into the snapshot; pair it with the matching
-        // JitCode offset via the parent jitcode's `pc_map`.
-        let jitcode_pc = unsafe { &(*parent_frame.sym().jitcode).payload }
-            .resume_jitcode_pc_for(parent.resume_pc)
-            .unwrap_or(0) as u32;
-        (full_types, jitcode_index, jitcode_pc, active_boxes)
+        (full_types, jitcode_index, active_boxes)
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:

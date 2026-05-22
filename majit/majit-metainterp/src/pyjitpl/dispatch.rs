@@ -5781,14 +5781,6 @@ pub fn build_state_field_snapshot(
         snapshot_frames.push(crate::recorder::SnapshotFrame {
             jitcode_index,
             pc: frame.pc as u32,
-            // Phase 7a (issue #73): dispatch.rs runs the MIFrame path
-            // where `frame.pc` is already the RPython-orthodox JitCode
-            // PC (`pyjitpl.py:185 setposition`), so `pc == jitcode_pc`
-            // by construction here.  Pyre's tracer-side writer in
-            // `pyre-jit-trace/src/trace_opcode.rs::build_framestack_snapshot`
-            // is the site where the two coordinates diverge — that's
-            // where `pc_map[orgpc]` populates this slot.
-            jitcode_pc: frame.pc as u32,
             boxes,
         });
     }

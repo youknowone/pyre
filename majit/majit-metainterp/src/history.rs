@@ -624,7 +624,6 @@ impl TreeLoop {
                         .map(|f| crate::recorder::SnapshotFrame {
                             jitcode_index: f.jitcode_index,
                             pc: f.pc,
-                            jitcode_pc: f.jitcode_pc,
                             boxes: f.boxes.iter().map(&remap_tagged).collect(),
                         })
                         .collect(),
@@ -1873,40 +1872,11 @@ impl TraceCtx {
         jitcode_index: u32,
         pc: u32,
     ) {
-        // `jitcode_pc: 0` placeholder applies to the segmented-driver +
-        // force-finish callers that have no PyJitCode handle to resolve
-        // `pc_map[py_pc]`; resume through them goes via the legacy
-        // `PyJitCode::resume_jitcode_pc_for` lookup that
-        // `build_resumed_frames` performs at decode time.  Callers that
-        // do know the JitCode PC at recording time (e.g. the
-        // jitcode-bytecode walker) should use
-        // [`capture_snapshot_for_last_guard_with_jitcode_pc`] so the
-        // resume path can short-circuit the `pc_map` lookup.
-        self.capture_snapshot_for_last_guard_with_jitcode_pc(active_boxes, jitcode_index, pc, 0);
-    }
-
-    /// Variant of [`capture_snapshot_for_last_guard`] that records both
-    /// the Python PC (`py_pc`) and the matched JitCode bytecode offset
-    /// (`jitcode_pc`) for the snapshot frame.
-    ///
-    /// Used by the jitcode-bytecode walker: at guard emission time the
-    /// walker knows the JitCode position directly (`op.pc`), so the
-    /// resume path can consume `frame.jitcode_pc` and skip the
-    /// `pc_map[py_pc]` lookup in `build_resumed_frames`
-    /// (`call_jit.rs:894-900 cache_valid` short-circuit).
-    pub fn capture_snapshot_for_last_guard_with_jitcode_pc(
-        &mut self,
-        active_boxes: &[OpRef],
-        jitcode_index: u32,
-        py_pc: u32,
-        jitcode_pc: u32,
-    ) {
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
-                pc: py_pc,
-                jitcode_pc,
+                pc,
                 boxes,
             }],
             vable_boxes: Vec::new(),
@@ -1915,7 +1885,7 @@ impl TraceCtx {
         self.set_last_guard_resume_position(snapshot_id);
     }
 
-    /// Multi-frame variant of [`capture_snapshot_for_last_guard_with_jitcode_pc`].
+    /// Multi-frame variant of [`capture_snapshot_for_last_guard`].
     ///
     /// Mirrors `opencoder.py:819-832 capture_resumedata` which walks
     /// `framestack[-1] .. framestack[0]` and emits one `SnapshotFrame`
@@ -1923,24 +1893,23 @@ impl TraceCtx {
     /// executing); `frames[1..]` are the paused parents in walker-call-
     /// order (immediate caller, then its caller, etc.).
     ///
-    /// Each frame triple `(jitcode_index, py_pc, jitcode_pc, boxes)`
-    /// is encoded into `Snapshot.frames` in the order given.  Callers
-    /// are responsible for deduplicating box positions across frames
+    /// Each frame triple `(jitcode_index, py_pc, boxes)` is encoded
+    /// into `Snapshot.frames` in the order given.  Callers are
+    /// responsible for deduplicating box positions across frames
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
     /// `resume.rs:1898 _number_boxes`).
     pub fn capture_snapshot_for_last_guard_multi_frame(
         &mut self,
-        frames: &[(u32, u32, u32, &[OpRef])],
+        frames: &[(u32, u32, &[OpRef])],
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, py_pc, jitcode_pc, boxes)| {
+            .map(|(jitcode_index, py_pc, boxes)| {
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
                     pc: *py_pc,
-                    jitcode_pc: *jitcode_pc,
                     boxes: encoded,
                 }
             })

@@ -6141,40 +6141,9 @@ fn build_resumed_frames(
             // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
-        // Issue #73 Phase 7b: read the JitCode PC directly off the
-        // decoded snapshot frame (`frame.jitcode_pc`) instead of
-        // repeating the runtime `PyJitCode::resume_jitcode_pc_for(py_pc)`
-        // lookup.  The encoder (`ResumeDataLoopMemo::number` →
-        // `rd_numb`) writes both `py_pc` and `jitcode_pc` per frame and
-        // the decoder (`rebuild_from_numbering` in majit-ir) returns
-        // both via `RebuiltFrame`, so this site can consume the paired
-        // value with no additional translation.
-        //
-        // `0` carries the "miss / unknown" sentinel coming from
-        // segmented-driver guards and other paths where the writer had
-        // no `PyJitCode` to consult — fall back to the legacy lookup
-        // there so resume continues to function when the cache is
-        // genuinely absent (the byte-equal `0` of a real entry-point
-        // jitcode collides with this sentinel; readers tolerate the
-        // false negative because the legacy lookup returns the same 0).
-        //
-        // Pseudo-instruction adjustment (Cache / ExtendedArg /
-        // NotTaken backtracking, `call_jit.rs:793-803`) still runs at
-        // read time off the unadjusted `py_pc`; resume_in_blackhole
-        // falls back to the read-time `resume_jitcode_pc_for` lookup
-        // when py_pc shifts after that adjustment.
-        let jitcode_pc = if frame.jitcode_pc != 0 {
-            Some(frame.jitcode_pc as usize)
-        } else if !w_code.is_null() {
-            pyre_jit_trace::state::pyjitcode_for_code(w_code)
-                .and_then(|pjc| pjc.resume_jitcode_pc_for(py_pc))
-        } else {
-            None
-        };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
-            jitcode_pc,
             rd_numb_pc: if frame.pc >= 0 {
                 Some(frame.pc as usize)
             } else {
@@ -6888,18 +6857,11 @@ mod tests {
         code: &pyre_interpreter::CodeObject,
         regs: &[u32],
     ) -> (usize, Vec<u32>) {
-        // Phase 8: this helper walks every Python PC; the corresponding
-        // JitCode PC requires the runtime pc_map lookup that the new
-        // jitcode_pc-first API was meant to replace.  Pass 0 here so
-        // the lookup falls back to `pc_map[py_pc]` — the helper is only
-        // used by test fixtures that don't carry a snapshot's
-        // jitcode_pc.
         let live_by_pc: Vec<(usize, Vec<u32>)> = (0..code.instructions.len())
             .map(|pc| {
                 let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
                     jitcode_index,
                     pc as i32,
-                    0,
                 );
                 (pc, live)
             })
@@ -7089,21 +7051,19 @@ mod tests {
         let color_a: u32 = (*local_color_map.get(0).expect("color for local a")).into();
         let color_b: u32 = (*local_color_map.get(1).expect("color for local b")).into();
         let color_c: u32 = (*local_color_map.get(2).expect("color for local c")).into();
-        // Test scan over py_pc range — pc_map fallback (jitcode_pc=0).
         let resume_pc = (0..code.instructions.len())
             .find(|&pc| {
-                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32, 0)
+                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
                     .contains(&color_i)
             })
             .expect("compiled liveness should expose local i at some Python PC");
-        let live_regs =
-            trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32, 0);
+        let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
         assert!(
             live_regs.contains(&color_i),
             "selected resume pc must decode the raw-int local slot"
         );
         assert_eq!(
-            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32, 0),
+            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32),
             live_regs.len(),
             "frame-value count must come from the same compiled jitcode liveness block"
         );

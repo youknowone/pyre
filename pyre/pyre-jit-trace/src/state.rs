@@ -758,7 +758,7 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
 /// `LiveVars` analysis over the Python bytecode. This path is used
 /// for inlined callee frames whose majit_jitcode has not been built
 /// at trace time.
-pub fn frame_value_count_at(jitcode_index: i32, pc: i32, jitcode_pc: i32) -> usize {
+pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -768,17 +768,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, jitcode_pc: i32) -> usi
             None => return 0,
         };
         let payload = &jc.payload;
-        // Issue #73 Phase 8: snapshot carries jitcode_pc paired with
-        // py_pc.  When the writer resolved the JitCode offset, consume
-        // it directly without the runtime `pc_map[py_pc]` lookup;
-        // otherwise fall back to the legacy lookup so guard PCs whose
-        // writer could not resolve the offset (encoded as 0) still
-        // produce a count.
-        let resolved_jit_pc: Option<usize> = if jitcode_pc > 0 {
-            Some(jitcode_pc as usize)
-        } else {
-            payload.metadata.pc_map.get(pc as usize).copied()
-        };
+        let resolved_jit_pc: Option<usize> = payload.metadata.pc_map.get(pc as usize).copied();
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
@@ -955,7 +945,6 @@ impl FrameLivenessRegIndices {
 pub fn frame_liveness_reg_indices_by_bank_at(
     jitcode_index: i32,
     pc: i32,
-    jitcode_pc: i32,
 ) -> FrameLivenessRegIndices {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -989,14 +978,7 @@ pub fn frame_liveness_reg_indices_by_bank_at(
                 float: Vec::new(),
             };
         }
-        // Issue #73 Phase 8: snapshot carries jitcode_pc; consume it
-        // directly when the writer resolved the JitCode offset.
-        // Otherwise fall back to the legacy `pc_map[py_pc]` lookup.
-        let resolved_jit_pc: Option<usize> = if jitcode_pc > 0 {
-            Some(jitcode_pc as usize)
-        } else {
-            payload.metadata.pc_map.get(pc as usize).copied()
-        };
+        let resolved_jit_pc: Option<usize> = payload.metadata.pc_map.get(pc as usize).copied();
         let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };
@@ -1031,8 +1013,8 @@ pub fn frame_liveness_reg_indices_by_bank_at(
     })
 }
 
-pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32, jitcode_pc: i32) -> Vec<u32> {
-    frame_liveness_reg_indices_by_bank_at(jitcode_index, pc, jitcode_pc).flattened()
+pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
+    frame_liveness_reg_indices_by_bank_at(jitcode_index, pc).flattened()
 }
 
 /// Test-only fixture seeder for `_with_compiled_trace_jitcode` unit tests.
@@ -1084,9 +1066,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
         sym.registers_r[reg_idx] = opref;
     }
 
-    // Test seeder: jitcode_pc=0 sentinel forces the legacy pc_map[py_pc]
-    // lookup path, matching the pre-Phase-8 contract these fixtures rely on.
-    let banks = frame_liveness_reg_indices_by_bank_at(jitcode_index, live_pc, 0);
+    let banks = frame_liveness_reg_indices_by_bank_at(jitcode_index, live_pc);
     for &reg in &banks.int {
         let r = reg as usize;
         if r >= sym.registers_i.len() {
@@ -5240,7 +5220,6 @@ impl JitState for PyreJitState {
         let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_at(
             frame0.jitcode_index,
             frame0.pc,
-            frame0.jitcode_pc,
         );
         let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
         let bridge_reg_len = nlocals + stack_only;
@@ -8828,7 +8807,6 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
-                jitcode_pc: 0,
                 values: vec![
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),

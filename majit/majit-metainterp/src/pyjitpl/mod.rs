@@ -18253,7 +18253,6 @@ mod tests {
                 header_pc: Some(17),
                 source_guard: None,
                 pc: 17,
-                jitcode_pc: 0,
                 jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                 slot_types: Some(vec![Type::Int]),
@@ -18281,7 +18280,6 @@ mod tests {
                 header_pc: Some(17),
                 source_guard: None,
                 pc: 17,
-                jitcode_pc: 0,
                 jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                 slot_types: Some(vec![Type::Int]),
@@ -18310,7 +18308,6 @@ mod tests {
                     header_pc: Some(11),
                     source_guard: None,
                     pc: 11,
-                    jitcode_pc: 0,
                     jitcode_index: 0,
                     slots: vec![
                         majit_backend::ExitValueSourceLayout::ExitValue(0),
@@ -18323,7 +18320,6 @@ mod tests {
                     header_pc: Some(23),
                     source_guard: None,
                     pc: 23,
-                    jitcode_pc: 0,
                     jitcode_index: 1,
                     slots: vec![
                         majit_backend::ExitValueSourceLayout::ExitValue(2),
@@ -18361,7 +18357,6 @@ mod tests {
                 header_pc: Some(41),
                 source_guard: None,
                 pc: 41,
-                jitcode_pc: 0,
                 jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                 slot_types: Some(vec![Type::Int]),
@@ -19239,7 +19234,6 @@ mod tests {
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,
-                    jitcode_pc: 0,
                     boxes: vec![crate::recorder::SnapshotTagged::Box(
                         OpRef::int_op(0),
                         majit_ir::Type::Int,

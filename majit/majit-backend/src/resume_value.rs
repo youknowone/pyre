@@ -173,11 +173,6 @@ pub struct FrameInfo {
     /// populates it with the Python bytecode PC because pyre's tracer
     /// records Python bytecode rather than JitCode.
     pub pc: u64,
-    /// JitCode byte offset paired with `pc` — populated by pyre's
-    /// tracer-side encoder so resume readers can consume the JitCode
-    /// PC directly instead of repeating `PyJitCode::resume_jitcode_pc_for`
-    /// at resume time (issue #73 Phase 7b).
-    pub jitcode_pc: u64,
     /// Mapping from slot index to a tagged resume source.
     pub slot_map: Vec<FrameSlotSource>,
 }

@@ -674,26 +674,6 @@ pub struct ResumedFrame {
     /// ExtendedArg / NotTaken backtracking near line 793) depends on
     /// the raw `py_pc` so it stays the canonical pre-adjustment value.
     pub py_pc: usize,
-    /// Pre-translated JitCode byte offset for the post-adjustment
-    /// `py_pc`, populated by `build_resumed_frames` via
-    /// `PyJitCode::resume_jitcode_pc_for`.  Consumers
-    /// (`call_jit::resume_in_blackhole`, `resolve_jitcode`) read this
-    /// directly instead of repeating `pc_map` lookups.
-    ///
-    /// `None` when the writer could not resolve `pyjitcode_for_code` /
-    /// the pc_map entry — readers fall back to recomputing the lookup
-    /// themselves and surface the same "pc_map miss" failure shape as
-    /// before this field landed.
-    ///
-    /// **NEW-DEVIATION**: upstream `blackhole.py:1712 setposition(
-    /// miframe.jitcode, miframe.pc)` consumes a JitCode PC directly
-    /// (`miframe.pc` IS the JitCode position) because pypy's tracer
-    /// interprets JitCode bytecode.  Storing the translated value here
-    /// is the closest pyre can get without rewriting the tracer to
-    /// interpret JitCode instead of Python bytecode — and reduces the
-    /// downstream migration target to a single writer once
-    /// pseudo-instruction handling moves into resume-data finalization.
-    pub jitcode_pc: Option<usize>,
     /// Raw frame.pc from rd_numb (= orgpc from snapshot).
     /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
     ///   pc=0 is valid (function start / loop header at bytecode 0).
@@ -887,16 +867,8 @@ pub fn resume_in_blackhole(
                 return BlackholeResult::Failed;
             }
         };
-        // Prefer the pre-translated jitcode_pc from the writer
-        // (`build_resumed_frames`) when the pseudo-instruction
-        // adjustment above did not move py_pc.  Otherwise re-translate
-        // via pc_map.
-        let cache_valid = section.jitcode_pc.is_some() && py_pc == section.py_pc;
-        let jitcode_pc = if let Some(jitcode_pc) = section
-            .jitcode_pc
-            .filter(|_| cache_valid)
-            .or_else(|| pyjitcode.resume_jitcode_pc_for(py_pc))
-        {
+        // Translate the post-adjustment py_pc through pc_map.
+        let jitcode_pc = if let Some(jitcode_pc) = pyjitcode.resume_jitcode_pc_for(py_pc) {
             jitcode_pc
         } else {
             if nbody_debug {
@@ -1941,39 +1913,27 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // through the trace-side MetaInterpStaticData.jitcodes store.
-    //
-    // Issue #73 Phase 7c: the per-frame `jitcode_pc` is carried alongside
-    // `pc` in rd_numb.  Prefer it directly; fall back to the legacy
-    // `PyJitCode::resume_jitcode_pc_for(py_pc)` lookup only when the
-    // writer could not resolve the value (encoded as 0 — collides with
-    // the legitimate entry-point JitCode PC, which the legacy path
-    // returns equivalently, so the fallback is safe).
-    let resolve_jitcode =
-        |jitcode_index: i32, pc: i32, jitcode_pc: i32| -> Option<resume::ResolvedJitCode> {
-            if pc < 0 {
-                return None;
-            }
-            let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-            if pyjitcode.has_abort_opcode() {
-                return None;
-            }
-            let resolved_pc = if jitcode_pc > 0 {
-                jitcode_pc as usize
-            } else {
-                pyjitcode.resume_jitcode_pc_for(pc as usize)?
-            };
-            // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
-            // `state::code_for_jitcode_index` indices name the runtime
-            // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
-            // are not the same index space as `jitcode_runtime::ALL_JITCODES`
-            // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
-            // canonical store by `jitcode_index` until pyre actually shares a
-            // single JitCode object graph end-to-end.
-            Some(
-                resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
-                    .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
-            )
-        };
+    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
+        if pc < 0 {
+            return None;
+        }
+        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        if pyjitcode.has_abort_opcode() {
+            return None;
+        }
+        let resolved_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
+        // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
+        // `state::code_for_jitcode_index` indices name the runtime
+        // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
+        // are not the same index space as `jitcode_runtime::ALL_JITCODES`
+        // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
+        // canonical store by `jitcode_index` until pyre actually shares a
+        // single JitCode object graph end-to-end.
+        Some(
+            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
+                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
+        )
+    };
 
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
@@ -3994,12 +3954,8 @@ pub fn cranelift_resumedata_deopt(
         return false;
     }
     let op_live = op_live_i32 as u8;
-    // Issue #73 Phase 7c: take `jitcode_pc` directly from rd_numb when
-    // non-zero; fall back to the legacy `pc_map[py_pc]` lookup only when
-    // the writer could not resolve the JitCode offset at encode time.
     let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32,
-                           jitcode_pc: i32|
+                           pc: i32|
      -> Option<(
         std::sync::Arc<majit_metainterp::jitcode::JitCode>,
         usize,
@@ -4012,11 +3968,7 @@ pub fn cranelift_resumedata_deopt(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let resolved_pc = if jitcode_pc > 0 {
-            jitcode_pc as usize
-        } else {
-            pyjitcode.metadata.pc_map.get(pc as usize).copied()?
-        };
+        let resolved_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
         Some((pyjitcode.jitcode.clone(), resolved_pc, op_live))
     };
 
