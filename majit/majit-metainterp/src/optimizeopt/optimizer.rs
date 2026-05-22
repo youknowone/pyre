@@ -4369,7 +4369,7 @@ mod tests {
     fn h3_0b_pending_box_pool_transfers_to_ctx() {
         use crate::r#box::BoxRef;
         let mut opt = Optimizer::default_pipeline();
-        let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
+        let b0 = BoxRef::new_inputarg(Type::Int, 0);
         let pool = vec![b0.clone()];
         opt.set_pending_box_pool(pool);
         let ops: Vec<Op> = Vec::new();

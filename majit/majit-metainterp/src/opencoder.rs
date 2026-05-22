@@ -350,7 +350,7 @@ impl<'a> TraceIterator<'a> {
                     });
                     let r = OpRef::input_arg_typed(_fresh, tp);
                     // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
-                    box_pool.push(BoxRef::new_inputarg(tp, Some(_fresh)));
+                    box_pool.push(BoxRef::new_inputarg(tp, _fresh));
                     _fresh += 1;
                     r
                 })
@@ -372,7 +372,7 @@ impl<'a> TraceIterator<'a> {
                 .map(|&tp| {
                     let r = OpRef::input_arg_typed(_fresh, tp);
                     // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
-                    box_pool.push(BoxRef::new_inputarg(tp, Some(_fresh)));
+                    box_pool.push(BoxRef::new_inputarg(tp, _fresh));
                     _fresh += 1;
                     r
                 })

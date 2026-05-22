@@ -65,9 +65,11 @@ pub enum BoxKind {
 
     /// `resoperation.py:699 AbstractInputArg`.
     /// `position` mirrors `AbstractInputArg.position`
-    /// (resoperation.py:699) — `Optional` because pyre constructs
-    /// inputargs without an assigned slot in some test fixtures.
-    InputArg { position: Option<u32> },
+    /// (resoperation.py:699) — non-optional, matching upstream:
+    /// every `AbstractInputArg` has a fixed slot index.  Test
+    /// fixtures that previously constructed positionless inputargs
+    /// must now supply a concrete index.
+    InputArg { position: u32 },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
     /// `const_index` is a pyre-only field carrying the
@@ -130,8 +132,11 @@ impl BoxRef {
         }))
     }
 
-    /// New `AbstractInputArg` Box.
-    pub fn new_inputarg(type_: Type, position: Option<u32>) -> Self {
+    /// New `AbstractInputArg` Box.  `position` is the input slot
+    /// index (`resoperation.py:699 AbstractInputArg.position`) — pyre
+    /// requires it at construction time matching upstream where every
+    /// inputarg has a definite slot.
+    pub fn new_inputarg(type_: Type, position: u32) -> Self {
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
@@ -205,7 +210,7 @@ impl BoxRef {
     pub fn position(&self) -> Option<u32> {
         match &self.0.kind {
             BoxKind::ResOp { position } => Some(position.get()),
-            BoxKind::InputArg { position } => *position,
+            BoxKind::InputArg { position } => Some(*position),
             BoxKind::Const { .. } => None,
         }
     }
@@ -236,7 +241,7 @@ impl BoxRef {
     /// Extract `AbstractInputArg.position`.
     pub fn inputarg_position(&self) -> Option<u32> {
         match self.0.kind {
-            BoxKind::InputArg { position } => position,
+            BoxKind::InputArg { position } => Some(position),
             _ => None,
         }
     }
@@ -823,7 +828,7 @@ mod tests {
 
     #[test]
     fn inputarg_position_preserved() {
-        let arg = BoxRef::new_inputarg(Type::Ref, Some(3));
+        let arg = BoxRef::new_inputarg(Type::Ref, 3);
         assert!(arg.is_inputarg());
         assert_eq!(arg.inputarg_position(), Some(3));
         assert_eq!(arg.type_(), Type::Ref);
@@ -862,11 +867,13 @@ mod tests {
     }
 
     #[test]
-    fn position_returns_inputarg_position_when_set() {
-        let arg = BoxRef::new_inputarg(Type::Ref, Some(7));
+    fn position_returns_inputarg_position() {
+        // `resoperation.py:699 AbstractInputArg.position` is
+        // construction-time assigned and required (non-optional);
+        // the round-trip mirrors that contract.
+        let arg = BoxRef::new_inputarg(Type::Ref, 7);
         assert_eq!(arg.position(), Some(7));
-        let unset = BoxRef::new_inputarg(Type::Int, None);
-        assert_eq!(unset.position(), None);
+        assert_eq!(arg.inputarg_position(), Some(7));
     }
 
     #[test]

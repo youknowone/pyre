@@ -184,8 +184,7 @@ impl Trace {
             Type::Void => panic!("input args cannot be Void"),
         };
         // H-2.1 parallel BoxRef: `AbstractInputArg` mirror with position.
-        self.box_pool
-            .push(BoxRef::new_inputarg(tp, Some(self.op_count)));
+        self.box_pool.push(BoxRef::new_inputarg(tp, self.op_count));
         self.op_count += 1;
         self.box_count += 1;
         opref

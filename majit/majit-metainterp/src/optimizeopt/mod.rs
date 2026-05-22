@@ -1644,7 +1644,7 @@ impl OptContext {
     }
 
     /// Construct an `OptContext` and seed `box_pool` with one
-    /// `BoxRef::new_inputarg(tp, Some(i))` per entry of `inputarg_types`.
+    /// `BoxRef::new_inputarg(tp, i)` per entry of `inputarg_types`.
     ///
     /// Mirrors `TraceIterator::new` (`opencoder.rs:373-426`, parity with
     /// `opencoder.py:259-262` `inputarg_from_tp(arg.type)`). Test fixtures
@@ -1662,7 +1662,7 @@ impl OptContext {
         let seed: Vec<crate::r#box::BoxRef> = inputarg_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| crate::r#box::BoxRef::new_inputarg(tp, Some(i as u32)))
+            .map(|(i, &tp)| crate::r#box::BoxRef::new_inputarg(tp, i as u32))
             .collect();
         ctx.box_pool = seed.into();
         // Mirror the production wiring at `setup_optimizations`
@@ -3773,6 +3773,34 @@ impl OptContext {
         }
         let idx = opref.raw() as usize;
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
+        let is_inputarg_variant = matches!(
+            opref,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        );
+        // Empty-slot variant-aware lazy materialisation:
+        // `resoperation.py:699 AbstractInputArg` and `resoperation.py:250
+        // AbstractResOp` are distinct classes upstream.  A Box minted
+        // for an `OpRef::InputArg*` must report `is_inputarg()`, not
+        // `is_resop()`, so the chain walker reconstructs the same
+        // variant when it round-trips through `Forwarded::Box`.  Plain
+        // `ensure_box_at_typed` always emits `new_resop`; without this
+        // pre-step, every retrace/synthetic path that lazily references
+        // an inputarg through the optimizer (e.g. `set_pending_box_pool`
+        // omitted, or a test fixture going through `with_num_inputs`
+        // that hands an OpRef::InputArg* in before its slot is
+        // populated) would silently demote the inputarg to a resop.
+        if self.box_pool.get(idx).is_none() && is_inputarg_variant && opref.ty().is_some() {
+            self.box_pool.set(
+                idx,
+                crate::r#box::BoxRef::new_inputarg(placeholder_type, idx as u32),
+            );
+            return Some(
+                self.box_pool
+                    .get(idx)
+                    .cloned()
+                    .expect("just inserted inputarg box"),
+            );
+        }
         // Phantom-target upgrade: when the OpRef carries a non-Void type
         // tag but the existing `box_pool[idx]` entry is a *clean* Void
         // placeholder (no live forwarding / Info), re-mint it with the
@@ -3794,11 +3822,8 @@ impl OptContext {
             && existing.type_() == majit_ir::Type::Void
             && matches!(&*existing.get_forwarded(), crate::r#box::Forwarded::None)
         {
-            let upgraded = if matches!(
-                opref,
-                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-            ) {
-                crate::r#box::BoxRef::new_inputarg(placeholder_type, Some(idx as u32))
+            let upgraded = if is_inputarg_variant {
+                crate::r#box::BoxRef::new_inputarg(placeholder_type, idx as u32)
             } else {
                 crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32)
             };
@@ -7142,8 +7167,8 @@ mod boxref_forwarding_tests {
 
     fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
-        let b1 = BoxRef::new_inputarg(Type::Int, Some(1));
+        let b0 = BoxRef::new_inputarg(Type::Int, 0);
+        let b1 = BoxRef::new_inputarg(Type::Int, 1);
         ctx.box_pool = vec![b0.clone(), b1.clone()].into();
         (ctx, b0, b1)
     }
@@ -7221,7 +7246,7 @@ mod boxref_forwarding_tests {
     fn h3_1_set_ptr_info_mirrors_box_info() {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, Some(0));
+        let b = BoxRef::new_inputarg(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
@@ -7240,7 +7265,7 @@ mod boxref_forwarding_tests {
     fn audit_a_make_nonnull_preserves_box_constant_slot() {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, Some(0));
+        let b = BoxRef::new_inputarg(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
@@ -7275,8 +7300,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn audit_a_chain_walker_reaches_constant_through_forwarded_box() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
-        let b1 = BoxRef::new_inputarg(Type::Int, Some(1));
+        let b0 = BoxRef::new_inputarg(Type::Int, 0);
+        let b1 = BoxRef::new_inputarg(Type::Int, 1);
         ctx.box_pool = vec![b0, b1.clone()].into();
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(0);
@@ -7296,7 +7321,7 @@ mod boxref_forwarding_tests {
         ctx.const_pool.insert(1, Value::Int(42));
         assert!(b1.get_box_replacement(false).is_constant());
         // Negative case: BoxRef with no constant forwarding.
-        let nb = BoxRef::new_inputarg(Type::Int, Some(0));
+        let nb = BoxRef::new_inputarg(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
     }
 
@@ -7430,8 +7455,8 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 4, 0, 4);
         let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 0);
         let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 1);
-        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(2));
-        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(3));
+        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 2);
+        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 3);
         ctx.box_pool = vec![
             placeholder_target.clone(),
             placeholder_other,
@@ -7504,8 +7529,8 @@ mod boxref_forwarding_tests {
         // (PyPy `box.type` invariant; `make_equal_to` cross-type assertion).
         let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 0);
         let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 1);
-        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(2));
-        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(3));
+        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 2);
+        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 3);
         ctx.box_pool = vec![
             placeholder_target.clone(),
             placeholder_other,
@@ -7652,7 +7677,7 @@ mod boxref_forwarding_tests {
 
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, Some(0));
+        let b = BoxRef::new_inputarg(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
         (ctx, b)
     }
@@ -8018,9 +8043,9 @@ mod boxref_forwarding_tests {
     #[test]
     fn chain_walk_preserves_ptr_info_rc_identity_across_two_hops() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 3, 0, 3);
-        let a = BoxRef::new_inputarg(Type::Ref, Some(0));
-        let b = BoxRef::new_inputarg(Type::Ref, Some(1));
-        let c = BoxRef::new_inputarg(Type::Ref, Some(2));
+        let a = BoxRef::new_inputarg(Type::Ref, 0);
+        let b = BoxRef::new_inputarg(Type::Ref, 1);
+        let c = BoxRef::new_inputarg(Type::Ref, 2);
         ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
         ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
@@ -8050,8 +8075,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Int, Some(0));
-        let new_box = BoxRef::new_inputarg(Type::Int, Some(1));
+        let old_box = BoxRef::new_inputarg(Type::Int, 0);
+        let new_box = BoxRef::new_inputarg(Type::Int, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.setintbound(
             &old_box,
@@ -8087,8 +8112,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Ref, Some(0));
-        let new_box = BoxRef::new_inputarg(Type::Ref, Some(1));
+        let old_box = BoxRef::new_inputarg(Type::Ref, 0);
+        let new_box = BoxRef::new_inputarg(Type::Ref, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
@@ -8122,8 +8147,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Int, Some(0));
-        let new_box = BoxRef::new_inputarg(Type::Int, Some(1));
+        let old_box = BoxRef::new_inputarg(Type::Int, 0);
+        let new_box = BoxRef::new_inputarg(Type::Int, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.setintbound(
             &old_box,
@@ -8146,8 +8171,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Ref, Some(0));
-        let new_box = BoxRef::new_inputarg(Type::Ref, Some(1));
+        let old_box = BoxRef::new_inputarg(Type::Ref, 0);
+        let new_box = BoxRef::new_inputarg(Type::Ref, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
@@ -8170,7 +8195,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let old_box = BoxRef::new_inputarg(Type::Int, Some(0));
+        let old_box = BoxRef::new_inputarg(Type::Int, 0);
         ctx.box_pool = vec![old_box.clone()].into();
         ctx.setintbound(
             &old_box,
@@ -8866,7 +8891,7 @@ mod intbound_invariant_tests {
         let ctx = OptContext::new(0);
         // BoxRef-direct setintbound asserts `op.type_()` is Int/Void per
         // optimizer.py:116. A Ref-typed BoxRef should trigger the panic.
-        let ref_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(0));
+        let ref_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 0);
         ctx.setintbound(&ref_box, &IntBound::nonnegative());
     }
 }
@@ -8984,6 +9009,62 @@ mod opt_box_env_tests {
         assert!(
             env.is_virtual_ref(source),
             "forwarded snapshot boxes must classify as virtual via replacement"
+        );
+    }
+
+    #[test]
+    fn ensure_box_lazy_materialises_inputarg_for_empty_inputarg_slot() {
+        // `resoperation.py:699 AbstractInputArg` and
+        // `resoperation.py:250 AbstractResOp` are distinct classes
+        // upstream — a Box materialised against `OpRef::InputArg*`
+        // must be `is_inputarg()` so the chain walker reconstructs
+        // the same variant on the round-trip through
+        // `Forwarded::Box`.  Prior to the per-variant empty-slot
+        // path, `ensure_box` routed through `ensure_box_at_typed`
+        // which always emits `new_resop`, silently demoting the
+        // inputarg.
+        // `with_inputarg_types` would seed the inputarg slots
+        // eagerly, defeating the lazy-materialisation check.  Use
+        // `with_num_inputs(_, 0)` to get an empty pool then hand an
+        // `OpRef::InputArg*` in directly — the regression we are
+        // covering is exactly the path where the empty slot must
+        // mint a `new_inputarg`.
+        let mut ctx = OptContext::with_num_inputs(8, 0);
+        let arg = OpRef::input_arg_typed(0, majit_ir::Type::Int);
+        let materialised = ctx
+            .ensure_box(arg)
+            .expect("InputArg OpRef must materialise a BoxRef");
+        assert!(
+            materialised.is_inputarg(),
+            "empty InputArg* slot lazy-materialised the wrong BoxKind",
+        );
+        assert_eq!(materialised.inputarg_position(), Some(0));
+        assert_eq!(materialised.type_(), majit_ir::Type::Int);
+
+        // Re-entering must keep the same identity (no second lazy
+        // mint): `BoxRef` `PartialEq` is `Rc::ptr_eq` matching
+        // PyPy's `_forwarded` identity.
+        let second = ctx
+            .ensure_box(arg)
+            .expect("InputArg OpRef must continue to resolve");
+        assert_eq!(
+            materialised, second,
+            "second ensure_box must return the same Box identity",
+        );
+    }
+
+    #[test]
+    fn ensure_box_lazy_materialises_resop_for_empty_resop_slot() {
+        // Companion to the InputArg case — `OpRef::int_op(_)` must
+        // continue to produce a `new_resop` Box so `is_resop()` holds.
+        let mut ctx = OptContext::with_num_inputs(8, 0);
+        let result = OpRef::int_op(3);
+        let materialised = ctx
+            .ensure_box(result)
+            .expect("ResOp OpRef must materialise a BoxRef");
+        assert!(
+            materialised.is_resop(),
+            "empty ResOp slot lazy-materialised the wrong BoxKind",
         );
     }
 }

@@ -490,7 +490,7 @@ impl TreeLoop {
         let mut box_pool: crate::r#box::BoxPool =
             Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len()).into();
         for (i, &tp) in new_ia_types.iter().enumerate() {
-            box_pool.push(BoxRef::new_inputarg(tp, Some(i as u32)));
+            box_pool.push(BoxRef::new_inputarg(tp, i as u32));
         }
         for &r in op_escaped.iter() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;

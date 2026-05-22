@@ -5001,8 +5001,8 @@ mod tests {
 
     #[test]
     fn test_retrace_box_pool_snapshot_preserves_inputargs_for_p1_full_prefix() {
-        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, Some(0));
-        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, Some(1));
+        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, 0);
+        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, 1);
         let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
         let emit3 = crate::r#box::BoxRef::new_resop(Type::Int, 3);
         let snapshot = vec![
