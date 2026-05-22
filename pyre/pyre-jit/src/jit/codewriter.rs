@@ -8921,8 +8921,7 @@ impl CodeWriter {
         // colors (HashMap iteration non-determinism between two
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
-        let mut graph_regallocs =
-            super::regalloc::perform_register_allocation_all_kinds(&graph);
+        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_graph(&graph, &mut graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
         // BEFORE `walker_post_walk_insert_renamings` reads

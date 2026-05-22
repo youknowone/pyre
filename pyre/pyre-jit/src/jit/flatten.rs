@@ -7764,8 +7764,7 @@ mod tests {
             )
             .into_ref(),
         ]);
-        let mut regallocs =
-            super::super::regalloc::perform_register_allocation_all_kinds(&graph);
+        let mut regallocs = super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
         assert_eq!(ssarepr.name, "orthodox4arg");
         assert!(
@@ -7800,8 +7799,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        let mut regallocs =
-            super::super::regalloc::perform_register_allocation_all_kinds(&graph);
+        let mut regallocs = super::super::regalloc::perform_register_allocation_all_kinds(&graph);
         // Use the canonical `flatten_graph(graph, regallocs,
         // include_all_exc_links, cpu)` entry — the loop_header op is a
         // passthrough family and needs no LoweringContext arm to fire.

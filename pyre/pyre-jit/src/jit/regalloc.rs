@@ -1,36 +1,56 @@
-//! Post-pass register allocation for pyre's per-CodeObject SSARepr.
+//! Register allocation: PyPy-orthodox port + pyre-only SSARepr scanner.
 //!
-//! Mirrors the two-file split in RPython:
+//! ## PyPy-orthodox surface
 //!
-//!   * `rpython/jit/codewriter/regalloc.py:6-8`
-//!     `perform_register_allocation(graph, kind)` — thin wrapper around
-//!     `tool.algo.regalloc.perform_register_allocation`. Pyre's analog is
-//!     `perform_register_allocation` below.
-//!   * `rpython/tool/algo/regalloc.py:8-15`
+//! Mirrors the two-file split in PyPy:
+//!
+//!   * `rpython/jit/codewriter/regalloc.py:6-8
+//!     perform_register_allocation(graph, kind)` — thin 2-arg wrapper.
+//!     Pyre's analog is `perform_register_allocation(graph, kind)`
+//!     below.
+//!   * `rpython/tool/algo/regalloc.py:8-15
+//!     perform_register_allocation(graph, consider_var, ListOfKind)`:
 //!     ```python
 //!     regalloc = RegAllocator(graph, consider_var, ListOfKind)
 //!     regalloc.make_dependencies()    # interference graph
 //!     regalloc.coalesce_variables()   # union-find on jump edges
 //!     regalloc.find_node_coloring()   # chordal coloring
 //!     ```
-//!     Pyre's analog is `RegAllocator` + the three private methods of
-//!     the same name.
-//!   * `rpython/jit/codewriter/flatten.py:88-100` `enforce_input_args` —
+//!     Pyre's analog is the `RegAllocator` struct below plus its three
+//!     private methods of the same name.
+//!   * `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
 //!     after coloring, `swapcolors` rotates inputarg colors into
-//!     `0..n-1`. Pyre's analog is `enforce_input_args` below.
+//!     `0..n-1`. Pyre's analog is `enforce_input_args_graph` below
+//!     (the graph-side entry; the convenience wrapper is named
+//!     differently to disambiguate from the SSARepr-side
+//!     `enforce_input_args` further down — see "Pyre-only deviation"
+//!     below).
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
 //!     `num_regs[kind] = max(coloring)+1` per kind, packed into the
-//!     `JitCode`. Pyre's analog is `RegAllocator::num_colors` plus the
-//!     `AllocationResult.num_regs` field.
+//!     `JitCode`. Pyre's analog is `RegAllocator::find_num_colors`
+//!     plus the `AllocationResult.num_regs` field.
 //!
-//! Architecture difference (Note): RPython's
-//! `RegAllocator` consumes a `FunctionGraph` (block + link.args
-//! structure). Pyre's input is a CPython `CodeObject` translated into
-//! a flat `SSARepr` by the dispatch loop, so `make_dependencies` works
-//! over the populated `SSARepr` via a backward live-set walk and
-//! `coalesce_variables` operates on `move_X` instructions (the
-//! SSARepr-level remnant of jump-edge `link.args ↔ inputargs`
-//! pairings). The chordal coloring algorithm itself is shared with
+//! ## Pyre-only deviation (Phase 4 retirement target, task #9)
+//!
+//! Pyre's walker emits SSARepr inline rather than building a graph it
+//! later flattens.  Until the walker defers SSARepr emission to the
+//! canonical `flatten_graph(graph, regallocs, cpu)` driver, an
+//! SSARepr-side companion allocator is needed:
+//!
+//!   * `SSAReprRegAllocator` (declared further down) — same
+//!     `make_dependencies` / `coalesce_variables` /
+//!     `find_node_coloring` / `getcolor` / `swapcolors` /
+//!     `find_num_colors` contract as upstream `RegAllocator`, but
+//!     driven by a backward live-set walk over the populated SSARepr
+//!     instead of `graph.iterblocks()`.
+//!   * `perform_ssarepr_register_allocation` — builds an
+//!     `SSAReprRegAllocator` and runs the three-stage pipeline,
+//!     mirroring the upstream `perform_register_allocation` body.
+//!   * `enforce_input_args` (SSARepr-side, lowercase `_graph_`-less
+//!     name) — variant of `enforce_input_args_graph` keyed on u16
+//!     register indices instead of Variable identities.
+//!
+//! The chordal coloring algorithm itself is shared with
 //! `majit-translate`'s flow-graph regalloc through
 //! `majit_translate::regalloc::DependencyGraph::find_node_coloring`
 //! (line-by-line port of `rpython/tool/algo/color.py:31-85`).
@@ -277,10 +297,7 @@ impl RegAllocator {
 ///      for STORE_FAST-LOAD_FAST fusions) that have no Link-level
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
-pub(super) fn perform_register_allocation(
-    graph: &FlowGraph,
-    kind: Kind,
-) -> GraphAllocationResult {
+pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> GraphAllocationResult {
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, kind);
     allocator.coalesce_variables(graph, kind);
@@ -347,9 +364,7 @@ pub(super) fn perform_register_allocation(
 /// degenerates to a position-indexed array in any RPython-orthodox
 /// port.  This is the input shape that the canonical
 /// `flatten_graph(graph, regallocs, ...)` driver consumes.
-pub fn perform_register_allocation_all_kinds(
-    graph: &FlowGraph,
-) -> [GraphAllocationResult; 3] {
+pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocationResult; 3] {
     [
         perform_register_allocation(graph, Kind::Int),
         perform_register_allocation(graph, Kind::Ref),
