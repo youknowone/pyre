@@ -208,10 +208,29 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> SlotToVaria
         }
 
         // Class 1b — op-result definitions, with Input rebind aliasing.
+        //
+        // `OpKind::Abort` (pyre-only front-end marker for unsupported
+        // expression forms — `front/ast.rs::continue_with_unknown` /
+        // `stop_unsupported`) is intentionally NOT seeded into
+        // `value_to_var`.  `translate_op`'s Abort arm emits no
+        // flowspace op (`flowspace_adapter.rs:648 OpKind::Abort { .. }
+        // => Ok(Vec::new())`), so seeding the result_var here would
+        // hand consumer ops a `Hlvalue::Variable` that never gets
+        // *defined* by any emitted flowspace op — `checkgraph`
+        // (`flowspace/model.rs::checkgraph`) then panics with
+        // "variable used before definition" at the consumer's arg
+        // slot, NOT at the missing-operand site.  Skipping the seed
+        // here forces the first consumer's `lookup_operand` to fail
+        // with "undefined operand ValueId" instead (`is_known_unported`
+        // already matches that substring; the dual gate Skip-classifies
+        // the graph cleanly at the producer-adjacent site).
         for op in &block.operations {
             let Some(result_var) = op.result.as_ref() else {
                 continue;
             };
+            if matches!(op.kind, OpKind::Abort { .. }) {
+                continue;
+            }
             let Some(result) = legacy.slot_of(result_var) else {
                 continue;
             };
@@ -2030,9 +2049,19 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
 
+            // Skip Abort here for the same reason
+            // `build_value_to_variable_map` skips it — `translate_op`
+            // emits no flowspace op for Abort, so seeding its result
+            // would leave the consumer's flowspace arg referencing a
+            // never-defined Variable.  Letting `lookup_operand` fail
+            // at the first consumer surfaces the orthodox
+            // "undefined operand ValueId" message that
+            // `is_known_unported` classifies as Skip at the
+            // producer-adjacent site.
             if let Some(result_var) = legacy_op.result.as_ref()
                 && let Some(result) = legacy.slot_of(result_var)
                 && !value_map.contains_key(&result)
+                && !matches!(legacy_op.kind, OpKind::Abort { .. })
             {
                 let var = seed_variable(result_var);
                 value_to_var.entry(result).or_insert_with(|| var.clone());
