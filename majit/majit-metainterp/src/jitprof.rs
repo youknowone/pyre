@@ -353,10 +353,19 @@ impl JitProfiler {
     /// still unwind through both layers, so the `current` stack and
     /// the debug section stay balanced.
     pub fn enter_tracing(&self) -> ProfilerEventGuard<'_> {
-        if let Some(channel) = debug_channel_for_event(counters::TRACING) {
-            crate::debug::debug_start(channel);
+        let channel = debug_channel_for_event(counters::TRACING);
+        if let Some(ch) = channel {
+            crate::debug::debug_start(ch);
         }
+        // Rollback guard: the debug section is open; `start_tracing`
+        // takes the timing-state mutex, which can panic on poison.
+        // Without the guard, that panic would leave the section open
+        // for later `debug_stop` mismatch panics.  Disarm via
+        // `mem::forget` once both opens succeed so the returned
+        // `ProfilerEventGuard::drop` owns the normal-path close.
+        let rollback = TracingOpenRollback { channel };
         self.start_tracing();
+        std::mem::forget(rollback);
         ProfilerEventGuard {
             profiler: self,
             event: counters::TRACING,
@@ -383,9 +392,19 @@ impl JitProfiler {
     /// callsite — this guard matches each one exactly.
     pub fn enter_backend(&self) -> ProfilerEventGuard<'_> {
         self.start_backend();
+        // Rollback guard: the backend event is now open, but
+        // `debug_start` may still panic on a nesting violation
+        // (`debug.rs:84-` strict-stop guard).  Without the guard, a
+        // panic between the two opens would leave the profiler stack
+        // dirty for later calls.  The local guard fires
+        // `end_backend()` on unwind; `mem::forget` disarms it once
+        // both opens succeed so the returned RAII guard owns the
+        // normal-path close.
+        let rollback = BackendOpenRollback { profiler: self };
         if let Some(channel) = debug_channel_for_event(counters::BACKEND) {
             crate::debug::debug_start(channel);
         }
+        std::mem::forget(rollback);
         ProfilerEventGuard {
             profiler: self,
             event: counters::BACKEND,
@@ -489,6 +508,38 @@ impl JitProfiler {
             counters::BACKEND => &self.backend_time_ns,
             _ => return None,
         })
+    }
+}
+
+/// Rollback guard used inside [`JitProfiler::enter_backend`] for the
+/// short window after `start_backend()` and before `debug_start` has
+/// returned cleanly.  If `debug_start` panics, the unwind path fires
+/// the matching `end_backend()` so the profiler stack does not stay
+/// dirty.  Disarmed via `mem::forget` once both opens succeed.
+struct BackendOpenRollback<'a> {
+    profiler: &'a JitProfiler,
+}
+
+impl Drop for BackendOpenRollback<'_> {
+    fn drop(&mut self) {
+        self.profiler.end_backend();
+    }
+}
+
+/// Rollback guard used inside [`JitProfiler::enter_tracing`] for the
+/// short window after `debug_start("jit-tracing")` and before
+/// `start_tracing()` has returned cleanly.  If `start_tracing` panics
+/// (timing-state mutex poisoned), the unwind path fires the matching
+/// `debug_stop` so the PYPYLOG category stack stays balanced.
+struct TracingOpenRollback {
+    channel: Option<&'static str>,
+}
+
+impl Drop for TracingOpenRollback {
+    fn drop(&mut self) {
+        if let Some(ch) = self.channel {
+            crate::debug::debug_stop(ch);
+        }
     }
 }
 

@@ -29,6 +29,47 @@ pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
 
+/// Dismissable RAII guard around `crate::debug::debug_start(channel)`.
+/// On drop without [`dismiss`](Self::dismiss), fires
+/// `debug_stop(channel)` so the PYPYLOG category stack stays balanced
+/// when the surrounding code panics before the normal `debug_stop`
+/// site (e.g. an `assert!` inside `_setup_once`).  Used by
+/// [`MetaInterp::prepare_trace_start_runtime`] to bridge the gap
+/// between `debug_start("jit-tracing")` and
+/// [`MetaInterp::open_profiler_tracing_inner`], after which ownership
+/// of the close transfers to
+/// [`MetaInterp::leave_profiler_tracing`].
+#[must_use = "drop the rollback guard to fire debug_stop on the unwind path"]
+struct DebugSectionRollback {
+    channel: &'static str,
+    armed: bool,
+}
+
+impl DebugSectionRollback {
+    fn arm(channel: &'static str) -> Self {
+        crate::debug::debug_start(channel);
+        Self {
+            channel,
+            armed: true,
+        }
+    }
+
+    /// Cancel the rollback — the caller has reached a point where
+    /// some downstream code path is now responsible for issuing the
+    /// matching `debug_stop`.
+    fn dismiss(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DebugSectionRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::debug::debug_stop(self.channel);
+        }
+    }
+}
+
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
@@ -2968,8 +3009,18 @@ impl<M: Clone> MetaInterp<M> {
         // event *after*, splitting the work that
         // [`enter_profiler_tracing`] would normally combine.
         self.warm_state.ensure_jitlog_initialised();
-        crate::debug::debug_start("jit-tracing");
+        // `_setup_once` contains unconditional asserts (vector_ext
+        // setup, jitdriver registration sanity, etc.) — a failure
+        // panics out of this function.  Use a dismissable RAII
+        // guard so the debug section closes on the unwind path
+        // instead of leaving `MAJIT_LOG`'s category stack
+        // unbalanced (which would trigger later `debug_stop`
+        // mismatch panics).
+        let rollback = DebugSectionRollback::arm("jit-tracing");
         self.staticdata._setup_once(&mut self.backend);
+        // `_setup_once` succeeded — hand the close off to
+        // `leave_profiler_tracing` via `profiler_tracing_active`.
+        rollback.dismiss();
         // Profiler event opens after `_setup_once`, matching PyPy
         // line 2890.  `open_profiler_tracing_inner` is the
         // debug_start-skipping variant of `enter_profiler_tracing`

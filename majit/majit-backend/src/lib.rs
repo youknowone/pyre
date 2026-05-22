@@ -40,7 +40,12 @@ use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 #[derive(Default, Debug)]
 pub struct CpuTotalTracker {
     /// `model.py:9` `total_compiled_loops` — bumped by
-    /// [`CompiledLoopToken::new`] on every fresh `CompiledLoopToken`.
+    /// [`record_compiled_loop_token`] at each backend's `compile_loop`
+    /// entry (PyPy `x86/assembler.py:514` parity).  The bump used to
+    /// live in [`CompiledLoopToken::new`] but moved because pyre
+    /// eagerly creates the CLT in `JitCellToken::new`, which would
+    /// over-count tokens that are allocated but never assembled
+    /// (the `register_pending_target` path is one such caller).
     pub total_compiled_loops: AtomicUsize,
     /// `model.py:10` `total_compiled_bridges` — bumped by
     /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
