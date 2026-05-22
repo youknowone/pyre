@@ -30,3 +30,4 @@ rustpython-host_env = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }
+indexmap = { workspace = true }

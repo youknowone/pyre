@@ -1,5 +1,5 @@
+use indexmap::IndexMap;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
@@ -147,12 +147,12 @@ pub trait FSObject {
 #[derive(Default)]
 pub struct Dir {
     state: FSObjectState,
-    pub entries: HashMap<String, FsNode>,
+    pub entries: IndexMap<String, FsNode>,
 }
 
 impl Dir {
     // vfs.py:61
-    pub fn new(entries: HashMap<String, FsNode>) -> Self {
+    pub fn new(entries: IndexMap<String, FsNode>) -> Self {
         Self {
             state: FSObjectState::default(),
             entries,
