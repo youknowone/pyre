@@ -2588,7 +2588,7 @@ pub fn flatten_graph<'a>(
     // `self.regallocs` via `swapcolors`.  Pyre runs the equivalent
     // here as a free function so the post-swap regallocs can be
     // borrowed immutably by `GraphFlattener::new` below.
-    super::regalloc::enforce_input_args_graph(graph, regallocs);
+    super::regalloc::enforce_input_args(graph, regallocs);
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,

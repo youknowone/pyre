@@ -20,7 +20,7 @@
 //!     private methods of the same name.
 //!   * `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
 //!     after coloring, `swapcolors` rotates inputarg colors into
-//!     `0..n-1`. Pyre's analog is `enforce_input_args_graph` below
+//!     `0..n-1`. Pyre's analog is `enforce_input_args` below
 //!     (the graph-side entry; the convenience wrapper is named
 //!     differently to disambiguate from the SSARepr-side
 //!     `enforce_input_args` further down — see "Pyre-only deviation"
@@ -47,7 +47,7 @@
 //!     `SSAReprRegAllocator` and runs the three-stage pipeline,
 //!     mirroring the upstream `perform_register_allocation` body.
 //!   * `enforce_input_args` (SSARepr-side, lowercase `_graph_`-less
-//!     name) — variant of `enforce_input_args_graph` keyed on u16
+//!     name) — variant of `enforce_input_args` keyed on u16
 //!     register indices instead of Variable identities.
 //!
 //! The chordal coloring algorithm itself is shared with
@@ -392,7 +392,7 @@ pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocat
 /// than a `GraphFlattener` method: pyre's `get_register` closure
 /// captures `&regallocs` immutably, so the `&mut regallocs`
 /// swap must run BEFORE the closure is constructed.
-pub fn enforce_input_args_graph(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
+pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
     // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
     // counter in a `[u16; 3]` array indexed by `Kind::index()` per
@@ -417,7 +417,7 @@ pub fn enforce_input_args_graph(graph: &FlowGraph, regallocs: &mut [GraphAllocat
         }
         assert!(
             curcol > realcol,
-            "enforce_input_args_graph: inputarg color {} must be >= realcol {} \
+            "enforce_input_args: inputarg color {} must be >= realcol {} \
              (regalloc.py invariant)",
             curcol,
             realcol,
@@ -463,7 +463,7 @@ pub(super) fn count_link_renamings_per_kind(
     // `0, 1, 2, …` per kind before `generate_ssa_form` walks links.
     // Callers that want this probe's output to match
     // `flatten_graph`'s post-swap reality should invoke
-    // `enforce_input_args_graph(graph, &mut regallocs)` first;
+    // `enforce_input_args(graph, &mut regallocs)` first;
     // otherwise the per-link step count is a lower bound, since the
     // swap can shift inputarg colors and re-introduce previously
     // coalesced renamings. Production wiring is Task #214.
@@ -683,7 +683,7 @@ pub(super) fn allocate_registers(
     // into 0..n-1 via swapcolors so the trace-side `idx < nlocals`
     // decode is guaranteed by code rather than by an interference
     // heuristic.
-    enforce_input_args(&mut allocators, nlocals, &inputs);
+    enforce_ssarepr_input_args(&mut allocators, nlocals, &inputs);
 
     // codewriter.py:62-67 `num_regs = {kind: max(coloring)+1 if coloring else 0}`.
     // Per-kind rename map: `[Vec<u16>; 3]` indexed by `Kind::index()`,
@@ -711,9 +711,11 @@ pub(super) fn allocate_registers(
     AllocationResult { rename, num_regs }
 }
 
-/// `flatten.py:88-100` `GraphFlattener.enforce_input_args`.
+/// SSARepr-side companion to upstream
+/// `rpython/jit/codewriter/flatten.py:88-100
+/// GraphFlattener.enforce_input_args`.
 ///
-/// RPython:
+/// Upstream:
 /// ```python
 /// def enforce_input_args(self):
 ///     inputargs = self.graph.startblock.inputargs
@@ -734,7 +736,13 @@ pub(super) fn allocate_registers(
 /// trace-side Python-local mirror) followed by the portal red args
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
-fn enforce_input_args(
+///
+/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
+/// the SSARepr-side variant operates on `SSAReprRegAllocator` keyed by
+/// u16 register indices instead of Variable identities.  The
+/// PyPy-orthodox graph-side sibling lives at `enforce_input_args`
+/// (free function) above.
+fn enforce_ssarepr_input_args(
     allocators: &mut [SSAReprRegAllocator; 3],
     nlocals: usize,
     inputs: &ExternalInputs,
@@ -764,7 +772,7 @@ fn enforce_input_args(
         if curcol != realcol {
             assert!(
                 curcol > realcol,
-                "enforce_input_args: inputarg color {} must be >= realcol {} (regalloc.py invariant)",
+                "enforce_ssarepr_input_args: inputarg color {} must be >= realcol {} (regalloc.py invariant)",
                 curcol,
                 realcol
             );
@@ -1350,7 +1358,7 @@ mod tests {
     /// allocator level: after the swap, every kind's startblock
     /// inputargs occupy colors `0, 1, 2, …` in source order.
     #[test]
-    fn enforce_input_args_graph_normalises_inputarg_colors() {
+    fn enforce_input_args_graph_side_normalises_inputarg_colors() {
         // 2 Ref inputargs + 1 Int inputarg, all live across an op
         // that defines fresh Variables of each kind so the chordal
         // coloring has to place every node on its own color.
@@ -1375,7 +1383,7 @@ mod tests {
         ]);
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
-        enforce_input_args_graph(&graph, &mut regallocs);
+        enforce_input_args(&graph, &mut regallocs);
 
         let ref_colors = &regallocs[Kind::Ref.index()].coloring;
         let int_colors = &regallocs[Kind::Int.index()].coloring;
