@@ -65,6 +65,23 @@ pub struct GraphAllocationResult {
     pub num_colors: u16,
 }
 
+impl GraphAllocationResult {
+    /// `rpython/tool/algo/regalloc.py:138-143 RegAllocator.swapcolors`
+    /// — swap every occurrence of `col1` and `col2` across the coloring
+    /// dict.  Called by `enforce_input_args` (`flatten.py:88-100`) when
+    /// an inputarg's coloring lands on a higher color than its
+    /// positional `realcol`.
+    pub fn swapcolors(&mut self, col1: u16, col2: u16) {
+        for color in self.coloring.values_mut() {
+            if *color == col1 {
+                *color = col2;
+            } else if *color == col2 {
+                *color = col1;
+            }
+        }
+    }
+}
+
 /// Field names follow `rpython/tool/algo/regalloc.py` — `_depgraph`
 /// (`make_dependencies`, py:77), `_unionfind` (`coalesce_variables`,
 /// py:80), `_coloring` (`find_node_coloring`, py:115).  The union-find
@@ -417,13 +434,8 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
             curcol,
             realcol,
         );
-        for color in alloc.coloring.values_mut() {
-            if *color == curcol {
-                *color = realcol;
-            } else if *color == realcol {
-                *color = curcol;
-            }
-        }
+        // `flatten.py:100 self.regallocs[kind].swapcolors(realcol, curcol)`.
+        alloc.swapcolors(realcol, curcol);
     }
 }
 
