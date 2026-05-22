@@ -183,7 +183,17 @@ impl CodeWriter {
         // annotator sees a synthetic flowed graph whose return Link
         // carries a Constant of the declared return lltype.  Idempotent
         // — re-entry via the cached registry path short-circuits at
-        // `lookup` on each key.
+        // `lookup` on each key.  Order: AFTER populate so that
+        // populate's alias-explosion canonicalisation
+        // (`canonical_dedup_key` strip → `registry.alias`) lands
+        // first; pre-seeding would make impl-method stubs collide
+        // with populate's `registry.alias()` invariant
+        // ("alias key already a canonical entry").  The trade-off:
+        // safe-fn bodies lifted DURING populate's pass-2 that
+        // reference unsafe-fn callees see "not registered" and
+        // surface as `cachedgraph: lift failed during populate` Skip
+        // events on the safe-fn entry (one remaining event
+        // `["baseobjspace", "is_none"]` at 2026-05-23 measurement).
         crate::translator::rtyper::cutover::register_unsafe_fn_stubs(
             &registry,
             &callcontrol.unsafe_fn_stubs,
