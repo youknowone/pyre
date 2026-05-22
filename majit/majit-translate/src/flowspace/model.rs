@@ -1959,6 +1959,29 @@ impl HostEnv {
         // llmemory.weakref_create at the rtyper level.
         let weakref_mod = HostObject::new_module("weakref");
         weakref_mod.module_set("ref", HostObject::new_builtin_callable("weakref.ref"));
+        // Z2.5 Path C tail — Rust std lib module-qualified entry points
+        // referenced by pyre-object / pyre-interpreter callsites
+        // (`std::ptr::null_mut`, `std::ptr::copy_nonoverlapping`,
+        // `std::mem::align_of`, `std::alloc::dealloc`).  Branch 3b of
+        // `flowspace_adapter::translate_op` resolves
+        // `["std", "ptr", "null_mut"]` by joining `segments[..-1]` with
+        // `.` (→ `"std.ptr"`) and calling
+        // `HOST_ENV.import_module("std.ptr").module_get("null_mut")`,
+        // so the module key matches the join shape.  No analyzer hook
+        // attached — the callable surface is sufficient to close the
+        // registry-Skip path; downstream type lowering for these
+        // intrinsics still routes through the M2.5g extern-Rust-helper
+        // walker when it lands.
+        let std_ptr = HostObject::new_module("std.ptr");
+        std_ptr.module_set("null_mut", HostObject::new_builtin_callable("std.ptr.null_mut"));
+        std_ptr.module_set(
+            "copy_nonoverlapping",
+            HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
+        );
+        let std_mem = HostObject::new_module("std.mem");
+        std_mem.module_set("align_of", HostObject::new_builtin_callable("std.mem.align_of"));
+        let std_alloc = HostObject::new_module("std.alloc");
+        std_alloc.module_set("dealloc", HostObject::new_builtin_callable("std.alloc.dealloc"));
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
@@ -1971,6 +1994,9 @@ impl HostEnv {
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("weakref".into(), weakref_mod);
+        mods.insert("std.ptr".into(), std_ptr);
+        mods.insert("std.mem".into(), std_mem);
+        mods.insert("std.alloc".into(), std_alloc);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
