@@ -9436,6 +9436,42 @@ impl CodeWriter {
                      canonical_only={canonical_only_names:?}",
                     ssarepr.name,
                 );
+                // Slice 12: bucket Label names by prefix and report
+                // counts.  Tests the hypothesis that canonical's extra
+                // Labels (slice 10 diff) are exactly the `link<N>`
+                // per-link trampolines emitted by
+                // `flatten.py:175-205 insert_exits`, which walker
+                // doesn't produce.  Expected: walker emits only
+                // block-prefixed labels; canonical emits both block-
+                // and link-prefixed; canonical_link_count equals the
+                // slice 10 diff.
+                let bucket = |names: &[String]| -> (usize, usize, usize) {
+                    let mut blocks = 0usize;
+                    let mut links = 0usize;
+                    let mut other = 0usize;
+                    for n in names {
+                        if n.starts_with("block") {
+                            blocks += 1;
+                        } else if n.starts_with("link") {
+                            links += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                    (blocks, links, other)
+                };
+                let (w_blocks, w_links, w_other) = bucket(&walker_names);
+                let (c_blocks, c_links, c_other) = bucket(&canonical_names);
+                eprintln!(
+                    "[phase4-diff-labels-prefix] graph={} \
+                     walker(block={w_blocks} link={w_links} other={w_other}) \
+                     canonical(block={c_blocks} link={c_links} other={c_other}) \
+                     diff(block={} link={} other={})",
+                    ssarepr.name,
+                    c_blocks as i64 - w_blocks as i64,
+                    c_links as i64 - w_links as i64,
+                    c_other as i64 - w_other as i64,
+                );
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
