@@ -3,7 +3,8 @@
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{
-    PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
+    PtrInfo, PtrInfoExt, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
+    VStringVariant,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 

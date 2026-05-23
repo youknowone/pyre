@@ -6,7 +6,7 @@
 /// the cached result is returned instead of recomputing.
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
-use crate::optimizeopt::info::PreambleOp;
+use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 /// pure.py:104,204-210: extra_call_pure entry.

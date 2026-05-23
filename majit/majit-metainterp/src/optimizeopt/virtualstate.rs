@@ -144,7 +144,7 @@ pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> 
 }
 
 use crate::optimizeopt::OptContext;
-use crate::optimizeopt::info::PtrInfo;
+use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 
 /// Abstract info for one value at the loop boundary.

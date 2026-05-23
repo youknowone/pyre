@@ -525,6 +525,8 @@ pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 pub use crate::optimizeopt::info::StringLengthResolver;
 pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolver};
 
+use crate::optimizeopt::info::PtrInfoExt;
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.

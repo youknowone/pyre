@@ -5,7 +5,7 @@
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
 
-use crate::optimizeopt::info::PreambleOp;
+use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 
 /// rewrite.py: loop_invariant_results value.

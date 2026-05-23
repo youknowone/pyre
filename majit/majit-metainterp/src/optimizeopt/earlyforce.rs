@@ -10,6 +10,7 @@
 /// forced operations starting from earlyforce.next (= heap).
 use majit_ir::{Op, OpCode};
 
+use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptEarlyForce;

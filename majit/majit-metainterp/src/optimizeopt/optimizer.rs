@@ -14,7 +14,7 @@ use crate::optimizeopt::{
 };
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
 
-use crate::optimizeopt::info::PtrInfo;
+use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
 /// bridgeopt.py:124 parity: data needed to call
