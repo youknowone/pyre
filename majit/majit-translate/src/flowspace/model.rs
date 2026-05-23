@@ -2007,6 +2007,26 @@ impl HostEnv {
         let bigint = HostObject::new_module("BigInt");
         bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
 
+        // External crate `majit_metainterp` helpers called from pyre
+        // source via `use majit_metainterp::{majit_log_enabled, ...}`.
+        // The two-segment callsites `["majit_metainterp",
+        // "majit_log_enabled"]` and the three-segment
+        // `["majit_metainterp", "jit", "we_are_jitted"]` both lower to
+        // `pub fn -> bool` flag checks that are compile-time constant
+        // outside the JIT context.  Register HOST_ENV stubs +
+        // analyzers (`builtin.rs`) so the registry resolution +
+        // `SomeBuiltin.call` dispatch both succeed.
+        let majit_metainterp = HostObject::new_module("majit_metainterp");
+        majit_metainterp.module_set(
+            "majit_log_enabled",
+            HostObject::new_builtin_callable("majit_metainterp.majit_log_enabled"),
+        );
+        let majit_metainterp_jit = HostObject::new_module("majit_metainterp.jit");
+        majit_metainterp_jit.module_set(
+            "we_are_jitted",
+            HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted"),
+        );
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2022,6 +2042,8 @@ impl HostEnv {
         mods.insert("std.mem".into(), std_mem);
         mods.insert("std.alloc".into(), std_alloc);
         mods.insert("BigInt".into(), bigint);
+        mods.insert("majit_metainterp".into(), majit_metainterp);
+        mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

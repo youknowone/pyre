@@ -315,6 +315,18 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.
     analyzer_for(&mut reg, "std.mem.size_of", std_mem_size_of);
+    // External crate `majit_metainterp` bool flag helpers — both
+    // qualnames share the same analyzer (returns `SomeBool`).
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.majit_log_enabled",
+        majit_metainterp_bool_flag,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.jit.we_are_jitted",
+        majit_metainterp_bool_flag,
+    );
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1205,6 +1217,19 @@ pub fn std_mem_size_of(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::default()))
+}
+
+/// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
+/// helpers.  Single implementation covers both `majit_log_enabled()`
+/// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
+/// both return `bool` so the annotation is `SomeBool` regardless of
+/// which qualname the dispatcher routed to.
+pub fn majit_metainterp_bool_flag(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Bool(super::model::SomeBool::new()))
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`
