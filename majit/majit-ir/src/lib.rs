@@ -6,6 +6,7 @@ pub mod effectinfo;
 pub mod field_entry;
 pub mod intbound;
 pub mod op_descr;
+pub mod op_info;
 pub mod op_type_index;
 pub mod optimize;
 pub mod ptr_info;
