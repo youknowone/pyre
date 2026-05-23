@@ -20,12 +20,16 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 /// aarch64/regalloc.py:169 `check_imm_box`. PyPy accepts only
 /// `ConstInt` values in the AArch64 immediate range; non-Int
 /// constants (ConstFloat/ConstPtr) and box references fall through
-/// to the register form.
-fn check_imm_box(arg: OpRef, val: i64) -> bool {
+/// to the register form. PyPy reads `arg.getint()` directly because
+/// the int is inlined on `ConstInt`; pyre's `OpRef::ConstInt` carries
+/// only a const-pool slot, so the actual i64 must be looked up. A
+/// missing pool entry is *not* the same as `#0` — it falls through
+/// to the register path.
+fn check_imm_box(arg: OpRef, val: Option<i64>) -> bool {
     if !matches!(arg, OpRef::ConstInt(_)) {
         return false;
     }
-    val >= 0 && val < DEFAULT_IMM_SIZE
+    matches!(val, Some(v) if v >= 0 && v < DEFAULT_IMM_SIZE)
 }
 
 /// aarch64/registers.py:14
@@ -181,7 +185,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let imm_rhs = check_imm_box(rhs, self.constants.get(&rhs.raw()).copied());
         let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
         let rhs_loc = if imm_rhs {
             self.loc(rhs, Type::Int)
@@ -286,8 +290,8 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        let imm_lhs = check_imm_box(lhs, self.const_value(lhs));
-        let imm_rhs = check_imm_box(rhs, self.const_value(rhs));
+        let imm_lhs = check_imm_box(lhs, self.constants.get(&lhs.raw()).copied());
+        let imm_rhs = check_imm_box(rhs, self.constants.get(&rhs.raw()).copied());
         let (l0, l1) = if !imm_lhs && imm_rhs {
             let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
             let r1 = self.loc(rhs, Type::Int);
