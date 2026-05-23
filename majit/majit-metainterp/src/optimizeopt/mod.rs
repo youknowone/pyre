@@ -358,14 +358,9 @@ impl std::ops::Deref for IntBoundHandleRef<'_> {
 
 /// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
 ///
-/// Used by `PtrInfo::getnullness` and `IntBound::getnullness` to
-/// report whether a slot is known null, known non-null, or unknown.
-/// Matches RPython's integer enum values exactly so that majit code
-/// can be ported line-by-line from upstream `optimizer.py:127` /
-/// `rewrite.py:496-503` `_optimize_nullness` switches.
-pub const INFO_NULL: i8 = 0;
-pub const INFO_NONNULL: i8 = 1;
-pub const INFO_UNKNOWN: i8 = 2;
+/// Re-exported from `majit_ir::optimize` so the bound / info types
+/// that reference them can be hosted there without a circular dep.
+pub use majit_ir::optimize::{INFO_NONNULL, INFO_NULL, INFO_UNKNOWN};
 
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
 ///
