@@ -9250,6 +9250,49 @@ impl CodeWriter {
                         );
                     }
                 }
+                // Slice 6: bucket the walker `-live-` excess by
+                // position relative to nearest preceding `Label`.
+                // `leading_after_label` = walker `-live-` insns at
+                // positions immediately following a Label (the
+                // per-block-entry pyre adaptation).  `mid_block` =
+                // walker `-live-` insns NOT preceded by a Label (the
+                // per-PC mid-block tracking).  Compares the sum to
+                // walker's total `-live-` count and to the
+                // canonical `-live-` count so the operator can tell
+                // whether closing the gap is a single per-block-
+                // entry decision or also requires touching mid-block
+                // emission.
+                let mut walker_total_live: usize = 0;
+                let mut walker_leading_live: usize = 0;
+                let mut walker_mid_live: usize = 0;
+                for (i, insn) in ssarepr.insns.iter().enumerate() {
+                    if phase4_insn_opname_key(insn) == "-live-" {
+                        walker_total_live += 1;
+                        let preceded_by_label = i > 0
+                            && matches!(
+                                ssarepr.insns[i - 1],
+                                super::flatten::Insn::Label(_)
+                            );
+                        if preceded_by_label {
+                            walker_leading_live += 1;
+                        } else {
+                            walker_mid_live += 1;
+                        }
+                    }
+                }
+                let canonical_total_live: usize = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| phase4_insn_opname_key(i) == "-live-")
+                    .count();
+                eprintln!(
+                    "[phase4-diff-live] graph={} walker_total_live={walker_total_live} \
+                     walker_leading_live={walker_leading_live} walker_mid_live={walker_mid_live} \
+                     canonical_total_live={canonical_total_live} \
+                     walker_excess={}",
+                    ssarepr.name,
+                    walker_total_live as i64 - canonical_total_live as i64,
+                );
             }
         }
 
