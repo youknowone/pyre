@@ -6787,7 +6787,24 @@ impl<'a> Assembler386<'a> {
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        // llsupport/callbuilder.py:36 emit order — prepare_arguments() then
+        // push_gcmap(); emit_raw_call(); ...; pop_gcmap() — collecting calls
+        // must publish the regalloc gcmap before the raw call so live `Ref`
+        // roots survive the slow path, and clear it after reloading a
+        // possibly-moved frame pointer (assembler.py:296
+        // `_reload_frame_if_necessary`).
+        let can_collect = op
+            .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
+            .unwrap_or(false);
+        let pushed_gcmap = if can_collect {
+            self.push_pending_call_gcmap()
+        } else {
+            false
+        };
         self._genop_call_with_arglocs(op, arglocs);
+        if can_collect {
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+        }
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());
         }

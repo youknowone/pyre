@@ -252,7 +252,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        debug_assert!(
+        assert!(
             !arg.is_constant(),
             "prepare_unary expects a non-const arg; got constant OpRef {arg:?} (should have been folded earlier)"
         );
