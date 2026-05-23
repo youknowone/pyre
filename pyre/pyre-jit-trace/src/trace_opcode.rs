@@ -578,10 +578,21 @@ pub(crate) fn write_stack_slot(
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
-    if reg_idx >= sym.registers_r.len() {
-        sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+    // Path 3 slice 35b (task #225): portal frames carry the authoritative
+    // stack shadow on `virtualizable_boxes` (`pyjitpl.py:1242
+    // _opimpl_setarrayitem_vable`). The companion read paths
+    // (`read_stack_slot` per slice 34; `read_live` per slice 32;
+    // `get_list_of_active_boxes` snapshot fallback per slice 35a) source
+    // their portal-frame view from the vable shadow, so the pyre-only
+    // `registers_r[reg_idx]` semantic-mirror write is dead for portal
+    // frames.  Non-portal frames retain the lazy-fill mirror because
+    // their read path still consults `registers_r[reg_idx]`.
+    if !sym.owns_virtualizable_shadow() {
+        if reg_idx >= sym.registers_r.len() {
+            sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+        }
+        sym.registers_r[reg_idx] = boxed;
     }
-    sym.registers_r[reg_idx] = boxed;
     if stack_idx >= sym.symbolic_stack_types.len() {
         sym.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
     }
