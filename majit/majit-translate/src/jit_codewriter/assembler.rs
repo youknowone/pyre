@@ -2127,6 +2127,7 @@ impl Assembler {
                 OpKind::JitMergePoint { .. } => "JitMergePoint",
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
+                OpKind::NewTuple { .. } => "NewTuple",
             }
         }
         let mut sites: std::collections::HashMap<crate::flowspace::model::Variable, ValueSites> =
@@ -3276,6 +3277,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
+        OpKind::NewTuple { .. } => "newtuple".into(),
     }
 }
 

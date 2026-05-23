@@ -6241,6 +6241,9 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
         //          return True
         OpKind::Abort { .. } => RaiseClass::Yes,
+        // RPython `newtuple` is a `PureOperation` (`operation.py:542`);
+        // pure tuple construction cannot raise.
+        OpKind::NewTuple { .. } => RaiseClass::No,
     }
 }
 

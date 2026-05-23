@@ -3921,6 +3921,9 @@ fn remap_op(
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. } => op.kind.clone(),
+        OpKind::NewTuple { args } => OpKind::NewTuple {
+            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
             kind_char: *kind_char,

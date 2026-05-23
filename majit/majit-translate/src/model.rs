@@ -888,6 +888,16 @@ pub enum OpKind {
     Abort {
         kind: UnknownKind,
     },
+
+    /// RPython `BUILD_TUPLE` (`flowspace/flowcontext.py:1163`) /
+    /// `newtuple` operation (`operation.py:542-548`).  Constructs a
+    /// new tuple from N element values; the result is a fresh tuple
+    /// object distinct from any individual element.  Emitted by
+    /// `front/ast.rs::lower_expr` for `syn::Expr::Tuple` in place of
+    /// the prior `Abort { UnsupportedExpr::Tuple }` marker.
+    NewTuple {
+        args: Vec<crate::flowspace::model::Variable>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

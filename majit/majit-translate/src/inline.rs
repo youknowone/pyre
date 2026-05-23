@@ -784,6 +784,9 @@ fn remap_op_kind(
             result_kind: *result_kind,
         },
         OpKind::Abort { kind } => OpKind::Abort { kind: kind.clone() },
+        OpKind::NewTuple { args } => OpKind::NewTuple {
+            args: args.iter().map(&remap_var).collect(),
+        },
     }
 }
 
@@ -809,6 +812,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::Abort { .. } => {
             vec![]
         }
+        OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::JitMergePoint {
             greens_i,
@@ -1042,7 +1046,9 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VableArrayRead { .. }
         // Pure vtable slot read — `cast_pointer + getfield` chain
         // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
-        | OpKind::VtableMethodPtr { .. } => true,
+        | OpKind::VtableMethodPtr { .. }
+        // `newtuple` is `PureOperation` (`operation.py:542-548`).
+        | OpKind::NewTuple { .. } => true,
         // Per-opname classification for `OpKind::BinOp` mirrors
         // `simplify.CanRemove` (`simplify.py:405-417`) +
         // `enum_ops_without_sideeffects()` for binary ops.  Pyre's

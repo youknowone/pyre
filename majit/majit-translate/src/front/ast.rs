@@ -7448,26 +7448,25 @@ fn lower_expr(
         // ── tuple (a, b, c) ──
         syn::Expr::Tuple(t) => {
             // RPython `BUILD_TUPLE` (`pypy/interpreter/pyopcode.py:955`,
-            // `flowspace/flowcontext.py:1163`) always pushes a fresh
-            // tuple object — the result is a NEW value distinct from
-            // any individual element.  Pyre has no `NewTuple` op yet
-            // (deferred), so the construct lowers to a single
-            // `Unknown` marker tagged `Tuple` that stands in for the
-            // whole tuple-builder; callers that read the result get a
-            // well-formed Variable but coverage audits still flag the
-            // port gap.  Elements lower for their side effects and
-            // path-closed propagation but do NOT feed the result.
+            // `flowspace/flowcontext.py:1163`) pops N items and pushes
+            // a fresh tuple via `space.newtuple(items)` —
+            // `PureOperation` `newtuple` (`operation.py:542-548`).
+            // Each element is lowered for its value and feeds the
+            // `OpKind::NewTuple { args }` argument list.
+            let mut elem_vars: Vec<crate::flowspace::model::Variable> =
+                Vec::with_capacity(t.elems.len());
             for e in &t.elems {
-                let lowered = lower_expr(graph, block, e, options, ctx)?;
-                if lowered.path_closed {
-                    return Ok(Lowered::path_closed());
-                }
+                let v_pre_var = get_value_var!(lower_expr(graph, block, e, options, ctx)?, graph);
+                ctx.pushvid_var(&v_pre_var);
             }
-            Ok(continue_with_unknown(
-                graph,
-                *block,
-                UnsupportedExprKind::Tuple,
-            ))
+            for _ in 0..t.elems.len() {
+                elem_vars.push(ctx.popvid_var(graph));
+            }
+            elem_vars.reverse();
+            let var = graph
+                .push_op_var(*block, OpKind::NewTuple { args: elem_vars }, true)
+                .expect("OpKind::NewTuple has has_result=true");
+            Ok(Lowered::from_value_var(graph, &var))
         }
 
         // ── try expr? ──

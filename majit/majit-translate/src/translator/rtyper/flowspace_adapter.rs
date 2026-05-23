@@ -738,6 +738,25 @@ pub fn translate_op(
         // re-classify as Skip.
         OpKind::Abort { .. } => Ok(Vec::new()),
 
+        // ─── `newtuple` — RPython `BUILD_TUPLE` / `space.newtuple` ───
+        // `PureOperation` (`operation.py:542-548`).  Each `args[i]`
+        // Variable is routed through `value_map` so the legacy
+        // flowspace SpaceOperation references the same Hlvalue
+        // identities the graph validator (`checkgraph`) tracks; using
+        // raw model-side Variables here would trip
+        // "variable used before definition" when an earlier op
+        // remapped its result to a different legacy Variable.
+        OpKind::NewTuple { args } => {
+            let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                let vid = operand_value_id(graph, var, op, "arg")?;
+                let role = format!("arg{i}");
+                hl_args.push(lookup_operand(value_map, vid, op, &role)?);
+            }
+            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
+        }
+
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
         // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).

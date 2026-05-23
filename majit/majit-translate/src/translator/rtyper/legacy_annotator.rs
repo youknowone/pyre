@@ -365,6 +365,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         | OpKind::ConditionalCallValue { result_kind, .. } => kind_char_to_value_type(*result_kind),
         OpKind::ConditionalCall { .. } => ValueType::Void,
         OpKind::Abort { .. } => ValueType::Unknown,
+        // `newtuple` yields a `Ref` to the freshly allocated tuple
+        // object (RPython `SomeTuple` lowers to `Ptr<GcStruct>`).
+        OpKind::NewTuple { .. } => ValueType::Ref,
     }
 }
 
