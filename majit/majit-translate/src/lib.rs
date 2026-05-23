@@ -596,6 +596,23 @@ fn analyze_pipeline_from_parsed(
         );
     }
     call_control.unsafe_fn_stubs = unsafe_stubs;
+    // Z2.5 Cat 2.1 Slice 2 — populate the metadata-only
+    // `static_decls` carrier so a later slice can plumb the
+    // catalogue through to `front/ast.rs::Expr::Path` lowering and
+    // skip the body-`OpKind::Input` fallthrough for known
+    // crate-level statics.  Walks each parsed source file under its
+    // crate-stripped `module_path` prefix.  No consumer wired yet —
+    // Slice 3 adds the front-end lookup.
+    let mut static_decls: Vec<(Vec<String>, crate::model::ValueType)> = Vec::new();
+    for parsed in parsed_files {
+        static_decls.extend(
+            crate::flowspace::rust_source::register::extract_static_decls(
+                &parsed.file,
+                &parsed.module_path,
+            ),
+        );
+    }
+    call_control.static_decls = static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {

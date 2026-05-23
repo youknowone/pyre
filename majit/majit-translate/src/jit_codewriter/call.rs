@@ -812,6 +812,19 @@ pub struct CallControl {
         crate::flowspace::argument::Signature,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     )>,
+    /// Z2.5 Cat 2.1 metadata carrier — `(segments, ValueType)` for
+    /// every `pub static` / `static` declaration discovered in the
+    /// parsed source set.  Populated by
+    /// `lib.rs::analyze_pipeline_from_parsed` via
+    /// `flowspace::rust_source::register::extract_static_decls`.
+    /// Consumed by `front/ast.rs::Expr::Path` lowering (Slice 3)
+    /// to skip the body-`OpKind::Input` fallthrough for known
+    /// crate-level statics — the closure path for the SHOUTY_CASE
+    /// cross-block body Input Skip cluster (57 events at 2026-05-23
+    /// measurement, dominated by INT_TYPE / BYTES_TYPE / STR_TYPE /
+    /// type-singleton names).  No consumer yet (Slice 2 plumbing
+    /// only).
+    pub static_decls: Vec<(Vec<String>, crate::model::ValueType)>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -1151,6 +1164,7 @@ impl CallControl {
             parsed_module_paths: Vec::new(),
             use_imports: HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
+            static_decls: Vec::new(),
         }
     }
 
