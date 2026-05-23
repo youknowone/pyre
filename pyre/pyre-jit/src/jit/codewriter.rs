@@ -9331,6 +9331,48 @@ impl CodeWriter {
                         None => "PREFIX_MATCH".to_string(),
                     },
                 );
+                // Slice 8: also filter `ref_copy` (in addition to
+                // `-live-`).  Slice 7 isolated the `-live-` adaptation;
+                // walker's per-opcode stack-shuffle `ref_copy` is the
+                // other major pyre-only emission family.  If non-
+                // exception benches reach PREFIX_MATCH under this
+                // double filter, the per-family flip becomes mechanical:
+                // canonical already produces the rest, and the only
+                // remaining work is deciding how to absorb / express
+                // `-live-` and `ref_copy` (as a runtime side-table, or
+                // via canonical extensions).
+                let walker_filtered2: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-" && k != "ref_copy")
+                    .collect();
+                let canonical_filtered2: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-" && k != "ref_copy")
+                    .collect();
+                let filtered2_first_div = walker_filtered2
+                    .iter()
+                    .zip(canonical_filtered2.iter())
+                    .position(|(w, c)| w != c);
+                eprintln!(
+                    "[phase4-diff-nolive-noref_copy] graph={} \
+                     walker_len2={} canonical_len2={} diff2={} first_div={}",
+                    ssarepr.name,
+                    walker_filtered2.len(),
+                    canonical_filtered2.len(),
+                    canonical_filtered2.len() as i64 - walker_filtered2.len() as i64,
+                    match filtered2_first_div {
+                        Some(pos) => format!(
+                            "pos={pos} walker={:?} canonical={:?}",
+                            walker_filtered2[pos],
+                            canonical_filtered2[pos]
+                        ),
+                        None => "PREFIX_MATCH".to_string(),
+                    },
+                );
             }
         }
 
