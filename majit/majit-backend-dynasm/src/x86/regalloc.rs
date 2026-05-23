@@ -334,6 +334,33 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc], Some(loc), output);
     }
 
+    /// x86/regalloc.py:1199 `consider_int_is_true` / `consider_int_is_zero`.
+    /// `TEST src, src ; SETcc dst` — input does not need to be in a
+    /// register, and the result lives in a distinct byte-addressable
+    /// register selected by `force_allocate_reg`. PyPy uses
+    /// `force_allocate_reg_or_cc` to leave the result in the condition
+    /// code when the consumer is a GUARD/jump; pyre's emit path always
+    /// materialises a byte register via SETcc, so the plain
+    /// `force_allocate_reg` is the closest available primitive.
+    pub(crate) fn consider_int_is_true_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let argloc = self.loc(arg, Type::Int);
+        let resloc = self.rm.force_allocate_reg(
+            dst,
+            &[],
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.perform(i, vec![argloc], Some(Loc::Reg(resloc)), output);
+    }
+
     /// x86/regalloc.py:591 `consider_uint_mul_high` — emits `MUL src`,
     /// which clobbers EAX (low) and EDX (high), so EAX must be
     /// pinned to one operand and EDX to the result.
@@ -352,6 +379,20 @@ impl<'a> RegAlloc<'a> {
         }
         self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
         let l1 = self.loc(arg1, Type::Int);
+        // x86/regalloc.py:600-601 asserts l1 can be `MUL`'s operand:
+        // it must not be an immediate (immediate would need a scratch
+        // register to materialise, which the optimiser already folded),
+        // and it can only coincide with eax when arg1 IS arg2 (the
+        // swap above already pinned arg2 to eax).
+        assert!(
+            !matches!(l1, Loc::Immed(_)),
+            "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
+        );
+        assert!(
+            !matches!(l1, Loc::Reg(r) if r.value == EAX.value)
+                || arg1 == arg2,
+            "consider_uint_mul_high_j2: l1==eax only allowed when arg1 is arg2"
+        );
         self.possibly_free_var(arg2, Type::Int);
         let tmp = self.fresh_temp_var();
         self.longevity.set(

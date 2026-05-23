@@ -262,6 +262,19 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![arg_loc], Some(Loc::Reg(res)), output);
     }
 
+    /// aarch64 `int_is_true` / `int_is_zero`: shares the 3-op `prepare_unary`
+    /// shape from regalloc.py:456 since `cmp Xn, #0 ; cset Wd, ne` keeps
+    /// the input register live while writing a fresh destination.
+    pub(crate) fn consider_int_is_true_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.consider_unary_int_j2(dst, arg, i, output);
+    }
+
     /// aarch64/regalloc.py:397 `prepare_op_uint_mul_high = prepare_op_int_mul`.
     /// `umulh Rd, Rn, Rm` is 3-operand; no scratch-pair constraints
     /// (unlike x86 which forces EAX/EDX).

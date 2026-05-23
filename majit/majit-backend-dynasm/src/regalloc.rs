@@ -2586,10 +2586,17 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         match kind {
-            IntUnaryKind::Neg
-            | IntUnaryKind::Invert
-            | IntUnaryKind::IsTrue
-            | IntUnaryKind::IsZero => self.consider_unary_int_j2(dst, arg, i, output),
+            IntUnaryKind::Neg | IntUnaryKind::Invert => {
+                self.consider_unary_int_j2(dst, arg, i, output)
+            }
+            // x86/regalloc.py:1199 `consider_int_is_true` — arg stays in
+            // memory/imm (no force-into-reg), result goes through
+            // `force_allocate_reg_or_cc`. AArch64 wraps to its 3-op unary
+            // handler since `neg`/`mvn` already keep arg and result in
+            // distinct registers.
+            IntUnaryKind::IsTrue | IntUnaryKind::IsZero => {
+                self.consider_int_is_true_j2(dst, arg, i, output)
+            }
         }
     }
 
