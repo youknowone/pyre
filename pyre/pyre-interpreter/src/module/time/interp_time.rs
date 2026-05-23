@@ -211,12 +211,32 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
         .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
 }
 
-#[cfg(not(feature = "host_env"))]
-fn _c_gmtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
-    // Sandbox semantics: no host_env → no OS time conversion available.
-    Err(crate::PyError::not_implemented(
-        "time.gmtime requires host_env feature",
-    ))
+// `interp_time.py c_gmtime` libc backend, used when the host_env
+// abstraction layer is disabled.  Mirrors PyPy's rffi.llexternal call
+// to libc gmtime_r (Unix) / _gmtime64_s (Windows CRT).
+#[cfg(all(unix, not(feature = "host_env")))]
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    let t = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let p = unsafe { libc::gmtime_r(&t, &mut tm) };
+    if p.is_null() {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    Ok(libc_tm_to_c_tm(&tm))
+}
+
+#[cfg(all(windows, not(feature = "host_env")))]
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    unsafe extern "C" {
+        fn _gmtime64_s(out: *mut MsvcTm, t: *const i64) -> i32;
+    }
+    let t = seconds;
+    let mut tm: MsvcTm = unsafe { std::mem::zeroed() };
+    let rc = unsafe { _gmtime64_s(&mut tm, &t) };
+    if rc != 0 {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    Ok(msvc_tm_to_c_tm(&tm))
 }
 
 #[cfg(feature = "host_env")]
@@ -226,12 +246,29 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
         .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
 }
 
-#[cfg(not(feature = "host_env"))]
-fn _c_localtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
-    // Sandbox semantics: no host_env → no OS time conversion available.
-    Err(crate::PyError::not_implemented(
-        "time.localtime requires host_env feature",
-    ))
+#[cfg(all(unix, not(feature = "host_env")))]
+fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    let t = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let p = unsafe { libc::localtime_r(&t, &mut tm) };
+    if p.is_null() {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    Ok(libc_tm_to_c_tm(&tm))
+}
+
+#[cfg(all(windows, not(feature = "host_env")))]
+fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    unsafe extern "C" {
+        fn _localtime64_s(out: *mut MsvcTm, t: *const i64) -> i32;
+    }
+    let t = seconds;
+    let mut tm: MsvcTm = unsafe { std::mem::zeroed() };
+    let rc = unsafe { _localtime64_s(&mut tm, &t) };
+    if rc != 0 {
+        return Err(crate::PyError::value_error("unconvertible time"));
+    }
+    Ok(msvc_tm_to_c_tm(&tm))
 }
 
 // ── Unix helpers ────────────────────────────────────────────────────
@@ -511,11 +548,27 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         tm.tm_wday = libc_tm.tm_wday;
         result as i64
     };
-    #[cfg(not(feature = "host_env"))]
+    #[cfg(all(unix, not(feature = "host_env")))]
     let tt: i64 = {
-        // Sandbox semantics: no host_env → no OS time conversion available.
+        let mut libc_tm = c_tm_to_libc_tm(&tm);
+        let r = unsafe { libc::mktime(&mut libc_tm) };
+        tm.tm_wday = libc_tm.tm_wday;
+        r as i64
+    };
+    #[cfg(all(windows, not(feature = "host_env")))]
+    let tt: i64 = {
+        unsafe extern "C" {
+            fn _mktime64(out: *mut MsvcTm) -> i64;
+        }
+        let mut msvc_tm = c_tm_to_msvc_tm(&tm);
+        let r = unsafe { _mktime64(&mut msvc_tm) };
+        tm.tm_wday = msvc_tm.tm_wday;
+        r
+    };
+    #[cfg(not(any(unix, windows)))]
+    let tt: i64 = {
         return Err(crate::PyError::not_implemented(
-            "time.mktime requires host_env feature",
+            "time.mktime requires host_env feature on this platform",
         ));
     };
 
