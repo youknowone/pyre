@@ -13,7 +13,17 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef,
     Type, Value,
 };
+use majit_metainterp::history::TreeLoop;
 use majit_metainterp::recorder::Trace;
+
+/// Materialize a `Vec<InputArg>` view of a `TreeLoop`'s inputargs for backend
+/// APIs that take `&[InputArg]`. `TreeLoop::inputargs` stores `InputArgRc`
+/// so optimizer/short-preamble/resume metadata observe a single shared
+/// identity; backend boundaries that don't traffic in `_forwarded` accept
+/// the deref-and-clone projection.
+fn inputargs_view(t: &TreeLoop) -> Vec<InputArg> {
+    t.inputargs.iter().map(|rc| (**rc).clone()).collect()
+}
 
 fn magic_numbers(m: i64) -> (u64, u32) {
     debug_assert!(m >= 3);
@@ -84,7 +94,7 @@ fn test_simple_arithmetic() {
 
     let mut token = JitCellToken::new(0);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Execute
@@ -127,7 +137,7 @@ fn test_sum_loop() {
 
     let mut token = JitCellToken::new(1);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Execute: i=100, sum=0
@@ -205,7 +215,7 @@ fn test_guard_failure_path() {
 
     let mut token = JitCellToken::new(3);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Execute with x=5: guard passes, result = 5 * 2 = 10
@@ -281,7 +291,7 @@ fn test_bridge_end_to_end() {
     backend.set_next_trace_id(0);
     let mut token = JitCellToken::new(10);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Execute without bridge: i=5, sum=0
@@ -341,7 +351,7 @@ fn test_bridge_end_to_end() {
     let bridge_info = backend
         .compile_bridge(
             bridge_fail_descr,
-            &bridge_trace.inputargs,
+            &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
             &[],
@@ -426,7 +436,7 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -467,7 +477,7 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -507,7 +517,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
 
     let mut token = JitCellToken::new(token_id);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     (backend, token)
@@ -702,7 +712,7 @@ fn test_vec_int_add_simd() {
 
     let mut token = JitCellToken::new(300);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // a=10, b=20, c=3, d=7 -> r0 = 10+3 = 13, r1 = 20+7 = 27
@@ -764,7 +774,7 @@ fn test_vec_int_sub_simd() {
 
     let mut token = JitCellToken::new(301);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // a=10, b=20, c=3, d=7 -> r0 = 10-3 = 7, r1 = 20-7 = 13
@@ -813,7 +823,7 @@ fn test_vec_int_mul_simd() {
 
     let mut token = JitCellToken::new(302);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // a=5, b=6, c=7, d=8 -> r0 = 5*7 = 35, r1 = 6*8 = 48
@@ -866,7 +876,7 @@ fn test_vec_expand_add_simd() {
 
     let mut token = JitCellToken::new(303);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // a=10, b=20, s=100 -> r0 = 10+100 = 110, r1 = 20+100 = 120
@@ -927,7 +937,7 @@ fn test_vec_float_add_simd() {
 
     let mut token = JitCellToken::new(304);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // Pass f64 values as i64 bit patterns
@@ -1006,7 +1016,7 @@ fn test_vec_chained_add_mul_simd() {
 
     let mut token = JitCellToken::new(305);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // a=2, b=3, c=4, d=5, e=10, f=20
@@ -1305,7 +1315,7 @@ fn test_threadlocalref_get_basic() {
 
     let mut token = JitCellToken::new(500);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1358,7 +1368,7 @@ fn test_threadlocalref_get_multiple_slots() {
 
     let mut token = JitCellToken::new(501);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1397,7 +1407,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
 
     let mut token = JitCellToken::new(502);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     for value in [0i64, 1, -1, 0x544C, i64::MAX, i64::MIN] {
@@ -1537,7 +1547,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
 
     let mut token = JitCellToken::new(600);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallReleaseGilI should compile");
 
     // Execute with a=10, b=32 -> expected result 42
@@ -1589,7 +1599,7 @@ fn test_call_release_gil_i_no_args() {
 
     let mut token = JitCellToken::new(601);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallReleaseGilI with no args should compile");
 
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -1634,7 +1644,7 @@ fn test_call_release_gil_n_void_return() {
 
     let mut token = JitCellToken::new(602);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallReleaseGilN should compile");
 
     FFI_SINK_VALUE.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1681,7 +1691,7 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut token = JitCellToken::new(603);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("trace with CallReleaseGilI + IntAdd should compile");
 
     // x=7 -> ffi_add(7, 10)=17 -> 17+5=22
@@ -1794,7 +1804,7 @@ fn test_raw_store_load_int_roundtrip() {
 
     let mut token = JitCellToken::new(600);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("raw int roundtrip compilation should succeed");
 
     // Allocate a buffer and execute
@@ -1836,7 +1846,7 @@ fn test_raw_store_load_float_roundtrip() {
 
     let mut token = JitCellToken::new(601);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("raw float roundtrip compilation should succeed");
 
     let mut buf = vec![0u8; 16];
@@ -1886,7 +1896,7 @@ fn test_raw_ops_different_offsets_no_interference() {
 
     let mut token = JitCellToken::new(602);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("multi-offset raw ops should compile");
 
     let mut buf = vec![0u8; 32];
@@ -1933,7 +1943,7 @@ fn test_raw_load_unsigned_byte() {
 
     let mut token = JitCellToken::new(603);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("unsigned byte raw load should compile");
 
     let mut data = vec![0xFFu8];
@@ -2044,7 +2054,7 @@ fn test_call_release_gil_with_guard_not_forced() {
 
     let mut token = JitCellToken::new(700);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallMayForceI + GuardNotForced should compile");
 
     // Not forced: guard passes, finish returns result = x * 2
@@ -2108,7 +2118,7 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let mut token = JitCellToken::new(701);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallMayForceI + GuardNotForced (forced) should compile");
 
     // flag=0 -> not forced -> reaches Finish
@@ -2188,7 +2198,7 @@ fn test_ffi_call_exception_propagation() {
 
     let mut token = JitCellToken::new(702);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("CallReleaseGilI + GuardNotForced + GuardNoException should compile");
 
     // collect_guards: GuardNotForced=0, GuardNoException=1, Finish=2
@@ -2249,7 +2259,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
 
     let mut token = JitCellToken::new(900);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // x=50: guard passes (55 < 100), reaches Finish
@@ -2314,7 +2324,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     backend.set_next_header_pc(1000);
     let mut token = JitCellToken::new(902);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("main loop compilation should succeed");
 
     // Set up recovery layout on the guard with 2 frames so the bridge
@@ -2396,7 +2406,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let _bridge_info = backend
         .compile_bridge(
             bridge_fail_descr,
-            &bridge_trace.inputargs,
+            &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
             &[],
@@ -2519,7 +2529,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     backend.set_next_header_pc(5000);
     let mut token = JitCellToken::new(904);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("compilation should succeed");
 
     // x_int=10, x_float=3.14: guard passes, finish returns 10
@@ -2631,7 +2641,7 @@ fn test_ffi_exchange_buffer_pattern() {
 
     let mut token = JitCellToken::new(950);
     backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &mut token)
         .expect("FFI exchange buffer pattern should compile");
 
     // Allocate a 48-byte exchange buffer (matching RPython's exbuf allocation)
