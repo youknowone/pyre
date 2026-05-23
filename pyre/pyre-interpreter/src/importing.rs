@@ -1434,6 +1434,7 @@ fn init_pwd(ns: &mut DictStorage) {
 /// is exposed as a builtin type attribute; full structseq instance
 /// materialisation (so `entry.gr_name` works) is blocked on the
 /// structseq framework task.
+#[cfg(unix)]
 fn init_grp(ns: &mut DictStorage) {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
