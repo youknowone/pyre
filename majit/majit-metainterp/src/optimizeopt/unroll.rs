@@ -109,7 +109,7 @@ pub struct UnrollOptimizer {
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
-    phase1_emit_ops: Vec<majit_ir::Op>,
+    phase1_emit_ops: Vec<majit_ir::OpRc>,
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,

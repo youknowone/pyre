@@ -180,7 +180,7 @@ pub struct Optimizer {
     /// `OptContext::op_at` resolves Phase 1 emit OpRefs through `op.type_`
     /// directly — single source of truth for cross-phase Box.type
     /// (history.py:220 parity).
-    pub phase1_emit_ops: Vec<majit_ir::Op>,
+    pub phase1_emit_ops: Vec<majit_ir::OpRc>,
     /// jitprof.Counters.OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED accumulators.
     ///
     /// RPython optimizer.py:626/629/673 calls
@@ -2361,7 +2361,7 @@ impl Optimizer {
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
             if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
-                self.phase1_emit_ops.push(op.clone());
+                self.phase1_emit_ops.push(std::rc::Rc::new(op.clone()));
             }
         }
         // Transfer exported virtual state from context to optimizer
@@ -5506,10 +5506,10 @@ mod tests {
         // Vec, so they are NOT carried here.
         let mut opt = Optimizer::new();
         opt.trace_inputarg_types = vec![Type::Void, Type::Int, Type::Ref];
-        opt.phase1_emit_ops.push(majit_ir::Op::new(
+        opt.phase1_emit_ops.push(std::rc::Rc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
             &[OpRef::int_op(50)],
-        ));
+        )));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let result = opt.optimize_with_constants_and_inputs_at(

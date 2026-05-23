@@ -742,7 +742,7 @@ pub struct OptContext {
     /// arguments inside Phase 2, but never inside Phase 2's own `new_operations`.
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
-    pub phase1_emit_ops: Vec<Op>,
+    pub phase1_emit_ops: Vec<majit_ir::OpRc>,
     /// Epic H H-3.0b: per-position BoxRef pool for the input ops being
     /// optimized. `box_pool[i]` mirrors the `AbstractValue` for the
     /// trace position whose `OpRef::raw() == i` (recorder issuance order:
@@ -5472,6 +5472,7 @@ impl OptContext {
             .iter()
             .rev()
             .find(|op| op.pos.get() == opref)
+            .map(|rc| rc.as_ref())
     }
 
     /// RPython box.type parity: find the result type of the operation
