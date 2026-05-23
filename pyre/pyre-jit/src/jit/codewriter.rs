@@ -9373,6 +9373,25 @@ impl CodeWriter {
                         None => "PREFIX_MATCH".to_string(),
                     },
                 );
+                // Slice 9: windowed dump around the double-filtered
+                // first-divergence — 5 positions before, 10 after.
+                // Helps see whether walker's vable-accessor extras are
+                // a structural pattern (always same opname sequence at
+                // every divergence) or per-bench-specific.
+                if let Some(pos) = filtered2_first_div {
+                    let lo = pos.saturating_sub(5);
+                    let walker_hi = (pos + 11).min(walker_filtered2.len());
+                    let canonical_hi = (pos + 11).min(canonical_filtered2.len());
+                    let walker_window: Vec<&String> =
+                        walker_filtered2[lo..walker_hi].iter().collect();
+                    let canonical_window: Vec<&String> =
+                        canonical_filtered2[lo..canonical_hi].iter().collect();
+                    eprintln!(
+                        "[phase4-diff-window] graph={} lo={lo} pos={pos} \
+                         walker={walker_window:?} canonical={canonical_window:?}",
+                        ssarepr.name,
+                    );
+                }
             }
         }
 
