@@ -1173,7 +1173,6 @@ impl Insn {
 /// flow-graph + flatten pipeline.
 pub struct GraphFlattener<'a> {
     // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
-
     /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
     ///
     /// `enforce_input_args` reads `self.graph.startblock.inputargs`
@@ -1213,7 +1212,6 @@ pub struct GraphFlattener<'a> {
     ssarepr: &'a mut SSARepr,
 
     // ─── pyre-only fields (no PyPy counterpart) ───
-
     /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
@@ -2330,7 +2328,11 @@ fn regalloc_color(
             alloc.coloring.len(),
             sampled.len(),
             sampled,
-            if known.len() > sampled.len() { ", ..." } else { "" },
+            if known.len() > sampled.len() {
+                ", ..."
+            } else {
+                ""
+            },
         )
     });
     Register::new(kind, color)

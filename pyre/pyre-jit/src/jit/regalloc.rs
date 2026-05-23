@@ -1524,5 +1524,4 @@ mod tests {
         assert_eq!(alloc.find_rep(4), 3);
         assert_eq!(alloc.find_rep(5), 3);
     }
-
 }

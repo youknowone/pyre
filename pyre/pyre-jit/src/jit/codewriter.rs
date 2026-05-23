@@ -9148,14 +9148,10 @@ impl CodeWriter {
         // also emit a per-graph length diff to stderr so the byte-
         // equivalent convergence rate can be measured across the 39
         // production benches.
-        let phase4_build_canonical = std::env::var("PYRE_PHASE4_BUILD_CANONICAL")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let phase4_diff_canonical = std::env::var("PYRE_PHASE4_DIFF_CANONICAL")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let phase4_build_canonical =
+            std::env::var("PYRE_PHASE4_BUILD_CANONICAL").ok().as_deref() == Some("1");
+        let phase4_diff_canonical =
+            std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1");
         if phase4_build_canonical || phase4_diff_canonical {
             let mut canonical_regallocs = graph_regallocs.clone();
             let canonical_ssarepr = super::flatten::flatten_graph(
@@ -9228,9 +9224,7 @@ impl CodeWriter {
                     .insns
                     .iter()
                     .zip(canonical_ssarepr.insns.iter())
-                    .position(|(w, c)| {
-                        phase4_insn_opname_key(w) != phase4_insn_opname_key(c)
-                    });
+                    .position(|(w, c)| phase4_insn_opname_key(w) != phase4_insn_opname_key(c));
                 match first_div {
                     Some(pos) => {
                         let w = phase4_insn_opname_key(&ssarepr.insns[pos]);
@@ -9268,11 +9262,8 @@ impl CodeWriter {
                 for (i, insn) in ssarepr.insns.iter().enumerate() {
                     if phase4_insn_opname_key(insn) == "-live-" {
                         walker_total_live += 1;
-                        let preceded_by_label = i > 0
-                            && matches!(
-                                ssarepr.insns[i - 1],
-                                super::flatten::Insn::Label(_)
-                            );
+                        let preceded_by_label =
+                            i > 0 && matches!(ssarepr.insns[i - 1], super::flatten::Insn::Label(_));
                         if preceded_by_label {
                             walker_leading_live += 1;
                         } else {
@@ -9325,8 +9316,7 @@ impl CodeWriter {
                     match filtered_first_div {
                         Some(pos) => format!(
                             "pos={pos} walker={:?} canonical={:?}",
-                            walker_filtered[pos],
-                            canonical_filtered[pos]
+                            walker_filtered[pos], canonical_filtered[pos]
                         ),
                         None => "PREFIX_MATCH".to_string(),
                     },
@@ -9367,8 +9357,7 @@ impl CodeWriter {
                     match filtered2_first_div {
                         Some(pos) => format!(
                             "pos={pos} walker={:?} canonical={:?}",
-                            walker_filtered2[pos],
-                            canonical_filtered2[pos]
+                            walker_filtered2[pos], canonical_filtered2[pos]
                         ),
                         None => "PREFIX_MATCH".to_string(),
                     },
@@ -9573,8 +9562,7 @@ impl CodeWriter {
                     float: canonical_regallocs[super::flatten::Kind::Float.index()].num_colors,
                 };
                 let mut canonical_emitter = SSAReprEmitter::new();
-                canonical_emitter
-                    .set_name(format!("{}_canonical_probe", canonical_ssarepr.name));
+                canonical_emitter.set_name(format!("{}_canonical_probe", canonical_ssarepr.name));
                 let _ = register_helper_fn_pointers(&mut canonical_emitter, self.cpu());
                 let canonical_builder = canonical_emitter.into_builder();
                 let assembly_result =
@@ -9794,12 +9782,9 @@ impl CodeWriter {
                     }
                 }
             }
-            let ref_coloring =
-                &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
+            let ref_coloring = &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
             let mut probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
-                if let Some(var_id) =
-                    slot_to_variable_id.get(pre_slot).copied().flatten()
-                {
+                if let Some(var_id) = slot_to_variable_id.get(pre_slot).copied().flatten() {
                     let v_id = super::flow::VariableId(var_id);
                     if let Some(&canonical_color) = ref_coloring.get(&v_id) {
                         if canonical_color != walker_color {
@@ -9807,11 +9792,18 @@ impl CodeWriter {
                                 "[phase4-color-mismatch] graph={} kind={label} \
                                  pre_slot={pre_slot} walker={walker_color} \
                                  canonical={canonical_color} var={}",
-                                ssarepr.name,
-                                var_id,
+                                ssarepr.name, var_id,
                             );
                         }
-                        return (1u32, if canonical_color == walker_color { 1 } else { 0 }, 0u32);
+                        return (
+                            1u32,
+                            if canonical_color == walker_color {
+                                1
+                            } else {
+                                0
+                            },
+                            0u32,
+                        );
                     } else {
                         return (1u32, 0u32, 1u32); // walker-only (no canonical entry)
                     }
@@ -9868,9 +9860,7 @@ impl CodeWriter {
                 let canonical_color = ref_coloring.get(&v.id).copied();
                 eprintln!(
                     "[phase4-inputarg] graph={} input_idx={input_idx} var={} canonical_color={:?}",
-                    ssarepr.name,
-                    v.id.0,
-                    canonical_color,
+                    ssarepr.name, v.id.0, canonical_color,
                 );
                 input_idx += 1;
             }

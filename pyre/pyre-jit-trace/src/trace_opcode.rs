@@ -2092,7 +2092,21 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.registers_r[idx] = value;
+            // Path 3 slice 37b (task #227): when `load_local_value`'s
+            // vable-read predicate (`is_active_vable_owner` AND no
+            // `bridge_local_oprefs`) fires, every reader of the local
+            // OpRef sources from `virtualizable_boxes` and the
+            // `registers_r[idx]` semantic-mirror write is dead — PyPy's
+            // `_opimpl_setarrayitem_vable` (`pyjitpl.py:1242-1247`)
+            // writes only the vable shadow.  Bridges with
+            // `bridge_local_oprefs=Some(...)` still read from
+            // `registers_r[idx]` (`load_local_value`'s non-vable arm at
+            // line 1999), so they retain the mirror write; non-owner
+            // frames also keep it.
+            let vable_read_path = s.is_active_vable_owner && s.bridge_local_oprefs.is_none();
+            if !vable_read_path {
+                s.registers_r[idx] = value;
+            }
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
@@ -4423,8 +4437,9 @@ impl MIFrame {
                 // the mirror write (slice 37b), so consult vable first
                 // for portal frames.
                 let opref = if owns_shadow {
-                    ctx.virtualizable_box_at(nvs + abs_idx)
-                        .unwrap_or_else(|| s.registers_r.get(abs_idx).copied().unwrap_or(OpRef::NONE))
+                    ctx.virtualizable_box_at(nvs + abs_idx).unwrap_or_else(|| {
+                        s.registers_r.get(abs_idx).copied().unwrap_or(OpRef::NONE)
+                    })
                 } else {
                     *s.registers_r.get(abs_idx)?
                 };
