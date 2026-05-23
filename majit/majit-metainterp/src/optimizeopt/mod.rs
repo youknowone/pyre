@@ -3759,6 +3759,11 @@ impl OptContext {
                     .new_operations
                     .iter()
                     .rfind(|op| op.pos.get() == opref)
+                    .or_else(|| {
+                        self.phase1_emit_ops
+                            .iter()
+                            .rfind(|op| op.pos.get() == opref)
+                    })
                     .cloned();
                 if let Some(op_rc) = op_rc {
                     p.bind_op(&op_rc);
