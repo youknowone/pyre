@@ -109,6 +109,16 @@ pub struct SSARepr {
     /// `assembler.py:41` populates this with the byte position of each
     /// instruction after `assemble()`.
     pub insns_pos: Option<Vec<usize>>,
+    /// Pyre-only side-table populated by canonical's
+    /// `serialize_op`: for each non-negative `op.offset` (Python PC)
+    /// encountered, the FIRST `insns` index where an op with that
+    /// PC was emitted.  Walker maintains the analogous mapping via
+    /// `walker_pc_live_marker_pos` (codewriter.rs:4125) — both
+    /// drive `pc_map` construction at exit-recovery time
+    /// (call_jit.rs:3939).  Empty when filled by the walker path.
+    /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc per
+    /// [[feedback-no-hashmap-ever]].
+    pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Phase 2.2a (plan staged-sauteeing-koala, Tasks #158/#159/#122
     /// epic): per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
@@ -131,6 +141,7 @@ impl SSARepr {
             name: name.into(),
             insns: Vec::new(),
             insns_pos: None,
+            pc_first_insn_pos: Vec::new(),
             next_var_idx: [0; 3],
         }
     }
@@ -1307,23 +1318,27 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
-        // Phase 4 endgame slice 14: under `PYRE_PHASE4_DIFF_CANONICAL`,
-        // emit `(graph_name, op.offset, insn_pos)` for each canonical
-        // op before it lands in the stream.  Walker tracks the same
-        // mapping via `walker_pc_live_marker_pos`
-        // (codewriter.rs:4125).  Comparing the two streams confirms
-        // whether canonical-derived `pc_map` would agree with walker's
-        // for production splice — the precondition for retiring
-        // walker's pcN emission.  Default-off; only the probe path
-        // accesses the env, the production canonical entry is
-        // unchanged.
-        if std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[phase4-canonical-pc-pos] graph={} py_pc={} insn_pos={}",
-                self.ssarepr.name,
-                op.offset,
-                self.ssarepr.insns.len(),
-            );
+        // Phase 4 endgame slice 15: record FIRST insn position per
+        // non-negative `op.offset` (Python PC) into
+        // `ssarepr.pc_first_insn_pos`.  Walker tracks the same mapping
+        // via `walker_pc_live_marker_pos` (codewriter.rs:4125); both
+        // drive `pc_map` construction at exit recovery
+        // (call_jit.rs:3939).  Synthetic ops with `offset = -1`
+        // (insert_renamings ref_copy / overflow trampolines /
+        // catch-landing entries) are skipped — they have no Python
+        // PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>` per
+        // [[feedback-no-hashmap-ever]].
+        if op.offset >= 0 {
+            let py_pc = op.offset;
+            let already_seen = self
+                .ssarepr
+                .pc_first_insn_pos
+                .iter()
+                .any(|(pc, _)| *pc == py_pc);
+            if !already_seen {
+                let pos = self.ssarepr.insns.len();
+                self.ssarepr.pc_first_insn_pos.push((py_pc, pos));
+            }
         }
         let insn = self.flatten_space_operation(op);
         self.emitline(insn);

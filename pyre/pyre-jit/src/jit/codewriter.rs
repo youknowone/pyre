@@ -9496,6 +9496,26 @@ impl CodeWriter {
                         }
                     }
                 }
+                // Slice 15: canonical's `pc_first_insn_pos` side-table
+                // is now populated by `flatten::serialize_op`.  Report
+                // its size for each graph alongside the count of
+                // distinct walker py_pcs (from
+                // `walker_pc_live_marker_pos`'s outer length minus
+                // None-only entries).  When the two match, canonical's
+                // side-table covers every Python PC walker tracks — a
+                // necessary condition for canonical-driven pc_map at
+                // exit recovery (call_jit.rs:3939).
+                let canonical_pc_count = canonical_ssarepr.pc_first_insn_pos.len();
+                let walker_pc_count = walker_pc_live_marker_pos
+                    .iter()
+                    .filter(|entries| !entries.is_empty())
+                    .count();
+                eprintln!(
+                    "[phase4-pc-coverage] graph={} \
+                     canonical_pc_first_insn_pos_len={canonical_pc_count} \
+                     walker_pc_live_marker_pos_nonempty={walker_pc_count}",
+                    ssarepr.name,
+                );
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
