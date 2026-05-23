@@ -9109,21 +9109,40 @@ impl CodeWriter {
         // ssarepr = flatten_graph(graph, regallocs, cpu)` — the upstream
         // production path that pyre's walker currently bypasses by
         // emitting SSARepr inline.  Output is currently unused; this
-        // probe surfaces panics or graph-shape gaps on real 14-bench
-        // workloads before any per-family flip from walker inline to
-        // canonical splice.  Default-off so production is unchanged.
-        if std::env::var("PYRE_PHASE4_BUILD_CANONICAL")
+        // probe surfaces panics or graph-shape gaps on real workloads
+        // before any per-family flip from walker inline to canonical
+        // splice.  Default-off so production is unchanged.
+        //
+        // Slice 3: under `PYRE_PHASE4_DIFF_CANONICAL=1` (implies build),
+        // also emit a per-graph length diff to stderr so the byte-
+        // equivalent convergence rate can be measured across the 39
+        // production benches.
+        let phase4_build_canonical = std::env::var("PYRE_PHASE4_BUILD_CANONICAL")
             .ok()
             .as_deref()
-            == Some("1")
-        {
+            == Some("1");
+        let phase4_diff_canonical = std::env::var("PYRE_PHASE4_DIFF_CANONICAL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if phase4_build_canonical || phase4_diff_canonical {
             let mut canonical_regallocs = graph_regallocs.clone();
-            let _canonical_ssarepr = super::flatten::flatten_graph(
+            let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
                 &mut canonical_regallocs,
                 false,
                 Some(self.cpu()),
             );
+            if phase4_diff_canonical {
+                let walker_len = ssarepr.insns.len();
+                let canonical_len = canonical_ssarepr.insns.len();
+                let diff = canonical_len as i64 - walker_len as i64;
+                eprintln!(
+                    "[phase4-diff] graph={} walker_len={walker_len} \
+                     canonical_len={canonical_len} diff={diff}",
+                    ssarepr.name,
+                );
+            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
