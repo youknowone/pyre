@@ -4005,6 +4005,61 @@ pub fn extract_unsafe_fn_signatures(
     out
 }
 
+/// Walk a parsed `syn::File` for `pub static X: T = ...` items and
+/// project each to `[prefix?, ident]` segments + `ValueType` from `T`.
+///
+/// Cat 2.1 Slice 1 (Z2.5 SHOUTY_CASE cluster): the lazy install
+/// fallback at `front/ast.rs::Expr::Path` emits a body-`OpKind::Input`
+/// for any single-segment name not bound in `ctx.local_value_ids` —
+/// crate-local statics (e.g. `INT_TYPE`, `BYTES_TYPE`, `TRUE_SINGLETON`)
+/// fall into that hole and surface as "adapter cross-block body Input"
+/// Skip events when the same static is read across blocks (predecessor
+/// link.args carries no matching entry because the name is not a
+/// local).  The orthodox fix is to recognise the name as a known
+/// crate-level static at lowering time and emit a `Constant`-style
+/// load instead of a body-`Input`, but the immediate prerequisite is a
+/// catalogue of every `pub static` in the pyre source tree paired with
+/// its declared type so the lowering site can decide.
+///
+/// This helper produces that catalogue.  Pure-extract — no
+/// registration, no side effects; the slice 2 consumer will plumb the
+/// result through `lib.rs::analyze_pipeline_from_parsed` into the
+/// front-end ctx alongside `unsafe_fn_stubs`.  `prefix` mirrors the
+/// other Slice-1 helpers: passed at the file's module path so segments
+/// resolve to `[module, name]` (`module_path::name` form).  An empty
+/// prefix yields `[name]` single-segment entries (test fixtures /
+/// crate-root statics).
+///
+/// Type projection: routes the static's `syn::Type` through
+/// `front/ast.rs::classify_fn_arg_ty` which already handles
+/// `i8..i64` / `u8..u64` / `bool` / `f32`/`f64` / `Box<T>`/`Rc<T>`/`Arc<T>`
+/// unwrapping + the `Self::Truth` self-ty special case.  Compound
+/// types (`PyType`, `LazyLock<...>`, custom structs) surface as
+/// `ValueType::Ref` since the address `&STATIC` is the lowering shape
+/// upstream `LOAD_GLOBAL` produces for module-level constants
+/// (`flowcontext.py:841` pushes the literal value; for compound
+/// values pyre emits the address).  `static` (non-`pub`) items are
+/// included too — they're still in-scope inside the defining crate
+/// and same-crate cross-block reads trip the same Skip family.
+pub fn extract_static_decls(
+    file: &File,
+    prefix: &str,
+) -> Vec<(Vec<String>, crate::model::ValueType)> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        if let Item::Static(s) = item {
+            let mut segments = Vec::with_capacity(2);
+            if !prefix.is_empty() {
+                segments.push(prefix.to_string());
+            }
+            segments.push(s.ident.to_string());
+            let value_type = crate::front::ast::classify_fn_arg_ty(&s.ty);
+            out.push((segments, value_type));
+        }
+    }
+    out
+}
+
 /// Z2.5 Path C slice 3a — project a `syn::ReturnType` to a
 /// `LowLevelType` representable by the slice 2 stub-pygraph builder.
 /// Coverage is intentionally narrow at this slice (Bool / Void only) —
@@ -8898,5 +8953,82 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         };
         assert_eq!(target._name, "ParityProbe_UnitStruct");
         assert!(target._names.is_empty());
+    }
+
+    #[test]
+    fn extract_static_decls_empty_file_returns_empty() {
+        let file = parse_file("");
+        assert!(extract_static_decls(&file, "anyprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_static_decls_const_not_static_skipped() {
+        let file = parse_file("pub const FOO: i64 = 42;");
+        assert!(extract_static_decls(&file, "modprefix").is_empty());
+    }
+
+    #[test]
+    fn extract_static_decls_pub_static_int_unsigned_bool_float() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "pub static A: i64 = 0;
+             pub static B: usize = 0;
+             pub static C: bool = false;
+             pub static D: f64 = 0.0;",
+        );
+        let decls = extract_static_decls(&file, "pyobject");
+        assert_eq!(decls.len(), 4);
+        assert_eq!(decls[0].0, vec!["pyobject".to_string(), "A".to_string()]);
+        assert_eq!(decls[0].1, ValueType::Int);
+        assert_eq!(decls[1].1, ValueType::Unsigned);
+        assert_eq!(decls[2].1, ValueType::Bool);
+        assert_eq!(decls[3].1, ValueType::Float);
+    }
+
+    #[test]
+    fn extract_static_decls_empty_prefix_emits_bare_name() {
+        let file = parse_file("pub static BARE: bool = true;");
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].0, vec!["BARE".to_string()]);
+    }
+
+    #[test]
+    fn extract_static_decls_compound_type_classifies_as_ref() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "pub static INT_TYPE: PyType = new_pytype(\"int\");
+             pub static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| vec![]);",
+        );
+        let decls = extract_static_decls(&file, "pyobject");
+        assert_eq!(decls.len(), 2);
+        // `PyType` is a bare path leaf; `classify_fn_arg_ty` falls through
+        // to the compound-type `Ref` branch.
+        assert_eq!(decls[0].1, ValueType::Ref);
+        // `LazyLock<...>` is not in the `Box | Rc | Arc` unwrap list;
+        // also falls through to Ref.
+        assert_eq!(decls[1].1, ValueType::Ref);
+    }
+
+    #[test]
+    fn extract_static_decls_non_pub_static_included() {
+        let file = parse_file("static PRIVATE: bool = false;");
+        let decls = extract_static_decls(&file, "mod");
+        assert_eq!(decls.len(), 1, "non-pub static must still be catalogued");
+        assert_eq!(decls[0].0, vec!["mod".to_string(), "PRIVATE".to_string()]);
+    }
+
+    #[test]
+    fn extract_static_decls_other_items_ignored() {
+        let file = parse_file(
+            "pub fn foo() {}
+             pub const C: i64 = 0;
+             pub static S: bool = true;
+             pub struct St;
+             pub enum E { A }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 1, "only Item::Static contributes");
+        assert_eq!(decls[0].0, vec!["S".to_string()]);
     }
 }
