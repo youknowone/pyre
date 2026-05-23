@@ -2280,7 +2280,26 @@ fn regalloc_color(
     // `flatten.py:382-386 GraphFlattener.getcolor` — pick the
     // per-kind allocator and call `regallocs[kind].getcolor(v)`.
     let kind = v.kind.unwrap_or(Kind::Ref);
-    let color = regallocs[kind.index()].getcolor(v.id);
+    let alloc = &regallocs[kind.index()];
+    let color = alloc.coloring.get(&v.id).copied().unwrap_or_else(|| {
+        // Surface kind + per-kind coloring size so the Phase 4 endgame
+        // probe (codewriter.rs PYRE_PHASE4_BUILD_CANONICAL) can name
+        // the specific dual-coloring gap without dumping the entire
+        // graph.  Sample up to 8 known IDs to make "is the Variable
+        // simply skipped or is the kind allocator empty?" obvious at
+        // a glance.
+        let mut known: Vec<u32> = alloc.coloring.keys().map(|id| id.0).collect();
+        known.sort_unstable();
+        let sampled: Vec<u32> = known.iter().take(8).copied().collect();
+        panic!(
+            "regalloc_color: missing color for {v:?} (kind={kind:?}); \
+             kind allocator has {} entries (first {}: {:?}{})",
+            alloc.coloring.len(),
+            sampled.len(),
+            sampled,
+            if known.len() > sampled.len() { ", ..." } else { "" },
+        )
+    });
     Register::new(kind, color)
 }
 
