@@ -9396,6 +9396,46 @@ impl CodeWriter {
                     ssarepr.name,
                     canonical_label_count as i64 - walker_label_count as i64,
                 );
+                // Slice 11: collect Label NAMES per stream and emit
+                // the multiset deltas (canonical-only and walker-only).
+                // Tells us whether canonical's extra Labels follow a
+                // naming pattern (block-N synthetic forwarders, link-N
+                // trampolines, etc.) which would point at the
+                // structural fix needed to close the per-PC vs
+                // per-block emission gap.
+                let walker_names: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|i| match i {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let canonical_names: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter_map(|i| match i {
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut walker_only_names: Vec<String> = Vec::new();
+                let mut canonical_only_names: Vec<String> = Vec::new();
+                let mut wc = walker_names.clone();
+                for c in &canonical_names {
+                    if let Some(pos) = wc.iter().position(|w| w == c) {
+                        wc.remove(pos);
+                    } else {
+                        canonical_only_names.push(c.clone());
+                    }
+                }
+                walker_only_names = wc;
+                eprintln!(
+                    "[phase4-diff-labels-names] graph={} \
+                     walker_only={walker_only_names:?} \
+                     canonical_only={canonical_only_names:?}",
+                    ssarepr.name,
+                );
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
