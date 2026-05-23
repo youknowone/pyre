@@ -430,12 +430,50 @@ impl PyreCallRegistry {
             return None;
         }
         let leaf = segments.last()?;
+        // Free-fn vs impl-method shape disambiguator.  A free-fn query
+        // path spells `[module_or_crate, fn_name]` where every pre-leaf
+        // segment is snake_case (module conv); an impl-method path
+        // spells `[..., ImplType, method_name]` where the segment
+        // immediately preceding the leaf is the impl target type
+        // (PascalCase by Rust naming conv).  When the query is a
+        // free-fn shape but the registry has an unrelated impl-method
+        // candidate sharing the leaf identifier (e.g. `OpRef::is_none`
+        // colliding with free-fn `pyre_object::is_none`), the impl
+        // candidate should be rejected — the callsite was already typed
+        // by the caller as a non-method call.  Mirrors PyPy's bookkeeper
+        // never confusing `is_none(obj)` with `obj.is_none()` because
+        // `Constant.value` identity differs (free fn object vs bound
+        // method object); pyre's segment-key carrier reproduces that
+        // distinction structurally.
+        let query_is_free_fn = segments
+            .iter()
+            .rev()
+            .skip(1)
+            .all(|s| !starts_with_uppercase(s));
         let entries_borrow = self.entries.borrow();
         let matches: Vec<&Rc<PyreFunctionEntry>> = entries_borrow
             .iter()
             .filter(|(k, e)| {
-                e.host_object.is_user_function()
-                    && k.segments().last().map(|s| s == leaf).unwrap_or(false)
+                if !e.host_object.is_user_function() {
+                    return false;
+                }
+                let cand_segs = k.segments();
+                if cand_segs.last().map(|s| s != leaf).unwrap_or(true) {
+                    return false;
+                }
+                if query_is_free_fn {
+                    // Reject impl-method candidates: the segment
+                    // immediately preceding the leaf is PascalCase
+                    // (impl target type) while every earlier segment is
+                    // snake_case (module path).
+                    if cand_segs.len() >= 2
+                        && let Some(impl_ty) = cand_segs.iter().rev().nth(1)
+                        && starts_with_uppercase(impl_ty)
+                    {
+                        return false;
+                    }
+                }
+                true
             })
             .map(|(_, e)| e)
             .collect();
@@ -654,6 +692,16 @@ impl PyreCallRegistry {
     // readers must consult `Variable.concretetype` directly through
     // the `PyGraph.graph` already cached on the `PyreFunctionEntry.
     // function_desc.cache`.
+}
+
+/// Rust naming convention shape check: PascalCase / leading-uppercase
+/// idents are type / struct / enum names (impl method receivers); all-
+/// snake_case idents are modules / functions / primitives.  Used by
+/// [`PyreCallRegistry::lookup_with_leaf_match`] to distinguish
+/// `Type::method` candidates from `module::fn` candidates when the
+/// query path's shape disagrees.
+fn starts_with_uppercase(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -918,4 +966,61 @@ mod tests {
     // which builds a real lifted leaf PyGraph via
     // `lift_callee_to_pygraph` and verifies the cache pre-fill lets
     // the rtyper resolve the call to `Signed`.
+
+    #[test]
+    fn lookup_with_leaf_match_prefers_free_fn_over_impl_method_collision() {
+        // Free-fn `pyre_object::is_none` colliding with impl-method
+        // `OpRef::is_none` (unrelated `Option::is_none`-style helper on
+        // a primitive enum).  A bare-call query `["pyre_object",
+        // "is_none"]` (free-fn shape — every pre-leaf segment
+        // snake_case) must resolve to the free fn, not the impl method
+        // — `Bookkeeper.getdesc(Constant(is_none))` would key on the
+        // free-fn Python callable identity, never colliding with the
+        // bound-method object.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let free_fn = registry.get_or_register(
+            FunctionPathKey::from_segments(["pyobject", "is_none"]),
+            signature(&["obj"]),
+        );
+        let _impl_method = registry.get_or_register(
+            FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
+            signature(&["self"]),
+        );
+        let resolved = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments([
+                "pyre_object",
+                "is_none",
+            ]))
+            .expect("free-fn-shape query must resolve via leaf-match");
+        assert!(
+            Rc::ptr_eq(&resolved, &free_fn),
+            "leaf-match must pick the free-fn registration when the query is free-fn shape, \
+             not the colliding impl-method one"
+        );
+    }
+
+    #[test]
+    fn lookup_with_leaf_match_still_resolves_impl_method_when_no_free_fn() {
+        // No free-fn `is_none` registered, only the impl method.  The
+        // free-fn-shape query should fall through and return None
+        // rather than incorrectly latching onto the impl method —
+        // upstream would surface the same "no such free fn" gap as a
+        // bookkeeper lookup miss.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let _impl_method = registry.get_or_register(
+            FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
+            signature(&["self"]),
+        );
+        let resolved = registry.lookup_with_leaf_match(&FunctionPathKey::from_segments([
+            "pyre_object",
+            "is_none",
+        ]));
+        assert!(
+            resolved.is_none(),
+            "free-fn-shape query must NOT silently latch onto an impl-method \
+             candidate sharing the leaf identifier"
+        );
+    }
 }
