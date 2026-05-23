@@ -757,6 +757,29 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
+/// Phase 4 endgame slice 4 helper.  Tally per-opname occurrences of
+/// the given Insn slice, using `"Label"` / `"---"` for the non-`Op`
+/// variants so the resulting `Vec<(String, i64)>` is sortable and
+/// comparable across walker and canonical SSARepr.  `Vec` keyed by
+/// `String` per [[feedback-no-hashmap-ever]] — opname cardinality
+/// stays in the dozens, so linear scan is acceptable.
+fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64)> {
+    let mut tally: Vec<(String, i64)> = Vec::new();
+    for insn in insns {
+        let key = match insn {
+            super::flatten::Insn::Label(_) => "Label".to_string(),
+            super::flatten::Insn::Unreachable => "---".to_string(),
+            super::flatten::Insn::Op { opname, .. } => opname.clone(),
+        };
+        if let Some(entry) = tally.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 += 1;
+        } else {
+            tally.push((key, 1));
+        }
+    }
+    tally
+}
+
 /// The next-block label is recognised as `Insn::Label(L)`, matching
 /// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
 /// catch-landing labels.  The corresponding `goto TLabel(...)` carries
@@ -9141,6 +9164,48 @@ impl CodeWriter {
                     "[phase4-diff] graph={} walker_len={walker_len} \
                      canonical_len={canonical_len} diff={diff}",
                     ssarepr.name,
+                );
+                // Slice 4: per-opname tally so walker-only and
+                // canonical-only opnames are named.  Walker emits more
+                // insns than canonical (slice 3 finding); slicing the
+                // delta by opname reveals which families need closure
+                // before the production flip — typically `-live-` and
+                // `Label` (per-PC) on the walker side, possibly
+                // `ref_copy` on the canonical side from
+                // `insert_renamings`.
+                let walker_tally = phase4_tally_insn_opnames(&ssarepr.insns);
+                let canonical_tally = phase4_tally_insn_opnames(&canonical_ssarepr.insns);
+                let mut all_keys: Vec<&str> = walker_tally
+                    .iter()
+                    .chain(canonical_tally.iter())
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                all_keys.sort();
+                all_keys.dedup();
+                let mut walker_only: Vec<(String, i64)> = Vec::new();
+                let mut canonical_only: Vec<(String, i64)> = Vec::new();
+                for key in all_keys {
+                    let w = walker_tally
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0);
+                    let c = canonical_tally
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0);
+                    if w > c {
+                        walker_only.push((key.to_string(), w - c));
+                    } else if c > w {
+                        canonical_only.push((key.to_string(), c - w));
+                    }
+                }
+                walker_only.sort_by(|a, b| b.1.cmp(&a.1));
+                canonical_only.sort_by(|a, b| b.1.cmp(&a.1));
+                eprintln!(
+                    "[phase4-diff-opname] graph={} walker-only={:?} canonical-only={:?}",
+                    ssarepr.name, walker_only, canonical_only,
                 );
             }
         }
