@@ -4046,18 +4046,63 @@ pub fn extract_static_decls(
     prefix: &str,
 ) -> Vec<(Vec<String>, crate::model::ValueType)> {
     let mut out = Vec::new();
+    let mut push_entry = |ident: &syn::Ident, ty: &syn::Type| {
+        let mut segments = Vec::with_capacity(2);
+        if !prefix.is_empty() {
+            segments.push(prefix.to_string());
+        }
+        segments.push(ident.to_string());
+        let value_type = crate::front::ast::classify_fn_arg_ty(ty);
+        out.push((segments, value_type));
+    };
     for item in &file.items {
-        if let Item::Static(s) = item {
-            let mut segments = Vec::with_capacity(2);
-            if !prefix.is_empty() {
-                segments.push(prefix.to_string());
+        // `Item::Const` covers crate-level `const X: T = ...` declarations
+        // (e.g. `pub const PY_NULL: PyObjectRef = std::ptr::null_mut();`,
+        // `pub const WITHPREBUILTINT: bool = false;`). Same Skip family
+        // as `static` — single-segment reads cross block boundaries via
+        // body-`OpKind::Input`, surface as "adapter cross-block body
+        // Input" without a defining link.arg.
+        match item {
+            Item::Static(s) => push_entry(&s.ident, &s.ty),
+            Item::Const(c) => push_entry(&c.ident, &c.ty),
+            // `thread_local! { static X: T = ...; ... }` expands to a
+            // set of TLS-keyed statics; the inner names are
+            // single-segment crate-local references that
+            // `front/ast.rs::Expr::Path` reads exactly like a normal
+            // `static`.  `syn::Item::Macro` carries the body as opaque
+            // tokens — parse them as a sequence of `ItemStatic`s and
+            // re-use the same emit path.  Other macros are ignored.
+            Item::Macro(m) if m.mac.path.is_ident("thread_local") => {
+                if let Ok(body) =
+                    syn::parse2::<ThreadLocalBody>(m.mac.tokens.clone())
+                {
+                    for s in &body.statics {
+                        push_entry(&s.ident, &s.ty);
+                    }
+                }
             }
-            segments.push(s.ident.to_string());
-            let value_type = crate::front::ast::classify_fn_arg_ty(&s.ty);
-            out.push((segments, value_type));
+            _ => continue,
         }
     }
     out
+}
+
+/// `thread_local! { ... }` body parser — accepts a sequence of
+/// `static NAME: TYPE = EXPR;` entries.  Matches the grammar
+/// documented at the std `thread_local!` macro
+/// (`rustc_src/library/std/src/thread/local.rs`).
+struct ThreadLocalBody {
+    statics: Vec<syn::ItemStatic>,
+}
+
+impl syn::parse::Parse for ThreadLocalBody {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut statics = Vec::new();
+        while !input.is_empty() {
+            statics.push(input.parse()?);
+        }
+        Ok(Self { statics })
+    }
 }
 
 /// Z2.5 Path C slice 3a — project a `syn::ReturnType` to a
@@ -4179,9 +4224,7 @@ fn lookup_return_type_for_signature(
                 }
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
-                        if method.sig.unsafety.is_some()
-                            && method.sig.ident == method_or_fn_ident
-                        {
+                        if method.sig.unsafety.is_some() && method.sig.ident == method_or_fn_ident {
                             return Some(method.sig.output.clone());
                         }
                     }
@@ -4219,13 +4262,14 @@ mod tests {
 
     #[test]
     fn extract_unsafe_fn_signatures_free_unsafe_fn_prefixed() {
-        let file = parse_file(
-            "pub unsafe fn is_none(obj: *const u8) -> bool { obj.is_null() }",
-        );
+        let file = parse_file("pub unsafe fn is_none(obj: *const u8) -> bool { obj.is_null() }");
         let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
         assert_eq!(pairs.len(), 1);
         let (segments, sig) = &pairs[0];
-        assert_eq!(segments, &vec!["pyobject".to_string(), "is_none".to_string()]);
+        assert_eq!(
+            segments,
+            &vec!["pyobject".to_string(), "is_none".to_string()]
+        );
         assert_eq!(sig.argnames, vec!["obj".to_string()]);
     }
 
@@ -4252,9 +4296,7 @@ mod tests {
 
     #[test]
     fn extract_unsafe_fn_signatures_trait_impl_unsafe_method_keys_by_self_type() {
-        let file = parse_file(
-            "impl SomeTrait for Bar { unsafe fn op(&self) -> i64 { 0 } }",
-        );
+        let file = parse_file("impl SomeTrait for Bar { unsafe fn op(&self) -> i64 { 0 } }");
         let pairs = extract_unsafe_fn_signatures(&file, "");
         assert_eq!(pairs.len(), 1);
         let (segments, _) = &pairs[0];
@@ -4355,9 +4397,8 @@ mod tests {
 
     #[test]
     fn extract_unsafe_fn_stubs_resolves_impl_method_return_types() {
-        let file = parse_file(
-            "impl Foo { pub unsafe fn method_b(&self, x: i64) -> bool { true } }",
-        );
+        let file =
+            parse_file("impl Foo { pub unsafe fn method_b(&self, x: i64) -> bool { true } }");
         let stubs = extract_unsafe_fn_stubs(&file, "pyobject");
         assert_eq!(stubs.len(), 1);
         let (segments, _, lltype) = &stubs[0];
@@ -8962,9 +9003,13 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
-    fn extract_static_decls_const_not_static_skipped() {
+    fn extract_static_decls_const_emitted_alongside_static() {
+        use crate::model::ValueType;
         let file = parse_file("pub const FOO: i64 = 42;");
-        assert!(extract_static_decls(&file, "modprefix").is_empty());
+        let decls = extract_static_decls(&file, "modprefix");
+        assert_eq!(decls.len(), 1, "Item::Const must be catalogued");
+        assert_eq!(decls[0].0, vec!["modprefix".to_string(), "FOO".to_string()]);
+        assert_eq!(decls[0].1, ValueType::Int);
     }
 
     #[test]
@@ -9019,6 +9064,40 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
+    fn extract_static_decls_thread_local_macro_inner_statics_catalogued() {
+        use crate::model::ValueType;
+        let file = parse_file(
+            "thread_local! {\n\
+                 static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };\n\
+                 pub static SHADOW_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "modprefix");
+        assert_eq!(decls.len(), 2, "both thread_local statics must be catalogued");
+        let names: Vec<String> = decls.iter().map(|(seg, _)| seg.last().cloned().unwrap()).collect();
+        assert!(names.contains(&"CALL_DEPTH".to_string()));
+        assert!(names.contains(&"SHADOW_STACK".to_string()));
+        // Compound types fall through to `ValueType::Ref` per the
+        // `compound_type_classifies_as_ref` invariant.
+        assert!(decls.iter().all(|(_, ty)| matches!(ty, ValueType::Ref)));
+    }
+
+    #[test]
+    fn extract_static_decls_non_thread_local_macros_ignored() {
+        let file = parse_file(
+            "println!(\"hello\");\n\
+             lazy_static::lazy_static! {\n\
+                 static ref OTHER: Vec<u8> = vec![];\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert!(
+            decls.is_empty(),
+            "only `thread_local!` is recognised; other macros stay opaque"
+        );
+    }
+
+    #[test]
     fn extract_static_decls_other_items_ignored() {
         let file = parse_file(
             "pub fn foo() {}
@@ -9028,7 +9107,13 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
              pub enum E { A }",
         );
         let decls = extract_static_decls(&file, "");
-        assert_eq!(decls.len(), 1, "only Item::Static contributes");
-        assert_eq!(decls[0].0, vec!["S".to_string()]);
+        assert_eq!(
+            decls.len(),
+            2,
+            "Item::Static and Item::Const contribute; fn/struct/enum ignored",
+        );
+        let names: Vec<String> = decls.iter().map(|(seg, _)| seg[0].clone()).collect();
+        assert!(names.contains(&"C".to_string()));
+        assert!(names.contains(&"S".to_string()));
     }
 }

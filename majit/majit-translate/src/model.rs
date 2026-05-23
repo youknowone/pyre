@@ -3051,8 +3051,7 @@ impl FunctionGraph {
             // touched every slot every time).
             for slot_idx in old_len..self.value_variables.len() {
                 if let Some(placeholder) = &self.value_variables[slot_idx] {
-                    self.variable_to_vid
-                        .insert(placeholder.id(), slot_idx);
+                    self.variable_to_vid.insert(placeholder.id(), slot_idx);
                 }
             }
             // Keep the allocator cursor past any slot reserved here so

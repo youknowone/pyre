@@ -371,6 +371,30 @@ impl CodeWriter {
                 // annotations off `Variable.annotation` populated by
                 // the preceding `annotate` post-loop publish.
                 crate::translator::rtyper::legacy_resolve::resolve_types(graph);
+                // Clear `Variable.annotation` after the Skip-arm
+                // legacy walker has committed each cell's
+                // `Variable.concretetype` via
+                // `FunctionGraph::set_concretetype_of_inline`.
+                // Downstream consumers (jtransform, regalloc, ...)
+                // read `graph.concretetype(v)` — the persisted
+                // `concretetype` cell — so clearing the intermediate
+                // `annotation` is information-preserving.  Restores
+                // the `flowspace_adapter::seed_variable` documented
+                // invariant ("production `addpendingblock` flowin
+                // path leaves `legacy_var.annotation` empty so the
+                // fresh Variable starts unannotated and flowin
+                // populates it via `setbinding`") for subsequent
+                // dual-gate passes on the same graph; without it the
+                // Skip arm's `legacy_annotator::annotate` writes
+                // persist as residue and re-entering
+                // `function_graph_to_flowspace::seed_variable` would
+                // copy a wider legacy lift onto the fresh flowspace
+                // Variable, tripping `bindinputargs::setbinding`
+                // monotonicity when the real path's flowin computes a
+                // narrower binding.
+                for (_, var) in graph.iter_variable_slots() {
+                    *var.annotation.borrow_mut() = None;
+                }
                 None
             }
             Err(diff) => panic!(

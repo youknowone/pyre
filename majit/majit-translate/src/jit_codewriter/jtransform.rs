@@ -1002,32 +1002,30 @@ impl<'a> Transformer<'a> {
             // pyre's lighter rtyper leaves the generic `BinOp` in place
             // with one or both operands defaulting to `'r'` kind, so the
             // unconditional `int_<op>` prefix at
-            // `assembler.rs:3160` would emit `int_eq/ir>i` /
-            // `int_le/rr>i` / etc. opnames that no RPython blackhole
-            // handler registers (see
+            // `assembler.rs:3160` would emit `int_eq/ir>i` opnames that
+            // no RPython blackhole handler registers (see
             // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
             //
-            // `eq` / `ne` over two Ref operands is already handled by the
-            // `ptr_eq` / `ptr_ne` arm above (per
-            // `jtransform.py:1243-1255`); this arm covers the remaining
-            // mixed `i / r` shapes for `eq` / `ne` and any `'r'`-tainted
-            // operand for the strict orderings `lt` / `le` / `gt` / `ge`
-            // (RPython has no `ptr_lt` family).  Mirrors the `mod` /
-            // `floordiv` PRE-EXISTING-ADAPTATION at
-            // `jtransform.rs:1119-1206`.  Convergence is the same: the
-            // proper fix is to find the simplify / inline pass that drops
-            // the `cast_ptr_to_int` and preserve it instead, then narrow
-            // this gate.
+            // Equality only: `jtransform.py:1243-1255` rewrites `ptr_eq`
+            // / `ptr_ne` between Ref operands at the rtyper layer; pyre's
+            // remaining mixed `i / r` equality fallback lands here.
+            // RPython has no `ptr_lt` family — strict orderings between
+            // Ref operands are a real parity bug at the producer site
+            // (a missing `cast_ptr_to_int` in the SSA chain), not a
+            // recoverable jtransform shape.  Restricting this arm to
+            // `eq` / `ne` aligns with `jtransform.py:1243-1255` and
+            // forces `lt` / `le` / `gt` / `ge` with a Ref operand to
+            // surface at the rtyper / simplify pass that dropped the
+            // cast.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
+            } if matches!(binop_name.as_str(), "eq" | "ne")
                 && matches!(self.get_value_kind_var(lhs), 'i' | 'r')
                 && matches!(self.get_value_kind_var(rhs), 'i' | 'r')
-                && (self.get_value_kind_var(lhs) == 'r'
-                    || self.get_value_kind_var(rhs) == 'r') =>
+                && (self.get_value_kind_var(lhs) == 'r' || self.get_value_kind_var(rhs) == 'r') =>
             {
                 self.stamp_value_kind(
                     graph,

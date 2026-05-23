@@ -1973,16 +1973,25 @@ impl HostEnv {
         // intrinsics still routes through the M2.5g extern-Rust-helper
         // walker when it lands.
         let std_ptr = HostObject::new_module("std.ptr");
-        std_ptr.module_set("null_mut", HostObject::new_builtin_callable("std.ptr.null_mut"));
+        std_ptr.module_set(
+            "null_mut",
+            HostObject::new_builtin_callable("std.ptr.null_mut"),
+        );
         std_ptr.module_set("eq", HostObject::new_builtin_callable("std.ptr.eq"));
         std_ptr.module_set(
             "copy_nonoverlapping",
             HostObject::new_builtin_callable("std.ptr.copy_nonoverlapping"),
         );
         let std_mem = HostObject::new_module("std.mem");
-        std_mem.module_set("align_of", HostObject::new_builtin_callable("std.mem.align_of"));
+        std_mem.module_set(
+            "align_of",
+            HostObject::new_builtin_callable("std.mem.align_of"),
+        );
         let std_alloc = HostObject::new_module("std.alloc");
-        std_alloc.module_set("dealloc", HostObject::new_builtin_callable("std.alloc.dealloc"));
+        std_alloc.module_set(
+            "dealloc",
+            HostObject::new_builtin_callable("std.alloc.dealloc"),
+        );
 
         // `BigInt::from(v)` callsites in `pyre-object` (longobject /
         // tupleobject etc.) emit `["BigInt", "from"]` as the canonical

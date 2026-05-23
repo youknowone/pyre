@@ -777,9 +777,8 @@ pub fn translate_op(
         // jit_codewriter consume the same OpKind variant via the
         // `static_decls` carrier on `CallControl`).
         OpKind::LoadStatic { segments, .. } => {
-            let sentinel = Hlvalue::Constant(Constant::new(ConstValue::UniStr(
-                segments.join("::"),
-            )));
+            let sentinel =
+                Hlvalue::Constant(Constant::new(ConstValue::UniStr(segments.join("::"))));
             let result = resolve_result_hlvalue(op, value_map, graph)?;
             Ok(vec![FlowspaceOp::new("same_as", vec![sentinel], result)])
         }

@@ -1002,7 +1002,10 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
         .map(|n| Hlvalue::Variable(Variable::named(n)))
         .collect();
     let startblock = Block::shared(inputargs);
-    let func = GraphFunc::new(name.clone(), Constant::new(ConstValue::Dict(HashMap::new())));
+    let func = GraphFunc::new(
+        name.clone(),
+        Constant::new(ConstValue::Dict(HashMap::new())),
+    );
     let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
     graph_inner.func = Some(func.clone());
     let return_constant = Hlvalue::Constant(Constant::with_concretetype(
@@ -3130,10 +3133,22 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         let graph = pygraph.graph.borrow();
         assert_eq!(graph.name, "is_none");
         let start = graph.startblock.borrow();
-        assert_eq!(start.inputargs.len(), 1, "argname must map to a single inputarg");
-        assert_eq!(start.exits.len(), 1, "stub must Link directly to returnblock");
+        assert_eq!(
+            start.inputargs.len(),
+            1,
+            "argname must map to a single inputarg"
+        );
+        assert_eq!(
+            start.exits.len(),
+            1,
+            "stub must Link directly to returnblock"
+        );
         let link = start.exits[0].borrow();
-        assert_eq!(link.args.len(), 1, "stub Link carries exactly the return constant");
+        assert_eq!(
+            link.args.len(),
+            1,
+            "stub Link carries exactly the return constant"
+        );
         // The link's target must be the graph's returnblock.
         let link_target = link.target.as_ref().expect("Link must target a block");
         assert!(

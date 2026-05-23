@@ -5933,33 +5933,37 @@ fn lower_expr(
                     .map(|var| Lowered::from_value_var(graph, &var))
                     .unwrap_or_else(Lowered::no_value));
             }
-            // Z2.5 Cat 2.1 Slice 3b — `KNOWN_STATICS` is populated
-            // at `analyze_pipeline_from_parsed` entry; the emit-site
-            // wiring is deferred to Slice 3c because unconditional
-            // `OpKind::LoadStatic` emission widens the annotator's
-            // visit set in a way that surfaces a pre-existing
-            // `setbinding` monotonicity gap on graphs that previously
-            // converged via the body-`OpKind::Input` fallthrough
-            // (observed: `crate::tupleobject::w_tuple_len`
-            // → `is_specialised_tuple_ii` reaches its `return 2`
-            // constant-Integer arm before the union with the wider
-            // Integer slot, panicking on
-            // `Integer(Const(2)) ⊄ Integer(non-const)`).  The fix
-            // path is either narrowing the emit trigger or routing
-            // setbinding through `unionof` first; both are
-            // multi-session epics, not single-slice closures.
-            //
-            // The lookup is still wired below so the codewriter-side
-            // `static_decls` consumer (currently planned for rclass
-            // / rpbc) has a single chokepoint when the production
-            // emit re-arms.
-            let _known_static_ty: Option<ValueType> = if path.path.segments.len() == 1
-                && path.qself.is_none()
-            {
-                KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
-            } else {
-                None
-            };
+            // Z2.5 Cat 2.1 Slice 3c — `KNOWN_STATICS` lookup
+            // is populated at `analyze_pipeline_from_parsed` entry;
+            // a single-segment SHOUTY_CASE identifier that matches a
+            // crate-level `static` decl emits `OpKind::LoadStatic`
+            // (translated by `flowspace_adapter::translate_op` to a
+            // `same_as(Constant(UniStr(segments)))`) instead of the
+            // body-`OpKind::Input` fallthrough.  Closes the Cat 2.1
+            // Skip family — see [[project-z25-skip-profile-2026-05-23]].
+            let known_static_ty: Option<ValueType> =
+                if path.path.segments.len() == 1 && path.qself.is_none() {
+                    KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
+                } else {
+                    None
+                };
+            if let Some(static_ty) = known_static_ty {
+                let segments = vec![name.clone()];
+                let value_var = graph.push_op_var(
+                    *block,
+                    OpKind::LoadStatic {
+                        segments,
+                        ty: static_ty,
+                    },
+                    true,
+                );
+                if let Some(ref var) = value_var {
+                    ctx.bind_local_id_var(name.clone(), var, graph, *block);
+                }
+                return Ok(value_var
+                    .map(|var| Lowered::from_value_var(graph, &var))
+                    .unwrap_or_else(Lowered::no_value));
+            }
             let ty = ctx
                 .local_value_types
                 .get(&name)
