@@ -3609,12 +3609,23 @@ pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
 /// `(frame: Ref, exc: Ref, cause: Ref) → Ref`.  The frame pointer is
 /// emitted explicitly by `Instruction::RaiseVarargs` (codewriter.rs)
 /// via `portal_frame_reg`, mirroring `bh_load_global_fn`'s frame-as-arg
-/// ABI.  `frame_ptr == 0` is treated as a null frame.
+/// ABI.  `pyopcode.py:704-722 RAISE_VARARGS` runs inside an opcode
+/// dispatch where `frame` and `frame.execution_context` are always
+/// valid, so `frame_ptr == 0` here signals a wiring bug — fail fast
+/// at entry to match `bh_call_fn_impl_with_frame`'s strict ABI rather
+/// than degrade silently to a `RuntimeError`.
 pub extern "C" fn bh_normalize_raise_varargs_with_frame(
     frame_ptr: i64,
     exc: i64,
     cause: i64,
 ) -> i64 {
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
+    assert!(
+        !parent_frame_ptr.is_null(),
+        "bh_normalize_raise_varargs_with_frame requires a non-null parent \
+         PyFrame; every RAISE_VARARGS emit site must thread portal_frame_reg \
+         as the leading ref operand"
+    );
     let exc = exc as PyObjectRef;
     let raw_cause = cause as PyObjectRef;
 
@@ -3622,12 +3633,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
     // `self.space` / `frame.execution_context`. Pin the caller frame's
     // execution_context for the whole body so the cause-class-call and
     // exc-class-call observe the same namespace.
-    let parent_frame_ptr = frame_ptr as *const PyFrame;
-    let frame_ctx = if parent_frame_ptr.is_null() {
-        std::ptr::null()
-    } else {
-        unsafe { (*parent_frame_ptr).execution_context }
-    };
+    let frame_ctx = unsafe { (*parent_frame_ptr).execution_context };
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !frame_ctx.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
@@ -3657,13 +3663,9 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         if pyre_object::is_exception(exc) {
             exc
         } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-            if frame_ctx.is_null() {
-                pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
-                return pyre_interpreter::PyError::runtime_error(
-                    "raise helper missing current frame",
-                )
-                .to_exc_object() as i64;
-            }
+            // pyopcode.py:711-713 — `space.call_function(w_type)` does
+            // not depend on `frame.execution_context`; if the field is
+            // null on a valid frame the class-call still proceeds.
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
