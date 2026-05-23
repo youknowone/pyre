@@ -6,7 +6,6 @@ use majit_ir::OpRef;
 
 pub use majit_ir::box_ref::{BoxRef, Forwarded, PtrInfoBorrowMut};
 
-
 /// Encapsulated `BoxRef` storage for `OptContext` (Codex plan step 1).
 ///
 /// Indexed by `OpRef` raw position. `BoxRef._forwarded` is the

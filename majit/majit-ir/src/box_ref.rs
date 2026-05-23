@@ -397,14 +397,15 @@ impl BoxRef {
         self.write_forwarded(Forwarded::None);
     }
 
-    /// Slice 8.C dual-write helper: write `Box.forwarded` and, when an
-    /// `Op` is bound via `bind_op`, also write `op.forwarded` so the
-    /// invariant `Box.forwarded == op.forwarded` holds for every reader.
-    /// `clone()` is one `Rc` bump per variant; cheap.
+    /// Slice 8.D writer: route to `op.forwarded` when the box is bound,
+    /// else fall back to the in-Box slot. Box.forwarded is inert for bound
+    /// ResOp boxes — `get_forwarded` already reads from `op.forwarded` for
+    /// these, so the redundant Box write was removed.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(weak) = self.0.op_handle.borrow().as_ref() {
             if let Some(op) = weak.upgrade() {
-                *op.forwarded.borrow_mut() = value.clone();
+                *op.forwarded.borrow_mut() = value;
+                return;
             }
         }
         *self.0.forwarded.borrow_mut() = value;
@@ -417,27 +418,14 @@ impl BoxRef {
     pub fn get_box_replacement(&self, not_const: bool) -> BoxRef {
         let mut cur = self.clone();
         loop {
-            // Drop the borrow scope immediately. While a
-            // `Ref<'_, Forwarded>` is alive we cannot move `cur`, so we
-            // snapshot the decision and release the borrow before
-            // advancing.
-            enum Step {
-                Stop,
-                Advance(BoxRef),
-            }
-            let step = match &*cur.0.forwarded.borrow() {
-                Forwarded::None | Forwarded::Info(_) | Forwarded::VectorInfo(_) => Step::Stop,
+            match cur.get_forwarded() {
+                Forwarded::None | Forwarded::Info(_) | Forwarded::VectorInfo(_) => return cur,
                 Forwarded::Box(b) => {
                     if not_const && b.is_constant() {
-                        Step::Stop
-                    } else {
-                        Step::Advance(b.clone())
+                        return cur;
                     }
+                    cur = b;
                 }
-            };
-            match step {
-                Step::Stop => return cur,
-                Step::Advance(next) => cur = next,
             }
         }
     }
@@ -459,12 +447,10 @@ impl BoxRef {
     /// `OptContext::get_box_replacement_box`) before calling. This mirrors
     /// reading `box.get_forwarded()` directly in RPython.
     pub fn ptr_info(&self) -> Option<PtrInfoBorrow> {
-        let outer = self.0.forwarded.borrow();
-        let rc = match &*outer {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Rc::clone(rc),
+        let rc = match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => rc,
             _ => return None,
         };
-        drop(outer);
         Some(PtrInfoBorrow::new(rc))
     }
 
@@ -472,8 +458,8 @@ impl BoxRef {
     /// retain identity (e.g. `Rc::ptr_eq`-based `same_info`) or pass the
     /// handle elsewhere without the borrow guard.
     pub fn ptr_info_handle(&self) -> Option<Rc<std::cell::RefCell<PtrInfo>>> {
-        match &*self.0.forwarded.borrow() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(Rc::clone(rc)),
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(rc),
             _ => None,
         }
     }
@@ -485,19 +471,17 @@ impl BoxRef {
     /// Other states return `None`.  Same caller-walks-the-chain contract
     /// as `ptr_info`.
     pub fn int_bound(&self) -> Option<IntBoundBorrow> {
-        let outer = self.0.forwarded.borrow();
-        let rc = match &*outer {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Rc::clone(rc),
+        let rc = match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => rc,
             _ => return None,
         };
-        drop(outer);
         Some(IntBoundBorrow::new(rc))
     }
 
     /// Live `Rc<RefCell<IntBound>>` handle.
     pub fn int_bound_handle(&self) -> Option<Rc<std::cell::RefCell<IntBound>>> {
-        match &*self.0.forwarded.borrow() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Some(Rc::clone(rc)),
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => Some(rc),
             _ => None,
         }
     }
@@ -517,23 +501,19 @@ impl BoxRef {
     /// as the `Rc` clone is captured, so other consumers can still take
     /// non-conflicting borrows of `self.0.forwarded`.
     pub fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
-        let outer = self.0.forwarded.borrow();
-        let rc = match &*outer {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Rc::clone(rc),
+        let rc = match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => rc,
             _ => return None,
         };
-        drop(outer);
         Some(PtrInfoBorrowMut::new(rc))
     }
 
     /// Mutable counterpart of `int_bound`. Same contract as `ptr_info_mut`.
     pub fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
-        let outer = self.0.forwarded.borrow();
-        let rc = match &*outer {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Rc::clone(rc),
+        let rc = match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => rc,
             _ => return None,
         };
-        drop(outer);
         Some(IntBoundBorrowMut::new(rc))
     }
 }

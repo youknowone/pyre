@@ -12,8 +12,8 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 }
 
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
-pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::op_info::OpInfo;
+pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 
 pub use majit_ir::ptr_info::{
@@ -145,7 +145,9 @@ impl EnsuredPtrInfo {
     }
 }
 
-pub use majit_ir::ptr_info::{VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant};
+pub use majit_ir::ptr_info::{
+    VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
+};
 
 /// Extension trait carrying the OptContext-coupled methods that used
 /// to live on `impl StrPtrInfo` in metainterp. The data type itself
@@ -293,20 +295,11 @@ pub trait PtrInfoExt {
     fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<GcRef>;
 
     /// info.py:83 `make_guards(op, short, optimizer)`.
-    fn make_guards(
-        &self,
-        op: OpRef,
-        short: &mut Vec<Op>,
-        ctx: &mut crate::optimizeopt::OptContext,
-    );
+    fn make_guards(&self, op: OpRef, short: &mut Vec<Op>, ctx: &mut crate::optimizeopt::OptContext);
 
     /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
     /// query across `ConstPtrInfo` and `StrPtrInfo`.
-    fn get_known_str_length(
-        &self,
-        ctx: &crate::optimizeopt::OptContext,
-        mode: u8,
-    ) -> Option<i64>;
+    fn get_known_str_length(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64>;
 
     /// info.py:793 ConstPtrInfo.get_constant_string_spec and
     /// vstring.py:178 / 236 / 298 — recursive constant string extraction.
@@ -334,15 +327,10 @@ pub trait PtrInfoExt {
     /// info.py:273-303: `_is_immutable_and_filled_with_constants`
     /// — used by `force_box` to decide whether a virtual can be
     /// constant-folded.
-    fn is_immutable_and_filled_with_constants(
-        &self,
-        ctx: &crate::optimizeopt::OptContext,
-    ) -> bool;
+    fn is_immutable_and_filled_with_constants(&self, ctx: &crate::optimizeopt::OptContext) -> bool;
 }
 
-
 impl PtrInfoExt for PtrInfo {
-
     /// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)` +
     /// the other PtrInfo subclasses' `_known_class` accessors:
     ///
@@ -399,7 +387,6 @@ impl PtrInfoExt for PtrInfo {
             _ => None,
         }
     }
-
 
     /// info.py:83: make_guards(op, short, optimizer)
     /// info.py: make_guards(self, op, short, optimizer)
@@ -591,14 +578,9 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-
     /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
     /// query across `ConstPtrInfo` and `StrPtrInfo`.
-    fn get_known_str_length(
-        &self,
-        ctx: &crate::optimizeopt::OptContext,
-        mode: u8,
-    ) -> Option<i64> {
+    fn get_known_str_length(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
         match self {
             PtrInfo::Str(info) => info.getstrlen(ctx, mode),
             // info.py:804-808 ConstPtrInfo.getstrlen — delegate to
@@ -610,7 +592,6 @@ impl PtrInfoExt for PtrInfo {
             _ => None,
         }
     }
-
 
     /// info.py:793 ConstPtrInfo.get_constant_string_spec and
     /// vstring.py:178 / 236 / 298 — recursive constant string extraction.
@@ -633,7 +614,6 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-
     /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo — virtual dispatch only.
     /// ConstPtr constant resolution is handled by `OptString::strgetitem`
     /// (vstring.py:393-403 `_strgetitem`), which needs `&mut OptContext`.
@@ -643,7 +623,6 @@ impl PtrInfoExt for PtrInfo {
             _ => None,
         }
     }
-
 
     /// info.py:331 / 369 / 376 / 445 / 485 / 598 / 701 +
     /// vstring.py:211 / 263 / 333 `visitor_dispatch_virtual_type`.
@@ -717,7 +696,6 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-
     /// info.py:137-160 / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     ///
@@ -726,7 +704,6 @@ impl PtrInfoExt for PtrInfo {
     fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         force_box_impl(self, opref, ctx)
     }
-
 
     /// info.py:273-303: _is_immutable_and_filled_with_constants
     ///
@@ -741,10 +718,7 @@ impl PtrInfoExt for PtrInfo {
     ///
     /// Check if this virtual is immutable and all fields are constants.
     /// Used by force_box to determine if the virtual can be constant-folded.
-    fn is_immutable_and_filled_with_constants(
-        &self,
-        ctx: &crate::optimizeopt::OptContext,
-    ) -> bool {
+    fn is_immutable_and_filled_with_constants(&self, ctx: &crate::optimizeopt::OptContext) -> bool {
         let (fields, descr) = match self {
             PtrInfo::Virtual(v) => (&v.fields, &v.descr),
             PtrInfo::VirtualStruct(v) => (&v.fields, &v.descr),
@@ -781,9 +755,11 @@ impl PtrInfoExt for PtrInfo {
     }
 }
 
-
-
-fn force_box_impl(self_: &mut PtrInfo, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
+fn force_box_impl(
+    self_: &mut PtrInfo,
+    opref: OpRef,
+    ctx: &mut crate::optimizeopt::OptContext,
+) -> OpRef {
     use majit_ir::{Op, OpCode};
 
     fn force_child(orig_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
@@ -842,13 +818,11 @@ fn force_box_impl(self_: &mut PtrInfo, opref: OpRef, ctx: &mut crate::optimizeop
                                     let offset = field_d.offset();
                                     match value {
                                         Value::Int(v) => unsafe {
-                                            let dest =
-                                                (ptr.0 as *mut u8).add(offset) as *mut i64;
+                                            let dest = (ptr.0 as *mut u8).add(offset) as *mut i64;
                                             *dest = v;
                                         },
                                         Value::Ref(r) => unsafe {
-                                            let dest =
-                                                (ptr.0 as *mut u8).add(offset) as *mut usize;
+                                            let dest = (ptr.0 as *mut u8).add(offset) as *mut usize;
                                             *dest = r.0;
                                         },
                                         _ => {}
@@ -1149,8 +1123,7 @@ fn force_box_impl(self_: &mut PtrInfo, opref: OpRef, ctx: &mut crate::optimizeop
             for (offset, _length, descr, value) in entries {
                 let value_ref = force_child(value, ctx);
                 let offset_ref = ctx.emit_constant_int(offset);
-                let mut store_op =
-                    Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
+                let mut store_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
                 store_op.setdescr(descr);
                 emit_op(ctx, store_op);
             }
