@@ -665,19 +665,17 @@ fn is_cpu_tracker_kind(kind: i32) -> bool {
 /// ```
 ///
 /// Caller must restrict `kind` to the four `TOTAL_*` ids
-/// ([`is_cpu_tracker_kind`]); other ids panic in debug and silently
-/// route to `total_compiled_loops` in release, but no caller passes
-/// such an id today.
+/// ([`is_cpu_tracker_kind`]); any other id panics on both debug and
+/// release builds, matching the `assert!` strictness of
+/// [`JitProfiler::count`] / [`JitProfiler::count_ops`] (PyPy raises
+/// `IndexError` / `AttributeError` for the equivalent paths).
 fn cpu_tracker_field(tracker: &CpuTotalTracker, kind: i32) -> &AtomicUsize {
     match kind {
         counters::TOTAL_COMPILED_LOOPS => &tracker.total_compiled_loops,
         counters::TOTAL_COMPILED_BRIDGES => &tracker.total_compiled_bridges,
         counters::TOTAL_FREED_LOOPS => &tracker.total_freed_loops,
         counters::TOTAL_FREED_BRIDGES => &tracker.total_freed_bridges,
-        _ => {
-            debug_assert!(false, "cpu_tracker_field({kind}) — not a TOTAL_* id");
-            &tracker.total_compiled_loops
-        }
+        _ => panic!("cpu_tracker_field({kind}) — not a TOTAL_* id"),
     }
 }
 

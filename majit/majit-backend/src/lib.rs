@@ -1590,16 +1590,23 @@ pub trait Backend: Send {
     /// [`CompiledLoopToken::compiling_a_bridge`] read this through
     /// `&self` so multi-backend processes (e.g. test fixtures
     /// creating fresh `MetaInterpStaticData` repeatedly) keep
-    /// counters isolated.  Default returns the process-wide
-    /// [`fallback_cpu_tracker`] so synthetic/test backends that
-    /// haven't migrated continue to behave like the previous
-    /// process-global singleton.
+    /// counters isolated.
+    ///
+    /// Default returns a process-wide `Arc<CpuTotalTracker>` distinct
+    /// from [`fallback_cpu_tracker`]: the trait signature is
+    /// `&Arc<CpuTotalTracker>` (so callers can `Arc::clone` into
+    /// [`crate::JitProfiler::set_cpu_tracker`]) while
+    /// `fallback_cpu_tracker` returns a `&'static CpuTotalTracker`
+    /// reference for callers that already have direct access.  The
+    /// two statics therefore back independent counter stores;
+    /// synthetic/test backends that don't override this method
+    /// continue to behave like a process-global singleton among
+    /// themselves but won't observe writes through
+    /// `fallback_cpu_tracker`.
     fn cpu_tracker(&self) -> &Arc<CpuTotalTracker> {
-        // SAFETY: the fallback Arc is borrowed from a process-global
-        // OnceLock; reading the cached value is sound from any
-        // thread.
-        static FALLBACK: std::sync::OnceLock<Arc<CpuTotalTracker>> = std::sync::OnceLock::new();
-        FALLBACK.get_or_init(|| Arc::new(CpuTotalTracker::default()))
+        static FALLBACK_ARC: std::sync::OnceLock<Arc<CpuTotalTracker>> =
+            std::sync::OnceLock::new();
+        FALLBACK_ARC.get_or_init(|| Arc::new(CpuTotalTracker::default()))
     }
 
     /// Compile a loop trace into native code.

@@ -3773,22 +3773,33 @@ impl OptContext {
         }
         let idx = opref.raw() as usize;
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
-        let is_inputarg_variant = matches!(
-            opref,
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-        );
-        // Empty-slot variant-aware lazy materialisation:
         // `resoperation.py:699 AbstractInputArg` and `resoperation.py:250
         // AbstractResOp` are distinct classes upstream.  A Box minted
         // for an `OpRef::InputArg*` must report `is_inputarg()`, not
         // `is_resop()`, so the chain walker reconstructs the same
-        // variant when it round-trips through `Forwarded::Box`.  Plain
-        // `ensure_box_at_typed` always emits `new_resop`; without this
-        // pre-step, every retrace/synthetic path that lazily references
-        // an inputarg through the optimizer (e.g. `set_pending_box_pool`
-        // omitted, or a test fixture going through `with_num_inputs`
-        // that hands an OpRef::InputArg* in before its slot is
-        // populated) would silently demote the inputarg to a resop.
+        // variant when it round-trips through `Forwarded::Box`.
+        //
+        // Variant-only classification is correct here:
+        // `AbstractInputArg` vs `AbstractResOp` is a class-level
+        // distinction in PyPy, not a slot-position one.  Slot-range
+        // classification (matching `inputarg_type` on
+        // `[inputarg_base, inputarg_base + num_inputs)`) would also
+        // sweep in op-result positions that happen to land inside
+        // that window in test fixtures whose `assign_positions`
+        // starts at 0 — promoting a resop result to inputarg breaks
+        // those layouts.  Production callers that need a
+        // slot-classified inputarg always use the typed
+        // `OpRef::input_arg_typed(i, tp)` factory, which produces
+        // the matching `OpRef::InputArg*` variant.
+        let is_inputarg_variant = matches!(
+            opref,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        );
+        // Empty-slot lazy materialisation: route through `new_inputarg`
+        // for inputarg variants, leaving `ensure_box_at_typed` to
+        // handle ResOp slots below.  Without this, retrace/synthetic
+        // paths handing an `OpRef::InputArg*` in before its slot is
+        // populated would silently demote the inputarg to a resop.
         if self.box_pool.get(idx).is_none() && is_inputarg_variant && opref.ty().is_some() {
             self.box_pool.set(
                 idx,
