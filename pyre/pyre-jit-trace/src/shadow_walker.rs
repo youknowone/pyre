@@ -112,6 +112,13 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // `[[project-issue73-phase5-design]]` for the cutover sequencing
     // and `[[project_issue73_phase4_poptop_vable_getfield_blocker]]` for
     // the small-int unboxed concrete vs heap-pointer view residual gap.
+    //
+    // Net effect: this function returns `false` for every instruction —
+    // the shadow allow-list is intentionally empty for this phase.
+    // `MAJIT_SHADOW_WALKER=1` therefore does not enable any Nop-family
+    // exceptions; the env flag remains plumbed for future expansion
+    // (M4 LoadFast / arithmetic / branch ops, gated on the Int-bank
+    // concrete shadow work below) but is presently inert.
     let _ = instruction;
     false
     // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
@@ -487,7 +494,18 @@ mod tests {
         // shadow validation cannot meaningfully run against arm-local
         // r0=frame semantics until MIFrame restructuring lands.  Until
         // then the allow-list stays empty.
+        // The Nop family of zero-op opcodes that Phase 5.A flipped to
+        // production walker dispatch must all be rejected here, not just
+        // Nop itself.  Covering every unit variant of the family
+        // prevents a partial reintroduction from slipping through
+        // (e.g. accidentally re-allowing Cache while keeping Nop
+        // disabled).  Resume and ExtendedArg are struct variants whose
+        // construction needs an `Arg<...>`; their rejection is exercised
+        // implicitly through the production code path covered by
+        // `production_walker_handles`.
         assert!(!opname_in_shadow_allow_list(&Instruction::Nop));
+        assert!(!opname_in_shadow_allow_list(&Instruction::Cache));
+        assert!(!opname_in_shadow_allow_list(&Instruction::NotTaken));
         assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 
