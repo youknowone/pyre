@@ -9847,6 +9847,33 @@ impl CodeWriter {
                  local_walker_only={local_walker_only}",
                 ssarepr.name,
             );
+            // Slice 25: report startblock inputargs' canonical colors
+            // directly.  Tests the slice 24 hypothesis: enforce_input_args
+            // rotates inputargs to colors 0..n, but those inputargs are
+            // DIFFERENT VariableIds than the scratches walker_slot_for_variable
+            // points to.  If canonical[inputarg_for_slot_0] == 0 universally,
+            // the divergence is entirely the slot↔Variable mapping (research
+            // confirms walker_slot_for_variable picks scratch not inputarg).
+            let startblock_inputargs = graph.startblock.borrow().inputargs.clone();
+            let mut input_idx = 0u32;
+            for arg in &startblock_inputargs {
+                let Some(v) = arg.as_variable() else {
+                    input_idx += 1;
+                    continue;
+                };
+                if v.kind != Some(super::flatten::Kind::Ref) {
+                    input_idx += 1;
+                    continue;
+                }
+                let canonical_color = ref_coloring.get(&v.id).copied();
+                eprintln!(
+                    "[phase4-inputarg] graph={} input_idx={input_idx} var={} canonical_color={:?}",
+                    ssarepr.name,
+                    v.id.0,
+                    canonical_color,
+                );
+                input_idx += 1;
+            }
         }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
