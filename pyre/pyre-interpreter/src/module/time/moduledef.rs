@@ -84,18 +84,18 @@ pub fn init(ns: &mut DictStorage) {
         dict_storage_store(
             ns,
             "clock_gettime",
-            make_builtin_function("clock_gettime", interp_time::clock_gettime),
+            make_builtin_function_with_arity("clock_gettime", interp_time::clock_gettime, 1),
         );
         dict_storage_store(
             ns,
             "clock_gettime_ns",
-            make_builtin_function("clock_gettime_ns", interp_time::clock_gettime_ns),
+            make_builtin_function_with_arity("clock_gettime_ns", interp_time::clock_gettime_ns, 1),
         );
         #[cfg(not(target_os = "redox"))]
         dict_storage_store(
             ns,
             "clock_getres",
-            make_builtin_function("clock_getres", interp_time::clock_getres),
+            make_builtin_function_with_arity("clock_getres", interp_time::clock_getres, 1),
         );
         dict_storage_store(
             ns,

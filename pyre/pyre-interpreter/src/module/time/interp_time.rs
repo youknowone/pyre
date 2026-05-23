@@ -72,7 +72,12 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             0.0
         }
     };
-    if secs <= 0.0 {
+    if secs < 0.0 {
+        return Err(crate::PyError::value_error(
+            "sleep length must be non-negative",
+        ));
+    }
+    if secs == 0.0 {
         return Ok(w_none());
     }
     let dur = std::time::Duration::from_secs_f64(secs);
