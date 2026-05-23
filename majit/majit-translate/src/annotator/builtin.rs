@@ -327,6 +327,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_metainterp.jit.we_are_jitted",
         majit_metainterp_bool_flag,
     );
+    // Rust primitive type conversion impls — all return `SomeInteger`.
+    analyzer_for(&mut reg, "u32.from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "i64.try_from", primitive_integer_conversion);
+    analyzer_for(&mut reg, "usize.try_from", primitive_integer_conversion);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1230,6 +1235,21 @@ pub fn majit_metainterp_bool_flag(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// Analyzer for Rust primitive type `From` / `TryFrom` impls
+/// (`u32::from`, `i64::from`, `i64::try_from`, `usize::try_from`).
+/// All return integer values (the target primitive); `TryFrom` returns
+/// `Result<T, ...>` but pyre lowers the unwrap inline so the
+/// annotation surface is `SomeInteger`.  Per-primitive precision
+/// (knowntype) is left as default since the rtyper folds the
+/// conversion at lowering time.
+pub fn primitive_integer_conversion(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`

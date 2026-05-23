@@ -2007,6 +2007,25 @@ impl HostEnv {
         let bigint = HostObject::new_module("BigInt");
         bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
 
+        // Rust primitive type conversion impls (`u32::from`,
+        // `i64::from`, `i64::try_from`, `usize::try_from`) — callsites
+        // emit `[primitive, method]` 2-segment paths.  Each impl
+        // returns an integer; a shared `SomeInteger` analyzer covers
+        // all conversion variants.
+        let primitive_u32 = HostObject::new_module("u32");
+        primitive_u32.module_set("from", HostObject::new_builtin_callable("u32.from"));
+        let primitive_i64 = HostObject::new_module("i64");
+        primitive_i64.module_set("from", HostObject::new_builtin_callable("i64.from"));
+        primitive_i64.module_set(
+            "try_from",
+            HostObject::new_builtin_callable("i64.try_from"),
+        );
+        let primitive_usize = HostObject::new_module("usize");
+        primitive_usize.module_set(
+            "try_from",
+            HostObject::new_builtin_callable("usize.try_from"),
+        );
+
         // External crate `majit_metainterp` helpers called from pyre
         // source via `use majit_metainterp::{majit_log_enabled, ...}`.
         // The two-segment callsites `["majit_metainterp",
@@ -2044,6 +2063,9 @@ impl HostEnv {
         mods.insert("BigInt".into(), bigint);
         mods.insert("majit_metainterp".into(), majit_metainterp);
         mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
+        mods.insert("u32".into(), primitive_u32);
+        mods.insert("i64".into(), primitive_i64);
+        mods.insert("usize".into(), primitive_usize);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

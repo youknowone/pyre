@@ -3922,13 +3922,18 @@ thread_local! {
     /// available to `lower_expr` so a single-segment `Expr::Path` whose
     /// joined name matches a registered static can emit `OpKind::
     /// LoadStatic` instead of the body-`OpKind::Input` fallthrough.
-    /// Keys are both the bare ident (e.g. `GC_WEAKREF_TYPE`) and the
-    /// fully-qualified path (e.g. `crate::weakref::GC_WEAKREF_TYPE`)
-    /// — same dual-publish shape as `STRUCT_ORIGIN_REGISTRY` so a
-    /// source's use-import resolution doesn't have to be replicated
-    /// at the front-end.  Populated by `populate_known_statics` from
-    /// `analyze_pipeline_from_parsed` before the semantic build runs.
-    /// Read-only during `lower_expr`.
+    /// Keyed strictly on the fully-qualified joined path (e.g.
+    /// `crate::weakref::GC_WEAKREF_TYPE`) — PyPy `LOAD_GLOBAL`
+    /// (`flowcontext.py:856`) resolves the name through the frame's
+    /// globals/builtins namespace, which is module-scoped by host
+    /// Python identity; pyre carries names as strings, so the
+    /// equivalent narrowing is to require callers to qualify
+    /// single-segment reads via `module_prefix` / `use_imports`
+    /// before the lookup.  Bare-leaf entries are NOT installed — two
+    /// different modules with the same SHOUTY leaf must resolve to
+    /// distinct catalogue entries.  Populated by
+    /// `populate_known_statics` from `analyze_pipeline_from_parsed`
+    /// before the semantic build runs.  Read-only during `lower_expr`.
     pub(crate) static KNOWN_STATICS: std::cell::RefCell<
         std::collections::HashMap<String, ValueType>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -3938,19 +3943,22 @@ thread_local! {
 /// `KNOWN_STATICS` cell before semantic build runs.  `decls` is the
 /// flat list `[(segments, ty)]` produced by
 /// `flowspace::rust_source::register::extract_static_decls`; each
-/// entry is published twice — once under the leaf segment (bare
-/// SHOUTY_CASE name), once under the joined `::`-path.
+/// entry is published exactly once under its joined `::`-path.
+///
+/// Bare-leaf publication was removed (reviewer 2026-05-24 round):
+/// two modules registering the same SHOUTY leaf would collapse
+/// last-writer-wins, breaking PyPy's per-module globals identity.
+/// Single-segment reads at the `lower_expr` lookup site must now
+/// qualify via `module_prefix` / `use_imports` before the lookup.
 pub fn populate_known_statics(decls: &[(Vec<String>, ValueType)]) {
     KNOWN_STATICS.with(|cell| {
         let mut m = cell.borrow_mut();
         m.clear();
         for (segments, ty) in decls {
-            if let Some(leaf) = segments.last() {
-                m.insert(leaf.clone(), ty.clone());
+            if segments.is_empty() {
+                continue;
             }
-            if segments.len() > 1 {
-                m.insert(segments.join("::"), ty.clone());
-            }
+            m.insert(segments.join("::"), ty.clone());
         }
     });
 }
@@ -5943,23 +5951,35 @@ fn lower_expr(
             // body-`OpKind::Input` fallthrough.  Closes the Cat 2.1
             // Skip family — see [[project-z25-skip-profile-2026-05-23]].
             //
-            // Slice 3f: multi-segment paths (e.g. `pyre_object::PY_NULL`)
-            // route through the same lookup — `populate_known_statics`
-            // publishes both the bare leaf and the joined `::`-path,
-            // so multi-segment reads resolve when the path's joined
-            // ident matches a catalogued static.
-            let known_static_ty: Option<ValueType> = if path.qself.is_none() {
-                KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
+            // Reviewer 2026-05-24 round — qualified-only lookup:
+            // `populate_known_statics` no longer publishes a
+            // bare-leaf entry, so single-segment reads must be
+            // qualified through `use_imports` (alias → fully
+            // qualified path) or `module_prefix` (same-module
+            // qualification) before the catalogue hit.  Multi-
+            // segment reads use the joined path directly.
+            // Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`)
+            // resolving the name through the frame's per-module
+            // globals namespace.
+            let qualified_lookup_key: Option<String> = if path.qself.is_some() {
+                None
+            } else if path.path.segments.len() > 1 {
+                Some(name.clone())
+            } else if let Some(full) = ctx.use_imports.get(&name) {
+                Some(full.split("::").collect::<Vec<_>>().join("::"))
+            } else if !ctx.module_prefix.is_empty() {
+                Some(format!("{}::{}", ctx.module_prefix, name))
             } else {
                 None
             };
-            if let Some(static_ty) = known_static_ty {
-                let segments: Vec<String> = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|seg| seg.ident.to_string())
-                    .collect();
+            let known_static_ty: Option<(String, ValueType)> = qualified_lookup_key
+                .as_ref()
+                .and_then(|key| {
+                    KNOWN_STATICS.with(|m| m.borrow().get(key).cloned().map(|ty| (key.clone(), ty)))
+                });
+            if let Some((qualified_key, static_ty)) = known_static_ty {
+                let segments: Vec<String> =
+                    qualified_key.split("::").map(|s| s.to_string()).collect();
                 let value_var = graph.push_op_var(
                     *block,
                     OpKind::LoadStatic {
