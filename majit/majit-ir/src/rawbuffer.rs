@@ -3,7 +3,7 @@
 //! RPython parity target:
 //! `rpython/jit/metainterp/optimizeopt/rawbuffer.py`.
 
-use majit_ir::{DescrRef, OpRef};
+use crate::{DescrRef, OpRef};
 
 /// rawbuffer.py:13 RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
 /// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
@@ -89,7 +89,7 @@ impl RawBuffer {
             .map(|(((offset, length), descr), value)| (offset, length, descr, value))
     }
 
-    pub(crate) fn drain_entries(&mut self) -> Vec<(i64, usize, DescrRef, OpRef)> {
+    pub fn drain_entries(&mut self) -> Vec<(i64, usize, DescrRef, OpRef)> {
         let offsets = std::mem::take(&mut self.offsets);
         let lengths = std::mem::take(&mut self.lengths);
         let descrs = std::mem::take(&mut self.descrs);
@@ -242,12 +242,12 @@ mod tests {
 
     /// Create an int ArrayDescr for tests (base_size=0, item_size=8, Int).
     fn int_descr() -> DescrRef {
-        majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
+        crate::descr::make_array_descr(0, 8, crate::Type::Int)
     }
 
     /// Create an int ArrayDescr with specified item_size for tests.
     fn int_descr_sz(item_size: usize) -> DescrRef {
-        majit_ir::descr::make_array_descr(0, item_size, majit_ir::Type::Int)
+        crate::descr::make_array_descr(0, item_size, crate::Type::Int)
     }
 
     fn make_buf(_size: usize) -> RawBuffer {
@@ -367,7 +367,7 @@ mod tests {
     /// must be compatible. Different signed-ness must be incompatible.
     #[test]
     fn test_unpack_descrs() {
-        use majit_ir::descr::SimpleArrayDescr;
+        use crate::descr::SimpleArrayDescr;
 
         // ArrayS_8_1 and ArrayS_8_2: same (base=0, item=8, signed=true)
         let array_s_8_1: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
@@ -375,16 +375,16 @@ mod tests {
             0,
             8,
             0,
-            majit_ir::Type::Int,
-            majit_ir::descr::ArrayFlag::Signed,
+            crate::Type::Int,
+            crate::descr::ArrayFlag::Signed,
         ));
         let array_s_8_2: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
             1,
             0,
             8,
             0,
-            majit_ir::Type::Int,
-            majit_ir::descr::ArrayFlag::Signed,
+            crate::Type::Int,
+            crate::descr::ArrayFlag::Signed,
         ));
         // ArrayU_8: same size but unsigned
         let array_u_8: DescrRef = std::sync::Arc::new(SimpleArrayDescr::with_flag(
@@ -392,8 +392,8 @@ mod tests {
             0,
             8,
             0,
-            majit_ir::Type::Int,
-            majit_ir::descr::ArrayFlag::Unsigned,
+            crate::Type::Int,
+            crate::descr::ArrayFlag::Unsigned,
         ));
 
         assert!(!std::sync::Arc::ptr_eq(&array_s_8_1, &array_s_8_2));

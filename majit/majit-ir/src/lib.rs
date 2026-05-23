@@ -7,6 +7,7 @@ pub mod intbound;
 pub mod op_descr;
 pub mod op_type_index;
 pub mod optimize;
+pub mod rawbuffer;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
