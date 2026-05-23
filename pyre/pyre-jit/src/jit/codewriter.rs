@@ -9104,6 +9104,28 @@ impl CodeWriter {
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
+        // Phase 4 endgame slice 1: build canonical SSARepr in parallel
+        // under `PYRE_PHASE4_BUILD_CANONICAL=1`.  Mirrors `codewriter.py:53
+        // ssarepr = flatten_graph(graph, regallocs, cpu)` — the upstream
+        // production path that pyre's walker currently bypasses by
+        // emitting SSARepr inline.  Output is currently unused; this
+        // probe surfaces panics or graph-shape gaps on real 14-bench
+        // workloads before any per-family flip from walker inline to
+        // canonical splice.  Default-off so production is unchanged.
+        if std::env::var("PYRE_PHASE4_BUILD_CANONICAL")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let mut canonical_regallocs = graph_regallocs.clone();
+            let _canonical_ssarepr = super::flatten::flatten_graph(
+                &graph,
+                &mut canonical_regallocs,
+                false,
+                Some(self.cpu()),
+            );
+        }
+
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         //
