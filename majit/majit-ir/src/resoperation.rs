@@ -6,6 +6,7 @@
 /// Naming convention: CamelCase variant name, with type suffix I/R/F/N where applicable.
 use smallvec::SmallVec;
 
+use crate::box_ref::Forwarded;
 use crate::descr::DescrRef;
 use crate::value::{GcRef, Type};
 
@@ -1063,6 +1064,12 @@ pub struct Op {
     /// scalar ops keep this `None`. `RefCell` mirrors the in-place
     /// `op.bytesize = ...` overwrite in `VecOperation.__init__`.
     pub vecinfo: std::cell::RefCell<Option<std::boxed::Box<VectorizationInfo>>>,
+
+    /// `resoperation.py:233-242 AbstractResOpOrInputArg._forwarded` parity
+    /// slot. Empty (`Forwarded::None`) until Slice 8.C dual-writes wire
+    /// `BoxRef::set_forwarded_*` to this field. Slice 8.D migrates readers
+    /// from `BoxRef.forwarded` to this field; Slice 8.E retires `BoxRef`.
+    pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 }
 
 impl Clone for Op {
@@ -1079,6 +1086,7 @@ impl Clone for Op {
             // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
             // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
+            forwarded: std::cell::RefCell::new(self.forwarded.borrow().clone()),
         }
     }
 }
@@ -1184,6 +1192,7 @@ impl Op {
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
+            forwarded: std::cell::RefCell::new(Forwarded::None),
         }
     }
 
@@ -1198,6 +1207,7 @@ impl Op {
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
+            forwarded: std::cell::RefCell::new(Forwarded::None),
         }
     }
 
@@ -1253,6 +1263,7 @@ impl Op {
             // datatype/bytesize/signed/count from self. Scalar ops keep
             // `self.vecinfo` as `None`, so the clone is a no-op for them.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
+            forwarded: std::cell::RefCell::new(Forwarded::None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3294,6 +3305,8 @@ mod tests {
             let mut __op = Op {
                 $($field)*
                 type_: Type::Void,
+                vecinfo: std::cell::RefCell::new(None),
+                forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             };
             __op.type_ = __op.opcode.result_type();
             __op

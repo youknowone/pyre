@@ -100,7 +100,7 @@ pub enum BoxKind {
 /// RPython's `_forwarded` is `None | another AbstractResOpOrInputArg |
 /// AbstractInfo`. Const forwarding is one case of "another box", so we
 /// represent it as `Box(BoxRef)` carrying a `BoxKind::Const(...)`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Forwarded {
     None,
 

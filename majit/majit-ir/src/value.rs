@@ -241,18 +241,33 @@ impl Const {
 /// The `_forwarded` slot (`resoperation.py:235`) lives on `BoxRef`
 /// (`majit-metainterp/src/box.rs`), which is pyre's mirror of RPython's
 /// `AbstractValue` object identity.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InputArg {
     pub tp: Type,
     /// Index in the inputargs list.
     pub index: u32,
+    /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot.
+    /// Empty (`Forwarded::None`) until Slice 8.C dual-writes wire
+    /// `BoxRef::set_forwarded_*` to this field.
+    pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+}
+
+impl Clone for InputArg {
+    fn clone(&self) -> Self {
+        InputArg {
+            tp: self.tp,
+            index: self.index,
+            forwarded: std::cell::RefCell::new(self.forwarded.borrow().clone()),
+        }
+    }
 }
 
 impl PartialEq for InputArg {
     /// PyPy compares `AbstractInputArg`s by Python object identity
     /// (`AbstractValue.same_box` at `resoperation.py:38`). Pyre's
     /// value-typed `InputArg` stands in for that identity via
-    /// `(tp, index)` tuple equality.
+    /// `(tp, index)` tuple equality. `_forwarded` is mutable per-op
+    /// state and excluded from identity comparison.
     fn eq(&self, other: &Self) -> bool {
         self.tp == other.tp && self.index == other.index
     }
@@ -263,6 +278,7 @@ impl InputArg {
         InputArg {
             tp: Type::Int,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
@@ -270,6 +286,7 @@ impl InputArg {
         InputArg {
             tp: Type::Ref,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
@@ -277,11 +294,16 @@ impl InputArg {
         InputArg {
             tp: Type::Float,
             index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {
-        InputArg { tp, index }
+        InputArg {
+            tp,
+            index,
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+        }
     }
 
     /// Returns the OpRef referencing this input arg's slot.
