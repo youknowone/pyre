@@ -33,7 +33,7 @@ pub mod virtualstate;
 pub mod vstring;
 // walkvirtual moved to crate::walkvirtual (RPython: metainterp/walkvirtual.py)
 
-use crate::optimizeopt::intutils::IntBound;
+use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};

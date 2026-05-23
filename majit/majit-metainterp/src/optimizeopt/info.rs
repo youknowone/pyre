@@ -1,4 +1,4 @@
-use crate::optimizeopt::intutils::IntBound;
+use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Abstract information attached to operations during optimization.
 ///
