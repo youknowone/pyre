@@ -297,9 +297,17 @@ impl BoxRef {
         }
     }
 
-    /// `resoperation.py:50 get_forwarded`.
-    pub fn get_forwarded(&self) -> Ref<'_, Forwarded> {
-        self.0.forwarded.borrow()
+    /// `resoperation.py:50 get_forwarded`. Returns a clone of the
+    /// current slot. For Slice 8.C-bound ResOp boxes the read is routed
+    /// through `op.forwarded` so callers transparently see the PyPy-parity
+    /// authoritative slot; for unbound boxes (InputArg / Const /
+    /// lazy-allocated) it falls back to `Box.forwarded`. The clone is
+    /// cheap — every `Forwarded` payload is an `Rc`/`Copy` handle.
+    pub fn get_forwarded(&self) -> Forwarded {
+        if let Some(op) = self.bound_op() {
+            return op.forwarded.borrow().clone();
+        }
+        self.0.forwarded.borrow().clone()
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Box variant.
@@ -801,7 +809,7 @@ mod tests {
         a.set_forwarded_box(b.clone());
         a.clear_forwarded();
         assert_eq!(a.get_box_replacement(false), a);
-        assert!(matches!(*a.get_forwarded(), Forwarded::None));
+        assert!(matches!(a.get_forwarded(), Forwarded::None));
     }
 
     #[test]
@@ -956,23 +964,23 @@ mod tests {
         b.bind_op(&op);
 
         // Initially both are Forwarded::None.
-        assert!(matches!(*b.get_forwarded(), Forwarded::None));
+        assert!(matches!(b.get_forwarded(), Forwarded::None));
         assert!(matches!(*op.forwarded.borrow(), Forwarded::None));
 
         // set_forwarded_info → both slots updated.
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
-        assert!(matches!(*b.get_forwarded(), Forwarded::Info(_)));
+        assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
         assert!(matches!(*op.forwarded.borrow(), Forwarded::Info(_)));
 
         // clear_forwarded → both slots reset.
         b.clear_forwarded();
-        assert!(matches!(*b.get_forwarded(), Forwarded::None));
+        assert!(matches!(b.get_forwarded(), Forwarded::None));
         assert!(matches!(*op.forwarded.borrow(), Forwarded::None));
 
         // set_forwarded_box → both slots carry the target.
         let target = BoxRef::new_resop(Type::Int, 1);
         b.set_forwarded_box(target.clone());
-        match (&*b.get_forwarded(), &*op.forwarded.borrow()) {
+        match (&b.get_forwarded(), &*op.forwarded.borrow()) {
             (Forwarded::Box(box_target), Forwarded::Box(op_target)) => {
                 assert_eq!(box_target, op_target);
             }
@@ -994,6 +1002,6 @@ mod tests {
         }
         // Dual-write target is gone; set_forwarded should not panic.
         b.set_forwarded_info(OpInfo::Unknown);
-        assert!(matches!(*b.get_forwarded(), Forwarded::Info(_)));
+        assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
     }
 }

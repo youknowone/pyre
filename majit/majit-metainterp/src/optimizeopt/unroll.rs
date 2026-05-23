@@ -2011,7 +2011,7 @@ impl ExportedState {
         if let Some(snapshot) = &self.box_pool_snapshot {
             for (i, b) in snapshot.iter_indexed() {
                 let forwarded = b.get_forwarded();
-                if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &*forwarded {
+                if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &forwarded {
                     let info = rc.borrow();
                     match &*info {
                         PtrInfo::Constant(gcref) if !gcref.is_null() => {
@@ -2036,7 +2036,7 @@ impl ExportedState {
                         }
                         _ => {}
                     }
-                } else if let crate::r#box::Forwarded::Box(target) = &*forwarded {
+                } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
                     if target.is_constant() {
                         if let Some(Value::Ref(gcref)) = target.const_value() {
                             if !gcref.is_null() {
@@ -2154,7 +2154,7 @@ impl ExportedState {
                         // in place so any other handle sharing it sees the post-GC
                         // address. Matches PyPy's `_forwarded` Python object reference
                         // semantics — the cell stays, only its content updates.
-                        let rc = match &*b.get_forwarded() {
+                        let rc = match &b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
                                 if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
                             {
@@ -2171,7 +2171,7 @@ impl ExportedState {
                     if let Some(snapshot) = self.box_pool_snapshot.as_ref()
                         && let Some(b) = snapshot.get_at_position(*i)
                     {
-                        let rc = match &*b.get_forwarded() {
+                        let rc = match &b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
                                 if matches!(&*rc.borrow(), PtrInfo::Instance(_)) =>
                             {
@@ -2205,7 +2205,7 @@ impl ExportedState {
                         // at an index-less Const.
                         let swap: Option<(bool, Option<u32>)> = {
                             let f = b.get_forwarded();
-                            if let crate::r#box::Forwarded::Box(target) = &*f
+                            if let crate::r#box::Forwarded::Box(target) = &f
                                 && target.is_constant()
                                 && matches!(target.const_value(), Some(Value::Ref(_)))
                             {

@@ -287,7 +287,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if b.is_inputarg() {
             continue;
         }
-        let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() else {
+        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
             continue;
         };
         let Some(value) = target.const_value() else {
@@ -344,7 +344,7 @@ impl Optimizer {
         let Some(b) = box_pool.get(op.pos.get()) else {
             return false;
         };
-        let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() else {
+        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
             return false;
         };
         if target.const_value().is_none() {
@@ -2842,7 +2842,7 @@ impl Optimizer {
                 if old_idx < num_inputs as u32 {
                     continue;
                 }
-                let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() else {
+                let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
                     continue;
                 };
                 if target.const_value().is_none() {

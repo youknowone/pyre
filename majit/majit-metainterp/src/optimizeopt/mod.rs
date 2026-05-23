@@ -2020,7 +2020,7 @@ impl OptContext {
             .box_pool
             .get_at_position(self.next_pos as usize)
             .is_some_and(|b| {
-                matches!(*b.get_forwarded(), crate::r#box::Forwarded::Box(ref t) if t.const_value().is_some())
+                matches!(b.get_forwarded(), crate::r#box::Forwarded::Box(ref t) if t.const_value().is_some())
             })
         {
             self.next_pos += 1;
@@ -2757,7 +2757,7 @@ impl OptContext {
             //       FloatConstInfo planted via set_preamble_forwarded_info.
             let b = ctx.box_pool.get(arg)?;
             use crate::optimizeopt::info::OpInfo;
-            match &*b.get_forwarded() {
+            match &b.get_forwarded() {
                 crate::r#box::Forwarded::Info(OpInfo::Ptr(info)) => {
                     Some(ForwardedInfo::Ptr(info.borrow().clone()))
                 }
@@ -2914,7 +2914,7 @@ impl OptContext {
         let b = self.box_pool.get(source).cloned()?;
         let result = {
             let fwd = b.get_forwarded();
-            match &*fwd {
+            match &fwd {
                 crate::r#box::Forwarded::Info(OpInfo::Ptr(p)) => Some(OpInfo::Ptr(p.clone())),
                 crate::r#box::Forwarded::Info(OpInfo::IntBound(ib)) => {
                     Some(OpInfo::IntBound(ib.clone()))
@@ -3370,7 +3370,7 @@ impl OptContext {
                 // value and the downstream `ExtendedShortPreambleBuilder::setup`
                 // `constants_set` check accepts them as resolved deps.
                 for (idx, b) in self.box_pool.iter_indexed() {
-                    if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
+                    if let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() {
                         if let Some(val) = target.const_value() {
                             if !loop_constants.contains_key(&(idx as u32)) {
                                 loop_constants.insert(idx as u32, val.to_const());
@@ -3479,7 +3479,7 @@ impl OptContext {
         }
         // optimizer.py:393 opinfo = op.get_forwarded()
         use crate::optimizeopt::info::OpInfo;
-        let info_to_transfer: Option<OpInfo> = match &*op.get_forwarded() {
+        let info_to_transfer: Option<OpInfo> = match &op.get_forwarded() {
             crate::r#box::Forwarded::Info(
                 opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConst(_)),
             ) => Some(opinfo.clone()),
@@ -3962,7 +3962,7 @@ impl OptContext {
         }
         // `resoperation.py:235 _forwarded = None` — slot is None until
         // `set_forwarded` writes. `op.get_forwarded() is not None`.
-        !matches!(*op.get_forwarded(), crate::r#box::Forwarded::None)
+        !matches!(op.get_forwarded(), crate::r#box::Forwarded::None)
     }
 
     /// True only when opref has a non-const forwarding redirect.
@@ -3984,7 +3984,7 @@ impl OptContext {
             return false;
         }
         matches!(
-            &*op.get_forwarded(),
+            &op.get_forwarded(),
             crate::r#box::Forwarded::Box(target) if !target.is_constant()
         )
     }
@@ -4047,7 +4047,7 @@ impl OptContext {
             let box_at = self
                 .ensure_box(opref)
                 .expect("body-namespace OpRef must have a BoxRef slot");
-            if matches!(*box_at.get_forwarded(), crate::r#box::Forwarded::None) {
+            if matches!(box_at.get_forwarded(), crate::r#box::Forwarded::None) {
                 box_at.set_forwarded_box(crate::r#box::BoxRef::new_const(value));
             }
         }
@@ -4122,7 +4122,7 @@ impl OptContext {
         let b = self
             .ensure_box(replaced)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        match &*b.get_forwarded() {
+        match &b.get_forwarded() {
             crate::r#box::Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().clone(),
             crate::r#box::Forwarded::None => {}
             _ => return crate::optimizeopt::intutils::IntBound::unbounded(),
@@ -4174,7 +4174,7 @@ impl OptContext {
                 v as i64,
             ));
         }
-        match &*resolved.get_forwarded() {
+        match &resolved.get_forwarded() {
             crate::r#box::Forwarded::Info(OpInfo::IntBound(rc)) => {
                 return IntBoundHandle::live(std::rc::Rc::clone(rc));
             }
@@ -4246,7 +4246,7 @@ impl OptContext {
         // raw-pointer Int), upstream's outer `if cur is not None` already
         // consumed control; the else branch only runs when cur is None.
         use crate::r#box::Forwarded as BoxFwd;
-        if matches!(*op.get_forwarded(), BoxFwd::None) {
+        if matches!(op.get_forwarded(), BoxFwd::None) {
             op.set_forwarded_info(OpInfo::int_bound(bound.clone()));
         }
     }
@@ -4307,7 +4307,7 @@ impl OptContext {
             return f(&mut tmp);
         }
         // optimizer.py:104-109: branch on forwarded slot.
-        let needs_init = matches!(*resolved.get_forwarded(), Forwarded::None);
+        let needs_init = matches!(resolved.get_forwarded(), Forwarded::None);
         if needs_init {
             // optimizer.py:110-112 first-access: materialize unbounded,
             // mutate via closure, install on `_forwarded`.
@@ -4581,7 +4581,7 @@ impl OptContext {
             return self.const_pool.get(&opref.const_index()).copied();
         }
         if let Some(b) = self.box_pool.get(opref) {
-            if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
+            if let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() {
                 if let Some(value) = target.const_value() {
                     return Some(value);
                 }
@@ -5788,7 +5788,7 @@ impl OptContext {
         //         assert isinstance(fw, AbstractRawPtrInfo)
         //         return fw
         //     return None
-        match &*terminal.get_forwarded() {
+        match &terminal.get_forwarded() {
             Forwarded::None => None,
             Forwarded::Info(OpInfo::IntBound(_)) => None,
             Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
@@ -5880,7 +5880,7 @@ impl OptContext {
         if let Some(Value::Ref(gcref)) = terminal.const_value() {
             return Some(PtrInfoHandle::Const(PtrInfo::Constant(gcref)));
         }
-        match &*terminal.get_forwarded() {
+        match &terminal.get_forwarded() {
             Forwarded::None => None,
             Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
             // info.py:892 `assert isinstance(fw, PtrInfo)` — a Ref-typed
@@ -6210,7 +6210,7 @@ impl OptContext {
             // optimizer.py:104-109: fw = op.get_forwarded(); branch on type.
             {
                 let fw = resolved.get_forwarded();
-                match &*fw {
+                match &fw {
                     Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().getnullness(),
                     // optimizer.py:108-109: rare case (fw is RawBufferPtrInfo).
                     // optimizer.py:104-109 reads anything that is not an
@@ -6283,7 +6283,7 @@ impl OptContext {
         let b = self
             .ensure_box(terminal)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        let already_set = !matches!(*b.get_forwarded(), crate::r#box::Forwarded::None);
+        let already_set = !matches!(b.get_forwarded(), crate::r#box::Forwarded::None);
         if !already_set {
             b.set_forwarded_info(OpInfo::ptr(info));
         }
@@ -6555,7 +6555,7 @@ impl OptContext {
         // forwarded slot is either `Forwarded::None` or `Forwarded::Info(_)`
         // (Box variants are consumed during walk). The skip condition maps
         // directly to "Info present".
-        if matches!(*op.get_forwarded(), crate::r#box::Forwarded::Info(_)) {
+        if matches!(op.get_forwarded(), crate::r#box::Forwarded::Info(_)) {
             return;
         }
         // optimizer.py:451: op.set_forwarded(info.NonNullPtrInfo())
@@ -6897,7 +6897,7 @@ impl OptContext {
         // `BoxRef::clear_forwarded` per AbstractValue invariant.
         let info = {
             let fw = resolved.get_forwarded();
-            match &*fw {
+            match &fw {
                 Forwarded::Info(OpInfo::Ptr(rc)) => Some(rc.borrow().clone()),
                 _ => None,
             }
@@ -7161,7 +7161,7 @@ mod boxref_forwarding_tests {
     fn h3_1_replace_op_mirrors_box_forward() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Box(target) => assert_eq!(target, &b1),
             other => panic!("expected Forwarded::Box, got {:?}", other),
         }
@@ -7175,7 +7175,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
         b0.clear_forwarded();
-        assert!(matches!(*b0.get_forwarded(), BoxForwarded::None));
+        assert!(matches!(b0.get_forwarded(), BoxForwarded::None));
     }
 
     /// `optimizer.py:387-400 make_equal_to` Info transfer parity: when
@@ -7189,12 +7189,12 @@ mod boxref_forwarding_tests {
         ctx.make_equal_to(&b0, &b1);
         // After: old's IntBound transferred to new (PyPy:
         // `newop.set_forwarded(opinfo)`). old now forwards to new.
-        match &*b1.get_forwarded() {
+        match &b1.get_forwarded() {
             BoxForwarded::Info(OpInfo::IntBound(b)) => assert_eq!(b.borrow().lower, 7),
             other => panic!("BoxRef[1] should carry IntBound, got {:?}", other),
         }
         // old's slot now points to new (forwarding chain head).
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Box(target) => assert_eq!(target, &b1),
             other => panic!("expected b0 to forward to b1, got {:?}", other),
         }
@@ -7218,7 +7218,7 @@ mod boxref_forwarding_tests {
         ctx.make_equal_to(&b0, &b_const);
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Box(target) => assert!(target.is_constant()),
             other => panic!("expected b0 to forward to const_box, got {:?}", other),
         }
@@ -7233,7 +7233,7 @@ mod boxref_forwarding_tests {
         ctx.box_pool = vec![b.clone()].into();
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
-        match &*b.get_forwarded() {
+        match &b.get_forwarded() {
             BoxForwarded::Info(OpInfo::Ptr(rc))
                 if matches!(&*rc.borrow(), PtrInfo::NonNull { .. }) => {}
             other => panic!("expected Info(Ptr(NonNull)), got {:?}", other),
@@ -7252,7 +7252,7 @@ mod boxref_forwarding_tests {
         ctx.box_pool = vec![b.clone()].into();
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
-        match &*b.get_forwarded() {
+        match &b.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert_eq!(target.const_value(), Some(Value::Ref(GcRef(0xdead_beef))));
             }
@@ -7260,7 +7260,7 @@ mod boxref_forwarding_tests {
         }
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
         ctx.make_nonnull(&b);
-        match &*b.get_forwarded() {
+        match &b.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert_eq!(
                     target.const_value(),
@@ -7314,7 +7314,7 @@ mod boxref_forwarding_tests {
     fn h3_1_make_constant_mirrors_box_info_constant() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert_eq!(target.const_value(), Some(Value::Int(42)));
             }
@@ -7328,7 +7328,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
         ctx.setintbound(&b0, &bound);
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Info(OpInfo::IntBound(b)) => {
                 let b = b.borrow();
                 assert_eq!(b.lower, 7);
@@ -7354,7 +7354,7 @@ mod boxref_forwarding_tests {
             .ensure_box(const_opref)
             .expect("const_pool seeded above");
         ctx.make_equal_to(&b0, &b_const);
-        match &*b0.get_forwarded() {
+        match &b0.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert!(target.is_constant());
                 assert_eq!(target.const_value(), Some(Value::Int(42)));
@@ -7484,7 +7484,7 @@ mod boxref_forwarding_tests {
         // Placeholder Box absorbed the mirror write, so its _forwarded now
         // carries the info — equivalent to PyPy's Phase 1 Box receiving
         // setinfo_from_preamble.
-        match &*placeholder_target.get_forwarded() {
+        match &placeholder_target.get_forwarded() {
             BoxForwarded::Info(OpInfo::Ptr(rc))
                 if matches!(&*rc.borrow(), PtrInfo::NonNull { .. }) => {}
             other => panic!(
@@ -7542,7 +7542,7 @@ mod boxref_forwarding_tests {
 
         // Placeholder Box was not mutated (no info import fired) — still None.
         assert!(matches!(
-            *placeholder_target.get_forwarded(),
+            placeholder_target.get_forwarded(),
             BoxForwarded::None
         ));
     }
@@ -8191,7 +8191,7 @@ mod boxref_forwarding_tests {
 
         old_box.clear_forwarded();
         assert!(matches!(
-            &*old_box.get_forwarded(),
+            &old_box.get_forwarded(),
             crate::r#box::Forwarded::None,
         ));
     }
