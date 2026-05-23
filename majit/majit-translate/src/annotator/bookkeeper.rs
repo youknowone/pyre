@@ -2573,6 +2573,28 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
+        // Fallback `callable(x)` arm for `BuiltinCallable` HostObjects
+        // whose qualname is not registered in `BUILTIN_ANALYZERS`
+        // (e.g. the bare `std.ptr.eq` / `std.mem.align_of` /
+        // `std.alloc.dealloc` host stubs published by
+        // `HostEnv::bootstrap`).  Mirrors upstream `bookkeeper.py:317-331`
+        // `elif callable(x): result = SomePBC([self.getdesc(x)])`:
+        // PyPy doesn't distinguish "analyzer-backed builtin" from
+        // "bare-stub callable" at the immutablevalue boundary — both
+        // route through the same `callable(x)` arm.  Pyre splits the
+        // registered-analyzer path (returns `SomeBuiltin` with an
+        // analyzer ref) from the unregistered fallback (returns
+        // `SomeBuiltin` with `analyzer = None`), so a call-site
+        // dispatch on this `SomeBuiltin` still fails loud when the
+        // analyser is genuinely missing — but `immutablevalue` itself
+        // succeeds, matching upstream's "annotate first, fail at the
+        // call site only" lifecycle.
+        if obj.is_builtin_callable() {
+            let qualname = obj.qualname().to_string();
+            let mut sb = SomeBuiltin::new(qualname.clone(), None, Some(qualname));
+            sb.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::Builtin(sb));
+        }
         // upstream bookkeeper.py:332-338 — `elif hasattr(x, '_freeze_'):
         // assert x._freeze_() is True; result = SomePBC([getdesc(x)])`.
         // Check BEFORE the instance branch so any HostObject carrying

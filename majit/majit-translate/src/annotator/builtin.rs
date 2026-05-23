@@ -306,6 +306,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
+    // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
+    // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
+    // (`flowspace/model.rs:1910`).  Lowers identity checks in
+    // `baseobjspace::is_w` / `baseobjspace::is_`.
+    analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1164,6 +1169,22 @@ pub fn rarith_longlongmask(
         false,
         crate::annotator::model::KnownType::LongLong,
     )))
+}
+
+/// Analyzer for `std::ptr::eq(p1, p2) -> bool` — Rust pointer identity
+/// check.  Registered against the `HostObject::new_builtin_callable
+/// ("std.ptr.eq")` stub published by [`HostEnv::bootstrap`]
+/// (`flowspace/model.rs:1910`) so `baseobjspace::is_w` /
+/// `baseobjspace::is_` (which lower the Python identity check to
+/// `std::ptr::eq(w_one, w_two)`) annotate cleanly.  Mirrors PyPy's
+/// `ptr_eq(p, q)` annotator: pure identity comparison returning
+/// `SomeBool` regardless of operand types.
+pub fn std_ptr_eq(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Bool(super::model::SomeBool::new()))
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`
