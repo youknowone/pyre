@@ -5935,20 +5935,31 @@ fn lower_expr(
             }
             // Z2.5 Cat 2.1 Slice 3c — `KNOWN_STATICS` lookup
             // is populated at `analyze_pipeline_from_parsed` entry;
-            // a single-segment SHOUTY_CASE identifier that matches a
-            // crate-level `static` decl emits `OpKind::LoadStatic`
-            // (translated by `flowspace_adapter::translate_op` to a
+            // a path identifier that matches a registered crate-level
+            // `static` / `const` decl (or a `thread_local!` static)
+            // emits `OpKind::LoadStatic` (translated by
+            // `flowspace_adapter::translate_op` to a
             // `same_as(Constant(UniStr(segments)))`) instead of the
             // body-`OpKind::Input` fallthrough.  Closes the Cat 2.1
             // Skip family — see [[project-z25-skip-profile-2026-05-23]].
-            let known_static_ty: Option<ValueType> =
-                if path.path.segments.len() == 1 && path.qself.is_none() {
-                    KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
-                } else {
-                    None
-                };
+            //
+            // Slice 3f: multi-segment paths (e.g. `pyre_object::PY_NULL`)
+            // route through the same lookup — `populate_known_statics`
+            // publishes both the bare leaf and the joined `::`-path,
+            // so multi-segment reads resolve when the path's joined
+            // ident matches a catalogued static.
+            let known_static_ty: Option<ValueType> = if path.qself.is_none() {
+                KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
+            } else {
+                None
+            };
             if let Some(static_ty) = known_static_ty {
-                let segments = vec![name.clone()];
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
                 let value_var = graph.push_op_var(
                     *block,
                     OpKind::LoadStatic {
