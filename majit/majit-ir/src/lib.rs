@@ -1,4 +1,5 @@
 pub mod bitstring;
+pub mod box_ref;
 pub mod debug;
 pub mod descr;
 pub mod descr_registry;
