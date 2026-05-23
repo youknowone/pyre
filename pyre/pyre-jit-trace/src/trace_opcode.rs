@@ -1444,6 +1444,18 @@ impl MIFrame {
             let mut registers_r_semantic: Vec<OpRef> =
                 if let Some(ref pre_r) = self.pre_opcode_registers_r {
                     pre_r[..valid_len.min(pre_r.len())].to_vec()
+                } else if s.owns_virtualizable_shadow() {
+                    // Path 3 slice 35a (task #225): portal frames have the
+                    // authoritative semantic-indexed shadow in
+                    // `virtualizable_boxes` (`pyjitpl.py:1242
+                    // _opimpl_setarrayitem_vable`).  When no opcode-start
+                    // snapshot is available, source the encoder's
+                    // semantic view directly from the vable shadow rather
+                    // than the pyre-only `registers_r` semantic mirror.
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    (0..valid_len)
+                        .map(|idx| ctx.virtualizable_box_at(nvs + idx).unwrap_or(OpRef::NONE))
+                        .collect()
                 } else {
                     s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
                 };
