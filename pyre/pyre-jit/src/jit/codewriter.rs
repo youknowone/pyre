@@ -9588,10 +9588,33 @@ impl CodeWriter {
                         (jitcode, canonical_ssarepr_to_assemble)
                     }));
                 match assembly_result {
-                    Ok((_jitcode, post_assemble_ssarepr)) => {
+                    Ok((jitcode, post_assemble_ssarepr)) => {
+                        // Slice 20: log canonical's assembled bytecode
+                        // length and the highest pc_first_insn_pos byte
+                        // offset (translated via `insns_pos`) so the
+                        // splice viability question — "could canonical's
+                        // body replace walker's at the same install
+                        // site?" — has a per-graph byte budget.
+                        let body_len = jitcode.core().code.len();
+                        let walker_insns_len = ssarepr.insns.len();
+                        let canonical_insns_len = post_assemble_ssarepr.insns.len();
+                        let max_pc_byte = post_assemble_ssarepr
+                            .insns_pos
+                            .as_ref()
+                            .and_then(|positions| {
+                                post_assemble_ssarepr
+                                    .pc_first_insn_pos
+                                    .iter()
+                                    .map(|(_, ip)| positions.get(*ip).copied().unwrap_or(0))
+                                    .max()
+                            })
+                            .unwrap_or(0);
                         eprintln!(
                             "[phase4-canonical-assemble] graph={} OK \
-                             insns_pos_len={} pc_first_insn_pos_len={}",
+                             insns_pos_len={} pc_first_insn_pos_len={} \
+                             body_len={body_len} walker_insns={walker_insns_len} \
+                             canonical_insns={canonical_insns_len} \
+                             max_pc_byte={max_pc_byte}",
                             ssarepr.name,
                             post_assemble_ssarepr
                                 .insns_pos
