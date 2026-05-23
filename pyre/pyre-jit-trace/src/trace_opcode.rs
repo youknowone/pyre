@@ -645,6 +645,29 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
         sym.registers_r[reg_idx] =
             trace_array_getitem_value(ctx, sym.locals_cells_stack_array_ref, idx_const);
     }
+    // Path 3 slice 33 (task #219): verify that `registers_r[reg_idx]` matches
+    // the PyPy-orthodox `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]`
+    // shadow for portal frames.  If the two agree universally, `read_stack_slot`
+    // can route through the vable shadow and the semantic-mirror write at
+    // `write_stack_slot:584` is retire-able.  Diagnostic-only — gated on
+    // `PYRE_PATH3_VERIFY_STACK_READ=1`.
+    if std::env::var("PYRE_PATH3_VERIFY_STACK_READ").is_ok() && sym.owns_virtualizable_shadow() {
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        let vable = ctx.virtualizable_box_at(nvs + semantic_idx);
+        let mirror = sym.registers_r[reg_idx];
+        match vable {
+            Some(v) if v == mirror => {}
+            Some(v) => eprintln!(
+                "[path3-verify] read_stack_slot mismatch stack_idx={} semantic={} \
+                 mirror={:?} vable={:?}",
+                stack_idx, semantic_idx, mirror, v
+            ),
+            None => eprintln!(
+                "[path3-verify] read_stack_slot vable=None stack_idx={} semantic={} mirror={:?}",
+                stack_idx, semantic_idx, mirror
+            ),
+        }
+    }
     sym.registers_r[reg_idx]
 }
 
