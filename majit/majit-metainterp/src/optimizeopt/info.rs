@@ -2664,18 +2664,7 @@ impl PtrInfo {
 /// referencing the same virtual. `RefCell` provides interior
 /// mutability so the immutable-receiver accessor can populate the
 /// cache on first miss.
-#[derive(Clone, Debug, Default)]
-pub struct AbstractVirtualPtrInfo {
-    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-}
-
-impl AbstractVirtualPtrInfo {
-    pub fn new() -> Self {
-        Self {
-            cached_vinfo: std::cell::RefCell::new(None),
-        }
-    }
-}
+pub use majit_ir::ptr_info::AbstractVirtualPtrInfo;
 
 /// A virtual object whose allocation has been removed.
 ///
