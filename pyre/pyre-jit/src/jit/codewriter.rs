@@ -9373,6 +9373,29 @@ impl CodeWriter {
                         None => "PREFIX_MATCH".to_string(),
                     },
                 );
+                // Slice 10: direct Label count diff.  Slice 9's windowed
+                // dump showed the entire non-exception bench divergence
+                // is canonical's extra `Label` insns.  Counting Labels
+                // directly turns the diff into a single measurement
+                // that quantifies the per-block (canonical) vs per-PC
+                // (walker) emission discrepancy without needing the
+                // filter chain.
+                let walker_label_count = ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| matches!(i, super::flatten::Insn::Label(_)))
+                    .count();
+                let canonical_label_count = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| matches!(i, super::flatten::Insn::Label(_)))
+                    .count();
+                eprintln!(
+                    "[phase4-diff-labels] graph={} walker={walker_label_count} \
+                     canonical={canonical_label_count} diff={}",
+                    ssarepr.name,
+                    canonical_label_count as i64 - walker_label_count as i64,
+                );
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
