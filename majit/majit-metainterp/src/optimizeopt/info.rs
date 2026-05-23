@@ -16,24 +16,9 @@ pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::op_info::OpInfo;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 
-/// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
-/// Returns `Some(length)` when `gcref` points at a known string of the
-/// requested mode, `None` otherwise. Cloned (Arc) into each
-/// `EnsuredPtrInfo` instance so the helper can satisfy
-/// `getlenbound(Some(mode))` for constant string args without re-borrowing
-/// `OptContext`.
-pub type StringLengthResolver = std::sync::Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>;
-
-/// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
-/// extracting characters from a constant string GcRef. Returns the char
-/// values as `Vec<i64>`. Set by the host runtime (pyre etc.).
-pub type StringContentResolver =
-    std::sync::Arc<dyn Fn(GcRef, u8) -> Option<Vec<i64>> + Send + Sync>;
-
-/// history.py:377-387 `get_const_ptr_for_string(s)` — runtime hook for
-/// creating a constant string GcRef from char values. The bool indicates
-/// unicode (true) vs byte-string (false). Set by the host runtime.
-pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef + Send + Sync>;
+pub use majit_ir::ptr_info::{
+    StringConstantAllocator, StringContentResolver, StringLengthResolver,
+};
 
 /// Result of `OptContext::ensure_ptr_info_arg0(op)` — direct line-by-line
 /// equivalent of PyPy's `ensure_ptr_info_arg0` return value

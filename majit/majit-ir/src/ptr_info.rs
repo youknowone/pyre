@@ -27,6 +27,24 @@ pub fn reasonable_array_index(index: i64) -> bool {
     index >= 0 && index <= 150_000
 }
 
+/// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
+/// Returns `Some(length)` when `gcref` points at a known string of the
+/// requested mode, `None` otherwise.
+pub type StringLengthResolver =
+    std::sync::Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>;
+
+/// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
+/// extracting characters from a constant string GcRef. Returns the char
+/// values as `Vec<i64>`. Set by the host runtime (pyre etc.).
+pub type StringContentResolver =
+    std::sync::Arc<dyn Fn(GcRef, u8) -> Option<Vec<i64>> + Send + Sync>;
+
+/// history.py:377-387 `get_const_ptr_for_string(s)` — runtime hook for
+/// creating a constant string GcRef from char values. The bool indicates
+/// unicode (true) vs byte-string (false). Set by the host runtime.
+pub type StringConstantAllocator =
+    std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef + Send + Sync>;
+
 /// info.py: `AbstractVirtualPtrInfo` (RPython base class hint). Pyre
 /// hoists only the fields shared by every Virtual* variant so each
 /// `PtrInfo::Virtual*` carries a single embedded slot instead of N
