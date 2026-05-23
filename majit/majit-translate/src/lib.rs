@@ -432,6 +432,25 @@ fn analyze_pipeline_from_parsed(
         }
     }
     majit_ir::descr::register_struct_origins(struct_origins);
+    // Z2.5 Cat 2.1 Slice 3 — publish the per-thread `KNOWN_STATICS`
+    // catalogue before the semantic build runs so `front/ast.rs::
+    // lower_expr`'s `Expr::Path` arm can emit `OpKind::LoadStatic` for
+    // single-segment SHOUTY_CASE references instead of falling through
+    // to the body-`OpKind::Input` Skip class.  The same catalogue
+    // re-populates `CallControl.static_decls` further down for the
+    // codewriter-side adapter consumer; deduplicating to a single
+    // walk would couple the call-control population to semantic build
+    // order, so the publish is kept as a cheap pre-pass.
+    let early_static_decls: Vec<(Vec<String>, crate::model::ValueType)> = parsed_files
+        .iter()
+        .flat_map(|parsed| {
+            crate::flowspace::rust_source::register::extract_static_decls(
+                &parsed.file,
+                &parsed.module_path,
+            )
+        })
+        .collect();
+    crate::front::ast::populate_known_statics(&early_static_decls);
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
@@ -596,23 +615,12 @@ fn analyze_pipeline_from_parsed(
         );
     }
     call_control.unsafe_fn_stubs = unsafe_stubs;
-    // Z2.5 Cat 2.1 Slice 2 — populate the metadata-only
-    // `static_decls` carrier so a later slice can plumb the
-    // catalogue through to `front/ast.rs::Expr::Path` lowering and
-    // skip the body-`OpKind::Input` fallthrough for known
-    // crate-level statics.  Walks each parsed source file under its
-    // crate-stripped `module_path` prefix.  No consumer wired yet —
-    // Slice 3 adds the front-end lookup.
-    let mut static_decls: Vec<(Vec<String>, crate::model::ValueType)> = Vec::new();
-    for parsed in parsed_files {
-        static_decls.extend(
-            crate::flowspace::rust_source::register::extract_static_decls(
-                &parsed.file,
-                &parsed.module_path,
-            ),
-        );
-    }
-    call_control.static_decls = static_decls;
+    // Z2.5 Cat 2.1 Slice 2/3 — codewriter-side mirror of the static
+    // catalogue.  Reuses the `early_static_decls` walk that already
+    // populated the front-end `KNOWN_STATICS` thread-local; both
+    // consumers expect the same `(segments, ty)` shape so a second
+    // walk would duplicate effort with no observable difference.
+    call_control.static_decls = early_static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
         if let Some(layout) = provider.get_struct_layout(struct_name) {

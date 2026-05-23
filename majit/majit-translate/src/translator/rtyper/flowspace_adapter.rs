@@ -757,6 +757,33 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
         }
 
+        // ─── `LoadStatic` — Z2.5 Cat 2.1 single-segment static lookup ─
+        // Pyre-only marker emitted by `front/ast.rs::lower_expr` when
+        // `Expr::Path` resolves to a crate-level `static` declaration
+        // (SHOUTY_CASE constant like `GC_WEAKREF_TYPE`).  RPython
+        // peer: `LOAD_GLOBAL` (`flowspace/flowcontext.py:1098`)
+        // resolves the name lookup to a `Constant(value)` directly
+        // — no SpaceOperation is emitted, and the bound `Variable`
+        // *is* the graph-level definition.  Pyre always emits an op
+        // here so cross-block reads have a defined producer (the
+        // `checkgraph` defining-var set requires every operand to
+        // trace to an op result or `Block.inputargs`).
+        //
+        // The arg side carries a string sentinel `UniStr(segments)`
+        // — the rtyper's `same_as` arm (`rtyper.rs::translate_op
+        // "same_as"`) treats this as identity and binds the result
+        // Variable to the same constant; the concrete static address
+        // resolution is deferred to a future slice (rclass /
+        // jit_codewriter consume the same OpKind variant via the
+        // `static_decls` carrier on `CallControl`).
+        OpKind::LoadStatic { segments, .. } => {
+            let sentinel = Hlvalue::Constant(Constant::new(ConstValue::UniStr(
+                segments.join("::"),
+            )));
+            let result = resolve_result_hlvalue(op, value_map, graph)?;
+            Ok(vec![FlowspaceOp::new("same_as", vec![sentinel], result)])
+        }
+
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
         // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).

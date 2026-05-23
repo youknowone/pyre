@@ -367,7 +367,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::Abort { .. } => ValueType::Unknown,
         // `newtuple` yields a `Ref` to the freshly allocated tuple
         // object (RPython `SomeTuple` lowers to `Ptr<GcStruct>`).
-        OpKind::NewTuple { .. } => ValueType::Ref,
+        OpKind::NewTuple { .. } => ValueType::Ref(None),
         // `LoadStatic` carries the declared `ValueType` of the static
         // directly (extracted from the `syn::Item::Static.ty` at
         // `register::extract_static_decls`).

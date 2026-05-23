@@ -3917,6 +3917,42 @@ thread_local! {
     /// elsewhere — purely cosmetic for the dump output.
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Z2.5 Cat 2.1 — catalogue of crate-local `static` declarations
+    /// available to `lower_expr` so a single-segment `Expr::Path` whose
+    /// joined name matches a registered static can emit `OpKind::
+    /// LoadStatic` instead of the body-`OpKind::Input` fallthrough.
+    /// Keys are both the bare ident (e.g. `GC_WEAKREF_TYPE`) and the
+    /// fully-qualified path (e.g. `crate::weakref::GC_WEAKREF_TYPE`)
+    /// — same dual-publish shape as `STRUCT_ORIGIN_REGISTRY` so a
+    /// source's use-import resolution doesn't have to be replicated
+    /// at the front-end.  Populated by `populate_known_statics` from
+    /// `analyze_pipeline_from_parsed` before the semantic build runs.
+    /// Read-only during `lower_expr`.
+    pub(crate) static KNOWN_STATICS: std::cell::RefCell<
+        std::collections::HashMap<String, ValueType>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Z2.5 Cat 2.1 — install the static catalogue into the per-thread
+/// `KNOWN_STATICS` cell before semantic build runs.  `decls` is the
+/// flat list `[(segments, ty)]` produced by
+/// `flowspace::rust_source::register::extract_static_decls`; each
+/// entry is published twice — once under the leaf segment (bare
+/// SHOUTY_CASE name), once under the joined `::`-path.
+pub fn populate_known_statics(decls: &[(Vec<String>, ValueType)]) {
+    KNOWN_STATICS.with(|cell| {
+        let mut m = cell.borrow_mut();
+        m.clear();
+        for (segments, ty) in decls {
+            if let Some(leaf) = segments.last() {
+                m.insert(leaf.clone(), ty.clone());
+            }
+            if segments.len() > 1 {
+                m.insert(segments.join("::"), ty.clone());
+            }
+        }
+    });
 }
 
 /// RAII guard for `CURRENT_LOWERING_FN_NAME` — restores the previous
@@ -5897,6 +5933,33 @@ fn lower_expr(
                     .map(|var| Lowered::from_value_var(graph, &var))
                     .unwrap_or_else(Lowered::no_value));
             }
+            // Z2.5 Cat 2.1 Slice 3b — `KNOWN_STATICS` is populated
+            // at `analyze_pipeline_from_parsed` entry; the emit-site
+            // wiring is deferred to Slice 3c because unconditional
+            // `OpKind::LoadStatic` emission widens the annotator's
+            // visit set in a way that surfaces a pre-existing
+            // `setbinding` monotonicity gap on graphs that previously
+            // converged via the body-`OpKind::Input` fallthrough
+            // (observed: `crate::tupleobject::w_tuple_len`
+            // → `is_specialised_tuple_ii` reaches its `return 2`
+            // constant-Integer arm before the union with the wider
+            // Integer slot, panicking on
+            // `Integer(Const(2)) ⊄ Integer(non-const)`).  The fix
+            // path is either narrowing the emit trigger or routing
+            // setbinding through `unionof` first; both are
+            // multi-session epics, not single-slice closures.
+            //
+            // The lookup is still wired below so the codewriter-side
+            // `static_decls` consumer (currently planned for rclass
+            // / rpbc) has a single chokepoint when the production
+            // emit re-arms.
+            let _known_static_ty: Option<ValueType> = if path.path.segments.len() == 1
+                && path.qself.is_none()
+            {
+                KNOWN_STATICS.with(|m| m.borrow().get(&name).cloned())
+            } else {
+                None
+            };
             let ty = ctx
                 .local_value_types
                 .get(&name)
