@@ -1987,6 +1987,10 @@ impl HostEnv {
             "align_of",
             HostObject::new_builtin_callable("std.mem.align_of"),
         );
+        std_mem.module_set(
+            "size_of",
+            HostObject::new_builtin_callable("std.mem.size_of"),
+        );
         let std_alloc = HostObject::new_module("std.alloc");
         std_alloc.module_set(
             "dealloc",

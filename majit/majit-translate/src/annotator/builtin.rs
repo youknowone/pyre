@@ -311,6 +311,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
     // `baseobjspace::is_w` / `baseobjspace::is_`.
     analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
+    // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
+    // constant called by `lltype::malloc_typed` /
+    // `object_array::items_block_layout`.  Returns `SomeInteger`.
+    analyzer_for(&mut reg, "std.mem.size_of", std_mem_size_of);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1185,6 +1189,22 @@ pub fn std_ptr_eq(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
+/// type-size constant.  Registered against the
+/// `HostObject::new_builtin_callable("std.mem.size_of")` stub.
+/// Callers in pyre source: `lltype::malloc_typed`,
+/// `object_array::items_block_layout`.  Returns `SomeInteger` since
+/// the actual value is a compile-time `usize`; the rtyper folds the
+/// const at lowering time, but the annotator just needs the lattice
+/// position.
+pub fn std_mem_size_of(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
 /// Upstream `ann_cast_ptr_to_int(s_ptr)`
