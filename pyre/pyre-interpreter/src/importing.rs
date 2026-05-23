@@ -2086,6 +2086,15 @@ fn init_syslog(ns: &mut DictStorage) {
                         None
                     }
                 });
+                if args
+                    .iter()
+                    .skip(1)
+                    .any(|&a| !unsafe { pyre_object::is_int(a) })
+                {
+                    return Err(crate::PyError::type_error(
+                        "openlog(): logoption and facility must be integers",
+                    ));
+                }
                 let logoption = args
                     .get(1)
                     .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
@@ -2171,6 +2180,11 @@ fn init_syslog(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     let mask = if let Some(&a) = args.first() {
+                        if !unsafe { pyre_object::is_int(a) } {
+                            return Err(crate::PyError::type_error(
+                                "setlogmask(): argument must be an integer",
+                            ));
+                        }
                         unsafe { pyre_object::w_int_get_value(a) as i32 }
                     } else {
                         return Err(crate::PyError::type_error("setlogmask() missing argument"));
