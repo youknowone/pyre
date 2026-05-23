@@ -225,6 +225,15 @@ impl BoxRef {
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
+    /// Slice 8.D prep: upgrade the bound `Weak<Op>` into a strong `OpRc`.
+    /// Returns `None` for unbound boxes (InputArg / Const / lazy-allocated)
+    /// or if the bound `Op` was dropped. Callers migrating away from
+    /// `box.get_forwarded()` use this to reach `op.forwarded.borrow()` for
+    /// readers and `op.forwarded.borrow_mut()` for writers.
+    pub fn bound_op(&self) -> Option<crate::resoperation::OpRc> {
+        self.0.op_handle.borrow().as_ref().and_then(|w| w.upgrade())
+    }
+
     /// Extract the `const_index` field for chain-walker reconstruction.
     /// Returns `None` for non-Const boxes and for Consts created via
     /// `new_const` (no index in scope).
