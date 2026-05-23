@@ -6258,6 +6258,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython `newtuple` is a `PureOperation` (`operation.py:542`);
         // pure tuple construction cannot raise.
         OpKind::NewTuple { .. } => RaiseClass::No,
+        // `LoadStatic` reads a `static` declaration's address — a
+        // compile-time constant.  `LOAD_GLOBAL` analog
+        // (`flowspace/flowcontext.py:1098`); cannot raise.
+        OpKind::LoadStatic { .. } => RaiseClass::No,
     }
 }
 

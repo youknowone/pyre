@@ -787,6 +787,10 @@ fn remap_op_kind(
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(&remap_var).collect(),
         },
+        OpKind::LoadStatic { segments, ty } => OpKind::LoadStatic {
+            segments: segments.clone(),
+            ty: ty.clone(),
+        },
     }
 }
 
@@ -809,7 +813,8 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::Abort { .. } => {
+        | OpKind::Abort { .. }
+        | OpKind::LoadStatic { .. } => {
             vec![]
         }
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
@@ -1048,7 +1053,11 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
         | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py:542-548`).
-        | OpKind::NewTuple { .. } => true,
+        | OpKind::NewTuple { .. }
+        // `LoadStatic` reads a `static` declaration's compile-time
+        // address — equivalent to `LOAD_GLOBAL` → Constant lookup,
+        // pure.
+        | OpKind::LoadStatic { .. } => true,
         // Per-opname classification for `OpKind::BinOp` mirrors
         // `simplify.CanRemove` (`simplify.py:405-417`) +
         // `enum_ops_without_sideeffects()` for binary ops.  Pyre's

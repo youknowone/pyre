@@ -3920,7 +3920,8 @@ fn remap_op(
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::Abort { .. } => op.kind.clone(),
+        | OpKind::Abort { .. }
+        | OpKind::LoadStatic { .. } => op.kind.clone(),
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },

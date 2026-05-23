@@ -2128,6 +2128,7 @@ impl Assembler {
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
+                OpKind::LoadStatic { .. } => "LoadStatic",
             }
         }
         let mut sites: std::collections::HashMap<crate::flowspace::model::Variable, ValueSites> =
@@ -3278,6 +3279,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
+        // `LoadStatic` lowers to a `same_as` SpaceOperation whose arg
+        // is the static's resolved `Hlvalue::Constant` (see model.rs
+        // `LoadStatic` doc).  The opname matches RPython's
+        // `same_as` (`flowspace/operation.py:540`) which the rtyper
+        // already handles as identity.
+        OpKind::LoadStatic { .. } => "same_as".into(),
     }
 }
 

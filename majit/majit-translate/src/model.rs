@@ -898,6 +898,36 @@ pub enum OpKind {
     NewTuple {
         args: Vec<crate::flowspace::model::Variable>,
     },
+
+    /// Single-segment `Expr::Path` resolving to a crate-local `static`
+    /// declaration (typically a SHOUTY_CASE constant like
+    /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).  Emitted by
+    /// `front/ast.rs::lower_expr` for `syn::Expr::Path` whose joined
+    /// `name` is present in `ctx.known_statics` (populated from
+    /// `CallControl.static_decls`).
+    ///
+    /// RPython parity: `flowspace/flowcontext.py:LOAD_GLOBAL` lifts a
+    /// module-scope name lookup to a `Constant(value)` whose payload
+    /// is the resolved object (`flowspace/flowcontext.py:1098`); the
+    /// annotator binds the result via `unionof(s_Constant)` without
+    /// emitting a SpaceOperation (the bound `Variable` *is* the
+    /// graph-level definition).  Pyre's adapter emits a placeholder
+    /// `same_as` SpaceOperation whose first arg is the static's
+    /// declared `Hlvalue::Constant` so checkgraph's defining-var
+    /// set includes the producer (this differs from PyPy where
+    /// `LOAD_GLOBAL` returns a Constant Hlvalue directly and no
+    /// SpaceOperation is needed — pyre's frontend always emits an
+    /// op so cross-block reads have a defined producer).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython has no concept of a
+    /// "static at a crate path" — it has module-global Python names
+    /// looked up by `LOAD_GLOBAL`.  The `segments` field carries the
+    /// fully-qualified path (`["module_path", "STATIC_NAME"]`)
+    /// matching the upstream lookup key shape.
+    LoadStatic {
+        segments: Vec<String>,
+        ty: ValueType,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
