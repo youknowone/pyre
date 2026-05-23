@@ -16,6 +16,17 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// info.py:487-492 `reasonable_array_index(index)` — sanity gate on a
+/// constant array index or array size. Returns false for negative
+/// values or values above 150_000 so invalid loops and pathological
+/// allocations are not optimized.
+///
+/// Used by `virtualize.py:28` (NEW_ARRAY size gate) and
+/// `info.py:561` (per-element initialization gate).
+pub fn reasonable_array_index(index: i64) -> bool {
+    index >= 0 && index <= 150_000
+}
+
 /// info.py: `AbstractVirtualPtrInfo` (RPython base class hint). Pyre
 /// hoists only the fields shared by every Virtual* variant so each
 /// `PtrInfo::Virtual*` carries a single embedded slot instead of N

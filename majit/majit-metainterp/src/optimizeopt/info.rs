@@ -11,23 +11,8 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
-/// info.py:487-492 line-by-line:
-///
-/// ```python
-/// def reasonable_array_index(index):
-///     """Check a given constant array index or array size for sanity.
-///     In case of invalid loops or very large arrays, we shouldn't try
-///     to optimize them."""
-///     return index >= 0 and index <= 150000
-/// ```
-///
-/// Used by `virtualize.py:28` (NEW_ARRAY size gate) and
-/// `info.py:561` (per-element initialization gate).
-pub fn reasonable_array_index(index: i64) -> bool {
-    index >= 0 && index <= 150000
-}
-
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
+pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::op_info::OpInfo;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 
