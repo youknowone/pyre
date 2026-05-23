@@ -1678,6 +1678,11 @@ fn init_resource(ns: &mut DictStorage) {
                         }
                         let s = pyre_object::w_tuple_getitem(args[1], 0).unwrap();
                         let h = pyre_object::w_tuple_getitem(args[1], 1).unwrap();
+                        if !pyre_object::is_int(s) || !pyre_object::is_int(h) {
+                            return Err(crate::PyError::type_error(
+                                "setrlimit(): limits members must be integers",
+                            ));
+                        }
                         (
                             pyre_object::w_int_get_value(s) as libc::rlim_t,
                             pyre_object::w_int_get_value(h) as libc::rlim_t,
@@ -1813,6 +1818,14 @@ fn init_fcntl(ns: &mut DictStorage) {
                         "fcntl() requires at least 2 arguments",
                     ));
                 }
+                if !unsafe { pyre_object::is_int(args[0]) }
+                    || !unsafe { pyre_object::is_int(args[1]) }
+                    || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
+                {
+                    return Err(crate::PyError::type_error(
+                        "fcntl() arguments must be integers",
+                    ));
+                }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let arg = if args.len() >= 3 {
@@ -1846,6 +1859,14 @@ fn init_fcntl(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error(
                         "ioctl() requires at least 2 arguments",
+                    ));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) }
+                    || !unsafe { pyre_object::is_int(args[1]) }
+                    || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
+                {
+                    return Err(crate::PyError::type_error(
+                        "ioctl() arguments must be integers",
                     ));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
@@ -1884,6 +1905,13 @@ fn init_fcntl(ns: &mut DictStorage) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("flock() requires 2 arguments"));
                     }
+                    if !unsafe { pyre_object::is_int(args[0]) }
+                        || !unsafe { pyre_object::is_int(args[1]) }
+                    {
+                        return Err(crate::PyError::type_error(
+                            "flock() arguments must be integers",
+                        ));
+                    }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     match rustpython_host_env::fcntl::flock(fd, op) {
@@ -1915,6 +1943,14 @@ fn init_fcntl(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error(
                         "lockf() requires at least 2 arguments",
                     ));
+                }
+                for (i, &a) in args.iter().enumerate().take(5) {
+                    if !unsafe { pyre_object::is_int(a) } {
+                        let _ = i;
+                        return Err(crate::PyError::type_error(
+                            "lockf() arguments must be integers",
+                        ));
+                    }
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -2077,6 +2113,11 @@ fn init_syslog(ns: &mut DictStorage) {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 let (priority, msg_obj) = if args.len() >= 2 {
+                    if !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "syslog(): priority must be an integer",
+                        ));
+                    }
                     (
                         unsafe { pyre_object::w_int_get_value(args[0]) as i32 },
                         args[1],
@@ -2561,6 +2602,12 @@ fn init_termios(ns: &mut DictStorage) {
                     "tcsetattr() requires 3 arguments",
                 ));
             }
+            if !unsafe { pyre_object::is_int(args[0]) } || !unsafe { pyre_object::is_int(args[1]) }
+            {
+                return Err(crate::PyError::type_error(
+                    "tcsetattr: fd and when must be integers",
+                ));
+            }
             let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
             let when = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
             let attrs = args[2];
@@ -2579,6 +2626,14 @@ fn init_termios(ns: &mut DictStorage) {
                 unsafe { pyre_object::w_list_getitem(attrs, i as i64) }
                     .ok_or_else(|| crate::PyError::value_error("tcsetattr: missing item"))
             };
+            for i in 0..6 {
+                let item = get(i)?;
+                if !unsafe { pyre_object::is_int(item) } {
+                    return Err(crate::PyError::type_error(
+                        "tcsetattr: numeric attribute fields must be integers",
+                    ));
+                }
+            }
             let iflag = unsafe { pyre_object::w_int_get_value(get(0)?) } as libc::tcflag_t;
             let oflag = unsafe { pyre_object::w_int_get_value(get(1)?) } as libc::tcflag_t;
             let cflag = unsafe { pyre_object::w_int_get_value(get(2)?) } as libc::tcflag_t;
