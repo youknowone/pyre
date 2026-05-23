@@ -2676,6 +2676,11 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcgetattr() requires 1 argument",
                     ));
                 }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "tcgetattr: fd must be an integer",
+                    ));
+                }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let t = host_termios::tcgetattr(fd).map_err(|e| {
                     crate::PyError::os_error_with_errno(
@@ -2824,6 +2829,13 @@ fn init_termios(ns: &mut DictStorage) {
                         "tcsendbreak() requires 2 arguments",
                     ));
                 }
+                if !unsafe { pyre_object::is_int(args[0]) }
+                    || !unsafe { pyre_object::is_int(args[1]) }
+                {
+                    return Err(crate::PyError::type_error(
+                        "tcsendbreak: fd and duration must be integers",
+                    ));
+                }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let dur = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 host_termios::tcsendbreak(fd, dur).map_err(|e| {
@@ -2847,6 +2859,9 @@ fn init_termios(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("tcdrain() requires 1 argument"));
                 }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error("tcdrain: fd must be an integer"));
+                }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 host_termios::tcdrain(fd).map_err(|e| {
                     crate::PyError::os_error_with_errno(
@@ -2868,6 +2883,13 @@ fn init_termios(ns: &mut DictStorage) {
             |args| {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("tcflush() requires 2 arguments"));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) }
+                    || !unsafe { pyre_object::is_int(args[1]) }
+                {
+                    return Err(crate::PyError::type_error(
+                        "tcflush: fd and queue must be integers",
+                    ));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let q = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -2891,6 +2913,13 @@ fn init_termios(ns: &mut DictStorage) {
             |args| {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("tcflow() requires 2 arguments"));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) }
+                    || !unsafe { pyre_object::is_int(args[1]) }
+                {
+                    return Err(crate::PyError::type_error(
+                        "tcflow: fd and action must be integers",
+                    ));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                 let action = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
@@ -4173,6 +4202,13 @@ fn init_socket(ns: &mut DictStorage) {
             ns,
             "socketpair",
             crate::make_builtin_function("socketpair", |args| {
+                for (idx, label) in [(0, "family"), (1, "type"), (2, "proto")] {
+                    if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "socketpair: {label} must be an integer"
+                        )));
+                    }
+                }
                 let family = if args.is_empty() {
                     libc::AF_UNIX
                 } else {

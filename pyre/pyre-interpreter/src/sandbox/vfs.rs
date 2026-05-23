@@ -390,10 +390,7 @@ impl FSObject for RealFile {
     fn open(&self) -> VfsResult<Box<dyn Read>> {
         fs::File::open(&self.path)
             .map(|file| Box::new(file) as Box<dyn Read>)
-            .map_err(|err| VfsError {
-                errno: err.raw_os_error().unwrap_or(libc::EIO),
-                object: "open failed".to_owned(),
-            })
+            .map_err(|err| io_error(err, self.path.display().to_string()))
     }
 }
 
