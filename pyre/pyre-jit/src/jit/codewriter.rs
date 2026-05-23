@@ -9770,6 +9770,83 @@ impl CodeWriter {
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
             pyre_color_for_semantic_local.push(post);
         }
+        // Phase 4 endgame slice 22: under PYRE_PHASE4_DIFF_CANONICAL,
+        // compare walker's alloc_result-derived stack_slot_color_map /
+        // pyre_color_for_semantic_local against a graph_regallocs-derived
+        // alternative.  Production splice (replace walker emission with
+        // canonical `flatten_graph`) requires walker's metadata side-
+        // tables to be reproducible from graph_regallocs alone — this
+        // probe quantifies the per-slot regalloc divergence.
+        //
+        // Lookup paths:
+        //   walker:    alloc_result.rename[Kind::Ref][pre_slot] (SSA-side)
+        //   canonical: graph_regallocs[Kind::Ref].coloring[VariableId]
+        //              via inverse `slot_to_variable_id` derived from
+        //              `walker_slot_for_variable`.
+        if phase4_diff_canonical {
+            let total_pre = stack_base as usize + max_stackdepth as usize;
+            let mut slot_to_variable_id: Vec<Option<u32>> = vec![None; total_pre];
+            for (variable_id, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
+                if let Some(slot) = maybe_slot {
+                    let slot_idx = *slot as usize;
+                    if slot_idx < slot_to_variable_id.len() {
+                        slot_to_variable_id[slot_idx] = Some(variable_id as u32);
+                    }
+                }
+            }
+            let ref_coloring =
+                &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
+            let mut probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
+                if let Some(var_id) =
+                    slot_to_variable_id.get(pre_slot).copied().flatten()
+                {
+                    let v_id = super::flow::VariableId(var_id);
+                    if let Some(&canonical_color) = ref_coloring.get(&v_id) {
+                        if canonical_color != walker_color {
+                            eprintln!(
+                                "[phase4-color-mismatch] graph={} kind={label} \
+                                 pre_slot={pre_slot} walker={walker_color} \
+                                 canonical={canonical_color}",
+                                ssarepr.name,
+                            );
+                        }
+                        return (1u32, if canonical_color == walker_color { 1 } else { 0 }, 0u32);
+                    } else {
+                        return (1u32, 0u32, 1u32); // walker-only (no canonical entry)
+                    }
+                }
+                (0u32, 0u32, 0u32) // no variable bound to slot — uncounted
+            };
+            let mut stack_probed = 0u32;
+            let mut stack_match = 0u32;
+            let mut stack_walker_only = 0u32;
+            for d in 0..stack_map_len {
+                let pre_slot = (stack_base + d) as usize;
+                let walker_color = stack_slot_color_map[d as usize];
+                let (p, m, w) = probe_slot("stack", pre_slot, walker_color);
+                stack_probed += p;
+                stack_match += m;
+                stack_walker_only += w;
+            }
+            let mut local_probed = 0u32;
+            let mut local_match = 0u32;
+            let mut local_walker_only = 0u32;
+            for i in 0..nlocals {
+                let walker_color = pyre_color_for_semantic_local[i];
+                let (p, m, w) = probe_slot("local", i, walker_color);
+                local_probed += p;
+                local_match += m;
+                local_walker_only += w;
+            }
+            eprintln!(
+                "[phase4-color-diff] graph={} \
+                 stack_probed={stack_probed} stack_match={stack_match} \
+                 stack_walker_only={stack_walker_only} \
+                 local_probed={local_probed} local_match={local_match} \
+                 local_walker_only={local_walker_only}",
+                ssarepr.name,
+            );
+        }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
         // map may legitimately repeat colors (e.g. `[1, 1, 2, 3, 4, 0,
