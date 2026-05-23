@@ -1,0 +1,100 @@
+//! `PreambleOp` sentinel + `FieldEntry` enum stored inside `PtrInfo`
+//! struct/array field caches.
+//!
+//! RPython parity:
+//! - `rpython/jit/metainterp/optimizeopt/shortpreamble.py:11-49 PreambleOp`
+//! - `rpython/jit/metainterp/optimizeopt/info.py:203 setfield` —
+//!   `_fields[]` element is either a normal Box or a PreambleOp.
+//!
+//! Pure data; no metainterp deps. Hosted in `majit-ir` so the
+//! PtrInfo move that follows can reference these types without a
+//! `majit-metainterp → majit-ir` circular dep.
+
+use crate::{Op, OpRef};
+
+/// shortpreamble.py:11-49: PreambleOp
+///
+/// Wrapper stored in PtrInfo._fields during Phase 2 import.
+/// When `_getfield` (heap.py:177-187) encounters this in a field slot,
+/// it calls `force_op_from_preamble()` to lazily resolve the value
+/// via the short preamble builder.
+///
+/// RPython stores PreambleOp directly in `_fields[]` (Python's dynamic
+/// typing). Rust mirrors this with the `FieldEntry` enum stored in the
+/// same `fields` / `items` vectors.
+#[derive(Clone, Debug)]
+pub struct PreambleOp {
+    /// RPython `PreambleOp.op` — the carried Box (= `self.res` from the
+    /// short_op). For non-invented entries this is the body-visible
+    /// OpRef directly; for invented entries (CompoundOp alternates)
+    /// `op` forwards to the carried Box via `make_equal_to(source, op)`
+    /// so `get_box_replacement(op)` reaches the body-visible OpRef.
+    pub op: OpRef,
+    /// RPython: PreambleOp.invented_name
+    pub invented_name: bool,
+    /// RPython: PreambleOp.preamble_op — the actual replay operation
+    /// for the short preamble. Always present (RPython parity).
+    pub preamble_op: Op,
+}
+
+/// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
+///
+/// info.py:203 `setfield` stores either a normal Box or a PreambleOp into
+/// `_fields[]`. heap.py:177 `_getfield` checks `isinstance(res, PreambleOp)`
+/// to decide whether to force the value via the short preamble.
+///
+/// Rust equivalent: typed enum instead of Python's duck-typed list.
+#[derive(Clone, Debug)]
+pub enum FieldEntry {
+    /// Normal cached field value (info.py:203 setfield).
+    Value(OpRef),
+    /// shortpreamble.py:11 PreambleOp — sentinel stored during Phase 2 import.
+    Preamble(PreambleOp),
+}
+
+impl FieldEntry {
+    /// Extract the concrete OpRef if this is a `Value` entry.
+    /// Returns `None` for `Preamble` entries (those need special handling
+    /// via `force_op_from_preamble`).
+    pub fn as_opref(&self) -> Option<OpRef> {
+        match self {
+            FieldEntry::Value(opref) => Some(*opref),
+            FieldEntry::Preamble(_) => None,
+        }
+    }
+
+    /// Returns true if this is a `Preamble` entry.
+    pub fn is_preamble(&self) -> bool {
+        matches!(self, FieldEntry::Preamble(_))
+    }
+
+    /// Extract the `PreambleOp` if this is a `Preamble` entry.
+    pub fn as_preamble(&self) -> Option<&PreambleOp> {
+        match self {
+            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Value(_) => None,
+        }
+    }
+
+    /// View this slot the same way RPython reads `_fields[]` / `_items[]`
+    /// in non-forcing paths such as `serialize_optheap`,
+    /// `produce_short_preamble_ops`, and `_expand_infos_from_virtual`.
+    ///
+    /// Normal values return the stored OpRef. `PreambleOp` entries expose
+    /// their original Phase 1 source box (`pop.op`), matching PyPy's
+    /// `get_box_replacement(PreambleOp(...))` behavior.
+    pub fn as_seen_opref(&self) -> OpRef {
+        match self {
+            FieldEntry::Value(opref) => *opref,
+            FieldEntry::Preamble(pop) => pop.op,
+        }
+    }
+
+    /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
+    pub fn into_preamble(self) -> Option<PreambleOp> {
+        match self {
+            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Value(_) => None,
+        }
+    }
+}
