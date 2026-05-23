@@ -1246,7 +1246,7 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 /// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
 #[cfg(unix)]
 fn init_pwd(ns: &mut DictStorage) {
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
         pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new(&pw.name),
@@ -1256,6 +1256,28 @@ fn init_pwd(ns: &mut DictStorage) {
             pyre_object::w_str_new(&pw.gecos),
             pyre_object::w_str_new(&pw.dir),
             pyre_object::w_str_new(&pw.shell),
+        ])
+    }
+    // `interp_pwd.py:75-87 make_struct_passwd` libc backend, used when
+    // the host_env abstraction layer is disabled.  Mirrors the same
+    // rffi.charp2str / int construction PyPy uses.
+    #[cfg(not(feature = "host_env"))]
+    unsafe fn make_struct_passwd_libc(pw: *const libc::passwd) -> pyre_object::PyObjectRef {
+        unsafe fn cstr(p: *const libc::c_char) -> String {
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(&cstr((*pw).pw_name)),
+            pyre_object::w_str_new(&cstr((*pw).pw_passwd)),
+            pyre_object::w_int_new((*pw).pw_uid as i64),
+            pyre_object::w_int_new((*pw).pw_gid as i64),
+            pyre_object::w_str_new(&cstr((*pw).pw_gecos)),
+            pyre_object::w_str_new(&cstr((*pw).pw_dir)),
+            pyre_object::w_str_new(&cstr((*pw).pw_shell)),
         ])
     }
     // `app_pwd.py:1-21` — `pwd.struct_passwd` / `pwd.struct_pwent`.
@@ -1284,7 +1306,7 @@ fn init_pwd(ns: &mut DictStorage) {
                     }
                     Err(e) => return Err(e),
                 };
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::pwd::getpwuid(uid) {
                         Ok(Some(pw)) => return Ok(make_struct_passwd(&pw)),
@@ -1302,13 +1324,19 @@ fn init_pwd(ns: &mut DictStorage) {
                         }
                     }
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = uid;
-                    // Sandbox semantics: no host_env → no pwd database access.
-                    Err(crate::PyError::not_implemented(
-                        "pwd.getpwuid requires host_env feature",
-                    ))
+                // `interp_pwd.py:90-108` — libc fallback path; host_env
+                // is a pyre-only abstraction layer over the same
+                // getpwuid() call PyPy makes via rffi.llexternal.
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let pw = libc::getpwuid(uid);
+                    if pw.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getpwuid(): uid not found: {}",
+                            uid as i64
+                        )));
+                    }
+                    return Ok(make_struct_passwd_libc(pw));
                 }
             },
             1,
@@ -1323,14 +1351,19 @@ fn init_pwd(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getpwnam() missing argument"));
                 }
-                #[cfg(all(unix, feature = "host_env"))]
+                if !unsafe { pyre_object::is_str(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "getpwnam(): name should be a string",
+                    ));
+                }
+                let name = unsafe { pyre_object::w_str_get_value(args[0]) };
+                // `interp_pwd.py:111 @unwrap_spec(name='text0')` rejects
+                // embedded NULs.  CString::new() enforces that here.
+                let c_name = std::ffi::CString::new(name).map_err(|_| {
+                    crate::PyError::value_error("getpwnam: name must not contain NUL bytes")
+                })?;
+                #[cfg(feature = "host_env")]
                 {
-                    if !unsafe { pyre_object::is_str(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "getpwnam(): name should be a string",
-                        ));
-                    }
-                    let name = unsafe { pyre_object::w_str_get_value(args[0]) };
                     match rustpython_host_env::pwd::getpwnam(name) {
                         Some(pw) => return Ok(make_struct_passwd(&pw)),
                         None => {
@@ -1341,13 +1374,16 @@ fn init_pwd(ns: &mut DictStorage) {
                         }
                     }
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = &args;
-                    // Sandbox semantics: no host_env → no pwd database access.
-                    Err(crate::PyError::not_implemented(
-                        "pwd.getpwnam requires host_env feature",
-                    ))
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let pw = libc::getpwnam(c_name.as_ptr());
+                    if pw.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getpwnam(): name not found: {}",
+                            name
+                        )));
+                    }
+                    return Ok(make_struct_passwd_libc(pw));
                 }
             },
             1,
@@ -1359,7 +1395,7 @@ fn init_pwd(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getpwall",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(feature = "host_env")]
                 {
                     let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::pwd::getpwall()
                         .iter()
@@ -1367,12 +1403,21 @@ fn init_pwd(ns: &mut DictStorage) {
                         .collect();
                     return Ok(pyre_object::w_list_new(items));
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    // Sandbox semantics: no host_env → no pwd database access.
-                    Err(crate::PyError::not_implemented(
-                        "pwd.getpwall requires host_env feature",
-                    ))
+                // `interp_pwd.py:123-134` — setpwent / loop getpwent /
+                // endpwent.
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let mut items: Vec<pyre_object::PyObjectRef> = Vec::new();
+                    libc::setpwent();
+                    loop {
+                        let pw = libc::getpwent();
+                        if pw.is_null() {
+                            break;
+                        }
+                        items.push(make_struct_passwd_libc(pw));
+                    }
+                    libc::endpwent();
+                    return Ok(pyre_object::w_list_new(items));
                 }
             },
             0,
@@ -1390,7 +1435,7 @@ fn init_pwd(ns: &mut DictStorage) {
 /// materialisation (so `entry.gr_name` works) is blocked on the
 /// structseq framework task.
 fn init_grp(ns: &mut DictStorage) {
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         let mem_items: Vec<pyre_object::PyObjectRef> =
             g.mem.iter().map(|s| pyre_object::w_str_new(s)).collect();
@@ -1398,6 +1443,32 @@ fn init_grp(ns: &mut DictStorage) {
             pyre_object::w_str_new(&g.name),
             pyre_object::w_str_new(&g.passwd),
             pyre_object::w_int_new(g.gid as i64),
+            pyre_object::w_list_new(mem_items),
+        ])
+    }
+    // `lib_pypy/grp.py:21-34 _group_from_gstruct` libc backend, used when
+    // the host_env abstraction layer is disabled.
+    #[cfg(not(feature = "host_env"))]
+    unsafe fn make_struct_group_libc(g: *const libc::group) -> pyre_object::PyObjectRef {
+        unsafe fn cstr(p: *const libc::c_char) -> String {
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+        let mut mem_items: Vec<pyre_object::PyObjectRef> = Vec::new();
+        let mut p = (*g).gr_mem;
+        if !p.is_null() {
+            while !(*p).is_null() {
+                mem_items.push(pyre_object::w_str_new(&cstr(*p)));
+                p = p.add(1);
+            }
+        }
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(&cstr((*g).gr_name)),
+            pyre_object::w_str_new(&cstr((*g).gr_passwd)),
+            pyre_object::w_int_new((*g).gr_gid as i64),
             pyre_object::w_list_new(mem_items),
         ])
     }
@@ -1415,15 +1486,15 @@ fn init_grp(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getgrgid() missing argument"));
                 }
-                #[cfg(all(unix, feature = "host_env"))]
+                // `Modules/grpmodule.c grp_getgrgid` — accept any
+                // python int (including bigint) via int_w; reject
+                // floats as TypeError.  PyPy's `lib_pypy/grp.py`
+                // forwards directly through ctypes which would
+                // do the same conversion.
+                let val = crate::baseobjspace::int_w(args[0])?;
+                let gid = val as libc::gid_t;
+                #[cfg(feature = "host_env")]
                 {
-                    // `Modules/grpmodule.c grp_getgrgid` — accept any
-                    // python int (including bigint) via int_w; reject
-                    // floats as TypeError.  PyPy's `lib_pypy/grp.py`
-                    // forwards directly through ctypes which would
-                    // do the same conversion.
-                    let val = crate::baseobjspace::int_w(args[0])?;
-                    let gid = val as libc::gid_t;
                     match rustpython_host_env::grp::getgrgid(gid) {
                         Ok(Some(g)) => return Ok(make_struct_group(&g)),
                         Ok(None) => {
@@ -1440,12 +1511,16 @@ fn init_grp(ns: &mut DictStorage) {
                         }
                     }
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = &args;
-                    Err(crate::PyError::not_implemented(
-                        "grp.getgrgid requires host_env feature",
-                    ))
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let g = libc::getgrgid(gid);
+                    if g.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getgrgid(): gid not found: {}",
+                            gid
+                        )));
+                    }
+                    return Ok(make_struct_group_libc(g));
                 }
             },
             1,
@@ -1460,14 +1535,19 @@ fn init_grp(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getgrnam() missing argument"));
                 }
-                #[cfg(all(unix, feature = "host_env"))]
+                if !unsafe { pyre_object::is_str(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "getgrnam(): name should be a string",
+                    ));
+                }
+                let name = unsafe { pyre_object::w_str_get_value(args[0]) };
+                // Reject embedded NULs (parity with PyPy's @unwrap_spec
+                // text0 used for similar lookup APIs).
+                let c_name = std::ffi::CString::new(name).map_err(|_| {
+                    crate::PyError::value_error("getgrnam: name must not contain NUL bytes")
+                })?;
+                #[cfg(feature = "host_env")]
                 {
-                    if !unsafe { pyre_object::is_str(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "getgrnam(): name should be a string",
-                        ));
-                    }
-                    let name = unsafe { pyre_object::w_str_get_value(args[0]) };
                     match rustpython_host_env::grp::getgrnam(name) {
                         Ok(Some(g)) => return Ok(make_struct_group(&g)),
                         Ok(None) => {
@@ -1484,12 +1564,16 @@ fn init_grp(ns: &mut DictStorage) {
                         }
                     }
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = &args;
-                    Err(crate::PyError::not_implemented(
-                        "grp.getgrnam requires host_env feature",
-                    ))
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let g = libc::getgrnam(c_name.as_ptr());
+                    if g.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getgrnam(): name not found: {}",
+                            name
+                        )));
+                    }
+                    return Ok(make_struct_group_libc(g));
                 }
             },
             1,
@@ -1501,7 +1585,7 @@ fn init_grp(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getgrall",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(feature = "host_env")]
                 {
                     let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::grp::getgrall()
                         .iter()
@@ -1509,11 +1593,19 @@ fn init_grp(ns: &mut DictStorage) {
                         .collect();
                     return Ok(pyre_object::w_list_new(items));
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    Err(crate::PyError::not_implemented(
-                        "grp.getgrall requires host_env feature",
-                    ))
+                #[cfg(not(feature = "host_env"))]
+                unsafe {
+                    let mut items: Vec<pyre_object::PyObjectRef> = Vec::new();
+                    libc::setgrent();
+                    loop {
+                        let g = libc::getgrent();
+                        if g.is_null() {
+                            break;
+                        }
+                        items.push(make_struct_group_libc(g));
+                    }
+                    libc::endgrent();
+                    return Ok(pyre_object::w_list_new(items));
                 }
             },
             0,
