@@ -6,8 +6,28 @@ use pyre_object::*;
 
 #[cfg(feature = "host_env")]
 use rustpython_host_env::time as host_time;
+use std::sync::OnceLock;
+use std::time::Instant;
 #[cfg(not(feature = "host_env"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-start `Instant` used as the monotonic-clock origin whenever
+/// `clock_gettime(CLOCK_MONOTONIC)` is unavailable.  Keeping a single
+/// baseline preserves `time.monotonic()`'s non-decreasing guarantee.
+fn monotonic_baseline() -> Instant {
+    static BASELINE: OnceLock<Instant> = OnceLock::new();
+    *BASELINE.get_or_init(Instant::now)
+}
+
+fn monotonic_seconds() -> f64 {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+            return d.as_secs_f64();
+        }
+    }
+    monotonic_baseline().elapsed().as_secs_f64()
+}
 
 /// Wall-clock seconds since the unix epoch, falling back to 0 on
 /// `SystemTimeError`.  Routes through `host_env::time` when enabled.
@@ -40,20 +60,14 @@ pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// time.monotonic() → float
 ///
-/// Prefers `clock_gettime(CLOCK_MONOTONIC)` on Unix so callers see a
-/// true monotonic clock; falls back to the wall-clock duration when
-/// host_env is off or the syscall errors.
+/// Prefers `clock_gettime(CLOCK_MONOTONIC)` on Unix; otherwise reads
+/// the process-start `Instant` baseline.  `std::time::Instant` is the
+/// platform's monotonic clock on every Rust target, so the fallback
+/// preserves `time.monotonic`'s non-decreasing guarantee even when the
+/// syscall is unavailable.
 pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    #[cfg(all(unix, feature = "host_env"))]
-    {
-        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-            return Ok(floatobject::w_float_new(d.as_secs_f64()));
-        }
-    }
-    Ok(floatobject::w_float_new(
-        duration_since_epoch().as_secs_f64(),
-    ))
+    Ok(floatobject::w_float_new(monotonic_seconds()))
 }
 
 /// time.sleep(seconds)
@@ -99,20 +113,12 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// time.perf_counter() → float
 ///
-/// Same MONOTONIC-preferred path as `monotonic`; CPython documents the
-/// two as different clocks but pyre's wall-clock fallback is identical
-/// either way.
+/// Shares `monotonic_seconds()` with `time.monotonic`; the two clocks
+/// are nominally separate but pyre exposes the same monotonic source so
+/// that `perf_counter` is also non-decreasing across calls.
 pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    #[cfg(all(unix, feature = "host_env"))]
-    {
-        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-            return Ok(floatobject::w_float_new(d.as_secs_f64()));
-        }
-    }
-    Ok(floatobject::w_float_new(
-        duration_since_epoch().as_secs_f64(),
-    ))
+    Ok(floatobject::w_float_new(monotonic_seconds()))
 }
 
 /// time.clock_gettime(clk_id) → float seconds
