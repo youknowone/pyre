@@ -9554,38 +9554,51 @@ impl CodeWriter {
                 // canonical bypasses all that and uses the bare
                 // `Assembler::assemble` path.  Wrap in catch_unwind so
                 // a canonical-assembly panic surfaces but doesn't
-                // abort the production CodeWriter.  This sets the
-                // stage for canonical-derived pc_map byte translation
-                // (slice 18).
-                let mut canonical_ssarepr_clone = canonical_ssarepr.clone();
+                // abort the production CodeWriter.
+                //
+                // Slice 19: pre-register helper fn pointers on a fresh
+                // canonical `SSAReprEmitter` so descrs[0..N] align
+                // with the fn_idx values baked into canonical's
+                // `residual_call_*` Insn shapes.  Mirrors walker's
+                // `register_helper_fn_pointers(&mut assembler, cpu)`
+                // at codewriter.rs:4002.  fn_idx ordering is
+                // deterministic — the helper's static `bind(...)` call
+                // sequence produces identical descrs[i] entries on the
+                // walker emitter and the canonical emitter, so
+                // canonical's Insn references resolve.
+                let mut canonical_ssarepr_to_assemble = canonical_ssarepr.clone();
                 let canonical_num_regs = super::assembler::NumRegs {
                     int: canonical_regallocs[super::flatten::Kind::Int.index()].num_colors,
                     ref_: canonical_regallocs[super::flatten::Kind::Ref.index()].num_colors,
                     float: canonical_regallocs[super::flatten::Kind::Float.index()].num_colors,
                 };
-                let canonical_builder =
-                    majit_metainterp::jitcode::JitCodeBuilder::default();
+                let mut canonical_emitter = SSAReprEmitter::new();
+                canonical_emitter
+                    .set_name(format!("{}_canonical_probe", canonical_ssarepr.name));
+                let _ = register_helper_fn_pointers(&mut canonical_emitter, self.cpu());
+                let canonical_builder = canonical_emitter.into_builder();
                 let assembly_result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         let mut asm = super::assembler::Assembler::new();
-                        asm.assemble(
-                            &mut canonical_ssarepr_clone,
+                        let jitcode = asm.assemble(
+                            &mut canonical_ssarepr_to_assemble,
                             canonical_builder,
                             Some(canonical_num_regs),
-                        )
+                        );
+                        (jitcode, canonical_ssarepr_to_assemble)
                     }));
                 match assembly_result {
-                    Ok(_jitcode) => {
+                    Ok((_jitcode, post_assemble_ssarepr)) => {
                         eprintln!(
                             "[phase4-canonical-assemble] graph={} OK \
                              insns_pos_len={} pc_first_insn_pos_len={}",
                             ssarepr.name,
-                            canonical_ssarepr_clone
+                            post_assemble_ssarepr
                                 .insns_pos
                                 .as_ref()
                                 .map(|p| p.len())
                                 .unwrap_or(0),
-                            canonical_ssarepr_clone.pc_first_insn_pos.len(),
+                            post_assemble_ssarepr.pc_first_insn_pos.len(),
                         );
                     }
                     Err(panic) => {

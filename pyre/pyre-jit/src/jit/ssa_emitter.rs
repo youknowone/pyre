@@ -184,6 +184,16 @@ impl SSAReprEmitter {
             Self::insn_pos_to_byte_offset(&ssarepr, insn_positions.iter().copied());
         (jitcode, byte_positions)
     }
+
+    /// Consume the emitter and yield its underlying [`JitCodeBuilder`].
+    /// Used by the Phase 4 canonical-assemble probe so it can drive
+    /// [`Assembler::assemble`] directly while retaining ownership of the
+    /// canonical [`SSARepr`] (whose `insns_pos` side-table the probe
+    /// inspects post-assemble).  Production callers continue to use
+    /// `finish_with_positions_from`.
+    pub fn into_builder(self) -> JitCodeBuilder {
+        self.builder
+    }
 }
 
 impl Default for SSAReprEmitter {
