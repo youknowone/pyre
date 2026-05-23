@@ -757,6 +757,18 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
+/// Phase 4 endgame slice 4 / 5 helper.  Returns a stable opname key
+/// per insn variant so the diff probe can compare and tally across
+/// the walker / canonical streams without dragging in operand
+/// equality.
+fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
+    match insn {
+        super::flatten::Insn::Label(_) => "Label".to_string(),
+        super::flatten::Insn::Unreachable => "---".to_string(),
+        super::flatten::Insn::Op { opname, .. } => opname.clone(),
+    }
+}
+
 /// Phase 4 endgame slice 4 helper.  Tally per-opname occurrences of
 /// the given Insn slice, using `"Label"` / `"---"` for the non-`Op`
 /// variants so the resulting `Vec<(String, i64)>` is sortable and
@@ -766,11 +778,7 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64)> {
     let mut tally: Vec<(String, i64)> = Vec::new();
     for insn in insns {
-        let key = match insn {
-            super::flatten::Insn::Label(_) => "Label".to_string(),
-            super::flatten::Insn::Unreachable => "---".to_string(),
-            super::flatten::Insn::Op { opname, .. } => opname.clone(),
-        };
+        let key = phase4_insn_opname_key(insn);
         if let Some(entry) = tally.iter_mut().find(|(k, _)| k == &key) {
             entry.1 += 1;
         } else {
@@ -9207,6 +9215,41 @@ impl CodeWriter {
                     "[phase4-diff-opname] graph={} walker-only={:?} canonical-only={:?}",
                     ssarepr.name, walker_only, canonical_only,
                 );
+                // Slice 5: first-divergence position locator.  Walker
+                // and canonical streams agree on the common prefix
+                // (block label naming, initial inputarg setup); the
+                // first index where their opname tags differ is the
+                // concrete anchor for designing the next per-bench
+                // slice.  Common-prefix length is also useful: a long
+                // prefix means most of the structural divergence is
+                // tail-localised; a short prefix means divergence
+                // starts at block entry.
+                let first_div = ssarepr
+                    .insns
+                    .iter()
+                    .zip(canonical_ssarepr.insns.iter())
+                    .position(|(w, c)| {
+                        phase4_insn_opname_key(w) != phase4_insn_opname_key(c)
+                    });
+                match first_div {
+                    Some(pos) => {
+                        let w = phase4_insn_opname_key(&ssarepr.insns[pos]);
+                        let c = phase4_insn_opname_key(&canonical_ssarepr.insns[pos]);
+                        eprintln!(
+                            "[phase4-diff-firstpos] graph={} pos={pos} \
+                             walker={w:?} canonical={c:?}",
+                            ssarepr.name,
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[phase4-diff-firstpos] graph={} pos=PREFIX_MATCH \
+                             (common prefix is full overlap; tail differs by {} insns)",
+                            ssarepr.name,
+                            (canonical_len as i64 - walker_len as i64).abs(),
+                        );
+                    }
+                }
             }
         }
 
