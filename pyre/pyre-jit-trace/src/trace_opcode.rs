@@ -633,6 +633,23 @@ pub(crate) fn write_stack_slot(
 /// `GetarrayitemGcR` with a NONE base operand.
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
+    // Path 3 slice 34 (task #219): for portal frames, read the stack slot
+    // directly from the `virtualizable_boxes` shadow — PyPy-orthodox
+    // (`pyjitpl.py:1230 _opimpl_getarrayitem_vable`).  Empirical verification
+    // (slice 33, `PYRE_PATH3_VERIFY_STACK_READ`) showed zero mismatch between
+    // the vable shadow and the legacy `registers_r[reg_idx]` semantic-mirror
+    // value across 9 benches.  Routing through vable retires one dependency
+    // on the `registers_r` semantic-mirror NEW DEVIATION.
+    //
+    // Non-portal frames keep the `registers_r` lazy-fill path below — they
+    // don't own a vable shadow.  Their semantic-mirror retirement is a
+    // separate epic (Path 3 follow-up).
+    if sym.owns_virtualizable_shadow() {
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        if let Some(v) = ctx.virtualizable_box_at(nvs + semantic_idx) {
+            return v;
+        }
+    }
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -644,29 +661,6 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
         let idx_const = ctx.const_int(semantic_idx as i64);
         sym.registers_r[reg_idx] =
             trace_array_getitem_value(ctx, sym.locals_cells_stack_array_ref, idx_const);
-    }
-    // Path 3 slice 33 (task #219): verify that `registers_r[reg_idx]` matches
-    // the PyPy-orthodox `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]`
-    // shadow for portal frames.  If the two agree universally, `read_stack_slot`
-    // can route through the vable shadow and the semantic-mirror write at
-    // `write_stack_slot:584` is retire-able.  Diagnostic-only — gated on
-    // `PYRE_PATH3_VERIFY_STACK_READ=1`.
-    if std::env::var("PYRE_PATH3_VERIFY_STACK_READ").is_ok() && sym.owns_virtualizable_shadow() {
-        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-        let vable = ctx.virtualizable_box_at(nvs + semantic_idx);
-        let mirror = sym.registers_r[reg_idx];
-        match vable {
-            Some(v) if v == mirror => {}
-            Some(v) => eprintln!(
-                "[path3-verify] read_stack_slot mismatch stack_idx={} semantic={} \
-                 mirror={:?} vable={:?}",
-                stack_idx, semantic_idx, mirror, v
-            ),
-            None => eprintln!(
-                "[path3-verify] read_stack_slot vable=None stack_idx={} semantic={} mirror={:?}",
-                stack_idx, semantic_idx, mirror
-            ),
-        }
     }
     sym.registers_r[reg_idx]
 }
