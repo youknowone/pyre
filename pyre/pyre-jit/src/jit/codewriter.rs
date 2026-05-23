@@ -9516,6 +9516,37 @@ impl CodeWriter {
                      walker_pc_live_marker_pos_nonempty={walker_pc_count}",
                     ssarepr.name,
                 );
+                // Slice 16: enumerate walker-only PCs (PCs walker
+                // tracks that canonical does NOT).  walker uses py_pc
+                // as an index, so the position in
+                // `walker_pc_live_marker_pos` IS the py_pc.  canonical's
+                // covered set is the first element of each tuple in
+                // `pc_first_insn_pos`.  Walker-only PCs correspond to
+                // Python opcodes that lower to ZERO SpaceOps (NOP /
+                // CACHE / debug_merge_point / dropped-by-flowgraph
+                // ops).  At runtime, `call_jit.rs:3925-3941`'s
+                // `resolve_jitcode` returns `None` on pc_map miss and
+                // falls through to `recovery_layout` — so canonical's
+                // sparse coverage may be tolerated as-is.
+                let canonical_pcs: Vec<i64> = canonical_ssarepr
+                    .pc_first_insn_pos
+                    .iter()
+                    .map(|(pc, _)| *pc)
+                    .collect();
+                let walker_only_pcs: Vec<usize> = walker_pc_live_marker_pos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entries)| !entries.is_empty())
+                    .map(|(pc, _)| pc)
+                    .filter(|pc| !canonical_pcs.contains(&(*pc as i64)))
+                    .collect();
+                eprintln!(
+                    "[phase4-pc-walker-only] graph={} count={} \
+                     first16={:?}",
+                    ssarepr.name,
+                    walker_only_pcs.len(),
+                    walker_only_pcs.iter().take(16).collect::<Vec<_>>(),
+                );
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
