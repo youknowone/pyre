@@ -2658,6 +2658,43 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
 /// When `cpu` is `None` or `cpu.lowering_ctx` is unset, the HLOp
 /// dispatcher is disabled and pre-rtype HLOp opnames passthrough to
 /// the SSARepr — useful for tests against structural-only graphs.
+///
+/// **Phase 4 endgame status (2026-05-23, after probe slices 1-26).**
+/// This entry runs without panic on every production bench (14/14)
+/// + every synth bench (25/25), but production callers (the walker
+/// in `codewriter.rs::transform_graph_to_jitcode`) still emit
+/// SSARepr inline rather than swapping to a post-walk call here.
+/// The blocker is slot↔color divergence:
+///
+/// - Walker's SSA-side `enforce_ssarepr_input_args` pins slot
+///   `i ∈ 0..nlocals` to color `i`, plus `portal_frame_reg → color
+///   nlocals`, `portal_ec_reg → color nlocals+1`.  Walker invented
+///   this for runtime-decoder ergonomics (color N = local N for
+///   N < nlocals).
+/// - Canonical's `enforce_input_args` here pins only
+///   `graph.startblock.inputargs` to colors `0..n` per
+///   `flatten.py:88-100`.  For a function with no args (e.g.
+///   `main()` in `inline_helper.py`), startblock.inputargs holds
+///   only `[frame_var, ec_var]`, so color 0 = frame, color 1 = ec
+///   — irreconcilable with walker's "color 0 = local s".
+///
+/// Three multi-session paths to converge (see project memory
+/// `project_phase4_endgame_canonical_probe_2026_05_23`):
+///
+///   1. Extend this signature with `external_pins: &[(Variable,
+///      u16)]` so canonical can honor pyre's slot-pinned scheme
+///      as an additive parameter.
+///   2. Pyre adopts upstream-orthodox color semantics; runtime
+///      decoder switches from "color N = local N" to per-PC
+///      side-table lookups (multi-site refactor: assembler,
+///      blackhole resume, recovery_layout, stack_slot_color_map
+///      consumers).
+///   3. Full walker-emits-only-graph cutover; canonical rebuilds
+///      SSARepr + runtime decoder maps from per-PC liveness.
+///
+/// Until a structural decision is made, the production splice
+/// stays blocked and the canonical entry continues serving as a
+/// validation oracle for the walker's SSARepr.
 pub fn flatten_graph<'a>(
     graph: &super::flow::FunctionGraph,
     regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
