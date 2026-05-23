@@ -9293,6 +9293,44 @@ impl CodeWriter {
                     ssarepr.name,
                     walker_total_live as i64 - canonical_total_live as i64,
                 );
+                // Slice 7: filter out every `-live-` from BOTH streams
+                // and rerun the opname-sequence diff.  If the filtered
+                // streams agree, `-live-` is the only structural
+                // divergence and the remaining work is mechanical.
+                // If they still diverge, the new first-divergence
+                // position is the next concrete anchor.
+                let walker_filtered: Vec<String> = ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-")
+                    .collect();
+                let canonical_filtered: Vec<String> = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .map(phase4_insn_opname_key)
+                    .filter(|k| k != "-live-")
+                    .collect();
+                let filtered_first_div = walker_filtered
+                    .iter()
+                    .zip(canonical_filtered.iter())
+                    .position(|(w, c)| w != c);
+                eprintln!(
+                    "[phase4-diff-nolive] graph={} walker_len_nolive={} \
+                     canonical_len_nolive={} diff_nolive={} first_div={}",
+                    ssarepr.name,
+                    walker_filtered.len(),
+                    canonical_filtered.len(),
+                    canonical_filtered.len() as i64 - walker_filtered.len() as i64,
+                    match filtered_first_div {
+                        Some(pos) => format!(
+                            "pos={pos} walker={:?} canonical={:?}",
+                            walker_filtered[pos],
+                            canonical_filtered[pos]
+                        ),
+                        None => "PREFIX_MATCH".to_string(),
+                    },
+                );
             }
         }
 
