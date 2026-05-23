@@ -9547,6 +9547,59 @@ impl CodeWriter {
                     walker_only_pcs.len(),
                     walker_only_pcs.iter().take(16).collect::<Vec<_>>(),
                 );
+                // Slice 17: attempt to assemble canonical SSARepr to
+                // validate it produces a complete byte stream.  Walker
+                // assembles via `finalize_jitcode` (with `pc_map`
+                // translation + descr stamping + many side-effects);
+                // canonical bypasses all that and uses the bare
+                // `Assembler::assemble` path.  Wrap in catch_unwind so
+                // a canonical-assembly panic surfaces but doesn't
+                // abort the production CodeWriter.  This sets the
+                // stage for canonical-derived pc_map byte translation
+                // (slice 18).
+                let mut canonical_ssarepr_clone = canonical_ssarepr.clone();
+                let canonical_num_regs = super::assembler::NumRegs {
+                    int: canonical_regallocs[super::flatten::Kind::Int.index()].num_colors,
+                    ref_: canonical_regallocs[super::flatten::Kind::Ref.index()].num_colors,
+                    float: canonical_regallocs[super::flatten::Kind::Float.index()].num_colors,
+                };
+                let canonical_builder =
+                    majit_metainterp::jitcode::JitCodeBuilder::default();
+                let assembly_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut asm = super::assembler::Assembler::new();
+                        asm.assemble(
+                            &mut canonical_ssarepr_clone,
+                            canonical_builder,
+                            Some(canonical_num_regs),
+                        )
+                    }));
+                match assembly_result {
+                    Ok(_jitcode) => {
+                        eprintln!(
+                            "[phase4-canonical-assemble] graph={} OK \
+                             insns_pos_len={} pc_first_insn_pos_len={}",
+                            ssarepr.name,
+                            canonical_ssarepr_clone
+                                .insns_pos
+                                .as_ref()
+                                .map(|p| p.len())
+                                .unwrap_or(0),
+                            canonical_ssarepr_clone.pc_first_insn_pos.len(),
+                        );
+                    }
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("<unknown panic payload>");
+                        eprintln!(
+                            "[phase4-canonical-assemble] graph={} PANIC msg={msg:?}",
+                            ssarepr.name,
+                        );
+                    }
+                }
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
