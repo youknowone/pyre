@@ -3747,7 +3747,24 @@ impl OptContext {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
                 crate::r#box::BoxRef::new_inputarg(placeholder_type, idx as u32)
             }
-            _ => crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32),
+            _ => {
+                let p = crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32);
+                // Bind to the producing OpRc when present so `box.set_forwarded`
+                // dual-writes to `op.forwarded` (resoperation.py:233 `_forwarded`
+                // host). Searches the current phase's `new_operations` first,
+                // then cross-phase `phase1_emit_ops`. Search reaches a value
+                // for every emitted ResOp; unbound only when the producer Op
+                // has not yet been pushed (forward reference inside a pass).
+                let op_rc = self
+                    .new_operations
+                    .iter()
+                    .rfind(|op| op.pos.get() == opref)
+                    .cloned();
+                if let Some(op_rc) = op_rc {
+                    p.bind_op(&op_rc);
+                }
+                p
+            }
         };
         Some(self.box_pool.set(opref, placeholder))
     }
