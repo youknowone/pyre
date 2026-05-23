@@ -1307,6 +1307,24 @@ impl<'a> GraphFlattener<'a> {
         if self.lowering_ctx.is_some() && is_pyre_canonical_elidable_hlop(&op.opname) {
             return;
         }
+        // Phase 4 endgame slice 14: under `PYRE_PHASE4_DIFF_CANONICAL`,
+        // emit `(graph_name, op.offset, insn_pos)` for each canonical
+        // op before it lands in the stream.  Walker tracks the same
+        // mapping via `walker_pc_live_marker_pos`
+        // (codewriter.rs:4125).  Comparing the two streams confirms
+        // whether canonical-derived `pc_map` would agree with walker's
+        // for production splice — the precondition for retiring
+        // walker's pcN emission.  Default-off; only the probe path
+        // accesses the env, the production canonical entry is
+        // unchanged.
+        if std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[phase4-canonical-pc-pos] graph={} py_pc={} insn_pos={}",
+                self.ssarepr.name,
+                op.offset,
+                self.ssarepr.insns.len(),
+            );
+        }
         let insn = self.flatten_space_operation(op);
         self.emitline(insn);
     }
