@@ -4401,15 +4401,33 @@ impl MIFrame {
         None
     }
 
-    fn existing_ref_for_concrete(&self, concrete_obj: PyObjectRef) -> Option<OpRef> {
+    fn existing_ref_for_concrete(
+        &self,
+        ctx: &TraceCtx,
+        concrete_obj: PyObjectRef,
+    ) -> Option<OpRef> {
         if concrete_obj.is_null() {
             return None;
         }
         let s = self.sym();
         let total_slots = s.nlocals + s.concrete_stack.len();
+        let owns_shadow = s.owns_virtualizable_shadow();
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         for abs_idx in 0..total_slots {
             if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
-                let opref = *s.registers_r.get(abs_idx)?;
+                // Path 3 slice 37a (task #227): portal frames carry the
+                // current OpRef on `virtualizable_boxes` (`pyjitpl.py:
+                // 1230 _opimpl_getarrayitem_vable`).  The legacy
+                // `registers_r[abs_idx]` semantic mirror returns the
+                // init-symbolic seed once `store_local_value` retires
+                // the mirror write (slice 37b), so consult vable first
+                // for portal frames.
+                let opref = if owns_shadow {
+                    ctx.virtualizable_box_at(nvs + abs_idx)
+                        .unwrap_or_else(|| s.registers_r.get(abs_idx).copied().unwrap_or(OpRef::NONE))
+                } else {
+                    *s.registers_r.get(abs_idx)?
+                };
                 if opref != OpRef::NONE && self.value_type(opref) == Type::Ref {
                     return Some(opref);
                 }
@@ -5169,7 +5187,9 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
-                    if let Some(existing) = this.existing_ref_for_concrete(inner_self) {
+                    if let Some(existing) =
+                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
+                    {
                         return existing;
                     }
                     this.with_ctx(|this, ctx| {
