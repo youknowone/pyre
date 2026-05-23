@@ -156,6 +156,24 @@ impl BoxPool {
         self.inner.push(Some(value));
     }
 
+    /// Slice 8.C: bind ResOp boxes to their matching `OpRc` so subsequent
+    /// `BoxRef::set_forwarded_*` calls dual-write through to `Op.forwarded`.
+    /// `num_inputargs` is the count of InputArg boxes at the head of the
+    /// pool — ResOp boxes occupy `box_pool[num_inputargs..]` and correspond
+    /// 1:1 to `ops[i - num_inputargs]`.
+    pub fn bind_ops(&self, num_inputargs: usize, ops: &[majit_ir::OpRc]) {
+        for (pool_idx, box_opt) in self.inner.iter().enumerate().skip(num_inputargs) {
+            if let Some(boxref) = box_opt {
+                let op_idx = pool_idx - num_inputargs;
+                if let Some(op) = ops.get(op_idx) {
+                    if boxref.is_resop() {
+                        boxref.bind_op(op);
+                    }
+                }
+            }
+        }
+    }
+
     /// Drop trailing entries until `len() <= new_len`. Mirrors PyPy
     /// recorder savepoint rollback (`recorder.py savepoint.restore`).
     pub fn truncate(&mut self, new_len: usize) {

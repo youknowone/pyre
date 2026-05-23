@@ -23,12 +23,12 @@
 //!   variant: RPython stores everything in a single `_forwarded` slot.
 
 use std::cell::{Cell, Ref, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
-use crate::resoperation::VectorizationInfo;
+use crate::resoperation::{Op, VectorizationInfo};
 use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
@@ -59,6 +59,18 @@ pub struct Box {
     /// Const boxes ignore this slot; their value lives in
     /// `BoxKind::Const { value, .. }` instead.
     pub value: Cell<Option<Value>>,
+
+    /// Slice 8.C dual-write backref to the `Op` this Box stands in for.
+    /// `Weak` to avoid an Rc cycle (Op.forwarded may carry a `BoxRef`
+    /// holding an `Rc<Box>` whose `op_handle` could otherwise loop back
+    /// through the trace). Empty for `BoxKind::InputArg` / `Const`
+    /// (those have their own backref strategy or no Op counterpart);
+    /// for `BoxKind::ResOp` it is filled by `BoxRef::bind_op` at the
+    /// recorder→TreeLoop handoff. When `Some`, `set_forwarded_box` /
+    /// `set_forwarded_info` / `clear_forwarded` also write through to
+    /// `op.forwarded`, establishing the Slice 8.D invariant
+    /// `Box.forwarded == op.forwarded`.
+    pub op_handle: RefCell<Option<Weak<Op>>>,
 }
 
 /// Enum mirror of the PyPy class hierarchy.
@@ -150,6 +162,7 @@ impl BoxRef {
                 position: std::cell::Cell::new(position),
             },
             value: Cell::new(None),
+            op_handle: RefCell::new(None),
         }))
     }
 
@@ -160,6 +173,7 @@ impl BoxRef {
             type_,
             kind: BoxKind::InputArg { position },
             value: Cell::new(None),
+            op_handle: RefCell::new(None),
         }))
     }
 
@@ -176,6 +190,7 @@ impl BoxRef {
                 const_index: None,
             },
             value: Cell::new(None),
+            op_handle: RefCell::new(None),
         }))
     }
 
@@ -193,7 +208,21 @@ impl BoxRef {
                 const_index: Some(const_index),
             },
             value: Cell::new(None),
+            op_handle: RefCell::new(None),
         }))
+    }
+
+    /// Slice 8.C: bind this Box to its corresponding `Op` so subsequent
+    /// `set_forwarded_*` / `clear_forwarded` calls dual-write through to
+    /// `op.forwarded`. Stores a `Weak<Op>` to avoid an Rc cycle. Called by
+    /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
+    /// if called on a non-ResOp Box.
+    pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
+        debug_assert!(
+            matches!(&self.0.kind, BoxKind::ResOp { .. }),
+            "BoxRef::bind_op only valid for ResOp boxes"
+        );
+        *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
     /// Extract the `const_index` field for chain-walker reconstruction.
@@ -279,7 +308,8 @@ impl BoxRef {
             "set_forwarded_box on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        *self.0.forwarded.borrow_mut() = Forwarded::Box(target);
+        let next = Forwarded::Box(target);
+        self.write_forwarded(next);
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
@@ -292,7 +322,8 @@ impl BoxRef {
             "set_forwarded_info on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        *self.0.forwarded.borrow_mut() = Forwarded::Info(info);
+        let next = Forwarded::Info(info);
+        self.write_forwarded(next);
     }
 
     /// `schedule.py:20-28 forwarded_vecinfo` — set the per-op vectorizer
@@ -346,7 +377,20 @@ impl BoxRef {
         if matches!(self.0.kind, BoxKind::Const { .. }) {
             return;
         }
-        *self.0.forwarded.borrow_mut() = Forwarded::None;
+        self.write_forwarded(Forwarded::None);
+    }
+
+    /// Slice 8.C dual-write helper: write `Box.forwarded` and, when an
+    /// `Op` is bound via `bind_op`, also write `op.forwarded` so the
+    /// invariant `Box.forwarded == op.forwarded` holds for every reader.
+    /// `clone()` is one `Rc` bump per variant; cheap.
+    fn write_forwarded(&self, value: Forwarded) {
+        if let Some(weak) = self.0.op_handle.borrow().as_ref() {
+            if let Some(op) = weak.upgrade() {
+                *op.forwarded.borrow_mut() = value.clone();
+            }
+        }
+        *self.0.forwarded.borrow_mut() = value;
     }
 
     /// `resoperation.py:57-68 get_box_replacement(not_const=False)`.
@@ -890,5 +934,57 @@ mod tests {
         let a = BoxRef::new_resop(Type::Ref, 0);
         a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
         assert!(a.int_bound_mut().is_none());
+    }
+
+    /// Slice 8.C: after `bind_op`, `set_forwarded_*` dual-writes through
+    /// to `op.forwarded`, so a reader on `op.forwarded` sees the same
+    /// state as `box.get_forwarded()`.
+    #[test]
+    fn bind_op_makes_set_forwarded_dual_write_to_op() {
+        use crate::resoperation::{Op, OpCode};
+        let op = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+        let b = BoxRef::new_resop(Type::Int, 0);
+        b.bind_op(&op);
+
+        // Initially both are Forwarded::None.
+        assert!(matches!(*b.get_forwarded(), Forwarded::None));
+        assert!(matches!(*op.forwarded.borrow(), Forwarded::None));
+
+        // set_forwarded_info → both slots updated.
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
+        assert!(matches!(*b.get_forwarded(), Forwarded::Info(_)));
+        assert!(matches!(*op.forwarded.borrow(), Forwarded::Info(_)));
+
+        // clear_forwarded → both slots reset.
+        b.clear_forwarded();
+        assert!(matches!(*b.get_forwarded(), Forwarded::None));
+        assert!(matches!(*op.forwarded.borrow(), Forwarded::None));
+
+        // set_forwarded_box → both slots carry the target.
+        let target = BoxRef::new_resop(Type::Int, 1);
+        b.set_forwarded_box(target.clone());
+        match (&*b.get_forwarded(), &*op.forwarded.borrow()) {
+            (Forwarded::Box(box_target), Forwarded::Box(op_target)) => {
+                assert_eq!(box_target, op_target);
+            }
+            _ => panic!("expected Forwarded::Box on both slots"),
+        }
+    }
+
+    /// `bind_op` stores `Weak<Op>`; once the `Rc<Op>` is dropped, the
+    /// dual-write becomes a no-op (Weak::upgrade returns None) without
+    /// panicking. Slice 8.C safety net.
+    #[test]
+    fn dropped_op_makes_dual_write_a_noop() {
+        use crate::resoperation::{Op, OpCode};
+        let b = BoxRef::new_resop(Type::Int, 0);
+        {
+            let op = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+            b.bind_op(&op);
+            // op drops here.
+        }
+        // Dual-write target is gone; set_forwarded should not panic.
+        b.set_forwarded_info(OpInfo::Unknown);
+        assert!(matches!(*b.get_forwarded(), Forwarded::Info(_)));
     }
 }

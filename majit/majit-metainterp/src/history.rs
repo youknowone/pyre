@@ -111,9 +111,11 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        let ops: Vec<OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            ops,
             snapshots,
             box_pool,
         }
@@ -131,6 +133,7 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
             ops,
