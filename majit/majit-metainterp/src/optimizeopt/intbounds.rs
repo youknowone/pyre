@@ -3389,11 +3389,7 @@ mod tests {
             }
         }
 
-        let result: Vec<Op> = ctx
-            .new_operations
-            .iter()
-            .map(|rc| (**rc).clone())
-            .collect();
+        let result: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
         let _ = pass;
         (result, ctx)
     }

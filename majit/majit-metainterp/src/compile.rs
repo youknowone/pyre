@@ -251,7 +251,7 @@ impl<'a> CompileData<'a> {
         Self { trace }
     }
 
-    pub fn inputargs(&self) -> &'a [InputArg] {
+    pub fn inputargs(&self) -> &'a [majit_ir::InputArgRc] {
         &self.trace.inputargs
     }
 

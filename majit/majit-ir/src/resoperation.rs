@@ -1073,6 +1073,12 @@ pub struct Op {
 }
 
 impl Clone for Op {
+    /// Cloning produces a fresh-identity `Op`. The `_forwarded` slot
+    /// (`resoperation.py:233-242 AbstractResOpOrInputArg._forwarded`) is
+    /// per-instance mutable state tied to that identity, and RPython
+    /// resets it for every newly-constructed `ResOperation`
+    /// (`resoperation.py:243-247 __init__`). Preserve identity-shared
+    /// forwarding via `Rc::clone` on `OpRc` instead.
     fn clone(&self) -> Self {
         Op {
             opcode: self.opcode,
@@ -1086,7 +1092,7 @@ impl Clone for Op {
             // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
             // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
-            forwarded: std::cell::RefCell::new(self.forwarded.borrow().clone()),
+            forwarded: std::cell::RefCell::new(Forwarded::None),
         }
     }
 }

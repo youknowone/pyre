@@ -2191,7 +2191,19 @@ impl OptContext {
         // side-table entry is gone; its Box.type invariant survives as
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
-        self.new_operations.push(std::rc::Rc::new(op));
+        let op_pos = op.pos.get();
+        let op_rc = std::rc::Rc::new(op);
+        // Catch up any unbound BoxRef placeholder that ensure_box created
+        // for `op_pos` ahead of this emit (forward-reference path).
+        // resoperation.py:233 `_forwarded` lives on the operation object;
+        // late binding establishes that connection so subsequent
+        // `box.set_forwarded` reaches `op.forwarded`.
+        if let Some(b) = self.box_pool.get(op_pos) {
+            if b.bound_op().is_none() && b.is_resop() {
+                b.bind_op(&op_rc);
+            }
+        }
+        self.new_operations.push(op_rc);
         pos_ref
     }
 

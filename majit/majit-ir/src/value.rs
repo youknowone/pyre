@@ -253,11 +253,15 @@ pub struct InputArg {
 }
 
 impl Clone for InputArg {
+    /// Cloning produces a fresh-identity `InputArg`. The `_forwarded`
+    /// slot (`resoperation.py:700 AbstractInputArg._forwarded`) is
+    /// per-instance mutable state tied to that identity. Preserve
+    /// identity-shared forwarding via `Rc::clone` on `InputArgRc`.
     fn clone(&self) -> Self {
         InputArg {
             tp: self.tp,
             index: self.index,
-            forwarded: std::cell::RefCell::new(self.forwarded.borrow().clone()),
+            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
         }
     }
 }
@@ -317,6 +321,16 @@ impl InputArg {
         crate::resoperation::OpRef::input_arg_typed(self.index, self.tp)
     }
 }
+
+/// Shared `InputArg` identity (resoperation.py:700 `AbstractInputArg`).
+///
+/// PyPy's `inputargs` list holds Python objects that are reachable
+/// unchanged from `TreeLoop.inputargs`, the optimizer's exported state,
+/// the short preamble, resume metadata, and the backend's regalloc
+/// surface. Pyre matches that shape by wrapping every `InputArg` in
+/// `Rc` so all consumers traffic in the same identity and observe the
+/// same `_forwarded` slot via `inputarg.forwarded`.
+pub type InputArgRc = std::rc::Rc<InputArg>;
 
 /// Limit on the number of fail arguments per guard.
 ///

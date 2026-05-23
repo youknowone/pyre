@@ -276,11 +276,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
-    let ops_view: Vec<Op> = ctx
-        .new_operations
-        .iter()
-        .map(|rc| (**rc).clone())
-        .collect();
+    let ops_view: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
     let live_positions = live_runtime_positions(&ops_view);
 
     for (idx, b) in ctx.box_pool.iter_indexed() {
@@ -3031,11 +3027,7 @@ impl Optimizer {
 
         // Export newly-discovered constants back to the caller's map.
         merge_backend_constants_from_ctx(&ctx, constants);
-        let new_ops_view: Vec<Op> = ctx
-            .new_operations
-            .iter()
-            .map(|rc| (**rc).clone())
-            .collect();
+        let new_ops_view: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
         sanitize_backend_constants_for_ops(&new_ops_view, constants);
 
         // Preserve final context for jump_to_existing_trace.

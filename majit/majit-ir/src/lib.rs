@@ -44,9 +44,9 @@ pub use resoperation::{
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn,
-    StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot, set_str_resolver,
-    set_unicode_resolver,
+    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc,
+    JitDriverVar, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot,
+    set_str_resolver, set_unicode_resolver,
 };
 pub use vec_assoc::VecAssoc;
 pub use vec_set::VecSet;

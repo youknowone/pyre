@@ -217,11 +217,19 @@ impl BoxRef {
     /// `op.forwarded`. Stores a `Weak<Op>` to avoid an Rc cycle. Called by
     /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
     /// if called on a non-ResOp Box.
+    ///
+    /// Late-binding carry-over: at bind time the `Box`'s forwarded state
+    /// becomes the source of truth for the bound `Op`. Copy `Box.forwarded`
+    /// into `op.forwarded` unconditionally — including when the box is
+    /// `Forwarded::None` — so any stale forwarding the `OpRc` happened to
+    /// carry (e.g. from a clone path) is overwritten and post-bind
+    /// `get_forwarded` reads exactly what the writer set.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
         debug_assert!(
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
             "BoxRef::bind_op only valid for ResOp boxes"
         );
+        *op.forwarded.borrow_mut() = self.0.forwarded.borrow().clone();
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 

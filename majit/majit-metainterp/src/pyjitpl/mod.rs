@@ -4749,11 +4749,11 @@ impl<M: Clone> MetaInterp<M> {
         // root inputarg types. RPython has no synthetic recovery when this
         // is absent; abort compilation so the caller falls back to the
         // interpreter instead of synthesizing Int-padded InputArgs.
-        let root_inputargs = if retried_without_unroll {
+        let root_inputargs: Vec<InputArg> = if retried_without_unroll {
             // compile.py:233 compile_simple_loop: loop.inputargs is the
             // original trace inputargs. There is no ExportedState on the
             // simple path.
-            trace.inputargs.clone()
+            trace.inputargs.iter().map(|rc| (**rc).clone()).collect()
         } else {
             match unroll_opt
                 .final_exported_state
@@ -6287,7 +6287,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs = trace.inputargs.clone();
+        let mut inputargs: Vec<InputArg> =
+            trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
         // the optimizer may unbox Int-typed locals. Read the first guard's
@@ -6387,11 +6388,13 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
+                let trace_inputargs_view: Vec<InputArg> =
+                    trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
                     trace_id,
-                    &trace.inputargs,
+                    &trace_inputargs_view,
                     trace_info.as_ref(),
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
@@ -6407,7 +6410,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs.clone(),
+                        inputargs: trace.inputargs.iter().map(|rc| (**rc).clone()).collect(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -6647,7 +6650,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs = trace.inputargs.clone();
+        let mut inputargs: Vec<InputArg> =
+            trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
@@ -6745,11 +6749,13 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
+                let trace_inputargs_view: Vec<InputArg> =
+                    trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
                     trace_id,
-                    &trace.inputargs,
+                    &trace_inputargs_view,
                     trace_info.as_ref(),
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
@@ -6765,7 +6771,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs.clone(),
+                        inputargs: trace.inputargs.iter().map(|rc| (**rc).clone()).collect(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,

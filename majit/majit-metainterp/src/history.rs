@@ -38,7 +38,14 @@ impl TreeLoopCutPosition {
 #[derive(Clone, Debug)]
 pub struct TreeLoop {
     /// Input arguments to the trace (loop header variables).
-    pub inputargs: Vec<InputArg>,
+    ///
+    /// `history.py:528` `# self.inputargs = list of InputArg` —
+    /// PyPy's `TreeLoop.inputargs` holds Python references shared by
+    /// identity with the recorder, optimizer exported state, short
+    /// preamble, resume metadata, and backend regalloc. Pyre wraps
+    /// each `InputArg` in `Rc` so every consumer observes the same
+    /// `_forwarded` slot.
+    pub inputargs: Vec<majit_ir::InputArgRc>,
     /// The recorded operations, in execution order.
     ///
     /// `history.py:528` `# self.operations = list of ResOperations` —
@@ -80,7 +87,7 @@ impl TreeLoop {
     /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
-            inputargs,
+            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots: Vec::new(),
             box_pool: crate::r#box::BoxPool::new(),
@@ -94,7 +101,7 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
     ) -> Self {
         TreeLoop {
-            inputargs,
+            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
             box_pool: crate::r#box::BoxPool::new(),
@@ -111,6 +118,8 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        let inputargs: Vec<majit_ir::InputArgRc> =
+            inputargs.into_iter().map(std::rc::Rc::new).collect();
         let ops: Vec<OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
@@ -133,6 +142,8 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
         box_pool: crate::r#box::BoxPool,
     ) -> Self {
+        let inputargs: Vec<majit_ir::InputArgRc> =
+            inputargs.into_iter().map(std::rc::Rc::new).collect();
         box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
