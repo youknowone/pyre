@@ -6442,9 +6442,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         while !self.done_reading() {
             // resume.py:1338-1340 read_jitcode_pos_pc.
             let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
-            let Some((jitcode, resolved_pc, op_live)) =
-                resolve_jitcode(jitcode_pos, pc)
-            else {
+            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
                 return false;
             };
             // `blackhole.rs:1435 get_current_position_info` parity —

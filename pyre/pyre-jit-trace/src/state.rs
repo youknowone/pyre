@@ -768,7 +768,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             None => return 0,
         };
         let payload = &jc.payload;
-        let resolved_jit_pc: Option<usize> = payload.metadata.pc_map.get(pc as usize).copied();
+        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
@@ -978,7 +978,7 @@ pub fn frame_liveness_reg_indices_by_bank_at(
                 float: Vec::new(),
             };
         }
-        let resolved_jit_pc: Option<usize> = payload.metadata.pc_map.get(pc as usize).copied();
+        let resolved_jit_pc: Option<usize> = payload.resume_jitcode_pc_for(pc as usize);
         let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };
@@ -5217,10 +5217,8 @@ impl JitState for PyreJitState {
         // a single `registers_X` vector by abstract register color —
         // there is no `idx < nlocals` decode.
         let frame0 = &resume_data.frames[0];
-        let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_at(
-            frame0.jitcode_index,
-            frame0.pc,
-        );
+        let reg_indices =
+            crate::state::frame_liveness_reg_indices_by_bank_at(frame0.jitcode_index, frame0.pc);
         let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
@@ -5802,7 +5800,7 @@ impl JitState for PyreJitState {
                 }
                 return true;
             }
-            let Some(&jit_pc) = payload.metadata.pc_map.get(live_pc) else {
+            let Some(jit_pc) = payload.resume_jitcode_pc_for(live_pc) else {
                 return false;
             };
             let all_liveness = liveness_info_snapshot();

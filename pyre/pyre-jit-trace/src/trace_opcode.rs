@@ -1209,7 +1209,10 @@ impl MIFrame {
                 // stack can hold an OpRef before the kind bank has been
                 // populated, so collect every listed bank/index and complete
                 // the matching bank immediately before the direct snapshot.
-                let jit_pc = jc.payload.metadata.pc_map[live_pc];
+                let jit_pc = jc
+                    .payload
+                    .resume_jitcode_pc_for(live_pc)
+                    .expect("pc_map non-empty branch above ensures lookup hits");
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
                 let all_liveness = crate::state::liveness_info_snapshot();
@@ -1665,10 +1668,7 @@ impl MIFrame {
         // contract (`all_liveness` byte layout).
         let jit_pc = jc
             .payload
-            .metadata
-            .pc_map
-            .get(live_pc)
-            .copied()
+            .resume_jitcode_pc_for(live_pc)
             .unwrap_or_else(|| {
                 panic!(
                     "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",

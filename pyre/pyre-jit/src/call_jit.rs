@@ -3968,7 +3968,7 @@ pub fn cranelift_resumedata_deopt(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let resolved_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        let resolved_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
         Some((pyjitcode.jitcode.clone(), resolved_pc, op_live))
     };
 

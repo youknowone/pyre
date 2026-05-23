@@ -633,10 +633,7 @@ pub(crate) fn build_guard_metadata(
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
                 for frame in frames.iter() {
-                    builder.push_frame(
-                        frame.jitcode_index,
-                        frame.pc as u64,
-                    );
+                    builder.push_frame(frame.jitcode_index, frame.pc as u64);
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
                         add_slot(&mut builder, slot_idx, val);

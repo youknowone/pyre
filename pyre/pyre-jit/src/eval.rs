@@ -6859,10 +6859,8 @@ mod tests {
     ) -> (usize, Vec<u32>) {
         let live_by_pc: Vec<(usize, Vec<u32>)> = (0..code.instructions.len())
             .map(|pc| {
-                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
-                    jitcode_index,
-                    pc as i32,
-                );
+                let live =
+                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
                 (pc, live)
             })
             .collect();

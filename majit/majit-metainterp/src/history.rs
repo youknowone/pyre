@@ -1899,10 +1899,7 @@ impl TraceCtx {
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
     /// `resume.rs:1898 _number_boxes`).
-    pub fn capture_snapshot_for_last_guard_multi_frame(
-        &mut self,
-        frames: &[(u32, u32, &[OpRef])],
-    ) {
+    pub fn capture_snapshot_for_last_guard_multi_frame(&mut self, frames: &[(u32, u32, &[OpRef])]) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
             .map(|(jitcode_index, py_pc, boxes)| {
