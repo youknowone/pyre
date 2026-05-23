@@ -9472,6 +9472,30 @@ impl CodeWriter {
                     c_links as i64 - w_links as i64,
                     c_other as i64 - w_other as i64,
                 );
+                // Slice 13: for each canonical `link<N>` Label, dump
+                // the opname of the next ~3 instructions.  Tests
+                // whether canonical's per-link trampolines are bare
+                // (Label + goto, elidable) or carry ref_copy chains
+                // (insert_renamings sites — walker's inline
+                // insert_renamings is the structural equivalent).
+                for (idx, insn) in canonical_ssarepr.insns.iter().enumerate() {
+                    if let super::flatten::Insn::Label(l) = insn {
+                        if l.name.starts_with("link") {
+                            let follow: Vec<String> = canonical_ssarepr
+                                .insns
+                                .iter()
+                                .skip(idx + 1)
+                                .take(3)
+                                .map(phase4_insn_opname_key)
+                                .collect();
+                            eprintln!(
+                                "[phase4-canonical-link-tail] graph={} \
+                                 label={} follow={:?}",
+                                ssarepr.name, l.name, follow,
+                            );
+                        }
+                    }
+                }
                 // Slice 9: windowed dump around the double-filtered
                 // first-divergence — 5 positions before, 10 after.
                 // Helps see whether walker's vable-accessor extras are
