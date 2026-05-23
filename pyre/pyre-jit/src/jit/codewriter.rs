@@ -9806,8 +9806,9 @@ impl CodeWriter {
                             eprintln!(
                                 "[phase4-color-mismatch] graph={} kind={label} \
                                  pre_slot={pre_slot} walker={walker_color} \
-                                 canonical={canonical_color}",
+                                 canonical={canonical_color} var={}",
                                 ssarepr.name,
+                                var_id,
                             );
                         }
                         return (1u32, if canonical_color == walker_color { 1 } else { 0 }, 0u32);
