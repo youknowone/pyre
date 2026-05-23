@@ -29,6 +29,21 @@ use crate::pyjitpl::counters;
 /// `self.t1` + `self.current` from `jitprof.py:56,60`.  Kept behind a
 /// `Mutex` on the owning [`JitProfiler`] so the GIL-protected
 /// list/scalar pair in upstream becomes a critical section here.
+///
+/// **Single-thread contract.**  PyPy's GIL serialises every
+/// `_start`/`_end` call, so `current` behaves as a strict LIFO stack
+/// with no cross-thread interleaving.  Pyre cannot rely on GIL —
+/// every `JitProfiler` is shared via `Arc` and JIT operations may
+/// touch the same profiler from multiple worker threads.  The
+/// `Mutex` only protects each individual `_start`/`_end` push/pop;
+/// between calls the lock is released, so two threads opening
+/// overlapping scopes would interleave the stack and trip
+/// `BROKEN PROFILER DATA!` on the second drop.  Callers MUST
+/// serialise profiler `start_*`/`end_*` at a higher level (typically
+/// by holding a JIT-wide lock); the [`owner_thread`] field below
+/// catches accidental sharing in debug builds.
+///
+/// [`owner_thread`]: TimingState::owner_thread
 #[derive(Default, Debug)]
 struct TimingState {
     /// `self.t1` (`jitprof.py:56`) — timer baseline for the next
@@ -38,6 +53,15 @@ struct TimingState {
     /// entry is a `Counters.*` id matching the matching `_start(event)`
     /// push at `jitprof.py:81`.
     current: Vec<i32>,
+    /// Set to the thread that first pushes onto an empty stack; cleared
+    /// once the stack drains back to empty.  Same-thread re-entry is
+    /// fine (the GIL-equivalent invariant only requires serialisation,
+    /// not single-thread exclusivity across the profiler lifetime); a
+    /// `_start`/`_end` from a *different* thread while the stack is
+    /// non-empty trips a debug-build panic.  Detects the cross-thread
+    /// interleaving bug at the point it would corrupt state instead of
+    /// at the later `BROKEN PROFILER DATA!` mismatch.
+    owner_thread: Option<std::thread::ThreadId>,
 }
 
 /// jitprof.py:52-122 `Profiler` — every `Counters.*` slot is one
@@ -469,6 +493,7 @@ impl JitProfiler {
         //   self.current.append(event)
         let now = Instant::now();
         let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+        check_or_claim_owner_thread(&mut state, "start_event");
         if let (Some(t1), Some(&top_event)) = (state.t1, state.current.last()) {
             self.add_time(top_event, now.saturating_duration_since(t1));
         }
@@ -494,6 +519,7 @@ impl JitProfiler {
         let t0;
         {
             let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+            check_or_claim_owner_thread(&mut state, "end_event");
             t0 = state.t1;
             state.t1 = Some(now);
             let Some(ev1) = state.current.pop() else {
@@ -501,6 +527,11 @@ impl JitProfiler {
                 return;
             };
             popped_event = ev1;
+            // Drained back to empty — release ownership so the next
+            // `start_event`/`end_event` from any thread can claim it.
+            if state.current.is_empty() {
+                state.owner_thread = None;
+            }
         }
         if popped_event != event {
             crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
@@ -664,6 +695,36 @@ fn is_cpu_tracker_kind(kind: i32) -> bool {
 ///     return getattr(self.cpu.tracker, Counters.counter_names[num])
 /// ```
 ///
+/// Enforce the single-thread contract documented on [`TimingState`]:
+/// once a thread has pushed onto the empty stack, only that thread
+/// may push/pop until the stack drains back to empty.  Same-thread
+/// re-entry (nested `start_event`/`end_event` on one thread) is
+/// fine; a *different* thread arriving while `owner_thread.is_some()`
+/// would interleave the LIFO stack and trip the `BROKEN PROFILER
+/// DATA!` mismatch detector later.
+///
+/// Debug builds panic immediately with the offending caller name so
+/// the cross-thread bug is visible at the actual misuse site.
+/// Release builds skip the check (the caller is expected to
+/// serialise profiler operations at a higher level, matching PyPy's
+/// GIL-equivalent invariant).
+fn check_or_claim_owner_thread(state: &mut TimingState, caller: &'static str) {
+    if cfg!(debug_assertions) {
+        let here = std::thread::current().id();
+        match state.owner_thread {
+            None => state.owner_thread = Some(here),
+            Some(existing) if existing == here => {}
+            Some(existing) => {
+                panic!(
+                    "JitProfiler {caller} from thread {here:?} while stack is owned by \
+                     {existing:?}; profiler operations must be serialised at the caller \
+                     (see TimingState single-thread contract)"
+                );
+            }
+        }
+    }
+}
+
 /// Caller must restrict `kind` to the four `TOTAL_*` ids
 /// ([`is_cpu_tracker_kind`]); any other id panics on both debug and
 /// release builds, matching the `assert!` strictness of
@@ -804,6 +865,60 @@ mod tests {
                 "kind {kind} did not land in the expected atomic field",
             );
         }
+    }
+
+    #[test]
+    fn start_end_on_one_thread_drains_owner_thread_for_the_next_caller() {
+        // `TimingState.owner_thread` is set on the first push into an
+        // empty stack and cleared when the stack drains back to empty.
+        // Subsequent callers (from any thread) must be able to claim
+        // ownership again — otherwise normal sequential use across
+        // worker threads would trip the cross-thread check.
+        let prof = JitProfiler::default();
+        prof.start();
+        prof.start_tracing();
+        prof.end_tracing();
+        // Stack is now empty; a fresh start from another thread (or
+        // the same thread) must succeed.
+        let prof_arc = Arc::new(prof);
+        let prof_clone = Arc::clone(&prof_arc);
+        std::thread::spawn(move || {
+            prof_clone.start_backend();
+            prof_clone.end_backend();
+        })
+        .join()
+        .expect("worker should complete without panic");
+        // Bookkeeping shows both events landed.
+        let snap = prof_arc.snapshot();
+        assert_eq!(snap.tracing, 1);
+        assert_eq!(snap.backend, 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "JitProfiler")]
+    fn cross_thread_start_event_while_stack_owned_panics_in_debug() {
+        // The owner_thread guard exists to catch the cross-thread
+        // interleaving bug the previous Mutex-only design hid: thread
+        // A opens TRACING, thread B opens BACKEND, then A drops first
+        // and pops B's BACKEND (mismatch → BROKEN PROFILER DATA).
+        // Detect the bug at the second thread's push instead.
+        let prof = Arc::new(JitProfiler::default());
+        prof.start();
+        prof.start_tracing();
+        let prof_clone = Arc::clone(&prof);
+        let join = std::thread::spawn(move || {
+            prof_clone.start_backend();
+        });
+        // The worker thread's `start_backend` must panic on the owner
+        // check.  Surface the panic to the test thread.
+        let result = join.join();
+        assert!(result.is_err(), "cross-thread push should panic in debug");
+        // Drain on this thread so the panic doesn't leak owner_thread
+        // (irrelevant for assertion shape but keeps the profiler
+        // structurally tidy for any downstream code).
+        prof.end_tracing();
+        panic!("JitProfiler cross-thread check fired (expected by #[should_panic])");
     }
 
     #[test]

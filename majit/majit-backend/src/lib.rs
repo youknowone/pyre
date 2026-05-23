@@ -29,13 +29,14 @@ use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 /// relationship between bumps and snapshots.
 #[derive(Default, Debug)]
 pub struct CpuTotalTracker {
-    /// `model.py:9` `total_compiled_loops` — bumped by
-    /// [`record_compiled_loop_token`] at each backend's `compile_loop`
-    /// entry (PyPy `x86/assembler.py:514` parity).  The bump used to
-    /// live in [`CompiledLoopToken::new`] but moved because pyre
-    /// eagerly creates the CLT in `JitCellToken::new`, which would
-    /// over-count tokens that are allocated but never assembled
-    /// (the `register_pending_target` path is one such caller).
+    /// `model.py:9` `total_compiled_loops` — bumped once by
+    /// [`record_compiled_loop_token`] for each [`CompiledLoopToken`],
+    /// at backend `compile_loop` entry (PyPy `x86/assembler.py:514`
+    /// parity).  The bump used to live in [`CompiledLoopToken::new`]
+    /// but moved because pyre eagerly creates the CLT in
+    /// `JitCellToken::new`, which would over-count tokens that are
+    /// allocated but never assembled (the `register_pending_target`
+    /// path is one such caller).
     pub total_compiled_loops: AtomicUsize,
     /// `model.py:10` `total_compiled_bridges` — bumped by
     /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
@@ -950,6 +951,18 @@ pub struct CompiledLoopToken {
     /// `CALL_ASSEMBLER` uses in `handle_call_assembler`
     /// (rewrite.py:673) to spill callee arguments.
     pub _ll_initial_locs: parking_lot::Mutex<Vec<i32>>,
+    /// Pyre-only one-shot latch for the side effects PyPy performs in
+    /// `CompiledLoopToken.__init__` (`model.py:296-307`): increment
+    /// `cpu.tracker.total_compiled_loops` and emit the
+    /// `jit-mem-looptoken-alloc` log section.
+    ///
+    /// PyPy creates the CLT inside backend `assemble_loop`, so the
+    /// constructor side effects are naturally tied to actual assembly.
+    /// Pyre creates `CompiledLoopToken` eagerly with `JitCellToken`;
+    /// this latch lets `record_compiled_loop_token` fire at backend
+    /// assembly time while preserving PyPy's strict "once per CLT"
+    /// semantics if a caller retries `compile_loop` with the same token.
+    loop_allocation_recorded: AtomicBool,
 }
 
 /// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
@@ -963,14 +976,18 @@ pub struct CompiledLoopToken {
 /// `backend.compile_loop` (the `register_pending_target` path in
 /// `dynasm/runner.rs` is one such caller).
 ///
-/// Each backend's `compile_loop` calls this helper as its first act so
-/// the bump fires at the same structural point PyPy does, matching
-/// `Profiler.get_counter(TOTAL_COMPILED_LOOPS)` line-for-line.  The
-/// caller passes its own [`CpuTotalTracker`] (via
+/// Each backend's `compile_loop` calls this helper as its first act.
+/// The helper records at most once per [`CompiledLoopToken`], matching
+/// PyPy's constructor side effect even if a Rust caller retries
+/// `compile_loop` with the same token.  The caller passes its own
+/// [`CpuTotalTracker`] (via
 /// [`Backend::cpu_tracker`]) so multiple backend instances in the
 /// same process keep separate totals — matching PyPy's per-CPU
 /// `cpu.tracker`.
 pub fn record_compiled_loop_token(tracker: &CpuTotalTracker, clt: &CompiledLoopToken) {
+    if clt.loop_allocation_recorded.swap(true, Ordering::AcqRel) {
+        return;
+    }
     tracker.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
     majit_ir::debug::log_one(
         "jit-mem-looptoken-alloc",
@@ -999,6 +1016,7 @@ impl CompiledLoopToken {
             asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
+            loop_allocation_recorded: AtomicBool::new(false),
         }
     }
 
@@ -1604,8 +1622,7 @@ pub trait Backend: Send {
     /// themselves but won't observe writes through
     /// `fallback_cpu_tracker`.
     fn cpu_tracker(&self) -> &Arc<CpuTotalTracker> {
-        static FALLBACK_ARC: std::sync::OnceLock<Arc<CpuTotalTracker>> =
-            std::sync::OnceLock::new();
+        static FALLBACK_ARC: std::sync::OnceLock<Arc<CpuTotalTracker>> = std::sync::OnceLock::new();
         FALLBACK_ARC.get_or_init(|| Arc::new(CpuTotalTracker::default()))
     }
 

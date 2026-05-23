@@ -2204,7 +2204,15 @@ impl<M: Clone> MetaInterp<M> {
     /// the debug section but *before* the profiler event (PyPy
     /// `compile_and_run_once` order at `pyjitpl.py:2888-2892`).
     pub fn enter_profiler_tracing(&mut self) {
-        debug_assert!(
+        // `assert!` (not `debug_assert!`): in release, a second
+        // entry would open another profiler/debug scope that
+        // `leave_profiler_tracing` cannot close (the boolean flag
+        // only tracks one scope), leaving the stacks permanently
+        // unbalanced and corrupting later `debug_stop` mismatch
+        // detection.  Crash-on-misuse matches PyPy's intolerance for
+        // recursive `start_tracing()` (`jitprof.py:81` would push
+        // a second TRACING and `_print_stats` would observe it).
+        assert!(
             !self.profiler_tracing_active,
             "enter_profiler_tracing called while tracing profiler event is already open",
         );
@@ -2222,7 +2230,11 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py:2888-2892`.  The matching close still routes
     /// through [`leave_profiler_tracing`].
     pub fn open_profiler_tracing_inner(&mut self) {
-        debug_assert!(
+        // Same release-build assertion contract as
+        // [`enter_profiler_tracing`] — a second entry would leak a
+        // profiler scope past `leave_profiler_tracing`'s single-flag
+        // close.
+        assert!(
             !self.profiler_tracing_active,
             "open_profiler_tracing_inner called while tracing profiler event is already open",
         );
@@ -3029,14 +3041,24 @@ impl<M: Clone> MetaInterp<M> {
         // mismatch panics).
         let rollback = DebugSectionRollback::arm("jit-tracing");
         self.staticdata._setup_once(&mut self.backend);
-        // `_setup_once` succeeded — hand the close off to
-        // `leave_profiler_tracing` via `profiler_tracing_active`.
-        rollback.dismiss();
         // Profiler event opens after `_setup_once`, matching PyPy
         // line 2890.  `open_profiler_tracing_inner` is the
         // debug_start-skipping variant of `enter_profiler_tracing`
         // since the section is already open above.
+        //
+        // The rollback stays armed across `open_profiler_tracing_inner`:
+        // that call's `start_tracing()` can panic on a poisoned
+        // timing mutex, and the active flag is only set *after*
+        // `start_tracing()` returns.  If we dismissed earlier and
+        // `start_tracing()` then panicked, `profiler_tracing_active`
+        // would stay `false` so `leave_profiler_tracing` would skip
+        // the close — leaking the debug section.  Dismissing only
+        // after `open_profiler_tracing_inner` returns hands the
+        // close off cleanly: success → `leave_profiler_tracing`
+        // owns it via the now-`true` flag; panic → the rollback
+        // fires `debug_stop` on the unwind path.
         self.open_profiler_tracing_inner();
+        rollback.dismiss();
         self.try_to_free_some_loops();
     }
 
