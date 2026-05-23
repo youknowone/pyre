@@ -276,7 +276,12 @@ pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
-    let live_positions = live_runtime_positions(&ctx.new_operations);
+    let ops_view: Vec<Op> = ctx
+        .new_operations
+        .iter()
+        .map(|rc| (**rc).clone())
+        .collect();
+    let live_positions = live_runtime_positions(&ops_view);
 
     for (idx, b) in ctx.box_pool.iter_indexed() {
         // make_constant excludes InputArg positions from self.constants writes
@@ -751,7 +756,7 @@ impl Optimizer {
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
             // `value_types` write needed (Slice 0.5).
-            ctx.new_operations.push(op);
+            ctx.new_operations.push(std::rc::Rc::new(op));
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
         }
@@ -1644,7 +1649,7 @@ impl Optimizer {
 
     /// optimizer.py: getlastop() — return the last emitted non-guard operation.
     pub fn getlastop<'a>(&self, ctx: &'a OptContext) -> Option<&'a Op> {
-        ctx.new_operations.last()
+        ctx.new_operations.last().map(|rc| rc.as_ref())
     }
 
     /// optimizer.py: get_count_of_ops()
@@ -2361,7 +2366,7 @@ impl Optimizer {
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
             if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
-                self.phase1_emit_ops.push(std::rc::Rc::new(op.clone()));
+                self.phase1_emit_ops.push(op.clone());
             }
         }
         // Transfer exported virtual state from context to optimizer
@@ -2384,6 +2389,7 @@ impl Optimizer {
                 self.terminal_op
                     .clone()
                     .filter(|op| op.opcode == OpCode::Jump)
+                    .map(std::rc::Rc::new)
             });
         // RPython compile.py:327 `loop.operations = ([start_label] + preamble_ops
         // + loop_info.extra_same_as + loop_info.extra_before_label + [label_op]
@@ -2936,18 +2942,23 @@ impl Optimizer {
             }
 
             // Apply remap to all args and fail_args
-            for op in &mut ctx.new_operations {
+            for op in &ctx.new_operations {
                 for i in 0..op.num_args() {
                     let arg = op.arg(i);
                     if let Some(&new_pos) = remap.get(&arg.raw()) {
                         op.setarg(i, arg.with_raw(new_pos));
                     }
                 }
-                if let Some(fail_args) = op.fail_args_mut() {
+                if let Some(mut fail_args) = op.getfailargs() {
+                    let mut changed = false;
                     for arg in fail_args.iter_mut() {
                         if let Some(&new_pos) = remap.get(&arg.raw()) {
                             *arg = arg.with_raw(new_pos);
+                            changed = true;
                         }
+                    }
+                    if changed {
+                        op.setfailargs(fail_args);
                     }
                 }
             }
@@ -3020,7 +3031,12 @@ impl Optimizer {
 
         // Export newly-discovered constants back to the caller's map.
         merge_backend_constants_from_ctx(&ctx, constants);
-        sanitize_backend_constants_for_ops(&ctx.new_operations, constants);
+        let new_ops_view: Vec<Op> = ctx
+            .new_operations
+            .iter()
+            .map(|rc| (**rc).clone())
+            .collect();
+        sanitize_backend_constants_for_ops(&new_ops_view, constants);
 
         // Preserve final context for jump_to_existing_trace.
         let mut ops = std::mem::take(&mut ctx.new_operations);
@@ -3044,7 +3060,7 @@ impl Optimizer {
                 .position(|op| op.opcode == OpCode::Jump || op.opcode == OpCode::Finish)
                 .unwrap_or(ops.len());
             for (offset, op) in extra_same_as_aliases.into_iter().enumerate() {
-                ops.insert(term_idx + offset, op);
+                ops.insert(term_idx + offset, std::rc::Rc::new(op));
             }
         }
         // resume.py:411-417 parity: store_final_boxes_in_guard
@@ -3074,7 +3090,7 @@ impl Optimizer {
             }
         }
         self.final_ctx = Some(ctx);
-        ops
+        ops.into_iter().map(|rc| (*rc).clone()).collect()
     }
 
     /// unroll.py:183-236: optimize_bridge()
@@ -3207,7 +3223,7 @@ impl Optimizer {
                 );
                 self.send_extra_operation(&jump_op, &mut ctx);
                 let mut result = optimized_ops;
-                result.extend(ctx.new_operations.drain(..));
+                result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
                 return (result, false);
             }
             return (optimized_ops, false);
@@ -3279,7 +3295,7 @@ impl Optimizer {
                     );
                     self.send_extra_operation(&jump_op, &mut ctx);
                     let mut result = optimized_ops;
-                    result.extend(ctx.new_operations.drain(..));
+                    result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
                     return (result, false);
                 }
                 return (optimized_ops, false);
@@ -3289,7 +3305,7 @@ impl Optimizer {
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
             return (result, false);
         }
 
@@ -3339,7 +3355,7 @@ impl Optimizer {
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
             return (result, false);
         }
 
@@ -3362,7 +3378,7 @@ impl Optimizer {
             );
             self.send_extra_operation(&jump_op, &mut ctx);
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.extend(ctx.new_operations.drain(..).map(|rc| (*rc).clone()));
             (result, false)
         } else {
             (optimized_ops, false)
@@ -3719,7 +3735,7 @@ impl Optimizer {
                              replacement guard has no descr",
                         );
                         crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                        ctx.new_operations[target_pos] = op.clone();
+                        ctx.new_operations[target_pos] = std::rc::Rc::new(op.clone());
                         ctx.in_final_emission = saved_in_final_emission;
                         return;
                     }

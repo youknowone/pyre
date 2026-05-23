@@ -532,7 +532,7 @@ use crate::optimizeopt::info::PtrInfoExt;
 /// Holds the shared state that passes read from and write to.
 pub struct OptContext {
     /// The output operation list being built.
-    pub new_operations: Vec<Op>,
+    pub new_operations: Vec<majit_ir::OpRc>,
     /// Constants for constant-namespace OpRefs, indexed by
     /// `OpRef::const_index()`. Vec-backed dense pool — replaces the
     /// earlier `HashMap<u32, Value>`.
@@ -2191,7 +2191,7 @@ impl OptContext {
         // side-table entry is gone; its Box.type invariant survives as
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
-        self.new_operations.push(op);
+        self.new_operations.push(std::rc::Rc::new(op));
         pos_ref
     }
 
@@ -3547,7 +3547,7 @@ impl OptContext {
         // info.py:100-103: read last_guard_pos from terminal PtrInfo.
         let resolved = op.get_box_replacement(false);
         let pos = resolved.ptr_info().and_then(|p| p.get_last_guard_pos())?;
-        self.new_operations.get(pos)
+        self.new_operations.get(pos).map(|rc| rc.as_ref())
     }
 
     /// resoperation.py:57-68 get_box_replacement: follow the forwarding
@@ -5231,7 +5231,7 @@ impl OptContext {
         self.new_operations
             .iter()
             .find(|op| op.pos.get() == opref)
-            .cloned()
+            .map(|rc| (**rc).clone())
     }
 
     /// Number of emitted operations so far.
@@ -5241,7 +5241,7 @@ impl OptContext {
 
     /// Get the last emitted operation, if any.
     pub fn last_emitted_operation(&self) -> Option<&Op> {
-        self.new_operations.last()
+        self.new_operations.last().map(|rc| rc.as_ref())
     }
 
     /// `optimizer.py:379-387 get_constant_box`:
@@ -5505,11 +5505,6 @@ impl OptContext {
         let base = self.inputarg_base + self.num_inputs;
         self.next_pos = self.next_pos.max(base);
         self.const_infos.clear();
-    }
-
-    /// Get a mutable reference to the last emitted operation.
-    pub fn last_emitted_operation_mut(&mut self) -> Option<&mut Op> {
-        self.new_operations.last_mut()
     }
 
     /// resoperation.py: `op.type` parity. The Phase 1-5 OpRef enum

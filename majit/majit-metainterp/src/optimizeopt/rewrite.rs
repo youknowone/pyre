@@ -1798,7 +1798,7 @@ impl OptRewrite {
                             Some(None),
                         );
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
-                        ctx.new_operations[old_idx] = replacement;
+                        ctx.new_operations[old_idx] = std::rc::Rc::new(replacement);
                         // rewrite.py:345-346: info.reset_last_guard_pos()
                         if let Some(b) = ctx.ensure_box(obj) {
                             ctx.with_ptr_info_mut(&b, |info_mut| info_mut.reset_last_guard_pos());
@@ -1906,7 +1906,7 @@ impl OptRewrite {
                         Some(&[old_guard.arg(0), op.arg(1)]),
                         Some(Some(new_descr)),
                     );
-                    ctx.new_operations[old_idx] = combined;
+                    ctx.new_operations[old_idx] = std::rc::Rc::new(combined);
                     // rewrite.py:430-436 postprocess_GUARD_CLASS parity
                     // (invoked inline here because the replacement path
                     // rewrites `new_operations[old_idx]` directly instead
@@ -3528,7 +3528,11 @@ mod tests {
             }
         }
 
-        let new_ops = ctx.new_operations.clone();
+        let new_ops: Vec<Op> = ctx
+            .new_operations
+            .iter()
+            .map(|rc| (**rc).clone())
+            .collect();
         (new_ops, ctx)
     }
 

@@ -1382,7 +1382,10 @@ impl UnrollOptimizer {
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
-                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
+                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations)
+                    .into_iter()
+                    .map(|rc| (*rc).clone())
+                    .collect();
                 // Check if the redirected Jump targets the current body token
                 // (last in target_tokens) or an external token from a previous
                 // compilation.  The Cranelift backend compiles each trace as a
@@ -1466,7 +1469,11 @@ impl UnrollOptimizer {
                     // partial-inline operations already appended to
                     // _newoperations.
                     opt_p2.send_extra_operation(&end_jump, &mut final_ctx);
-                    let redirected_tail_ops = std::mem::take(&mut final_ctx.new_operations);
+                    let redirected_tail_ops: Vec<Op> =
+                        std::mem::take(&mut final_ctx.new_operations)
+                            .into_iter()
+                            .map(|rc| (*rc).clone())
+                            .collect();
                     opt_p2.final_ctx = Some(final_ctx);
                     body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
                 } else {

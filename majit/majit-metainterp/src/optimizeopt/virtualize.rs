@@ -2686,6 +2686,9 @@ mod tests {
 
         pass.flush(&mut ctx);
         ctx.new_operations
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     #[test]
@@ -4114,6 +4117,9 @@ mod tests {
 
         pass.flush(&mut ctx);
         ctx.new_operations
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     #[test]

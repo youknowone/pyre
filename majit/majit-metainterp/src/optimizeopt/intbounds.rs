@@ -2210,12 +2210,13 @@ impl OptIntBounds {
         // First try direct index (when OpRef matches new_operations index)
         let idx = cond_ref.raw() as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos.get() == cond_ref {
-            return Some(&ctx.new_operations[idx]);
+            return Some(ctx.new_operations[idx].as_ref());
         }
         // Otherwise search by pos field
         ctx.new_operations
             .iter()
             .rfind(|op| op.pos.get() == cond_ref)
+            .map(|rc| rc.as_ref())
     }
 
     // ── Bound narrowing helpers ──
@@ -3388,7 +3389,11 @@ mod tests {
             }
         }
 
-        let result = ctx.new_operations.clone();
+        let result: Vec<Op> = ctx
+            .new_operations
+            .iter()
+            .map(|rc| (**rc).clone())
+            .collect();
         let _ = pass;
         (result, ctx)
     }
