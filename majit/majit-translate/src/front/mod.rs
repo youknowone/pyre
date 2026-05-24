@@ -23,6 +23,34 @@
 //!
 //! Every non-trivial addition to this module must include a comment citing the RPython file:line it replaces or bridges. If no such line exists, the addition is further pyre-specific deviation and must be justified explicitly in the commit message.
 //!
+//! ## Step 5 retirement plan (gated on Step 4.5 production cutover)
+//!
+//! Once the MIR-driven driver (`front::mir`) reaches production
+//! coverage parity, the four AST-side CFG-reconstruction workarounds
+//! become reachable from the AST path only and can be lifted out:
+//!
+//! - `front::ast::lazy_install_local_at_current_block_var`
+//! - `front::ast::can_thread_variable_to_block`
+//! - `front::ast::lower_if_expr`'s fallback branch
+//! - `front::ast::GraphBuildContext` per-scope binding tracking
+//!
+//! Each compensates for the recursive walk's inability to see the CFG
+//! ahead of time.  MIR has the CFG explicit, so these have no analog
+//! in `front::mir`.  Retirement waits on:
+//!
+//! 1. Step 4.5 downstream-consumer widenings: `portal_targets`
+//!    (needs Charon to surface `#[majit_macros::portal]`),
+//!    `function_hints` (needs `elidable*` / `oopspec` attribute
+//!    surfacing), `immutable_fields` (`#[majit_macros::immutable]`).
+//! 2. The Charon dedup-table widening (Step 4.3.c.ext) so
+//!    `fn_return_types` carries resolved ADT paths rather than
+//!    `ty#N` labels.
+//! 3. Production validation under `--features mir-frontend
+//!    PYRE_MIR_FRONTEND_LLBC=...` passing `check.py`.
+//!
+//! Until all three land, the AST front-end remains the production
+//! path and the four shims above stay load-bearing.
+//!
 
 pub mod ast;
 pub mod mir;
