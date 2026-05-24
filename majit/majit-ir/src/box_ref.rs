@@ -350,13 +350,16 @@ impl BoxRef {
 
     /// `resoperation.py:50 get_forwarded`. Returns a clone of the
     /// current slot. For Slice 8.C-bound ResOp boxes the read is routed
-    /// through `op.forwarded` so callers transparently see the PyPy-parity
-    /// authoritative slot; for unbound boxes (InputArg / Const /
-    /// lazy-allocated) it falls back to `Box.forwarded`. The clone is
-    /// cheap — every `Forwarded` payload is an `Rc`/`Copy` handle.
+    /// through `op.forwarded`; Slice 8.D extends this to InputArg via
+    /// `inputarg.forwarded`. Unbound boxes (Const / lazy-allocated) fall
+    /// back to `Box.forwarded`. The clone is cheap — every `Forwarded`
+    /// payload is an `Rc`/`Copy` handle.
     pub fn get_forwarded(&self) -> Forwarded {
         if let Some(op) = self.bound_op() {
             return op.forwarded.borrow().clone();
+        }
+        if let Some(ia) = self.bound_inputarg() {
+            return ia.forwarded.borrow().clone();
         }
         self.0.forwarded.borrow().clone()
     }
@@ -448,14 +451,23 @@ impl BoxRef {
         self.write_forwarded(Forwarded::None);
     }
 
-    /// Slice 8.D writer: route to `op.forwarded` when the box is bound,
-    /// else fall back to the in-Box slot. Box.forwarded is inert for bound
-    /// ResOp boxes — `get_forwarded` already reads from `op.forwarded` for
-    /// these, so the redundant Box write was removed.
+    /// Slice 8.D writer: route to `op.forwarded` / `inputarg.forwarded`
+    /// when the box is bound, else fall back to the in-Box slot. The
+    /// Box.forwarded slot is inert for bound boxes — `get_forwarded`
+    /// already reads from the same handle that gets written here, so a
+    /// redundant Box write would only desync if a future reader looked at
+    /// the wrong slot. `op_handle` and `inputarg_handle` are mutually
+    /// exclusive (BoxKind determines which is populated by bind_*).
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(weak) = self.0.op_handle.borrow().as_ref() {
             if let Some(op) = weak.upgrade() {
                 *op.forwarded.borrow_mut() = value;
+                return;
+            }
+        }
+        if let Some(weak) = self.0.inputarg_handle.borrow().as_ref() {
+            if let Some(ia) = weak.upgrade() {
+                *ia.forwarded.borrow_mut() = value;
                 return;
             }
         }
@@ -1081,5 +1093,62 @@ mod tests {
 
         let resop_box = BoxRef::new_resop(Type::Int, 0);
         assert!(resop_box.bound_inputarg().is_none());
+    }
+
+    /// After `bind_inputarg`, `set_forwarded_*` writes through to
+    /// `inputarg.forwarded` and `get_forwarded` reads from it — same
+    /// dual-write invariant Slice 8.C established for ResOp.
+    #[test]
+    fn bind_inputarg_makes_set_forwarded_dual_write_to_inputarg() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_inputarg(Type::Int, 0);
+        let ia = std::rc::Rc::new(InputArg {
+            tp: Type::Int,
+            index: 0,
+            forwarded: std::cell::RefCell::new(Forwarded::None),
+        });
+        b.bind_inputarg(&ia);
+
+        // Initial state.
+        assert!(matches!(b.get_forwarded(), Forwarded::None));
+        assert!(matches!(*ia.forwarded.borrow(), Forwarded::None));
+
+        // Info write: inputarg slot reflects it; get_forwarded reads it back.
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(99)));
+        assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
+        assert!(matches!(*ia.forwarded.borrow(), Forwarded::Info(_)));
+
+        // Box write should also reach the InputArg slot.
+        let target = BoxRef::new_resop(Type::Int, 5);
+        b.set_forwarded_box(target.clone());
+        match (&b.get_forwarded(), &*ia.forwarded.borrow()) {
+            (Forwarded::Box(bt), Forwarded::Box(iat)) => assert_eq!(bt, iat),
+            _ => panic!("expected Forwarded::Box on both slots"),
+        }
+
+        // Clear reaches the InputArg slot.
+        b.clear_forwarded();
+        assert!(matches!(b.get_forwarded(), Forwarded::None));
+        assert!(matches!(*ia.forwarded.borrow(), Forwarded::None));
+    }
+
+    /// If the bound `InputArgRc` is dropped, `write_forwarded` falls back
+    /// to `Box.forwarded` instead of panicking — symmetric to
+    /// `dropped_op_makes_dual_write_a_noop`.
+    #[test]
+    fn dropped_inputarg_makes_write_fall_back_to_box() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_inputarg(Type::Int, 0);
+        {
+            let ia = std::rc::Rc::new(InputArg {
+                tp: Type::Int,
+                index: 0,
+                forwarded: std::cell::RefCell::new(Forwarded::None),
+            });
+            b.bind_inputarg(&ia);
+            // ia drops here.
+        }
+        b.set_forwarded_info(OpInfo::Unknown);
+        assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
     }
 }
