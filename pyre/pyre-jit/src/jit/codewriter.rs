@@ -2231,13 +2231,32 @@ fn pair_walker_slot_if_absent(
 /// arbitrary colors `>= nlocals` while walker has them at color `i`.
 ///
 /// This helper returns `(scratch_id, inputarg_id)` pairs for every
-/// non-inputarg Variable walker pinned to slot `i ∈ 0..nlocals`,
+/// non-inputarg Variable walker pinned to slot `i ∈ 0..n_args`,
 /// matched against `graph.startblock.inputargs[i]`.  Feeding the pairs
 /// to [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
 /// pre-coalesces them in the canonical union-find so chordal coloring
 /// gives the unified cluster a single color, which
-/// `enforce_input_args` then rotates onto the `0..nlocals-1` slot —
+/// `enforce_input_args` then rotates onto the `0..n_args-1` slot —
 /// matching walker's slot-pinned color exactly.
+///
+/// The slot upper bound is `n_args` (function parameter count), not
+/// `nlocals`.  Walker's `walker_slot_for_variable[scratch] = Some(i)`
+/// means "scratch represents Python local i", with semantics defined
+/// by `code.varnames[i]`.  Canonical's `startblock.inputargs` only
+/// holds entries for function parameters followed by portal red args
+/// (`graph_entry_inputargs`); `inputargs[n_args..n_args+2]` are
+/// `[portal_frame, portal_ec]`, NOT Python locals `n_args..nlocals`.
+///
+/// Pinning a walker-Python-local-i scratch with `inputargs[i]` for
+/// `i >= n_args` would semantically coalesce different things
+/// (Python local i with portal frame/ec) and force canonical regalloc
+/// to assign the same register to both — visible only via the probe
+/// today, but would corrupt runtime state if canonical's SSARepr ever
+/// became production.  Body-defined Python locals `n_args..nlocals`
+/// have no canonical inputarg counterpart in pyre today; the
+/// architecturally-correct fix (PyPy parity) is to extend
+/// `graph_entry_inputargs` to seed all `nlocals` slots — see
+/// [[phase4-endgame-task229-blockers-2026-05-24]] path (a).
 ///
 /// PRE-EXISTING-ADAPTATION (Phase 4 endgame Task #228): the upstream
 /// `flatten_graph(graph, regallocs, cpu)` signature has no extra
@@ -2252,17 +2271,21 @@ fn pair_walker_slot_if_absent(
 fn derive_walker_pin_coalesce_pairs(
     graph: &super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
-    nlocals: usize,
+    n_args: usize,
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     let inputargs = graph.startblock.borrow().inputargs.clone();
     let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
     for (var_id_usize, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
         let Some(slot) = maybe_slot else { continue };
         let slot_idx = *slot as usize;
-        if slot_idx >= nlocals {
-            // Stack slot — no inputarg counterpart; walker's chordal
-            // coloring assigns it freely.  Out of scope for this
-            // helper; stack-color alignment is a separate epic.
+        if slot_idx >= n_args {
+            // Slot above function-parameter range — either a body-
+            // defined Python local (`n_args..nlocals`, no canonical
+            // inputarg counterpart) or a stack slot (`>= nlocals`,
+            // walker's chordal coloring assigns it freely).  Both
+            // cases need the orthodox PyPy parity fix (extend
+            // `graph_entry_inputargs` to nlocals) before a meaningful
+            // pin can be derived.
             continue;
         }
         let Some(inputarg_value) = inputargs.get(slot_idx) else {
@@ -9107,7 +9130,7 @@ impl CodeWriter {
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
-            code.varnames.len(),
+            entry_arg_slots(code),
         );
         let mut graph_regallocs =
             super::regalloc::perform_register_allocation_all_kinds_with_pairs(
