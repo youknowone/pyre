@@ -29,6 +29,7 @@ use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{Op, VectorizationInfo};
+use crate::value::InputArg;
 use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
@@ -71,6 +72,16 @@ pub struct Box {
     /// `op.forwarded`, establishing the Slice 8.D invariant
     /// `Box.forwarded == op.forwarded`.
     pub op_handle: RefCell<Option<Weak<Op>>>,
+
+    /// Slice 8.D parity: backref to the `InputArg` this Box stands in
+    /// for, mirroring `op_handle` for the `BoxKind::InputArg` variant.
+    /// Empty for `BoxKind::ResOp` / `Const`; filled by
+    /// `BoxRef::bind_inputarg` at the recorder→TreeLoop handoff so the
+    /// authoritative `_forwarded` slot lives on the `InputArg` itself
+    /// (RPython `resoperation.py:700 AbstractInputArg._forwarded`).
+    /// Without this, `InputArg.forwarded` would remain a dead field and
+    /// readers migrating off `BoxRef.forwarded` would see stale `None`.
+    pub inputarg_handle: RefCell<Option<Weak<InputArg>>>,
 }
 
 /// Enum mirror of the PyPy class hierarchy.
@@ -163,6 +174,7 @@ impl BoxRef {
             },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
         }))
     }
 
@@ -174,6 +186,7 @@ impl BoxRef {
             kind: BoxKind::InputArg { position },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
         }))
     }
 
@@ -191,6 +204,7 @@ impl BoxRef {
             },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
         }))
     }
 
@@ -209,6 +223,7 @@ impl BoxRef {
             },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
         }))
     }
 
