@@ -23,4 +23,5 @@ pub mod math;
 pub mod mmap;
 pub mod operator;
 pub mod sys;
+pub mod termios;
 pub mod time;
