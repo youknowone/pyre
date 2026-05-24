@@ -336,10 +336,7 @@ impl IntBound {
             return true;
         }
         let mut newself = self.clone();
-        match newself.intersect(other) {
-            Err(_) => true,
-            Ok(_) => false,
-        }
+        newself.intersect(other).is_err()
     }
 
     // ── Unsigned comparisons ──
@@ -704,10 +701,10 @@ impl IntBound {
     pub fn py_div_bound(&self, other: &IntBound) -> IntBound {
         // We need 0 not in other's interval; also check that other doesn't straddle 0
         if !other.contains(0) && !(other.lower < 0 && 0 < other.upper) {
-            let v1 = py_div(self.upper, other.upper).checked_add(0); // just to have Option
-            let v2 = py_div(self.upper, other.lower).checked_add(0);
-            let v3 = py_div(self.lower, other.upper).checked_add(0);
-            let v4 = py_div(self.lower, other.lower).checked_add(0);
+            let v1 = Some(py_div(self.upper, other.upper));
+            let v2 = Some(py_div(self.upper, other.lower));
+            let v3 = Some(py_div(self.lower, other.upper));
+            let v4 = Some(py_div(self.lower, other.lower));
             // check for MININT / -1 overflow via checked_mul proxy
             // Actually py_div can't overflow except for MININT / -1, let's check explicitly
             if other.contains(-1) && (self.lower == i64::MIN || self.upper == i64::MIN) {
@@ -746,7 +743,7 @@ impl IntBound {
             if c_other >= 64 {
                 tvalue = 0;
                 tmask = 0; // TNUM_KNOWN_ZERO
-            } else if c_other >= 0 && c_other < 64 {
+            } else if (0..64).contains(&c_other) {
                 let shift = c_other as u32;
                 let r = self._tnum_lshift(shift);
                 tvalue = r.0;
@@ -916,7 +913,7 @@ impl IntBound {
         }
         let c_other = other.get_constant_int();
         let (mut tvalue, mut tmask) = (0u64, u64::MAX);
-        if c_other >= 0 && c_other < 64 {
+        if (0..64).contains(&c_other) {
             let shift = c_other as u32;
             tvalue = self.tvalue << shift;
             tmask = self.tmask << shift;
@@ -937,7 +934,7 @@ impl IntBound {
         }
         let c_other = other.get_constant_int();
         let (mut tvalue, mut tmask) = (0u64, u64::MAX);
-        if c_other >= 0 && c_other < 64 {
+        if (0..64).contains(&c_other) {
             let shift = c_other as u32;
             tvalue = self.tvalue >> shift;
             tmask = self.tmask >> shift;
@@ -1160,7 +1157,7 @@ impl IntBound {
         let u_min_threshold = threshold as u64;
         let (working_min, cl2set, set2cl) = self._helper_min_max_prepare(u_min_threshold);
         if working_min == u_min_threshold {
-            return threshold;
+            threshold
         } else if cl2set > set2cl {
             self._helper_min_case1(working_min, cl2set)
         } else {
@@ -1181,7 +1178,7 @@ impl IntBound {
         let u_max_threshold = threshold as u64;
         let (working_max, cl2set, set2cl) = self._helper_min_max_prepare(u_max_threshold);
         if working_max == u_max_threshold {
-            return threshold;
+            threshold
         } else if cl2set < set2cl {
             self._helper_max_case1(working_max, set2cl)
         } else {
