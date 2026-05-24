@@ -3313,7 +3313,6 @@ mod tests {
             let mut __op = Op {
                 $($field)*
                 type_: Type::Void,
-                vecinfo: std::cell::RefCell::new(None),
                 forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             };
             __op.type_ = __op.opcode.result_type();
