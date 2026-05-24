@@ -3628,12 +3628,7 @@ impl<'a> RegAlloc<'a> {
     /// and has no `flush_cc` equivalent, so receiving `frame_reg` as
     /// the result there would clobber x29 (the frame pointer). On
     /// non-x86 architectures, fall through to a plain force-allocate.
-    pub(crate) fn force_allocate_reg_or_cc(
-        &mut self,
-        result: OpRef,
-        ops: &[Op],
-        i: usize,
-    ) -> Loc {
+    pub(crate) fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
         #[cfg(target_arch = "x86_64")]
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);
@@ -5914,8 +5909,8 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
     use majit_ir::VecAssoc;
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let mut op = Op::new(opcode, args);

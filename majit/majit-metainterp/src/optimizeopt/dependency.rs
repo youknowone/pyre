@@ -1116,17 +1116,14 @@ impl<'a> IntegralForwardModification<'a> {
     }
 
     fn get_or_create(&mut self, arg: OpRef) -> IndexVar {
-        self.index_vars
-            .get(&arg)
-            .cloned()
-            .unwrap_or_else(|| {
-                if Self::is_const(arg) {
-                    let val = self.const_val(arg).unwrap_or(0);
-                    IndexVar::new_const(arg, val)
-                } else {
-                    IndexVar::new(arg)
-                }
-            })
+        self.index_vars.get(&arg).cloned().unwrap_or_else(|| {
+            if Self::is_const(arg) {
+                let val = self.const_val(arg).unwrap_or(0);
+                IndexVar::new_const(arg, val)
+            } else {
+                IndexVar::new(arg)
+            }
+        })
     }
 
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.

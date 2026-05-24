@@ -5099,7 +5099,7 @@ impl TraceCtx {
         self.current_merge_points
             .iter()
             .rev()
-            .any(|mp| mp.green_key == key && mp.original_boxes.len() == live_args_len)
+            .any(|mp| mp.green_key == key && mp.green_boxes.len() == live_args_len)
     }
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
@@ -5132,8 +5132,11 @@ impl TraceCtx {
         self.current_merge_points.push(MergePoint {
             green_key: key,
             position,
-            original_boxes: live_args,
-            original_box_types: live_arg_types,
+            green_boxes: live_args
+                .into_iter()
+                .zip(live_arg_types.into_iter())
+                .map(|(opref, ty)| crate::trace_ctx::GreenBox::new(opref, ty))
+                .collect(),
             header_pc,
         });
     }

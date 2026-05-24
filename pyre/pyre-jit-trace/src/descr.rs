@@ -2414,8 +2414,8 @@ fn simple_descr_group_from_bh_size(
         return mint();
     }
 
-    let cache = SIMPLE_DESCR_GROUP_CACHE
-        .get_or_init(|| std::sync::Mutex::new(majit_ir::VecAssoc::new()));
+    let cache =
+        SIMPLE_DESCR_GROUP_CACHE.get_or_init(|| std::sync::Mutex::new(majit_ir::VecAssoc::new()));
     {
         let cache = cache.lock().unwrap();
         if let Some(group) = cache.get(&spec.type_id) {

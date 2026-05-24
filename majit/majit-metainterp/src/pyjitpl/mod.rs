@@ -2607,7 +2607,7 @@ impl<M: Clone> MetaInterp<M> {
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
             .filter(|mp| mp.position._pos > 0)
-            .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
+            .map(|mp| (mp.header_pc, mp.original_box_types()))
     }
 
     /// Compat alias: delegates to set_trace_eagerness.
@@ -4490,8 +4490,8 @@ impl<M: Clone> MetaInterp<M> {
                 .filter(|mp| mp.position._pos > 0)
                 .map(|mp| {
                     (
-                        mp.original_boxes.clone(),
-                        mp.original_box_types.clone(),
+                        mp.original_boxes(),
+                        mp.original_box_types(),
                         crate::history::TreeLoopCutPosition::new(mp.position._pos),
                     )
                 })
@@ -5566,8 +5566,8 @@ impl<M: Clone> MetaInterp<M> {
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
                     .map(|mp| {
                         (
-                            mp.original_boxes.clone(),
-                            mp.original_box_types.clone(),
+                            mp.original_boxes(),
+                            mp.original_box_types(),
                             crate::history::TreeLoopCutPosition::new(mp.position._pos),
                         )
                     })

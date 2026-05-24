@@ -195,7 +195,11 @@ impl MetaInterpStaticData {
 
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
     /// into this staticdata object and snapshot the current `all_liveness`.
-    fn finish_setup_if_needed(&mut self, insns: &majit_ir::VecAssoc<String, u8>, all_liveness: Vec<u8>) {
+    fn finish_setup_if_needed(
+        &mut self,
+        insns: &majit_ir::VecAssoc<String, u8>,
+        all_liveness: Vec<u8>,
+    ) {
         let was_done = self.finish_setup_done;
         self.setup_insns(insns);
         self.liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice());

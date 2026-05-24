@@ -124,27 +124,60 @@ fn concrete_ptrs_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// pyjitpl.py:2989 box-with-type pair.
+///
+/// RPython's `Box` carries type implicitly via Python class identity
+/// (`ConstInt`/`ConstFloat`/`InputArgRef` etc.).  Pyre's flat-OpRef
+/// encoding stores type as a separate `Type` tag, so `GreenBox` bundles
+/// the position + type tag into one struct — Phase A.4 step in
+/// `~/.claude/plans/ec-wiring-gentle-wave.md` folding away the
+/// previous parallel `Vec<OpRef>` + `Vec<Type>` adaptation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenBox {
+    pub opref: OpRef,
+    pub ty: Type,
+}
+
+impl GreenBox {
+    pub fn new(opref: OpRef, ty: Type) -> Self {
+        Self { opref, ty }
+    }
+}
+
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
 ///
 /// RPython stores `(original_boxes, start)` where `original_boxes` is the
 /// full list of green+red args at the first visit, and `start` is a 5-tuple
-/// trace position. majit stores the equivalent as OpRef vectors + TracePosition.
+/// trace position. majit stores the equivalent as a `Vec<GreenBox>` (each
+/// pairing OpRef + Type tag) + TracePosition.
 #[derive(Clone, Debug)]
 pub struct MergePoint {
     /// Green key of the loop header.
     pub green_key: u64,
     /// Trace position when this loop header was first visited.
     pub position: crate::recorder::TracePosition,
-    /// pyjitpl.py:2989: original_boxes — live variable OpRefs at the first
-    /// visit to this loop header. Used by compile_loop/compile_retrace as
-    /// the inputargs for trace cutting.
-    pub original_boxes: Vec<OpRef>,
-    /// Types of original_boxes. RPython Box carries type implicitly;
-    /// majit stores types alongside OpRefs for compile_retrace parity.
-    pub original_box_types: Vec<Type>,
+    /// pyjitpl.py:2989: `original_boxes` — live variable boxes (OpRef +
+    /// type tag) at the first visit to this loop header. Used by
+    /// compile_loop/compile_retrace as the inputargs for trace cutting.
+    pub green_boxes: Vec<GreenBox>,
     /// Bytecode PC of this loop header. Used by cut_trace_from to update
     /// meta when the trace closes at a different loop.
     pub header_pc: usize,
+}
+
+impl MergePoint {
+    /// pyjitpl.py:2989 `original_boxes` view — produces a fresh
+    /// `Vec<OpRef>` for callers that still consume the legacy split shape.
+    pub fn original_boxes(&self) -> Vec<OpRef> {
+        self.green_boxes.iter().map(|gb| gb.opref).collect()
+    }
+
+    /// pyjitpl.py:2989 `[b.type for b in original_boxes]` view — pyre-only
+    /// because PyPy Box objects carry their type implicitly, but pyre's
+    /// flat OpRef encoding needs the parallel Type tag for compile_retrace.
+    pub fn original_box_types(&self) -> Vec<Type> {
+        self.green_boxes.iter().map(|gb| gb.ty).collect()
+    }
 }
 
 /// Tracing context: wraps Trace + ConstantPool with convenience API.
@@ -985,8 +1018,11 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
-                original_box_types: initial_types,
-                original_boxes: initial_boxes.clone(),
+                green_boxes: initial_boxes
+                    .iter()
+                    .zip(initial_types.iter())
+                    .map(|(&opref, &ty)| GreenBox::new(opref, ty))
+                    .collect(),
                 header_pc: 0,
             }],
             heap_cache: HeapCache::new(),
@@ -1047,8 +1083,11 @@ impl TraceCtx {
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
-                original_box_types: initial_input_types,
-                original_boxes: initial_boxes.clone(),
+                green_boxes: initial_boxes
+                    .iter()
+                    .zip(initial_input_types.iter())
+                    .map(|(&opref, &ty)| GreenBox::new(opref, ty))
+                    .collect(),
                 header_pc: 0,
             }],
             heap_cache: HeapCache::new(),

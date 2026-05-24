@@ -1186,8 +1186,7 @@ impl VecScheduleState {
             let candidates: Vec<OpRef> = expansions
                 .iter()
                 .filter(|&&(vecop, idx)| {
-                    idx == i as i32
-                        && possible.get(&vecop).copied().unwrap_or(true)
+                    idx == i as i32 && possible.get(&vecop).copied().unwrap_or(true)
                 })
                 .map(|&(vecop, _)| vecop)
                 .collect();

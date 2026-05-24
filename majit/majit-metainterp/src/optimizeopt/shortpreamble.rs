@@ -1791,11 +1791,9 @@ impl AbstractShortPreambleBuilderState {
             // In RPython, Box identity makes this lookup trivial. In majit,
             // produce_arg returns preamble_op.pos which may differ from the
             // produced_short_boxes key.
-            let dep = all_produced.get(&arg).or_else(|| {
-                pos_to_key
-                    .get(&arg)
-                    .and_then(|key| all_produced.get(key))
-            });
+            let dep = all_produced
+                .get(&arg)
+                .or_else(|| pos_to_key.get(&arg).and_then(|key| all_produced.get(key)));
             if let Some(dep) = dep {
                 let dep_canonical = dep.preamble_op.pos.get();
                 if !self.short_results.contains(&dep_canonical)
@@ -2208,8 +2206,7 @@ impl ExtendedShortPreambleBuilder {
                 if let Some(&phase1_ref) = entry.op.getarglist().get(arg_pos) {
                     if let Some(&current_inputarg) = label_args.get(label_idx) {
                         if phase1_ref != current_inputarg {
-                            self.phase1_to_inputarg
-                                .insert(phase1_ref, current_inputarg);
+                            self.phase1_to_inputarg.insert(phase1_ref, current_inputarg);
                         }
                     }
                 }
@@ -2304,15 +2301,11 @@ impl ExtendedShortPreambleBuilder {
         // RPython uses Box identity; pyre needs both direct lookup and the
         // reverse `preamble_op.pos → key` lookup because produce_arg may
         // return a `.pos` distinct from the original key.
-        let dep = self
-            .produced_short_boxes
-            .get(&arg)
-            .cloned()
-            .or_else(|| {
-                pos_to_key
-                    .get(&arg)
-                    .and_then(|key| self.produced_short_boxes.get(key).cloned())
-            });
+        let dep = self.produced_short_boxes.get(&arg).cloned().or_else(|| {
+            pos_to_key
+                .get(&arg)
+                .and_then(|key| self.produced_short_boxes.get(key).cloned())
+        });
         let Some(dep) = dep else {
             return false;
         };
@@ -2392,7 +2385,11 @@ impl ExtendedShortPreambleBuilder {
         preamble_op: &crate::optimizeopt::info::PreambleOp,
         resolved_op: OpRef,
     ) {
-        let lookup_key = if self.produced_short_boxes.iter().any(|(k, _)| *k == resolved_op) {
+        let lookup_key = if self
+            .produced_short_boxes
+            .iter()
+            .any(|(k, _)| *k == resolved_op)
+        {
             resolved_op
         } else {
             preamble_op.op

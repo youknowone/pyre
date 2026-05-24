@@ -510,11 +510,8 @@ impl GuardStrengthenOpt {
         // Determine the strengthening interactions before mutating `self.guards`
         // (we can't hold &mut on self.strongest_guards while passing &mut guards).
         let mut updates: Vec<(usize, Option<Guard>)> = Vec::new();
-        let mut new_strongest: Vec<Guard> = self
-            .strongest_guards
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let mut new_strongest: Vec<Guard> =
+            self.strongest_guards.get(&key).cloned().unwrap_or_default();
         let mut replaced = false;
         for slot in new_strongest.iter_mut() {
             if guard.implies(slot, None) {

@@ -2803,11 +2803,10 @@ impl<'a> Assembler386<'a> {
                                 // disp32 = `-2147483648`. `i32::try_from`
                                 // panics if the regalloc guard somehow let
                                 // through a non-encodable value.
-                                let v = i32::try_from(i.value.wrapping_neg())
-                                    .expect(
-                                        "IntSub LEA requires an immediate \
+                                let v = i32::try_from(i.value.wrapping_neg()).expect(
+                                    "IntSub LEA requires an immediate \
                                          encodable as signed disp32 after negation",
-                                    );
+                                );
                                 dynasm!(self.mc ; .arch x64
                                     ; lea Rq(dst.value), [Rq(a.value) + v])
                             }

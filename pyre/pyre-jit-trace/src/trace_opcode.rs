@@ -8657,8 +8657,8 @@ mod tests {
 
     #[test]
     fn get_list_of_active_boxes_reads_kind_specific_register_banks() {
-        use majit_translate::liveness::encode_liveness;
         use majit_ir::VecAssoc;
+        use majit_translate::liveness::encode_liveness;
         use std::sync::Arc;
 
         let mut all_liveness = vec![1, 1, 1];
@@ -8740,8 +8740,8 @@ mod tests {
 
     #[test]
     fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
-        use majit_translate::liveness::encode_liveness;
         use majit_ir::VecAssoc;
+        use majit_translate::liveness::encode_liveness;
         use std::sync::Arc;
 
         let mut all_liveness = vec![0, 1, 0];

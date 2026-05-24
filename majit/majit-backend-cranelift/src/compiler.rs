@@ -1,9 +1,9 @@
-use std::cell::{Cell, RefCell, UnsafeCell};
 /// Cranelift-based JIT code generation backend.
 ///
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
 use majit_ir::{VecAssoc, VecSet};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -13381,8 +13381,7 @@ fn collect_guards(
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
-            let mut vidx_to_slot: majit_ir::VecAssoc<usize, usize> =
-                majit_ir::VecAssoc::new();
+            let mut vidx_to_slot: majit_ir::VecAssoc<usize, usize> = majit_ir::VecAssoc::new();
             let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
             for frame in &frames {
                 for val in &frame.values {

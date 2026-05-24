@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use majit_ir::VecAssoc;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;

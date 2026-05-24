@@ -1175,7 +1175,8 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+                let mut seen_used: majit_ir::vec_set::VecSet<OpRef> =
+                    majit_ir::vec_set::VecSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .chain(initial_sp.used_boxes.iter())
@@ -3392,7 +3393,10 @@ impl OptUnroll {
                     // are NOT Const objects — they are regular boxes with forwarded
                     // set to a Const, so they must go through the mapping.
                     if arg.is_constant()
-                        || short_preamble.constants.iter().any(|(k, _)| *k == arg.raw())
+                        || short_preamble
+                            .constants
+                            .iter()
+                            .any(|(k, _)| *k == arg.raw())
                     {
                         continue;
                     }
@@ -4897,9 +4901,7 @@ fn remap_snapshot_boxes(
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
-        .map(|&boxref| {
-            boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref))
-        })
+        .map(|&boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
         .collect()
 }
 
