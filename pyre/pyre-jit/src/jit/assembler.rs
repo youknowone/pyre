@@ -108,7 +108,7 @@ impl std::hash::Hash for ArcByPtr {
 struct AssemblyState {
     builder: JitCodeBuilder,
     /// `assembler.py:59` `self.label_positions = {}`.
-    label_positions: HashMap<String, usize>,
+    label_positions: VecAssoc<String, usize>,
     /// Builder adapter for `Label/TLabel` name → builder label id.
     /// RPython stores bytecode positions directly in `label_positions`; this
     /// extra vector exists only because `JitCodeBuilder` patches jumps by
@@ -208,7 +208,7 @@ impl Assembler {
 
         let mut state = AssemblyState {
             builder,
-            label_positions: HashMap::new(),
+            label_positions: VecAssoc::new(),
             builder_labels: Vec::new(),
         };
 
