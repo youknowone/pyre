@@ -6,7 +6,13 @@
 pub mod __builtin__;
 pub mod _io;
 #[allow(non_snake_case)]
+pub mod _abc;
+#[allow(non_snake_case)]
+pub mod _contextvars;
+#[allow(non_snake_case)]
 pub mod _ctypes;
+#[allow(non_snake_case)]
+pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
@@ -28,6 +34,7 @@ pub mod faulthandler;
 pub mod fcntl;
 pub mod gc;
 pub mod grp;
+pub mod itertools;
 pub mod math;
 pub mod mmap;
 pub mod operator;
