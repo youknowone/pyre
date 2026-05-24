@@ -644,6 +644,12 @@ impl OptPure {
                         }
                     }
                     crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
+                        // Normalize through forwarding so a box that became
+                        // constant via `make_constant` / replace_op chains
+                        // still matches, mirroring `_same_args` and
+                        // `preamble_pure_ops` upstream paths
+                        // (optimizer.py:343 get_box_replacement).
+                        let arg = ctx.get_box_replacement(arg);
                         match ctx.get_constant(arg) {
                             Some(v) if v == *expected_value => {}
                             _ => {

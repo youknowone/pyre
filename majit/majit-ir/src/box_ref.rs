@@ -244,7 +244,13 @@ impl BoxRef {
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
             "BoxRef::bind_op only valid for ResOp boxes"
         );
-        *op.forwarded.borrow_mut() = self.0.forwarded.borrow().clone();
+        // Read the canonical effective forwarded slot, not the in-Box
+        // mirror. `get_forwarded` consults the bound op/inputarg first,
+        // so a `bind → set_forwarded → rebind` sequence carries the
+        // freshest state across the rebind even if a writer ever bypasses
+        // `BoxRef::set_forwarded_*` and updates `op.forwarded` directly.
+        let carry = self.get_forwarded();
+        *op.forwarded.borrow_mut() = carry;
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
@@ -270,7 +276,10 @@ impl BoxRef {
             matches!(&self.0.kind, BoxKind::InputArg { .. }),
             "BoxRef::bind_inputarg only valid for InputArg boxes"
         );
-        *ia.forwarded.borrow_mut() = self.0.forwarded.borrow().clone();
+        // Same canonical-slot rule as `bind_op`: `get_forwarded` reads via
+        // the bound handle first so the rebind sees the freshest state.
+        let carry = self.get_forwarded();
+        *ia.forwarded.borrow_mut() = carry;
         *self.0.inputarg_handle.borrow_mut() = Some(Rc::downgrade(ia));
     }
 
@@ -1170,6 +1179,64 @@ mod tests {
         // The snapshot still sees the Info forwarding because the writer
         // mirrored to Box.forwarded alongside op.forwarded.
         assert!(matches!(snapshot.get_forwarded(), Forwarded::Info(_)));
+    }
+
+    /// Reviewer scenario: `bind A → set_forwarded(X) → bind B`. PyPy's
+    /// single `_forwarded` slot model preserves X across the rebind
+    /// (resoperation.py:233-240). The rust port must do the same — `bind_op`
+    /// reads via `get_forwarded()` so it carries X into B even if a
+    /// future writer ever updates `A.forwarded` without going through
+    /// `BoxRef::set_forwarded_*`.
+    #[test]
+    fn rebind_carries_forwarded_state_to_new_op() {
+        use crate::resoperation::{Op, OpCode};
+        let b = BoxRef::new_resop(Type::Int, 0);
+        let op_a = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+        b.bind_op(&op_a);
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
+
+        // Simulate a direct write that bypasses BoxRef so the in-Box
+        // mirror could plausibly diverge in a future migration step.
+        *op_a.forwarded.borrow_mut() = Forwarded::Info(OpInfo::Unknown);
+
+        let op_b = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+        b.bind_op(&op_b);
+
+        // op_b must carry the canonical effective forwarding (the post-
+        // direct-write state on op_a), not the stale Box mirror.
+        assert!(matches!(*op_b.forwarded.borrow(), Forwarded::Info(_)));
+        match &*op_b.forwarded.borrow() {
+            Forwarded::Info(OpInfo::Unknown) => {}
+            other => panic!("rebind dropped the latest forwarding: {other:?}"),
+        }
+    }
+
+    /// Same invariant for InputArg rebinding.
+    #[test]
+    fn rebind_inputarg_carries_forwarded_state_to_new_ia() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_inputarg(Type::Int, 0);
+        let ia_a = std::rc::Rc::new(InputArg {
+            tp: Type::Int,
+            index: 0,
+            forwarded: std::cell::RefCell::new(Forwarded::None),
+        });
+        b.bind_inputarg(&ia_a);
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(11)));
+
+        *ia_a.forwarded.borrow_mut() = Forwarded::Info(OpInfo::Unknown);
+
+        let ia_b = std::rc::Rc::new(InputArg {
+            tp: Type::Int,
+            index: 0,
+            forwarded: std::cell::RefCell::new(Forwarded::None),
+        });
+        b.bind_inputarg(&ia_b);
+
+        match &*ia_b.forwarded.borrow() {
+            Forwarded::Info(OpInfo::Unknown) => {}
+            other => panic!("inputarg rebind dropped the latest forwarding: {other:?}"),
+        }
     }
 
     /// Same invariant for InputArg-bound boxes.
