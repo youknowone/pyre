@@ -6501,14 +6501,25 @@ impl MIFrame {
         &mut self,
         instruction: &Instruction,
     ) -> Result<pyre_interpreter::StepResult<FrontendOp>, PyError> {
-        let jitcode =
-            crate::jitcode_runtime::jitcode_for_instruction(instruction).unwrap_or_else(|| {
-                panic!(
-                    "dispatch_via_walker_for_opcode: production-walker allow-listed \
-                     instruction has no codewriter arm: {:?}",
-                    instruction,
-                )
-            });
+        let jitcode = match crate::jitcode_runtime::jitcode_for_instruction(instruction) {
+            Some(jc) => jc,
+            None => {
+                // The production-walker allow-list (`production_walker_handles`)
+                // expanded ahead of `jitcode_for_instruction` registering an
+                // arm for `instruction`; degrade to a trace abort so the
+                // outer tracer can fall back instead of crashing.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         no_codewriter_arm instr={:?}",
+                        instruction,
+                    );
+                }
+                return Err(trace_abort_error(
+                    "production walker allow-listed instruction has no codewriter arm",
+                ));
+            }
+        };
 
         let (done_void, done_int, done_ref, done_float, exit_exc_ref) =
             {
@@ -6582,15 +6593,40 @@ impl MIFrame {
                 apply_walker_stack_effect(self, instruction);
                 Ok(pyre_interpreter::StepResult::Continue)
             }
-            Ok((outcome, _)) => panic!(
-                "dispatch_via_walker_for_opcode: unexpected {:?} outcome for {:?}; \
-                 production-walker allow-list expansion must add a mapping arm",
-                outcome, instruction,
-            ),
-            Err(e) => panic!(
-                "dispatch_via_walker_for_opcode: walker failure {:?} for {:?}",
-                e, instruction,
-            ),
+            Ok((outcome, _)) => {
+                // Allow-list expansion let an opcode through whose arm
+                // returns something other than `SubReturn` (e.g. an arm
+                // that emits `Finish` or `Goto`); the walker leg cannot
+                // unify with `trace_code_step`'s top-level control flow
+                // for those, so abort the trace and let `trace_code_step`
+                // fall back to the trait dispatch.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         unexpected_outcome instr={:?} outcome={:?}",
+                        instruction, outcome,
+                    );
+                }
+                Err(trace_abort_error(
+                    "production walker received unexpected dispatch outcome",
+                ))
+            }
+            Err(e) => {
+                // Walker dispatch raised a structured error (e.g.
+                // `GotoIfNotValueNotConcrete`, register-bank size
+                // mismatch).  Surface as a trace abort so production
+                // recovers rather than crashing the process.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] dispatch_via_walker_for_opcode \
+                         walker_error instr={:?} err={:?}",
+                        instruction, e,
+                    );
+                }
+                Err(trace_abort_error(
+                    "production walker dispatch failed",
+                ))
+            }
         }
     }
 
