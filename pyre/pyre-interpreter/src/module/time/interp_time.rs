@@ -163,6 +163,72 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_int_new(d.as_nanos() as i64))
 }
 
+/// time.clock_settime(clk_id, time: float) → None
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "clock_settime() requires 2 arguments",
+        ));
+    }
+    if !unsafe { is_int(args[0]) } {
+        return Err(crate::PyError::type_error("clock id must be an integer"));
+    }
+    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let secs = unsafe {
+        if is_int(args[1]) {
+            w_int_get_value(args[1]) as f64
+        } else if is_float(args[1]) {
+            floatobject::w_float_get_value(args[1])
+        } else {
+            return Err(crate::PyError::type_error(
+                "clock_settime: time must be a real number",
+            ));
+        }
+    };
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(crate::PyError::value_error("clock_settime: invalid time"));
+    }
+    let dur = std::time::Duration::from_secs_f64(secs);
+    host_time::clock_settime(host_time::ClockId::from_raw(id), dur).map_err(|e| {
+        crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("clock_settime: {e}"),
+        )
+    })?;
+    Ok(w_none())
+}
+
+/// time.clock_settime_ns(clk_id, time: int) → None
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "clock_settime_ns() requires 2 arguments",
+        ));
+    }
+    if !unsafe { is_int(args[0]) } || !unsafe { is_int(args[1]) } {
+        return Err(crate::PyError::type_error(
+            "clock_settime_ns: clock id and time must be integers",
+        ));
+    }
+    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let ns = unsafe { w_int_get_value(args[1]) };
+    if ns < 0 {
+        return Err(crate::PyError::value_error(
+            "clock_settime_ns: invalid time",
+        ));
+    }
+    let dur = std::time::Duration::from_nanos(ns as u64);
+    host_time::clock_settime(host_time::ClockId::from_raw(id), dur).map_err(|e| {
+        crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("clock_settime_ns: {e}"),
+        )
+    })?;
+    Ok(w_none())
+}
+
 /// time.clock_getres(clk_id) → float seconds
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

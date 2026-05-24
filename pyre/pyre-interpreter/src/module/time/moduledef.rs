@@ -92,11 +92,27 @@ pub fn init(ns: &mut DictStorage) {
             make_builtin_function_with_arity("clock_gettime_ns", interp_time::clock_gettime_ns, 1),
         );
         #[cfg(not(target_os = "redox"))]
-        dict_storage_store(
-            ns,
-            "clock_getres",
-            make_builtin_function_with_arity("clock_getres", interp_time::clock_getres, 1),
-        );
+        {
+            dict_storage_store(
+                ns,
+                "clock_getres",
+                make_builtin_function_with_arity("clock_getres", interp_time::clock_getres, 1),
+            );
+            dict_storage_store(
+                ns,
+                "clock_settime",
+                make_builtin_function_with_arity("clock_settime", interp_time::clock_settime, 2),
+            );
+            dict_storage_store(
+                ns,
+                "clock_settime_ns",
+                make_builtin_function_with_arity(
+                    "clock_settime_ns",
+                    interp_time::clock_settime_ns,
+                    2,
+                ),
+            );
+        }
         dict_storage_store(
             ns,
             "CLOCK_REALTIME",
