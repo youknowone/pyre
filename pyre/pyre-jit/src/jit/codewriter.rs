@@ -9104,15 +9104,31 @@ impl CodeWriter {
         // `enforce_input_args`'s rotation lands the scratch on its
         // semantic local-i slot — matching walker's
         // `walker_slot_for_variable` pinning regime exactly.
+        //
+        // P4.B.2: also thread CFG `link.args ↔ target.inputargs`
+        // Variable pairs from `collect_cfg_coalesce_pairs` (PyPy
+        // `regalloc.py:79-96 coalesce_variables`).  The CFG sweep
+        // already feeds the SSARepr-side regalloc below; routing
+        // the same Variable-keyed pairs here puts the canonical
+        // Ref regalloc on the same pre-coalesce surface PyPy uses.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
             entry_arg_slots(code),
         );
+        let cfg_variable_pairs_for_canonical = collect_cfg_coalesce_pairs(&graph);
+        let canonical_ref_coalesce_pairs: Vec<(
+            super::flow::VariableId,
+            super::flow::VariableId,
+        )> = walker_pin_pairs
+            .iter()
+            .copied()
+            .chain(cfg_variable_pairs_for_canonical.iter().copied())
+            .collect();
         let mut graph_regallocs =
             super::regalloc::perform_register_allocation_all_kinds_with_pairs(
                 &graph,
-                &walker_pin_pairs,
+                &canonical_ref_coalesce_pairs,
             );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
