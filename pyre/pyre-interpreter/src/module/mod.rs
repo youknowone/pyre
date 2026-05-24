@@ -8,9 +8,13 @@ pub mod _io;
 #[allow(non_snake_case)]
 pub mod _ctypes;
 #[allow(non_snake_case)]
+pub mod _locale;
+#[allow(non_snake_case)]
 pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _posixshmem;
+#[allow(non_snake_case)]
+pub mod _random;
 #[allow(non_snake_case)]
 pub mod _signal;
 #[allow(non_snake_case)]
