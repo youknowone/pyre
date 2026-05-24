@@ -941,10 +941,21 @@ impl MIFrame {
     /// opcode that mutates the concrete stack (the walker records the
     /// residual_call but does not run `MIFrame::pop_value`'s `sym.valuestackdepth -= 1`).
     ///
-    /// Returns `None` only when `concrete_frame_addr == 0` (i.e. tests
-    /// constructing a sym-only `MIFrame`); production tracer paths always
-    /// seed `concrete_frame_addr` from the live `PyFrame`.
+    /// Returns `None` when:
+    /// 1. `concrete_frame_addr == 0` (tests constructing a sym-only `MIFrame`)
+    /// 2. `self.parent_frames` is non-empty (this MIFrame is an inline
+    ///    callee — its `concrete_frame_addr` is the heap PyFrame snapshot
+    ///    frozen at CALL entry and does not advance during inline body
+    ///    tracing.  The live traced depth for an inline frame lives only in
+    ///    `sym.valuestackdepth`, which the walker / trait dispatch update
+    ///    via `push_typed_value` / `pop_value` as the inline body executes).
+    ///
+    /// Production tracer paths always seed `concrete_frame_addr` from the
+    /// live `PyFrame` for the top frame.
     pub(crate) fn concrete_valuestackdepth(&self) -> Option<usize> {
+        if !self.parent_frames.is_empty() {
+            return None;
+        }
         crate::state::concrete_stack_depth(self.concrete_frame_addr)
     }
 
@@ -2296,7 +2307,21 @@ impl MIFrame {
         // values rather than a seed-time stale copy.  When dispatch unification
         // retires `execute_opcode_step`, this call becomes a no-op and can be
         // removed.
-        self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
+        //
+        // Inline-frame guard: when `self.parent_frames` is non-empty we are
+        // running `trace_code_step_inline` on a callee MIFrame.  The shared
+        // `TraceCtx.virtualizable_boxes` shadow still belongs to the portal
+        // (caller) frame; refreshing it from heap mid-inline would overwrite
+        // any caller-side updates that the walker pushed into the shadow
+        // before the inline call but has not yet written back to heap, and a
+        // guard raised in the callee would then capture stale caller state
+        // for `materialize_parent_snapshot_state` /
+        // `get_list_of_active_boxes`.  Skip the refresh for inline frames —
+        // the caller's last opcode boundary already ran the refresh from its
+        // own `set_orgpc` call.
+        if self.parent_frames.is_empty() {
+            self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
+        }
         self.publish_last_instr_to_vable(pc);
     }
 
