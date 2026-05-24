@@ -3528,18 +3528,33 @@ fn collect_outer_active_boxes(
     let live_i = banks.int.clone();
     let live_r = banks.ref_.clone();
     let live_f = banks.float.clone();
-    let (ni, nr, nf) = (sym.registers_i.len(), sym.registers_r.len(), sym.registers_f.len());
+    let (ni, nr, nf) = (
+        sym.registers_i.len(),
+        sym.registers_r.len(),
+        sym.registers_f.len(),
+    );
     let nlocals = sym.nlocals;
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
+    // Int / Float bank candidates: pyre's vable static fields decode as
+    // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
+    // register that the trait dispatcher never filled, the candidate fill
+    // is one of these sym shadow OpRefs.  Including them in the diagnostic
+    // lets Task #30 fallback work jump straight to the right source.
+    let vable_vsd = sym.vable_valuestackdepth;
+    let vable_last_instr = sym.vable_last_instr;
     let dump_ctx = |bank: &'static str, reg_idx: u32| -> String {
         let vable_idx = nvs + reg_idx as usize;
         let vable_val = if portal_vable_owner {
-            format!(
-                "{:?}",
-                trace_ctx.virtualizable_box_at(vable_idx)
-            )
+            format!("{:?}", trace_ctx.virtualizable_box_at(vable_idx))
         } else {
             "n/a (non-portal)".to_string()
+        };
+        let int_hint = if bank == "int" {
+            format!(
+                ", sym.vable_valuestackdepth={vable_vsd:?}, sym.vable_last_instr={vable_last_instr:?}"
+            )
+        } else {
+            String::new()
         };
         format!(
             "collect_outer_active_boxes: liveness-active {bank} \
@@ -3548,7 +3563,8 @@ fn collect_outer_active_boxes(
               nlocals={nlocals}, portal_vable_owner={portal_vable_owner}, \
               vable_len={vable_len}, vable[{vable_idx}]={vable_val}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
-              live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?})",
+              live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
+              {int_hint})",
         )
     };
     for &idx in &banks.int {
