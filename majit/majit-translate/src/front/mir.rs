@@ -144,14 +144,22 @@ pub fn build_semantic_program_from_llbc(
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
-    let mut fn_return_types: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
         if fd.unstructured().is_none() {
             continue;
         }
-        let name = fd.item_meta.name_path();
+        // Step 4.5 naming alignment: AST front-end keys SemanticFunction
+        // by bare leaf name plus a separate `module_path`.  Mirror the
+        // shape so `register_function_graph_alias` (lib.rs:444) walks
+        // `{bare, crate::*, pyre_*::*}` correctly for both front-ends
+        // and the portal lookup at lib.rs:1043 (`["eval_loop_jit"]`)
+        // resolves.
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let (module_path, name) = match stripped.rsplit_once("::") {
+            Some((module, leaf)) => (module.to_string(), leaf.to_string()),
+            None => (String::new(), stripped),
+        };
         // Step 4.5: a single function whose body the driver does not
         // yet handle should not abort the whole-program build.
         // Capture per-function errors into a side bucket and continue;
@@ -167,16 +175,21 @@ pub fn build_semantic_program_from_llbc(
                 continue;
             }
         };
-        // Step 4.3.a: surface return types as TyRef labels. Step 4.3.c
-        // will resolve TyRef → ADT path via `type_decls` (currently
-        // available as `llbc.type_by_id(...)`) once consumers need it.
-        fn_return_types.insert(name.clone(), fd.signature.output.label());
+        // Step 4.5: return_type is intentionally `None` until the
+        // Charon dedup-table widening (Step 4.3.c.ext) can resolve a
+        // `TyRef::Deduplicated{id}` to its primitive name. The
+        // codewriter's call-signature validator at
+        // `jit_codewriter/call.rs:4234` skips the check when declared
+        // type is None, which is the right behaviour while the
+        // resolution gap is open — TyRef labels (`ty#170`) would
+        // otherwise be classified as `Type::Ref` and trip a spurious
+        // mismatch panic against a real `Type::Int` callee result.
         functions.push(crate::front::ast::SemanticFunction {
             name,
             graph,
-            return_type: Some(fd.signature.output.label()),
+            return_type: None,
             self_ty_root: None,
-            module_path: String::new(),
+            module_path,
             hints: Vec::new(),
             access_directly: false,
         });
@@ -195,7 +208,10 @@ pub fn build_semantic_program_from_llbc(
         known_struct_names,
         known_trait_names,
         struct_fields,
-        fn_return_types,
+        // Step 4.5: fn_return_types empty until Step 4.3.c.ext (Charon
+        // dedup-table widening) lets us resolve TyRef→primitive name.
+        // Empty is type-validator-safe; TyRef labels are not.
+        fn_return_types: std::collections::HashMap::new(),
         // Immutable-field tracking depends on `#[majit_macros::immutable]`
         // attribute serialization that Charon does not currently surface
         // (the `attributes` array carries DocComment / Outer but not our
@@ -1294,6 +1310,24 @@ fn trait_call_label(v: &serde_json::Value) -> String {
         return format!("trait{decl_id}::m{method_idx}");
     }
     "unknown".to_string()
+}
+
+/// Strip the leading crate-name segment from a Charon `name_path()`.
+/// Charon prefixes every fully-qualified path with the crate name
+/// (`pyre_interpreter::frame::eval_loop_jit`), while the AST front-end
+/// names functions relative to their parsed-file root
+/// (`frame::eval_loop_jit` for a non-empty `module_path`, or the bare
+/// leaf for `module_path == ""`).  Matching the AST convention lets
+/// `register_function_graph_alias` (lib.rs:444) walk
+/// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, pyre_jit::*}`
+/// aliases off the same `func.name` for both front-ends.
+fn strip_crate_prefix(path: &str) -> String {
+    match path.split_once("::") {
+        Some((_crate, rest)) => rest.to_string(),
+        // single-segment name (rare — top-level item without crate
+        // prefix in some Charon outputs): leave as-is.
+        None => path.to_string(),
+    }
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {

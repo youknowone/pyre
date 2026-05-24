@@ -20,6 +20,10 @@ fn load_corpus() -> Llbc {
 fn lowers_straight_line_add() {
     let llbc = load_corpus();
     let graph = lower_function(&llbc, "straight_line_add").expect("lowering");
+    // FunctionGraph.name keeps the full Charon-qualified path
+    // because it identifies the LLBC source — only the
+    // SemanticFunction.name has the AST-convention crate-prefix
+    // stripping applied at SemanticProgram build time.
     assert_eq!(graph.name, "charon_spike_corpus::straight_line_add");
 
     let startblock = graph.block(graph.startblock);
@@ -158,24 +162,21 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     );
     let names: std::collections::HashSet<_> =
         program.functions.iter().map(|f| f.name.as_str()).collect();
+    // Names are crate-prefix-stripped to match AST convention
+    // (lib.rs:444 register_function_graph_alias walks bare leaf +
+    // crate aliases off this shape).
     for required in [
-        "charon_spike_corpus::straight_line_add",
-        "charon_spike_corpus::branch_loop_sum",
-        "charon_spike_corpus::strategy_len",
-        "charon_spike_corpus::desugar_mix",
+        "straight_line_add",
+        "branch_loop_sum",
+        "strategy_len",
+        "desugar_mix",
     ] {
         assert!(names.contains(required), "missing {required}");
     }
-    // Step 4.3.a populates fn_return_types with TyRef labels (not
-    // yet fully-qualified strings). Step 4.3.c will resolve TyRef
-    // labels into ADT paths via type_decls.
-    assert_eq!(program.fn_return_types.len(), program.functions.len());
-    assert!(
-        program
-            .fn_return_types
-            .get("charon_spike_corpus::straight_line_add")
-            .is_some()
-    );
+    // Step 4.5: fn_return_types is empty until Step 4.3.c.ext lands a
+    // dedup-table widening that resolves TyRef::Deduplicated{id} →
+    // primitive name. Empty is the type-validator-safe state.
+    assert!(program.fn_return_types.is_empty());
     // Step 4.3.b: corpus declares one struct-shaped enum (Strategy +
     // Token), one type alias (PyResult), so we expect Strategy/Token
     // and their variant paths plus the leaf names.

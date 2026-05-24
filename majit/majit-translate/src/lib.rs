@@ -137,13 +137,90 @@ fn build_semantic_program_via_active_frontend(
         if let Ok(llbc_path) = std::env::var("PYRE_MIR_FRONTEND_LLBC") {
             let llbc = majit_charon_reader::Llbc::load(&llbc_path)
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {llbc_path}: {e}"));
-            return front::mir::build_semantic_program_from_llbc(&llbc)
+            let mut program = front::mir::build_semantic_program_from_llbc(&llbc)
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {llbc_path}: {e}"));
+            // Step 4.5.b: hybrid hint pass. Charon does not yet
+            // serialize pyre's proc-macro attributes
+            // (`#[majit_macros::elidable*]` / `oopspec` / `portal`),
+            // but those attributes survive in the parsed_files syn::File
+            // trees the AST front-end already had to parse for
+            // compatibility. Walk the same source, build a
+            // {fn_path → hints} table, and merge into the
+            // MIR-driven SemanticProgram by name.
+            merge_hints_from_parsed_files(&mut program, parsed_files);
+            return program;
         }
     }
     let _ = parsed_files; // silence unused warning when only AST is reachable
     front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError")
+}
+
+/// Step 4.5.b helper — merge syn-AST proc-macro hints into a
+/// MIR-driven SemanticProgram.
+///
+/// Walks `parsed_files` for every top-level / impl-method `ItemFn`
+/// and records its `#[majit_macros::*]` attribute hints under both
+/// the bare leaf name and the module-qualified path. Then matches
+/// each `SemanticFunction` in `program` by the trailing segment of
+/// its `name` (Charon's `name_path` form, e.g.
+/// `pyre_interpreter::frame::Frame::pop`) and copies the hints in.
+///
+/// Matches by leaf because Charon paths use the crate name as the
+/// first segment (e.g. `pyre_interpreter::…`) while the AST parser
+/// is module-rooted; a full-path match would always miss.
+#[cfg(feature = "mir-frontend")]
+fn merge_hints_from_parsed_files(
+    program: &mut front::SemanticProgram,
+    parsed_files: &[parse::ParsedInterpreter],
+) {
+    use std::collections::HashMap;
+    let mut hints_by_leaf: HashMap<String, Vec<String>> = HashMap::new();
+    for parsed in parsed_files {
+        collect_hints_walk(&parsed.file.items, &mut hints_by_leaf);
+    }
+    for f in &mut program.functions {
+        let leaf = f.name.rsplit("::").next().unwrap_or(&f.name);
+        if let Some(h) = hints_by_leaf.get(leaf) {
+            f.hints.clone_from(h);
+        }
+    }
+}
+
+#[cfg(feature = "mir-frontend")]
+fn collect_hints_walk(
+    items: &[syn::Item],
+    out: &mut std::collections::HashMap<String, Vec<String>>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                let hints = front::ast::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
+                if !hints.is_empty() {
+                    out.insert(item_fn.sig.ident.to_string(), hints);
+                }
+            }
+            syn::Item::Impl(item_impl) => {
+                for sub in &item_impl.items {
+                    if let syn::ImplItem::Fn(impl_fn) = sub {
+                        let hints = front::ast::collect_jit_hints_with_sig(
+                            &impl_fn.attrs,
+                            &impl_fn.sig,
+                        );
+                        if !hints.is_empty() {
+                            out.insert(impl_fn.sig.ident.to_string(), hints);
+                        }
+                    }
+                }
+            }
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, sub_items)) = &item_mod.content {
+                    collect_hints_walk(sub_items, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Configurable canonical single-file analysis entry point.

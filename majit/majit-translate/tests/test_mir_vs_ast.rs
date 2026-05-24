@@ -109,12 +109,24 @@ fn semantic_program_builder_matches_corpus_count() {
     // assertion.
     let llbc = Llbc::load(CORPUS).expect("load corpus");
     let program = build_semantic_program_from_llbc(&llbc).expect("mir program");
-    let corpus_names: Vec<_> = program
+    // Crate-prefix stripped at SemanticProgram build (Step 4.5);
+    // match against the bare leaf names instead.
+    let leaves: std::collections::HashSet<_> = program
         .functions
         .iter()
-        .filter(|f| f.name.starts_with("charon_spike_corpus::"))
         .map(|f| f.name.clone())
         .collect();
+    let corpus_names: Vec<_> = [
+        "straight_line_add",
+        "branch_loop_sum",
+        "strategy_len",
+        "parse_one",
+        "desugar_mix",
+    ]
+    .iter()
+    .filter(|n| leaves.contains(**n))
+    .map(|s| s.to_string())
+    .collect();
     // 4 pub fns (straight_line_add, branch_loop_sum, strategy_len,
     // desugar_mix) + the `parse_one` private helper that
     // `desugar_mix` calls.
