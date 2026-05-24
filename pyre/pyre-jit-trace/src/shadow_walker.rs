@@ -105,13 +105,17 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // panics under `MAJIT_SHADOW_WALKER=1`.
     // Phase 5.A (issue #73, 2026-05-20): the Nop family of 5 zero-op
     // opcodes has been production-flipped to walker dispatch via
-    // `production_walker_handles` in trace_opcode.rs.  Phase 5.B
-    // (2026-05-21) added PopTop to the same set.  Shadow validation is
-    // now moot for those because there is no parallel trait dispatch to
-    // compare against — the walker IS production.  See
-    // `[[project-issue73-phase5-design]]` for the cutover sequencing
-    // and `[[project_issue73_phase4_poptop_vable_getfield_blocker]]` for
-    // the small-int unboxed concrete vs heap-pointer view residual gap.
+    // `production_walker_handles` in trace_opcode.rs (currently:
+    // `Nop | ExtendedArg | Resume { .. } | Cache | NotTaken`).  A
+    // subsequent PopTop activation was reverted in Stage A.1 because
+    // its sym-shadow effects cannot ride alongside the trait dispatch
+    // for `raise_catch_loop` / `synth/set_membership`; see
+    // `[[project_issue73_phase4_poptop_vable_getfield_blocker]]` for
+    // the small-int unboxed concrete vs heap-pointer view residual gap
+    // and `[[project-issue73-phase5-design]]` for the cutover sequencing.
+    // Shadow validation is moot for the production-flipped opcodes
+    // because there is no parallel trait dispatch to compare against —
+    // the walker IS production.
     //
     // Net effect: this function returns `false` for every instruction —
     // the shadow allow-list is intentionally empty for this phase.
