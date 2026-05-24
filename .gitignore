@@ -76,6 +76,9 @@ benchmarks/*
 /target
 Cargo.lock
 
+# Build artefacts: Charon binary fetched via scripts/install-charon.sh
+/build/
+
 # Local Claude settings (personal, not committed)
 .claude/settings.local.json
 .claude/stop-hook.sh
