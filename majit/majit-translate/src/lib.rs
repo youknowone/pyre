@@ -1158,8 +1158,12 @@ fn analyze_pipeline_from_parsed(
         total_vable_rewrites: 0,
     };
 
-    let (opcode_dispatch, jitcodes, insns, descrs) =
-        build_canonical_opcode_dispatch(parsed_files, &config.pipeline, &mut call_control);
+    let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
+        parsed_files,
+        &program.fn_return_types,
+        &config.pipeline,
+        &mut call_control,
+    );
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
@@ -1197,6 +1201,7 @@ fn analyze_pipeline_from_parsed(
 /// it picks up callee graphs discovered during jtransform.
 fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
+    fn_return_types: &std::collections::HashMap<String, String>,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
@@ -1208,7 +1213,7 @@ fn build_canonical_opcode_dispatch(
     let mut opcode_arms = Vec::new();
 
     for parsed in parsed_files {
-        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed);
+        let file_opcodes = parse::extract_opcode_dispatch_arms(parsed, fn_return_types);
         if !file_opcodes.is_empty() {
             opcode_arms = file_opcodes;
             break;

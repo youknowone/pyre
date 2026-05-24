@@ -1707,7 +1707,8 @@ pub fn lower_expr_into_graph(
     graph: &mut FunctionGraph,
     expr: &syn::Expr,
 ) -> Result<(), FlowingError> {
-    lower_expr_into_graph_with_signature(graph, expr, None)
+    let empty_fn_ret = HashMap::new();
+    lower_expr_into_graph_with_signature(graph, expr, None, &empty_fn_ret)
 }
 
 /// Variant of [`lower_expr_into_graph`] that pre-registers a function
@@ -1732,20 +1733,28 @@ pub fn lower_expr_into_graph(
 /// (`front/ast.rs:3056-3156`) but skips module-prefix / use-imports /
 /// struct / trait registries, since opcode-dispatch arm graphs are
 /// synthesized without whole-program context.
+///
+/// `fn_return_types` carries the whole-program callee-return-type map
+/// (`ProgramMetadata.fn_return_types`) so callsites inside the arm
+/// body resolve a function's declared return type instead of falling
+/// back to `ValueType::Unknown = Type::Ref`.  RPython
+/// `annrpython.py:103-150 build_types` is a single whole-program pass
+/// before per-function graph build; the arm-graph synthesis sits
+/// after that pass so the map is fully populated.
 pub fn lower_expr_into_graph_with_signature(
     graph: &mut FunctionGraph,
     expr: &syn::Expr,
     sig: Option<&syn::Signature>,
+    fn_return_types: &HashMap<String, String>,
 ) -> Result<(), FlowingError> {
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
-    let empty_fn_ret = HashMap::new();
     let empty_suffix_index = MethodSuffixIndex::default();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let mut ctx = GraphBuildContext::new(
         &empty_registry,
-        &empty_fn_ret,
+        fn_return_types,
         &empty_suffix_index,
         "",
         HashMap::new(),

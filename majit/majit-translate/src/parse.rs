@@ -1249,14 +1249,21 @@ fn collect_inherent_methods_from_items(
 ///
 /// Duplicate opcode selectors are rejected. Silently keeping the first arm
 /// would hide dispatch drift in the interpreter source.
-pub fn extract_opcode_dispatch_arms(parsed: &ParsedInterpreter) -> Vec<ExtractedOpcodeArm> {
+pub fn extract_opcode_dispatch_arms(
+    parsed: &ParsedInterpreter,
+    fn_return_types: &std::collections::HashMap<String, String>,
+) -> Vec<ExtractedOpcodeArm> {
     let Some(func) = find_function(parsed, "execute_opcode_step") else {
         return Vec::new();
     };
     let Some(opcode_match) = find_opcode_match(func) else {
         return Vec::new();
     };
-    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match, &func.sig))
+    reject_duplicate_opcode_selectors(extract_match_arms(
+        opcode_match,
+        &func.sig,
+        fn_return_types,
+    ))
 }
 
 /// Extract receiver -> trait bounds for `execute_opcode_step`.
@@ -1324,7 +1331,11 @@ pub fn collect_function_graphs(
 /// a panic rather than silently dropping the arm's graph.  Silently
 /// dropping would let a `PipelineOpcodeArm` reach the codewriter
 /// without the semantic graph the downstream jitcode path depends on.
-fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOpcodeArm> {
+fn extract_match_arms(
+    expr: &ExprMatch,
+    sig: &syn::Signature,
+    fn_return_types: &std::collections::HashMap<String, String>,
+) -> Vec<ExtractedOpcodeArm> {
     expr.arms
         .iter()
         .map(|arm| {
@@ -1347,6 +1358,7 @@ fn extract_match_arms(expr: &ExprMatch, sig: &syn::Signature) -> Vec<ExtractedOp
                 &mut graph,
                 &arm.body,
                 Some(sig),
+                fn_return_types,
             )
             .unwrap_or_else(|e| {
                 panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")
@@ -2206,7 +2218,7 @@ mod tests {
             }
         "#,
         );
-        let arms = extract_opcode_dispatch_arms(&parsed);
+        let arms = extract_opcode_dispatch_arms(&parsed, &std::collections::HashMap::new());
         let selectors: Vec<String> = arms
             .iter()
             .map(|arm| arm.selector.canonical_key())
@@ -2235,6 +2247,6 @@ mod tests {
             }
         "#,
         );
-        let _ = extract_opcode_dispatch_arms(&parsed);
+        let _ = extract_opcode_dispatch_arms(&parsed, &std::collections::HashMap::new());
     }
 }

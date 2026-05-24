@@ -4500,47 +4500,15 @@ impl CallControl {
                             let expected_result =
                                 return_type_string_to_value_type(Some(&effective_declared));
                             // RPython call.py:220 hard-fails when
-                            // `RESULT != FUNC.RESULT`.  Pyre's
-                            // dispatch-arm entry
-                            // (`parse.rs::lower_expr_into_graph_with_signature`)
-                            // currently passes an empty
-                            // `fn_return_types`, so the front-end
-                            // falls back to `ValueType::Unknown` (=
-                            // `Type::Ref`) for any bare callsite of a
-                            // function whose return type the front-end
-                            // could not resolve.  A callee declared as
-                            // a primitive (`Int` / `Float`) then sees a
-                            // caller-side `Type::Ref` actual at
-                            // `getcalldescr` — observably
-                            // indistinguishable from a real signature
-                            // mismatch but driven entirely by the
-                            // missing side-table.
-                            //
-                            // PRE-EXISTING-ADAPTATION: the leniency
-                            // narrows to that exact shape (`Ref` actual
-                            // vs `Int|Float` declared) and only fires
-                            // when the audit env var
-                            // `PYRE_STRICT_GETCALLDESCR` is unset.
-                            // `Type::Void` declared vs `Type::Ref`
-                            // actual remains a hard fail (the front-end
-                            // emits `Type::Void` directly from a real
-                            // `()` return spelling).  The PyPy-strict
-                            // version of this check requires closing
-                            // the fn_return_types gap — restoring
-                            // strict-mode without the gap closure
-                            // surfaces strict failures at
-                            // `jtransform.rs` (outside the
-                            // `dual_gate_publish_concretetypes`
-                            // `catch_unwind`), making the build
-                            // unbuildable.  Tracked as a multi-session
-                            // epic; the env-var override stays as the
-                            // audit-time strict gate.
-                            let strict_mode =
-                                std::env::var_os("PYRE_STRICT_GETCALLDESCR").is_some();
-                            let result_type_unresolved = !strict_mode
-                                && matches!(result_type, Type::Ref)
-                                && matches!(expected_result, Type::Int | Type::Float);
-                            if result_type != expected_result && !result_type_unresolved {
+                            // `RESULT != FUNC.RESULT`.  The arm-graph
+                            // entry threads `ProgramMetadata.fn_return_types`
+                            // through to
+                            // `lower_expr_into_graph_with_signature`
+                            // (parse.rs:808), so every callsite's
+                            // expected result type is resolved from the
+                            // whole-program return-type map before it
+                            // reaches `getcalldescr`.
+                            if result_type != expected_result {
                                 panic!(
                                     "in operation calling {target}: calling a \
                                      function with return type \
