@@ -1577,10 +1577,11 @@ pub fn function_graph_to_flowspace(
                         // legacy Variable cell directly, so the write is
                         // additive — `RPythonTyper.specialize` won't
                         // overwrite this slot.  Downstream consumers
-                        // reading `graph.concretetype(v)` (RPython parity
-                        // for `getkind(v.concretetype)`) then see the
-                        // const kind inline, without depending on the
-                        // post-rtyper `apply_to_graph(constant_concretetypes, …)`
+                        // reading `FunctionGraph::concretetype_of(&v)`
+                        // (RPython parity for `getkind(v.concretetype)`)
+                        // then see the const kind inline, without
+                        // depending on the post-rtyper
+                        // `apply_to_graph(constant_concretetypes, …)`
                         // bridge.
                         if let Some(var) = legacy.variable_at(slot) {
                             var.set_concretetype(Some(ct.clone()));

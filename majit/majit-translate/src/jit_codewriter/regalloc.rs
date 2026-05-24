@@ -449,7 +449,7 @@ impl RegAllocResult {
 }
 
 // `perform_register_allocation` reads kinds directly from
-// `graph.concretetype(v)`, matching upstream
+// `FunctionGraph::concretetype_of(&v)`, matching upstream
 // `regalloc.py::perform_register_allocation(graph, kind)` where
 // every Variable's kind comes from `getkind(v.concretetype)`.
 // See [`perform_register_allocation`] below.
@@ -467,8 +467,9 @@ impl RegAllocResult {
 /// hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
 /// did not — equivalent to the previous `augment_value_kinds_*`
 /// helper but written directly through to each backing
-/// `Variable.concretetype` cell via `graph.set_concretetype`
-/// instead of returning a transitional HashMap.
+/// `Variable.concretetype` cell via
+/// `FunctionGraph::set_concretetype_of_inline` instead of returning
+/// a transitional HashMap.
 pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
     let except_args = &graph.block(graph.exceptblock).inputargs;
     if except_args.len() == 2 {
@@ -490,8 +491,9 @@ pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
 /// Perform register allocation for all three kinds — `&FunctionGraph`-only.
 ///
 /// RPython parity: every `Variable.concretetype` is the source of
-/// kind; pyre reads each per-value kind via `graph.concretetype(v)`,
-/// projecting the [`ConcreteType`] enum onto the JIT codewriter's
+/// kind; pyre reads each per-value kind via
+/// `FunctionGraph::concretetype_of(&v)`, projecting the
+/// [`ConcreteType`] enum onto the JIT codewriter's
 /// [`RegKind`] partitioning axis.  Canonical exceptblock inputargs
 /// are stamped on the graph up-front via
 /// [`augment_canonical_exceptblock_on_graph`].
@@ -527,8 +529,8 @@ pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKin
 
 /// `regalloc.py::perform_register_allocation(graph, kind)` direct
 /// port.  Runs on FunctionGraph (Block structure), BEFORE flatten.
-/// Reads kind from `graph.concretetype(v)` exactly like upstream
-/// reads `getkind(v.concretetype)`.
+/// Reads kind from `FunctionGraph::concretetype_of(&v)` exactly like
+/// upstream reads `getkind(v.concretetype)`.
 pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocResult {
     let consider =
         |var: &crate::flowspace::model::Variable| -> bool { variable_regkind(var) == Some(kind) };

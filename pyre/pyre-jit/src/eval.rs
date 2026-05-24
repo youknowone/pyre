@@ -174,7 +174,7 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
 /// (`dictmultiobject.py:702-705`) reaches the full
 /// `__eq__`/`__hash__` resolution.
 unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObjectRef) -> bool {
-    pyre_interpreter::baseobjspace::compares_by_identity(w_type)
+    unsafe { pyre_interpreter::baseobjspace::compares_by_identity(w_type) }
 }
 
 /// Custom trace for `W_TypeObject`.
@@ -258,7 +258,7 @@ unsafe fn module_dict_object_custom_trace(
         let strategy = unsafe { &mut *md.mstrategy };
         if let Some(caches) = strategy.caches.as_mut() {
             for cache in caches.values() {
-                trace_global_cache(cache, f);
+                unsafe { trace_global_cache(cache, f) };
             }
         }
     }
@@ -287,7 +287,7 @@ unsafe fn trace_global_cache(
         // at a DIFFERENT GlobalCache instance per `celldict.py:236
         // builtin_strategy.get_global_cache(w_builtin_dict, key)`.
         drop(c);
-        trace_global_cache(&builtincache, f);
+        unsafe { trace_global_cache(&builtincache, f) };
     }
 }
 

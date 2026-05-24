@@ -12,9 +12,6 @@ use crate::flowspace::model::ConstValue;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ValueId(pub usize);
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueType {
     Int,
@@ -1095,7 +1092,7 @@ pub struct Block {
     /// Framestate snapshot captured at the moment this block was closed
     /// (its `set_goto` / `set_branch` / `set_return`).  Read by the
     /// frontend's lazy cross-block local installer to recover, after the
-    /// fact, what `(name → ValueId)` mapping was visible to a
+    /// fact, what `(name → Variable)` mapping was visible to a
     /// predecessor when its outgoing link fired.  Build-time only —
     /// downstream rtyper/jtransform passes ignore this field; it is
     /// neither serialised nor required to remain populated past the
@@ -1141,23 +1138,23 @@ pub struct FrameState {
     /// Slot `i` ↔ graph-wide first-bind name at index `i`; `None` if
     /// unbound at this snapshot point.  RPython parity:
     /// `framestate.py:19 self.locals_w` — list of `Variable | Constant
-    /// | None` indexed by `co_varnames` slot.  Pyre's AST-frontend
-    /// graph keys variable identity through `ValueId`; Path-Z Slice 2.5
-    /// replaces this with `Vec<Option<Hlvalue>>` once the front::ast
-    /// cutover lands, dropping the AST-side identity in favour of
-    /// upstream `flowspace::Variable`.
-    pub entries: Vec<Option<ValueId>>,
+    /// | None` indexed by `co_varnames` slot.  Carries upstream
+    /// `Variable` identity directly; the parallel `locals_w`
+    /// `Vec<Option<Hlvalue>>` carrier (next field) still distinguishes
+    /// `Hlvalue::Constant` cells which this Variable-only carrier
+    /// collapses to `None`.
+    pub entries: Vec<Option<crate::flowspace::model::Variable>>,
     /// Parallel `Hlvalue` carrier matching upstream
     /// `framestate.py:19 self.locals_w` shape — list of
     /// `Variable | Constant | None` indexed by `co_varnames` slot.
     /// Currently derived from `entries` at the end of `union` via
     /// `graph.variable_at(slot)` lookup; the long-term plan is to
     /// promote this to the single source of truth and retire the
-    /// ValueId carrier (task #56 — Delete ValueId struct, key IR
-    /// slots on Variable identity).  Production read sites still
-    /// consume `entries`; future substeps swap them over slot-by-slot
-    /// before flipping the construction direction (fixtures populate
-    /// `locals_w` directly, `entries` becomes the derived projection).
+    /// per-entry `Variable` carrier in `entries`.  Production read
+    /// sites still consume `entries`; future substeps swap them over
+    /// slot-by-slot before flipping the construction direction
+    /// (fixtures populate `locals_w` directly, `entries` becomes
+    /// the derived projection).
     ///
     /// Fixtures that build a `FrameState` by hand keep this empty;
     /// only `FrameState::union` populates it today.  Read sites that
@@ -1201,11 +1198,38 @@ impl FrameState {
     /// query the type via `graph.concretetype_at(value_slot)` —
     /// upstream `framestate.py:locals_w` slot-index convention with
     /// type carried on the `Variable.concretetype` slot.
-    pub fn iter_slots(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub fn iter_slots<'a>(
+        &'a self,
+        graph: &'a FunctionGraph,
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
         self.entries
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| e.map(|vid| (i, vid.0)))
+            .filter_map(move |(i, e)| e.as_ref().and_then(|v| graph.slot_of(v).map(|s| (i, s))))
+    }
+
+    /// Project `entries[slot]` to a backing `Variable` via the graph's
+    /// slot table.  `Some` when the slot is bound and its `Variable`
+    /// resolves on `graph`; `None` for unbound (None-killed) slots or
+    /// out-of-range indices.
+    pub fn entry_var(
+        &self,
+        slot: usize,
+        _graph: &FunctionGraph,
+    ) -> Option<crate::flowspace::model::Variable> {
+        self.entries.get(slot).cloned().flatten()
+    }
+
+    /// Project `entries[slot]` to the graph-wide value slot index its
+    /// backing Variable occupies.  Returns `Some(idx)` when the entry
+    /// is bound and resolves to a registered Variable; `None` for
+    /// None-killed slots or out-of-range indices.  Bridge accessor
+    /// ahead of the carrier flip — after `entries` holds Variables
+    /// directly the body becomes
+    /// `self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))`,
+    /// keeping callers identity-stable through the flip.
+    pub fn entry_slot(&self, slot: usize, graph: &FunctionGraph) -> Option<usize> {
+        self.entry_var(slot, graph).and_then(|v| graph.slot_of(&v))
     }
 
     /// Authoritative locals view — upstream `framestate.py:19 self.locals_w`
@@ -1228,15 +1252,10 @@ impl FrameState {
             std::borrow::Cow::Borrowed(&self.locals_w)
         } else {
             std::borrow::Cow::Owned(
-                self.entries
-                    .iter()
-                    .map(|slot| {
-                        slot.and_then(|vid| {
-                            graph
-                                .variable_at(vid.0)
-                                .cloned()
-                                .map(crate::flowspace::model::Hlvalue::Variable)
-                        })
+                (0..self.entries.len())
+                    .map(|i| {
+                        self.entry_var(i, graph)
+                            .map(crate::flowspace::model::Hlvalue::Variable)
                     })
                     .collect(),
             )
@@ -1255,19 +1274,20 @@ impl FrameState {
     /// Per-slot semantics (RPython `framestate.py:105-128 union`):
     ///   - `(None, _) | (_, None)` → None-kill (`framestate.py:
     ///     110-111`); merged slot is `None`.
-    ///   - `(Some(s), Some(o))` with `s.value_id == o.value_id` →
-    ///     carry through that vid (`framestate.py:108 if w1 == w2:
+    ///   - `(Some(s), Some(o))` with matching Variable identity →
+    ///     carry through that Variable (`framestate.py:108 if w1 == w2:
     ///     return w1`).
-    ///   - `(Some(s), Some(o))` with disagreeing vids →
-    ///     `graph.alloc_value()` for a fresh `ValueId` at the slot
-    ///     (`framestate.py:113-114 return Variable()` analogue).
+    ///   - `(Some(s), Some(o))` with disagreeing Variables →
+    ///     `graph.alloc_value_var()` for a fresh slot at this
+    ///     position (`framestate.py:113-114 return Variable()`
+    ///     analogue).
     ///
     /// Type unification is NOT performed here — upstream's per-slot
     /// `union(w1, w2)` (`framestate.py:105-128`) compares Hlvalue
     /// identity only, with type-side reconciliation deferred to the
     /// annotator (`annrpython.py`).  Pyre follows the same convention:
-    /// callers query types via `graph_value_type(graph, value_id)` at
-    /// the point of use; the prior per-slot `value_type` field on
+    /// callers query types via `FunctionGraph::concretetype_of(&var)`
+    /// at the point of use; the prior per-slot `value_type` field on
     /// `FrameStateEntry` was a NEW-DEVIATION that has been retired in
     /// Path-Z Slice 2.3.
     ///
@@ -1277,13 +1297,13 @@ impl FrameState {
     /// The `None` return propagates upstream's "merge candidates
     /// disagree, fall back to a fresh SpamBlock" path at
     /// `flowcontext.py:431-436 mergeblock`.  Agreement slots in the
-    /// locals projection carry the predecessor's vid, disagreement
-    /// slots get a freshly-allocated vid (the upstream `Variable()`
+    /// locals projection carry the predecessor's Variable, disagreement
+    /// slots get a freshly-allocated Variable (the upstream `Variable()`
     /// analogue).  Callers detect "this slot is a fresh phi" by
-    /// comparing the merged `value_id` against the predecessor's vid
+    /// comparing the merged Variable identity against the predecessor's
     /// for the same slot.  The install is then driven via
-    /// `lazy_install_local_at_current_block(.., Some(merged_vid))` so
-    /// the Input op carries the same vid the merged state already
+    /// `lazy_install_local_at_current_block(.., Some(merged_var))` so
+    /// the Input op carries the same Variable the merged state already
     /// refers to.
     pub fn union(&self, other: &FrameState, graph: &mut FunctionGraph) -> Option<FrameState> {
         // Line-by-line port of `framestate.py:73-90 FrameState.union`:
@@ -1316,12 +1336,13 @@ impl FrameState {
         // Body order (`framestate.py:79-87`): locals → stack →
         // exception, all inside the try/except envelope.  Pyre
         // **reorders** to (stack → exception → locals): the locals
-        // fold is total (ValueId domain has no UnionError analogue)
-        // but invokes `graph.alloc_value()` which advances a global
-        // allocator counter.  Stack and exception unions CAN return
-        // `None`/`Err` once the Z4 walker activates real cells; doing
-        // them first keeps `union` atomic — no `alloc_value` writes
-        // unless the whole merge succeeds.  Upstream's `Variable()`
+        // fold is total (Variable domain has no UnionError analogue)
+        // but invokes `graph.alloc_value_var()` which advances a
+        // global allocator counter.  Stack and exception unions CAN
+        // return `None`/`Err` once the Z4 walker activates real
+        // cells; doing them first keeps `union` atomic — no
+        // `alloc_value_var` writes unless the whole merge succeeds.
+        // Upstream's `Variable()`
         // construction is side-effect-free (per-instance object), so
         // the reorder is a Rust-side atomic-safety adaptation with
         // no observable upstream-parity divergence.
@@ -1391,9 +1412,9 @@ impl FrameState {
         // `framestate.py:113-114 union` mints a fresh `Variable()`
         // at every disagreeing-cell position across the locals /
         // stack / exception projections.  Pair each such Variable
-        // identity with a pyre ValueId so that when the merged
+        // identity with a graph slot so that when the merged
         // FrameState later becomes a predecessor of another merge,
-        // the Hlvalue→ValueId bridge resolves without silently
+        // the Hlvalue→slot bridge resolves without silently
         // allocating a fresh slot at the read site.  Carry-through
         // Variables (`framestate.py:108 if w1 == w2: return w1`)
         // are already registered at their upstream definition site
@@ -1401,7 +1422,7 @@ impl FrameState {
         // leaves them alone.
         for cell in locals_w.iter().flatten() {
             if let crate::flowspace::model::Hlvalue::Variable(v) = cell {
-                graph.ensure_variable_registered_void(v);
+                graph.ensure_variable_registered_void(&v);
             }
         }
         graph.register_phi_variables_in_stack_exc(
@@ -1415,21 +1436,21 @@ impl FrameState {
         // Derive `entries` from `locals_w` — `locals_w` is now the
         // primary carrier matching `framestate.py:19 self.locals_w`,
         // and `entries` is a backward-compatibility view for callers
-        // that have not yet migrated.  `Hlvalue::Variable(v)` →
-        // `graph.value_id_of(v)` recovers the ValueId paired at
-        // either an upstream definition site or the
-        // `ensure_variable_registered_void` walk above;
-        // `Hlvalue::Constant(_)` cells carry no ValueId (Constants
-        // are not ValueId-bound in the pyre IR), so they collapse
-        // to `None` in the `entries` view — matching the prior
-        // ValueId-only locals fold's lossy projection on the few
-        // sites where a Constant could land in locals via
+        // that have not yet migrated.  `Hlvalue::Variable(v)` is
+        // cloned directly into the entry, with its identity already
+        // registered at either an upstream definition site or the
+        // `ensure_variable_registered_void` walk above.
+        // `Hlvalue::Constant(_)` cells carry no Variable identity
+        // (Constants are not Variable-bound in the pyre IR), so they
+        // collapse to `None` in the `entries` view — matching the
+        // prior Variable-only locals fold's lossy projection on the
+        // few sites where a Constant could land in locals via
         // `setstate`.
-        let entries: Vec<Option<ValueId>> = locals_w
+        let entries: Vec<Option<crate::flowspace::model::Variable>> = locals_w
             .iter()
             .map(|slot| {
                 slot.as_ref().and_then(|hv| match hv {
-                    crate::flowspace::model::Hlvalue::Variable(v) => graph.value_id_of(v),
+                    crate::flowspace::model::Hlvalue::Variable(v) => Some(v.clone()),
                     crate::flowspace::model::Hlvalue::Constant(_) => None,
                 })
             })
@@ -1477,9 +1498,9 @@ impl FrameState {
         //   - `Hlvalue::Variable(v)` → `LinkArg::Value(v.clone())` —
         //     the Variable identity carries through inline, so a
         //     single upstream `Variable` reaches every Link threading
-        //     it without a separate ValueId allocation.
+        //     it without a separate slot allocation.
         //   - `Hlvalue::Constant(c)` → `LinkArg::Const(c.clone())` —
-        //     direct carry, no synthetic op or ValueId required.
+        //     direct carry, no synthetic op or slot required.
         //
         // Upstream's `mergeable` is `locals_w + recursively_flatten(
         // stack) + [exc_type, exc_value]`.  Pyre walks the same three
@@ -1611,7 +1632,7 @@ impl FrameState {
     /// stack) + [exc_type, exc_value]` (same shape as `getvariables` /
     /// `getoutputargs`).  Two cells match iff they are equal or both
     /// are `Variable` cells (regardless of identity — phi slot equality
-    /// is by structure, not vid).  `(None, None)` matches; any other
+    /// is by structure, not Variable identity).  `(None, None)` matches; any other
     /// mix involving `None` does not.
     pub fn matches(&self, other: &FrameState, graph: &FunctionGraph) -> bool {
         use crate::flowspace::model::Hlvalue;
@@ -1672,15 +1693,31 @@ impl FrameState {
 
     /// cfg(test) constructor mirror of [`entry_slots`] in
     /// `front/ast.rs`: project a slice of `Option<usize>` slot indices
-    /// into a `Vec<Option<ValueId>>` ready for
+    /// into a `Vec<Option<Variable>>` ready for
     /// `FrameState { entries: ..., .. }` initialization.  Used by
-    /// hand-built test fixtures to retire caller-side `Some(ValueId(N))`
-    /// literals while the `Vec<Option<ValueId>>` storage shape is still
-    /// in place (the final flip to `Vec<Option<Variable>>` is the
-    /// multi-session carrier blocker).
+    /// hand-built test fixtures so each fixture stays slot-indexed
+    /// while the storage carrier holds Variable identities.  Each slot
+    /// is materialized on `graph` via `bind_variable_at` if not already
+    /// present so subsequent `slot_of(v)` reads round-trip back to the
+    /// fixture's slot index.
     #[cfg(test)]
-    pub(crate) fn entries_from_slots(slots: &[Option<usize>]) -> Vec<Option<ValueId>> {
-        slots.iter().map(|s| s.map(ValueId)).collect()
+    pub(crate) fn entries_from_slots(
+        slots: &[Option<usize>],
+        graph: &mut FunctionGraph,
+    ) -> Vec<Option<crate::flowspace::model::Variable>> {
+        slots
+            .iter()
+            .map(|s| {
+                s.map(|idx| match graph.variable_at(idx) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let v = crate::flowspace::model::Variable::new();
+                        graph.bind_variable_at(idx, v.clone());
+                        v
+                    }
+                })
+            })
+            .collect()
     }
 }
 
@@ -1878,7 +1915,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///      Input op is already gone).  Naked `OpKind::Input` ops
 ///      (legacy frontend fallback for cross-block reads not yet
 ///      routed through the lazy installer) are likewise removed
-///      when their result vid is dead — `simplify.py` itself has
+///      when their result Variable is dead — `simplify.py` itself has
 ///      no standalone Input shape, but the line-by-line port
 ///      sweeps them under the same canremove rule.
 ///
@@ -1913,7 +1950,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///   7. Walk each reachable non-terminal block once more and drop
 ///      `block.inputargs[i]` (and its matching `OpKind::Input` op
 ///      if still present in `block.operations`) for every dead
-///      vid (`simplify.py:520-524`).
+///      Variable (`simplify.py:520-524`).
 pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     use crate::inline::is_pure_op;
     use std::collections::HashMap;
@@ -1997,7 +2034,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // `block.exitswitch is c_last_exception`).  Pure-classified
     // ops parked there as overflow / zero-divide checks
     // (`int_add_ovf`, `int_floordiv_zer`, ...) MUST NOT be DCE'd
-    // even if their result vid is unread — the raise side-effect
+    // even if their result Variable is unread — the raise side-effect
     // is observable.
     // RPython `simplify.py:425-426`:
     //     read_vars = set()  # set of variables really used
@@ -2099,7 +2136,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // Step 5: drop every pure op whose result is dead.
     // `simplify.py:484-488 if op.result not in read_vars: if
     // canremove(op, block): del block.operations[i]`.
-    // Inputarg-shaped Input ops keep their result vid in `read_vars`
+    // Inputarg-shaped Input ops keep their result Variable in `read_vars`
     // via Step 1+3+dependency-routing, so the live ones survive
     // unconditionally; dead ones get removed alongside their
     // matching inputarg trim in Step 7.  Naked Input ops (the
@@ -2247,8 +2284,8 @@ impl Block {
 /// renamer so callers whose alias map is keyed on Variable identity
 /// (e.g. jtransform's `Transformer.aliases: HashMap<Variable,
 /// Variable>` or inline's per-block value_map) write the rename
-/// directly without round-tripping through ValueId.  Mirrors upstream's
-/// Variable-identity rewrite path.
+/// directly without round-tripping through a slot index.  Mirrors
+/// upstream's Variable-identity rewrite path.
 pub fn remap_control_flow_metadata_var<FValue, FBlock>(
     exitswitch: &Option<ExitSwitch>,
     exits: &[Link],
@@ -2511,39 +2548,37 @@ pub struct FunctionGraph {
     pub blocks: Vec<Block>,
     pub notes: Vec<String>,
     next_value: usize,
-    /// Per-`ValueId` backing [`crate::flowspace::model::Variable`].
+    /// Per-slot backing [`crate::flowspace::model::Variable`].
     ///
     /// **Variable identity bridge** — RPython's IR is keyed on
     /// `Variable` identity (`flowspace/model.py:280`); pyre uses
-    /// `ValueId` as a dense index but eagerly stores the
+    /// a dense slot index but eagerly stores the
     /// `Variable` so [`Self::concretetype`] can route reads
     /// through `Variable.concretetype` directly (the upstream
     /// inline attribute), and so future passes can adopt
     /// Variable-keyed lookups (`replace`, `name`, etc.) without
-    /// further churn.  Every freshly minted `ValueId` (via
+    /// further churn.  Every freshly minted slot (via
     /// [`Self::alloc_value_var_with_type`], [`Self::set_next_value`]
     /// grow paths, etc.) gets a `Some(Variable::new())` so this
     /// vec is the single source of truth — no parallel kind
-    /// side-table backs it.  Indexed by `ValueId.0`.
+    /// side-table backs it.  Indexed by slot index.
     pub value_variables: Vec<Option<crate::flowspace::model::Variable>>,
     /// Variable names for debugging (RPython Variable._name).
     pub value_names: std::collections::HashMap<usize, String>,
-    /// Slice Z2.5.A scaffolding — `flowspace::model::Variable.id` →
-    /// `ValueId` bridge for the gap between upstream's polymorphic
-    /// `Hlvalue` mergeable cells (Variable | Constant | FlowSignal) and
-    /// pyre's `link.args: Vec<ValueId>` representation.  Populated lazily
-    /// at link-arg materialization sites (the consumer is
-    /// `FrameState::getoutputargs` stack / exception walks); ValueIds are
-    /// minted from `alloc_value()` so they live in the same allocator
-    /// space as IR operand ids and never collide.
+    /// `flowspace::model::Variable.id` → graph-slot reverse index.
+    /// Populated by `ensure_variable_registered_void` / `bind_variable_at`
+    /// at Variable definition sites; consumed by `slot_of` /
+    /// `bridge_variable` lookup paths so a `Variable` carried through
+    /// `Hlvalue` / `LinkArg::Value` can be projected back to its
+    /// allocation slot for `value_variables` / `value_names` indexing.
     ///
     /// RPython has no counterpart — `framestate.py:92-99 getoutputargs`
     /// pushes the polymorphic `Hlvalue` cell directly into `Link.args`,
     /// no bridge needed because the link domain IS `Hlvalue`.  This map
-    /// is the documented PRE-EXISTING-ADAPTATION for pyre's pre-Z2.5
-    /// `Vec<ValueId>` link-arg shape; once the Z2.5 epic (slices A–D)
-    /// completes, the bridge becomes the canonical narrow waist between
-    /// the flowspace-shaped FrameState and pyre's IR.
+    /// is the documented PRE-EXISTING-ADAPTATION for pyre's slot-indexed
+    /// `value_variables` / `value_names` side tables: it lets
+    /// Variable-keyed lookups resolve in `O(1)` without scanning
+    /// `value_variables` linearly.
     pub(crate) variable_to_vid: std::collections::HashMap<u64, usize>,
     /// The source-level return type string (Rust `syn::ReturnType`
     /// rendered through `qualified_full_type_string`). RPython
@@ -2745,7 +2780,7 @@ impl FunctionGraph {
                 "create_block_from_framestate: Variable id={} not registered \
                  in graph.variable_to_vid on graph {:?}; mint sites must \
                  invoke `ensure_variable_registered_void` (or the cfg(test) \
-                 `alloc_value_with_variable` form) before constructing a \
+                 `ensure_variable_registered` form) before constructing a \
                  framestate-derived merge block",
                 var.id(),
                 self.name,
@@ -2764,53 +2799,35 @@ impl FunctionGraph {
         id
     }
 
-    /// Create a block with explicit inputargs (Phi nodes).
-    pub fn create_block_with_args(&mut self, num_args: usize) -> (BlockId, Vec<ValueId>) {
+    /// Create a block with `num_args` fresh inputarg `Variable`s
+    /// (Phi nodes), each minted via `alloc_value_var_with_type` with
+    /// `ConcreteType::Unknown` and returned to the caller for direct
+    /// use.  RPython parity: `flowmodel.py:130-145 Block(inputargs)`
+    /// where each inputarg is a fresh Variable.
+    pub fn create_block_with_arg_vars(
+        &mut self,
+        num_args: usize,
+    ) -> (BlockId, Vec<crate::flowspace::model::Variable>) {
         let id = BlockId(self.blocks.len());
-        let args: Vec<ValueId> = (0..num_args).map(|_| self.alloc_value()).collect();
-        let inputargs: Vec<crate::flowspace::model::Variable> = args
-            .iter()
-            .map(|v| {
-                self.variable_at(v.0)
-                    .expect("alloc_value mints backing Variable")
-                    .clone()
-            })
+        let inputargs: Vec<crate::flowspace::model::Variable> = (0..num_args)
+            .map(|_| self.alloc_value_var_with_type(ConcreteType::Unknown))
             .collect();
         self.blocks.push(Block {
             id,
-            inputargs,
+            inputargs: inputargs.clone(),
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
             framestate: None,
             dead: false,
         });
-        (id, args)
-    }
-
-    /// Variable-returning sibling of [`Self::create_block_with_args`] —
-    /// hands back the freshly minted inputarg [`Variable`]s directly so
-    /// callers can skip the per-slot `must_variable` projection.
-    pub fn create_block_with_arg_vars(
-        &mut self,
-        num_args: usize,
-    ) -> (BlockId, Vec<crate::flowspace::model::Variable>) {
-        let (id, _vids) = self.create_block_with_args(num_args);
-        let inputargs = self.blocks[id.0].inputargs.clone();
         (id, inputargs)
     }
 
-    pub fn alloc_value(&mut self) -> ValueId {
-        let var = self.alloc_value_var_with_type(ConcreteType::Unknown);
-        self.value_id_of(&var)
-            .expect("freshly minted Variable must have a ValueId in variable_to_vid")
-    }
-
-    /// Variable-returning sibling of [`Self::alloc_value`] — mints a
-    /// fresh slot and hands back the backing
-    /// [`crate::flowspace::model::Variable`] directly so callers can
-    /// skip the local `must_variable` projection.  Recover the
-    /// slot index via [`Self::slot_of`] when needed.
+    /// Mint a fresh slot with `ConcreteType::Unknown` and hand back the
+    /// backing [`crate::flowspace::model::Variable`] directly.  Recover
+    /// the slot index via [`Self::slot_of`] when a `usize` carrier is
+    /// needed at a boundary.
     pub fn alloc_value_var(&mut self) -> crate::flowspace::model::Variable {
         self.alloc_value_var_with_type(ConcreteType::Unknown)
     }
@@ -2834,49 +2851,23 @@ impl FunctionGraph {
         &mut self,
         ty: ConcreteType,
     ) -> crate::flowspace::model::Variable {
-        let id = ValueId(self.next_value);
+        let slot = self.next_value;
         self.next_value += 1;
         // Keep `value_variables` in lockstep with `next_value`.  Any
         // gap means a downstream `concretetype(v)` would silently see
         // `Unknown` — keep the invariant explicit.
         debug_assert_eq!(
             self.value_variables.len(),
-            id.0,
+            slot,
             "value_variables length must equal the next slot index ({} != {})",
             self.value_variables.len(),
-            id.0,
+            slot,
         );
         let var = crate::flowspace::model::Variable::new();
         var.set_concretetype(concrete_to_canonical_lltype(ty));
-        self.variable_to_vid.insert(var.id(), id.0);
+        self.variable_to_vid.insert(var.id(), slot);
         self.value_variables.push(Some(var.clone()));
         var
-    }
-
-    /// Allocate a fresh [`ValueId`] backed by the given upstream
-    /// `Variable` — pyre's analogue of `Variable()` followed by
-    /// `setbinding(v)`.  The Variable's
-    /// [`crate::flowspace::model::Variable::concretetype`] is the
-    /// authoritative kind source for this slot via
-    /// [`Self::concretetype`].
-    ///
-    /// Production callers route through
-    /// [`Self::ensure_variable_registered_void`], which inlines the same
-    /// allocator sequence without exposing the ValueId-return surface;
-    /// this form is retained for cfg(test) call sites that consume the
-    /// freshly-minted slot id directly.
-    #[cfg(test)]
-    pub fn alloc_value_with_variable(&mut self, var: crate::flowspace::model::Variable) -> ValueId {
-        let id = ValueId(self.next_value);
-        self.next_value += 1;
-        debug_assert_eq!(
-            self.value_variables.len(),
-            id.0,
-            "value_variables length must equal the next slot index",
-        );
-        self.variable_to_vid.insert(var.id(), id.0);
-        self.value_variables.push(Some(var));
-        id
     }
 
     /// Read the backing [`crate::flowspace::model::Variable`] at the
@@ -2969,27 +2960,17 @@ impl FunctionGraph {
         }
     }
 
-    /// Reverse of [`Self::variable_at`] — recover the dense `ValueId`
-    /// for a backing [`crate::flowspace::model::Variable`].  Thin
-    /// projection over [`Self::slot_of`] for callers that still hold
-    /// a [`ValueId`]-keyed structure (HashMap<ValueId, _> downstream).
-    pub fn value_id_of(&self, var: &crate::flowspace::model::Variable) -> Option<ValueId> {
-        self.slot_of(var).map(ValueId)
-    }
-
-    /// Slot-indexed primitive — indexes `variable_to_vid` directly
-    /// and projects `ValueId → usize`.  Canonical accessor for the
-    /// Task #56 sweep: callers that hand the index straight to
-    /// `value_variables` / `value_names` / `Block.inputargs` skip
-    /// the `ValueId(usize)` wrapper.
+    /// Slot-indexed primitive — indexes `variable_to_vid` directly.
+    /// Canonical accessor: callers hand the index straight to
+    /// `value_variables` / `value_names` / `Block.inputargs`.
     pub fn slot_of(&self, var: &crate::flowspace::model::Variable) -> Option<usize> {
         self.variable_to_vid.get(&var.id()).copied()
     }
 
-    /// LOOKUP-only ValueId bridge for an upstream `Variable` cell
-    /// (key = `Variable.id`).  Returns the ValueId previously
+    /// LOOKUP-only slot bridge for an upstream `Variable` cell
+    /// (key = `Variable.id`).  Returns the slot previously
     /// registered via `ensure_variable_registered_void` /
-    /// `alloc_value_with_variable` / `bind_variable_at` at the Variable's
+    /// `ensure_variable_registered` / `bind_variable_at` at the Variable's
     /// flowspace-side definition site (the matching pyre IR op result
     /// or `Block.inputargs` slot, or a merge-phi minted by
     /// `framestate.py:113-114 union`).
@@ -3001,11 +2982,11 @@ impl FunctionGraph {
     /// `Block.inputargs` entry, or a fresh `Variable()` minted by
     /// `framestate.py:113-114 union` whose definition site is the
     /// merge block's `inputargs`).  Pyre's `LinkArg::Value` has the
-    /// same precondition: every emitted ValueId must be "defined" —
+    /// same precondition: every emitted slot must be "defined" —
     /// i.e. produced by an op or bound as an inputarg — or downstream
     /// consumers (annotator, rtyper, regalloc, backends) silently
     /// drop the value (return `None` / `SomeValue::Impossible` / no
-    /// coloring).  Minting an unanchored ValueId here would convert
+    /// coloring).  Minting an unanchored slot here would convert
     /// that silent drop into a strict-parity defect.
     ///
     /// The production mint paths that prime this table:
@@ -3020,20 +3001,20 @@ impl FunctionGraph {
     ///   - `bind_variable_at` — rtyper handoff that swaps the
     ///     placeholder Variable for the upstream one.
     ///
-    /// `alloc_value_with_variable` is the cfg(test) ValueId-returning
+    /// `ensure_variable_registered` is the cfg(test) slot-returning
     /// form of the same allocator sequence, retained for fixtures
     /// that need the freshly-minted slot id directly.
     ///
     /// Production callers route through [`Self::slot_of`] (returns
-    /// `Option<usize>`) instead; this panicking ValueId-returning form
-    /// is retained for cfg(test) ValueId-shape assertions only.
+    /// `Option<usize>`) instead; this panicking form is retained for
+    /// cfg(test) slot-shape assertions only.
     #[cfg(test)]
-    pub fn bridge_variable(&self, v: &crate::flowspace::model::Variable) -> ValueId {
+    pub fn bridge_variable(&self, v: &crate::flowspace::model::Variable) -> usize {
         match self.variable_to_vid.get(&v.id()) {
-            Some(&slot) => ValueId(slot),
+            Some(&slot) => slot,
             None => panic!(
-                "bridge_variable: upstream Variable id={} has no registered ValueId on graph {:?}; \
-                 callers must invoke `ensure_variable_registered_void` / `alloc_value_with_variable` \
+                "bridge_variable: upstream Variable id={} has no registered slot on graph {:?}; \
+                 callers must invoke `ensure_variable_registered_void` / `ensure_variable_registered` \
                  at the Variable's flowspace definition site (op result, block inputarg, or \
                  merge-phi minted via framestate.py:113-114 union) before threading it through a \
                  Link.args boundary",
@@ -3044,20 +3025,21 @@ impl FunctionGraph {
     }
 
     /// Definition-site helper: idempotent lookup-or-allocate-and-register
-    /// for an upstream `Variable` whose paired `ValueId` is created right
-    /// now (no caller-supplied vid to honour).  Returns the bound vid.
+    /// for an upstream `Variable` whose paired graph slot is created right
+    /// now (no caller-supplied slot to honour).  Returns void; callers
+    /// recover the bound slot via [`Self::slot_of`].
     ///
     /// Use this at the **mint site** of a fresh Variable when the pyre
-    /// IR's `ValueId` is allocated alongside.  The two production mint
+    /// IR's slot is allocated alongside.  The two production mint
     /// sites are:
     ///   - `framestate.py:113-114 union` fresh phi Variables for the
     ///     stack / exception projections of `FrameState::union`.  The
-    ///     allocated vid corresponds to the merge block's stack /
+    ///     allocated slot corresponds to the merge block's stack /
     ///     exception inputarg at the matching position (materialised by
     ///     the AST walker's merge-block construction).
     ///   - Any future site that mints `Hlvalue::Variable(Variable::new())`
     ///     as the result of a `SpaceOperation` and needs the pyre
-    ///     `OpKind`'s result vid to track the same identity.
+    ///     `OpKind`'s result slot to track the same identity.
     ///
     /// `slot_of` is the read side of the same table (`variable_to_vid`
     /// lookup keyed on `Variable::id()`).  Re-call on the same Variable
@@ -3080,18 +3062,18 @@ impl FunctionGraph {
         self.value_variables.push(Some(v.clone()));
     }
 
-    /// ValueId-returning form of [`Self::ensure_variable_registered_void`].
+    /// Slot-returning form of [`Self::ensure_variable_registered_void`].
     /// Retained for cfg(test) round-trip assertions that compare the
-    /// bound ValueId across two calls; production sites use the void
+    /// bound slot index across two calls; production sites use the void
     /// sibling and recover the slot via [`Self::slot_of`].
     #[cfg(test)]
-    pub fn ensure_variable_registered(&mut self, v: &crate::flowspace::model::Variable) -> ValueId {
+    pub fn ensure_variable_registered(&mut self, v: &crate::flowspace::model::Variable) -> usize {
         self.ensure_variable_registered_void(v);
         self.bridge_variable(v)
     }
 
     /// Walk a freshly-unioned stack + exception projection and register
-    /// every **fresh phi** `Hlvalue::Variable` cell with a `ValueId`
+    /// every **fresh phi** `Hlvalue::Variable` cell with a slot
     /// pairing.  Called from `FrameState::union` after
     /// `flowspace::framestate::union_stack` / per-cell exception `union`
     /// have produced the merged values but before `FrameState` is
@@ -3110,9 +3092,9 @@ impl FunctionGraph {
     ///
     /// The fresh-phi guard is critical: if an externally-minted
     /// Variable enters one of the predecessors *without* having been
-    /// registered upstream, we must not silently mint a ValueId for
+    /// registered upstream, we must not silently mint a slot for
     /// it here — that would advance the allocator cursor in a way
-    /// downstream codegen does not expect and surface as a vid
+    /// downstream codegen does not expect and surface as a slot
     /// mismatch in cranelift / dynasm output.  Such Variables are
     /// PRE-EXISTING-ADAPTATIONs of the AST frontend's `last_exception`
     /// flow and are left to their unregistered state; the future Z4
@@ -3168,7 +3150,7 @@ impl FunctionGraph {
         let register_if_fresh =
             |graph: &mut FunctionGraph, v: &crate::flowspace::model::Variable| {
                 if !pred_ids.contains(&v.id()) {
-                    graph.ensure_variable_registered_void(v);
+                    graph.ensure_variable_registered_void(&v);
                 }
             };
         for elem in merged_stack {
@@ -3213,11 +3195,11 @@ impl FunctionGraph {
 
     /// Variable-keyed mirror of [`Self::concretetype`] — reads the
     /// `Variable.concretetype` cell directly without going through the
-    /// `value_variables` ValueId index.  RPython's resolver iterates
+    /// slot-indexed `value_variables` table.  RPython's resolver iterates
     /// `Variable` instances directly (`rtyper.py:258 v.concretetype =
     /// ...`); use this when the caller already holds a `&Variable`
     /// (e.g. `OpKind::BinOp.lhs / .rhs`, `block.inputargs[i]`) to
-    /// skip the `ValueId → Variable` round-trip.
+    /// skip the slot → Variable round-trip.
     pub fn concretetype_of(var: &crate::flowspace::model::Variable) -> ConcreteType {
         match var.concretetype.borrow().as_ref() {
             Some(lltype) => getkind(lltype),
@@ -3246,7 +3228,7 @@ impl FunctionGraph {
     /// `Variable.concretetype` cell directly, preserving a richer
     /// rtyper-written `LowLevelType` when its `getkind` already
     /// matches `ty`.  Used by passes that already hold a `&Variable`
-    /// and want to skip the `ValueId → Variable` lookup.
+    /// and want to skip the slot → Variable lookup.
     pub fn set_concretetype_of_inline(var: &crate::flowspace::model::Variable, ty: ConcreteType) {
         let preserve_existing = matches!(
             (ty, var.concretetype.borrow().as_ref()),
@@ -3258,21 +3240,21 @@ impl FunctionGraph {
         }
     }
 
-    /// Read-only view of the ValueId allocator cursor.  Used by passes
-    /// that need to mint fresh ValueIds outside the graph (e.g.
+    /// Read-only view of the slot allocator cursor.  Used by passes
+    /// that need to mint fresh slots outside the graph (e.g.
     /// `Transformer::allocate_synthetic_value` in `jtransform.rs`).
     pub fn next_value(&self) -> usize {
         self.next_value
     }
 
-    /// Iterate every `ValueId` that has a backing
+    /// Iterate every dense slot that has a backing
     /// [`crate::flowspace::model::Variable`] on the graph, yielding
-    /// `(ValueId, &Variable)` pairs in cursor order.  Mirrors the
+    /// `(slot, &Variable)` pairs in cursor order.  Mirrors the
     /// upstream RPython convention where regalloc / coloring passes
     /// walk `Variable` instances directly — pyre's index-keyed
     /// callers stay terse by routing through this single helper
     /// instead of `0..next_value()` plus per-slot
-    /// `variable(v)` re-checks.
+    /// `variable_at(slot)` re-checks.
     pub fn iter_variable_slots(
         &self,
     ) -> impl Iterator<Item = (usize, &crate::flowspace::model::Variable)> {
@@ -3282,9 +3264,9 @@ impl FunctionGraph {
             .filter_map(|(idx, opt)| opt.as_ref().map(|var| (idx, var)))
     }
 
-    /// Re-seat the ValueId allocator cursor.  Must be called after a
+    /// Re-seat the slot allocator cursor.  Must be called after a
     /// pass that synthesized values outside the graph so subsequent
-    /// `alloc_value()` calls do not collide.
+    /// `alloc_value_var()` calls do not collide.
     pub fn set_next_value(&mut self, next: usize) {
         debug_assert!(
             next >= self.next_value,
@@ -3318,7 +3300,7 @@ impl FunctionGraph {
     /// Push an op whose fresh result `Variable` is minted in place
     /// when `has_result` is true; callers receive that `Variable`
     /// directly without round-tripping through
-    /// `Option<ValueId>` + `must_variable`.
+    /// `Option<usize>` + `must_variable_at`.
     pub fn push_op_var(
         &mut self,
         block: BlockId,
@@ -3554,20 +3536,53 @@ impl FunctionGraph {
         if pred_edges.is_empty() {
             return false;
         }
+        // If `block` is a phi-block (has any `OpKind::Input` op), the
+        // back-edge close machinery (front/ast.rs `header_phi_name_list`)
+        // pairs every inputarg with an `OpKind::Input { name, .. }` op to
+        // produce the per-name link-arg list at close time.  When this
+        // helper adds a fresh inputarg via the recursive backfill we
+        // must also emit the paired op so the invariant holds; otherwise
+        // header_phi_name_list silently drops the new inputarg and the
+        // back-edge `set_goto` panics on `args.len() != inputargs.len()`.
+        let is_phi_block = self
+            .block(block)
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Input { .. }));
         self.block_mut(block).inputargs.push(var.clone());
+        if is_phi_block {
+            let name = self
+                .slot_of(var)
+                .and_then(|slot| self.value_name_at(slot))
+                .map(String::from)
+                .unwrap_or_default();
+            self.push_op_with_result_var(
+                block,
+                OpKind::Input {
+                    name,
+                    ty: ValueType::Unknown,
+                },
+                var.clone(),
+            );
+        }
         for (pred_block, exit_idx) in pred_edges {
             let ok = self.ensure_variable_at_block(pred_block, var);
-            assert!(
-                ok,
-                "ensure_variable_at_block: predecessor {:?} cannot define \
-                 Variable id={} when threading to block {:?} on graph {:?} \
-                 — graph corruption: no transitive predecessor chain leads \
-                 to a definition site",
-                pred_block,
-                var.id(),
-                block,
-                self.name,
-            );
+            if !ok {
+                let slot = self.slot_of(var);
+                let name = slot.and_then(|s| self.value_name_at(s)).map(String::from);
+                panic!(
+                    "ensure_variable_at_block: predecessor {:?} cannot define \
+                     Variable id={} (slot={:?}, name={:?}) when threading to block {:?} on graph {:?} \
+                     — graph corruption: no transitive predecessor chain leads \
+                     to a definition site",
+                    pred_block,
+                    var.id(),
+                    slot,
+                    name,
+                    block,
+                    self.name,
+                );
+            }
             self.block_mut(pred_block).exits[exit_idx]
                 .args
                 .push(LinkArg::Value(var.clone()));
@@ -3692,7 +3707,7 @@ impl FunctionGraph {
     /// flags "this block raises".
     ///
     /// Emits the same CFG shape as upstream: a Link to
-    /// `graph.exceptblock` with two fresh prevblock-side ValueIds
+    /// `graph.exceptblock` with two fresh prevblock-side Variables
     /// standing in for the `(etype, evalue)` pair.  The `_reason`
     /// string is retained for optional GraphTransformNote annotations
     /// (see `jtransform.rs::rewrite_graph`'s abort note); pass `""`
@@ -3719,8 +3734,8 @@ impl FunctionGraph {
     /// at `flowspace/flowcontext.py:638-656`, where `popvalue()`s
     /// provide the exception type / value already on the stack.
     /// This API lets pyre's macro lowering thread the evaluated
-    /// ValueIds into the exceptblock Link so the exception payload
-    /// is preserved, not discarded in favor of fresh `alloc_value()`
+    /// Variables into the exceptblock Link so the exception payload
+    /// is preserved, not discarded in favor of fresh `alloc_value_var()`
     /// placeholders as `set_raise` does.
     pub fn set_raise_values(
         &mut self,
@@ -3736,7 +3751,7 @@ impl FunctionGraph {
     }
 
     /// Name a value (RPython Variable._name).  Projects the backing
-    /// `ValueId` from `var` and forwards to the `value_names`
+    /// slot from `var` and forwards to the `value_names`
     /// side-table.
     pub fn name_value_var(
         &mut self,
@@ -3991,15 +4006,15 @@ mod tests {
         // self_only=1, other_only=2]; `self` has slot 1 bound but slot
         // 2 unbound, `other` has slot 2 bound but slot 1 unbound, so
         // both one-sided slots collapse to None-kill at union.
+        let mut graph = FunctionGraph::new("test");
         let self_state = FrameState {
-            entries: FrameState::entries_from_slots(&[Some(0), Some(1), None]),
+            entries: FrameState::entries_from_slots(&[Some(0), Some(1), None], &mut graph),
             ..Default::default()
         };
         let other_state = FrameState {
-            entries: FrameState::entries_from_slots(&[Some(2), None, Some(3)]),
+            entries: FrameState::entries_from_slots(&[Some(2), None, Some(3)], &mut graph),
             ..Default::default()
         };
-        let mut graph = FunctionGraph::new("test");
         // Reserve vid space past the test fixtures' hardcoded vids so
         // a fresh allocation for the disagreement on slot 0 picks an
         // id distinguishable from both predecessors.
@@ -4013,11 +4028,11 @@ mod tests {
             3,
             "merged state preserves positional length = max(len)"
         );
-        let surviving_slot = merged.entries[0]
-            .expect("slot 0 (x) is bound on both sides and must survive")
-            .0;
+        let surviving_slot = merged
+            .entry_slot(0, &graph)
+            .expect("slot 0 (x) is bound on both sides and must survive");
         // Slot 0's predecessors disagreed on `value_id` (0 vs 2), so
-        // `union` allocated a fresh vid via `graph.alloc_value()`.
+        // `union` allocated a fresh vid via `graph.alloc_value_var()`.
         assert_ne!(surviving_slot, 0);
         assert_ne!(surviving_slot, 2);
         assert_eq!(surviving_slot, 100);
@@ -4366,10 +4381,10 @@ mod tests {
         );
     }
 
-    /// `bridge_variable` returns the previously-registered ValueId
+    /// `bridge_variable` returns the previously-registered slot
     /// for a Variable identity; cloning preserves identity
     /// (id-sharing semantics in `flowspace::model::Variable::clone`)
-    /// so a clone resolves to the same ValueId.
+    /// so a clone resolves to the same slot.
     #[test]
     fn bridge_variable_resolves_registered_variable_to_paired_valueid() {
         use crate::flowspace::model::Variable;
@@ -4381,7 +4396,7 @@ mod tests {
         assert_eq!(graph.bridge_variable(&v_clone), vid);
     }
 
-    /// Distinct upstream `Variable`s register to distinct ValueIds
+    /// Distinct upstream `Variable`s register to distinct slots
     /// via `ensure_variable_registered`'s allocator-advancing fast
     /// path on first call.
     #[test]
@@ -4398,7 +4413,7 @@ mod tests {
     }
 
     /// `bridge_variable` panics when the Variable identity has no
-    /// registered ValueId — strict-parity tripwire.  Callers must
+    /// registered slot — strict-parity tripwire.  Callers must
     /// register at the Variable's definition site (op result, block
     /// inputarg, or fresh-phi mint) before crossing a Link.args
     /// boundary.
@@ -4412,8 +4427,8 @@ mod tests {
     }
 
     /// `ensure_variable_registered` is idempotent on the same Variable
-    /// identity (returns the existing vid without allocating) and mints
-    /// a fresh ValueId only on first call.
+    /// identity (returns the existing slot without allocating) and mints
+    /// a fresh slot only on first call.
     #[test]
     fn ensure_variable_registered_is_idempotent_lookup_or_alloc() {
         use crate::flowspace::model::Variable;
@@ -4435,11 +4450,11 @@ mod tests {
 
     /// `FrameState::union` walks the merged stack and registers every
     /// `Hlvalue::Variable` cell so the merged FrameState satisfies the
-    /// Hlvalue→ValueId bridge contract when it later becomes a
+    /// Hlvalue→slot bridge contract when it later becomes a
     /// predecessor of another merge.  The disagreement at stack slot 0
     /// (Variable vs Variable with distinct identities) yields a fresh
     /// phi Variable per `framestate.py:113-114 return Variable()`; that
-    /// fresh identity is paired with a freshly-allocated ValueId via
+    /// fresh identity is paired with a freshly-allocated slot via
     /// `register_phi_variables_in_stack_exc`.
     #[test]
     fn union_registers_fresh_stack_phi_variable_with_valueid() {
@@ -4449,8 +4464,8 @@ mod tests {
         let mut graph = FunctionGraph::new("union_stack_phi");
         let v_a = Variable::new();
         let v_b = Variable::new();
-        let a_vid = graph.alloc_value_with_variable(v_a.clone());
-        let b_vid = graph.alloc_value_with_variable(v_b.clone());
+        let a_vid = graph.ensure_variable_registered(&v_a);
+        let b_vid = graph.ensure_variable_registered(&v_b);
 
         let pred_a = FrameState {
             entries: Vec::new(),
@@ -4472,12 +4487,12 @@ mod tests {
         let phi_slot = graph
             .slot_of(phi)
             .expect("fresh phi Variable must have a registered slot after union");
-        assert_ne!(phi_slot, a_vid.0);
-        assert_ne!(phi_slot, b_vid.0);
+        assert_ne!(phi_slot, a_vid);
+        assert_ne!(phi_slot, b_vid);
     }
 
     /// Carry-through stack Variable (identical Hlvalue identity on both
-    /// predecessors) is re-bound to its existing ValueId without
+    /// predecessors) is re-bound to its existing slot without
     /// touching the allocator cursor — `framestate.py:108 if w1 == w2:
     /// return w1` parity for the registration walk.
     #[test]
@@ -4487,7 +4502,7 @@ mod tests {
 
         let mut graph = FunctionGraph::new("union_stack_carry");
         let shared = Variable::new();
-        let shared_vid = graph.alloc_value_with_variable(shared.clone());
+        let shared_vid = graph.ensure_variable_registered(&shared);
 
         let pred_a = FrameState {
             entries: Vec::new(),
@@ -4512,12 +4527,12 @@ mod tests {
         let StackElem::Value(Hlvalue::Variable(carried)) = &merged.stack[0] else {
             panic!("Variable carry-through expected");
         };
-        assert_eq!(graph.slot_of(carried), Some(shared_vid.0));
+        assert_eq!(graph.slot_of(carried), Some(shared_vid));
     }
 
     /// `FSException` projections route through the same registration
     /// walk: a fresh phi Variable minted by the per-cell exception
-    /// `union` lands in `merged.last_exception` with a paired ValueId.
+    /// `union` lands in `merged.last_exception` with a paired slot.
     #[test]
     fn union_registers_fresh_exception_phi_variable_with_valueid() {
         use crate::flowspace::model::{FSException, Hlvalue, Variable};
@@ -4528,7 +4543,7 @@ mod tests {
         let v_v1 = Variable::new();
         let v_v2 = Variable::new();
         for v in [&v_t1, &v_t2, &v_v1, &v_v2] {
-            graph.alloc_value_with_variable(v.clone());
+            graph.ensure_variable_registered_void(&v);
         }
         let pred_a = FrameState {
             entries: Vec::new(),
@@ -4568,9 +4583,9 @@ mod tests {
 
     /// Task #117 Substep 1: `FrameState::union` derives the parallel
     /// `locals_w` (`Hlvalue` carrier matching `framestate.py:19
-    /// self.locals_w`) from the unioned `entries` (ValueId carrier).
-    /// Each defined slot's ValueId maps to its backing Variable via
-    /// `graph.variable_at(slot)`; None-killed slots stay None.
+    /// self.locals_w`) from the unioned `entries` (Variable carrier).
+    /// Each defined slot's Variable carries through directly via
+    /// clone; None-killed slots stay None.
     #[test]
     fn union_derives_locals_w_hlvalue_carrier_from_entries() {
         use crate::flowspace::model::{Hlvalue, Variable};
@@ -4578,16 +4593,16 @@ mod tests {
         let v_shared = Variable::new();
         let v_a_only = Variable::new();
         let v_b_only = Variable::new();
-        let shared_vid = graph.alloc_value_with_variable(v_shared.clone());
-        let a_vid = graph.alloc_value_with_variable(v_a_only.clone());
-        let b_vid = graph.alloc_value_with_variable(v_b_only.clone());
+        graph.ensure_variable_registered_void(&v_shared);
+        graph.ensure_variable_registered_void(&v_a_only);
+        graph.ensure_variable_registered_void(&v_b_only);
 
         let pred_a = FrameState {
-            entries: vec![Some(shared_vid), Some(a_vid), None],
+            entries: vec![Some(v_shared.clone()), Some(v_a_only.clone()), None],
             ..Default::default()
         };
         let pred_b = FrameState {
-            entries: vec![Some(shared_vid), None, Some(b_vid)],
+            entries: vec![Some(v_shared.clone()), None, Some(v_b_only.clone())],
             ..Default::default()
         };
         let merged = pred_a
@@ -4633,11 +4648,11 @@ mod tests {
 
         let v_local = Variable::new();
         let v_stack = Variable::new();
-        let local_vid = graph.alloc_value_with_variable(v_local.clone());
-        graph.alloc_value_with_variable(v_stack.clone());
+        graph.ensure_variable_registered_void(&v_local);
+        graph.ensure_variable_registered_void(&v_stack);
 
         let pred_state = FrameState {
-            entries: vec![Some(local_vid)],
+            entries: vec![Some(v_local.clone())],
             stack: vec![
                 StackElem::Value(Hlvalue::Constant(Constant::new(ConstValue::Int(42)))),
                 StackElem::Value(Hlvalue::Variable(v_stack)),
@@ -4649,13 +4664,13 @@ mod tests {
         // slot is Some, stack cells are Hlvalue::Variable).  Stack
         // Variables are registered up front so the framestate-driven
         // merge block construction can pair Variable identity with the
-        // graph's ValueId table.
+        // graph's slot table.
         let v_target_stack_0 = Variable::new();
         let v_target_stack_1 = Variable::new();
-        graph.alloc_value_with_variable(v_target_stack_0.clone());
-        graph.alloc_value_with_variable(v_target_stack_1.clone());
+        graph.ensure_variable_registered_void(&v_target_stack_0);
+        graph.ensure_variable_registered_void(&v_target_stack_1);
         let target_state = FrameState {
-            entries: vec![Some(local_vid)],
+            entries: vec![Some(v_local.clone())],
             stack: vec![
                 StackElem::Value(Hlvalue::Variable(v_target_stack_0)),
                 StackElem::Value(Hlvalue::Variable(v_target_stack_1)),
@@ -4702,16 +4717,16 @@ mod tests {
         // Target block created without inputargs — empty inputargs vec.
         let target = graph.create_block();
         let v_local = Variable::new();
-        let local_vid = graph.alloc_value_with_variable(v_local.clone());
+        graph.ensure_variable_registered_void(&v_local);
         let pred_state = FrameState {
-            entries: vec![Some(local_vid)],
+            entries: vec![Some(v_local.clone())],
             ..Default::default()
         };
         // pred_state.mergeable Variable cells: 1 locals.
         // target_state.mergeable Variable cells: 1 locals.
         // getoutputargs returns 1 LinkArg, but target.inputargs is empty.
         let target_state = FrameState {
-            entries: vec![Some(local_vid)],
+            entries: vec![Some(v_local.clone())],
             ..Default::default()
         };
         graph.set_goto_from_framestate(pred, target, &pred_state, &target_state);
@@ -4725,7 +4740,7 @@ mod tests {
         let mut graph = FunctionGraph::new("ensure_var_idempotent_input");
         let block = graph.create_block();
         let v = Variable::new();
-        graph.alloc_value_with_variable(v.clone());
+        graph.ensure_variable_registered_void(&v);
         graph.block_mut(block).inputargs.push(v.clone());
 
         let inputargs_before = graph.block(block).inputargs.len();
@@ -4777,7 +4792,7 @@ mod tests {
         let mut graph = FunctionGraph::new("ensure_var_orphan");
         let orphan = graph.create_block();
         let v = Variable::new();
-        graph.alloc_value_with_variable(v.clone());
+        graph.ensure_variable_registered_void(&v);
         let ok = graph.ensure_variable_at_block(orphan, &v);
         assert!(!ok, "no predecessors + not defined => fails (no threading)");
         assert!(
@@ -4798,7 +4813,7 @@ mod tests {
         let pred = graph.create_block();
         let target = graph.create_block();
         let v = Variable::new();
-        graph.alloc_value_with_variable(v.clone());
+        graph.ensure_variable_registered_void(&v);
         // Define v in pred via an Input op result.
         let _ = graph.push_op_var(
             pred,
@@ -4843,7 +4858,7 @@ mod tests {
         let mid = graph.create_block();
         let leaf = graph.create_block();
         let v = Variable::new();
-        graph.alloc_value_with_variable(v.clone());
+        graph.ensure_variable_registered_void(&v);
         let _ = graph.push_op_var(
             root,
             OpKind::Input {
@@ -4889,7 +4904,7 @@ mod tests {
         let header = graph.create_block();
         let body_tail = graph.create_block();
         let v = Variable::new();
-        graph.alloc_value_with_variable(v.clone());
+        graph.ensure_variable_registered_void(&v);
         let _ = graph.push_op_var(
             entry,
             OpKind::Input {
@@ -4945,13 +4960,13 @@ mod tests {
         let v_stack = Variable::new();
         let v_exc_type = Variable::new();
         let v_exc_value = Variable::new();
-        let local_vid = graph.alloc_value_with_variable(v_local.clone());
-        graph.alloc_value_with_variable(v_stack.clone());
-        graph.alloc_value_with_variable(v_exc_type.clone());
-        graph.alloc_value_with_variable(v_exc_value.clone());
+        graph.ensure_variable_registered_void(&v_local);
+        graph.ensure_variable_registered_void(&v_stack);
+        graph.ensure_variable_registered_void(&v_exc_type);
+        graph.ensure_variable_registered_void(&v_exc_value);
 
         let fs = FrameState {
-            entries: vec![Some(local_vid), None],
+            entries: vec![Some(v_local.clone()), None],
             stack: vec![
                 StackElem::Value(Hlvalue::Constant(Constant::new(ConstValue::Int(7)))),
                 StackElem::Value(Hlvalue::Variable(v_stack.clone())),
@@ -4991,11 +5006,11 @@ mod tests {
         let mut graph = FunctionGraph::new("spamblock_shape");
         let v_local = Variable::new();
         let v_stack = Variable::new();
-        let local_vid = graph.alloc_value_with_variable(v_local.clone());
-        let stack_vid = graph.alloc_value_with_variable(v_stack.clone());
+        graph.ensure_variable_registered_void(&v_local);
+        graph.ensure_variable_registered_void(&v_stack);
 
         let fs = FrameState {
-            entries: vec![Some(local_vid)],
+            entries: vec![Some(v_local.clone())],
             stack: vec![StackElem::Value(Hlvalue::Variable(v_stack.clone()))],
             ..Default::default()
         };
@@ -5012,8 +5027,8 @@ mod tests {
             block.framestate.is_some(),
             "block.framestate stamped (SpamBlock parity)"
         );
-        assert_eq!(graph.slot_of(&block.inputargs[0]), Some(local_vid.0));
-        assert_eq!(graph.slot_of(&block.inputargs[1]), Some(stack_vid.0));
+        assert_eq!(graph.slot_of(&block.inputargs[0]), graph.slot_of(&v_local));
+        assert_eq!(graph.slot_of(&block.inputargs[1]), graph.slot_of(&v_stack));
     }
 
     /// The critical round-trip invariant: predecessor's
@@ -5031,20 +5046,20 @@ mod tests {
         let mut graph = FunctionGraph::new("mergeable_round_trip");
         let v_a = Variable::new();
         let v_b = Variable::new();
-        let a_vid = graph.alloc_value_with_variable(v_a.clone());
-        graph.alloc_value_with_variable(v_b.clone());
+        graph.ensure_variable_registered_void(&v_a);
+        graph.ensure_variable_registered_void(&v_b);
 
         // Two predecessors disagreeing on stack slot 0 (Variable phi)
-        // and on exception (Variable phi); locals agree on a_vid.
+        // and on exception (Variable phi); locals agree on v_a.
         let v_t1 = Variable::new();
         let v_t2 = Variable::new();
         let v_v1 = Variable::new();
         let v_v2 = Variable::new();
         for v in [&v_t1, &v_t2, &v_v1, &v_v2] {
-            graph.alloc_value_with_variable(v.clone());
+            graph.ensure_variable_registered_void(&v);
         }
         let pred_a = FrameState {
-            entries: vec![Some(a_vid)],
+            entries: vec![Some(v_a.clone())],
             stack: vec![
                 StackElem::Value(Hlvalue::Variable(v_b.clone())),
                 StackElem::Value(Hlvalue::Constant(Constant::new(ConstValue::Int(1)))),
@@ -5056,7 +5071,7 @@ mod tests {
             ..Default::default()
         };
         let pred_b = FrameState {
-            entries: vec![Some(a_vid)],
+            entries: vec![Some(v_a.clone())],
             stack: vec![
                 StackElem::Value(Hlvalue::Variable(v_b.clone())),
                 StackElem::Value(Hlvalue::Constant(Constant::new(ConstValue::Int(1)))),

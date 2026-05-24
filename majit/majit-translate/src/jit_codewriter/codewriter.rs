@@ -216,8 +216,8 @@ impl CodeWriter {
     /// **Type-source contract (post graph-side concretetype migration)**
     ///
     /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
-    /// kinds via `graph.concretetype(v)`, which routes straight to
-    /// the backing `Variable.concretetype` cell stored in
+    /// kinds via `FunctionGraph::concretetype_of(&v)`, which routes
+    /// straight to the backing `Variable.concretetype` cell stored in
     /// [`crate::model::FunctionGraph::value_variables`] — RPython's
     /// `Variable.concretetype` (`flowspace/model.py:280`) is the
     /// single source of truth for every slot.  No type side-table
@@ -300,7 +300,7 @@ impl CodeWriter {
                 // Commit each real-rtyper Variable's `concretetype`
                 // (LowLevelType) onto its placeholder on the graph's
                 // value table.  Mirrors RPython `rtyper.py:258 v.concretetype = ...`
-                // attribute aliasing; reads via `graph.concretetype(v)`
+                // attribute aliasing; reads via `FunctionGraph::concretetype_of(&v)`
                 // then match upstream `getkind(v.concretetype)`.
                 for var in real_value_to_var.values() {
                     if let Some(lltype) = var.concretetype().as_ref() {
@@ -324,9 +324,8 @@ impl CodeWriter {
                 // cells at the resolver boundary.  Skip arm has no
                 // flowspace Variable surface — the legacy walker stays
                 // the only source of types for these graphs.  Reads
-                // annotations off `graph.variable(vid).annotation`
-                // populated by the preceding `annotate` post-loop
-                // publish.
+                // annotations off `Variable.annotation` populated by
+                // the preceding `annotate` post-loop publish.
                 crate::translator::rtyper::legacy_resolve::resolve_types(graph);
                 None
             }
@@ -362,7 +361,7 @@ impl CodeWriter {
         // `dual_gate_publish_concretetypes` commits every resolved
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
-        // `graph.concretetype(v)` directly.
+        // `FunctionGraph::concretetype_of(&v)` directly.
         let real_value_to_var =
             self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag);
 
@@ -379,8 +378,9 @@ impl CodeWriter {
         // `resolve_types` (called upstream by the rtyper) already
         // commits each backing Variable's `concretetype` cell as it
         // resolves, so jtransform reads kinds via
-        // `graph.concretetype(v)` (the upstream `getkind(v.concretetype)`
-        // path) without a separate publish step here.
+        // `FunctionGraph::concretetype_of(&v)` (the upstream
+        // `getkind(v.concretetype)` path) without a separate publish
+        // step here.
         // Annotator monomorphization producer — for every Call(Method)
         // op in the graph, look up the receiver's annotated flowspace
         // Variable via `real_value_to_var` and stamp its concrete
@@ -448,9 +448,10 @@ impl CodeWriter {
         // inputarg Variables when splicing new control flow).
         // Merge the four post-rtyper kind sources directly into
         // each backing `Variable.concretetype` (via
-        // `graph.set_concretetype`) — pyre's analogue of RPython's
-        // "rtyper finishes, every Variable has `.concretetype`
-        // inline" handoff (`rtyper.py`).  Precedence stack
+        // `FunctionGraph::set_concretetype_of_inline`) — pyre's
+        // analogue of RPython's "rtyper finishes, every Variable
+        // has `.concretetype` inline" handoff (`rtyper.py`).
+        // Precedence stack
         // `stamped > post_result > post_resolve > original` is
         // preserved; the graph IS the merge target, no intermediate
         // type side-table survives the call.
@@ -471,8 +472,8 @@ impl CodeWriter {
         // `apply_to_graph` / `resolve_types`); this overlay handles
         // the post-jtransform op-result deltas.  Precedence stack
         // `post_result > pre-jtransform` falls out of
-        // `graph.set_concretetype`'s "preserve richer existing iff
-        // getkind matches" semantic.
+        // `set_concretetype_of_inline`'s "preserve richer existing
+        // iff getkind matches" semantic.
         for (var, kind) in &post_result_types {
             if !matches!(kind, crate::model::ConcreteType::Unknown) {
                 crate::model::FunctionGraph::set_concretetype_of_inline(var, kind.clone());
@@ -480,8 +481,8 @@ impl CodeWriter {
         }
         // Long-term parity hydration: when the dual-gate Match arm
         // surfaced a `SlotToVariable` map, rebind each slot to the
-        // upstream-typed `Variable` so `graph.concretetype(v)` reads
-        // its `concretetype` cell directly.  Upstream parity:
+        // upstream-typed `Variable` so `FunctionGraph::concretetype_of(&v)`
+        // reads its `concretetype` cell directly.  Upstream parity:
         // `history.py:46-71 getkind` reads `v.concretetype` from the
         // Variable, so this rebinding makes pyre's read path
         // line-for-line equivalent.
@@ -494,9 +495,10 @@ impl CodeWriter {
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
-        // Pyre reads each per-value kind via `graph.concretetype(v)`
-        // (set up by `apply_to_graph` / `apply_from_flowspace_variables`
-        // above), matching upstream's `getkind(v.concretetype)` access.
+        // Pyre reads each per-value kind via
+        // `FunctionGraph::concretetype_of(&v)` (set up by `apply_to_graph`
+        // / `apply_from_flowspace_variables` above), matching upstream's
+        // `getkind(v.concretetype)` access.
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
@@ -544,10 +546,10 @@ impl CodeWriter {
             // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS`
             // directly.  Pyre's source-of-truth analogue is each
             // start-block inputarg's backing `Variable.concretetype`:
-            // `graph.concretetype(v)` projects `getkind(v.concretetype)`
-            // verbatim.  Reading from the Variable matches the
-            // upstream's "type-source" provenance instead of going
-            // through regalloc as a side-channel.
+            // `FunctionGraph::concretetype_of(&v)` projects
+            // `getkind(v.concretetype)` verbatim.  Reading from the
+            // Variable matches the upstream's "type-source" provenance
+            // instead of going through regalloc as a side-channel.
             for arg in &start_block.inputargs {
                 use crate::model::ConcreteType;
                 let class = match crate::model::FunctionGraph::concretetype_of(arg) {

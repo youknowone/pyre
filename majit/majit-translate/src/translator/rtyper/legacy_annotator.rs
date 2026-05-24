@@ -11,7 +11,7 @@
 //! the Skip-fallback in
 //! [`crate::jit_codewriter::codewriter::transform_graph_to_jitcode`]
 //! still drive this `annotate()` for its side-effect: populating each
-//! `graph.variable(vid).annotation` cell via [`setbinding`].  A
+//! `Variable.annotation` cell via [`setbinding`].  A
 //! follow-up retirement slice drops both consumers and this file
 //! together once the dual-gate Skip categories close.
 //!

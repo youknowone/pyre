@@ -7109,12 +7109,10 @@ unsafe fn trace_check_exc_match_against(
     // the trace and emits a guard for the `raise oefmt(...)` arm;
     // pyre's residual-call ABI keeps `bool` so the raise/guard split
     // lives on the caller side.
-    unsafe {
-        let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
-            return false;
-        };
-        pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
-    }
+    let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
+        return false;
+    };
+    pyre_interpreter::baseobjspace::exception_match(w_exc_class, exc_type)
 }
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {

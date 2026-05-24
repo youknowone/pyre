@@ -1153,7 +1153,7 @@ impl OptHeap {
         for (descr_idx, descr, indexes) in entries {
             for index in indexes {
                 // heap.py:591 cf.force_lazy_set(self, None, can_cache=True)
-                self.force_lazy_set_array(&descr, descr_idx, index, true, ctx);
+                self.force_lazy_set_array(descr_idx, index, true, ctx);
             }
         }
     }
@@ -1927,12 +1927,12 @@ impl OptHeap {
                 if read {
                     // heap.py:555-556 force_lazy_setarrayitem_submap(submap)
                     // [can_cache=True] → cf.force_lazy_set per index.
-                    self.force_lazy_set_array(&descr, descr_idx, index, true, ctx);
+                    self.force_lazy_set_array(descr_idx, index, true, ctx);
                 }
                 if write {
                     // heap.py:557-558 force_lazy_setarrayitem_submap(submap,
                     // can_cache=False) → cf.force_lazy_set per index.
-                    self.force_lazy_set_array(&descr, descr_idx, index, false, ctx);
+                    self.force_lazy_set_array(descr_idx, index, false, ctx);
                 }
             }
             if write {
@@ -2397,7 +2397,6 @@ impl OptHeap {
     /// - `_get_rhs_from_set_op` uses op.arg(2) at the put_back step.
     fn force_lazy_set_array(
         &mut self,
-        descr: &DescrRef,
         descr_idx: u32,
         const_index: i64,
         can_cache: bool,
@@ -2476,7 +2475,7 @@ impl OptHeap {
         if needs_force {
             // heap.py:122-145 force_lazy_set(self, optheap, descr) [can_cache=True]
             // extracted as force_lazy_set_array per AbstractCachedEntry parity.
-            self.force_lazy_set_array(descr, descr_idx, const_index, true, ctx);
+            self.force_lazy_set_array(descr_idx, const_index, true, ctx);
         }
         // heap.py:85 cached_field = self._getfield(structinfo, descr, optheap, False)
         // heap.py:86-87 get_box_replacement
@@ -2903,8 +2902,6 @@ impl OptHeap {
             submap.clear_varindex();
         }
         return result;
-
-        OptimizationResult::Remove
     }
 
     /// Handle operations that may have side effects.

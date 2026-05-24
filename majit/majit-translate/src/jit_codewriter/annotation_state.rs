@@ -4,7 +4,7 @@
 //! directly to each `Variable.annotation` slot on the flowgraph
 //! (`rpython/annotator/annrpython.py:54-66`,
 //! `rpython/flowspace/model.py: Variable.annotation`).  Pyre writes the
-//! same lattice node into `graph.variable(vid).annotation` via
+//! same lattice node into `Variable.annotation` via
 //! [`crate::translator::rtyper::legacy_annotator::setbinding`], which
 //! routes through [`valuetype_to_someshell`] to build the shell.
 //!

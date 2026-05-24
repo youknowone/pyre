@@ -12,8 +12,8 @@ use crate::{
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
     decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
-    execute_opcode_step, make_function_from_code_obj, range_iter_continues,
-    range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact, w_code_new,
+    execute_opcode_step, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
+    unpack_sequence_exact, w_code_new,
 };
 use pyre_object::*;
 
@@ -1124,7 +1124,8 @@ pub unsafe fn load_global_via_cache_extern(
     // (the only call site that can raise here in practice), `finditem_str`
     // only raises on a non-dict mapping with custom `__getitem__` — never
     // for the W_DictObject / W_ModuleDictObject backing real builtins.
-    match load_global_via_cache(w_module_dict, w_builtin, name, std::ptr::null_mut(), 0) {
+    match unsafe { load_global_via_cache(w_module_dict, w_builtin, name, std::ptr::null_mut(), 0) }
+    {
         Ok(v) => v,
         Err(_) => None,
     }
@@ -1146,99 +1147,102 @@ unsafe fn load_global_via_cache(
     pycode: PyObjectRef,
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    use pyre_object::celldict::{GlobalCache, unwrap_cell};
+    use pyre_object::celldict::unwrap_cell;
     use pyre_object::dictmultiobject::W_ModuleDictObject;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    // `celldict.py:292-313`: per-name slot fast path.  Read the slot,
-    // upgrade the weakref; if the cache is alive, follow cell → builtincache
-    // → builtins w_dict before falling through to the strategy lookup.
-    if !pycode.is_null() {
-        if let Some(cache) = crate::pycode::w_code_globals_caches_get(pycode, nameindex) {
-            // `celldict.py:295-313`: fast-path layout —
-            //
-            //     w_value = cache.getvalue(self.space)
-            //     if w_value is not None:
-            //         return w_value
-            //     if cache.valid:
-            //         builtincache = cache.builtincache
-            //         if builtincache is not None:
-            //             w_value = builtincache.getvalue(self.space)
-            //             if w_value is not None:
-            //                 return w_value
-            //             # builtin getdictvalue + _load_global_failed
-            //
-            // The builtins fallback is GATED on `builtincache is not None`.
-            // Under pyre's honor__builtins__=True equivalence the
-            // `builtincache` attach is dead, so the slot path just
-            // returns early on a cell hit and otherwise falls through to
-            // the slow path (`# either no cache or an invalid cache`),
-            // which calls `_load_global` whose own fallback chain reads
-            // the frame's picked builtin via `space.finditem_str`.
-            let (cell_opt, valid, bc_opt) = {
-                let c = cache.borrow();
-                (c.cell, c.valid, c.builtincache.clone())
-            };
-            if let Some(v) = cell_opt {
-                return Ok(Some(unwrap_cell(v)));
-            }
-            if valid && let Some(bc) = bc_opt {
-                let bcell = bc.borrow().cell;
-                if let Some(v) = bcell {
+    // Body is a chain of unsafe-fn / raw-ptr ops on caller-supplied
+    // PyObjectRefs; SAFETY contract is on the `unsafe fn` signature
+    // (caller upholds w_module_dict / pycode / w_builtin validity).
+    unsafe {
+        // `celldict.py:292-313`: per-name slot fast path.  Read the slot,
+        // upgrade the weakref; if the cache is alive, follow cell → builtincache
+        // → builtins w_dict before falling through to the strategy lookup.
+        if !pycode.is_null() {
+            if let Some(cache) = crate::pycode::w_code_globals_caches_get(pycode, nameindex) {
+                // `celldict.py:295-313`: fast-path layout —
+                //
+                //     w_value = cache.getvalue(self.space)
+                //     if w_value is not None:
+                //         return w_value
+                //     if cache.valid:
+                //         builtincache = cache.builtincache
+                //         if builtincache is not None:
+                //             w_value = builtincache.getvalue(self.space)
+                //             if w_value is not None:
+                //                 return w_value
+                //             # builtin getdictvalue + _load_global_failed
+                //
+                // The builtins fallback is GATED on `builtincache is not None`.
+                // Under pyre's honor__builtins__=True equivalence the
+                // `builtincache` attach is dead, so the slot path just
+                // returns early on a cell hit and otherwise falls through to
+                // the slow path (`# either no cache or an invalid cache`),
+                // which calls `_load_global` whose own fallback chain reads
+                // the frame's picked builtin via `space.finditem_str`.
+                let (cell_opt, valid, bc_opt) = {
+                    let c = cache.borrow();
+                    (c.cell, c.valid, c.builtincache.clone())
+                };
+                if let Some(v) = cell_opt {
                     return Ok(Some(unwrap_cell(v)));
                 }
-                // `celldict.py:307-313`: the `_load_global_failed`
-                // branch is inside `if builtincache is not None` — only
-                // reachable when a real builtincache is installed.
-                // Under honor=True this scope is dead; included for
-                // strict line-by-line shape parity should
-                // honor__builtins__ ever flip False.
-                if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
-                    let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
-                    if !w_builtin_dict.is_null() {
-                        return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+                if valid && let Some(bc) = bc_opt {
+                    let bcell = bc.borrow().cell;
+                    if let Some(v) = bcell {
+                        return Ok(Some(unwrap_cell(v)));
+                    }
+                    // `celldict.py:307-313`: the `_load_global_failed`
+                    // branch is inside `if builtincache is not None` — only
+                    // reachable when a real builtincache is installed.
+                    // Under honor=True this scope is dead; included for
+                    // strict line-by-line shape parity should
+                    // honor__builtins__ ever flip False.
+                    if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                        let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+                        if !w_builtin_dict.is_null() {
+                            return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+                        }
                     }
                 }
             }
         }
-    }
-    let raw = &mut *(w_module_dict as *mut W_ModuleDictObject);
-    if raw.mstrategy.is_null() || raw.dstorage.is_null() {
-        return Ok(None);
-    }
-    // `celldict.py:315-322`: the slow-path install just routes through
-    // `w_globals.get_global_cache(varname)` and writes
-    // `pycode._globals_caches[nameindex] = cache.ref`.
-    //
-    // Under pyre's permanent `honor__builtins__=True` (frame picks its
-    // own builtin per `pyframe.py:115`), the cache carries no
-    // `builtincache` — that branch is dead in
-    // `ModuleDictStrategy::get_global_cache` per its line-by-line port
-    // of `celldict.py:224 not space.config.objspace.honor__builtins__`.
-    let strategy = &mut *raw.mstrategy;
-    let storage = &*raw.dstorage;
-    let cache = strategy.get_global_cache(storage, name);
-    // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
-    if !pycode.is_null() {
-        crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
-    }
-    // `_LOAD_GLOBAL_cached` lines 296-298: cache.getvalue hit.
-    let cell_opt = cache.borrow().cell;
-    if let Some(v) = cell_opt {
-        return Ok(Some(unwrap_cell(v)));
-    }
-    // `_load_global_fallback` → `_load_global` (`pyopcode.py:958-967`):
-    // when globals miss, route through `self.get_builtin().getdictvalue(
-    // space, varname)` which resolves via `space.finditem_str` per
-    // `baseobjspace.py:45-49 W_Root.getdictvalue`.  The caller threads
-    // its frame's picked builtin in as `w_builtin`.
-    if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
-        let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
-        if !w_builtin_dict.is_null() {
-            return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+        let raw = &mut *(w_module_dict as *mut W_ModuleDictObject);
+        if raw.mstrategy.is_null() || raw.dstorage.is_null() {
+            return Ok(None);
         }
+        // `celldict.py:315-322`: the slow-path install just routes through
+        // `w_globals.get_global_cache(varname)` and writes
+        // `pycode._globals_caches[nameindex] = cache.ref`.
+        //
+        // Under pyre's permanent `honor__builtins__=True` (frame picks its
+        // own builtin per `pyframe.py:115`), the cache carries no
+        // `builtincache` — that branch is dead in
+        // `ModuleDictStrategy::get_global_cache` per its line-by-line port
+        // of `celldict.py:224 not space.config.objspace.honor__builtins__`.
+        let strategy = &mut *raw.mstrategy;
+        let storage = &*raw.dstorage;
+        let cache = strategy.get_global_cache(storage, name);
+        // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
+        if !pycode.is_null() {
+            crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
+        }
+        // `_LOAD_GLOBAL_cached` lines 296-298: cache.getvalue hit.
+        let cell_opt = cache.borrow().cell;
+        if let Some(v) = cell_opt {
+            return Ok(Some(unwrap_cell(v)));
+        }
+        // `_load_global_fallback` → `_load_global` (`pyopcode.py:958-967`):
+        // when globals miss, route through `self.get_builtin().getdictvalue(
+        // space, varname)` which resolves via `space.finditem_str` per
+        // `baseobjspace.py:45-49 W_Root.getdictvalue`.  The caller threads
+        // its frame's picked builtin in as `w_builtin`.
+        if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+            let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+            if !w_builtin_dict.is_null() {
+                return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+            }
+        }
+        Ok(None)
     }
-    Ok(None)
 }
 
 thread_local! {

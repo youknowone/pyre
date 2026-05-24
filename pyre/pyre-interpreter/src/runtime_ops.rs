@@ -10,8 +10,8 @@ use pyre_object::{
 };
 
 use crate::{
-    DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, function_new,
-    is_builtin_code, is_function, w_code_get_ptr,
+    DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code,
+    is_function, w_code_get_ptr,
 };
 
 pub fn make_function_from_code_obj(

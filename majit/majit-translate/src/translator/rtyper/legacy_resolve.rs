@@ -359,8 +359,9 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // RPython parity: every `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     // above publishes the resolved kind on each Variable's
     // `concretetype` cell, matching `rtyper.py:258 v.concretetype = ...`.
-    // Downstream consumers read kinds via `graph.concretetype(v)`
-    // (i.e. `getkind(v.concretetype)`) directly without a separate
+    // Downstream consumers read kinds via
+    // `FunctionGraph::concretetype_of(&v)` (i.e.
+    // `getkind(v.concretetype)`) directly without a separate
     // `apply_to_graph` publish step.
 }
 

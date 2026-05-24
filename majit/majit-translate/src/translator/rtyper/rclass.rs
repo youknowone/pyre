@@ -4147,6 +4147,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn instance_repr_none_classdef_populates___class___field() {
         let rtyper = fresh_rtyper();
         let repr = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root instance repr");

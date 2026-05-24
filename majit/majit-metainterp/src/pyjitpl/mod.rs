@@ -14,7 +14,6 @@ pub(crate) use dispatch::{call_int_function, call_ref_function, call_void_functi
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};

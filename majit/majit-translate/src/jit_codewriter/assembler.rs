@@ -246,8 +246,8 @@ impl Assembler {
     /// `graph` is mandatory because PyPy's `Assembler.assemble` always
     /// runs against a fully-typed `ssarepr` (every Variable has
     /// `.concretetype`).  [`Self::lookup_coloring_var`] reads the kind
-    /// source via `graph.concretetype(v)` exactly like RPython's
-    /// `flatten.py:382 getcolor` reads `getkind(v.concretetype)`, and
+    /// source via `FunctionGraph::concretetype_of(&v)` exactly like
+    /// RPython's `flatten.py:382 getcolor` reads `getkind(v.concretetype)`, and
     /// [`crate::liveness::compute_liveness`] needs the same projection
     /// to bridge each `FlatOp::Op` operand to its `(kind, color)`.
     pub fn assemble(

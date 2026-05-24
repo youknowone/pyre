@@ -10,9 +10,9 @@
 //! rtyper via `RPythonTyper.setconcretetype()`
 //! (`rpython/rtyper/rtyper.py:258 v.concretetype = ...`).  Pyre
 //! reproduces this through `FunctionGraph::set_concretetype_of_inline`
-//! writes followed by `graph.concretetype(v)` reads (which routes to
-//! the backing `Variable.concretetype` cell).  No external slot table
-//! survives.
+//! writes followed by `FunctionGraph::concretetype_of(&v)` reads
+//! (which routes to the backing `Variable.concretetype` cell).  No
+//! external slot table survives.
 
 use std::collections::HashMap;
 
@@ -27,16 +27,16 @@ use crate::model::{FunctionGraph, OpKind, ValueType};
 /// [`FunctionGraph::value_variables`] (mirroring upstream
 /// `Variable.concretetype` line-for-line).  The alias keeps existing
 /// imports working while consumers migrate to reading
-/// `graph.concretetype(v)`.
+/// `FunctionGraph::concretetype_of(&v)`.
 pub use crate::model::ConcreteType;
 
 /// Rebind each per-slot Variable handle to the upstream-typed
 /// Variable in `value_to_var`, so subsequent
-/// `graph.concretetype(v)` reads route through the rtyper's
-/// `Variable.concretetype` directly.
+/// `FunctionGraph::concretetype_of(&v)` reads route through the
+/// rtyper's `Variable.concretetype` directly.
 ///
-/// The codewriter reads kinds via `graph.concretetype(v)`, which
-/// routes to each `Variable.concretetype` cell (set by the
+/// The codewriter reads kinds via `FunctionGraph::concretetype_of(&v)`,
+/// which routes to each `Variable.concretetype` cell (set by the
 /// `RPythonTyper`) and projects through [`crate::model::getkind`],
 /// matching upstream's `getkind(v.concretetype)` access pattern.
 ///

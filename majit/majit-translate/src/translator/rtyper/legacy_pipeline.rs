@@ -59,9 +59,10 @@ pub(crate) fn analyze_function(func: &SemanticFunction, config: &PipelineConfig)
 
     // Pass 2: Type resolution (RPython rtyper) — commits per-Variable
     // `concretetype` cells via `FunctionGraph::set_concretetype_of_inline`,
-    // so downstream consumers read kinds via `graph.concretetype(v)`.
-    // The returned scratch state is unused here (legacy_pipeline does
-    // not run the dual-gate comparison).
+    // so downstream consumers read kinds via
+    // `FunctionGraph::concretetype_of(&v)`.  The returned scratch state
+    // is unused here (legacy_pipeline does not run the dual-gate
+    // comparison).
     resolve_types(graph);
     // Pass 2b: rtyper-equivalent indirect_call lowering. RPython's rtyper
     // (rpbc.py:199-217) always emits `indirect_call(funcptr, *args,
@@ -81,7 +82,7 @@ pub(crate) fn analyze_function(func: &SemanticFunction, config: &PipelineConfig)
 
     // `resolve_types` already commits each backing Variable's
     // `concretetype` cell as it resolves, so jtransform reads kinds
-    // via `graph.concretetype(v)` (the upstream
+    // via `FunctionGraph::concretetype_of(&v)` (the upstream
     // `getkind(v.concretetype)` path) directly here.
     // `with_type_state` is still threaded as a belt-and-suspenders
     // fallback for any slot that the rtyper left Unknown — without it
@@ -112,13 +113,13 @@ pub(crate) fn analyze_function(func: &SemanticFunction, config: &PipelineConfig)
     // 2 / Pass 2.5 → Variable cells via apply_to_graph) and by
     // jtransform's per-op result_kind stamps (committed in
     // `Transformer::transform` → apply_to_graph).  Downstream
-    // consumers read kinds via `graph.concretetype(v)`.
+    // consumers read kinds via `FunctionGraph::concretetype_of(&v)`.
     let mut transform_result = transform_result;
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
-    // Reads kinds straight off `graph.concretetype(v)` after the
-    // canonical exceptblock stamp.  No `value_kinds` HashMap surface
-    // any more — the graph IS the kind table.
+    // Reads kinds straight off `FunctionGraph::concretetype_of(&v)`
+    // after the canonical exceptblock stamp.  No `value_kinds`
+    // HashMap surface any more — the graph IS the kind table.
     crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transform_result.graph);
     let mut regallocs = crate::regalloc::perform_all_register_allocations(&transform_result.graph);
     // `flatten_graph` runs `enforce_input_args` (flatten.py:88-100)

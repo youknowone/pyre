@@ -416,8 +416,8 @@ impl<'a> Transformer<'a> {
 
     /// RPython: Transformer.transform() — process all blocks in the graph.
     ///
-    /// Reads operand kinds via `graph.concretetype(v)` (RPython
-    /// `getkind(v.concretetype)`).  Callers commit kinds to each
+    /// Reads operand kinds via `FunctionGraph::concretetype_of(&v)`
+    /// (RPython `getkind(v.concretetype)`).  Callers commit kinds to each
     /// backing `Variable.concretetype` cell upstream — through
     /// `legacy_resolve::resolve_types` (which writes through
     /// `FunctionGraph::set_concretetype_of_inline(&var, ct)` per-set)
@@ -560,8 +560,9 @@ impl<'a> Transformer<'a> {
     /// backward-inference pass classifies `op.result` from its consumer-op
     /// constraints, and that classification is stamped on the result
     /// Variable's `concretetype` cell via `apply_to_graph` before this
-    /// pass runs.  Reading `graph.concretetype(v)` therefore propagates
-    /// the same `result_kind` the rtyper already chose, instead of
+    /// pass runs.  Reading `FunctionGraph::concretetype_of(&v)` therefore
+    /// propagates the same `result_kind` the rtyper already chose,
+    /// instead of
     /// falling back to `value_type_to_kind(Unknown) == 'r'`.
     fn resolve_call_result_kind(
         &self,
@@ -2488,7 +2489,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:2186 _handle_dict_lookup_call passes
         // `extradescr=[cpu.fielddescrof(STRUCT, 'entries'), cpu.arraydescrof(STRUCT.entries.TO)]`
         // derived from `op.args[1].concretetype.TO`. pyre's
-        // `graph.concretetype(v)` collapses lltype to four kinds, so
+        // `FunctionGraph::concretetype_of(&v)` collapses lltype to four kinds, so
         // the dict struct is not recoverable here — extradescrs stays
         // None until full lltype propagation lands.
         // OptHeap::_optimize_call_dict_lookup returns false on None extradescrs

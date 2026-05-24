@@ -37,7 +37,7 @@ use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;

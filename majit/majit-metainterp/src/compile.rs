@@ -24,10 +24,9 @@ use majit_backend::{
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_ir::{
-    AccumInfo, Const, Descr, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op,
-    OpCode, OpRef, RdVirtualInfo, Type, Value,
+    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
+    OpRef, RdVirtualInfo, Type, Value,
 };
-use std::collections::HashMap;
 
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
@@ -2222,9 +2221,8 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // depending on `majit-metainterp`.  Re-exported here for callers
 // reaching them through `compile::DoneWithThisFrameDescr*` etc.
 pub use majit_backend::{
-    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
-    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
-    PropagateExceptionDescr,
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
+    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
 
 /// `compile.py:665-674` `def make_and_attach_done_descrs(targets)`.

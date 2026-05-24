@@ -108,23 +108,23 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     all_jitcodes().get(index).cloned()
 }
 
-/// Cached index of the build-time portal jitcode within `ALL_JITCODES`.
-///
-/// RPython `warmspot.py:281-282` + `call.py:147-148`:
-/// `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` followed by
-/// `jd.mainjitcode.jitdriver_sd = jd`. The single jitcode whose
-/// `jitdriver_sd` is set is the portal — every other entry in
-/// `metainterp_sd.jitcodes` is either an inlined callee or an indirect
-/// call target. Pyre's bincode preserves that flag through
-/// `oncelock_usize_serde`, so the scan below identifies the same
-/// jitcode the codewriter side stored in
-/// `JitDriverStaticData.mainjitcode`.
-///
-/// Production identity: `pyre-jit-trace/build.rs:33-54` (Task #140)
-/// includes `pyre/pyre-jit/src/eval.rs` in the source-only walk so the
-/// scan below picks up the `eval_loop_jit` jitcode whose
-/// `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
-/// (`pyre-jit/src/jit/codewriter.rs:6544` — call.py:148 deferred port).
+// Cached index of the build-time portal jitcode within `ALL_JITCODES`.
+//
+// RPython `warmspot.py:281-282` + `call.py:147-148`:
+// `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` followed by
+// `jd.mainjitcode.jitdriver_sd = jd`. The single jitcode whose
+// `jitdriver_sd` is set is the portal — every other entry in
+// `metainterp_sd.jitcodes` is either an inlined callee or an indirect
+// call target. Pyre's bincode preserves that flag through
+// `oncelock_usize_serde`, so the scan below identifies the same
+// jitcode the codewriter side stored in
+// `JitDriverStaticData.mainjitcode`.
+//
+// Production identity: `pyre-jit-trace/build.rs:33-54` (Task #140)
+// includes `pyre/pyre-jit/src/eval.rs` in the source-only walk so the
+// scan below picks up the `eval_loop_jit` jitcode whose
+// `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
+// (`pyre-jit/src/jit/codewriter.rs:6544` — call.py:148 deferred port).
 thread_local! {
     /// Cached portal jitcode index for the current thread.  See
     /// `portal_jitcode` for the resolution semantics.  `thread_local!`

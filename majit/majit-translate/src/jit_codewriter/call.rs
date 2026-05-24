@@ -4171,7 +4171,7 @@ impl CallControl {
                         // `concretetype` list. Pyre's caller-side
                         // `arg_types` comes from `resolve_non_void_arg_types`
                         // which falls back to `Type::Ref` whenever
-                        // `graph.concretetype(v)` returns `Unknown`.
+                        // `FunctionGraph::concretetype_of(&v)` returns `Unknown`.
                         // Trait-method test fixtures
                         // (`transform_all_handlers_to_jitcode`) hit that
                         // path because they construct `CallControl` without

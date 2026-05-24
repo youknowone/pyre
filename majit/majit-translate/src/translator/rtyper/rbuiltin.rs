@@ -1439,6 +1439,7 @@ fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// return.  Upstream's `getattr(..., 'im_func', ...)` unwraps the
 /// Python-2 bound-method `__init__` descriptor; pyre uses a single
 /// `"object.__init__"` qualname key in HOST_ENV instead.
+#[allow(non_snake_case)]
 fn rtype_object__init__(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     Ok(None)

@@ -343,8 +343,8 @@ pub(crate) enum DualGateOutcome {
         /// model.py:280`), so codewriter callers rebind each slot to
         /// the upstream-typed Variable via
         /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
-        /// `graph.concretetype(v)` then reads its `concretetype`
-        /// cell directly.
+        /// `FunctionGraph::concretetype_of(&v)` then reads its
+        /// `concretetype` cell directly.
         real_value_to_var: SlotToVariable,
     },
     /// Real path failed on a known-unported feature — the gate
@@ -951,7 +951,7 @@ pub(crate) fn lift_callee_to_pygraph(
     // concretetype`).  The by-slot side map was a pyre-only divergence.
     //
     // Test fixtures that hand-roll minimal SSA shapes must seed
-    // `callee_graph.variable(vid).annotation` directly via
+    // each `Variable.annotation` directly via
     // `legacy_annotator::setbinding(&var, ValueType::…)` before calling
     // this so `seed_variable` has type info to attach.
     let FlowspaceAdapterOutput { graph, .. } =

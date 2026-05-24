@@ -955,7 +955,7 @@ mod tests {
         cb.split = true;
         let ptrs = EntryPointPtr::Many(Vec::new());
         let err = cb
-            .build_database_from_entrypointptr(ptrs)
+            .build_database_with(&|| Ok(ptrs.clone()))
             .expect_err("getexceptiontransformer must require rtyper");
         assert!(
             err.message.contains("translator.py:88"),

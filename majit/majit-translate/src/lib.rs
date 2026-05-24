@@ -1555,8 +1555,8 @@ mod tests {
         // Step 3: flatten the rewritten graph
         // `resolve_types` commits per-value `concretetype` cells on
         // each backing Variable as it builds, so downstream consumers
-        // can read kinds via `graph.concretetype(v)` without a
-        // separate publish step.
+        // can read kinds via `FunctionGraph::concretetype_of(&v)`
+        // without a separate publish step.
         annotate::annotate(&result.graph);
         rtype::resolve_types(&result.graph);
         let mut result = result;

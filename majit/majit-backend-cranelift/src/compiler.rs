@@ -894,40 +894,10 @@ thread_local! {
 
 // ── Exception state shims called from JIT-compiled code ──
 
-/// Read the current exception value (returns 0 if no exception pending).
-extern "C" fn jit_exc_get_value() -> i64 {
-    JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Read the current exception class (returns 0 if no exception pending).
-extern "C" fn jit_exc_get_type() -> i64 {
-    JIT_EXC_TYPE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Clear the current exception state and return the value that was pending.
-extern "C" fn jit_exc_clear_and_get_value() -> i64 {
-    let val = JIT_EXC_VALUE.swap(0, std::sync::atomic::Ordering::Relaxed);
-    JIT_EXC_TYPE.store(0, std::sync::atomic::Ordering::Relaxed);
-    val
-}
-
 /// Clear the current exception state.
 extern "C" fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, std::sync::atomic::Ordering::Relaxed);
     JIT_EXC_TYPE.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Return 1 if the current exception class exactly matches `expected_type`.
-extern "C" fn jit_exc_type_matches(expected_type: i64) -> i64 {
-    let exc_value = JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed);
-    let exc_type = JIT_EXC_TYPE.load(std::sync::atomic::Ordering::Relaxed);
-    i64::from(exc_value != 0 && exc_type == expected_type)
-}
-
-/// Set the current exception state (value, class).
-extern "C" fn jit_exc_restore(value: i64, exc_type: i64) {
-    JIT_EXC_VALUE.store(value, std::sync::atomic::Ordering::Relaxed);
-    JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// llmodel.py:194-199 _store_exception parity: set exception state.
@@ -4452,7 +4422,6 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
 /// "guard fired before redefinition → use original inputarg type"
 /// fallback in `resolve_fail_arg_types`.
 fn build_type_overrides(
-    inputargs: &[InputArg],
     ops: &[Op],
     type_index: &OpTypeIndex<'_>,
 ) -> (HashMap<u32, Type>, HashMap<u32, usize>) {
@@ -7792,7 +7761,6 @@ impl CraneliftBackend {
             source_guard,
             caller_layout,
             &self.constants,
-            &self.constant_types,
             attached_descrs,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
@@ -7804,7 +7772,6 @@ impl CraneliftBackend {
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
             inputargs,
-            &self.constant_types,
             &force_tokens,
             trace_id,
             header_pc,
@@ -7815,7 +7782,7 @@ impl CraneliftBackend {
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
         let type_index = OpTypeIndex::new(inputargs, ops);
-        let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
+        let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
         let ref_root_slots =
             build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
         let gc_nursery_addrs =
@@ -13227,12 +13194,10 @@ fn collect_guards(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &majit_ir::VecAssoc<u32, i64>,
-    constant_types: &majit_ir::VecAssoc<u32, Type>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
-    let num_inputs = inputargs.len();
     let type_index = OpTypeIndex::new(inputargs, ops);
-    let (type_overrides, op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
+    let (type_overrides, op_def_positions) = build_type_overrides(ops, &type_index);
 
     // Map Label descr index → block arity, used to distinguish internal vs
     // external JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose
@@ -13982,7 +13947,6 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
-    constant_types: &majit_ir::VecAssoc<u32, Type>,
     force_tokens: &HashSet<u32>,
     trace_id: u64,
     header_pc: u64,
@@ -13990,7 +13954,7 @@ fn collect_terminal_exit_layouts(
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
-    let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
+    let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;
 

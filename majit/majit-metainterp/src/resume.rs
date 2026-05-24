@@ -10,8 +10,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use majit_backend::{
-    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    ExitVirtualLayout,
+    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitVirtualLayout,
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -563,12 +562,12 @@ pub struct EncodedResumeData {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct DecodedResumeLayout {
-    vable_array: Vec<ResumeValueSource>,
-    vref_array: Vec<ResumeValueSource>,
-    frames: Vec<FrameInfo>,
-    virtuals: Vec<VirtualInfo>,
-    pending_fields: Vec<PendingFieldInfo>,
+pub struct DecodedResumeLayout {
+    pub vable_array: Vec<ResumeValueSource>,
+    pub vref_array: Vec<ResumeValueSource>,
+    pub frames: Vec<FrameInfo>,
+    pub virtuals: Vec<VirtualInfo>,
+    pub pending_fields: Vec<PendingFieldInfo>,
 }
 
 // ResumeValueKind / ResumeValueLayoutSummary moved to
