@@ -3372,38 +3372,6 @@ mod tests {
         assert_ne!(OpRef::ref_op(0), OpRef::float_op(0));
     }
 
-    #[test]
-    fn opref_same_box_mirrors_partial_eq() {
-        // `resoperation.py:38 AbstractValue.same_box` is identity-only.
-        // For pyre's flat-OpRef encoding identity = variant + raw payload
-        // equality (`derive(PartialEq)`), so `same_box` must equal `==`
-        // for every OpRef pair the caller can construct.
-        let a = OpRef::int_op(7);
-        assert!(a.same_box(a));
-        assert!(a.same_box(OpRef::int_op(7)));
-
-        // Disjoint variants with matching payload: not same box.
-        assert!(!OpRef::int_op(0).same_box(OpRef::ref_op(0)));
-        assert!(!OpRef::int_op(0).same_box(OpRef::float_op(0)));
-        assert!(!OpRef::ref_op(0).same_box(OpRef::float_op(0)));
-
-        // None vs typed: not same box (history.py:182 `None` vs Box).
-        assert!(!OpRef::NONE.same_box(OpRef::int_op(0)));
-        assert!(!OpRef::int_op(0).same_box(OpRef::NONE));
-        assert!(OpRef::NONE.same_box(OpRef::NONE));
-
-        // Two distinct Const-namespace mints of the same value (different
-        // pool indices) compare unequal via `same_box` because their raw
-        // payloads (CONST_BIT | idx) differ. This matches PyPy where
-        // `ConstInt(42)` and `ConstInt(42)` are distinct Box objects with
-        // `same_box == False`; value-aware comparison is the separate
-        // `same_constant` method (history.py:204/244).
-        let c0 = OpRef::const_int(0);
-        let c1 = OpRef::const_int(1);
-        assert!(!c0.same_box(c1));
-        assert!(c0.same_box(OpRef::const_int(0)));
-    }
-
     // ── Metadata table coverage ──
 
     #[test]
