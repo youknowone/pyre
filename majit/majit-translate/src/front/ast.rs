@@ -2311,26 +2311,28 @@ fn allocate_loop_header_phis(
 }
 
 /// Walk `header.inputargs` and recover, in inputarg order, the local
-/// name attached to each `OpKind::Input { name, .. }` op whose result
-/// is that inputarg.  Used by `Expr::While` / `Expr::Loop` (Slice
-/// 5c.1+) to capture the FROZEN header-phi name list once the loop
-/// header is fully populated — both by `allocate_loop_header_phis`'s
-/// eager phis and by any cond-driven cross-block lazy installs.  The
-/// returned list drives the back-edge close and `Expr::Continue` per-
-/// name link-arg threading; it must match `header.inputargs.len()`.
+/// name attached to each Variable.  Used by `Expr::While` / `Expr::Loop`
+/// (Slice 5c.1+) to capture the FROZEN header-phi name list once the
+/// loop header is fully populated — both by
+/// `allocate_loop_header_phis`'s eager phis and by any cond-driven
+/// cross-block lazy installs and carry-through Variables threaded in
+/// via `ensure_variable_at_block` (Slice 4.2).  The returned list
+/// drives the back-edge close and `Expr::Continue` per-name link-arg
+/// threading; it must match `header.inputargs.len()`.
+///
+/// Reads `graph.value_name(vid)` directly so carry-through Variables
+/// added to `inputargs` by `ensure_variable_at_block` (which does not
+/// emit a paired `OpKind::Input { name, .. }` op) are recovered under
+/// their original definition-site name — typically a function
+/// parameter named at `entry`-block registration time.
 fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
     let header_block = graph.block(header);
     header_block
         .inputargs
         .iter()
         .filter_map(|iarg| {
-            header_block
-                .operations
-                .iter()
-                .find_map(|op| match (&op.kind, op.result.as_ref()) {
-                    (OpKind::Input { name, .. }, Some(r)) if r == iarg => Some(name.clone()),
-                    _ => None,
-                })
+            let slot = graph.slot_of(iarg)?;
+            graph.value_name_at(slot).map(|s| s.to_string())
         })
         .collect()
 }
@@ -2708,6 +2710,116 @@ impl<'a> GraphBuildContext<'a> {
         // `flowcontext.py:352 self.stack = state.stack[:]` — direct
         // copy now that `value_stack` and `FrameState.stack` share the
         // `Vec<StackElem>` carrier (Z4.A.5).
+        self.value_stack = state.stack.clone();
+        self.last_exception = state.last_exception.clone();
+        self.blockstack = state.blocklist.clone();
+        self.normalize_raise_signals();
+    }
+
+    /// `flowcontext.py:350-356 setstate` companion threaded with an
+    /// explicit `owner_block` so the post-merge `local_value_ids`
+    /// records carry the merge block itself as their `defining_block`
+    /// — every `Variable` in `state.locals_w` is materialised in
+    /// `owner_block.inputargs` by `create_block_from_framestate`, so
+    /// `(vid, owner_block)` is the structurally honest pairing of the
+    /// pyre `(ValueId, BlockId)` reuse-gate.
+    ///
+    /// Also names freshly-minted phi `Variable`s via
+    /// `graph.name_value(vid, name)` so the cutover's
+    /// `flowspace_adapter.rs:1706-1708` cross-block aliasing recovers
+    /// the merge-block inputarg under the local's name.  Upstream
+    /// `framestate.py:113 Variable()` mints anonymous Variables at
+    /// NeedsPhi cells — pyre's IR side-table for `value_name` is the
+    /// graph-side carrier that `register_variable_valueid` leaves
+    /// untouched, so the naming step lives here at the setstate
+    /// boundary.
+    ///
+    /// Refreshes `local_value_types` from `graph_value_type(vid)` so
+    /// later `read_local` / `STORE_FAST` re-entry sees the merged kind
+    /// (carry-through type widening: `Unknown` cells inherit the
+    /// concrete sibling kind via `FrameState::union`'s wildcard rule).
+    ///
+    /// Currently unused — Slice 4.2 production migration deferred until
+    /// `ensure_variable_at_block` learns to emit paired
+    /// `OpKind::Input { name, .. }` ops alongside its inputargs
+    /// growth (third blocker discovered during the slice-4.2 attempt:
+    /// the helper's grown inputargs are picked up by
+    /// `header_phi_name_list` via `value_name(vid)` post the same
+    /// session's update, but downstream cutover at
+    /// `flowspace_adapter.rs:1739-1797` requires the paired Input op
+    /// for cross-block body-Input aliasing, which `ensure_*` does not
+    /// produce; raw `Variable::new()` phi cells minted by
+    /// `FrameState::union` for NeedsPhi slots have no in-graph
+    /// definition site, so chain backfill into upstream blocks fails
+    /// with `graph corruption: no transitive predecessor chain leads
+    /// to a definition site` on real production graphs).
+    #[allow(dead_code)]
+    fn setstate_at_block(
+        &mut self,
+        state: &FrameState,
+        owner_block: BlockId,
+        graph: &mut FunctionGraph,
+    ) {
+        // Snapshot the slot view + Variables + names before re-borrowing
+        // graph mutably for `name_value_var` / `local_value_types` updates.
+        let entries: Vec<(
+            usize,
+            String,
+            Option<(crate::flowspace::model::Variable, ValueType)>,
+        )> = {
+            let view = state.locals_w_view(graph);
+            self.local_first_bind_order
+                .iter()
+                .enumerate()
+                .map(|(slot_idx, name)| {
+                    let payload = view
+                        .get(slot_idx)
+                        .and_then(|c| c.as_ref())
+                        .and_then(|cell| {
+                            match cell {
+                                crate::flowspace::model::Hlvalue::Variable(v) => Some((
+                                    v.clone(),
+                                    graph_value_type_var(graph, v).unwrap_or(ValueType::Unknown),
+                                )),
+                                // Constant cells in locals: pyre keys
+                                // identity through ValueId, and Constants
+                                // are emitted on-demand by the reader
+                                // (Stmt::Local / Expr::Path lower constant
+                                // literals via push_op directly), so we
+                                // drop the binding here and let the next
+                                // read re-emit.  Upstream `framestate.py`
+                                // carries the Constant cell directly; the
+                                // structural divergence is accepted at
+                                // `setstate`-boundary today (rare path —
+                                // `framestate.py:113` mints Variables not
+                                // Constants on NeedsPhi).
+                                crate::flowspace::model::Hlvalue::Constant(_) => None,
+                            }
+                        });
+                    (slot_idx, name.clone(), payload)
+                })
+                .collect()
+        };
+        for (_slot_idx, name, payload) in entries {
+            match payload {
+                Some((var, ty)) => {
+                    if graph
+                        .slot_of(&var)
+                        .and_then(|s| graph.value_name_at(s))
+                        .is_none()
+                    {
+                        graph.name_value_var(&var, name.clone());
+                    }
+                    self.local_value_ids
+                        .insert(name.clone(), (var, owner_block));
+                    self.local_value_types.insert(name, ty);
+                }
+                None => {
+                    self.local_value_ids.remove(&name);
+                    self.local_value_types.remove(&name);
+                }
+            }
+        }
         self.value_stack = state.stack.clone();
         self.last_exception = state.last_exception.clone();
         self.blockstack = state.blocklist.clone();
