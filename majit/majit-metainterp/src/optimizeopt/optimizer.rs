@@ -90,6 +90,20 @@ pub struct Optimizer {
     /// Types of the original trace inputargs (from LABEL or inputarg_types).
     /// RPython Boxes carry type intrinsically; we store it here so
     /// export_state can propagate to ExportedState.renamed_inputarg_types.
+    ///
+    /// Production redundancy: `OpRef::ty()` (resoperation.rs:133-135)
+    /// already derives `Type::Int` / `Float` / `Ref` from the
+    /// `InputArg*` variant tag, mirroring PyPy `isinstance(x,
+    /// InputArgInt)` class-derived type lookup.  This field carries the
+    /// same information and survives as a compatibility shim for the
+    /// test-only auto-seed at
+    /// [`Self::optimize_with_constants_and_inputs_at`] — many fixtures
+    /// still use `OpRef::int_op(N)` (`AbstractResOp::IntOp` mixin) at
+    /// inputarg slots, where `OpRef::ty()` returns the IntOp type
+    /// regardless of whether the slot is genuinely an inputarg.  Once
+    /// fixtures are migrated to `InputArg*` variants (via
+    /// [`OpRef::inputarg_refs`]) this field can be dropped in favour of
+    /// per-slot `OpRef::ty()` resolution.
     pub trace_inputarg_types: Vec<majit_ir::Type>,
     /// unroll.py / compile.py parity: original live values at the jump
     /// point, threaded into export_state as `runtime_boxes`. Dormant

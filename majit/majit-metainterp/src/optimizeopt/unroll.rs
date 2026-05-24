@@ -56,9 +56,7 @@ fn is_trace_runtime_ref(
 /// same `None`/`Some` distinction the `p1_full_prefix` argument
 /// expects.  GcRef rooting via `ExportedState::root_all_gcrefs` is the
 /// canonical safety net, not snapshot copying.
-fn p1_full_prefix_from_box_pool(
-    pool: &crate::r#box::BoxPool,
-) -> Option<crate::r#box::BoxPool> {
+fn p1_full_prefix_from_box_pool(pool: &crate::r#box::BoxPool) -> Option<crate::r#box::BoxPool> {
     if pool.is_empty() {
         None
     } else {
