@@ -6000,6 +6000,313 @@ fn init_socket_type(ns: &mut DictStorage) {
         }),
     );
 
+    // recvmsg(bufsize, [ancbufsize, flags]) → (data, ancdata, msg_flags, address)
+    // `interp_socket.py:525-569` — receives normal + ancillary data
+    // via libc::recvmsg.  ancdata is a list of (cmsg_level, cmsg_type,
+    // cmsg_data:bytes) triples walked through CMSG_FIRSTHDR /
+    // CMSG_NXTHDR / CMSG_DATA.
+    crate::dict_storage_store(
+        ns,
+        "recvmsg",
+        crate::make_builtin_function("recvmsg", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("recvmsg() missing buffer size"));
+            }
+            if !unsafe { pyre_object::is_int(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "recvmsg: bufsize must be an integer",
+                ));
+            }
+            let bufsize_raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            if bufsize_raw < 0 {
+                return Err(crate::PyError::value_error(
+                    "negative buffer size in recvmsg()",
+                ));
+            }
+            let bufsize = bufsize_raw as usize;
+            let ancbufsize = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvmsg: ancbufsize must be an integer",
+                    ));
+                }
+                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if raw < 0 {
+                    return Err(crate::PyError::value_error(
+                        "invalid ancillary data buffer length",
+                    ));
+                }
+                raw as usize
+            } else {
+                0
+            };
+            let flags = if args.len() >= 4 {
+                if !unsafe { pyre_object::is_int(args[3]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvmsg: flags must be an integer",
+                    ));
+                }
+                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+            } else {
+                0
+            };
+            let fd = socket_fd(args[0])?;
+
+            let mut data = vec![0u8; bufsize];
+            let mut control = vec![0u8; ancbufsize];
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let (got, msg_flags) = loop {
+                let mut iov = libc::iovec {
+                    iov_base: data.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: bufsize,
+                };
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+                msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                if ancbufsize > 0 {
+                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    msg.msg_controllen = ancbufsize as _;
+                }
+                let r = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+                if r >= 0 {
+                    break (r, msg.msg_flags);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
+            data.truncate(got as usize);
+
+            // Walk ancillary data.  Re-run msghdr with the final
+            // controllen so CMSG_* macros see the trimmed buffer.
+            let mut anc_items = Vec::new();
+            if ancbufsize > 0 {
+                let mut iov = libc::iovec {
+                    iov_base: data.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: bufsize,
+                };
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = ancbufsize as _;
+                unsafe {
+                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    while !cmsg.is_null() {
+                        let header = &*cmsg;
+                        let hdr_size = libc::CMSG_LEN(0) as usize;
+                        let total = header.cmsg_len as usize;
+                        if total < hdr_size {
+                            break;
+                        }
+                        let payload_len = total - hdr_size;
+                        let payload_ptr = libc::CMSG_DATA(cmsg);
+                        let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                        anc_items.push(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(header.cmsg_level as i64),
+                            pyre_object::w_int_new(header.cmsg_type as i64),
+                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
+                        ]));
+                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                    }
+                }
+            }
+            let addr = unpack_inet_addr(&storage);
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                pyre_object::w_list_new(anc_items),
+                pyre_object::w_int_new(msg_flags as i64),
+                addr,
+            ]))
+        }),
+    );
+
+    // sendmsg(data_iter[, ancillary[, flags[, address]]]) → bytes_sent
+    // `interp_socket.py:711-773` — gather-write of multiple bytes-like
+    // buffers plus optional ancillary control messages.  Each cmsg is
+    // a (cmsg_level, cmsg_type, cmsg_data) 3-tuple; we lay them out
+    // into a single control buffer via CMSG_SPACE / CMSG_NXTHDR.
+    crate::dict_storage_store(
+        ns,
+        "sendmsg",
+        crate::make_builtin_function("sendmsg", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("sendmsg() missing data"));
+            }
+            let obj = args[0];
+            let fd = socket_fd(obj)?;
+
+            // Collect data buffers from args[1] (must be an iterable
+            // of bytes-like).  We borrow the bytes-like data ref into
+            // a Vec<&[u8]> so the iovec can point at it.
+            if !unsafe { pyre_object::is_list(args[1]) || pyre_object::is_tuple(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "sendmsg: data must be a sequence of bytes-like objects",
+                ));
+            }
+            let data_len = unsafe {
+                if pyre_object::is_list(args[1]) {
+                    pyre_object::w_list_len(args[1])
+                } else {
+                    pyre_object::w_tuple_len(args[1])
+                }
+            };
+            let mut data_refs: Vec<&[u8]> = Vec::with_capacity(data_len);
+            for i in 0..data_len {
+                let item = unsafe {
+                    if pyre_object::is_list(args[1]) {
+                        pyre_object::w_list_getitem(args[1], i as i64)
+                            .unwrap_or(pyre_object::PY_NULL)
+                    } else {
+                        pyre_object::w_tuple_getitem(args[1], i as i64)
+                            .unwrap_or(pyre_object::PY_NULL)
+                    }
+                };
+                if !unsafe { pyre_object::bytesobject::is_bytes_like(item) } {
+                    return Err(crate::PyError::type_error(
+                        "sendmsg: data items must be bytes-like",
+                    ));
+                }
+                let slice = unsafe { pyre_object::bytesobject::bytes_like_data(item) };
+                data_refs.push(slice);
+            }
+            let mut iovs: Vec<libc::iovec> = data_refs
+                .iter()
+                .map(|s| libc::iovec {
+                    iov_base: s.as_ptr() as *mut libc::c_void,
+                    iov_len: s.len(),
+                })
+                .collect();
+
+            // Build ancillary control buffer from args[2] (optional).
+            let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+            if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
+                if !unsafe { pyre_object::is_list(args[2]) || pyre_object::is_tuple(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "sendmsg: ancillary must be a sequence",
+                    ));
+                }
+                let n = unsafe {
+                    if pyre_object::is_list(args[2]) {
+                        pyre_object::w_list_len(args[2])
+                    } else {
+                        pyre_object::w_tuple_len(args[2])
+                    }
+                };
+                for i in 0..n {
+                    let item = unsafe {
+                        if pyre_object::is_list(args[2]) {
+                            pyre_object::w_list_getitem(args[2], i as i64)
+                                .unwrap_or(pyre_object::PY_NULL)
+                        } else {
+                            pyre_object::w_tuple_getitem(args[2], i as i64)
+                                .unwrap_or(pyre_object::PY_NULL)
+                        }
+                    };
+                    if !unsafe { pyre_object::is_tuple(item) }
+                        || unsafe { pyre_object::w_tuple_len(item) } != 3
+                    {
+                        return Err(crate::PyError::type_error(
+                            "sendmsg: ancillary items must be 3-tuples",
+                        ));
+                    }
+                    let level_o = unsafe { pyre_object::w_tuple_getitem(item, 0) }
+                        .ok_or_else(|| crate::PyError::value_error("ancillary level missing"))?;
+                    let type_o = unsafe { pyre_object::w_tuple_getitem(item, 1) }
+                        .ok_or_else(|| crate::PyError::value_error("ancillary type missing"))?;
+                    let data_o = unsafe { pyre_object::w_tuple_getitem(item, 2) }
+                        .ok_or_else(|| crate::PyError::value_error("ancillary data missing"))?;
+                    if !unsafe { pyre_object::is_int(level_o) }
+                        || !unsafe { pyre_object::is_int(type_o) }
+                    {
+                        return Err(crate::PyError::type_error(
+                            "sendmsg: ancillary level/type must be integers",
+                        ));
+                    }
+                    if !unsafe { pyre_object::bytesobject::is_bytes_like(data_o) } {
+                        return Err(crate::PyError::type_error(
+                            "sendmsg: ancillary data must be bytes-like",
+                        ));
+                    }
+                    let level = unsafe { pyre_object::w_int_get_value(level_o) } as libc::c_int;
+                    let ty = unsafe { pyre_object::w_int_get_value(type_o) } as libc::c_int;
+                    let data =
+                        unsafe { pyre_object::bytesobject::bytes_like_data(data_o).to_vec() };
+                    cmsgs.push((level, ty, data));
+                }
+            }
+            let flags = if args.len() >= 4 {
+                if !unsafe { pyre_object::is_int(args[3]) } {
+                    return Err(crate::PyError::type_error(
+                        "sendmsg: flags must be an integer",
+                    ));
+                }
+                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+            } else {
+                0
+            };
+            let (addr_storage, addr_len) =
+                if args.len() >= 5 && !unsafe { pyre_object::is_none(args[4]) } {
+                    let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                    let (s, l) = pack_inet_addr(family, args[4])?;
+                    (Some(s), l)
+                } else {
+                    (None, 0)
+                };
+
+            // Lay out cmsgs into a single control buffer.
+            let total_control: usize = cmsgs
+                .iter()
+                .map(|(_, _, d)| unsafe { libc::CMSG_SPACE(d.len() as libc::c_uint) as usize })
+                .sum();
+            let mut control = vec![0u8; total_control];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = iovs.as_mut_ptr();
+            msg.msg_iovlen = iovs.len() as _;
+            if let Some(ref s) = addr_storage {
+                msg.msg_name = s as *const _ as *mut libc::c_void;
+                msg.msg_namelen = addr_len;
+            }
+            if total_control > 0 {
+                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = total_control as _;
+                unsafe {
+                    let mut cur = libc::CMSG_FIRSTHDR(&msg);
+                    for (level, ty, data) in &cmsgs {
+                        if cur.is_null() {
+                            break;
+                        }
+                        let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
+                        (*cur).cmsg_level = *level;
+                        (*cur).cmsg_type = *ty;
+                        (*cur).cmsg_len = cmsg_len as _;
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            libc::CMSG_DATA(cur),
+                            data.len(),
+                        );
+                        cur = libc::CMSG_NXTHDR(&msg, cur);
+                    }
+                }
+            }
+
+            let sent = loop {
+                let r = unsafe { libc::sendmsg(fd, &msg, flags) };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
+            Ok(pyre_object::w_int_new(sent as i64))
+        }),
+    );
+
     crate::dict_storage_store(
         ns,
         "shutdown",
