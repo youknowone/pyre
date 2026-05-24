@@ -848,14 +848,6 @@ impl PtrInfo {
         )
     }
 
-    /// info.py: same_info(other) — identity (or constant equality).
-    pub fn same_info(&self, other: &PtrInfo) -> bool {
-        match (self, other) {
-            (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
-            _ => std::ptr::eq(self, other),
-        }
-    }
-
     /// info.py: get_descr() — size/type descriptor for virtual objects.
     pub fn get_descr(&self) -> Option<&DescrRef> {
         match self {
