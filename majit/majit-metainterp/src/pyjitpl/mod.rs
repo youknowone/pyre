@@ -4753,7 +4753,7 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:233 compile_simple_loop: loop.inputargs is the
             // original trace inputargs. There is no ExportedState on the
             // simple path.
-            trace.inputargs.iter().map(|rc| (**rc).clone()).collect()
+            trace.inputargs_cloned()
         } else {
             match unroll_opt
                 .final_exported_state
@@ -6288,7 +6288,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs: Vec<InputArg> =
-            trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
+            trace.inputargs_cloned();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
         // the optimizer may unbox Int-typed locals. Read the first guard's
@@ -6389,7 +6389,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let trace_inputargs_view: Vec<InputArg> =
-                    trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
+                    trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -6410,7 +6410,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs.iter().map(|rc| (**rc).clone()).collect(),
+                        inputargs: trace.inputargs_cloned(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -6651,7 +6651,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs: Vec<InputArg> =
-            trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
+            trace.inputargs_cloned();
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
@@ -6750,7 +6750,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let trace_inputargs_view: Vec<InputArg> =
-                    trace.inputargs.iter().map(|rc| (**rc).clone()).collect();
+                    trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -6771,7 +6771,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs.iter().map(|rc| (**rc).clone()).collect(),
+                        inputargs: trace.inputargs_cloned(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,

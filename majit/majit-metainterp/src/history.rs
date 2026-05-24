@@ -80,6 +80,10 @@ impl TreeLoop {
         !opref.is_none() && !opref.is_constant()
     }
 
+    pub fn inputargs_cloned(&self) -> Vec<InputArg> {
+        self.inputargs.iter().map(|rc| (**rc).clone()).collect()
+    }
+
     /// Create a new trace from input arguments and operations.
     ///
     /// `ops` are wrapped in `Rc` at construction so that every downstream
