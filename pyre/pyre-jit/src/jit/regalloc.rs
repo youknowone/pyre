@@ -134,7 +134,21 @@ impl<'a> RegAllocator<'a> {
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
-                        die_at.insert(v.id, 0);
+                        // Task #237 ADAPTATION: project each Variable ID
+                        // through `_unionfind.find_rep` so pre-merged
+                        // pairs (from `perform_register_allocation_with_pairs`'s
+                        // `extra_coalesce_pairs`) share a single
+                        // live-set identity.  Walker scratch variables
+                        // pinned to a local-i inputarg slot otherwise
+                        // get distinct entries here and an interference
+                        // edge gets recorded between them — preventing
+                        // the later `try_coalesce` from merging them
+                        // (regalloc.py:106 `has_edge` early return).
+                        // When `_unionfind` has no pre-merges, find_rep
+                        // returns the input ID unchanged so this matches
+                        // upstream `regalloc.py:26-77` exactly.
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.insert(rep, 0);
                     }
                 }
             }
@@ -142,27 +156,31 @@ impl<'a> RegAllocator<'a> {
                 for arg in &op.args {
                     for v in arg.variables() {
                         if v.kind == Some(kind) {
-                            die_at.insert(v.id, i);
+                            let rep = self._unionfind.find_rep(v.id);
+                            die_at.insert(rep, i);
                         }
                     }
                 }
                 if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if v.kind == Some(kind) {
-                        die_at.insert(v.id, i + 1);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.insert(rep, i + 1);
                     }
                 }
             }
             match &block_borrow.exitswitch {
                 Some(ExitSwitch::Value(value)) => {
                     if let Some(v) = value.as_variable() {
-                        die_at.remove(&v.id);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.remove(&rep);
                     }
                 }
                 Some(ExitSwitch::Tuple(values)) => {
                     for value in values {
                         if let ExitSwitchElement::Value(value) = value {
                             if let Some(v) = value.as_variable() {
-                                die_at.remove(&v.id);
+                                let rep = self._unionfind.find_rep(v.id);
+                                die_at.remove(&rep);
                             }
                         }
                     }
@@ -172,7 +190,8 @@ impl<'a> RegAllocator<'a> {
             for link in &block_borrow.exits {
                 for arg in &link.borrow().args {
                     if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                        die_at.remove(&v.id);
+                        let rep = self._unionfind.find_rep(v.id);
+                        die_at.remove(&rep);
                     }
                 }
             }
@@ -181,22 +200,26 @@ impl<'a> RegAllocator<'a> {
             die_list.sort_by_key(|(time, _)| *time);
             die_list.push((usize::MAX, super::flow::VariableId(u32::MAX)));
 
-            let livevars: Vec<Variable> = block_borrow
+            let livevar_reps: Vec<super::flow::VariableId> = block_borrow
                 .inputargs
                 .iter()
                 .filter_map(FlowValue::as_variable)
                 .filter(|v| v.kind == Some(kind))
+                .map(|v| self._unionfind.find_rep(v.id))
                 .collect();
-            for (i, &v) in livevars.iter().enumerate() {
-                self._depgraph.add_node(v.id);
+            for (i, &v) in livevar_reps.iter().enumerate() {
+                self._depgraph.add_node(v);
                 for j in 0..i {
-                    self._depgraph.add_edge(livevars[j].id, v.id);
+                    // `add_edge` is a no-op for self-edges, so distinct
+                    // inputargs that pre-merge into the same rep don't
+                    // trigger a phantom interference.
+                    self._depgraph.add_edge(livevar_reps[j], v);
                 }
             }
             // upstream: `livevars = set(livevars)` — shadow the list
             // with the set rather than renaming to `alive`.
             let mut livevars: HashSet<super::flow::VariableId> =
-                livevars.into_iter().map(|v| v.id).collect();
+                livevar_reps.into_iter().collect();
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -205,15 +228,16 @@ impl<'a> RegAllocator<'a> {
                 }
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
-                        self._depgraph.add_node(result.id);
+                        let rep = self._unionfind.find_rep(result.id);
+                        self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
                         // to `livevars` only *after* the loop, so no
                         // self-edge guard is needed.
                         for &v in &livevars {
-                            self._depgraph.add_edge(v, result.id);
+                            self._depgraph.add_edge(v, rep);
                         }
-                        livevars.insert(result.id);
+                        livevars.insert(rep);
                     }
                 }
             }
@@ -398,14 +422,34 @@ pub fn perform_register_allocation_with_pairs(
     //     regalloc.coalesce_variables()
     //     regalloc.find_node_coloring()
     let mut allocator = RegAllocator::new(graph, kind);
+    // Task #237 ADAPTATION: pre-merge external pairs into
+    // `_unionfind` BEFORE `make_dependencies` so the live-set
+    // tracking (which projects every Variable ID through
+    // `_unionfind.find_rep`) treats each pinned scratch↔inputarg
+    // pair as a single node.  Without the pre-merge, walker scratch
+    // and the corresponding canonical inputarg get separate live
+    // entries and `make_dependencies` records an interference edge
+    // between them; the post-coalesce `try_coalesce_ids` then
+    // early-returns at the `has_edge` check (regalloc.py:106) and
+    // the pin has no effect on coloring.  `find_rep` auto-creates a
+    // singleton partition for IDs not yet tracked, so unknown
+    // scratch IDs are handled safely.
+    for &(v_id, w_id) in extra_coalesce_pairs {
+        let v0 = allocator._unionfind.find_rep(v_id);
+        let w0 = allocator._unionfind.find_rep(w_id);
+        if v0 != w0 {
+            allocator._unionfind.union(v0, w0);
+        }
+    }
     allocator.make_dependencies();
     allocator.coalesce_variables();
-    // Task #228 external pins — applied AFTER the upstream
-    // `coalesce_variables` pass so they augment rather than replace
-    // the CFG link.args↔inputargs coalesce.  Pairs whose endpoints
-    // interfere in the post-CFG dependency graph are silently skipped
-    // by `try_coalesce_ids` (mirrors `regalloc.py:106-110 if
-    // self._depgraph.has_edge(v0, w0): return`).
+    // Task #228 external pins — re-apply via `try_coalesce_ids` after
+    // `make_dependencies` so the surviving rep is explicitly added to
+    // `_depgraph.all_nodes` even when neither endpoint appeared as an
+    // op result/arg in the canonical graph.  With the Task #237 pre-
+    // merge above these calls are no-ops on the union-find side
+    // (`find_rep` already returns a common rep), but `add_node` still
+    // matters for `find_node_coloring`'s `getnodes` filter.
     for &(v_id, w_id) in extra_coalesce_pairs {
         allocator.try_coalesce_ids(v_id, w_id);
     }
