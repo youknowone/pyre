@@ -225,7 +225,7 @@ impl BoxRef {
     /// carry (e.g. from a clone path) is overwritten and post-bind
     /// `get_forwarded` reads exactly what the writer set.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
-        debug_assert!(
+        assert!(
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
             "BoxRef::bind_op only valid for ResOp boxes"
         );

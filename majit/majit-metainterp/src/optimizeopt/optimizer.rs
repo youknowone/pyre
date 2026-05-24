@@ -236,24 +236,27 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
-    let live_limit = ops
-        .iter()
-        .filter(|op| !op.pos.get().is_none() && !op.pos.get().is_constant())
-        .map(|op| op.pos.get().raw() as usize + 1)
-        .max()
-        .unwrap_or(0);
-    let mut live_positions = vec![false; live_limit];
+fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<bool> {
+    let mut live_indices: Vec<usize> = Vec::new();
+    let mut live_limit = 0usize;
     for op in ops {
-        if !op.pos.get().is_none() && !op.pos.get().is_constant() {
-            live_positions[op.pos.get().raw() as usize] = true;
+        let pos = op.pos.get();
+        if pos.is_none() || pos.is_constant() {
+            continue;
         }
+        let idx = pos.raw() as usize;
+        live_limit = live_limit.max(idx + 1);
+        live_indices.push(idx);
+    }
+    let mut live_positions = vec![false; live_limit];
+    for idx in live_indices {
+        live_positions[idx] = true;
     }
     live_positions
 }
 
-pub(crate) fn sanitize_backend_constants_for_ops(
-    ops: &[Op],
+pub(crate) fn sanitize_backend_constants_for_ops<'a>(
+    ops: impl IntoIterator<Item = &'a Op>,
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
@@ -276,8 +279,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
 ) {
-    let ops_view: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
-    let live_positions = live_runtime_positions(&ops_view);
+    let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
     for (idx, b) in ctx.box_pool.iter_indexed() {
         // make_constant excludes InputArg positions from self.constants writes
@@ -3027,8 +3029,10 @@ impl Optimizer {
 
         // Export newly-discovered constants back to the caller's map.
         merge_backend_constants_from_ctx(&ctx, constants);
-        let new_ops_view: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
-        sanitize_backend_constants_for_ops(&new_ops_view, constants);
+        sanitize_backend_constants_for_ops(
+            ctx.new_operations.iter().map(|rc| rc.as_ref()),
+            constants,
+        );
 
         // Preserve final context for jump_to_existing_trace.
         let mut ops = std::mem::take(&mut ctx.new_operations);

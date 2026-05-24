@@ -9051,7 +9051,7 @@ mod opt_box_env_tests {
             materialised.is_inputarg(),
             "empty InputArg* slot lazy-materialised the wrong BoxKind",
         );
-        assert_eq!(materialised.inputarg_position(), Some(0));
+        assert_eq!(materialised.position(), Some(0));
         assert_eq!(materialised.type_(), majit_ir::Type::Int);
 
         // Re-entering must keep the same identity (no second lazy
