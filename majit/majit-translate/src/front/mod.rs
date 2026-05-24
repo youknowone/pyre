@@ -41,15 +41,32 @@
 //! 1. Step 4.5 downstream-consumer widenings: `portal_targets`
 //!    (needs Charon to surface `#[majit_macros::portal]`),
 //!    `function_hints` (needs `elidable*` / `oopspec` attribute
-//!    surfacing), `immutable_fields` (`#[majit_macros::immutable]`).
+//!    surfacing — closed via Step 4.5.b hybrid pass),
+//!    `immutable_fields` (`#[majit_macros::immutable]` — closed via
+//!    Step 4.5.c hybrid pass).
 //! 2. The Charon dedup-table widening (Step 4.3.c.ext) so
 //!    `fn_return_types` carries resolved ADT paths rather than
-//!    `ty#N` labels.
+//!    `ty#N` labels — closed via Step 4.5.c hybrid pass (AST
+//!    populates `fn_return_types` from syn-source type strings;
+//!    same surface treatment as struct_fields).
 //! 3. Production validation under `--features mir-frontend
-//!    PYRE_MIR_FRONTEND_LLBC=...` passing `check.py`.
+//!    PYRE_MIR_FRONTEND_LLBC=...` passing `check.py` — LANDED
+//!    2026-05-25 (`check.py` 39/39 dynasm + 39/39 cranelift under
+//!    `PYRE_MIR_FRONTEND_LLBC=pyre-object.ullbc:pyre-interpreter.ullbc`).
+//! 4. Step 4.5.e classdef hybrid pass — pending.  MIR-derived
+//!    `Variable.annotation` carries `SomeInstance{ classdef: None }`;
+//!    downstream annotator passes that resolve `.field` access via
+//!    `SomeInstance.getattr` panic (one remaining lib test:
+//!    `generated::tests::generic_handler_graphs_keep_symbolic_fnaddr_surface`).
+//!    Closing this needs a pass that walks parsed_files and pre-
+//!    populates the annotator's classdef bookkeeper so
+//!    `init_someinstance_overrides` can resolve field reads on
+//!    MIR-derived `SomeInstance`.
 //!
-//! Until all three land, the AST front-end remains the production
-//! path and the four shims above stay load-bearing.
+//! Until (4) lands, the AST front-end remains the source of the
+//! four shims above and Step 5 deletion stays gated.  The hybrid
+//! cutover (Step 4.6, `8e3c3731b1`) reduced MIR-only-mode lib test
+//! failures from 9 to 1 while keeping production validation green.
 //!
 
 pub mod ast;
