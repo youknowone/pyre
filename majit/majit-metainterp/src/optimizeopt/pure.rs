@@ -571,24 +571,13 @@ impl OptPure {
             }
             // pure.py:62 lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
             // Both stored and query are walked through the forwarding chain
-            // (the caller already walks the query at lookup; the stored arg
-            // is walked here line-by-line per pure.py:62, :72-73).
-            let args_match =
-                entry
-                    .args
-                    .iter()
-                    .zip(op.getarglist().iter())
-                    .all(|(&stored, &query)| {
-                        let s = ctx.get_box_replacement(stored);
-                        let q = ctx.get_box_replacement(query);
-                        if s == q {
-                            return true;
-                        }
-                        matches!(
-                            (ctx.get_constant(s), ctx.get_constant(q)),
-                            (Some(a), Some(b)) if a == b
-                        )
-                    });
+            // via `OptContext::same_box` (pure.py:62, :72-73 +
+            // history.py:204-205 Const.same_box → same_constant).
+            let args_match = entry
+                .args
+                .iter()
+                .zip(op.getarglist().iter())
+                .all(|(&stored, &query)| ctx.same_box(stored, query));
             if args_match {
                 // pure.py:50-55: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
