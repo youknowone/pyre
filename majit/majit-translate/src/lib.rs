@@ -115,6 +115,37 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
     analyze_pipeline_with_config(source, &AnalyzeConfig::default())
 }
 
+/// Issue #97 Step 4.4 — feature-gated SemanticProgram builder cutover.
+///
+/// When the `mir-frontend` feature is enabled AND the environment
+/// variable `PYRE_MIR_FRONTEND_LLBC` is set to a path of a
+/// Charon-extracted `.ullbc` snapshot, route the build through
+/// [`front::mir::build_semantic_program_from_llbc`]. Otherwise fall
+/// back to the syn-AST builder so partial enablement is a no-op.
+///
+/// The env-var split (rather than purely cfg) is deliberate: the
+/// `.ullbc` file must exist for the build to succeed, and producing
+/// it requires running Charon out-of-band via
+/// `scripts/extract-llbc.sh`. Letting the env-var gate the actual
+/// switch keeps cargo's default build path working even with the
+/// feature compiled in.
+fn build_semantic_program_via_active_frontend(
+    parsed_files: &[parse::ParsedInterpreter],
+) -> front::SemanticProgram {
+    #[cfg(feature = "mir-frontend")]
+    {
+        if let Ok(llbc_path) = std::env::var("PYRE_MIR_FRONTEND_LLBC") {
+            let llbc = majit_charon_reader::Llbc::load(&llbc_path)
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {llbc_path}: {e}"));
+            return front::mir::build_semantic_program_from_llbc(&llbc)
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {llbc_path}: {e}"));
+        }
+    }
+    let _ = parsed_files; // silence unused warning when only AST is reachable
+    front::build_semantic_program_from_parsed_files(parsed_files)
+        .expect("pyre-interpreter source must lower without FlowingError")
+}
+
 /// Configurable canonical single-file analysis entry point.
 pub fn analyze_pipeline_with_config(
     source: &str,
@@ -569,10 +600,16 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
+    // Issue #97 Step 4.4: feature-gated cutover. When the
+    // `mir-frontend` feature is enabled AND `PYRE_MIR_FRONTEND_LLBC`
+    // is set, route the production SemanticProgram build through the
+    // MIR-driven `front::mir::build_semantic_program_from_llbc` path
+    // instead of the syn-AST builder. The env-var carries the path to
+    // a Charon-extracted .ullbc snapshot (produced by
+    // `scripts/extract-llbc.sh`). The flag without the env-var still
+    // takes the AST path so partial enablement stays a no-op.
     mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
-    let program =
-        front::build_semantic_program_from_parsed_files_with_statics(parsed_files, static_addrs)
-            .expect("pyre-interpreter source must lower without FlowingError");
+    let program = build_semantic_program_via_active_frontend(parsed_files);
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();

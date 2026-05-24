@@ -66,6 +66,20 @@ stacker = { workspace = true }
 # to the dep graph, both already workspace-shared.
 majit-charon-reader = { workspace = true }
 
+[features]
+default = []
+# Issue #97 Step 4.4: when enabled, lib.rs routes the production
+# SemanticProgram builder through the MIR-driven `front::mir`
+# pipeline (consuming a pre-extracted .ullbc) instead of the
+# syn-AST `front::ast::build_semantic_program_from_parsed_files`
+# path. The flag is opt-in because the MIR-driven builder currently
+# produces a SemanticProgram with degraded metadata (TyRef::label()
+# instead of resolved ADT paths, no `immutable_fields`, empty
+# `module_path`/`hints`); downstream consumers can fail when one of
+# those gaps reaches an assertion. Build a .ullbc snapshot via
+# `scripts/extract-llbc.sh` before enabling.
+mir-frontend = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 walkdir = { workspace = true }
