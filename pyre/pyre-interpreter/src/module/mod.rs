@@ -27,6 +27,8 @@ pub mod _signal;
 pub mod _socket;
 #[allow(non_snake_case)]
 pub mod _struct;
+#[allow(non_snake_case)]
+pub mod _thread;
 pub mod _sre;
 pub mod _weakref;
 pub mod atexit;
