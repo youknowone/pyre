@@ -22,7 +22,7 @@
 //!   `box.set_forwarded(constbox)`. We do not introduce a separate `Const`
 //!   variant: RPython stores everything in a single `_forwarded` slot.
 
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use crate::intbound::IntBound;
