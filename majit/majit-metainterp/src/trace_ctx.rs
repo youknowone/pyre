@@ -1498,31 +1498,35 @@ impl TraceCtx {
         let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
             return;
         };
+        // Clone `lengths` (small — one entry per vable array; one entry total
+        // for PyFrame) to release the immutable borrow before reborrowing
+        // `virtualizable_values` mutably.  The decode loop below reads
+        // statics + array items field-by-field straight into the shadow,
+        // avoiding the `Vec<i64>` + `Vec<Vec<i64>>` allocations that
+        // `read_all_boxes` would materialise on every hot-path call.
         let array_lengths = lengths.clone();
-        let (static_bits, array_bits) = unsafe { info.read_all_boxes(heap_ptr, &array_lengths) };
         let static_count = info.num_static_extra_boxes;
         let info = info.clone();
         let Some(values) = self.virtualizable_values.as_mut() else {
             return;
         };
-        for (i, bits) in static_bits.iter().enumerate().take(static_count) {
-            if i >= values.len() {
-                break;
-            }
+        for i in 0..static_count.min(values.len()) {
             let ty = info.static_fields[i].field_type;
-            values[i] = crate::pyjitpl::heap_value_for_pub(ty, *bits);
+            let bits = unsafe { info.read_field(heap_ptr, i) };
+            values[i] = crate::pyjitpl::heap_value_for_pub(ty, bits);
         }
         let mut cursor = static_count;
-        for (a, items) in array_bits.iter().enumerate() {
-            if a >= info.array_fields.len() {
+        for (a_idx, &length) in array_lengths.iter().enumerate() {
+            if a_idx >= info.array_fields.len() {
                 break;
             }
-            let ty = info.array_fields[a].item_type;
-            for bits in items {
+            let ty = info.array_fields[a_idx].item_type;
+            for item_idx in 0..length {
                 if cursor >= values.len() {
                     break;
                 }
-                values[cursor] = crate::pyjitpl::heap_value_for_pub(ty, *bits);
+                let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
+                values[cursor] = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 cursor += 1;
             }
         }
