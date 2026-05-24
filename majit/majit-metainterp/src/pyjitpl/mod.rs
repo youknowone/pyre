@@ -4490,8 +4490,7 @@ impl<M: Clone> MetaInterp<M> {
                 .filter(|mp| mp.position._pos > 0)
                 .map(|mp| {
                     (
-                        mp.original_boxes(),
-                        mp.original_box_types(),
+                        mp.green_boxes.clone(),
                         crate::history::TreeLoopCutPosition::new(mp.position._pos),
                     )
                 })
@@ -4533,9 +4532,7 @@ impl<M: Clone> MetaInterp<M> {
         // When the trace was retargeted to a different loop header,
         // cut_trace_from removes ops before the merge point and
         // replaces inputargs with original_boxes at the cut position.
-        let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
-            cross_loop_cut
-        {
+        let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] cut_trace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
@@ -4548,7 +4545,6 @@ impl<M: Clone> MetaInterp<M> {
             trace.cut_trace_from_with_consts(
                 start,
                 original_boxes,
-                original_box_types,
                 &ctx.initial_inputarg_consts,
             )
         } else {
@@ -5566,8 +5562,7 @@ impl<M: Clone> MetaInterp<M> {
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
                     .map(|mp| {
                         (
-                            mp.original_boxes(),
-                            mp.original_box_types(),
+                            mp.green_boxes.clone(),
                             crate::history::TreeLoopCutPosition::new(mp.position._pos),
                         )
                     })
@@ -5585,9 +5580,7 @@ impl<M: Clone> MetaInterp<M> {
             // so close once, then cut the completed trace.
             ctx.close_loop(jump_args);
             let trace = ctx.into_tree_loop();
-            let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
-                retrace_cut
-            {
+            let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
@@ -5600,7 +5593,6 @@ impl<M: Clone> MetaInterp<M> {
                 trace.cut_trace_from_with_consts(
                     start,
                     original_boxes,
-                    original_box_types,
                     &initial_inputarg_consts,
                 )
             } else {

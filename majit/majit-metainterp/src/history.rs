@@ -371,17 +371,16 @@ impl TreeLoop {
     }
 
     /// opencoder.py CutTrace parity — create a new trace by cutting at the
-    /// given position. `original_boxes` become the new inputargs; any OpRef
-    /// referenced after the cut but defined before it (and not in
-    /// `original_boxes`) is re-emitted as a prefix operation (transitive
-    /// closure of dependencies).
+    /// given position. `original_boxes` (paired OpRef + Type via `GreenBox`)
+    /// become the new inputargs; any OpRef referenced after the cut but
+    /// defined before it (and not in `original_boxes`) is re-emitted as a
+    /// prefix operation (transitive closure of dependencies).
     pub fn cut_trace_from(
         &self,
         start: TreeLoopCutPosition,
-        original_boxes: &[OpRef],
-        original_box_types: &[majit_ir::Type],
+        original_boxes: &[crate::trace_ctx::GreenBox],
     ) -> TreeLoop {
-        self.cut_trace_from_with_consts(start, original_boxes, original_box_types, &[])
+        self.cut_trace_from_with_consts(start, original_boxes, &[])
     }
 
     /// Like `cut_trace_from`, but with pre-allocated constant OpRefs for each
@@ -391,8 +390,7 @@ impl TreeLoop {
     pub fn cut_trace_from_with_consts(
         &self,
         start: TreeLoopCutPosition,
-        original_boxes: &[OpRef],
-        original_box_types: &[majit_ir::Type],
+        original_boxes: &[crate::trace_ctx::GreenBox],
         inputarg_consts: &[OpRef],
     ) -> TreeLoop {
         use majit_ir::vec_set::VecSet;
@@ -402,16 +400,19 @@ impl TreeLoop {
         let cut_ops = &self.ops[start.op_index..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
-        // Each new inputarg carries the type recorded in `original_box_types[i]`.
+        // Each new inputarg carries the type recorded in `GreenBox.ty`.
         let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
-        let original_set: VecSet<OpRef> = original_boxes.iter().copied().collect();
-        for (i, &old_ref) in original_boxes.iter().enumerate() {
-            remap.insert(
-                old_ref,
-                OpRef::input_arg_typed(i as u32, original_box_types[i]),
-            );
+        let original_set: VecSet<OpRef> = original_boxes.iter().map(|gb| gb.opref).collect();
+        for (i, gb) in original_boxes.iter().enumerate() {
+            remap.insert(gb.opref, OpRef::input_arg_typed(i as u32, gb.ty));
         }
+        // Project GreenBox slice into the two split-shape vectors used
+        // by the rest of the function (new_ia_boxes / new_ia_types
+        // grow with escaped-inputarg fallback so they need to be owned).
+        let original_box_opref: Vec<OpRef> = original_boxes.iter().map(|gb| gb.opref).collect();
+        let original_box_types: Vec<majit_ir::Type> =
+            original_boxes.iter().map(|gb| gb.ty).collect();
 
         // Collect all OpRefs defined by post-cut ops.
         let defined_after_cut: VecSet<OpRef> = cut_ops
@@ -481,8 +482,8 @@ impl TreeLoop {
         // If concrete initial values are available, escaped original inputargs
         // become typed constants (avoiding entry-contract mismatch at runtime).
         // Otherwise, they become additional inputargs (original behavior).
-        let mut new_ia_boxes = original_boxes.to_vec();
-        let mut new_ia_types = original_box_types.to_vec();
+        let mut new_ia_boxes = original_box_opref;
+        let mut new_ia_types = original_box_types;
         for &r in &orig_inputarg_escaped {
             if let Some(&const_opref) = inputarg_consts.get(r.raw() as usize) {
                 // Remap to the pre-allocated pool constant (already GC-rooted).
@@ -1454,10 +1455,12 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1); // cut after op0
-        let original_boxes = vec![iarg(0), iarg(1)];
-        let original_box_types = vec![Type::Int, Type::Int];
+        let original_boxes = vec![
+            crate::trace_ctx::GreenBox::new(iarg(0), Type::Int),
+            crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
+        ];
 
-        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        let cut = trace.cut_trace_from(start, &original_boxes);
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
@@ -1488,10 +1491,9 @@ mod tests {
 
         let start = TreeLoopCutPosition::new(1); // cut after op0
         // original_boxes only has v0 — v2 is escaped
-        let original_boxes = vec![iarg(0)];
-        let original_box_types = vec![Type::Int];
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        let cut = trace.cut_trace_from(start, &original_boxes);
         // v1 = OpRef::input_arg_int(1) is an original trace inputarg NOT in original_boxes.
         // It's referenced by the escaped int_add op → added as extra inputarg.
         // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
@@ -1519,10 +1521,9 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1);
-        let original_boxes = vec![iarg(0)];
-        let original_box_types = vec![Type::Int];
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        let cut = trace.cut_trace_from(start, &original_boxes);
         assert_eq!(cut.ops.len(), 2);
         // Constant ref should be preserved as-is
         assert_eq!(cut.ops[0].arg(1), const_ref);
@@ -1551,10 +1552,9 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(2); // cut after op0 and op1
-        let original_boxes = vec![iarg(0)];
-        let original_box_types = vec![Type::Int];
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
-        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        let cut = trace.cut_trace_from(start, &original_boxes);
         // 1 inputarg, 2 prefix ops (v1=int_add, v2=int_mul), 2 post-cut ops
         assert_eq!(cut.inputargs.len(), 1);
         assert_eq!(cut.ops.len(), 4);
