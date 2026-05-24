@@ -5579,6 +5579,36 @@ fn init_socket_type(ns: &mut DictStorage) {
         ),
     );
 
+    // connect_ex(address) → errno (no exception on error)
+    // `interp_socket.py:376-392` — `try: connect; except` equivalent
+    // that returns the errno integer instead of raising OSError.
+    crate::dict_storage_store(
+        ns,
+        "connect_ex",
+        crate::make_builtin_function_with_arity(
+            "connect_ex",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("connect_ex() missing address"));
+                }
+                let obj = args[0];
+                let fd = socket_fd(obj)?;
+                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                let (storage, slen) = pack_inet_addr(family, args[1])?;
+                let r = unsafe {
+                    libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
+                };
+                let err = if r != 0 {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                } else {
+                    0
+                };
+                Ok(pyre_object::w_int_new(err as i64))
+            },
+            2,
+        ),
+    );
+
     crate::dict_storage_store(
         ns,
         "send",
@@ -5787,6 +5817,142 @@ fn init_socket_type(ns: &mut DictStorage) {
             let addr = unpack_inet_addr(&storage);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&buf),
+                addr,
+            ]))
+        }),
+    );
+
+    // recv_into(buffer, [nbytes, flags]) → nbytes_read
+    // `interp_socket.py:831-863` — writes directly into a writable
+    // bytes-like buffer.  nbytes==0 uses the full buffer length.
+    crate::dict_storage_store(
+        ns,
+        "recv_into",
+        crate::make_builtin_function("recv_into", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("recv_into() missing buffer"));
+            }
+            let obj = args[0];
+            let buf_obj = args[1];
+            if !unsafe { pyre_object::bytearrayobject::is_bytearray(buf_obj) } {
+                return Err(crate::PyError::type_error(
+                    "recv_into: buffer must be a bytearray",
+                ));
+            }
+            let buf_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf_obj) };
+            let nbytes = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "recv_into: nbytes must be an integer",
+                    ));
+                }
+                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if raw < 0 {
+                    return Err(crate::PyError::value_error(
+                        "negative buffersize in recv_into",
+                    ));
+                }
+                let n = raw as usize;
+                if n == 0 { buf_len } else { n }
+            } else {
+                buf_len
+            };
+            if buf_len < nbytes {
+                return Err(crate::PyError::value_error(
+                    "buffer too small for requested bytes",
+                ));
+            }
+            let flags = if args.len() >= 4 {
+                if !unsafe { pyre_object::is_int(args[3]) } {
+                    return Err(crate::PyError::type_error(
+                        "recv_into: flags must be an integer",
+                    ));
+                }
+                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+            } else {
+                0
+            };
+            let fd = socket_fd(obj)?;
+            let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
+            let got =
+                unsafe { libc::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags) };
+            if got < 0 {
+                return Err(socket_io_err(std::io::Error::last_os_error()));
+            }
+            Ok(pyre_object::w_int_new(got as i64))
+        }),
+    );
+
+    // recvfrom_into(buffer, [nbytes, flags]) → (nbytes, address)
+    // `interp_socket.py:866-899` — recvfrom variant that fills a
+    // caller-provided buffer rather than allocating a new bytes.
+    crate::dict_storage_store(
+        ns,
+        "recvfrom_into",
+        crate::make_builtin_function("recvfrom_into", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("recvfrom_into() missing buffer"));
+            }
+            let obj = args[0];
+            let buf_obj = args[1];
+            if !unsafe { pyre_object::bytearrayobject::is_bytearray(buf_obj) } {
+                return Err(crate::PyError::type_error(
+                    "recvfrom_into: buffer must be a bytearray",
+                ));
+            }
+            let buf_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(buf_obj) };
+            let nbytes = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvfrom_into: nbytes must be an integer",
+                    ));
+                }
+                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if raw < 0 {
+                    return Err(crate::PyError::value_error(
+                        "negative buffersize in recvfrom_into",
+                    ));
+                }
+                let n = raw as usize;
+                if n == 0 { buf_len } else { n }
+            } else {
+                buf_len
+            };
+            if nbytes > buf_len {
+                return Err(crate::PyError::value_error(
+                    "nbytes is greater than the length of the buffer",
+                ));
+            }
+            let flags = if args.len() >= 4 {
+                if !unsafe { pyre_object::is_int(args[3]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvfrom_into: flags must be an integer",
+                    ));
+                }
+                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+            } else {
+                0
+            };
+            let fd = socket_fd(obj)?;
+            let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let got = unsafe {
+                libc::recvfrom(
+                    fd,
+                    slot.as_mut_ptr() as *mut libc::c_void,
+                    nbytes,
+                    flags,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut slen,
+                )
+            };
+            if got < 0 {
+                return Err(socket_io_err(std::io::Error::last_os_error()));
+            }
+            let addr = unpack_inet_addr(&storage);
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(got as i64),
                 addr,
             ]))
         }),
@@ -6059,6 +6225,89 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_bool_from(false))
         }),
+    );
+
+    // __repr__ — `interp_socket.py:304-312 descr_repr`.  Format
+    // matches CPython: `<socket object, fd=N, family=F, type=T, proto=P>`.
+    crate::dict_storage_store(
+        ns,
+        "__repr__",
+        crate::make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = socket_get_attr_i64(obj, "_fd");
+                let family = socket_get_attr_i64(obj, "_family");
+                let ty = socket_get_attr_i64(obj, "_type");
+                let proto = socket_get_attr_i64(obj, "_proto");
+                Ok(pyre_object::w_str_new(&format!(
+                    "<socket object, fd={fd}, family={family}, type={ty}, proto={proto}>"
+                )))
+            },
+            1,
+        ),
+    );
+
+    // set_inheritable / get_inheritable — `interp_socket.py` wraps
+    // the FD_CLOEXEC bit on `F_GETFD` / `F_SETFD`.
+    crate::dict_storage_store(
+        ns,
+        "set_inheritable",
+        crate::make_builtin_function_with_arity(
+            "set_inheritable",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "set_inheritable() missing argument",
+                    ));
+                }
+                let fd = socket_fd(args[0])?;
+                let want_inheritable = unsafe {
+                    if pyre_object::is_bool(args[1]) {
+                        pyre_object::boolobject::w_bool_get_value(args[1])
+                    } else if pyre_object::is_int(args[1]) {
+                        pyre_object::w_int_get_value(args[1]) != 0
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "set_inheritable: value must be bool",
+                        ));
+                    }
+                };
+                let cur = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if cur < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                let new = if want_inheritable {
+                    cur & !libc::FD_CLOEXEC
+                } else {
+                    cur | libc::FD_CLOEXEC
+                };
+                if new != cur {
+                    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, new) };
+                    if r < 0 {
+                        return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                }
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_inheritable",
+        crate::make_builtin_function_with_arity(
+            "get_inheritable",
+            |args| {
+                let fd = socket_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
+                let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if r < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                Ok(pyre_object::w_bool_from((r & libc::FD_CLOEXEC) == 0))
+            },
+            1,
+        ),
     );
 }
 

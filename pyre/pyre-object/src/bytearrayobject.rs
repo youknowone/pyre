@@ -105,6 +105,15 @@ pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
     }
 }
 
+/// Get a mutable reference to the internal data. Caller must ensure
+/// the bytearray is not aliased while the returned slice is live.
+pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        &mut *ba.data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
