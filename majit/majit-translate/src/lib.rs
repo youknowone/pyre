@@ -246,6 +246,17 @@ fn merge_ast_only_functions(
         *program = ast_program;
         return;
     }
+    // Step 4.5.c (immutable_fields):  AST collected
+    // `#[majit_macros::immutable]` / `#[jit_immutable_fields(...)]`
+    // attributes that Charon does not yet surface (DocComment /
+    // Outer only).  Copy AST's entries into the MIR program so
+    // `analyze_pipeline_from_parsed` at lib.rs:766/775 sees the
+    // quasi-immut metadata the codewriter consumes.  Same hybrid
+    // surface as `merge_fn_return_types_from_parsed_files` /
+    // `merge_hints_from_parsed_files`.
+    for (owner, ranks) in ast_program.immutable_fields {
+        program.immutable_fields.entry(owner).or_insert(ranks);
+    }
     let mut appended = 0usize;
     for f in ast_program.functions {
         if !mir_names.contains(&f.name) {
