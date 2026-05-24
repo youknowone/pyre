@@ -1,0 +1,79 @@
+# majit-charon-reader
+
+Stable-Rust parser for Charon `.llbc` / `.ullbc` JSON artefacts.
+
+Consumed by `majit-translate`'s MIR-driven flowspace driver (issue #97
+Step 3). Produced by `scripts/extract-llbc.sh` running the pinned
+Charon binary that `scripts/install-charon.sh` installs.
+
+## Usage
+
+```rust
+use majit_charon_reader::{Llbc, ullbc::{CallClass, TermKind}};
+
+let llbc = Llbc::load("build/llbc/pyre-object.ullbc")?;
+println!("crate = {}", llbc.crate_name());
+
+for fd in llbc.iter_local_fns() {
+    let Some(u) = fd.unstructured() else { continue };
+    for bb in &u.body {
+        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            match call.func.classify() {
+                CallClass::Direct  => { /* monomorphized fn call */ }
+                CallClass::Trait   => { /* trait-bound generic */ }
+                CallClass::Dynamic => { /* dyn Trait virtual call */ }
+                CallClass::Ptr     => { /* function-pointer call */ }
+                CallClass::Unknown => { /* fail-loud */ }
+            }
+        }
+    }
+}
+```
+
+## Schema policy
+
+The reader covers the subset of Charon ULLBC that Step 3 of issue #97
+actually consumes. Fields the driver does not read remain
+`serde_json::Value` so that newer Charon versions stay loadable
+without code changes. Variants we typed are listed by name; every
+enum has a `#[serde(other)] Unknown` arm so unrecognised future
+variants surface as fail-loud `Unknown` instead of being silently
+dropped.
+
+Run the diagnostic example to spot a fresh schema gap:
+
+```sh
+cargo run --example dump_stats -p majit-charon-reader -- \
+    build/llbc/pyre-object.ullbc
+cargo run --example probe_errors -p majit-charon-reader -- \
+    build/llbc/pyre-object.ullbc        # error tally per outer variant
+```
+
+Add a new typed variant + a regression test under `tests/corpus.rs`
+whenever a new construct appears.
+
+## Validation against real crates
+
+The reader is validated against the corpus snapshot (checked in at
+`majit/charon-spike/corpus.ullbc`) via `tests/corpus.rs`, and against
+the full extracted `pyre-object.ullbc` (23 MB) / `pyre-interpreter.ullbc`
+(133 MB) snapshots not committed to git (regenerable via
+`scripts/extract-llbc.sh`). At the time of the Step 2 landing every
+statement and terminator in every extracted body decodes:
+
+| crate            | bodies | stmt decode errors | term decode errors |
+|------------------|-------:|-------------------:|--------------------:|
+| corpus           |      5 |                  0 |                   0 |
+| pyre-object      |  1718  |                  0 |                   0 |
+| pyre-interpreter |  5435  |                  0 |                   0 |
+
+The pyre-interpreter `Call` terminators classify as:
+
+```
+  direct    25502   (Fun.Regular: monomorphized direct call)
+  trait       382   (Fun.Trait: trait-bound generic, statically resolved)
+  dynamic      36   (Dynamic: dyn Trait virtual call)
+```
+
+The 36 `dynamic` count matches the Step 1 audit exactly
+(`majit/charon-spike/step1-compatibility.md`).

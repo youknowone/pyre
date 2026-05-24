@@ -1,0 +1,11 @@
+[package]
+name = "majit-charon-reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable-Rust parser for Charon .llbc / .ullbc JSON; consumed by majit-translate's MIR-driven flowspace driver"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

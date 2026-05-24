@@ -21,6 +21,7 @@ members = [
     "majit/majit-macros",
     "majit/majit-metainterp",
     "majit/majit-translate",
+    "majit/majit-charon-reader",
     "majit/examples/tlr",
     "majit/examples/tl",
     "majit/examples/tla",
@@ -71,6 +72,7 @@ majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
 majit-translate = { version = "0.0.2", path = "majit/majit-translate" }
+majit-charon-reader = { version = "0.0.2", path = "majit/majit-charon-reader" }
 
 # shared dependencies
 parking_lot = "0.12"
