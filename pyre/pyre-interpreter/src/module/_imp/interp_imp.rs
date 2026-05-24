@@ -1,0 +1,147 @@
+//! _imp implementation — PyPy: pypy/module/imp/interp_imp.py
+//!
+//! Verbatim move of the inline block previously in importing.rs.
+
+use crate::DictStorage;
+use crate::importing::BUILTIN_MODULES;
+
+/// _imp stub — PyPy: pypy/module/imp/
+///
+/// Minimal subset required by importlib._bootstrap to decide which loader
+/// handles a name. We report every name we know about as a builtin so
+/// pyre's own registrations remain authoritative.
+pub fn register_module(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "is_builtin",
+        crate::make_builtin_function_with_arity(
+            "is_builtin",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_int_new(0));
+                }
+                let name = unsafe {
+                    if pyre_object::is_str(args[0]) {
+                        pyre_object::w_str_get_value(args[0])
+                    } else {
+                        return Ok(pyre_object::w_int_new(0));
+                    }
+                };
+                let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(name));
+                Ok(pyre_object::w_int_new(if is_builtin { 1 } else { 0 }))
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "is_frozen",
+        crate::make_builtin_function_with_arity(
+            "is_frozen",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "is_frozen_package",
+        crate::make_builtin_function_with_arity(
+            "is_frozen_package",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "get_frozen_object",
+        crate::make_builtin_function_with_arity(
+            "get_frozen_object",
+            |_| Ok(pyre_object::w_none()),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "create_builtin",
+        crate::make_builtin_function_with_arity(
+            "create_builtin",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(args[0])
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "exec_builtin",
+        crate::make_builtin_function_with_arity(
+            "exec_builtin",
+            |_| Ok(pyre_object::w_int_new(0)),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "exec_dynamic",
+        crate::make_builtin_function_with_arity(
+            "exec_dynamic",
+            |_| Ok(pyre_object::w_int_new(0)),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "acquire_lock",
+        crate::make_builtin_function_with_arity("acquire_lock", |_| Ok(pyre_object::w_none()), 0),
+    );
+    crate::dict_storage_store(
+        ns,
+        "release_lock",
+        crate::make_builtin_function_with_arity("release_lock", |_| Ok(pyre_object::w_none()), 0),
+    );
+    crate::dict_storage_store(
+        ns,
+        "lock_held",
+        crate::make_builtin_function_with_arity(
+            "lock_held",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_fix_co_filename",
+        crate::make_builtin_function_with_arity(
+            "_fix_co_filename",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "extension_suffixes",
+        crate::make_builtin_function_with_arity(
+            "extension_suffixes",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "source_hash",
+        crate::make_builtin_function_with_arity(
+            "source_hash",
+            |_| Ok(pyre_object::w_int_new(0)),
+            2,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "check_hash_based_pycs",
+        pyre_object::w_str_new("default"),
+    );
+    crate::dict_storage_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
+}

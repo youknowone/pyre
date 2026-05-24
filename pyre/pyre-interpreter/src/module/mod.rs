@@ -8,13 +8,20 @@ pub mod _io;
 #[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
+pub mod _ast;
+#[allow(non_snake_case)]
+pub mod _codecs;
+#[allow(non_snake_case)]
 pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
+pub mod copyreg;
 #[allow(non_snake_case)]
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
+#[allow(non_snake_case)]
+pub mod _imp;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
@@ -36,10 +43,12 @@ pub mod _thread;
 pub mod _sre;
 pub mod _weakref;
 pub mod atexit;
+pub mod errno;
 pub mod faulthandler;
 pub mod fcntl;
 pub mod gc;
 pub mod grp;
+pub mod importlib;
 pub mod itertools;
 pub mod math;
 pub mod mmap;
