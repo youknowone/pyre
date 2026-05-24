@@ -2016,10 +2016,7 @@ impl HostEnv {
         primitive_u32.module_set("from", HostObject::new_builtin_callable("u32.from"));
         let primitive_i64 = HostObject::new_module("i64");
         primitive_i64.module_set("from", HostObject::new_builtin_callable("i64.from"));
-        primitive_i64.module_set(
-            "try_from",
-            HostObject::new_builtin_callable("i64.try_from"),
-        );
+        primitive_i64.module_set("try_from", HostObject::new_builtin_callable("i64.try_from"));
         let primitive_usize = HostObject::new_module("usize");
         primitive_usize.module_set(
             "try_from",

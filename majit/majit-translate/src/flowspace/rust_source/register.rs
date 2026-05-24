@@ -4073,9 +4073,7 @@ pub fn extract_static_decls(
             // tokens — parse them as a sequence of `ItemStatic`s and
             // re-use the same emit path.  Other macros are ignored.
             Item::Macro(m) if m.mac.path.is_ident("thread_local") => {
-                if let Ok(body) =
-                    syn::parse2::<ThreadLocalBody>(m.mac.tokens.clone())
-                {
+                if let Ok(body) = syn::parse2::<ThreadLocalBody>(m.mac.tokens.clone()) {
                     for s in &body.statics {
                         push_entry(&s.ident, &s.ty);
                     }
@@ -9073,8 +9071,15 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
              }",
         );
         let decls = extract_static_decls(&file, "modprefix");
-        assert_eq!(decls.len(), 2, "both thread_local statics must be catalogued");
-        let names: Vec<String> = decls.iter().map(|(seg, _)| seg.last().cloned().unwrap()).collect();
+        assert_eq!(
+            decls.len(),
+            2,
+            "both thread_local statics must be catalogued"
+        );
+        let names: Vec<String> = decls
+            .iter()
+            .map(|(seg, _)| seg.last().cloned().unwrap())
+            .collect();
         assert!(names.contains(&"CALL_DEPTH".to_string()));
         assert!(names.contains(&"SHADOW_STACK".to_string()));
         // Compound types fall through to `ValueType::Ref` per the

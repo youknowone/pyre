@@ -5972,9 +5972,8 @@ fn lower_expr(
             } else {
                 None
             };
-            let known_static_ty: Option<(String, ValueType)> = qualified_lookup_key
-                .as_ref()
-                .and_then(|key| {
+            let known_static_ty: Option<(String, ValueType)> =
+                qualified_lookup_key.as_ref().and_then(|key| {
                     KNOWN_STATICS.with(|m| m.borrow().get(key).cloned().map(|ty| (key.clone(), ty)))
                 });
             if let Some((qualified_key, static_ty)) = known_static_ty {
