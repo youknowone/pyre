@@ -952,16 +952,10 @@ impl OptString {
         let a_nonnull = i1 && self.is_known_nonnull(arg1, ctx);
         let b_nonnull = i2 && self.is_known_nonnull(arg2, ctx);
         if a_nonnull && b_nonnull {
-            // vstring.py:728: l1box.same_box(l2box)
-            // history.py:204: same identity OR both constants with equal value
-            let same_len = match (l1box, l2box) {
-                (Some(a), Some(b)) if a == b => true,
-                (Some(a), Some(b)) => {
-                    ctx.get_constant_int(a).is_some()
-                        && ctx.get_constant_int(a) == ctx.get_constant_int(b)
-                }
-                _ => false,
-            };
+            // vstring.py:728: l1box.same_box(l2box) routes through
+            // `OptContext::same_box` (history.py:204-205) which combines
+            // `get_box_replacement` + identity + Const value equality.
+            let same_len = matches!((l1box, l2box), (Some(a), Some(b)) if ctx.same_box(a, b));
             let oopspec = if same_len {
                 OopSpecIndex::StreqLengthok
             } else {
