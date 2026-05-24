@@ -22,6 +22,7 @@ pub mod faulthandler;
 pub mod math;
 pub mod mmap;
 pub mod operator;
+pub mod select;
 pub mod sys;
 pub mod termios;
 pub mod time;
