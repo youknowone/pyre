@@ -257,6 +257,34 @@ impl BoxRef {
         self.0.op_handle.borrow().as_ref().and_then(|w| w.upgrade())
     }
 
+    /// Slice 8.D InputArg counterpart of `bind_op`. Stores a
+    /// `Weak<InputArg>` so subsequent `set_forwarded_*` / `clear_forwarded`
+    /// route through `inputarg.forwarded` (`resoperation.py:700
+    /// AbstractInputArg._forwarded`). Panics if called on a non-InputArg
+    /// box. Late-binding carry-over: `Box.forwarded` is copied into
+    /// `inputarg.forwarded` unconditionally so any forwarding written
+    /// before bind survives the handoff and post-bind readers see what
+    /// was set.
+    pub fn bind_inputarg(&self, ia: &crate::value::InputArgRc) {
+        assert!(
+            matches!(&self.0.kind, BoxKind::InputArg { .. }),
+            "BoxRef::bind_inputarg only valid for InputArg boxes"
+        );
+        *ia.forwarded.borrow_mut() = self.0.forwarded.borrow().clone();
+        *self.0.inputarg_handle.borrow_mut() = Some(Rc::downgrade(ia));
+    }
+
+    /// Slice 8.D prep: upgrade the bound `Weak<InputArg>` into a strong
+    /// `InputArgRc`. Returns `None` for unbound or non-InputArg boxes and
+    /// for dropped `InputArg`s. Symmetric to `bound_op`.
+    pub fn bound_inputarg(&self) -> Option<crate::value::InputArgRc> {
+        self.0
+            .inputarg_handle
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.upgrade())
+    }
+
     /// Extract the `const_index` field for chain-walker reconstruction.
     /// Returns `None` for non-Const boxes and for Consts created via
     /// `new_const` (no index in scope).
@@ -1006,5 +1034,52 @@ mod tests {
         // Dual-write target is gone; set_forwarded should not panic.
         b.set_forwarded_info(OpInfo::Unknown);
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
+    }
+
+    /// `bind_inputarg` panics on a non-InputArg box (same contract as
+    /// `bind_op`'s ResOp-only check).
+    #[test]
+    #[should_panic(expected = "bind_inputarg only valid for InputArg boxes")]
+    fn bind_inputarg_on_resop_panics() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_resop(Type::Int, 0);
+        let ia = std::rc::Rc::new(InputArg {
+            tp: Type::Int,
+            index: 0,
+            forwarded: std::cell::RefCell::new(Forwarded::None),
+        });
+        b.bind_inputarg(&ia);
+    }
+
+    /// `bind_inputarg` carries pre-bind `Box.forwarded` state into
+    /// `inputarg.forwarded`, mirroring `bind_op`'s carry-over.
+    #[test]
+    fn bind_inputarg_carries_pre_bind_forwarded_to_inputarg() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_inputarg(Type::Int, 3);
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(7)));
+
+        let ia = std::rc::Rc::new(InputArg {
+            tp: Type::Int,
+            index: 3,
+            forwarded: std::cell::RefCell::new(Forwarded::None),
+        });
+        b.bind_inputarg(&ia);
+
+        // The pre-bind Info forwarding survives on the InputArg slot.
+        assert!(matches!(*ia.forwarded.borrow(), Forwarded::Info(_)));
+        // bound_inputarg upgrades the Weak.
+        assert!(b.bound_inputarg().is_some());
+    }
+
+    /// `bound_inputarg` returns `None` for unbound boxes (no Weak set)
+    /// and for non-InputArg variants (the field is reserved for InputArg).
+    #[test]
+    fn bound_inputarg_none_for_unbound_and_wrong_kind() {
+        let ia_box = BoxRef::new_inputarg(Type::Int, 0);
+        assert!(ia_box.bound_inputarg().is_none());
+
+        let resop_box = BoxRef::new_resop(Type::Int, 0);
+        assert!(resop_box.bound_inputarg().is_none());
     }
 }
