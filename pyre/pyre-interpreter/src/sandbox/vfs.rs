@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use std::cell::Cell;
 use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -224,17 +224,6 @@ impl RealDir {
 
     // vfs.py:94
     pub fn join(&self, name: &str) -> VfsResult<FsNode> {
-        // Reject anything that is not a single basename component so
-        // that absolute paths, "..", or embedded separators cannot
-        // escape the mounted root or skip the dotfile/exclude checks
-        // for intermediate parts.
-        let mut components = Path::new(name).components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err(VfsError {
-                errno: libc::ENOENT,
-                object: name.to_owned(),
-            });
-        }
         if name.starts_with('.') && !self.show_dotfiles {
             return Err(VfsError {
                 errno: libc::ENOENT,
