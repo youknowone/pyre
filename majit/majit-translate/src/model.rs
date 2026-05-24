@@ -1407,22 +1407,39 @@ impl FrameState {
             })
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
+        // Capture predecessor Variable identities before dropping the
+        // views — used below to distinguish fresh phi Variables (minted
+        // by `framestate.py:113-114 union`) from carry-through Variables
+        // (`framestate.py:108 if w1 == w2: return w1`).  Mirrors the
+        // pred-id gate in `register_phi_variables_in_stack_exc`.
+        let pred_local_ids: std::collections::HashSet<u64> = self_view
+            .iter()
+            .chain(other_view.iter())
+            .filter_map(|c| c.as_ref())
+            .filter_map(|h| match h {
+                crate::flowspace::model::Hlvalue::Variable(v) => Some(v.id()),
+                _ => None,
+            })
+            .collect();
         drop(self_view);
         drop(other_view);
-        // `framestate.py:113-114 union` mints a fresh `Variable()`
-        // at every disagreeing-cell position across the locals /
-        // stack / exception projections.  Pair each such Variable
-        // identity with a graph slot so that when the merged
-        // FrameState later becomes a predecessor of another merge,
-        // the Hlvalue→slot bridge resolves without silently
-        // allocating a fresh slot at the read site.  Carry-through
-        // Variables (`framestate.py:108 if w1 == w2: return w1`)
-        // are already registered at their upstream definition site
-        // and `ensure_variable_registered_void`'s idempotent lookup
-        // leaves them alone.
+        // `framestate.py:113-114 union` mints a fresh `Variable()` at
+        // every disagreeing-cell position.  Pair only those fresh phi
+        // Variables with a graph slot so downstream
+        // `Hlvalue→slot` bridge resolves at the merged-predecessor
+        // read site.  Carry-through Variables (`framestate.py:108 if
+        // w1 == w2: return w1`) are excluded by the `pred_local_ids`
+        // gate — they are already registered at their upstream
+        // definition site, and unconditional registration here would
+        // silently invent a slot for any externally-minted Variable
+        // that reached `union` unregistered, hiding the same kind of
+        // bug `register_phi_variables_in_stack_exc` catches for
+        // stack / exception cells.
         for cell in locals_w.iter().flatten() {
             if let crate::flowspace::model::Hlvalue::Variable(v) = cell {
-                graph.ensure_variable_registered_void(&v);
+                if !pred_local_ids.contains(&v.id()) {
+                    graph.ensure_variable_registered_void(&v);
+                }
             }
         }
         graph.register_phi_variables_in_stack_exc(
@@ -2934,6 +2951,11 @@ impl FunctionGraph {
                         .or_insert(slot_idx);
                 }
             }
+            // Keep the allocator cursor past any slot reserved here so
+            // a subsequent `alloc_value_var*()` lands on a fresh slot
+            // and the `value_variables.len() == next_value` invariant
+            // holds.
+            self.next_value = self.next_value.max(idx + 1);
         }
         match self.value_variables[idx].as_ref() {
             Some(placeholder) if placeholder.id() != var.id() => {
