@@ -70,6 +70,66 @@ pub struct GlobalDecl {
     pub rest: std::collections::BTreeMap<String, Value>,
 }
 
+/// User-defined type (`struct` / `enum` / `type` alias / opaque
+/// forward-decl) the program references. Issue #97 Step 4.3.b consumes
+/// the `kind` field to populate `SemanticProgram.{known_struct_names,
+/// struct_fields, known_trait_names}` from the LLBC alone.
+#[derive(Debug, Deserialize)]
+pub struct TypeDecl {
+    pub def_id: u64,
+    pub item_meta: ItemMeta,
+    pub kind: TypeDeclKind,
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub enum TypeDeclKind {
+    /// Struct body — vector of field declarations.
+    Struct(Vec<FieldDecl>),
+    /// Enum body — vector of variant declarations. Each variant
+    /// carries its own field list (zero-arg for unit variants, named
+    /// for `Foo { a: ... }`, positional for `Bar(T)`).
+    Enum(Vec<VariantDecl>),
+    /// Type alias (`type T = ...`). The aliased type lives in
+    /// `rest["aliased_ty"]`; not currently consumed.
+    Alias(Value),
+    /// Forward declaration / opaque type (Charon couldn't see body).
+    Opaque,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FieldDecl {
+    pub name: Option<String>,
+    pub ty: TyRef,
+    #[serde(default)]
+    pub attr_info: Option<AttrInfo>,
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VariantDecl {
+    pub name: String,
+    #[serde(default)]
+    pub fields: Vec<FieldDecl>,
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, Value>,
+}
+
+/// Trait declaration — referenced when populating
+/// `SemanticProgram.known_trait_names`. Body intentionally minimal:
+/// only `item_meta.name_path()` is consumed.
+#[derive(Debug, Deserialize)]
+pub struct TraitDecl {
+    pub def_id: u64,
+    pub item_meta: ItemMeta,
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ItemMeta {
     pub name: Vec<NameSeg>,

@@ -89,7 +89,8 @@ use majit_charon_reader::{
     Llbc,
     ullbc::{
         BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, Operand, Place,
-        PlaceKind, ProjectionElem, Rvalue, StmtKind, SwitchTargets, TermKind, Unstructured,
+        PlaceKind, ProjectionElem, Rvalue, StmtKind, SwitchTargets, TermKind, TypeDeclKind,
+        Unstructured,
     },
 };
 
@@ -137,6 +138,11 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::ast::SemanticProgram, LowerError> {
+    // ── Pass 1: walk type_decls + trait_decls (Step 4.3.b) ────────
+    let (known_struct_names, known_trait_names, struct_fields) =
+        derive_program_metadata(llbc);
+
+    // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
     let mut fn_return_types: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -146,11 +152,9 @@ pub fn build_semantic_program_from_llbc(
         }
         let graph = lower_fun_decl(llbc, fd)?;
         let name = fd.item_meta.name_path();
-        // Step 4.3.a: surface return types as TyRef labels. This is
-        // not yet the fully-qualified type string the AST driver
-        // emits, but it gives downstream consumers a stable key per
-        // function; future widenings will resolve the TyRef into an
-        // ADT path via Charon's `type_decls` table.
+        // Step 4.3.a: surface return types as TyRef labels. Step 4.3.c
+        // will resolve TyRef → ADT path via `type_decls` (currently
+        // available as `llbc.type_by_id(...)`) once consumers need it.
         fn_return_types.insert(name.clone(), fd.signature.output.label());
         functions.push(crate::front::ast::SemanticFunction {
             name,
@@ -164,12 +168,89 @@ pub fn build_semantic_program_from_llbc(
     }
     Ok(crate::front::ast::SemanticProgram {
         functions,
-        known_struct_names: std::collections::HashSet::new(),
-        known_trait_names: std::collections::HashSet::new(),
-        struct_fields: crate::front::ast::StructFieldRegistry::default(),
+        known_struct_names,
+        known_trait_names,
+        struct_fields,
         fn_return_types,
+        // Immutable-field tracking depends on `#[majit_macros::immutable]`
+        // attribute serialization that Charon does not currently surface
+        // (the `attributes` array carries DocComment / Outer but not our
+        // proc-macro hints). Tracked under Step 4.3.d.
         immutable_fields: std::collections::HashMap::new(),
     })
+}
+
+/// Step 4.3.b: derive whole-program type-metadata fields of
+/// `SemanticProgram` from Charon's `type_decls` + `trait_decls`
+/// tables.
+///
+/// Returns `(known_struct_names, known_trait_names, struct_fields)`.
+/// Names are taken from `item_meta.name_path()`; struct field rows use
+/// `TyRef::label()` as the field type string (matching Step 4.3.a's
+/// label-as-placeholder convention).
+fn derive_program_metadata(
+    llbc: &Llbc,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+    crate::front::ast::StructFieldRegistry,
+) {
+    let mut known_struct_names = std::collections::HashSet::new();
+    let mut known_trait_names = std::collections::HashSet::new();
+    let mut struct_fields = crate::front::ast::StructFieldRegistry::default();
+
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        match &td.kind {
+            TypeDeclKind::Struct(fields) => {
+                // Register the qualified path *and* the bare leaf name
+                // so downstream lookups (`canonical_call_target`'s
+                // bare-leaf fallback) resolve either spelling. Matches
+                // the AST driver's dual-publish convention.
+                let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                let rows: Vec<(String, String)> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let fname = f
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("__pos_{i}"));
+                        (fname, f.ty.label())
+                    })
+                    .collect();
+                struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields.fields.insert(leaf.clone(), rows);
+                known_struct_names.insert(name);
+                known_struct_names.insert(leaf);
+            }
+            TypeDeclKind::Enum(variants) => {
+                // Enums register under their type name *and* under each
+                // variant path (`Strategy::Empty`, `Strategy::IntKeyed`,
+                // …) so synthetic Aggregate(SyntheticTransparentCtor)
+                // emitted by Step 3.9 can be matched downstream.
+                let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                known_struct_names.insert(name.clone());
+                known_struct_names.insert(leaf);
+                for v in variants {
+                    let variant_path = format!("{name}::{}", v.name);
+                    known_struct_names.insert(variant_path);
+                }
+            }
+            TypeDeclKind::Alias(_)
+            | TypeDeclKind::Opaque
+            | TypeDeclKind::Unknown => {}
+        }
+    }
+
+    for td in llbc.iter_trait_decls() {
+        let name = td.item_meta.name_path();
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        known_trait_names.insert(name);
+        known_trait_names.insert(leaf);
+    }
+
+    (known_struct_names, known_trait_names, struct_fields)
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].

@@ -24,7 +24,8 @@ pub mod ullbc;
 
 pub use schema::LlbcFile;
 pub use ullbc::{
-    BasicBlock, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TermKind, Unstructured,
+    BasicBlock, FieldDecl, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TermKind, TraitDecl,
+    TypeDecl, TypeDeclKind, Unstructured, VariantDecl,
 };
 
 use std::path::Path;
@@ -79,6 +80,43 @@ impl Llbc {
             .global_decls
             .get(def_id as usize)?
             .as_ref()
+    }
+
+    /// Look up a `TypeDecl` by its Charon `def_id`. Same indexing
+    /// invariant as [`fn_by_id`].
+    pub fn type_by_id(&self, def_id: u64) -> Option<&TypeDecl> {
+        self.file
+            .translated
+            .type_decls
+            .get(def_id as usize)?
+            .as_ref()
+    }
+
+    /// Look up a `TraitDecl` by its Charon `def_id`.
+    pub fn trait_by_id(&self, def_id: u64) -> Option<&TraitDecl> {
+        self.file
+            .translated
+            .trait_decls
+            .get(def_id as usize)?
+            .as_ref()
+    }
+
+    /// Iterate over every present `TypeDecl`.
+    pub fn iter_type_decls(&self) -> impl Iterator<Item = &TypeDecl> {
+        self.file
+            .translated
+            .type_decls
+            .iter()
+            .filter_map(Option::as_ref)
+    }
+
+    /// Iterate over every present `TraitDecl`.
+    pub fn iter_trait_decls(&self) -> impl Iterator<Item = &TraitDecl> {
+        self.file
+            .translated
+            .trait_decls
+            .iter()
+            .filter_map(Option::as_ref)
     }
 
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).

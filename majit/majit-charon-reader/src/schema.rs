@@ -24,13 +24,22 @@ pub struct Translated {
     /// corpora).
     #[serde(default)]
     pub global_decls: Vec<Option<crate::ullbc::GlobalDecl>>,
-    /// `type_decls`, `trait_decls`, `trait_impls`, `ordered_decls`,
-    /// `files`, `options`, `target_information`, `item_names`,
-    /// `assoc_item_names`, `short_names` — kept opaque until a driver
-    /// pass needs them. Charon's release-to-release renames of these
-    /// surfaces are the most common source of schema drift; staying
-    /// opaque here means a Charon bump does not require recompiling
-    /// this crate.
+    /// User-defined types (`struct` / `enum` / alias / opaque).
+    /// Indexed by `def_id`. Step 4.3.b consumes this to populate
+    /// `SemanticProgram.{known_struct_names, struct_fields,
+    /// immutable_fields}`.
+    #[serde(default)]
+    pub type_decls: Vec<Option<crate::ullbc::TypeDecl>>,
+    /// Trait declarations. Indexed by `def_id`. Step 4.3.b consumes
+    /// this for `SemanticProgram.known_trait_names`.
+    #[serde(default)]
+    pub trait_decls: Vec<Option<crate::ullbc::TraitDecl>>,
+    /// `trait_impls`, `ordered_decls`, `files`, `options`,
+    /// `target_information`, `item_names`, `assoc_item_names`,
+    /// `short_names` — kept opaque until a driver pass needs them.
+    /// Charon's release-to-release renames of these surfaces are the
+    /// most common source of schema drift; staying opaque here means
+    /// a Charon bump does not require recompiling this crate.
     #[serde(flatten)]
     pub rest: std::collections::BTreeMap<String, Value>,
 }

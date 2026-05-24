@@ -167,8 +167,8 @@ fn semantic_program_builder_lowers_every_corpus_function() {
         assert!(names.contains(required), "missing {required}");
     }
     // Step 4.3.a populates fn_return_types with TyRef labels (not
-    // yet fully-qualified strings). Step 4.3.b will widen reader to
-    // resolve type_decls and replace these labels with ADT paths.
+    // yet fully-qualified strings). Step 4.3.c will resolve TyRef
+    // labels into ADT paths via type_decls.
     assert_eq!(program.fn_return_types.len(), program.functions.len());
     assert!(
         program
@@ -176,7 +176,18 @@ fn semantic_program_builder_lowers_every_corpus_function() {
             .get("charon_spike_corpus::straight_line_add")
             .is_some()
     );
-    // Pin these at empty until Step 4.3.b lands.
-    assert!(program.known_struct_names.is_empty());
-    assert!(program.known_trait_names.is_empty());
+    // Step 4.3.b: corpus declares one struct-shaped enum (Strategy +
+    // Token), one type alias (PyResult), so we expect Strategy/Token
+    // and their variant paths plus the leaf names.
+    assert!(
+        program.known_struct_names.contains("Strategy"),
+        "expected Strategy in known_struct_names, got {:?}",
+        program.known_struct_names
+    );
+    assert!(
+        program
+            .known_struct_names
+            .contains("charon_spike_corpus::Strategy::IntKeyed")
+    );
+    assert!(program.known_struct_names.contains("Token"));
 }
