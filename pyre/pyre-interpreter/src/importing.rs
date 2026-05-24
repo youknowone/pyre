@@ -5631,11 +5631,18 @@ fn init_socket_type(ns: &mut DictStorage) {
             } else {
                 0
             };
-            let n =
-                unsafe { libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
-            if n < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
+            let n = loop {
+                let r = unsafe {
+                    libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
             Ok(pyre_object::w_int_new(n as i64))
         }),
     );
@@ -5673,7 +5680,11 @@ fn init_socket_type(ns: &mut DictStorage) {
                     )
                 };
                 if n < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(socket_io_err(err));
                 }
                 off += n as usize;
             }
@@ -5707,10 +5718,16 @@ fn init_socket_type(ns: &mut DictStorage) {
                 0
             };
             let mut buf = vec![0u8; n];
-            let got = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags) };
-            if got < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
+            let got = loop {
+                let r = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags) };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
             buf.truncate(got as usize);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
         }),
@@ -5749,19 +5766,25 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
             let (storage, slen) = pack_inet_addr(family, addr_obj)?;
-            let n = unsafe {
-                libc::sendto(
-                    fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                    flags,
-                    &storage as *const _ as *const libc::sockaddr,
-                    slen,
-                )
+            let n = loop {
+                let r = unsafe {
+                    libc::sendto(
+                        fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                        flags,
+                        &storage as *const _ as *const libc::sockaddr,
+                        slen,
+                    )
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
             };
-            if n < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
             Ok(pyre_object::w_int_new(n as i64))
         }),
     );
@@ -5800,19 +5823,25 @@ fn init_socket_type(ns: &mut DictStorage) {
             let mut buf = vec![0u8; n];
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            let got = unsafe {
-                libc::recvfrom(
-                    fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    n,
-                    flags,
-                    &mut storage as *mut _ as *mut libc::sockaddr,
-                    &mut slen,
-                )
+            let got = loop {
+                let r = unsafe {
+                    libc::recvfrom(
+                        fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        n,
+                        flags,
+                        &mut storage as *mut _ as *mut libc::sockaddr,
+                        &mut slen,
+                    )
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
             };
-            if got < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
             buf.truncate(got as usize);
             let addr = unpack_inet_addr(&storage);
             Ok(pyre_object::w_tuple_new(vec![
@@ -5874,11 +5903,18 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             let fd = socket_fd(obj)?;
             let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
-            let got =
-                unsafe { libc::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags) };
-            if got < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
+            let got = loop {
+                let r = unsafe {
+                    libc::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
             Ok(pyre_object::w_int_new(got as i64))
         }),
     );
@@ -5937,19 +5973,25 @@ fn init_socket_type(ns: &mut DictStorage) {
             let slot = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf_obj) };
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            let got = unsafe {
-                libc::recvfrom(
-                    fd,
-                    slot.as_mut_ptr() as *mut libc::c_void,
-                    nbytes,
-                    flags,
-                    &mut storage as *mut _ as *mut libc::sockaddr,
-                    &mut slen,
-                )
+            let got = loop {
+                let r = unsafe {
+                    libc::recvfrom(
+                        fd,
+                        slot.as_mut_ptr() as *mut libc::c_void,
+                        nbytes,
+                        flags,
+                        &mut storage as *mut _ as *mut libc::sockaddr,
+                        &mut slen,
+                    )
+                };
+                if r >= 0 {
+                    break r;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
             };
-            if got < 0 {
-                return Err(socket_io_err(std::io::Error::last_os_error()));
-            }
             let addr = unpack_inet_addr(&storage);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(got as i64),
