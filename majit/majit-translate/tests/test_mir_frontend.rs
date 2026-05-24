@@ -5,7 +5,7 @@
 //! input — the same artefact the spike's prototype consumes.
 
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::{LowerError, lower_function};
+use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
 
 const CORPUS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -140,4 +140,35 @@ fn unknown_function_name_errors() {
     let llbc = load_corpus();
     let err = lower_function(&llbc, "no_such_function_anywhere").unwrap_err();
     assert!(matches!(err, LowerError::FunctionNotFound(_)));
+}
+
+#[test]
+fn semantic_program_builder_lowers_every_corpus_function() {
+    // Step 4.1 smoke test: building a SemanticProgram from the
+    // corpus.ullbc should succeed and surface every local function
+    // as a SemanticFunction with a populated FunctionGraph. The
+    // whole-program metadata (struct_fields etc.) is left empty by
+    // design — populating it comes from Step 4.3 (Charon type_decls).
+    let llbc = load_corpus();
+    let program = build_semantic_program_from_llbc(&llbc).expect("builder");
+    assert!(
+        program.functions.len() >= 4,
+        "expected at least the 4 corpus shapes, got {}",
+        program.functions.len()
+    );
+    let names: std::collections::HashSet<_> =
+        program.functions.iter().map(|f| f.name.as_str()).collect();
+    for required in [
+        "charon_spike_corpus::straight_line_add",
+        "charon_spike_corpus::branch_loop_sum",
+        "charon_spike_corpus::strategy_len",
+        "charon_spike_corpus::desugar_mix",
+    ] {
+        assert!(names.contains(required), "missing {required}");
+    }
+    // Step 4.3 deliverable: these should NOT be empty after
+    // type_decls derivation lands. Pin them at empty for now so the
+    // first non-empty population triggers a test-update event.
+    assert!(program.known_struct_names.is_empty());
+    assert!(program.fn_return_types.is_empty());
 }

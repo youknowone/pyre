@@ -112,6 +112,57 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
     lower_fun_decl(llbc, fd)
 }
 
+/// Build a [`SemanticProgram`] by lowering every local function
+/// declaration in `llbc`.
+///
+/// This is the MIR-driven analog of
+/// [`crate::front::ast::build_semantic_program_from_parsed_files`]
+/// and the entry point Step 4 will eventually swap into the
+/// production pipeline at `lib.rs:391`.
+///
+/// **Scope of this Step 4.1 slice**: only the `functions` field is
+/// populated. Whole-program metadata (`known_struct_names`,
+/// `known_trait_names`, `struct_fields`, `fn_return_types`,
+/// `immutable_fields`) is left at its default empty value because
+/// deriving it requires widening
+/// [`majit_charon_reader::schema::Translated`] to surface
+/// `type_decls` / `trait_decls`; that is tracked as Step 4.3.
+///
+/// Functions whose body Charon could not extract (extraction error,
+/// opaque body, `null` entry) are skipped silently — the production
+/// pipeline relies on `lib.rs`-level coverage audits to flag missing
+/// graphs.  Functions whose MIR shape the driver does not yet handle
+/// produce a [`LowerError`] that propagates out: the function-level
+/// failure model from [`lower_function`] applies unchanged.
+pub fn build_semantic_program_from_llbc(
+    llbc: &Llbc,
+) -> Result<crate::front::ast::SemanticProgram, LowerError> {
+    let mut functions = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.unstructured().is_none() {
+            continue;
+        }
+        let graph = lower_fun_decl(llbc, fd)?;
+        functions.push(crate::front::ast::SemanticFunction {
+            name: fd.item_meta.name_path(),
+            graph,
+            return_type: None,
+            self_ty_root: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            access_directly: false,
+        });
+    }
+    Ok(crate::front::ast::SemanticProgram {
+        functions,
+        known_struct_names: std::collections::HashSet::new(),
+        known_trait_names: std::collections::HashSet::new(),
+        struct_fields: crate::front::ast::StructFieldRegistry::default(),
+        fn_return_types: std::collections::HashMap::new(),
+        immutable_fields: std::collections::HashMap::new(),
+    })
+}
+
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
 pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
