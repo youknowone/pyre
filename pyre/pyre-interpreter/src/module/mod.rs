@@ -40,6 +40,7 @@ pub mod itertools;
 pub mod math;
 pub mod mmap;
 pub mod operator;
+pub mod posix;
 pub mod pwd;
 pub mod resource;
 pub mod select;
