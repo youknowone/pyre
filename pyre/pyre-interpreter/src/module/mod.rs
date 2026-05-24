@@ -9,6 +9,7 @@ pub mod _io;
 pub mod _socket;
 pub mod _sre;
 pub mod _weakref;
+pub mod faulthandler;
 pub mod math;
 pub mod mmap;
 pub mod operator;
