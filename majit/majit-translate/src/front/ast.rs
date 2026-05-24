@@ -2739,21 +2739,17 @@ impl<'a> GraphBuildContext<'a> {
     /// (carry-through type widening: `Unknown` cells inherit the
     /// concrete sibling kind via `FrameState::union`'s wildcard rule).
     ///
-    /// Currently unused — Slice 4.2 production migration deferred until
-    /// `ensure_variable_at_block` learns to emit paired
-    /// `OpKind::Input { name, .. }` ops alongside its inputargs
-    /// growth (third blocker discovered during the slice-4.2 attempt:
-    /// the helper's grown inputargs are picked up by
-    /// `header_phi_name_list` via `value_name(vid)` post the same
-    /// session's update, but downstream cutover at
-    /// `flowspace_adapter.rs:1739-1797` requires the paired Input op
-    /// for cross-block body-Input aliasing, which `ensure_*` does not
-    /// produce; raw `Variable::new()` phi cells minted by
-    /// `FrameState::union` for NeedsPhi slots have no in-graph
-    /// definition site, so chain backfill into upstream blocks fails
-    /// with `graph corruption: no transitive predecessor chain leads
-    /// to a definition site` on real production graphs).
-    #[allow(dead_code)]
+    /// Slice 4.2 production entry — used by `lower_if_expr`'s
+    /// `!want_phi && both_open` migration to rebind ctx after the
+    /// merge block has been created via `create_block_from_framestate`
+    /// + `set_goto_from_framestate`.  Loop-body scope cleanup (#134)
+    /// drops body-local bindings on `Expr::ForLoop` / `Expr::While` /
+    /// `Expr::Loop` close, and the migration's
+    /// `can_thread_variable_to_block` dry-run skips orphan-rooted
+    /// graphs (`>2-arm Expr::Match` fallback at `ast.rs:6045-6052`),
+    /// so `merged.locals_w` no longer surfaces orphan Variables that
+    /// would trip `ensure_variable_at_block`'s pred-chain reachability
+    /// assert.
     fn setstate_at_block(
         &mut self,
         state: &FrameState,
@@ -4434,6 +4430,94 @@ fn lower_if_expr(
     let then_open = graph.block(then_block).is_open();
     let else_open = graph.block(else_block).is_open();
     let want_phi = then_value_var.is_some() && else_value_var.is_some();
+    let both_open = then_open && else_open;
+
+    // Pre-compute the unioned framestate when both arms are open — it is
+    // reused below for (a) Slice 4.2's migration path
+    // (`create_block_from_framestate` + `set_goto_from_framestate`) and
+    // (b) the legacy lean-merge-block ctx update (`None`-kill + lazy
+    // phi-install).  Doing the union once avoids duplicating
+    // `FrameState::union`'s O(slots) walk.
+    let merged_when_both_open: Option<FrameState> = if both_open {
+        Some(then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
+            "AST frontend: union is total — entries domain has no UnionError, \
+                 stack / last_exception / blocklist / next_offset are vestigial \
+                 (framestate.py:78 None-return reachable only post-Z4 walker)",
+        ))
+    } else {
+        None
+    };
+
+    // Slice 4.2: when both arms are open and there is no value-phi to
+    // thread (the result is `()` — a statement-shaped `if`), the merge
+    // joins via `flowcontext.py:443 SpamBlock(newstate)` — a block whose
+    // `inputargs` are every Variable in `merged.getvariables()` plus
+    // per-pred links built from `currentstate.getoutputargs(newstate)`.
+    // `create_block_from_framestate` + `set_goto_from_framestate`
+    // implement that shape; `ctx.setstate_at_block` rebinds
+    // `ctx.local_value_ids` to the merge's slot Variables so post-merge
+    // reads see the freshly-minted phi Variables without re-driving the
+    // lazy installer.
+    //
+    // Eligibility safety check: pyre's existing AST blocks are not
+    // SpamBlocks — many call sites set `Link.args` from name lists
+    // captured BEFORE `ensure_variable_at_block` may grow a block's
+    // `inputargs`, so unconditionally migrating risks two failure
+    // modes:
+    //
+    //   1. Orphan-rooted blocks.  The >2-arm `Expr::Match` fallback
+    //      at `ast.rs:6045-6052` only wires arms[0..2] via
+    //      `set_branch`, leaving arms[2..] orphan.  Inside their
+    //      bodies, the migration's `set_goto_from_framestate` would
+    //      call `ensure_variable_at_block` against an orphan and
+    //      panic ("no transitive predecessor chain leads to a
+    //      definition site").
+    //   2. Loop-header arity contracts.  `allocate_loop_header_phis`
+    //      (`ast.rs:2255`) populates header `inputargs` with NAMED
+    //      `OpKind::Input` ops and the back-edge close at
+    //      `Expr::Continue` (`ast.rs:6738-6741`) sends args derived
+    //      from `header_phi_name_list` (named-only enumeration).
+    //      `ensure_variable_at_block` adds carry-through Variables
+    //      as unnamed inputargs — the back-edge then trips
+    //      `set_goto`'s arity assert (`model.rs:3422-3433`) because
+    //      its named-only args count is less than the header's
+    //      grown inputargs count.
+    //
+    // `can_thread_variable_to_block` mirrors `ensure_variable_at_block`'s
+    // recursion without mutation, and `forbidden_growth` lists the
+    // current loop headers (continue_targets) so the dry-run also
+    // rejects a walk that would have to grow a header.  When the
+    // migration is skipped, the legacy lean-merge-block path below
+    // copes silently — its merge block carries no inputargs and the
+    // lazy installer only touches blocks that are actually reachable.
+    let forbidden_growth: std::collections::HashSet<BlockId> = ctx
+        .loop_stack
+        .iter()
+        .map(|frame| frame.continue_target)
+        .collect();
+    let migrate: bool = if let Some(merged) = merged_when_both_open.as_ref() {
+        if want_phi {
+            false
+        } else {
+            let then_outargs = then_exit_snapshot.getoutputargs(merged, graph);
+            let else_outargs = else_exit_snapshot.getoutputargs(merged, graph);
+            let safe_then = then_outargs.iter().all(|a| match a {
+                LinkArg::Value(v) => {
+                    graph.can_thread_variable_to_block(then_block, v, &forbidden_growth)
+                }
+                _ => true,
+            });
+            let safe_else = else_outargs.iter().all(|a| match a {
+                LinkArg::Value(v) => {
+                    graph.can_thread_variable_to_block(else_block, v, &forbidden_growth)
+                }
+                _ => true,
+            });
+            safe_then && safe_else
+        }
+    } else {
+        false
+    };
 
     let (merge_block, phi_result) = if want_phi {
         let (merge, phi_args) = graph.create_block_with_arg_vars(1);
@@ -4448,6 +4532,16 @@ fn lower_if_expr(
             graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
         }
         (merge, Some(phi_args[0].clone()))
+    } else if migrate {
+        let merged = merged_when_both_open
+            .as_ref()
+            .expect("migrate => merged_when_both_open is Some");
+        let merge = graph.create_block_from_framestate(merged);
+        graph.set_goto_from_framestate(then_block, merge, &then_exit_snapshot, merged);
+        graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
+        graph.set_goto_from_framestate(else_block, merge, &else_exit_snapshot, merged);
+        graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
+        (merge, None)
     } else {
         let merge = graph.create_block();
         if then_open {
@@ -4481,12 +4575,95 @@ fn lower_if_expr(
     //     each predecessor's goto args, and rebinds ctx so
     //     post-merge reads of the name resolve to the new
     //     phi vid without re-driving the lazy installer.
-    if then_open && else_open {
-        let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
-            "AST frontend: union is total — entries domain has no UnionError, \
-                 stack / last_exception / blocklist / next_offset are vestigial \
-                 (framestate.py:78 None-return reachable only post-Z4 walker)",
-        );
+    if migrate {
+        // Slice 4.2 migration path: `create_block_from_framestate`
+        // already threaded every Variable in `merged.getvariables()`
+        // into `merge_block.inputargs`, and `set_goto_from_framestate`
+        // pushed the per-arm `getoutputargs` projection onto each
+        // predecessor's link.  Fresh-phi slot Variables (minted by
+        // `FrameState::union` as `Variable::new()`) have no upstream
+        // defining op, so `graph_value_type_var` would surface Unknown
+        // when `setstate_at_block` derives the post-merge
+        // `ctx.local_value_types` entry — and a subsequent
+        // `Expr::Unary` `!` on the rebound local would trip
+        // `expr_unary_not_operand_kind`'s
+        // `UnaryNotUnknownOperand` arm.  Emit a paired
+        // `OpKind::Input { name, ty }` op in `merge_block` for every
+        // fresh phi so `graph_value_type_var` finds the op's `ty`
+        // upstream and the per-name registration carries through.
+        // The type fold mirrors
+        // `lazy_install_local_at_current_block_var`'s wildcard rule
+        // (`ast.rs:3367-3374`): concrete + same-concrete keeps the
+        // concrete kind, concrete + Unknown lifts to the concrete
+        // sibling, concrete + different-concrete widens to Unknown.
+        // `setstate_at_block` then rebinds ctx in lockstep with
+        // `merged.locals_w` — slots whose Variable carried through
+        // both arms rebind to the merge-block's inputarg, None-killed
+        // slots drop, fresh-phi slots rebind to the freshly-minted
+        // merge-block Variable now carrying a proper Input op.
+        let merged = merged_when_both_open
+            .as_ref()
+            .expect("migrate => merged_when_both_open is Some");
+        let phi_info: Vec<(usize, crate::flowspace::model::Variable, ValueType)> = {
+            let then_view = then_exit_snapshot.locals_w_view(graph);
+            let else_view = else_exit_snapshot.locals_w_view(graph);
+            let merged_view = merged.locals_w_view(graph);
+            let mut info = Vec::new();
+            for (i, slot) in merged_view.iter().enumerate() {
+                let Some(crate::flowspace::model::Hlvalue::Variable(merged_var)) = slot else {
+                    continue;
+                };
+                let then_var = then_view
+                    .get(i)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|c| match c {
+                        crate::flowspace::model::Hlvalue::Variable(v) => Some(v.clone()),
+                        _ => None,
+                    });
+                if then_var.as_ref() == Some(merged_var) {
+                    continue;
+                }
+                let else_var = else_view
+                    .get(i)
+                    .and_then(|s| s.as_ref())
+                    .and_then(|c| match c {
+                        crate::flowspace::model::Hlvalue::Variable(v) => Some(v.clone()),
+                        _ => None,
+                    });
+                let then_ty = then_var
+                    .as_ref()
+                    .map(|v| graph_value_type_var(graph, v).unwrap_or(ValueType::Unknown))
+                    .unwrap_or(ValueType::Unknown);
+                let else_ty = else_var
+                    .as_ref()
+                    .map(|v| graph_value_type_var(graph, v).unwrap_or(ValueType::Unknown))
+                    .unwrap_or(ValueType::Unknown);
+                let merged_ty = match (then_ty.clone(), else_ty) {
+                    (a, b) if a == b => a,
+                    (ValueType::Unknown, b) => b,
+                    (a, ValueType::Unknown) => a,
+                    _ => ValueType::Unknown,
+                };
+                info.push((i, merged_var.clone(), merged_ty));
+            }
+            info
+        };
+        for (slot_idx, phi_var, ty) in phi_info {
+            let name = ctx.local_first_bind_order[slot_idx].clone();
+            graph.push_op_with_result_var(
+                merge_block,
+                OpKind::Input {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                },
+                phi_var.clone(),
+            );
+            graph.name_value_var(&phi_var, name);
+        }
+        ctx.setstate_at_block(merged, merge_block, graph);
+    } else if then_open && else_open {
+        let merged =
+            merged_when_both_open.expect("both arms open => merged_when_both_open is Some");
         // Locals projection walks `merged.locals_w` per upstream
         // `framestate.py:19 self.locals_w` — pyre's `union` populates
         // the `Hlvalue` carrier in lockstep with `entries`, so this

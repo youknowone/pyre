@@ -3609,6 +3609,80 @@ impl FunctionGraph {
             .any(|op| op.result.as_ref() == Some(var))
     }
 
+    /// Non-mutating mirror of [`Self::ensure_variable_at_block`] — answers
+    /// "would the recursive backfill succeed without touching any block
+    /// in `forbidden`?" without modifying any block's `inputargs` or
+    /// exit-link args.  Used by Slice 4.2's `lower_if_expr` migration
+    /// to skip `create_block_from_framestate` +
+    /// `set_goto_from_framestate` when the chain walk would either:
+    ///
+    /// 1. Dead-end at a block with no predecessors and no local
+    ///    definition (orphan-rooted block — e.g. inside an arm of the
+    ///    pre-existing >2-arm `Expr::Match` fallback at
+    ///    `ast.rs:6045-6052` which wires only arms[0..2]).
+    /// 2. Need to grow `inputargs` on a block whose arity is
+    ///    externally constrained (loop headers; see
+    ///    `header_phi_name_list` at `ast.rs:2334-2344` for the
+    ///    named-only enumeration that breaks when an unnamed inputarg
+    ///    is later added to a header by ensure_variable_at_block).
+    ///
+    /// `forbidden` lists every block whose `inputargs` must NOT grow.
+    /// `Expr::While` / `Expr::Loop` / `Expr::ForLoop` close their
+    /// header into ctx.loop_stack as a continue_target — those header
+    /// blocks own the `forbidden` slots.  Returns `true` when `var` is
+    /// already defined at `block` or every transitive predecessor
+    /// chain leads to a definition site without entering a forbidden
+    /// block; `false` otherwise.  Cycle-safe: a block already touched
+    /// in the current dry-run walk is treated as "would-be-defined",
+    /// same way `ensure_variable_at_block`'s in-place `inputargs.push`
+    /// plus `variable_defined_in_block` short-circuit handles
+    /// back-edges.
+    pub fn can_thread_variable_to_block(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        forbidden: &std::collections::HashSet<BlockId>,
+    ) -> bool {
+        let mut would_define: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+        self.can_thread_variable_to_block_inner(block, var, forbidden, &mut would_define)
+    }
+
+    fn can_thread_variable_to_block_inner(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        forbidden: &std::collections::HashSet<BlockId>,
+        would_define: &mut std::collections::HashSet<BlockId>,
+    ) -> bool {
+        if self.variable_defined_in_block(block, var) || would_define.contains(&block) {
+            return true;
+        }
+        if forbidden.contains(&block) {
+            return false;
+        }
+        let pred_ids: Vec<BlockId> = self
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                let bid = b.id;
+                b.exits.iter().filter_map(move |exit| {
+                    if exit.target == block {
+                        Some(bid)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        if pred_ids.is_empty() {
+            return false;
+        }
+        would_define.insert(block);
+        pred_ids
+            .into_iter()
+            .all(|p| self.can_thread_variable_to_block_inner(p, var, forbidden, would_define))
+    }
+
     /// Shorthand for the boolean-branch shape — two Links with
     /// `Bool(false)` / `Bool(true)` exitcases, `exitswitch =
     /// ExitSwitch::Value(cond)`.  Upstream equivalent:
