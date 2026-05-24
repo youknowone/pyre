@@ -165,21 +165,6 @@ pub struct MergePoint {
     pub header_pc: usize,
 }
 
-impl MergePoint {
-    /// pyjitpl.py:2989 `original_boxes` view — produces a fresh
-    /// `Vec<OpRef>` for callers that still consume the legacy split shape.
-    pub fn original_boxes(&self) -> Vec<OpRef> {
-        self.green_boxes.iter().map(|gb| gb.opref).collect()
-    }
-
-    /// pyjitpl.py:2989 `[b.type for b in original_boxes]` view — pyre-only
-    /// because PyPy Box objects carry their type implicitly, but pyre's
-    /// flat OpRef encoding needs the parallel Type tag for compile_retrace.
-    pub fn original_box_types(&self) -> Vec<Type> {
-        self.green_boxes.iter().map(|gb| gb.ty).collect()
-    }
-}
-
 /// Tracing context: wraps Trace + ConstantPool with convenience API.
 ///
 /// The interpreter uses this during trace recording to:

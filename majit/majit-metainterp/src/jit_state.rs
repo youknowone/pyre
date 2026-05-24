@@ -264,11 +264,12 @@ pub trait JitState: Sized {
     fn build_meta_from_merge_point(
         provisional: &Self::Meta,
         header_pc: usize,
-        original_box_types: &[Type],
+        original_boxes: &[crate::trace_ctx::GreenBox],
     ) -> Self::Meta {
         // Default: clone + patch (backward compat for non-pyre consumers)
         let mut meta = provisional.clone();
-        Self::update_meta_for_cut(&mut meta, header_pc, original_box_types);
+        let original_box_types: Vec<Type> = original_boxes.iter().map(|gb| gb.ty).collect();
+        Self::update_meta_for_cut(&mut meta, header_pc, &original_box_types);
         meta
     }
 

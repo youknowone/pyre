@@ -2600,14 +2600,16 @@ impl<M: Clone> MetaInterp<M> {
 
     /// compile.py:269-270: return cross-loop cut info if the current trace
     /// closes at a different loop header than where it started.
-    pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<Type>)> {
+    pub fn cross_loop_cut_info(
+        &self,
+    ) -> Option<(usize, Vec<crate::trace_ctx::GreenBox>)> {
         let ctx = self.tracing.as_ref()?;
         let inner_key = ctx.cut_inner_green_key?;
         // compile.py:269: cross-loop cut uses the inner loop's merge point.
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
             .filter(|mp| mp.position._pos > 0)
-            .map(|mp| (mp.header_pc, mp.original_box_types()))
+            .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
 
     /// Compat alias: delegates to set_trace_eagerness.

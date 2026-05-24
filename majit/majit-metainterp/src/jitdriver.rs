@@ -1537,8 +1537,8 @@ impl<S: JitState> JitDriver<S> {
                     // rebuild meta from merge point to get the inner header's
                     // frame layout (vsd, slot_types).
                     let meta = {
-                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                        if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
+                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
                         } else {
                             provisional_meta
                         }
@@ -1650,8 +1650,8 @@ impl<S: JitState> JitDriver<S> {
                     // without consuming.
                     let provisional_meta = self.meta.trace_meta().cloned().unwrap();
                     let meta = {
-                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                        if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
+                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
                         } else {
                             provisional_meta
                         }

@@ -5529,8 +5529,10 @@ impl JitState for PyreJitState {
     fn build_meta_from_merge_point(
         provisional: &PyreMeta,
         _header_pc: usize,
-        original_box_types: &[Type],
+        original_boxes: &[majit_metainterp::GreenBox],
     ) -> PyreMeta {
+        let original_box_types: Vec<Type> = original_boxes.iter().map(|gb| gb.ty).collect();
+        let original_box_types = &original_box_types[..];
         // `NUM_SCALAR_INPUTARGS` already counts `NUM_EXTRA_REDS` (frame +
         // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
