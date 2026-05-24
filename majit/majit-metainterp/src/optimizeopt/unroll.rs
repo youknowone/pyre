@@ -5627,21 +5627,19 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_optimize_trace() {
         let mut unroll_opt = UnrollOptimizer::new();
-        // IntAdd operates on Int-typed inputs — seed the inner phase1/2
-        // optimizers' trace_inputarg_types via UnrollOptimizer so the
-        // intbounds pass sees Int on the two inputargs.
+        // Two Int inputargs.  Use `InputArgInt` variants via
+        // `OpRef::inputarg_refs` to match resoperation.py:719
+        // `AbstractInputArg` class identity — the prior fixture used
+        // `OpRef::int_op` (`AbstractResOp` mixin) at inputarg slots, so
+        // the type check passed but the variant tag PyPy's
+        // `isinstance(x, InputArgInt)` reads diverged.  Seeding
+        // `trace_inputarg_types` mirrors the same intent for the
+        // intbounds pass / `with_inputarg_types` BoxRef planter.
+        let inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int, majit_ir::Type::Int]);
         unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
-        // Use optimize_trace_with_constants_and_inputs to properly set
-        // num_inputs so input args don't collide with op positions. Args
-        // address inputarg slots via `InputArg*` OpRef variants so the
-        // BoxRef shape (`with_inputarg_types` plants `BoxRef::new_inputarg`)
-        // and the orthodox `_forwarded` mirror agree on the namespace.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-            ),
-            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntAdd, &[inputargs[0], inputargs[1]]),
+            Op::new(OpCode::Jump, &[inputargs[0]]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();

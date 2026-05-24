@@ -284,6 +284,22 @@ impl OpRef {
         }
     }
 
+    /// Build the `[InputArg*(0), InputArg*(1), ...]` vector for a trace
+    /// whose inputarg types are `types`.  Position is the slot index.
+    /// Used by test fixtures so inputarg slots get the `InputArg*`
+    /// variant tag PyPy's `isinstance(x, InputArgInt)` dispatch reads —
+    /// `IntOp` / `VoidOp` masquerading at inputarg positions matches
+    /// the type test by coincidence but trips any identity-based
+    /// dispatch (resoperation.py:699 `AbstractInputArg` vs :250
+    /// `AbstractResOp`).
+    pub fn inputarg_refs(types: &[Type]) -> Vec<OpRef> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| OpRef::input_arg_typed(i as u32, *t))
+            .collect()
+    }
+
     /// Allocate a typed `*Op` OpRef from a position. The type tag picks
     /// the matching mixin variant (resoperation.py:564-638).
     /// `Type::Void` lands on `VoidOp` — `AbstractResOp.type = 'v'`
