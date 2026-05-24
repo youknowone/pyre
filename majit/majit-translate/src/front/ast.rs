@@ -3988,7 +3988,57 @@ pub fn populate_known_statics(
             }
             m.insert(segments.join("::"), (ty.clone(), value.clone()));
         }
+        register_stdlib_known_statics(&mut m);
     });
+}
+
+/// Pre-register stdlib enum variants that pyre source carries through
+/// the flowgraph as opaque constants.  PyPy `LOAD_GLOBAL`
+/// (`flowcontext.py:856`) pushes the per-module-globals namespace
+/// entry as a `Constant(value)`; pyre's `extract_static_decls` only
+/// scans crate-local `Item::Static` / `Item::Const` so external
+/// stdlib paths (`std::sync::atomic::Ordering::Relaxed` reached via
+/// the imported `Ordering` alias) miss the catalogue and reach the
+/// `lower_expr` `Expr::Path` arm's body-`OpKind::Input` fallback.
+/// Threading a body-Input across an `if`/`return`-induced block
+/// boundary requires `Link.args` predeclaration on the predecessor
+/// link, which producers downstream of `Expr::If` do not perform —
+/// the adapter then panics ("cross-block body Input — name X was not
+/// threaded through Link.args / target inputargs").
+///
+/// Memory-ordering arguments are semantically opaque to the JIT — the
+/// underlying atomic operation encodes the ordering inline; the
+/// `Ordering` arg is consumed at the Rust→LL boundary.  Map each
+/// variant to a distinct `ConstInt` so the catalogue lookup at
+/// `lower_expr` emits a `ConstX` directly (each callsite
+/// self-contained, no cross-block threading needed) and the rtyper
+/// sees `int_call(_, ConstInt(n))` instead of an unbound
+/// cross-block `Input` op.
+///
+/// The two-segment key matches the in-source spelling — every pyre
+/// caller imports `Ordering` and writes `Ordering::Relaxed`, so the
+/// `populate_known_statics` map's qualified key matches the
+/// `lower_expr` lookup key directly.
+fn register_stdlib_known_statics(
+    m: &mut std::collections::HashMap<
+        String,
+        (ValueType, Option<crate::flowspace::model::ConstValue>),
+    >,
+) {
+    use crate::flowspace::model::ConstValue;
+    let ordering_variants: &[(&str, i64)] = &[
+        ("Ordering::Relaxed", 0),
+        ("Ordering::Acquire", 1),
+        ("Ordering::Release", 2),
+        ("Ordering::AcqRel", 3),
+        ("Ordering::SeqCst", 4),
+    ];
+    for (path, code) in ordering_variants {
+        m.insert(
+            (*path).to_string(),
+            (ValueType::Int, Some(ConstValue::Int(*code))),
+        );
+    }
 }
 
 /// RAII guard for `CURRENT_LOWERING_FN_NAME` — restores the previous
@@ -5676,6 +5726,62 @@ fn lower_expr(
                 args_vars.push(ctx.popvid_var(graph));
             }
             args_vars.reverse();
+
+            // Rust requires explicit `.wrapping_mul()` / `.wrapping_add()`
+            // etc. for wrap-around integer arithmetic because the bare
+            // `*`/`+`/`-` operators panic on debug overflow.  RPython
+            // expresses the same arithmetic as `r_uint(a) * r_uint(b)` on
+            // `SomeInteger * SomeInteger` where `rarithmetic.r_uint`
+            // silently wraps; its annotator never sees a method shape,
+            // only `int_mul(SomeInteger, SomeInteger)`.  Intercept the
+            // method-call shape here so annotator/rtyper see the same
+            // `BinOp`/`UnaryOp` ops as a direct `*` / `abs()` would
+            // produce — no method-resolution path through SomeInteger
+            // getattr.
+            let method_name = mc.method.to_string();
+            let wrapping_binop_op = match method_name.as_str() {
+                "wrapping_add" => Some("add"),
+                "wrapping_sub" => Some("sub"),
+                "wrapping_mul" => Some("mul"),
+                _ => None,
+            };
+            if let Some(binop) = wrapping_binop_op
+                && args_vars.len() == 2
+            {
+                let lhs = args_vars[0].clone();
+                let rhs = args_vars[1].clone();
+                let result_ty = binary_result_value_type_var(graph, &lhs, &rhs, binop);
+                let var = graph
+                    .push_op_var(
+                        *block,
+                        OpKind::BinOp {
+                            op: binop.into(),
+                            lhs,
+                            rhs,
+                            result_ty,
+                        },
+                        true,
+                    )
+                    .expect("OpKind::BinOp has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
+            if method_name == "wrapping_abs" && args_vars.len() == 1 {
+                let operand = args_vars[0].clone();
+                let result_ty = graph_value_type_var(graph, &operand).unwrap_or(ValueType::Int);
+                let var = graph
+                    .push_op_var(
+                        *block,
+                        OpKind::UnaryOp {
+                            op: "abs".into(),
+                            operand,
+                            result_ty,
+                        },
+                        true,
+                    )
+                    .expect("OpKind::UnaryOp has has_result=true");
+                return Ok(Lowered::from_value_var(graph, &var));
+            }
+
             // RPython `jtransform.py:410-412`: a polymorphic receiver
             // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
             // Detect via the collected local_dyn_trait_roots map so
@@ -9943,7 +10049,7 @@ fn transparent_option_method_result_type(
 ) -> Option<ValueType> {
     match method.to_string().as_str() {
         // Rust `usize`/`*const T::len` etc — RPython `lltype.Signed`.
-        "as_usize" | "len" | "wrapping_mul" => Some(ValueType::Int),
+        "as_usize" | "len" => Some(ValueType::Int),
         // Bool-returning predicates: RPython `SomeBool` (`annotator/
         // model.py:185-198`). Was `Int` until the Bool lattice landed
         // (`model.rs:18-42`); split out so the call result reaches
@@ -9996,10 +10102,7 @@ fn primitive_method_result_type(
         (ValueType::Float, "is_nan" | "is_infinite" | "is_finite" | "is_sign_negative") => {
             Some(ValueType::Bool)
         }
-        (
-            ValueType::Int,
-            "abs" | "wrapping_abs" | "wrapping_mul" | "wrapping_add" | "wrapping_sub",
-        ) => Some(ValueType::Int),
+        (ValueType::Int, "abs") => Some(ValueType::Int),
         _ => None,
     }
 }

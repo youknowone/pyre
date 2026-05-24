@@ -3207,6 +3207,39 @@ struct WalkerTypeAliasGuard {
 
 impl WalkerTypeAliasGuard {
     fn enter(aliases: StdHashMap<String, syn::Type>) -> Self {
+        // Mirror each entering alias into the process-wide registry so
+        // a `type PyObjectRef = *mut PyObject;` declared in
+        // `pyre-object/src/pyobject.rs` stays addressable when a later
+        // walker (e.g. `pyre-interpreter/src/pyframe.rs`) encounters
+        // `f_generator_nowref: PyObjectRef`.  Cross-file alias
+        // visibility matches RPython's whole-program visibility — its
+        // annotator resolves user-defined types regardless of which
+        // module declared them (`flowcontext.py:847` looks up names in
+        // `func_globals` which spans the imported namespace).  The
+        // thread-local map keeps per-scope isolation for shadowing
+        // (inline `mod foo { type T = U; }` does NOT leak `T` to the
+        // outer scope's local lookups), while the process-wide table
+        // is the cross-file floor.
+        //
+        // `syn::Type` is not `Send`/`Sync` (interior `proc_macro2`
+        // cells), so the global table serialises each entry to the
+        // source-level token spelling via `quote::ToTokens::
+        // to_token_stream`.  A per-thread parsed cache
+        // ([`PROCESS_WIDE_ALIAS_PARSED_CACHE`]) re-parses each entry
+        // at most once per thread so the hot path through
+        // [`syn_primitive_to_lltype`] does not call `syn::parse_str`
+        // repeatedly on the same alias spelling — without this cache,
+        // `test_codegen_output` regresses from ~260s to ~470s on the
+        // full pyre source set.  `entry().or_insert` makes the mirror
+        // first-writer-wins so re-walks of the same file are
+        // idempotent.
+        if let Ok(mut map) = PROCESS_WIDE_TYPE_ALIASES.lock() {
+            use quote::ToTokens;
+            for (name, ty) in &aliases {
+                map.entry(name.clone())
+                    .or_insert_with(|| ty.to_token_stream().to_string());
+            }
+        }
         let prev =
             WALKER_TYPE_ALIASES.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), aliases));
         WalkerTypeAliasGuard { prev }
@@ -3222,10 +3255,68 @@ impl Drop for WalkerTypeAliasGuard {
 }
 
 /// Consult the walker scope's alias map for a single-segment ident.
-/// Returns `None` when no alias matches or the walker scope is empty
-/// (no `with_walker_type_aliases` guard active).
+/// Returns `None` when no alias matches in either the thread-local
+/// scope or the process-wide fallback registry
+/// ([`PROCESS_WIDE_TYPE_ALIASES`]).  The fallback closes the
+/// cross-file gap: pyre source files are walked sequentially and
+/// each `WalkerTypeAliasGuard` drop clears the thread-local map, so a
+/// later file's struct field declared as `field: PyObjectRef` cannot
+/// see the earlier file's alias without the global floor.
 fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
-    WALKER_TYPE_ALIASES.with(|cell| cell.borrow().get(name).cloned())
+    let local = WALKER_TYPE_ALIASES.with(|cell| cell.borrow().get(name).cloned());
+    if local.is_some() {
+        return local;
+    }
+    // Per-thread cache of previously-parsed global entries (`None`
+    // entries cache misses too).  The lookup is on the hot path
+    // through [`syn_primitive_to_lltype`] for every single-segment
+    // ident encountered during the walker pass; without this cache
+    // each call re-parses the token spelling via [`syn::parse_str`],
+    // which compounds into hundreds of seconds of overhead on the
+    // full pyre source set.
+    if let Some(cached) =
+        PROCESS_WIDE_ALIAS_PARSED_CACHE.with(|cell| cell.borrow().get(name).cloned())
+    {
+        return cached;
+    }
+    let serialized = PROCESS_WIDE_TYPE_ALIASES.lock().ok()?.get(name).cloned();
+    let parsed = serialized.and_then(|s| syn::parse_str::<syn::Type>(&s).ok());
+    PROCESS_WIDE_ALIAS_PARSED_CACHE.with(|cell| {
+        cell.borrow_mut().insert(name.to_string(), parsed.clone());
+    });
+    parsed
+}
+
+/// Process-wide name → token-stream-serialised `syn::Type` alias
+/// registry populated by [`WalkerTypeAliasGuard::enter`] each time a
+/// per-scope alias map enters thread-local scope.  Lives for the
+/// duration of the process — once registered, the entry stays
+/// addressable until the program exits, matching
+/// `PROCESS_WIDE_STRUCT_PTRS`'s lifetime semantics.  The thread-local
+/// [`WALKER_TYPE_ALIASES`] still wins on lookup so inline-mod
+/// shadowing keeps per-scope isolation; this is the floor consulted
+/// only when the thread-local map misses.  Token-stream serialisation
+/// (vs. storing `syn::Type` directly) sidesteps the `!Send` interior
+/// `proc_macro2` cells; lookup goes through
+/// [`PROCESS_WIDE_ALIAS_PARSED_CACHE`] so the round-trip via
+/// [`syn::parse_str`] runs at most once per (thread, alias) pair.
+static PROCESS_WIDE_TYPE_ALIASES: std::sync::LazyLock<
+    std::sync::Mutex<StdHashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
+
+thread_local! {
+    /// Per-thread cache of `walker_type_alias_lookup` results for the
+    /// process-wide fallback path.  Each thread re-parses each global
+    /// alias spelling at most once; subsequent lookups read from this
+    /// `RefCell` directly.  Caches `None` for misses too — the global
+    /// table grows monotonically and a name that was missing at the
+    /// time of cache write may be registered by a later
+    /// `WalkerTypeAliasGuard::enter`, so a negative entry CAN go
+    /// stale.  In practice pyre source orders declarations before
+    /// consumers (alphabetical / dependency walks), so the negative
+    /// cache holds in the analyze path.
+    static PROCESS_WIDE_ALIAS_PARSED_CACHE: RefCell<StdHashMap<String, Option<syn::Type>>> =
+        RefCell::new(StdHashMap::new());
 }
 
 thread_local! {
@@ -8490,6 +8581,57 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         match &inner_ptr.TO {
             crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
                 assert_eq!(op.tag, "ParityProbe_AliasTarget");
+            }
+            other => panic!("inner Ptr target must be Opaque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_host_lltype_resolves_type_alias_declared_in_prior_file() {
+        // Cross-file alias visibility — pyre source files are walked
+        // sequentially and each `WalkerTypeAliasGuard::drop` clears
+        // the thread-local map.  Without [`PROCESS_WIDE_TYPE_ALIASES`]
+        // the second file's struct field declared as `field:
+        // ProbeXFileRef` could not see the first file's `type
+        // ProbeXFileRef = *mut ProbeXFileTarget;`.  Mirrors RPython's
+        // whole-program alias visibility — `flowcontext.py:847`
+        // resolves names through `func_globals` which spans the
+        // imported namespace.
+        let src_decl = "
+            pub type ProbeXFileRef = *mut ProbeXFileTarget;
+        ";
+        let src_user = "
+            pub struct ProbeXFileUser {
+                pub ptr: ProbeXFileRef,
+            }
+        ";
+        let file_decl = syn::parse_file(src_decl).expect("decl fixture parses");
+        let file_user = syn::parse_file(src_user).expect("user fixture parses");
+        // Two separate walks — drop of the first guard clears the
+        // thread-local map before the second walk runs.
+        let _ = register_rust_module(&file_decl).expect("decl walk succeeds");
+        let module_user_id = register_rust_module(&file_user).expect("user walk succeeds");
+
+        let host = lookup_host(module_user_id, "ProbeXFileUser")
+            .expect("ProbeXFileUser struct must register as HostObject");
+        let ptr = super::super::host_env::lookup_host_lltype(&host).expect(
+            "user struct must populate the lltype registry — the \
+             cross-file alias for `ProbeXFileRef` should resolve via \
+             PROCESS_WIDE_TYPE_ALIASES even after the decl file's \
+             WalkerTypeAliasGuard dropped",
+        );
+        let target = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
+            other => panic!("expected PtrTarget::Struct, got {other:?}"),
+        };
+        let ptr_field = target._flds.get("ptr").expect("`ptr` field present");
+        let inner_ptr = match ptr_field {
+            LowLevelType::Ptr(p) => p,
+            other => panic!("`ptr` must lift to Ptr(...), got {other:?}"),
+        };
+        match &inner_ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Opaque(op) => {
+                assert_eq!(op.tag, "ProbeXFileTarget");
             }
             other => panic!("inner Ptr target must be Opaque, got {other:?}"),
         }
