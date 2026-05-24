@@ -419,25 +419,11 @@ impl OptPure {
     /// (history.py:204-205): two distinct ConstInt slots with the same
     /// value are `same_box` true even though `OpRef ==` is false.
     fn lookup_pure(&self, key: &PureOpKey, ctx: &OptContext) -> Option<OpRef> {
-        let same_box = |query: OpRef, stored: OpRef| -> bool {
-            // pure.py:62 / :72-73 — both the currently looked-up op arg
-            // and the stored pure-op arg are walked through forwarding
-            // before same_box comparison.
-            let query = ctx.get_box_replacement(query);
-            let stored = ctx.get_box_replacement(stored);
-            if query == stored {
-                return true;
-            }
-            // history.py:204-205 Const.same_box → same_constant.
-            // OptContext::get_constant covers both namespaces:
-            // CONST_BIT (constant pool) and op-namespace make_constant.
-            // Identical constant values
-            // count as same_box even when their OpRef slots differ.
-            match (ctx.get_constant(query), ctx.get_constant(stored)) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            }
-        };
+        // pure.py:62 / :72-73 — `box.same_box(get_box_replacement(other))`
+        // routes through `OptContext::same_box`, which walks both sides
+        // through `get_box_replacement` and dispatches Const value equality
+        // for the `history.py:204-205 Const.same_box → same_constant` overload.
+        let same_box = |query: OpRef, stored: OpRef| -> bool { ctx.same_box(query, stored) };
         // pure.py:88-93 — `commutative` is forwarded into `lookup2`,
         // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
         let commutative = Self::is_commutative(key.opcode);
@@ -741,17 +727,11 @@ impl OptPure {
         }
         let mut j = start_index2;
         for i in start_index1..op1_args.len() {
-            let a = ctx.get_box_replacement(op1_args[i]);
-            let b = ctx.get_box_replacement(op2_args[j]);
-            if a == b {
-                j += 1;
-                continue;
-            }
-            // Const same_box semantics: matching constant values are equal
-            // even when their OpRefs differ.
-            match (ctx.get_constant(a), ctx.get_constant(b)) {
-                (Some(va), Some(vb)) if va == vb => {}
-                _ => return false,
+            // pure.py:240-247 — same_box(op1_args[i], op2_args[j])
+            // applies `get_box_replacement` to both sides, then dispatches
+            // identity vs Const value equality (`history.py:204-205`).
+            if !ctx.same_box(op1_args[i], op2_args[j]) {
+                return false;
             }
             j += 1;
         }

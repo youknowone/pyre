@@ -4650,6 +4650,33 @@ impl OptContext {
         self.get_constant(opref).is_some()
     }
 
+    /// `history.py:204-205 Const.same_box → same_constant` — value-aware
+    /// `same_box(query, stored)`. Walks both operands through
+    /// `get_box_replacement` first (`resoperation.py:58`), then compares:
+    ///   1. Identity (`OpRef ==`) — matches PyPy `AbstractValue.same_box`
+    ///      for the non-Const fast path.
+    ///   2. Value equality via `get_constant` for both sides — matches
+    ///      PyPy `Const.same_box` overload which delegates to
+    ///      `same_constant`. Two distinct ConstInt slots holding the same
+    ///      `Value::Int(42)` are `same_box == true`.
+    ///
+    /// Extracted from the previous `lookup_pure` closure + the inline body
+    /// of `_same_args` in `optimizeopt/pure.rs`. Future Phase A.3 inline-
+    /// storage work for `OpRef` will let this method shed the `&self`
+    /// parameter for Const-Const cases; until then callers route through
+    /// `OptContext` to reach the constant pool.
+    pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
+        let query = self.get_box_replacement(query);
+        let stored = self.get_box_replacement(stored);
+        if query == stored {
+            return true;
+        }
+        match (self.get_constant(query), self.get_constant(stored)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
     /// Get constant integer value, if known.
     pub fn get_constant_int(&self, opref: OpRef) -> Option<i64> {
         self.get_constant(opref).and_then(|v| match v {
