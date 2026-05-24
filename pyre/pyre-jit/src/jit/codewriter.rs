@@ -957,6 +957,61 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
+/// Path 4 endpoint shape — Variable-keyed CFG coalesce pair
+/// collection.  Same iteration + filter logic as
+/// `collect_cfg_coalesce_pairs` but returns `(VariableId, VariableId)`
+/// pairs directly without projecting through `walker_slot_for_variable`.
+///
+/// Matches `rpython/jit/codewriter/flatten.py` `_try_coalesce(v1, v2)`
+/// shape (Variables, not slots).  Consumer migration target is
+/// `perform_register_allocation_all_kinds_with_pairs` (Task #228),
+/// which already accepts Variable-keyed pairs.
+///
+/// Currently called only under `PYRE_PROBE_VARIABLE_KEYED_COALESCE`
+/// for projection-equivalence verification against the slot-keyed
+/// collector.  Production callers continue to use the slot-keyed
+/// path until `walker_slot_for_variable` retires under Path 4.
+fn collect_cfg_coalesce_pairs_variable_keyed(
+    graph: &super::flow::FunctionGraph,
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
+    for block in graph.iterblocks() {
+        let block_borrow = block.borrow();
+        for link_ref in &block_borrow.exits {
+            let link_borrow = link_ref.borrow();
+            let Some(target_ref) = link_borrow.target.clone() else {
+                continue;
+            };
+            let target_borrow = target_ref.borrow();
+            if link_borrow.args.len() != target_borrow.inputargs.len() {
+                continue;
+            }
+            for (i, arg) in link_borrow.args.iter().enumerate() {
+                let Some(src_value) = arg.as_ref() else {
+                    continue;
+                };
+                let Some(src_variable) = src_value.as_variable() else {
+                    continue;
+                };
+                let Some(dst_variable) = target_borrow.inputargs[i].as_variable() else {
+                    continue;
+                };
+                if Some(src_variable.clone()) == link_borrow.last_exception
+                    || Some(src_variable.clone()) == link_borrow.last_exc_value
+                {
+                    continue;
+                }
+                let kind = dst_variable.kind.unwrap_or(Kind::Ref);
+                if kind != Kind::Ref {
+                    continue;
+                }
+                pairs.push((src_variable.id, dst_variable.id));
+            }
+        }
+    }
+    pairs
+}
+
 /// Walker post-walk `insert_renamings` — port of
 /// `rpython/jit/codewriter/flatten.py:306-334`.
 ///
@@ -9843,6 +9898,45 @@ impl CodeWriter {
         // `*_copy` to `flatten.py:306-334`).  Both sources feed the
         // same union-find + depgraph.
         let cfg_coalesce_pairs = collect_cfg_coalesce_pairs(&graph, &walker_slot_for_variable);
+        if std::env::var("PYRE_PROBE_VARIABLE_KEYED_COALESCE").is_ok() {
+            let variable_pairs = collect_cfg_coalesce_pairs_variable_keyed(&graph);
+            let walker_slot = |id: super::flow::VariableId| -> Option<u16> {
+                walker_slot_for_variable
+                    .get(id.0 as usize)
+                    .copied()
+                    .flatten()
+            };
+            let projected: Vec<(u16, u16)> = variable_pairs
+                .iter()
+                .filter_map(|(src, dst)| {
+                    let s = walker_slot(*src)?;
+                    let d = walker_slot(*dst)?;
+                    Some((s, d))
+                })
+                .collect();
+            let mut sorted_slot = cfg_coalesce_pairs.clone();
+            sorted_slot.sort();
+            let mut sorted_projected = projected.clone();
+            sorted_projected.sort();
+            let slot_total = cfg_coalesce_pairs.len();
+            let variable_total = variable_pairs.len();
+            let projected_total = projected.len();
+            let unprojected = variable_total - projected_total;
+            let match_kind = if sorted_slot == sorted_projected {
+                "EQUIVALENT"
+            } else {
+                "DIVERGENT"
+            };
+            eprintln!(
+                "[phase4-variable-keyed-coalesce] graph={} slot_pairs={} variable_pairs={} projected_pairs={} unprojected={} match={}",
+                ssarepr.name,
+                slot_total,
+                variable_total,
+                projected_total,
+                unprojected,
+                match_kind,
+            );
+        }
         let alloc_result = super::regalloc::allocate_registers(
             &ssarepr,
             code.varnames.len(),
