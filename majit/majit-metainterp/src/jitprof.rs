@@ -219,6 +219,13 @@ impl JitProfiler {
         let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
         state.t1 = Some(Instant::now());
         state.current.clear();
+        // `current` is now empty — release the debug-only thread claim
+        // so the next push from any thread can re-acquire it.  Without
+        // this reset, a previous owner_thread set during the old
+        // session would persist and trip the cross-thread guard in
+        // `check_or_claim_owner_thread` on the next push from a
+        // different thread, even though the stack itself is empty.
+        state.owner_thread = None;
     }
 
     /// jitprof.py:95 `Profiler.start_tracing`.
@@ -523,6 +530,11 @@ impl JitProfiler {
             t0 = state.t1;
             state.t1 = Some(now);
             let Some(ev1) = state.current.pop() else {
+                // Stack was already empty on entry — no owner state to
+                // keep.  Clear the debug-only thread claim so the
+                // broken-data path does not leave dangling ownership
+                // behind for the next push.
+                state.owner_thread = None;
                 crate::debug::log_one("jit-profiler", "BROKEN PROFILER DATA!");
                 return;
             };
@@ -892,6 +904,35 @@ mod tests {
         let snap = prof_arc.snapshot();
         assert_eq!(snap.tracing, 1);
         assert_eq!(snap.backend, 1);
+    }
+
+    #[test]
+    fn start_resets_owner_thread_so_other_threads_can_push_after_a_reset() {
+        // `Profiler.start()` is the global reset entry point
+        // (`jitprof.py:55-61` clears `self.current = []`).  Pyre's
+        // debug-only `owner_thread` claim must clear alongside the
+        // stack — otherwise an in-flight session that gets reset by
+        // `start()` would leave the owner field set on an empty stack,
+        // and a fresh push from a different thread would falsely
+        // trigger `check_or_claim_owner_thread`.
+        let prof = Arc::new(JitProfiler::default());
+        prof.start();
+        // Push a frame on this thread, then reset without popping —
+        // mirrors the "abandon the in-flight session and start over"
+        // case `_setup_once` would not normally exercise but `start()`
+        // contract supports.
+        prof.start_tracing();
+        prof.start();
+        // After `start()`, a worker thread must be able to claim
+        // ownership.  In debug builds this is the meaningful coverage;
+        // in release it merely confirms the API does not regress.
+        let prof_clone = Arc::clone(&prof);
+        std::thread::spawn(move || {
+            prof_clone.start_backend();
+            prof_clone.end_backend();
+        })
+        .join()
+        .expect("worker should claim a freshly-reset stack without panic");
     }
 
     #[test]
