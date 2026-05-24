@@ -8,6 +8,8 @@ pub mod _io;
 #[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
+pub mod _collections;
+#[allow(non_snake_case)]
 pub mod _contextvars;
 #[allow(non_snake_case)]
 pub mod _ctypes;
@@ -17,6 +19,8 @@ pub mod _functools;
 pub mod _locale;
 #[allow(non_snake_case)]
 pub mod _multiprocessing;
+#[allow(non_snake_case)]
+pub mod _opcode;
 #[allow(non_snake_case)]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
