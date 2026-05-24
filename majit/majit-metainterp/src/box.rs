@@ -173,6 +173,21 @@ impl BoxPool {
         }
     }
 
+    /// Slice 8.D InputArg counterpart of `bind_ops`. Binds the head
+    /// `inputargs.len()` slots of the pool to their matching `InputArgRc`
+    /// so `BoxRef::set_forwarded_*` routes through `inputarg.forwarded`
+    /// (`resoperation.py:700 AbstractInputArg._forwarded`). Index `i`
+    /// in `inputargs` corresponds to `box_pool[i]`.
+    pub fn bind_inputargs(&self, inputargs: &[majit_ir::InputArgRc]) {
+        for (i, ia) in inputargs.iter().enumerate() {
+            if let Some(Some(boxref)) = self.inner.get(i) {
+                if boxref.is_inputarg() {
+                    boxref.bind_inputarg(ia);
+                }
+            }
+        }
+    }
+
     /// Drop trailing entries until `len() <= new_len`. Mirrors PyPy
     /// recorder savepoint rollback (`recorder.py savepoint.restore`).
     pub fn truncate(&mut self, new_len: usize) {

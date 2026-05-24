@@ -121,6 +121,7 @@ impl TreeLoop {
         let inputargs: Vec<majit_ir::InputArgRc> =
             inputargs.into_iter().map(std::rc::Rc::new).collect();
         let ops: Vec<OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        box_pool.bind_inputargs(&inputargs);
         box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
@@ -144,6 +145,7 @@ impl TreeLoop {
     ) -> Self {
         let inputargs: Vec<majit_ir::InputArgRc> =
             inputargs.into_iter().map(std::rc::Rc::new).collect();
+        box_pool.bind_inputargs(&inputargs);
         box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
             inputargs,
