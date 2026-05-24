@@ -1592,7 +1592,7 @@ pub struct RegAlloc<'a> {
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
-    operations: &'a [Op],
+    pub(crate) operations: &'a [Op],
     /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
     /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
@@ -3629,7 +3629,12 @@ impl<'a> RegAlloc<'a> {
     /// and has no `flush_cc` equivalent, so receiving `frame_reg` as
     /// the result there would clobber x29 (the frame pointer). On
     /// non-x86 architectures, fall through to a plain force-allocate.
-    fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
+    pub(crate) fn force_allocate_reg_or_cc(
+        &mut self,
+        result: OpRef,
+        ops: &[Op],
+        i: usize,
+    ) -> Loc {
         #[cfg(target_arch = "x86_64")]
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);

@@ -2797,15 +2797,13 @@ impl<'a> Assembler386<'a> {
                         match (a0, src) {
                             (Loc::Reg(a), Loc::Immed(i)) => {
                                 // regalloc.py:577 — `_consider_lea` is guarded
-                                // by `rx86.fits_in_32bits(-y.value)`, so check
-                                // the negated value directly.  `y.value =
-                                // 2147483648` is valid here because the disp32
-                                // is `-2147483648`; converting y to i32 first
-                                // would incorrectly reject that PyPy-valid case.
-                                let v = i
-                                    .value
-                                    .checked_neg()
-                                    .and_then(|negated| i32::try_from(negated).ok())
+                                // by `rx86.fits_in_32bits(-y.value)`. The
+                                // wrapping negate matches PyPy `-y.value`;
+                                // `y.value = 2147483648` is valid because
+                                // disp32 = `-2147483648`. `i32::try_from`
+                                // panics if the regalloc guard somehow let
+                                // through a non-encodable value.
+                                let v = i32::try_from(i.value.wrapping_neg())
                                     .expect(
                                         "IntSub LEA requires an immediate \
                                          encodable as signed disp32 after negation",
@@ -2916,15 +2914,15 @@ impl<'a> Assembler386<'a> {
                 self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_NE, r.value);
+                    self.flush_cc(CC_NE, result_loc);
                 }
             }
             OpCode::IntIsZero => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_E, r.value);
+                    self.flush_cc(CC_E, result_loc);
                 }
             }
             OpCode::UintMulHigh => {

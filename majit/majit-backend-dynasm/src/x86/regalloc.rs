@@ -15,7 +15,7 @@ use crate::regloc::{
     EAX, EBP, EBX, ECX, EDI, EDX, ESI, R8, R9, R10, R12, R13, R14, R15, RegLoc, XMM0, XMM1, XMM2,
     XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
 };
-use majit_ir::{OpRef, Type};
+use majit_ir::{Op, OpRef, Type};
 
 /// x86/regalloc.py X86_64_RegisterManager.all_regs — the GPR allocation
 /// pool.  Order chosen to prefer caller-save first (popped from end).
@@ -240,14 +240,13 @@ impl<'a> RegAlloc<'a> {
     ) {
         if rhs.is_constant() {
             let val = self.const_value(rhs);
-            // PyPy `rx86.fits_in_32bits(-y.value)` (regalloc.py:577) is safe
-            // because Python ints are arbitrary precision; Rust `-i64::MIN`
-            // overflows. `checked_neg` returns None for that single edge
-            // case and falls back to the normal SUB path.
-            if let Some(neg) = val.checked_neg() {
-                if fits_in_32bits(neg) {
-                    return self._consider_lea_j2(dst, lhs, rhs, i, output);
-                }
+            // x86/regalloc.py:577 `rx86.fits_in_32bits(-y.value)`. The
+            // negate-then-range-check filters `i64::MIN` naturally
+            // because `wrapping_neg(i64::MIN) == i64::MIN`, which sits
+            // outside the i32 range, so the LEA shortcut is skipped
+            // and the regular SUB path is taken.
+            if fits_in_32bits(val.wrapping_neg()) {
+                return self._consider_lea_j2(dst, lhs, rhs, i, output);
             }
         }
         self.consider_binop_j2(dst, lhs, rhs, i, output);
@@ -336,12 +335,10 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:1199 `consider_int_is_true` / `consider_int_is_zero`.
     /// `TEST src, src ; SETcc dst` — input does not need to be in a
-    /// register, and the result lives in a distinct byte-addressable
-    /// register selected by `force_allocate_reg`. PyPy uses
-    /// `force_allocate_reg_or_cc` to leave the result in the condition
-    /// code when the consumer is a GUARD/jump; pyre's emit path always
-    /// materialises a byte register via SETcc, so the plain
-    /// `force_allocate_reg` is the closest available primitive.
+    /// register, and the result is allocated via
+    /// `force_allocate_reg_or_cc` so that consumers like
+    /// `GUARD_TRUE/FALSE`/`COND_CALL` may receive the boolean via the
+    /// CPU condition flags instead of materialising it through SETcc.
     pub(crate) fn consider_int_is_true_j2(
         &mut self,
         dst: OpRef,
@@ -350,10 +347,9 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let argloc = self.loc(arg, Type::Int);
-        let resloc =
-            self.rm
-                .force_allocate_reg(dst, &[], None, false, &mut self.longevity, &mut self.fm);
-        self.perform(i, vec![argloc], Some(Loc::Reg(resloc)), output);
+        let ops_ref: &[Op] = self.operations;
+        let resloc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
+        self.perform(i, vec![argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py:591 `consider_uint_mul_high` — emits `MUL src`,
