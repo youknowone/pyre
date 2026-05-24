@@ -1088,6 +1088,28 @@ pub(crate) fn default_constvalue_for_lltype(lltype: &LowLevelType) -> Option<Con
 /// from the syn-AST stub-spec list instead of pyre's
 /// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
 /// unsafe fns by validate_signature rejection).
+///
+/// **Annotator-only carrier — never reaches the codewriter.**
+/// The stub graph carries a single default-Constant return link
+/// suitable for `RPythonAnnotator` return-type inference via
+/// `cachedgraph` (see `pyre_call_registry::prefill_default_cache`).
+/// Because `CallControl::function_graphs` is populated exclusively
+/// by safe-fn `build_flow` output (unsafe fns are rejected at
+/// `flowspace/rust_source/build_flow.rs:215`), the unsafe stub key
+/// is never present in `function_graphs`.  `CallControl::
+/// find_all_graphs` walks `function_graphs.keys()` only and resolves
+/// each call target via `target_to_path_and_graph`
+/// (`jit_codewriter/call.rs:2601`) which returns `None` for any
+/// path absent from `function_graphs` — so an unsafe-stub target
+/// triggers `continue` and is never added to `candidate_graphs`,
+/// never reaches `transform_graph_to_jitcode`, and never compiles
+/// into executable JITCode.  The actual unsafe-fn body executes
+/// through the residual-call / direct-call fnaddr lowering that
+/// the codewriter emits for the call op whose target resolves
+/// to the host-evaluator entry point.  Reviewer 2026-05-24 round
+/// item #5 audited this layering; the default-Constant return is
+/// safe by virtue of the `function_graphs` gate, not by any
+/// `look_inside_graph` policy on the stub itself.
 pub(crate) fn register_unsafe_fn_stubs(
     registry: &PyreCallRegistry,
     specs: &[(Vec<String>, Signature, LowLevelType)],
@@ -3205,6 +3227,55 @@ fn cross_block(x: i64, cond: bool) -> i64 {
                     "is_int".to_string()
                 ]))
                 .is_some()
+        );
+    }
+
+    /// Reviewer round 2026-05-24 item #5 — pin the layering invariant
+    /// that the synthetic stub-pygraph is annotator-only.  The
+    /// `register_unsafe_fn_stubs` helper writes the stub into the
+    /// `PyreCallRegistry` cache but does NOT mutate any
+    /// `CallControl::function_graphs` map; the codewriter's BFS walks
+    /// `function_graphs.keys()` and resolves each call op's target via
+    /// `target_to_path_and_graph` which requires the target to be
+    /// present in `function_graphs`.  This test mirrors the
+    /// `codewriter.rs:192-195` production call shape (registry +
+    /// `callcontrol.unsafe_fn_stubs`) and asserts the path is reachable
+    /// via the registry but not via `CallControl::function_graphs`.
+    #[test]
+    fn register_unsafe_fn_stubs_does_not_populate_callcontrol_function_graphs() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::jit_codewriter::call::CallControl;
+        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        let mut callcontrol = CallControl::new();
+        callcontrol.unsafe_fn_stubs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            LowLevelType::Bool,
+        )];
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs);
+        // Registry side: the stub is present for `cachedgraph` lookups.
+        let key = FunctionPathKey::from_segments([
+            "pyobject".to_string(),
+            "is_none".to_string(),
+        ]);
+        assert!(
+            registry.lookup(&key).is_some(),
+            "registry must carry the unsafe stub for annotator lookup"
+        );
+        // CallControl side: function_graphs is untouched, so
+        // `find_all_graphs_for_tests` (which BFS-walks
+        // `function_graphs.keys()`) cannot route to the stub.
+        let cp = crate::parse::CallPath::from_segments(["pyobject", "is_none"]);
+        assert!(
+            !callcontrol.function_graphs().contains_key(&cp),
+            "CallControl::function_graphs must NOT carry the unsafe stub path",
+        );
+        callcontrol.find_all_graphs_for_tests();
+        assert!(
+            !callcontrol.is_candidate(&cp),
+            "find_all_graphs must not pick up an unsafe-stub-only path",
         );
     }
 
