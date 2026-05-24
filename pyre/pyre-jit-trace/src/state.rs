@@ -18,7 +18,6 @@ use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::pyobject::{is_bool, is_float, is_int};
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
-use std::collections::HashMap;
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
 ///
@@ -183,7 +182,7 @@ impl MetaInterpStaticData {
     /// pyjitpl.py:2227-2243 `MetaInterpStaticData.setup_insns(self, insns)`:
     /// copy opcode numbers for the well-known bytecodes out of the
     /// assembler's `insns` dict in the same order as upstream.
-    fn setup_insns(&mut self, insns: &HashMap<String, u8>) {
+    fn setup_insns(&mut self, insns: &majit_ir::VecAssoc<String, u8>) {
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_goto = insns.get("goto/L").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
@@ -196,7 +195,7 @@ impl MetaInterpStaticData {
 
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
     /// into this staticdata object and snapshot the current `all_liveness`.
-    fn finish_setup_if_needed(&mut self, insns: &HashMap<String, u8>, all_liveness: Vec<u8>) {
+    fn finish_setup_if_needed(&mut self, insns: &majit_ir::VecAssoc<String, u8>, all_liveness: Vec<u8>) {
         let was_done = self.finish_setup_done;
         self.setup_insns(insns);
         self.liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice());
@@ -7229,7 +7228,7 @@ mod tests {
         let mut builder = majit_metainterp::JitCodeBuilder::default();
         let live_patch = builder.live_placeholder();
         builder.patch_live_offset(live_patch, 0);
-        let mut insns = std::collections::HashMap::new();
+        let mut insns = majit_ir::VecAssoc::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -9261,12 +9260,12 @@ mod finish_setup_tests {
     #[test]
     fn finish_setup_refreshes_opcode_cache_after_initial_empty_snapshot() {
         let mut sd = MetaInterpStaticData::new();
-        let empty = std::collections::HashMap::new();
+        let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
         assert_eq!(sd.op_live, u8::MAX);
         assert_eq!(sd.op_goto, u8::MAX);
 
-        let mut insns = std::collections::HashMap::new();
+        let mut insns = majit_ir::VecAssoc::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("goto/L".to_string(), 16u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
@@ -9292,7 +9291,7 @@ mod finish_setup_tests {
     #[test]
     fn blackhole_control_opcodes_reflect_finish_setup_cache() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns = majit_ir::VecAssoc::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);
@@ -9307,13 +9306,13 @@ mod finish_setup_tests {
     #[test]
     fn blackhole_control_opcodes_refresh_after_initial_empty_snapshot() {
         let mut sd = MetaInterpStaticData::new();
-        let empty = std::collections::HashMap::new();
+        let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
         METAINTERP_SD.with(|slot| {
             *slot.borrow_mut() = sd;
         });
 
-        let mut insns = std::collections::HashMap::new();
+        let mut insns = majit_ir::VecAssoc::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);

@@ -8658,14 +8658,14 @@ mod tests {
     #[test]
     fn get_list_of_active_boxes_reads_kind_specific_register_banks() {
         use majit_translate::liveness::encode_liveness;
-        use std::collections::HashMap;
+        use majit_ir::VecAssoc;
         use std::sync::Arc;
 
         let mut all_liveness = vec![1, 1, 1];
         all_liveness.extend(encode_liveness(&[2]));
         all_liveness.extend(encode_liveness(&[1]));
         all_liveness.extend(encode_liveness(&[3]));
-        let mut insns = HashMap::new();
+        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -8741,12 +8741,12 @@ mod tests {
     #[test]
     fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
         use majit_translate::liveness::encode_liveness;
-        use std::collections::HashMap;
+        use majit_ir::VecAssoc;
         use std::sync::Arc;
 
         let mut all_liveness = vec![0, 1, 0];
         all_liveness.extend(encode_liveness(&[0]));
-        let mut insns = HashMap::new();
+        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,

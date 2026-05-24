@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use majit_ir::VecAssoc;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 use vecset::VecSet;
 
@@ -48,7 +49,7 @@ pub struct Assembler {
     /// records only the actually-emitted well-known keys with their runtime
     /// opcode byte. That is sufficient for the lazy `finish_setup` cache
     /// refresh in `pyre_jit_trace::state`.
-    insns: HashMap<String, u8>,
+    insns: VecAssoc<String, u8>,
     /// `assembler.py:29` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
     /// `assembler.py:30` `self.all_liveness_length = 0`.
@@ -131,7 +132,7 @@ impl Assembler {
     }
 
     /// Snapshot of the emitted well-known `opname/argcodes` keys.
-    pub fn insns_snapshot(&self) -> HashMap<String, u8> {
+    pub fn insns_snapshot(&self) -> VecAssoc<String, u8> {
         self.insns.clone()
     }
 
@@ -401,7 +402,7 @@ impl Assembler {
             insn_key(opname, args, result)
         };
         if let Some(&opcode) = WELLKNOWN_BH_INSNS.get(key.as_str()) {
-            self.insns.entry(key).or_insert(opcode);
+            self.insns.entry_or_insert_with(key, || opcode);
         }
     }
 }
