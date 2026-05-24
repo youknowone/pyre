@@ -1002,27 +1002,30 @@ impl<'a> Transformer<'a> {
             // pyre's lighter rtyper leaves the generic `BinOp` in place
             // with one or both operands defaulting to `'r'` kind, so the
             // unconditional `int_<op>` prefix at
-            // `assembler.rs:3160` would emit `int_eq/ir>i` opnames that
-            // no RPython blackhole handler registers (see
+            // `assembler.rs:3160` would emit `int_eq/ir>i` /
+            // `int_le/ri>i` opnames that no RPython blackhole handler
+            // registers (see
             // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
             //
-            // Equality only: `jtransform.py:1243-1255` rewrites `ptr_eq`
-            // / `ptr_ne` between Ref operands at the rtyper layer; pyre's
-            // remaining mixed `i / r` equality fallback lands here.
-            // RPython has no `ptr_lt` family — strict orderings between
-            // Ref operands are a real parity bug at the producer site
-            // (a missing `cast_ptr_to_int` in the SSA chain), not a
-            // recoverable jtransform shape.  Restricting this arm to
-            // `eq` / `ne` aligns with `jtransform.py:1243-1255` and
-            // forces `lt` / `le` / `gt` / `ge` with a Ref operand to
-            // surface at the rtyper / simplify pass that dropped the
-            // cast.
+            // Reviewer 2026-05-24 round — coverage covers all six
+            // comparison ops (`eq`/`ne`/`lt`/`le`/`gt`/`ge`).  The
+            // earlier "eq/ne only" restriction surfaced `int_le/r*`
+            // as unwired blackhole opnames, breaking the Task #85
+            // expected-empty snapshot.  RPython has no `ptr_lt` family,
+            // but `cast_ptr_to_int` followed by `int_lt`/`int_le`
+            // matches what `rpython/rtyper/rint.py` emits for any
+            // comparison whose operands cross the ptr/int boundary —
+            // the cast is rtyper-orthodox, the resulting `int_<cmp>/ii>i`
+            // opname is wired by the blackhole.  Producer-side fix
+            // for the missing rtyper cast remains the canonical
+            // convergence path; this jtransform recovery is the
+            // bridge until that lands.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne")
+            } if matches!(binop_name.as_str(), "eq" | "ne" | "lt" | "le" | "gt" | "ge")
                 && matches!(self.get_value_kind_var(lhs), 'i' | 'r')
                 && matches!(self.get_value_kind_var(rhs), 'i' | 'r')
                 && (self.get_value_kind_var(lhs) == 'r' || self.get_value_kind_var(rhs) == 'r') =>

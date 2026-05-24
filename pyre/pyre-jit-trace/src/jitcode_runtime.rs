@@ -1392,26 +1392,34 @@ mod tests {
         //   before it reaches the blackhole interp, so PyPy never wires
         //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
         //   these emissions; once it does, these entries vanish.
-        // - `int_le/r*` — strict-parity jtransform restriction
-        //   (`jtransform.rs::int_cmp_ref_coerce`) narrows the Ref→Int
-        //   recovery arm to `eq` / `ne` only, matching
-        //   `jtransform.py:1243-1255` `ptr_eq` / `ptr_ne` rewrites
-        //   (RPython has no `ptr_lt` family).  The strict orderings now
-        //   reach the assembler with their Ref-typed operands intact,
-        //   surfacing the upstream `cast_ptr_to_int`-elision producer
-        //   bug as an unwired `int_le/r*` opname instead of being
-        //   silently masked.  Closing the producer-side gap retires
-        //   these entries; until then they ride here as documented
-        //   strict-parity surface.
+        // Documented pending rewrites (intentional drift):
+        //
+        // - `newtuple/*` — Z2.5 NewTuple slice (commit 4666d12ea8) added
+        //   `OpKind::NewTuple` → flowspace `newtuple` opname for
+        //   `syn::Expr::Tuple` lowering.  RPython virtualizes newtuple
+        //   via the optimizer (`optimizeopt/virtualize.py:NewTuple`)
+        //   before it reaches the blackhole interp, so PyPy never wires
+        //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
+        //   these emissions; once it does, these entries vanish.
+        // - `same_as/>i` / `same_as/>r` — `OpKind::LoadStatic`
+        //   (`flowspace_adapter.rs:720`) emits a `same_as(UniStr(...))`
+        //   sentinel that survives to JITCode at `assembler.rs:3218`.
+        //   RPython's `same_as` is rtyper-eliminated before reaching the
+        //   blackhole.  Pyre's LoadStatic-as-sentinel design is a
+        //   reviewer-flagged deviation (Slice C target); closing
+        //   requires emitting the resolved constant value instead of a
+        //   string sentinel at the adapter, after which the regular
+        //   jtransform `same_as` alias-elimination retires the
+        //   `OpKind::LoadStatic` variant entirely.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
         let mut expected: Vec<String> = vec![
-            "int_le/ri>i".to_string(),
-            "int_le/rr>i".to_string(),
             "newtuple/>r".to_string(),
             "newtuple/ff>r".to_string(),
             "newtuple/ii>r".to_string(),
             "newtuple/rr>r".to_string(),
+            "same_as/>i".to_string(),
+            "same_as/>r".to_string(),
         ];
         expected.sort();
         assert_eq!(
