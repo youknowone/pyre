@@ -3509,29 +3509,24 @@ fn collect_outer_active_boxes(
         entry_py_pc as i32,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
+    // RPython `pyjitpl.py:216-233 _get_list_of_active_boxes` reads
+    // `self.registers_X[index]` directly per liveness index — an
+    // out-of-bounds index is an IndexError, not a silent NONE.  Pyre's
+    // banks are sized to the jitcode's `num_regs_X`, which the codewriter
+    // co-publishes with the liveness side-table, so every liveness
+    // index is in range by construction.  A miss here is a tracer-side
+    // invariant violation (size mismatch) — panic loudly so the bug
+    // surfaces at the encode site instead of bleeding NONE values into
+    // `encode_snapshot_boxes` where `get_opref_type(NONE)` panics with
+    // no breadcrumb pointing at the source.
     for &idx in &banks.int {
-        active.push(
-            sym.registers_i
-                .get(idx as usize)
-                .copied()
-                .unwrap_or(OpRef::NONE),
-        );
+        active.push(sym.registers_i[idx as usize]);
     }
     for &idx in &banks.ref_ {
-        active.push(
-            sym.registers_r
-                .get(idx as usize)
-                .copied()
-                .unwrap_or(OpRef::NONE),
-        );
+        active.push(sym.registers_r[idx as usize]);
     }
     for &idx in &banks.float {
-        active.push(
-            sym.registers_f
-                .get(idx as usize)
-                .copied()
-                .unwrap_or(OpRef::NONE),
-        );
+        active.push(sym.registers_f[idx as usize]);
     }
     active
 }
