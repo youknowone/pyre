@@ -263,8 +263,34 @@ impl<'a> RegAllocator<'a> {
         if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
         }
-        let v0 = self._unionfind.find_rep(v.id);
-        let w0 = self._unionfind.find_rep(w.id);
+        self.try_coalesce_ids(v.id, w.id);
+    }
+
+    /// Variable-id-keyed `try_coalesce` for Phase 4 endgame Task #228
+    /// external-pin pre-coalesce.  Skips the kind check that
+    /// [`try_coalesce`] performs; callers must ensure both IDs name
+    /// variables of `self.kind` (the Task #228 production pin path
+    /// only generates Ref-kind pairs, matching walker's
+    /// `walker_slot_for_variable` which only tracks Ref slots).
+    ///
+    /// Calls `_depgraph.add_node` for both endpoints BEFORE the
+    /// union/coalesce: walker scratch variables that don't appear as
+    /// op operands/results in the canonical graph aren't registered
+    /// via `make_dependencies`, so they're absent from `_depgraph.all_nodes`.
+    /// `DependencyGraph::coalesce` only modifies `neighbours` (not
+    /// `all_nodes`), so `find_node_coloring`'s `getnodes` filter would
+    /// skip a coalesced surviving node that was never explicitly
+    /// added — yielding `None` for `getcolor` and dropping the chain's
+    /// inputarg from the final coloring map.
+    fn try_coalesce_ids(
+        &mut self,
+        v_id: super::flow::VariableId,
+        w_id: super::flow::VariableId,
+    ) {
+        self._depgraph.add_node(v_id);
+        self._depgraph.add_node(w_id);
+        let v0 = self._unionfind.find_rep(v_id);
+        let w0 = self._unionfind.find_rep(w_id);
         if v0 == w0 {
             return;
         }
@@ -336,6 +362,36 @@ impl<'a> RegAllocator<'a> {
 ///      representation and therefore cannot be coalesced at the CFG
 ///      level.
 pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> GraphAllocationResult {
+    perform_register_allocation_with_pairs(graph, kind, &[])
+}
+
+/// Phase 4 endgame Task #228 ADAPTATION variant: runs the same
+/// `RegAllocator` pipeline as [`perform_register_allocation`] but
+/// applies `extra_coalesce_pairs` between the upstream-orthodox
+/// `coalesce_variables` and `find_node_coloring` steps.
+///
+/// Each pair `(scratch_id, inputarg_id)` requests that
+/// `scratch_id`'s post-coloring color equal `inputarg_id`'s color.
+/// The mechanism is `try_coalesce`: the two variables are unioned in
+/// the regalloc union-find (if no interference edge blocks it), so
+/// the subsequent chordal coloring assigns them the same color.
+/// `enforce_input_args` then rotates the unified cluster onto the
+/// inputarg's `0..nlocals-1` slot.
+///
+/// Upstream RPython has no analog because PyPy's flowgraph never
+/// produces "scratch local-i" Variables disjoint from the
+/// `startblock.inputargs[i]` variable — the same Variable flows
+/// through every read/write of local i.  Pyre's walker
+/// (`codewriter.rs::transform_graph_to_jitcode`) emits fresh
+/// scratch Variables for each `LOAD_FAST` / `STORE_FAST` and pins
+/// them to slot=i via `walker_slot_for_variable`; this helper lets
+/// the canonical graph regalloc honor that same pin so the
+/// production splice (Task #229) is byte-equivalent.
+pub fn perform_register_allocation_with_pairs(
+    graph: &FlowGraph,
+    kind: Kind,
+    extra_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> GraphAllocationResult {
     // `rpython/tool/algo/regalloc.py:11-15`:
     //     regalloc = RegAllocator(graph, consider_var, ListOfKind)
     //     regalloc.make_dependencies()
@@ -344,6 +400,15 @@ pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> Grap
     let mut allocator = RegAllocator::new(graph, kind);
     allocator.make_dependencies();
     allocator.coalesce_variables();
+    // Task #228 external pins — applied AFTER the upstream
+    // `coalesce_variables` pass so they augment rather than replace
+    // the CFG link.args↔inputargs coalesce.  Pairs whose endpoints
+    // interfere in the post-CFG dependency graph are silently skipped
+    // by `try_coalesce_ids` (mirrors `regalloc.py:106-110 if
+    // self._depgraph.has_edge(v0, w0): return`).
+    for &(v_id, w_id) in extra_coalesce_pairs {
+        allocator.try_coalesce_ids(v_id, w_id);
+    }
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::new();
@@ -408,9 +473,22 @@ pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> Grap
 /// port.  This is the input shape that the canonical
 /// `flatten_graph(graph, regallocs, ...)` driver consumes.
 pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocationResult; 3] {
+    perform_register_allocation_all_kinds_with_pairs(graph, &[])
+}
+
+/// Phase 4 endgame Task #228 ADAPTATION variant: invokes the per-kind
+/// `perform_register_allocation_with_pairs` for `Kind::Ref` with
+/// `ref_coalesce_pairs`.  Int and Float kinds use the empty-pair
+/// path because walker's `walker_slot_for_variable` only tracks Ref
+/// slots (every `FrameState.mergeable()` position is Ref-kind:
+/// locals, stack, last_exc pair).
+pub fn perform_register_allocation_all_kinds_with_pairs(
+    graph: &FlowGraph,
+    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> [GraphAllocationResult; 3] {
     [
         perform_register_allocation(graph, Kind::Int),
-        perform_register_allocation(graph, Kind::Ref),
+        perform_register_allocation_with_pairs(graph, Kind::Ref, ref_coalesce_pairs),
         perform_register_allocation(graph, Kind::Float),
     ]
 }
@@ -1193,6 +1271,59 @@ mod tests {
         let result = perform_register_allocation(&graph, Kind::Int);
         assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
         assert_eq!(result.num_colors, 1);
+    }
+
+    #[test]
+    fn perform_register_allocation_with_pairs_shares_color_for_pinned_scratch() {
+        // Two non-interfering Ref variables in a single block:
+        // v0 (inputarg, dies after use) and v1 (scratch, defined later).
+        // Without pins they pick different colors via chordal coloring.
+        // With pin (v1.id, v0.id) they coalesce and share a color.
+        let v0 = flow_var(0, Kind::Ref);
+        let v1 = flow_var(1, Kind::Ref);
+        let start = Block::shared(vec![v0.into()]);
+        let mut graph = FunctionGraph::new("pin_share_color", start.clone(), None);
+        push_op(
+            &start,
+            SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
+        );
+        let next = graph.new_block(vec![v1.into()]);
+        start.closeblock(vec![
+            Link::new(vec![v1.into()], Some(next.clone()), None).into_ref(),
+        ]);
+        next.closeblock(vec![
+            Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let pin_pairs = vec![(v1.id, v0.id)];
+        let result = perform_register_allocation_with_pairs(&graph, Kind::Ref, &pin_pairs);
+        let color_v0 = result.coloring.get(&v0.id).copied();
+        let color_v1 = result.coloring.get(&v1.id).copied();
+        assert!(color_v0.is_some(), "v0 must have a color");
+        assert!(color_v1.is_some(), "v1 must have a color after pin");
+        assert_eq!(color_v0, color_v1, "pin must unify v0 and v1's colors");
+    }
+
+    #[test]
+    fn perform_register_allocation_with_pairs_handles_unknown_scratch_id() {
+        // Walker may produce scratch Variable IDs that never appear in
+        // the canonical graph (walker-only emit sites).  Pin pairs
+        // containing such IDs must not panic and must not strip the
+        // inputarg's color entry.
+        let v0 = flow_var(0, Kind::Ref);
+        let start = Block::shared(vec![v0.into()]);
+        let graph = FunctionGraph::new("pin_unknown_scratch", start.clone(), None);
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        // v_99 is not in the graph; pin (99, 0) should be benign.
+        let pin_pairs = vec![(VariableId(99), v0.id)];
+        let result = perform_register_allocation_with_pairs(&graph, Kind::Ref, &pin_pairs);
+        assert!(
+            result.coloring.get(&v0.id).is_some(),
+            "inputarg v0 must retain a color even when pinned scratch ID 99 is absent from the graph"
+        );
     }
 
     #[test]

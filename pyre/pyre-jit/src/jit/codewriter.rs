@@ -2218,6 +2218,74 @@ fn pair_walker_slot_if_absent(
     }
 }
 
+/// Phase 4 endgame Task #228 helper: derive scratch↔inputarg coalesce
+/// pairs from `walker_slot_for_variable`.
+///
+/// Walker pins every Variable it writes to a Python local-`i` register
+/// to `walker_slot=i` via [`pair_walker_slot`].  Canonical graph
+/// regalloc does not see those pins — its `RegAllocator` only knows
+/// the graph's `link.args↔target.inputargs` pairs (which all locals
+/// share the same inputarg Variable in upstream RPython, but in pyre
+/// each `LOAD_FAST`/`STORE_FAST` walker emit creates a fresh scratch
+/// Variable).  The result is canonical assigns scratch Variables to
+/// arbitrary colors `>= nlocals` while walker has them at color `i`.
+///
+/// This helper returns `(scratch_id, inputarg_id)` pairs for every
+/// non-inputarg Variable walker pinned to slot `i ∈ 0..nlocals`,
+/// matched against `graph.startblock.inputargs[i]`.  Feeding the pairs
+/// to [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
+/// pre-coalesces them in the canonical union-find so chordal coloring
+/// gives the unified cluster a single color, which
+/// `enforce_input_args` then rotates onto the `0..nlocals-1` slot —
+/// matching walker's slot-pinned color exactly.
+///
+/// PRE-EXISTING-ADAPTATION (Phase 4 endgame Task #228): the upstream
+/// `flatten_graph(graph, regallocs, cpu)` signature has no extra
+/// pre-coalesce parameter because PyPy's flowgraph never produces
+/// scratch local-`i` Variables disjoint from the
+/// `startblock.inputargs[i]` Variable — every read/write of local `i`
+/// flows through the same Variable.  Pyre's walker creates fresh
+/// scratch Variables per emit, so the canonical regalloc needs this
+/// pre-coalesce hint to converge with walker's color assignments.
+/// Retired when the walker is replaced with a graph-only emit
+/// pipeline (Phase 4 endgame Task #230+).
+fn derive_walker_pin_coalesce_pairs(
+    graph: &super::flow::FunctionGraph,
+    walker_slot_for_variable: &[Option<u16>],
+    nlocals: usize,
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let inputargs = graph.startblock.borrow().inputargs.clone();
+    let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
+    for (var_id_usize, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
+        let Some(slot) = maybe_slot else { continue };
+        let slot_idx = *slot as usize;
+        if slot_idx >= nlocals {
+            // Stack slot — no inputarg counterpart; walker's chordal
+            // coloring assigns it freely.  Out of scope for this
+            // helper; stack-color alignment is a separate epic.
+            continue;
+        }
+        let Some(inputarg_value) = inputargs.get(slot_idx) else {
+            continue;
+        };
+        let Some(inputarg_var) = inputarg_value.as_variable() else {
+            continue;
+        };
+        let scratch_id = super::flow::VariableId(var_id_usize as u32);
+        if inputarg_var.id == scratch_id {
+            // The inputarg itself was paired to its own slot — no
+            // coalesce needed (it's already at the right color via
+            // `enforce_input_args`).
+            continue;
+        }
+        if inputarg_var.kind != Some(Kind::Ref) {
+            continue;
+        }
+        pairs.push((scratch_id, inputarg_var.id));
+    }
+    pairs
+}
+
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py:1898-1906 do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
@@ -9000,19 +9068,13 @@ impl CodeWriter {
         // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
         // emit-then-strip approach converges to the same byte stream.
         //
-        // Compute graph regallocs ONCE pre-drain so walker
-        // insert_renamings and any downstream consumer share identical
-        // colors (HashMap iteration non-determinism between two
-        // separate regalloc calls would otherwise diverge bridge-
-        // fallback Variables' colors).
-        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds(&graph);
-        super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Seed `walker_slot_for_variable` with block inputarg slots
-        // BEFORE `walker_post_walk_insert_renamings` reads
-        // it.  The same pairing pass also runs downstream (idempotent
-        // via `pair_walker_slot_if_absent`), but the post-walk
-        // `insert_renamings` color resolution needs the bridge entries
-        // present at the moment the helper runs.
+        // BEFORE graph regalloc + `walker_post_walk_insert_renamings`
+        // read it.  The same pairing pass also runs downstream
+        // (idempotent via `pair_walker_slot_if_absent`), but Task #228
+        // `derive_walker_pin_coalesce_pairs` needs the full pin map
+        // to project scratch↔inputarg pre-coalesce pairs onto the
+        // canonical graph regalloc below.
         for spam in &all_walker_blocks {
             let Some(state) = spam.framestate() else {
                 continue;
@@ -9029,6 +9091,30 @@ impl CodeWriter {
                 }
             }
         }
+        // Compute graph regallocs ONCE pre-drain so walker
+        // insert_renamings and any downstream consumer share identical
+        // colors (HashMap iteration non-determinism between two
+        // separate regalloc calls would otherwise diverge bridge-
+        // fallback Variables' colors).
+        //
+        // Task #228 ADAPTATION: thread walker pin pairs into canonical
+        // Ref regalloc via `perform_register_allocation_all_kinds_with_pairs`.
+        // Each pair `(scratch_var, inputarg_var)` requests that the
+        // chordal coloring assign them the same color so
+        // `enforce_input_args`'s rotation lands the scratch on its
+        // semantic local-i slot — matching walker's
+        // `walker_slot_for_variable` pinning regime exactly.
+        let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
+            &graph,
+            &walker_slot_for_variable,
+            code.varnames.len(),
+        );
+        let mut graph_regallocs =
+            super::regalloc::perform_register_allocation_all_kinds_with_pairs(
+                &graph,
+                &walker_pin_pairs,
+            );
+        super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
