@@ -113,21 +113,83 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
     lower_fun_decl(llbc, fd)
 }
 
+/// Step 4.6 multi-LLBC variant — merge functions and metadata from a
+/// slice of LLBCs into one `SemanticProgram`.  When `pyre-jit-trace`
+/// parses pyre-object + pyre-interpreter together, the cutover needs
+/// each crate's `.ullbc` so cross-crate calls in the merged
+/// SemanticProgram resolve.  Per-LLBC duplicates (a function defined
+/// in both, e.g. via dependency closure) keep the first occurrence —
+/// matches the AST builder's first-wins semantics under repeated
+/// `parsed_files` entries.
+pub fn build_semantic_program_from_llbcs(
+    llbcs: &[Llbc],
+) -> Result<crate::front::ast::SemanticProgram, LowerError> {
+    let mut merged: Option<crate::front::ast::SemanticProgram> = None;
+    let mut seen_function_names = std::collections::HashSet::new();
+    let mut seen_struct_names = std::collections::HashSet::new();
+    let mut seen_trait_names = std::collections::HashSet::new();
+    for llbc in llbcs {
+        let prog = build_semantic_program_from_llbc(llbc)?;
+        match &mut merged {
+            None => {
+                for f in &prog.functions {
+                    seen_function_names.insert(f.name.clone());
+                }
+                for n in &prog.known_struct_names {
+                    seen_struct_names.insert(n.clone());
+                }
+                for n in &prog.known_trait_names {
+                    seen_trait_names.insert(n.clone());
+                }
+                merged = Some(prog);
+            }
+            Some(acc) => {
+                for f in prog.functions {
+                    if seen_function_names.insert(f.name.clone()) {
+                        acc.functions.push(f);
+                    }
+                }
+                for n in prog.known_struct_names {
+                    if seen_struct_names.insert(n.clone()) {
+                        acc.known_struct_names.insert(n);
+                    }
+                }
+                for n in prog.known_trait_names {
+                    if seen_trait_names.insert(n.clone()) {
+                        acc.known_trait_names.insert(n);
+                    }
+                }
+                for (key, fields) in prog.struct_fields.fields {
+                    acc.struct_fields.fields.entry(key).or_insert(fields);
+                }
+            }
+        }
+    }
+    Ok(merged.unwrap_or_else(|| crate::front::ast::SemanticProgram {
+        functions: Vec::new(),
+        known_struct_names: std::collections::HashSet::new(),
+        known_trait_names: std::collections::HashSet::new(),
+        struct_fields: crate::front::ast::StructFieldRegistry::default(),
+        fn_return_types: std::collections::HashMap::new(),
+        immutable_fields: std::collections::HashMap::new(),
+    }))
+}
+
 /// Build a [`SemanticProgram`] by lowering every local function
 /// declaration in `llbc`.
 ///
 /// This is the MIR-driven analog of
 /// [`crate::front::ast::build_semantic_program_from_parsed_files`]
-/// and the entry point Step 4 will eventually swap into the
-/// production pipeline at `lib.rs:391`.
+/// and the entry point Step 4 swaps into the production pipeline at
+/// `lib.rs:134`.
 ///
-/// **Scope of this Step 4.1 slice**: only the `functions` field is
-/// populated. Whole-program metadata (`known_struct_names`,
-/// `known_trait_names`, `struct_fields`, `fn_return_types`,
-/// `immutable_fields`) is left at its default empty value because
-/// deriving it requires widening
-/// [`majit_charon_reader::schema::Translated`] to surface
-/// `type_decls` / `trait_decls`; that is tracked as Step 4.3.
+/// **Whole-program metadata** (`known_struct_names`,
+/// `known_trait_names`, `struct_fields`) is populated from
+/// `type_decls` / `trait_decls` (Step 4.3.b). `fn_return_types` and
+/// `immutable_fields` remain empty until Step 4.3.c.ext widens the
+/// dedup table; the cutover at `lib.rs::build_semantic_program_via_active_frontend`
+/// fills these in via a syn-AST merge pass over the same
+/// parsed_files (Step 4.5.c).
 ///
 /// Functions whose body Charon could not extract (extraction error,
 /// opaque body, `null` entry) are skipped silently — the production

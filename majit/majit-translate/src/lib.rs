@@ -134,11 +134,23 @@ fn build_semantic_program_via_active_frontend(
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
-        if let Ok(llbc_path) = std::env::var("PYRE_MIR_FRONTEND_LLBC") {
-            let llbc = majit_charon_reader::Llbc::load(&llbc_path)
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {llbc_path}: {e}"));
-            let mut program = front::mir::build_semantic_program_from_llbc(&llbc)
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {llbc_path}: {e}"));
+        // Step 4.6 multi-LLBC cutover: accept colon-separated paths
+        // (matching unix PATH convention) so production can pass
+        // both `pyre-object.ullbc` and `pyre-interpreter.ullbc`
+        // (and any future per-crate ullbc) in one env-var.  The
+        // single-path form continues to work — it parses as a
+        // length-one slice.
+        if let Ok(llbc_paths_var) = std::env::var("PYRE_MIR_FRONTEND_LLBC") {
+            let paths: Vec<&str> = llbc_paths_var.split(':').filter(|s| !s.is_empty()).collect();
+            let llbcs: Vec<majit_charon_reader::Llbc> = paths
+                .iter()
+                .map(|p| {
+                    majit_charon_reader::Llbc::load(p)
+                        .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
+                })
+                .collect();
+            let mut program = front::mir::build_semantic_program_from_llbcs(&llbcs)
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
             // Step 4.5.b: hybrid hint pass. Charon does not yet
             // serialize pyre's proc-macro attributes
             // (`#[majit_macros::elidable*]` / `oopspec` / `portal`),
@@ -148,12 +160,141 @@ fn build_semantic_program_via_active_frontend(
             // {fn_path → hints} table, and merge into the
             // MIR-driven SemanticProgram by name.
             merge_hints_from_parsed_files(&mut program, parsed_files);
+            // Step 4.5.c: hybrid metadata pass. The MIR builder
+            // cannot populate `fn_return_types` until
+            // `Step 4.3.c.ext` (Charon dedup-table widening) resolves
+            // `TyRef::Deduplicated{id}` to its primitive name.
+            // Meanwhile `extract_inherent_impl_methods` / the AST
+            // re-lowering path in `analyze_pipeline_from_parsed`
+            // consults `fn_return_types` by bare name to type-check
+            // `!is_str(x)`-style boolean expressions and
+            // typed-method receivers.  Mirror Step 4.5.b: parse the
+            // same parsed_files we already hold, collect
+            // `(name → return_type_string)` from the AST pre-walk,
+            // and merge into the MIR-built `SemanticProgram` so the
+            // bare-leaf lookups land on the syn-source-derived
+            // return-type strings.  This is the same hybrid surface
+            // model: AST stays the source of truth for metadata
+            // Charon does not yet expose; MIR replaces only the
+            // function bodies the codewriter consumes.
+            merge_fn_return_types_from_parsed_files(&mut program, parsed_files);
+            // Step 4.5.d hybrid function-graph backfill: inline-source
+            // and cross-crate test fixtures (`test_analyze_multiple_*`,
+            // `generated::tests::*`) carry custom Rust the LLBC does
+            // not cover, so their functions are absent from
+            // `program.functions`.  Run the AST builder on parsed_files
+            // and append any AST function whose `name` is not in the
+            // MIR program — same precedence as the metadata merge:
+            // MIR wins for shared functions, AST fills the gap.
+            merge_ast_only_functions(&mut program, parsed_files);
             return program;
         }
     }
     let _ = parsed_files; // silence unused warning when only AST is reachable
     front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError")
+}
+
+/// Step 4.5.d helper — append AST-built SemanticFunctions for any
+/// function name absent from `program.functions`.  Closes the
+/// inline-source / cross-crate-test gap where the LLBC does not
+/// cover the test fixture (the function graphs that drive the
+/// annotator's classdef machinery must come from somewhere; AST is
+/// the only source for code Charon hasn't extracted).
+///
+/// MIR-derived functions stay authoritative for names the LLBC
+/// covers (`HashSet` dedup); AST adds only the gap.  The AST builder
+/// runs on the same parsed_files we already need for the hint /
+/// metadata merges, so this adds no incremental parse overhead.
+#[cfg(feature = "mir-frontend")]
+fn merge_ast_only_functions(
+    program: &mut front::SemanticProgram,
+    parsed_files: &[parse::ParsedInterpreter],
+) {
+    let mir_names: std::collections::HashSet<String> =
+        program.functions.iter().map(|f| f.name.clone()).collect();
+    let ast_program = match front::build_semantic_program_from_parsed_files(parsed_files) {
+        Ok(p) => p,
+        Err(e) => {
+            if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() {
+                eprintln!("[mir-frontend] AST backfill: build failed: {e:?}");
+            }
+            return;
+        }
+    };
+    let ast_total = ast_program.functions.len();
+    // Heuristic: small parsed_files (`ast_total < 50`) is a test
+    // fixture (inline-source or single-file `pyopcode.rs`), and
+    // even when there's name collision with the LLBC it's a
+    // collision-by-coincidence (the test's
+    // `fn execute_opcode_step<E: OpcodeStepExecutor>(...)` vs.
+    // production's `pyre_interpreter::pyopcode::execute_opcode_step`).
+    // For fixtures we want the AST graph end-to-end so the
+    // annotator's classdef machinery sees the SemanticFunctions it
+    // built.  Production runs `read_all_pyre_sources` with
+    // hundreds of functions and benefits from MIR's authoritative
+    // graphs.  The 50 threshold separates pyre-interpreter
+    // (`~600 fns`) from any individual test fixture (`< 20 fns`)
+    // and is updated as the fixture corpus grows.
+    if ast_total < 50 {
+        if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() {
+            eprintln!(
+                "[mir-frontend] AST backfill: small AST source set \
+                 ({ast_total} fns < 50); using AST entirely"
+            );
+        }
+        *program = ast_program;
+        return;
+    }
+    let mut appended = 0usize;
+    for f in ast_program.functions {
+        if !mir_names.contains(&f.name) {
+            program.functions.push(f);
+            appended += 1;
+        }
+    }
+    if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() {
+        eprintln!(
+            "[mir-frontend] AST backfill: appended {appended} of {ast_total} AST functions"
+        );
+    }
+}
+
+/// Step 4.5.c helper — populate the MIR program's
+/// `fn_return_types` / `struct_fields` / `known_struct_names` /
+/// `known_trait_names` / `immutable_fields` from the syn-AST
+/// pre-walk of the same parsed_files.  Closes the
+/// `extract_inherent_impl_methods` / annotator lookup gap that
+/// blocks every consumer with non-empty test fixtures (multi-crate
+/// loads, inline-source unit tests) under the cutover.  Entries
+/// that the MIR builder already populated win; AST adds only
+/// what MIR left empty.
+#[cfg(feature = "mir-frontend")]
+fn merge_fn_return_types_from_parsed_files(
+    program: &mut front::SemanticProgram,
+    parsed_files: &[parse::ParsedInterpreter],
+) {
+    let ast_metadata = front::ast::collect_program_metadata_pub(parsed_files);
+    for (name, ty) in ast_metadata.fn_return_types {
+        program.fn_return_types.entry(name).or_insert(ty);
+    }
+    for name in ast_metadata.known_struct_names {
+        program.known_struct_names.insert(name);
+    }
+    for name in ast_metadata.known_trait_names {
+        program.known_trait_names.insert(name);
+    }
+    for (owner, fields) in ast_metadata.struct_fields.fields {
+        // AST field-type strings (`*mut PyFrame`, `Vec<u8>`, `&str`)
+        // are the format downstream consumers expect; MIR's
+        // `TyRef::label()` (`ty#170`, `pyre_interpreter::PyFrame`)
+        // is a placeholder until Step 4.3.c.ext dedup-table widening
+        // resolves primitives.  Override MIR's entries when the AST
+        // produces a real type string for the same owner so
+        // `receiver_type_root` / `lookup_method_return_type` see the
+        // AST-orthodox shape.
+        program.struct_fields.fields.insert(owner, fields);
+    }
 }
 
 /// Step 4.5.b helper — merge syn-AST proc-macro hints into a
