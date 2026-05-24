@@ -5089,7 +5089,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.clone(),
+                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -5726,7 +5726,11 @@ impl<M: Clone> MetaInterp<M> {
         // type side data here: bridge Phase E.2b renamed_inputargs may live in
         // a shifted `[bridge_inputarg_base..)` namespace, exactly like
         // RPython's fresh InputArg object identities.
-        let root_inputargs: Vec<InputArg> = partial.inputargs.clone();
+        let root_inputargs: Vec<InputArg> = partial
+            .inputargs
+            .iter()
+            .map(InputArg::fresh_value_copy)
+            .collect();
         let (inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
@@ -5919,7 +5923,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.clone(),
+                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                         ops: combined_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -6287,8 +6291,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs: Vec<InputArg> =
-            trace.inputargs_cloned();
+        let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
         // the optimizer may unbox Int-typed locals. Read the first guard's
@@ -6388,8 +6391,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArg> =
-                    trace.inputargs_cloned();
+                let trace_inputargs_view: Vec<InputArg> = trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -6650,8 +6652,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         // compile.py:233 `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs: Vec<InputArg> =
-            trace.inputargs_cloned();
+        let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
@@ -6749,8 +6750,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArg> =
-                    trace.inputargs_cloned();
+                let trace_inputargs_view: Vec<InputArg> = trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -8771,7 +8771,10 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: bridge_inputargs.to_vec(),
+                        inputargs: bridge_inputargs
+                            .iter()
+                            .map(InputArg::fresh_value_copy)
+                            .collect(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,
@@ -9018,8 +9021,14 @@ impl<M: Clone> MetaInterp<M> {
             .filter(|op| op.opcode == OpCode::Jump)
             .map(|op| op.getarglist().to_vec())
             .unwrap_or_default();
-        let bridge_trace_data =
-            TreeLoop::with_snapshots(bridge_inputargs.to_vec(), bridge_ops.to_vec(), Vec::new());
+        let bridge_trace_data = TreeLoop::with_snapshots(
+            bridge_inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            bridge_ops.to_vec(),
+            Vec::new(),
+        );
         let bridge_resumestorage = pending_bridge_rd
             .as_ref()
             .map(|pending| pending.storage.as_ref());
@@ -9405,7 +9414,10 @@ impl<M: Clone> MetaInterp<M> {
                     compiled.traces.insert(
                         bridge_trace_id,
                         CompiledTrace {
-                            inputargs: bridge_inputargs.to_vec(),
+                            inputargs: bridge_inputargs
+                                .iter()
+                                .map(InputArg::fresh_value_copy)
+                                .collect(),
                             ops: optimized_ops,
                             constants: compiled_constants_typed,
                             exit_layouts,
@@ -18227,7 +18239,7 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.clone(),
+                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops,
                 constants,
                 exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
@@ -18799,7 +18811,7 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.to_vec(),
+                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops,
                 constants: constants_typed,
                 exit_layouts,

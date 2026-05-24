@@ -110,7 +110,6 @@ pub enum SnapshotTagged {
     Const(i64, majit_ir::Type),
 }
 
-#[derive(Clone)]
 pub struct Trace {
     /// Recorded operations.
     ops: Vec<Op>,

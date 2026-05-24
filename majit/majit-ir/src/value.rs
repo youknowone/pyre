@@ -252,12 +252,22 @@ pub struct InputArg {
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 }
 
-impl Clone for InputArg {
-    /// Cloning produces a fresh-identity `InputArg`. The `_forwarded`
-    /// slot (`resoperation.py:700 AbstractInputArg._forwarded`) is
-    /// per-instance mutable state tied to that identity. Preserve
-    /// identity-shared forwarding via `Rc::clone` on `InputArgRc`.
-    fn clone(&self) -> Self {
+impl InputArg {
+    /// Produce a fresh-identity `InputArg` from this one. The
+    /// `_forwarded` slot (`resoperation.py:700
+    /// AbstractInputArg._forwarded`) is per-instance mutable state tied
+    /// to that identity and resets to `Forwarded::None` for the new
+    /// object, mirroring RPython where every `InputArgInt(pos) /
+    /// InputArgFloat(pos) / InputArgRef(pos)` instantiation yields a
+    /// fresh Python object with `_forwarded = None`.
+    ///
+    /// `InputArg` deliberately is **not** `Clone`. Identity-shared
+    /// cloning (preserving the `_forwarded` slot) must go through
+    /// [`InputArgRc`](crate::value::InputArgRc) (`Rc::clone`); call this
+    /// helper only at boundaries where a value-typed `InputArg` is
+    /// intentionally being detached from its origin (e.g. backend input
+    /// list materialization).
+    pub fn fresh_value_copy(&self) -> Self {
         InputArg {
             tp: self.tp,
             index: self.index,

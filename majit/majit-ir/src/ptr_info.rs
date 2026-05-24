@@ -1311,8 +1311,7 @@ impl PtrInfo {
         let mut result = Vec::new();
         let field_descrs = self.all_fielddescrs_from_descr();
         let push_for = |result: &mut Vec<Op>, field_idx: u32, missing_msg: &str| {
-            let descr =
-                lookup_field_descr(&field_descrs, field_idx).expect(missing_msg);
+            let descr = lookup_field_descr(&field_descrs, field_idx).expect(missing_msg);
             let tp = descr
                 .as_field_descr()
                 .map(|fd| fd.field_type())

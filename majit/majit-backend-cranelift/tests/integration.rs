@@ -22,7 +22,10 @@ use majit_metainterp::recorder::Trace;
 /// identity; backend boundaries that don't traffic in `_forwarded` accept
 /// the deref-and-clone projection.
 fn inputargs_view(t: &TreeLoop) -> Vec<InputArg> {
-    t.inputargs.iter().map(|rc| (**rc).clone()).collect()
+    t.inputargs
+        .iter()
+        .map(|rc| (**rc).fresh_value_copy())
+        .collect()
 }
 
 fn magic_numbers(m: i64) -> (u64, u32) {

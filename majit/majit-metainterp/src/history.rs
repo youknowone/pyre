@@ -81,7 +81,10 @@ impl TreeLoop {
     }
 
     pub fn inputargs_cloned(&self) -> Vec<InputArg> {
-        self.inputargs.iter().map(|rc| (**rc).clone()).collect()
+        self.inputargs
+            .iter()
+            .map(|rc| (**rc).fresh_value_copy())
+            .collect()
     }
 
     /// Create a new trace from input arguments and operations.
@@ -825,7 +828,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let loop_trace = TreeLoop::new(
-            inputargs.clone(),
+            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             vec![
                 Op::new(
                     OpCode::IntAdd,

@@ -2816,7 +2816,11 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![Op::new(majit_ir::OpCode::Finish, &[])];
-        info.add_version(10, inputargs.clone(), ops.clone());
+        info.add_version(
+            10,
+            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops.clone(),
+        );
         assert_eq!(info.versions.len(), 1);
         assert_eq!(info.versions[0].0, 10);
 

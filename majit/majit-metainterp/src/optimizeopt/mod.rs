@@ -929,7 +929,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // reads this via `BoxEnv::get_type` so the wrong answer would
         // mis-tag liveboxes for those variants.
         let resolved_box = self.ctx.get_box_replacement_box(opref);
-        if let Some(info) = resolved_box.as_ref().and_then(|b| self.ctx.peek_ptr_info(b)) {
+        if let Some(info) = resolved_box
+            .as_ref()
+            .and_then(|b| self.ctx.peek_ptr_info(b))
+        {
             return match info {
                 crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
