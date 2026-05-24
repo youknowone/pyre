@@ -138,15 +138,24 @@ pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::ast::SemanticProgram, LowerError> {
     let mut functions = Vec::new();
+    let mut fn_return_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for fd in llbc.iter_local_fns() {
         if fd.unstructured().is_none() {
             continue;
         }
         let graph = lower_fun_decl(llbc, fd)?;
+        let name = fd.item_meta.name_path();
+        // Step 4.3.a: surface return types as TyRef labels. This is
+        // not yet the fully-qualified type string the AST driver
+        // emits, but it gives downstream consumers a stable key per
+        // function; future widenings will resolve the TyRef into an
+        // ADT path via Charon's `type_decls` table.
+        fn_return_types.insert(name.clone(), fd.signature.output.label());
         functions.push(crate::front::ast::SemanticFunction {
-            name: fd.item_meta.name_path(),
+            name,
             graph,
-            return_type: None,
+            return_type: Some(fd.signature.output.label()),
             self_ty_root: None,
             module_path: String::new(),
             hints: Vec::new(),
@@ -158,7 +167,7 @@ pub fn build_semantic_program_from_llbc(
         known_struct_names: std::collections::HashSet::new(),
         known_trait_names: std::collections::HashSet::new(),
         struct_fields: crate::front::ast::StructFieldRegistry::default(),
-        fn_return_types: std::collections::HashMap::new(),
+        fn_return_types,
         immutable_fields: std::collections::HashMap::new(),
     })
 }

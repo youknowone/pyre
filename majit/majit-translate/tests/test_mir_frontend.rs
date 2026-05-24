@@ -166,9 +166,17 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     ] {
         assert!(names.contains(required), "missing {required}");
     }
-    // Step 4.3 deliverable: these should NOT be empty after
-    // type_decls derivation lands. Pin them at empty for now so the
-    // first non-empty population triggers a test-update event.
+    // Step 4.3.a populates fn_return_types with TyRef labels (not
+    // yet fully-qualified strings). Step 4.3.b will widen reader to
+    // resolve type_decls and replace these labels with ADT paths.
+    assert_eq!(program.fn_return_types.len(), program.functions.len());
+    assert!(
+        program
+            .fn_return_types
+            .get("charon_spike_corpus::straight_line_add")
+            .is_some()
+    );
+    // Pin these at empty until Step 4.3.b lands.
     assert!(program.known_struct_names.is_empty());
-    assert!(program.fn_return_types.is_empty());
+    assert!(program.known_trait_names.is_empty());
 }
