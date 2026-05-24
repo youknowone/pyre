@@ -1057,6 +1057,30 @@ mod tests {
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
     }
 
+    /// CodeRabbit mod.rs:2204 scenario: `ensure_box` materializes an
+    /// unbound ResOp placeholder; subsequent code writes Info / IntBound
+    /// / PtrInfo onto it through `BoxRef::set_forwarded_*` (which lands
+    /// in `Box.forwarded` for unbound boxes). When the producer is
+    /// emitted and `bind_op` runs, the pre-emit state must reach
+    /// `op.forwarded` so reads routed through the bound op see it.
+    #[test]
+    fn bind_op_carries_pre_emit_forwarded_to_new_op() {
+        use crate::resoperation::{Op, OpCode};
+        let placeholder = BoxRef::new_resop(Type::Int, 5);
+        placeholder.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(13)));
+
+        let producer = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+        placeholder.bind_op(&producer);
+
+        // The pre-emit Info forwarding is reachable on the bound op.
+        match &*producer.forwarded.borrow() {
+            Forwarded::Info(_) => {}
+            other => panic!("bind_op dropped the pre-emit forwarding: {other:?}"),
+        }
+        // And via the BoxRef accessor too.
+        assert!(matches!(placeholder.get_forwarded(), Forwarded::Info(_)));
+    }
+
     /// `bind_inputarg` panics on a non-InputArg box (same contract as
     /// `bind_op`'s ResOp-only check).
     #[test]
