@@ -121,20 +121,17 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
     // the shadow allow-list is intentionally empty for this phase.
     // `MAJIT_SHADOW_WALKER=1` therefore does not enable any Nop-family
     // exceptions; the env flag remains plumbed for future expansion
-    // (M4 LoadFast / arithmetic / branch ops, gated on the Int-bank
-    // concrete shadow work below) but is presently inert.
+    // (M4 LoadFast / arithmetic / branch ops, Phase B per-opcode
+    // allow-list expansion) but is presently inert.
+    //
+    // The Int-bank concrete shadow plumbing prerequisite landed: see
+    // `WalkContext::concrete_registers_i` at
+    // `jitcode_dispatch.rs:360`.  Re-enabling per-opcode allow-list
+    // entries is now a per-opcode investigation (decode the arm bytes,
+    // confirm walker handlers cover every embedded opname, run shadow
+    // diff under `MAJIT_SHADOW_WALKER=1`), not a structural blocker.
     let _ = instruction;
     false
-    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
-    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
-    // codewriter-emitted LoadFastCheck arm body contains a
-    // `goto_if_not/iL` whose value lives in the Int register bank;
-    // walker `dispatch_goto_if_not` falls into the strict-mode
-    // fail-loud path because `concrete_registers_i` doesn't exist.
-    // Blocker is the Int-bank concrete shadow plumbing — see
-    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
-    // for the Int-bank shadow" section.  Allow-list expansion past
-    // PopTop into LoadFast/arithmetic/branch ops is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it

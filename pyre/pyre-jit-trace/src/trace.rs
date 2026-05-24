@@ -72,10 +72,7 @@ pub fn trace_bytecode(
             .iter()
             .enumerate()
             .map(|(i, &tp)| {
-                majit_metainterp::GreenBox::new(
-                    majit_ir::OpRef::input_arg_typed(i as u32, tp),
-                    tp,
-                )
+                majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
             })
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
