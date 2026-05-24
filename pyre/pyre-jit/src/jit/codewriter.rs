@@ -9116,14 +9116,21 @@ impl CodeWriter {
             &walker_slot_for_variable,
             entry_arg_slots(code),
         );
-        let cfg_variable_pairs_for_canonical = collect_cfg_coalesce_pairs(&graph);
+        // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
+        // `flatten.py:154 insert_renamings` mutates the graph.
+        // Collect once here so both the canonical (above) and
+        // SSARepr-side (below at `allocate_registers`) consumers
+        // share the same pre-renaming pair set, matching upstream
+        // sequence and avoiding sensitivity to any
+        // `walker_post_walk_insert_renamings` graph mutation.
+        let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
         let canonical_ref_coalesce_pairs: Vec<(
             super::flow::VariableId,
             super::flow::VariableId,
         )> = walker_pin_pairs
             .iter()
             .copied()
-            .chain(cfg_variable_pairs_for_canonical.iter().copied())
+            .chain(cfg_variable_pairs.iter().copied())
             .collect();
         let mut graph_regallocs =
             super::regalloc::perform_register_allocation_all_kinds_with_pairs(
@@ -9835,13 +9842,14 @@ impl CodeWriter {
         // coalesce, pyre walker NEW-DEVIATION because upstream defers
         // `*_copy` to `flatten.py:306-334`).  Both sources feed the
         // same union-find + depgraph.
-        let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        //
         // SSARepr-side regalloc is u16-keyed PRE-EXISTING-ADAPTATION;
-        // project Variable pairs through walker_slot_for_variable at
-        // the consumer.  Pairs whose endpoints have no walker slot
+        // project the Variable pairs (already collected pre-renaming
+        // above as `cfg_variable_pairs`) through `walker_slot_for_variable`
+        // at the consumer.  Pairs whose endpoints have no walker slot
         // pinning are silently dropped here — the canonical
-        // graph-side regalloc (Task #228 with_pairs entry) consumes
-        // the un-projected Variable pairs directly.
+        // graph-side regalloc (Task #228 with_pairs entry) already
+        // consumed the un-projected Variable pairs above.
         let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
             .iter()
             .filter_map(|(src, dst)| {
