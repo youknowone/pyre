@@ -15,11 +15,14 @@ pub mod _posixshmem;
 pub mod _signal;
 #[allow(non_snake_case)]
 pub mod _socket;
+#[allow(non_snake_case)]
+pub mod _struct;
 pub mod _sre;
 pub mod _weakref;
 pub mod atexit;
 pub mod faulthandler;
 pub mod fcntl;
+pub mod gc;
 pub mod grp;
 pub mod math;
 pub mod mmap;
@@ -31,3 +34,4 @@ pub mod sys;
 pub mod syslog;
 pub mod termios;
 pub mod time;
+pub mod unicodedata;
