@@ -4276,6 +4276,9 @@ fn init_socket(ns: &mut DictStorage) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("dup() missing argument"));
                     }
+                    if !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error("dup: fd must be an integer"));
+                    }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let n = unsafe { libc::dup(fd) };
                     if n < 0 {
@@ -4387,34 +4390,37 @@ fn pack_inet_addr(
     // out before touching tuple[1], which only the AF_INET/AF_INET6
     // forms guarantee.
     if family == libc::AF_UNIX {
-        let path_obj = if unsafe { pyre_object::is_str(addr) } {
-            addr
-        } else if unsafe { pyre_object::is_tuple(addr) } {
+        let path_obj = if unsafe { pyre_object::is_tuple(addr) } {
             unsafe { pyre_object::w_tuple_getitem(addr, 0) }
                 .ok_or_else(|| crate::PyError::value_error("address: missing path"))?
         } else {
-            return Err(crate::PyError::type_error(
-                "AF_UNIX address must be a string path",
-            ));
+            addr
         };
-        if !unsafe { pyre_object::is_str(path_obj) } {
-            return Err(crate::PyError::type_error(
-                "AF_UNIX address must be a string path",
-            ));
-        }
-        let path = unsafe { pyre_object::w_str_get_value(path_obj).to_string() };
+        let path_bytes_vec: Vec<u8> = unsafe {
+            if pyre_object::is_str(path_obj) {
+                pyre_object::w_str_get_value(path_obj)
+                    .to_string()
+                    .into_bytes()
+            } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
+                pyre_object::bytesobject::bytes_like_data(path_obj).to_vec()
+            } else {
+                return Err(crate::PyError::type_error(
+                    "AF_UNIX address must be a string or bytes path",
+                ));
+            }
+        };
         let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
         sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let path_bytes = path.as_bytes();
-        if path_bytes.len() >= sun.sun_path.len() {
+        if path_bytes_vec.len() >= sun.sun_path.len() {
             return Err(crate::PyError::os_error("AF_UNIX path too long"));
         }
-        for (i, &b) in path_bytes.iter().enumerate() {
+        for (i, &b) in path_bytes_vec.iter().enumerate() {
             sun.sun_path[i] = b as libc::c_char;
         }
         return Ok((
             storage,
-            (core::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t,
+            (core::mem::size_of::<libc::sa_family_t>() + path_bytes_vec.len() + 1)
+                as libc::socklen_t,
         ));
     }
 
@@ -4439,7 +4445,16 @@ fn pack_inet_addr(
         }
         pyre_object::w_str_get_value(host_obj).to_string()
     };
-    let port = (unsafe { pyre_object::w_int_get_value(port_obj) } as u16).to_be();
+    if !unsafe { pyre_object::is_int(port_obj) } {
+        return Err(crate::PyError::type_error(
+            "address port must be an integer",
+        ));
+    }
+    let port_raw = unsafe { pyre_object::w_int_get_value(port_obj) };
+    if !(0..=0xFFFF).contains(&port_raw) {
+        return Err(crate::PyError::overflow_error("port must be 0-65535"));
+    }
+    let port = (port_raw as u16).to_be();
 
     let c_host = std::ffi::CString::new(host.as_bytes())
         .map_err(|_| crate::PyError::value_error("embedded null in host"))?;
@@ -4589,6 +4604,13 @@ fn init_socket_type(ns: &mut DictStorage) {
             } else {
                 args
             };
+            for (idx, label) in [(0, "family"), (1, "type"), (2, "proto")] {
+                if after_cls.len() > idx && !unsafe { pyre_object::is_int(after_cls[idx]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "socket: {label} must be an integer"
+                    )));
+                }
+            }
             let family = if after_cls.is_empty() {
                 libc::AF_INET
             } else {
@@ -4617,6 +4639,11 @@ fn init_socket_type(ns: &mut DictStorage) {
                     }
                     fd
                 } else {
+                    if !unsafe { pyre_object::is_int(after_cls[3]) } {
+                        return Err(crate::PyError::type_error(
+                            "socket: fileno must be an integer or None",
+                        ));
+                    }
                     unsafe { pyre_object::w_int_get_value(after_cls[3]) as libc::c_int }
                 };
             Ok(socket_from_fd(fileno, family, ty, proto))
@@ -4892,10 +4919,20 @@ fn init_socket_type(ns: &mut DictStorage) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("recv() missing size"));
             }
+            if !unsafe { pyre_object::is_int(args[1]) } {
+                return Err(crate::PyError::type_error("recv: size must be an integer"));
+            }
+            let raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            if raw < 0 {
+                return Err(crate::PyError::value_error("negative buffersize in recv"));
+            }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
+            let n = raw as usize;
             let flags = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error("recv: flags must be an integer"));
+                }
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
@@ -4967,10 +5004,26 @@ fn init_socket_type(ns: &mut DictStorage) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("recvfrom() missing size"));
             }
+            if !unsafe { pyre_object::is_int(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "recvfrom: size must be an integer",
+                ));
+            }
+            let raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+            if raw < 0 {
+                return Err(crate::PyError::value_error(
+                    "negative buffersize in recvfrom",
+                ));
+            }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
+            let n = raw as usize;
             let flags = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvfrom: flags must be an integer",
+                    ));
+                }
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
