@@ -5111,18 +5111,9 @@ impl TraceCtx {
     pub fn add_merge_point(
         &mut self,
         key: u64,
-        live_args: Vec<OpRef>,
-        live_arg_types: Vec<Type>,
+        green_boxes: Vec<crate::trace_ctx::GreenBox>,
         header_pc: usize,
     ) {
-        debug_assert_eq!(
-            live_args.len(),
-            live_arg_types.len(),
-            "add_merge_point: live_args/live_arg_types length mismatch \
-             (key={key:#x}, header_pc={header_pc}, args={}, types={})",
-            live_args.len(),
-            live_arg_types.len(),
-        );
         // Use the TraceCtx-level position so `snapshot_data_len` reflects
         // the current Vec<Snapshot> side table length (Task #70 moved
         // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
@@ -5132,11 +5123,7 @@ impl TraceCtx {
         self.current_merge_points.push(MergePoint {
             green_key: key,
             position,
-            green_boxes: live_args
-                .into_iter()
-                .zip(live_arg_types.into_iter())
-                .map(|(opref, ty)| crate::trace_ctx::GreenBox::new(opref, ty))
-                .collect(),
+            green_boxes,
             header_pc,
         });
     }

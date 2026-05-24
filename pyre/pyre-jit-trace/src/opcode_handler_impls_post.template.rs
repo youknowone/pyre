@@ -24,19 +24,18 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
             let live_args =
                 crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));
-            let live_types = {
-                live_args
-                    .iter()
-                    .map(|opref| {
-                        ctx.get_opref_type(*opref).unwrap_or_else(|| {
-                            panic!(
-                                "live_arg {opref:?} has no type in OptContext; \
-                                 RPython Box always carries its type"
-                            )
-                        })
-                    })
-                    .collect()
-            };
+            let live_green_boxes: Vec<majit_metainterp::GreenBox> = live_args
+                .iter()
+                .map(|opref| {
+                    let ty = ctx.get_opref_type(*opref).unwrap_or_else(|| {
+                        panic!(
+                            "live_arg {opref:?} has no type in OptContext; \
+                             RPython Box always carries its type"
+                        )
+                    });
+                    majit_metainterp::GreenBox::new(*opref, ty)
+                })
+                .collect();
 
             // pyjitpl.py:2978-2983 compile_trace attempt.
             {
@@ -77,7 +76,7 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             // structural red-bank invariant under the same jitdriver.
             if !ctx.has_merge_point_with_shape_assert(back_edge_key, live_args.len()) {
                 // pyjitpl.py:3034-3036 first visit, register & continue
-                ctx.add_merge_point(back_edge_key, live_args, live_types, target);
+                ctx.add_merge_point(back_edge_key, live_green_boxes, target);
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][reached_loop_header] first visit, unroll: key={} pc={}",

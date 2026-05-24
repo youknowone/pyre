@@ -98,6 +98,7 @@ pub use pyjitpl::{
     trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
+pub use trace_ctx::GreenBox;
 pub use trace_ctx::MergePoint;
 pub use trace_ctx::TraceCtx;
 

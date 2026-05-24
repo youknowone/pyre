@@ -68,12 +68,17 @@ pub fn trace_bytecode(
         // RPython Box identity (variant-aware Eq) rather than collapsing
         // through an Untyped position (history.py:182 `box.type`).
         let input_types = ctx.inputarg_types();
-        let input_args: Vec<majit_ir::OpRef> = input_types
+        let input_args: Vec<majit_metainterp::GreenBox> = input_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| majit_ir::OpRef::input_arg_typed(i as u32, tp))
+            .map(|(i, &tp)| {
+                majit_metainterp::GreenBox::new(
+                    majit_ir::OpRef::input_arg_typed(i as u32, tp),
+                    tp,
+                )
+            })
             .collect();
-        ctx.add_merge_point(start_key, input_args, input_types, start_pc);
+        ctx.add_merge_point(start_key, input_args, start_pc);
     }
 
     let action = metainterp.interpret(ctx);
