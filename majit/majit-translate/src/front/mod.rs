@@ -25,6 +25,7 @@
 //!
 
 pub mod ast;
+pub mod mir;
 pub mod raise;
 
 pub use ast::{

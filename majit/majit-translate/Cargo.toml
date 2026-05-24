@@ -58,6 +58,14 @@ vecset = { workspace = true }
 # the lowering as an explicit pushdown automaton.
 stacker = { workspace = true }
 
+# Charon ULLBC reader — issue #97 Step 3 MIR-driven flowspace driver.
+# Pulled in as a regular dep (not gated): the driver lives under
+# `front/mir.rs` and is callable from production paths, but is not yet
+# wired into the AST front-end's call sites. Step 4 will introduce a
+# feature flag for cutover. Stable Rust; adds only serde + serde_json
+# to the dep graph, both already workspace-shared.
+majit-charon-reader = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 walkdir = { workspace = true }
