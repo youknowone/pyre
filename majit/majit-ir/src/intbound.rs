@@ -250,10 +250,11 @@ impl IntBound {
         }
     }
 
-    /// intutils.py: _are_knownbits_implied — check if known bits are
-    /// fully implied by the lower/upper bounds (no separate guard needed).
+    /// intutils.py:243-247 `_are_knownbits_implied` — true when the stored
+    /// known-bits tnum equals the tnum implied by the lower/upper bounds.
     pub fn are_knownbits_implied(&self) -> bool {
-        self.tmask == u64::MAX && self.tvalue == 0
+        let (implied_tvalue, implied_tmask) = self._tnum_implied_by_bounds();
+        self.tvalue == implied_tvalue && self.tmask == implied_tmask
     }
 
     /// Whether this abstract integer is unbounded.
@@ -701,23 +702,18 @@ impl IntBound {
     pub fn py_div_bound(&self, other: &IntBound) -> IntBound {
         // We need 0 not in other's interval; also check that other doesn't straddle 0
         if !other.contains(0) && !(other.lower < 0 && 0 < other.upper) {
-            let v1 = Some(py_div(self.upper, other.upper));
-            let v2 = Some(py_div(self.upper, other.lower));
-            let v3 = Some(py_div(self.lower, other.upper));
-            let v4 = Some(py_div(self.lower, other.lower));
-            // check for MININT / -1 overflow via checked_mul proxy
-            // Actually py_div can't overflow except for MININT / -1, let's check explicitly
+            // py_div uses unchecked `/` and `%`, which panic on i64::MIN / -1.
+            // Guard before evaluating the corners so we hit the fallback safely.
             if other.contains(-1) && (self.lower == i64::MIN || self.upper == i64::MIN) {
                 return IntBound::unbounded();
             }
-            match (v1, v2, v3, v4) {
-                (Some(a), Some(b), Some(c), Some(d)) => {
-                    let lower = a.min(b).min(c).min(d);
-                    let upper = a.max(b).max(c).max(d);
-                    IntBound::bounded(lower, upper)
-                }
-                _ => IntBound::unbounded(),
-            }
+            let a = py_div(self.upper, other.upper);
+            let b = py_div(self.upper, other.lower);
+            let c = py_div(self.lower, other.upper);
+            let d = py_div(self.lower, other.lower);
+            let lower = a.min(b).min(c).min(d);
+            let upper = a.max(b).max(c).max(d);
+            IntBound::bounded(lower, upper)
         } else {
             IntBound::unbounded()
         }
