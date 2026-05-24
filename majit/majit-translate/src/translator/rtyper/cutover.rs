@@ -3256,10 +3256,7 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         let registry = PyreCallRegistry::new(bk);
         register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs);
         // Registry side: the stub is present for `cachedgraph` lookups.
-        let key = FunctionPathKey::from_segments([
-            "pyobject".to_string(),
-            "is_none".to_string(),
-        ]);
+        let key = FunctionPathKey::from_segments(["pyobject".to_string(), "is_none".to_string()]);
         assert!(
             registry.lookup(&key).is_some(),
             "registry must carry the unsafe stub for annotator lookup"

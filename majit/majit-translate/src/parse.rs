@@ -1259,11 +1259,7 @@ pub fn extract_opcode_dispatch_arms(
     let Some(opcode_match) = find_opcode_match(func) else {
         return Vec::new();
     };
-    reject_duplicate_opcode_selectors(extract_match_arms(
-        opcode_match,
-        &func.sig,
-        fn_return_types,
-    ))
+    reject_duplicate_opcode_selectors(extract_match_arms(opcode_match, &func.sig, fn_return_types))
 }
 
 /// Extract receiver -> trait bounds for `execute_opcode_step`.

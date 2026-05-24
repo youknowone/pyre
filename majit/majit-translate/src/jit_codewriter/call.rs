@@ -3202,12 +3202,37 @@ impl CallControl {
                     // `FunctionDesc` (host object id) and methods
                     // through the receiver's `ClassDesc`, never
                     // crossing the two namespaces.
+                    //
+                    // **Cross-module disambiguation gate** — the
+                    // candidate must carry the caller-supplied
+                    // `segments` as a SUFFIX of its own segments.
+                    // Bare callsites (`segments = [name]`) match every
+                    // free-fn whose leaf is `name`; module-qualified
+                    // callsites (`segments = [caller_module, name]`)
+                    // only match candidates whose tail is
+                    // `[caller_module, name]`.  This stops a bare
+                    // callsite in `runtime_ops.rs` (resolving to
+                    // `["runtime_ops", "X"]`) from collapsing onto a
+                    // cross-module `["call", "X"]` registration when
+                    // both modules define a same-leaf free fn with
+                    // different signatures.  Mirrors PyPy
+                    // `bookkeeper.getdesc(callable)`'s per-function-
+                    // object identity (`annrpython.py:103-150 build_types`)
+                    // which never crosses the module boundary on a
+                    // syntactically-qualified callsite.
+                    let target_segs: &[String] = &segments[..];
+                    let candidate_carries_target_as_suffix = |k: &CallPath| -> bool {
+                        let cs = &k.segments;
+                        cs.len() >= target_segs.len()
+                            && cs[cs.len() - target_segs.len()..] == *target_segs
+                    };
                     let matches: Vec<&CallPath> = self
                         .function_graphs
                         .iter()
                         .filter(|(k, g)| {
                             g.owner_root.is_none()
                                 && k.segments.last().map(|s| s == leaf).unwrap_or(false)
+                                && candidate_carries_target_as_suffix(k)
                         })
                         .map(|(k, _)| k)
                         .collect();

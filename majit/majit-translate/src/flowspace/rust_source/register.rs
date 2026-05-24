@@ -962,6 +962,19 @@ fn register_items_into_namespace<'a>(
                 };
                 let nested_name = nested_item_mod.ident.to_string();
                 let nested_namespace = HostObject::new_class(&nested_name, vec![]);
+                // Push the nested mod ident onto the walker prefix so
+                // `build_host_class_from_struct` keys inner structs
+                // under the qualified path, mirroring PyPy nested
+                // module scoping (`classdesc.py:672` per-class identity).
+                let nested_prefix = {
+                    let parent = walker_module_prefix();
+                    if parent.is_empty() {
+                        nested_name.clone()
+                    } else {
+                        format!("{parent}::{nested_name}")
+                    }
+                };
+                let _walker_prefix_guard = WalkerModulePrefixGuard::enter(nested_prefix);
                 register_items_into_namespace(
                     &nested_namespace,
                     nested_inner_items,
@@ -969,6 +982,7 @@ fn register_items_into_namespace<'a>(
                     source_filename,
                     source_text,
                 )?;
+                drop(_walker_prefix_guard);
                 mirror_set(&nested_name, ConstValue::HostObject(nested_namespace));
             }
             // Slice O22 + O24 + O25: admit `impl Trait for Foo`
@@ -3120,6 +3134,7 @@ fn eval_binop(
 /// table.
 fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
     let name = item_struct.ident.to_string();
+    let qualified_key = qualify_under_walker_prefix(&name);
     // Z2.5 Path A — project the declared named fields into the
     // REGISTERED_STRUCT_FIELD_ATTRS side-table so
     // `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs`
@@ -3127,6 +3142,12 @@ fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
     // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) but data-
     // driven by the parsed struct declaration instead of a hard-coded
     // table.
+    //
+    // Keyed under the current walker-scope module prefix (see
+    // [`walker_module_prefix`]) so two structs with the same bare
+    // ident declared in different inline mods occupy distinct registry
+    // slots, mirroring PyPy `ClassDesc` per-class identity
+    // (`classdesc.py:672`).
     if let syn::Fields::Named(named) = &item_struct.fields {
         let mut stubs: Vec<(String, crate::model::ValueType)> = Vec::new();
         for field in &named.named {
@@ -3138,7 +3159,7 @@ fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
             stubs.push((field_name, ty));
         }
         if !stubs.is_empty() {
-            register_struct_field_attrs(&name, stubs);
+            register_struct_field_attrs(&qualified_key, stubs);
         }
     }
     let host = HostObject::new_class(&name, vec![]);
@@ -3297,6 +3318,63 @@ fn walker_struct_ptr_lookup(name: &str) -> Option<StructType> {
 /// program exits, matching `HOST_CLASS_MINTS`'s lifetime semantics.
 static PROCESS_WIDE_STRUCT_PTRS: std::sync::LazyLock<std::sync::Mutex<StdHashMap<String, Ptr>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
+
+thread_local! {
+    /// Per-walker-scope module-path prefix consulted by
+    /// [`build_host_class_from_struct`] when keying
+    /// [`REGISTERED_STRUCT_FIELD_ATTRS`] and minting the
+    /// `HostObject::Class` qualname.  Empty at top-level walks;
+    /// inline-mod arms in [`register_items_into_namespace`] push the
+    /// nested-mod ident so a `mod foo { struct Bar { ... } }` declared
+    /// inside a parent file keys its field-attr stub under `"foo::Bar"`
+    /// instead of the bare `"Bar"`.  Mirrors PyPy `ClassDesc` identity
+    /// (`classdesc.py:672`) which is per-class object — two structs
+    /// with the same bare ident in different module scopes occupy
+    /// distinct registry slots.
+    static WALKER_MODULE_PREFIX: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// RAII guard that swaps the walker's thread-local module-prefix on
+/// construction and restores the prior value on drop.  Symmetric to
+/// [`WalkerTypeAliasGuard`] / [`WalkerStructPtrsGuard`]; nested guards
+/// compose by saving the prior outer scope and reverting to it.
+struct WalkerModulePrefixGuard {
+    prev: String,
+}
+
+impl WalkerModulePrefixGuard {
+    fn enter(prefix: String) -> Self {
+        let prev =
+            WALKER_MODULE_PREFIX.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), prefix));
+        WalkerModulePrefixGuard { prev }
+    }
+}
+
+impl Drop for WalkerModulePrefixGuard {
+    fn drop(&mut self) {
+        WALKER_MODULE_PREFIX.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.prev);
+        });
+    }
+}
+
+/// Snapshot the current walker scope's module-prefix.  Empty when no
+/// [`WalkerModulePrefixGuard`] is active.
+fn walker_module_prefix() -> String {
+    WALKER_MODULE_PREFIX.with(|cell| cell.borrow().clone())
+}
+
+/// Compose the field-attrs registry key for `bare_name` under the
+/// current walker prefix.  Empty prefix yields the bare name; non-
+/// empty yields `"{prefix}::{bare_name}"`.
+fn qualify_under_walker_prefix(bare_name: &str) -> String {
+    let prefix = walker_module_prefix();
+    if prefix.is_empty() {
+        bare_name.to_string()
+    } else {
+        format!("{prefix}::{bare_name}")
+    }
+}
 
 /// Pre-collect `Item::Type T = U;` definitions from a flat list of
 /// items into a `StdHashMap<String, syn::Type>`. Skips items with
@@ -3645,20 +3723,11 @@ fn register_struct_field_attrs(struct_name: &str, fields: Vec<(String, crate::mo
 /// named fields, which the producer skips — so an empty map
 /// indicates a producer bug, not a normal state.
 ///
-/// Lookup order:
-///
-/// 1. Literal `struct_name` match against the registered keys.
-/// 2. **Bare-leaf fallback** — if `struct_name` carries a `::`
-///    separator and the literal lookup missed, retry against the
-///    segment after the final `::`.  `register_rust_module` walks
-///    each file independently and stores field stubs under the bare
-///    `ItemStruct.ident` (no module prefix is threaded into the
-///    walker), so callers that derived their key from a
-///    module-qualified `owner_root` (e.g. trait-impl methods whose
-///    `parse.rs::collect_trait_impls_from_items` qualifies the self
-///    type through `qualify_type_name_with_imports`) would otherwise
-///    miss the registration.  The bare leaf is the canonical bridge
-///    until producer-side prefix threading lands.
+/// Key contract: the registry is keyed under the walker-scope
+/// qualified path (`{walker_module_prefix}::{ItemStruct.ident}` when
+/// the prefix is non-empty, else the bare ident).  Callers must look
+/// up under the exact same shape — no bare-leaf fallback, mirroring
+/// PyPy `ClassDesc` per-class identity (`classdesc.py:672`).
 ///
 /// Consumed by `crate::annotator::classdesc::ClassDesc::_init_classdef`
 /// after the static `FORCE_ATTRIBUTES_INTO_CLASSES` block.
@@ -3666,16 +3735,7 @@ pub fn struct_field_attrs_snapshot(
     struct_name: &str,
 ) -> Option<indexmap::IndexMap<String, crate::model::ValueType>> {
     let table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
-    if let Some(hit) = table.get(struct_name) {
-        return Some(hit.clone());
-    }
-    if let Some(idx) = struct_name.rfind("::") {
-        let bare = &struct_name[idx + "::".len()..];
-        if let Some(hit) = table.get(bare) {
-            return Some(hit.clone());
-        }
-    }
-    None
+    table.get(struct_name).cloned()
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the
@@ -4131,10 +4191,7 @@ fn eval_literal_init_to_const_value(
             syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Float(f),
                 ..
-            }) => f
-                .base10_parse::<f64>()
-                .ok()
-                .map(|v| ConstValue::float(-v)),
+            }) => f.base10_parse::<f64>().ok().map(|v| ConstValue::float(-v)),
             _ => None,
         },
         // `thread_local! { static X: T = const { LIT }; }` — the
@@ -4526,40 +4583,58 @@ mod tests {
         assert!(!snap.contains_key("a"), "first walk's `a` must be evicted");
     }
 
-    /// Bare-leaf fallback: a registered bare `Foo` must resolve a
-    /// lookup that carries a module-qualified `mod::Foo` key.
-    /// Producer registers under the bare `ItemStruct.ident`; the
-    /// trait-impl path in `parse.rs::collect_trait_impls_from_items`
-    /// derives the consumer's `owner_root` via
-    /// `qualify_type_name_with_imports`, which prepends the module
-    /// prefix.  The snapshot helper bridges by stripping to the leaf
-    /// after the final `::`.
+    /// Qualified-key contract: a struct walked under a non-empty
+    /// `WalkerModulePrefixGuard` keys its field-attr stub under
+    /// `"{prefix}::{ident}"`.  Bare lookup misses (no fallback);
+    /// only the exact qualified key resolves.  Mirrors PyPy
+    /// `ClassDesc` per-class identity (`classdesc.py:672`).
     #[test]
-    fn struct_field_attrs_snapshot_bare_leaf_fallback_for_qualified_key() {
+    fn struct_field_attrs_snapshot_qualified_key_no_bare_fallback() {
         let item: ItemStruct =
-            syn::parse_str("struct PyreFieldStubBareLeafProbe { count: i64, name: String }")
+            syn::parse_str("struct PyreFieldStubQualifiedProbe { count: i64, name: String }")
                 .expect("fixture parses");
-        let _ = build_host_class_from_struct(&item);
-        // Sanity: bare lookup hits.
+        {
+            let _guard = WalkerModulePrefixGuard::enter("mymod".to_string());
+            let _ = build_host_class_from_struct(&item);
+        }
+        // Bare lookup must miss — fallback was removed.
         assert!(
-            struct_field_attrs_snapshot("PyreFieldStubBareLeafProbe").is_some(),
-            "bare-name lookup must hit the registered entry"
+            struct_field_attrs_snapshot("PyreFieldStubQualifiedProbe").is_none(),
+            "bare lookup must not resolve a qualified registration"
         );
-        // Qualified lookup falls back to the bare leaf.
-        let snap = struct_field_attrs_snapshot("mymod::PyreFieldStubBareLeafProbe")
-            .expect("qualified lookup must fall back to the bare leaf");
+        // Exact qualified lookup hits.
+        let snap = struct_field_attrs_snapshot("mymod::PyreFieldStubQualifiedProbe")
+            .expect("qualified lookup matches the registered key");
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get("count"), Some(&crate::model::ValueType::Int));
         assert_eq!(snap.get("name"), Some(&crate::model::ValueType::Ref));
-        // Multi-segment qualified lookup also falls back.
-        let snap_nested = struct_field_attrs_snapshot("outer::inner::PyreFieldStubBareLeafProbe")
-            .expect("multi-segment qualified lookup must fall back to the bare leaf");
-        assert_eq!(snap_nested.len(), 2);
-        // Unknown qualified key remains a miss.
+    }
+
+    /// Nested-mod prefix composition: a struct inside `mod outer { mod
+    /// inner { struct Foo { ... } } }` keys under
+    /// `"outer::inner::Foo"`.  Verifies that
+    /// `register_items_into_namespace`'s nested-mod arm pushes the mod
+    /// ident onto the walker prefix.
+    #[test]
+    fn struct_field_attrs_snapshot_nested_mod_qualified_key() {
+        let item: ItemStruct = syn::parse_str("struct PyreFieldStubNestedProbe { value: bool }")
+            .expect("fixture parses");
+        {
+            let _outer = WalkerModulePrefixGuard::enter("outer".to_string());
+            let _inner = WalkerModulePrefixGuard::enter("outer::inner".to_string());
+            let _ = build_host_class_from_struct(&item);
+        }
         assert!(
-            struct_field_attrs_snapshot("mymod::PyreFieldStubBareLeafProbeAbsent").is_none(),
-            "absent struct must not resolve via the fallback"
+            struct_field_attrs_snapshot("PyreFieldStubNestedProbe").is_none(),
+            "bare lookup must miss"
         );
+        assert!(
+            struct_field_attrs_snapshot("outer::PyreFieldStubNestedProbe").is_none(),
+            "single-segment lookup must miss when registered with two segments"
+        );
+        let snap = struct_field_attrs_snapshot("outer::inner::PyreFieldStubNestedProbe")
+            .expect("nested-mod prefix must compose into the registry key");
+        assert_eq!(snap.get("value"), Some(&crate::model::ValueType::Bool));
     }
 
     /// Tuple structs and unit structs have no named fields, so the
