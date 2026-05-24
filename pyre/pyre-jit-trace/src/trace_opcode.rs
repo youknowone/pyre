@@ -6763,7 +6763,21 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                if production_walker_handles(&instruction) {
+                // Inline-frame gate (Issue #73 Phase 4 PopTop activation):
+                // `walker_capture_snapshot_for_last_guard` only captures a
+                // single Python frame (the outer pyjitcode coordinates,
+                // jitcode_dispatch.rs:3568) because pyre's blackhole cannot
+                // resume into helper/sub jitcodes.  For inline-traced sub
+                // frames (`self.parent_frames` non-empty), the snapshot
+                // must carry the full framestack chain to make the resume
+                // point well-defined; walker dispatch in that context drops
+                // the parent frames, so deopt would re-enter at the wrong
+                // PyFrame.  Until the walker grows multi-frame snapshot
+                // capture (analogous to `capture_snapshot_for_last_guard_
+                // multi_frame_with_vable_vref`), fall back to trait
+                // dispatch in inline frames.
+                let in_inline_frame = !self.parent_frames.is_empty();
+                if production_walker_handles(&instruction) && !in_inline_frame {
                     self.dispatch_via_walker_for_opcode(&instruction)
                 } else {
                     let shadow_outcome =
@@ -7299,19 +7313,24 @@ impl MIFrame {
             }
             Some(Err(e)) => Err(e),
             None => {
-                if production_walker_handles(&instruction) {
-                    self.dispatch_via_walker_for_opcode(&instruction)
-                } else {
-                    let shadow_outcome =
-                        crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
-                    let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
-                    if result.is_ok() {
-                        if let Some(outcome) = shadow_outcome {
-                            crate::shadow_walker::shadow_validate_post(self, outcome);
-                        }
+                // Inline-frame gate: `trace_code_step_inline` always
+                // steps in an inline-traced sub frame, so
+                // `walker_capture_snapshot_for_last_guard`'s single-frame
+                // capture would drop the parent chain (see comment in
+                // `trace_code_step` for full rationale).  Walker dispatch
+                // remains disabled here until multi-frame walker
+                // snapshots land; route every opcode through trait
+                // dispatch so the snapshot encoder sees a fully formed
+                // framestack at every guard.
+                let shadow_outcome =
+                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                if result.is_ok() {
+                    if let Some(outcome) = shadow_outcome {
+                        crate::shadow_walker::shadow_validate_post(self, outcome);
                     }
-                    result
                 }
+                result
             }
         };
         if needs_pre_opcode_snapshot {
