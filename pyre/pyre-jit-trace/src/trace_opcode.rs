@@ -2295,34 +2295,34 @@ impl MIFrame {
     /// All guards within this opcode will use orgpc as their resume PC.
     pub(crate) fn set_orgpc(&mut self, pc: usize) {
         self.orgpc = pc;
-        // Pyre-only shadow refresh.  RPython's metainterp owns every opcode
-        // boundary so `metainterp.virtualizable_boxes` stays in lockstep with
-        // heap automatically.  Pyre splits dispatch between the walker (which
-        // mirrors via `vable_setfield → synchronize_virtualizable`) and
-        // `execute_opcode_step` (which mutates the heap PyFrame directly via
-        // `PyFrame::push` / `PyFrame::pop` etc.), so the shadow can lag the
-        // heap between opcodes.  Pull the heap values into the shadow at the
-        // opcode boundary so any walker arm body that reads `getfield_vable_*`
-        // or that triggers `synchronize_virtualizable` sees the up-to-date
-        // values rather than a seed-time stale copy.  When dispatch unification
-        // retires `execute_opcode_step`, this call becomes a no-op and can be
-        // removed.
-        //
-        // Inline-frame guard: when `self.parent_frames` is non-empty we are
-        // running `trace_code_step_inline` on a callee MIFrame.  The shared
-        // `TraceCtx.virtualizable_boxes` shadow still belongs to the portal
-        // (caller) frame; refreshing it from heap mid-inline would overwrite
-        // any caller-side updates that the walker pushed into the shadow
-        // before the inline call but has not yet written back to heap, and a
-        // guard raised in the callee would then capture stale caller state
-        // for `materialize_parent_snapshot_state` /
-        // `get_list_of_active_boxes`.  Skip the refresh for inline frames —
-        // the caller's last opcode boundary already ran the refresh from its
-        // own `set_orgpc` call.
-        if self.parent_frames.is_empty() {
-            self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
-        }
         self.publish_last_instr_to_vable(pc);
+    }
+
+    /// Pyre-only shadow refresh hook.  RPython's metainterp owns every opcode
+    /// boundary so `metainterp.virtualizable_boxes` stays in lockstep with
+    /// heap automatically.  Pyre splits dispatch between the walker (which
+    /// mirrors via `vable_setfield → synchronize_virtualizable`) and
+    /// `execute_opcode_step` (which mutates the heap PyFrame directly via
+    /// `PyFrame::push` / `PyFrame::pop` etc.), so the shadow can lag the
+    /// heap between opcodes.  Pull the heap values into the shadow before
+    /// entering walker dispatch so the arm body's `getfield_vable_*` reads
+    /// and any `synchronize_virtualizable` write-back see up-to-date values.
+    ///
+    /// Inline-frame guard: when `self.parent_frames` is non-empty we are
+    /// running `trace_code_step_inline` on a callee MIFrame.  The shared
+    /// `TraceCtx.virtualizable_boxes` shadow still belongs to the portal
+    /// (caller) frame; refreshing it from heap mid-inline would overwrite
+    /// any caller-side updates that the walker pushed into the shadow
+    /// before the inline call but has not yet written back to heap.
+    ///
+    /// When dispatch unification retires `execute_opcode_step`, this hook
+    /// becomes a no-op (every mutation already lands in shadow) and can
+    /// be removed.
+    fn refresh_vable_shadow_before_walker(&mut self) {
+        if !self.parent_frames.is_empty() {
+            return;
+        }
+        self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
     }
 
     /// pyopcode.py:170-172 `dispatch_bytecode` parity (Slice 3a, Task #115):
@@ -6778,6 +6778,7 @@ impl MIFrame {
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
                 if production_walker_handles(&instruction) && !in_inline_frame {
+                    self.refresh_vable_shadow_before_walker();
                     self.dispatch_via_walker_for_opcode(&instruction)
                 } else {
                     let shadow_outcome =
