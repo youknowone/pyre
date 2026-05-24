@@ -788,6 +788,100 @@ fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64
     tally
 }
 
+/// color-budget Step A probe helper: per-Register color-budget violation
+/// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
+/// Role distinguishes argument operand vs result register vs nested
+/// `ListOfKind` element so downstream analysis can correlate the
+/// violation with the canonical emit site responsible.
+type Phase4ColorBudgetViolation = (usize, String, &'static str, &'static str, u16, u16);
+
+fn phase4_check_register_budget(
+    insn_idx: usize,
+    opname: &str,
+    role: &'static str,
+    reg: &super::flatten::Register,
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+    out: &mut Vec<Phase4ColorBudgetViolation>,
+) {
+    let (kind_str, num_colors) = match reg.kind {
+        super::flatten::Kind::Int => ("int", num_int),
+        super::flatten::Kind::Ref => ("ref", num_ref),
+        super::flatten::Kind::Float => ("float", num_float),
+    };
+    if reg.index >= num_colors {
+        out.push((
+            insn_idx,
+            opname.to_string(),
+            role,
+            kind_str,
+            reg.index,
+            num_colors,
+        ));
+    }
+}
+
+fn phase4_check_operand_budget(
+    insn_idx: usize,
+    opname: &str,
+    role: &'static str,
+    op: &super::flatten::Operand,
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+    out: &mut Vec<Phase4ColorBudgetViolation>,
+) {
+    match op {
+        super::flatten::Operand::Register(reg) => {
+            phase4_check_register_budget(
+                insn_idx, opname, role, reg, num_int, num_ref, num_float, out,
+            );
+        }
+        super::flatten::Operand::ListOfKind(list) => {
+            for item in &list.content {
+                phase4_check_operand_budget(
+                    insn_idx, opname, "list", item, num_int, num_ref, num_float, out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// color-budget Step A probe: scan canonical SSARepr `Insn::Op` Register
+/// operands + result registers + nested `ListOfKind` elements for any
+/// `index >= num_colors[kind]`.  Mirrors the assembler-side bounds
+/// check at `majit-metainterp/src/jitcode/assembler.rs:3970-3987
+/// touch_ref_reg_or_pool_slot` that PANICs once `num_regs_frozen=true`.
+/// Surfaces the offending (graph, insn, opname, kind, color, num_colors)
+/// quad so the regalloc-side mutation that violated the budget
+/// (`enforce_input_args swapcolors`, post-chord adjustment, etc.) can be
+/// audited in Step B.
+fn phase4_scan_color_budget_violations(
+    insns: &[super::flatten::Insn],
+    num_int: u16,
+    num_ref: u16,
+    num_float: u16,
+) -> Vec<Phase4ColorBudgetViolation> {
+    let mut violations: Vec<Phase4ColorBudgetViolation> = Vec::new();
+    for (insn_idx, insn) in insns.iter().enumerate() {
+        if let super::flatten::Insn::Op { opname, args, result } = insn {
+            for arg in args {
+                phase4_check_operand_budget(
+                    insn_idx, opname, "arg", arg, num_int, num_ref, num_float, &mut violations,
+                );
+            }
+            if let Some(reg) = result {
+                phase4_check_register_budget(
+                    insn_idx, opname, "result", reg, num_int, num_ref, num_float, &mut violations,
+                );
+            }
+        }
+    }
+    violations
+}
+
 /// The next-block label is recognised as `Insn::Label(L)`, matching
 /// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
 /// catch-landing labels.  The corresponding `goto TLabel(...)` carries
@@ -9323,6 +9417,62 @@ impl CodeWriter {
                 Some(self.cpu()),
             );
             if phase4_diff_canonical {
+                // color-budget Step A probe: surface Register indices
+                // that exceed `regallocs[kind].num_colors` BEFORE the
+                // downstream `[phase4-canonical-assemble]` PANIC at
+                // `assembler.rs:3970-3987 touch_ref_reg_or_pool_slot`.
+                // The PANIC drops most diagnostic context (only the
+                // `(reg, limit)` pair survives); this scan enumerates
+                // every violation per graph along with the originating
+                // insn index + opname + role (arg/result/list) so the
+                // regalloc-side mutation that violated the budget
+                // (`enforce_input_args swapcolors`, post-chord
+                // adjustment, etc.) can be audited in Step B.
+                let num_int_canonical =
+                    canonical_regallocs[super::flatten::Kind::Int.index()].num_colors;
+                let num_ref_canonical =
+                    canonical_regallocs[super::flatten::Kind::Ref.index()].num_colors;
+                let num_float_canonical =
+                    canonical_regallocs[super::flatten::Kind::Float.index()].num_colors;
+                let color_budget_violations = phase4_scan_color_budget_violations(
+                    &canonical_ssarepr.insns,
+                    num_int_canonical,
+                    num_ref_canonical,
+                    num_float_canonical,
+                );
+                // Always log num_colors triple so the [PANIC] correlation
+                // is visible even when the SSARepr-level scan finds 0
+                // violations (e.g. the offending register index comes
+                // from a non-SSARepr source the scan does not cover).
+                eprintln!(
+                    "[phase4-color-budget-summary] graph={} num_int={num_int_canonical} \
+                     num_ref={num_ref_canonical} num_float={num_float_canonical} \
+                     violations={}",
+                    canonical_ssarepr.name,
+                    color_budget_violations.len(),
+                );
+                if !color_budget_violations.is_empty() {
+                    for (insn_idx, opname, role, kind_str, color, num_colors) in
+                        color_budget_violations.iter().take(8)
+                    {
+                        eprintln!(
+                            "[phase4-color-budget] graph={} insn={insn_idx} \
+                             opname={opname} role={role} kind={kind_str} \
+                             color={color} num_colors={num_colors}",
+                            canonical_ssarepr.name,
+                        );
+                    }
+                    eprintln!(
+                        "[phase4-color-budget] graph={} TOTAL violations={} \
+                         num_int={num_int_canonical} num_ref={num_ref_canonical} \
+                         num_float={num_float_canonical} \
+                         (showed first {} of {})",
+                        canonical_ssarepr.name,
+                        color_budget_violations.len(),
+                        color_budget_violations.len().min(8),
+                        color_budget_violations.len(),
+                    );
+                }
                 let walker_len = ssarepr.insns.len();
                 let canonical_len = canonical_ssarepr.insns.len();
                 let diff = canonical_len as i64 - walker_len as i64;
