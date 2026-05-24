@@ -10,6 +10,7 @@ pub mod _socket;
 pub mod _sre;
 pub mod _weakref;
 pub mod math;
+pub mod mmap;
 pub mod operator;
 pub mod sys;
 pub mod time;
