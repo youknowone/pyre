@@ -1998,10 +1998,20 @@ impl TraceCtx {
     ) -> Vec<crate::recorder::SnapshotTagged> {
         active_boxes
             .iter()
-            .map(|opref| {
-                let tp = self
-                    .get_opref_type(*opref)
-                    .expect("capture_snapshot_for_last_guard: active OpRef missing Box.type");
+            .enumerate()
+            .map(|(slot, opref)| {
+                let tp = self.get_opref_type(*opref).unwrap_or_else(|| {
+                    panic!(
+                        "capture_snapshot_for_last_guard: active OpRef missing Box.type \
+                         (slot={slot}, opref={opref:?}, raw={raw}, ty()={ty:?}, \
+                          is_constant={is_const}, num_inputargs={ninputs}, num_ops={nops})",
+                        raw = opref.raw(),
+                        ty = opref.ty(),
+                        is_const = opref.is_constant(),
+                        ninputs = self.recorder.num_inputargs(),
+                        nops = self.recorder.ops().len(),
+                    )
+                });
                 if opref.is_constant() {
                     let value = self.constant_value(*opref).expect(
                         "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
