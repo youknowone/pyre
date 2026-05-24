@@ -407,7 +407,7 @@ impl Assembler {
     }
 }
 
-static WELLKNOWN_BH_INSNS: LazyLock<HashMap<&'static str, u8>> =
+static WELLKNOWN_BH_INSNS: LazyLock<majit_ir::VecAssoc<&'static str, u8>> =
     LazyLock::new(majit_metainterp::jitcode::wellknown_bh_insns);
 
 fn is_adapter_only_helper_call_family(opname: &str) -> bool {
