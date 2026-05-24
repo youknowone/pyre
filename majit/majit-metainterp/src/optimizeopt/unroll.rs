@@ -41,6 +41,21 @@ fn is_trace_runtime_ref(
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
+/// Reconstruct Phase 1's `box_pool` prefix from the exported snapshot
+/// so a Phase 2 retrace observes the same `_forwarded` chain Phase 1
+/// produced. The `BoxPool::clone` here is intentionally shallow:
+/// `BoxRef` is `Rc<Box>`, so cloning shares the same `Box` cells —
+/// matching `unroll.py` Phase 2's behaviour of seeing Phase 1's
+/// `_forwarded` mutations through Python object identity
+/// (resoperation.py:233-240).
+///
+/// A "deep" snapshot (cloning each `Box` so Phase 2 cannot reach into
+/// `phase1_out`) would diverge from upstream: PyPy explicitly relies on
+/// shared identity to read Phase 1 forwarding from Phase 2 — see
+/// `unroll.py:55-64` `setinfo_from_preamble`. The defensive copy is the
+/// wrong direction for parity. The GcRef-rooting bookkeeping that
+/// `ExportedState::root_all_gcrefs` does is the canonical safety net,
+/// not snapshot copying.
 fn p1_full_prefix_from_box_pool_snapshot(
     snapshot: Option<&crate::r#box::BoxPool>,
 ) -> Option<crate::r#box::BoxPool> {
@@ -1923,6 +1938,12 @@ impl ExportedState {
     pub fn root_all_gcrefs(&mut self) {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
+        // Idempotency: a retrace can feed the same ExportedState back
+        // through `imported_state` and call `root_all_gcrefs` again.
+        // Without releasing the previous batch first, the earlier roots
+        // get pinned (`release_roots` only pops to the most recent
+        // `shadow_stack_base`).
+        self.release_roots();
         self.shadow_stack_base = majit_gc::shadow_stack::depth();
         // ── exported_infos GcRef fields ──
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
