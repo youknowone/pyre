@@ -10,7 +10,7 @@
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
 use crate::rawbuffer::{RawBuffer, RawBufferError};
-use crate::{DescrRef, GcRef, Op, OpCode, OpRef, RdVirtualInfo};
+use crate::{DescrRef, GcRef, Op, OpCode, OpRef, RdVirtualInfo, Type};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -678,7 +678,7 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v.fields.len(),
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
-            PtrInfo::VirtualArrayStruct(v) => v.element_fields.len(),
+            PtrInfo::VirtualArrayStruct(v) => v.element_fields.iter().map(Vec::len).sum(),
             PtrInfo::VirtualRawBuffer(v) => v.buffer.len(),
             _ => 0,
         }
@@ -1279,24 +1279,43 @@ impl PtrInfo {
 
     /// info.py: produce_short_preamble_ops — register cached field reads
     /// into the short preamble builder.
+    ///
+    /// The emitted opcode tracks the field's declared type
+    /// (`FieldDescr::field_type`) so ref / float fields land as
+    /// `GetfieldGcR` / `GetfieldGcF`; otherwise the short preamble would
+    /// reconstruct non-int virtual fields with the wrong result type.
     pub fn produce_short_preamble_ops(&self, structbox: OpRef) -> Vec<Op> {
         let mut result = Vec::new();
         let field_descrs = self.all_fielddescrs_from_descr();
+        let push_for = |result: &mut Vec<Op>, field_idx: u32, missing_msg: &str| {
+            let descr =
+                lookup_field_descr(&field_descrs, field_idx).expect(missing_msg);
+            let tp = descr
+                .as_field_descr()
+                .map(|fd| fd.field_type())
+                .unwrap_or(Type::Int);
+            let opcode = OpCode::getfield_for_type(tp);
+            result.push(Op::with_descr(opcode, &[structbox], descr));
+        };
         if let PtrInfo::Virtual(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    let descr = lookup_field_descr(&field_descrs, field_idx)
-                        .expect("produce_short_preamble_ops: virtual field descr missing");
-                    result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
+                    push_for(
+                        &mut result,
+                        field_idx,
+                        "produce_short_preamble_ops: virtual field descr missing",
+                    );
                 }
             }
         }
         if let PtrInfo::VirtualStruct(v) = self {
             for &(field_idx, value) in &v.fields {
                 if !value.is_none() {
-                    let descr = lookup_field_descr(&field_descrs, field_idx)
-                        .expect("produce_short_preamble_ops: virtual struct field descr missing");
-                    result.push(Op::with_descr(OpCode::GetfieldGcI, &[structbox], descr));
+                    push_for(
+                        &mut result,
+                        field_idx,
+                        "produce_short_preamble_ops: virtual struct field descr missing",
+                    );
                 }
             }
         }

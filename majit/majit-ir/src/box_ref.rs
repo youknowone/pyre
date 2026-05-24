@@ -367,7 +367,9 @@ impl BoxRef {
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Box variant.
     pub fn set_forwarded_box(&self, target: BoxRef) {
         // `assert forwarded_to is not self` (resoperation.py:241).
-        debug_assert!(!Rc::ptr_eq(&self.0, &target.0));
+        // Always-on assert so a release build can't accept a one-node
+        // forwarding cycle that would make `get_box_replacement()` spin.
+        assert!(!Rc::ptr_eq(&self.0, &target.0));
         // RPython AbstractValue invariant: `Const` is not a subclass of
         // `AbstractResOpOrInputArg` (history.py:182), so `set_forwarded`
         // is undefined on Const objects (resoperation.py:50 default
@@ -451,24 +453,23 @@ impl BoxRef {
         self.write_forwarded(Forwarded::None);
     }
 
-    /// Slice 8.D writer: route to `op.forwarded` / `inputarg.forwarded`
-    /// when the box is bound, else fall back to the in-Box slot. The
-    /// Box.forwarded slot is inert for bound boxes — `get_forwarded`
-    /// already reads from the same handle that gets written here, so a
-    /// redundant Box write would only desync if a future reader looked at
-    /// the wrong slot. `op_handle` and `inputarg_handle` are mutually
-    /// exclusive (BoxKind determines which is populated by bind_*).
+    /// Slice 8.D writer: dual-write to `op.forwarded` / `inputarg.forwarded`
+    /// AND `Box.forwarded`. Snapshot consumers (`ExportedState.box_pool_snapshot`,
+    /// retrace import) clone the `BoxRef` by value and may outlive the
+    /// originating `OpRc` / `InputArgRc`; once the `Weak` upgrade fails,
+    /// `get_forwarded` falls back to `Box.forwarded`, so that slot must
+    /// stay current. The cost is one extra `RefCell` write per
+    /// `set_forwarded_*` — `Forwarded` is `Clone`, payloads are `Rc`/`Copy`
+    /// handles.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(weak) = self.0.op_handle.borrow().as_ref() {
             if let Some(op) = weak.upgrade() {
-                *op.forwarded.borrow_mut() = value;
-                return;
+                *op.forwarded.borrow_mut() = value.clone();
             }
         }
         if let Some(weak) = self.0.inputarg_handle.borrow().as_ref() {
             if let Some(ia) = weak.upgrade() {
-                *ia.forwarded.borrow_mut() = value;
-                return;
+                *ia.forwarded.borrow_mut() = value.clone();
             }
         }
         *self.0.forwarded.borrow_mut() = value;
@@ -887,9 +888,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic]
-    fn set_forwarded_to_self_panics_in_debug() {
+    fn set_forwarded_to_self_panics() {
         let a = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_box(a.clone());
     }
@@ -1150,5 +1150,44 @@ mod tests {
         }
         b.set_forwarded_info(OpInfo::Unknown);
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
+    }
+
+    /// PR #93 review (Codex P1): `ExportedState.box_pool_snapshot` clones
+    /// `BoxRef`s by value and lives past the originating `OpRc`. Writes
+    /// done while the Op is alive must also land in `Box.forwarded` so the
+    /// snapshot keeps the latest forwarding once `Weak::upgrade` fails.
+    #[test]
+    fn write_forwarded_mirrors_to_box_so_snapshot_survives_op_drop() {
+        use crate::resoperation::{Op, OpCode};
+        let b = BoxRef::new_resop(Type::Int, 0);
+        let snapshot = b.clone();
+        {
+            let op = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+            b.bind_op(&op);
+            b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(7)));
+            // op drops at the end of this block.
+        }
+        // The snapshot still sees the Info forwarding because the writer
+        // mirrored to Box.forwarded alongside op.forwarded.
+        assert!(matches!(snapshot.get_forwarded(), Forwarded::Info(_)));
+    }
+
+    /// Same invariant for InputArg-bound boxes.
+    #[test]
+    fn write_forwarded_mirrors_to_box_so_snapshot_survives_inputarg_drop() {
+        use crate::value::InputArg;
+        let b = BoxRef::new_inputarg(Type::Int, 0);
+        let snapshot = b.clone();
+        {
+            let ia = std::rc::Rc::new(InputArg {
+                tp: Type::Int,
+                index: 0,
+                forwarded: std::cell::RefCell::new(Forwarded::None),
+            });
+            b.bind_inputarg(&ia);
+            b.set_forwarded_info(OpInfo::Unknown);
+            // ia drops here.
+        }
+        assert!(matches!(snapshot.get_forwarded(), Forwarded::Info(_)));
     }
 }

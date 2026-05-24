@@ -922,14 +922,19 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 return op.type_;
             }
         }
-        // PtrInfo presence → Ref type (for non-emitted ops like input args)
-        if self
-            .ctx
-            .get_box_replacement_box(opref)
-            .as_ref()
-            .is_some_and(|b| self.ctx.has_ptr_info(b))
-        {
-            return majit_ir::Type::Ref;
+        // PtrInfo-derived type — match the same variant split as
+        // `opref_type()` so raw-pointer Int boxes (`VirtualRawBuffer` /
+        // `VirtualRawSlice`, info.py:865 `RawBufferPtrInfo`) keep their
+        // Int classification instead of collapsing to Ref. Resume serdes
+        // reads this via `BoxEnv::get_type` so the wrong answer would
+        // mis-tag liveboxes for those variants.
+        let resolved_box = self.ctx.get_box_replacement_box(opref);
+        if let Some(info) = resolved_box.as_ref().and_then(|b| self.ctx.peek_ptr_info(b)) {
+            return match info {
+                crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
+                | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
+                _ => majit_ir::Type::Ref,
+            };
         }
         majit_ir::Type::Int
     }

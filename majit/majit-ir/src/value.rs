@@ -303,6 +303,13 @@ impl InputArg {
     }
 
     pub fn from_type(tp: Type, index: u32) -> Self {
+        // `InputArg*` has no Void encoding (resoperation.py:719/727/739
+        // — only `InputArgInt`/`InputArgFloat`/`InputArgRef`); fail at
+        // construction so `opref()` can't be reached with a Void slot.
+        assert!(
+            tp != Type::Void,
+            "InputArg::from_type: Type::Void is not a valid input-arg type",
+        );
         InputArg {
             tp,
             index,
