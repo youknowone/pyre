@@ -1049,10 +1049,11 @@ fn init_locale(ns: &mut DictStorage) {
             }
             #[cfg(not(all(unix, feature = "host_env")))]
             {
+                // No libc available — every category resolves to the
+                // POSIX "C" locale, mirroring what setlocale(LC_*, "C")
+                // returns on a real host.  Pure constant; no I/O.
                 let _ = args;
-                Err(crate::PyError::not_implemented(
-                    "_locale.setlocale requires host_env feature",
-                ))
+                Ok(pyre_object::w_str_new("C"))
             }
         }),
     );
@@ -1130,11 +1131,24 @@ fn init_locale(ns: &mut DictStorage) {
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
-                    let _ = args;
-                    // Sandbox semantics: no host_env → no locale collation.
-                    Err(crate::PyError::not_implemented(
-                        "_locale.strcoll requires host_env feature",
-                    ))
+                    if args.len() < 2
+                        || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
+                    {
+                        return Err(crate::PyError::type_error(
+                            "strcoll: arguments must be strings",
+                        ));
+                    }
+                    // No libc collation available — fall back to
+                    // lexical bytewise comparison.  Pure computation,
+                    // no I/O, so the sandbox principle is unaffected.
+                    let s1 = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                    let s2 = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
+                    let ord = match s1.as_str().cmp(s2.as_str()) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    };
+                    Ok(pyre_object::w_int_new(ord))
                 }
             },
             2,
