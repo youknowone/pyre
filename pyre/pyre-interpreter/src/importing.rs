@@ -1691,8 +1691,15 @@ fn init_resource(ns: &mut DictStorage) {
                     match rustpython_host_env::resource::getrusage(who) {
                         Ok(r) => return Ok(make_struct_rusage(&r)),
                         Err(e) => {
+                            let errno = e.raw_os_error().unwrap_or(0);
+                            // `lib_pypy/resource.py:106` raises ValueError for
+                            // an invalid `who`; only other errno values are
+                            // surfaced as OSError.
+                            if errno == libc::EINVAL {
+                                return Err(crate::PyError::value_error("invalid who parameter"));
+                            }
                             return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
+                                errno,
                                 format!("getrusage: {e}"),
                             ));
                         }
@@ -4374,6 +4381,43 @@ fn pack_inet_addr(
     family: libc::c_int,
     addr: pyre_object::PyObjectRef,
 ) -> Result<(libc::sockaddr_storage, libc::socklen_t), crate::PyError> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    // AF_UNIX is special: rsocket.py:RSocket.bind/connect accept a bare
+    // bytes/str path (or a 1-tuple wrapping the path).  Pull the path
+    // out before touching tuple[1], which only the AF_INET/AF_INET6
+    // forms guarantee.
+    if family == libc::AF_UNIX {
+        let path_obj = if unsafe { pyre_object::is_str(addr) } {
+            addr
+        } else if unsafe { pyre_object::is_tuple(addr) } {
+            unsafe { pyre_object::w_tuple_getitem(addr, 0) }
+                .ok_or_else(|| crate::PyError::value_error("address: missing path"))?
+        } else {
+            return Err(crate::PyError::type_error(
+                "AF_UNIX address must be a string path",
+            ));
+        };
+        if !unsafe { pyre_object::is_str(path_obj) } {
+            return Err(crate::PyError::type_error(
+                "AF_UNIX address must be a string path",
+            ));
+        }
+        let path = unsafe { pyre_object::w_str_get_value(path_obj).to_string() };
+        let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
+        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_bytes = path.as_bytes();
+        if path_bytes.len() >= sun.sun_path.len() {
+            return Err(crate::PyError::os_error("AF_UNIX path too long"));
+        }
+        for (i, &b) in path_bytes.iter().enumerate() {
+            sun.sun_path[i] = b as libc::c_char;
+        }
+        return Ok((
+            storage,
+            (core::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t,
+        ));
+    }
+
     if !unsafe { pyre_object::is_tuple(addr) } {
         return Err(crate::PyError::type_error(
             "AF_INET address must be a (host, port) tuple",
@@ -4399,7 +4443,6 @@ fn pack_inet_addr(
 
     let c_host = std::ffi::CString::new(host.as_bytes())
         .map_err(|_| crate::PyError::value_error("embedded null in host"))?;
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     if family == libc::AF_INET {
         let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -4461,23 +4504,6 @@ fn pack_inet_addr(
         Ok((
             storage,
             core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        ))
-    } else if family == libc::AF_UNIX {
-        // Special-case: AF_UNIX takes a bare string path, not a tuple.
-        // The original parsing above already extracted host_obj from
-        // tuple[0]; treat that as the path.
-        let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
-        sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let path_bytes = host.as_bytes();
-        if path_bytes.len() >= sun.sun_path.len() {
-            return Err(crate::PyError::os_error("AF_UNIX path too long"));
-        }
-        for (i, &b) in path_bytes.iter().enumerate() {
-            sun.sun_path[i] = b as libc::c_char;
-        }
-        Ok((
-            storage,
-            (core::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t,
         ))
     } else {
         Err(crate::PyError::os_error(format!(
@@ -4698,15 +4724,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                // AF_UNIX uses a bare string instead of a (host, port) tuple;
-                // wrap it in a 1-tuple so pack_inet_addr can reuse host_obj.
-                let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(args[1]) }
-                {
-                    pyre_object::w_tuple_new(vec![args[1]])
-                } else {
-                    args[1]
-                };
-                let (storage, slen) = pack_inet_addr(family, addr_obj)?;
+                let (storage, slen) = pack_inet_addr(family, args[1])?;
                 let r =
                     unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, slen) };
                 if r != 0 {
@@ -4782,13 +4800,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(args[1]) }
-                {
-                    pyre_object::w_tuple_new(vec![args[1]])
-                } else {
-                    args[1]
-                };
-                let (storage, slen) = pack_inet_addr(family, addr_obj)?;
+                let (storage, slen) = pack_inet_addr(family, args[1])?;
                 let r = unsafe {
                     libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
                 };
@@ -4930,11 +4942,6 @@ fn init_socket_type(ns: &mut DictStorage) {
                 )
             };
             let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-            let addr_obj = if family == libc::AF_UNIX && unsafe { pyre_object::is_str(addr_obj) } {
-                pyre_object::w_tuple_new(vec![addr_obj])
-            } else {
-                addr_obj
-            };
             let (storage, slen) = pack_inet_addr(family, addr_obj)?;
             let n = unsafe {
                 libc::sendto(
@@ -7128,8 +7135,7 @@ fn init_signal_stub(ns: &mut DictStorage) {
                         .into_iter()
                         .map(|n| pyre_object::w_int_new(n as i64))
                         .collect();
-                    // CPython returns a frozenset; pyre exposes a plain set for now.
-                    return Ok(pyre_object::w_list_new(items));
+                    return Ok(pyre_object::w_frozenset_from_items(&items));
                 }
                 #[cfg(not(feature = "host_env"))]
                 Err(crate::PyError::not_implemented(
