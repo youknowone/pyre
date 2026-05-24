@@ -3544,9 +3544,10 @@ fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: 
     //
     // RPython treats helper jitcodes (pop_value, nlocals, etc.) as
     // separate `MIFrame`s on `metainterp.framestack`, capturing one
-    // snapshot frame per `MIFrame`.  At resume, RPython's blackhole
-    // interpreter re-enters each frame's jitcode and replays from the
-    // saved pc.
+    // snapshot frame per `MIFrame` plus a vable_array / vref_array
+    // prefix on the top frame (`opencoder.py:767 create_top_snapshot`).
+    // At resume, RPython's blackhole interpreter re-enters each frame's
+    // jitcode and replays from the saved pc.
     //
     // Pyre's blackhole interpreter only knows how to run *pyjitcode*
     // bytecode (Python bytecode), not helper jitcodes — pyre's
@@ -3555,23 +3556,44 @@ fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: 
     // consequence: any walker-emitted guard, regardless of how deep
     // the sub-walk nesting is, must resume to the *outer* Python
     // opcode boundary (`sym.jitcode` at `entry_py_pc`) — that is the
-    // only resume point pyre's blackhole can re-enter.
+    // only resume point pyre's blackhole can re-enter.  The
+    // framestack-collapse is a deliberate adaptation, not a parity
+    // miss; the walker context carries the outer Python frame only.
+    // Inline-traced Python frames (`build_pending_inline_frame`) are
+    // not reachable from this entry point because the production
+    // walker allow-list does not yet enable opcodes that drive inline
+    // tracing — when that expands, `WalkContext` must grow a parent-
+    // Python-frame chain (analogous to `MIFrame.parent_frames`) and
+    // this helper switches to
+    // `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`.
     //
-    // Therefore the snapshot is single-frame and points at the outer
+    // The snapshot is therefore single Python frame at the outer
     // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
     // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
     // carries the `PyFrame` state at the Python opcode boundary
     // (snapshotted once at `dispatch_via_miframe_at_opcode_entry` from
-    // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`).
+    // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
+    // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
+    // by_bank_at`).
     //
     // `op_pc` (the walker's arm-local PC) is intentionally not used:
     // the arm jitcode has no resume entry point in pyre's blackhole.
     let _ = op_pc;
-    ctx.trace_ctx.capture_snapshot_for_last_guard(
-        &ctx.outer_active_boxes,
-        ctx.outer_jitcode_index,
-        ctx.entry_py_pc,
-    );
+    // `opencoder.py:772-775 create_top_snapshot` writes vable_array +
+    // vref_array on the top snapshot.  The walker-emitted guard IS
+    // a top snapshot for pyre (helper frames don't resume), so feed
+    // the trace-time vable/vref shadow through.  Empty when no
+    // virtualizable / virtualref is live, matching the upstream
+    // 0-length-array shape.
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    ctx.trace_ctx
+        .capture_snapshot_for_last_guard_with_vable_vref(
+            &ctx.outer_active_boxes,
+            ctx.outer_jitcode_index,
+            ctx.entry_py_pc,
+            &vable_boxes,
+            &vref_boxes,
+        );
 }
 
 fn direct_call_release_gil(

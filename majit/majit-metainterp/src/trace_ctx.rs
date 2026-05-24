@@ -1656,6 +1656,26 @@ impl TraceCtx {
         self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
     }
 
+    /// `opencoder.py:767-784 create_top_snapshot` parity for callers that
+    /// need to feed `vable_boxes` / `vref_boxes` into
+    /// `capture_snapshot_for_last_guard_with_vable_vref`.  Returns the
+    /// pre-shaped `(vable_boxes, vref_boxes)` ready to attach to a top
+    /// snapshot — identity-front reorder for vable, verbatim opref order
+    /// for vref.  Empty vectors when neither a virtualizable nor any
+    /// virtualref is live (matches RPython's `_list_of_boxes_virtualizable`
+    /// / `_list_of_boxes` returning a 0-length array).
+    pub fn build_snapshot_vable_vref_boxes(
+        &self,
+    ) -> (
+        Vec<crate::recorder::SnapshotTagged>,
+        Vec<crate::recorder::SnapshotTagged>,
+    ) {
+        let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        let vable_boxes = crate::pyjitpl::build_vable_snapshot_boxes(vable_slice);
+        let vref_boxes = crate::pyjitpl::build_vref_snapshot_boxes(&self.virtualref_boxes);
+        (vable_boxes, vref_boxes)
+    }
+
     /// Concrete shadow of the standard virtualizable — the raw heap pointer
     /// `standard_virtualizable_box` refers to. Parallels
     /// `MetaInterp.virtualizable_boxes[-1].getref_base()` at runtime; pyre

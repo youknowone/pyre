@@ -6648,9 +6648,7 @@ impl MIFrame {
                         instruction, e,
                     );
                 }
-                Err(trace_abort_error(
-                    "production walker dispatch failed",
-                ))
+                Err(trace_abort_error("production walker dispatch failed"))
             }
         }
     }
