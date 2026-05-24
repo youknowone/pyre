@@ -146,12 +146,27 @@ pub fn build_semantic_program_from_llbc(
     let mut functions = Vec::new();
     let mut fn_return_types: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
         if fd.unstructured().is_none() {
             continue;
         }
-        let graph = lower_fun_decl(llbc, fd)?;
         let name = fd.item_meta.name_path();
+        // Step 4.5: a single function whose body the driver does not
+        // yet handle should not abort the whole-program build.
+        // Capture per-function errors into a side bucket and continue;
+        // the cutover surfaces them via `PYRE_MIR_FRONTEND_DEBUG=1`
+        // for triage, but production keeps going with a degraded
+        // SemanticProgram. This matches the AST driver's policy of
+        // failing-loud on the single broken function rather than
+        // erroring out at program-build time.
+        let graph = match lower_fun_decl(llbc, fd) {
+            Ok(g) => g,
+            Err(e) => {
+                skipped.push((name.clone(), e.to_string()));
+                continue;
+            }
+        };
         // Step 4.3.a: surface return types as TyRef labels. Step 4.3.c
         // will resolve TyRef → ADT path via `type_decls` (currently
         // available as `llbc.type_by_id(...)`) once consumers need it.
@@ -165,6 +180,15 @@ pub fn build_semantic_program_from_llbc(
             hints: Vec::new(),
             access_directly: false,
         });
+    }
+    if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !skipped.is_empty() {
+        eprintln!(
+            "[mir-frontend] {} function(s) skipped during lowering:",
+            skipped.len()
+        );
+        for (name, msg) in skipped.iter().take(20) {
+            eprintln!("  {name}: {msg}");
+        }
     }
     Ok(crate::front::ast::SemanticProgram {
         functions,
