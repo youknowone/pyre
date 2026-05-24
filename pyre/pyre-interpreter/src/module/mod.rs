@@ -12,9 +12,12 @@ pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
+pub mod _signal;
+#[allow(non_snake_case)]
 pub mod _socket;
 pub mod _sre;
 pub mod _weakref;
+pub mod atexit;
 pub mod faulthandler;
 pub mod math;
 pub mod mmap;
