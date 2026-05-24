@@ -11,6 +11,12 @@ default = ["dynasm"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 cranelift = ["jit", "majit-backend-cranelift", "majit-metainterp/cranelift", "pyre-jit-trace/cranelift"]
 dynasm = ["jit", "majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-trace/dynasm"]
+# Issue #97 Step 4.5 — forward the majit-translate `mir-frontend`
+# feature so pyre-jit builds can flip the cutover from the top level
+# (`cargo build --features pyre-jit/mir-frontend`).  Production
+# validation runs check.py with this enabled and
+# PYRE_MIR_FRONTEND_LLBC pointing at an extracted .ullbc.
+mir-frontend = ["majit-translate/mir-frontend"]
 
 [dependencies]
 pyre-object = { workspace = true }
