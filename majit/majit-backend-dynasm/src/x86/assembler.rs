@@ -5719,7 +5719,9 @@ impl<'a> Assembler386<'a> {
         // srccount[dst] = number of times dst appears as a src
         let mut srccount: VecAssoc<i32, i32> = VecAssoc::new();
         for m in &moves {
-            srccount.entry(m.1).or_insert(0); // ensure dst exists
+            if !srccount.contains_key(&m.1) {
+                srccount.insert(m.1, 0); // ensure dst exists
+            }
         }
         let mut pending = n as i32;
         for (i, m) in moves.iter().enumerate() {
