@@ -3341,6 +3341,11 @@ unsafe extern "C" {
     ) -> *const libc::c_char;
     fn gethostname(name: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
     fn gethostbyname(name: *const libc::c_char) -> *mut HostentRaw;
+    fn gethostbyaddr(
+        addr: *const libc::c_void,
+        len: libc::socklen_t,
+        family: libc::c_int,
+    ) -> *mut HostentRaw;
     fn getservbyname(name: *const libc::c_char, proto: *const libc::c_char) -> *mut ServentRaw;
     fn getservbyport(port: libc::c_int, proto: *const libc::c_char) -> *mut ServentRaw;
 }
@@ -4071,6 +4076,145 @@ fn init_socket(ns: &mut DictStorage) {
             ),
         );
 
+        // gethostbyname_ex(name) → (name, aliases, addresses)
+        // `interp_func.py:53-65` — same lookup as gethostbyname but
+        // returns the full hostent triple.
+        crate::dict_storage_store(
+            ns,
+            "gethostbyname_ex",
+            crate::make_builtin_function_with_arity(
+                "gethostbyname_ex",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "gethostbyname_ex() missing argument",
+                        ));
+                    }
+                    let host_bytes = socket_idna_converter(args[0])?;
+                    let c = std::ffi::CString::new(host_bytes.clone())
+                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let he = unsafe { gethostbyname(c.as_ptr()) };
+                    if he.is_null() {
+                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
+                        return Err(socket_converted_error(
+                            "gaierror",
+                            None,
+                            &format!("gethostbyname_ex failed for {host_repr}"),
+                        ));
+                    }
+                    unpack_hostent(he)
+                },
+                1,
+            ),
+        );
+
+        // gethostbyaddr(addr) → (name, aliases, addresses)
+        // `interp_func.py:67-79` — reverse lookup; `addr` is an
+        // IPv4/IPv6 string we resolve through inet_pton, then feed
+        // to gethostbyaddr.
+        crate::dict_storage_store(
+            ns,
+            "gethostbyaddr",
+            crate::make_builtin_function_with_arity(
+                "gethostbyaddr",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error(
+                            "gethostbyaddr() missing argument",
+                        ));
+                    }
+                    let host_bytes = socket_idna_converter(args[0])?;
+                    let c = std::ffi::CString::new(host_bytes.clone())
+                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    // Try IPv4 first, then IPv6, then fall back to
+                    // gethostbyname → hostent.h_addr to obtain a raw
+                    // bytestring for gethostbyaddr.
+                    let mut buf4 = [0u8; 4];
+                    let r4 = unsafe {
+                        inet_pton(
+                            libc::AF_INET,
+                            c.as_ptr(),
+                            buf4.as_mut_ptr() as *mut libc::c_void,
+                        )
+                    };
+                    let (family, addr_ptr, addr_len) = if r4 == 1 {
+                        (
+                            libc::AF_INET,
+                            buf4.as_ptr() as *const libc::c_void,
+                            4 as libc::socklen_t,
+                        )
+                    } else {
+                        let mut buf6 = [0u8; 16];
+                        let r6 = unsafe {
+                            inet_pton(
+                                libc::AF_INET6,
+                                c.as_ptr(),
+                                buf6.as_mut_ptr() as *mut libc::c_void,
+                            )
+                        };
+                        if r6 == 1 {
+                            // Borrowed pointer: we copy into a stable
+                            // buffer below so the lifetime crosses the
+                            // FFI call safely.
+                            let mut owned: [u8; 16] = buf6;
+                            let he = unsafe {
+                                gethostbyaddr(
+                                    owned.as_mut_ptr() as *mut libc::c_void,
+                                    16 as libc::socklen_t,
+                                    libc::AF_INET6,
+                                )
+                            };
+                            if he.is_null() {
+                                let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
+                                return Err(socket_converted_error(
+                                    "herror",
+                                    None,
+                                    &format!("gethostbyaddr failed for {host_repr}"),
+                                ));
+                            }
+                            return unpack_hostent(he);
+                        }
+                        // Fall back: name → hostent → first IPv4 addr
+                        let he = unsafe { gethostbyname(c.as_ptr()) };
+                        if he.is_null() {
+                            let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
+                            return Err(socket_converted_error(
+                                "herror",
+                                None,
+                                &format!("gethostbyaddr failed for {host_repr}"),
+                            ));
+                        }
+                        unsafe {
+                            let h = &*he;
+                            if (*h.h_addr_list).is_null() {
+                                return Err(socket_converted_error(
+                                    "herror",
+                                    None,
+                                    "gethostbyaddr: empty address list",
+                                ));
+                            }
+                            (
+                                h.h_addrtype as libc::c_int,
+                                *h.h_addr_list as *const libc::c_void,
+                                h.h_length as libc::socklen_t,
+                            )
+                        }
+                    };
+                    let he = unsafe { gethostbyaddr(addr_ptr, addr_len, family) };
+                    if he.is_null() {
+                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
+                        return Err(socket_converted_error(
+                            "herror",
+                            None,
+                            &format!("gethostbyaddr failed for {host_repr}"),
+                        ));
+                    }
+                    unpack_hostent(he)
+                },
+                1,
+            ),
+        );
+
         // getservbyname(name[, proto]) → port
         crate::dict_storage_store(
             ns,
@@ -4209,6 +4353,267 @@ fn init_socket(ns: &mut DictStorage) {
     // a None so attribute lookups succeed.
     crate::dict_storage_store(ns, "_default_timeout", pyre_object::w_none());
 
+    // ── module-level getdefaulttimeout / setdefaulttimeout ──
+    // `interp_func.py:378-397` — None means "blocking", float means
+    // "timeout in seconds".  Stored as a process-wide cell.
+    crate::dict_storage_store(
+        ns,
+        "getdefaulttimeout",
+        crate::make_builtin_function_with_arity(
+            "getdefaulttimeout",
+            |_| Ok(get_default_socket_timeout()),
+            0,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "setdefaulttimeout",
+        crate::make_builtin_function_with_arity(
+            "setdefaulttimeout",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "setdefaulttimeout() missing argument",
+                    ));
+                }
+                let v = args[0];
+                if unsafe { pyre_object::is_none(v) } {
+                    set_default_socket_timeout(None);
+                    return Ok(pyre_object::w_none());
+                }
+                let secs = unsafe {
+                    if pyre_object::is_int(v) {
+                        pyre_object::w_int_get_value(v) as f64
+                    } else if pyre_object::is_float(v) {
+                        pyre_object::floatobject::w_float_get_value(v)
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "setdefaulttimeout: value must be a float or None",
+                        ));
+                    }
+                };
+                if secs < 0.0 || !secs.is_finite() {
+                    return Err(crate::PyError::value_error("Timeout value out of range"));
+                }
+                set_default_socket_timeout(Some(secs));
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // ── module-level close(fd) ──
+    // `interp_socket.py:close(fd)` — raw libc close, used for fd
+    // cleanup when callers obtain a bare fd via .detach().
+    #[cfg(unix)]
+    crate::dict_storage_store(
+        ns,
+        "close",
+        crate::make_builtin_function_with_arity(
+            "close",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("close() missing fd"));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error("close: fd must be an integer"));
+                }
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let r = unsafe { libc::close(fd) };
+                if r != 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // ── getprotobyname(name) ──
+    // `interp_func.py:125-134` — returns the IPPROTO_* number for a
+    // protocol name.  libc getprotobyname returns NULL on lookup
+    // failure; we surface that as OSError to match `converted_error`.
+    #[cfg(unix)]
+    crate::dict_storage_store(
+        ns,
+        "getprotobyname",
+        crate::make_builtin_function_with_arity(
+            "getprotobyname",
+            |args| {
+                if args.is_empty() || !unsafe { pyre_object::is_str(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "getprotobyname: name must be a string",
+                    ));
+                }
+                let name = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                let c_name = std::ffi::CString::new(name.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
+                let pe = unsafe { libc::getprotobyname(c_name.as_ptr()) };
+                if pe.is_null() {
+                    return Err(socket_converted_error("error", None, "protocol not found"));
+                }
+                let proto = unsafe { (*pe).p_proto };
+                Ok(pyre_object::w_int_new(proto as i64))
+            },
+            1,
+        ),
+    );
+
+    // ── if_nameindex / if_nametoindex / if_indextoname ──
+    // `interp_socket.py:if_nameindex|if_nametoindex|if_indextoname`
+    // — direct wrappers around libc's network-interface accessors.
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(
+            ns,
+            "if_nameindex",
+            crate::make_builtin_function_with_arity(
+                "if_nameindex",
+                |_| {
+                    let head = unsafe { libc::if_nameindex() };
+                    if head.is_null() {
+                        return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                    let mut items = Vec::new();
+                    let mut p = head;
+                    unsafe {
+                        while (*p).if_index != 0 && !(*p).if_name.is_null() {
+                            let name = std::ffi::CStr::from_ptr((*p).if_name)
+                                .to_string_lossy()
+                                .into_owned();
+                            items.push(pyre_object::w_tuple_new(vec![
+                                pyre_object::w_int_new((*p).if_index as i64),
+                                pyre_object::w_str_new(&name),
+                            ]));
+                            p = p.add(1);
+                        }
+                        libc::if_freenameindex(head);
+                    }
+                    Ok(pyre_object::w_list_new(items))
+                },
+                0,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "if_nametoindex",
+            crate::make_builtin_function_with_arity(
+                "if_nametoindex",
+                |args| {
+                    if args.is_empty() || !unsafe { pyre_object::is_str(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "if_nametoindex: name must be a string",
+                        ));
+                    }
+                    let name = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                    let c_name = std::ffi::CString::new(name.as_bytes())
+                        .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
+                    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+                    if idx == 0 {
+                        return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                    Ok(pyre_object::w_int_new(idx as i64))
+                },
+                1,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "if_indextoname",
+            crate::make_builtin_function_with_arity(
+                "if_indextoname",
+                |args| {
+                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "if_indextoname: index must be an integer",
+                        ));
+                    }
+                    let idx = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_uint;
+                    let mut buf = [0u8; libc::IF_NAMESIZE];
+                    let p =
+                        unsafe { libc::if_indextoname(idx, buf.as_mut_ptr() as *mut libc::c_char) };
+                    if p.is_null() {
+                        return Err(socket_io_err(std::io::Error::last_os_error()));
+                    }
+                    let s = unsafe { std::ffi::CStr::from_ptr(p) };
+                    Ok(pyre_object::w_str_new(&s.to_string_lossy()))
+                },
+                1,
+            ),
+        );
+    }
+
+    // ── CMSG_SPACE / CMSG_LEN ──
+    // `interp_func.py:341-376` — POSIX macros, exposed only when the
+    // host libc has them.  rust's `libc` crate provides both on every
+    // unix target we ship, so we register them under the same cfg.
+    #[cfg(unix)]
+    {
+        crate::dict_storage_store(
+            ns,
+            "CMSG_SPACE",
+            crate::make_builtin_function_with_arity(
+                "CMSG_SPACE",
+                |args| {
+                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "CMSG_SPACE: size must be an integer",
+                        ));
+                    }
+                    let raw = unsafe { pyre_object::w_int_get_value(args[0]) };
+                    if raw < 0 {
+                        return Err(crate::PyError::overflow_error(
+                            "CMSG_SPACE() argument out of range",
+                        ));
+                    }
+                    let n = unsafe { libc::CMSG_SPACE(raw as libc::c_uint) };
+                    if n == 0 {
+                        return Err(crate::PyError::overflow_error(
+                            "CMSG_SPACE() argument out of range",
+                        ));
+                    }
+                    Ok(pyre_object::w_int_new(n as i64))
+                },
+                1,
+            ),
+        );
+        crate::dict_storage_store(
+            ns,
+            "CMSG_LEN",
+            crate::make_builtin_function_with_arity(
+                "CMSG_LEN",
+                |args| {
+                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
+                        return Err(crate::PyError::type_error(
+                            "CMSG_LEN: length must be an integer",
+                        ));
+                    }
+                    let raw = unsafe { pyre_object::w_int_get_value(args[0]) };
+                    if raw < 0 {
+                        return Err(crate::PyError::overflow_error(
+                            "CMSG_LEN() argument out of range",
+                        ));
+                    }
+                    let n = unsafe { libc::CMSG_LEN(raw as libc::c_uint) };
+                    if n == 0 {
+                        return Err(crate::PyError::overflow_error(
+                            "CMSG_LEN() argument out of range",
+                        ));
+                    }
+                    Ok(pyre_object::w_int_new(n as i64))
+                },
+                1,
+            ),
+        );
+    }
+
+    // ── getaddrinfo / getnameinfo ──
+    // `interp_func.py:294-339` (getaddrinfo) and `:137-156`
+    // (getnameinfo) — directly wrap libc's getaddrinfo / getnameinfo
+    // and walk the addrinfo linked list.
+    #[cfg(unix)]
+    init_socket_getaddrinfo(ns);
+
     // ── socket class (slice S2) ──
     #[cfg(unix)]
     {
@@ -4293,6 +4698,340 @@ fn init_socket(ns: &mut DictStorage) {
             ),
         );
     }
+}
+
+// ── hostent → (name, aliases, addrs) ──
+// `interp_func.py:46-51 common_wrapgethost` — packs a libc hostent
+// into the 3-tuple shape used by gethostbyname_ex / gethostbyaddr.
+#[cfg(unix)]
+fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    unsafe {
+        let h = &*he;
+        let name = if h.h_name.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(h.h_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut aliases = Vec::new();
+        if !h.h_aliases.is_null() {
+            let mut p = h.h_aliases;
+            while !(*p).is_null() {
+                aliases.push(pyre_object::w_str_new(
+                    &std::ffi::CStr::from_ptr(*p).to_string_lossy(),
+                ));
+                p = p.add(1);
+            }
+        }
+        let mut addrs = Vec::new();
+        if !h.h_addr_list.is_null() {
+            let mut p = h.h_addr_list;
+            while !(*p).is_null() {
+                let addr_str = if h.h_addrtype == libc::AF_INET && h.h_length == 4 {
+                    let addr = libc::in_addr {
+                        s_addr: *(*p as *const u32),
+                    };
+                    let s = inet_ntoa(addr);
+                    std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+                } else if h.h_addrtype == libc::AF_INET6 && h.h_length == 16 {
+                    let mut buf = [0u8; 64];
+                    let q = inet_ntop(
+                        libc::AF_INET6,
+                        *p as *const libc::c_void,
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len() as libc::socklen_t,
+                    );
+                    if q.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(q).to_string_lossy().into_owned()
+                    }
+                } else {
+                    String::new()
+                };
+                addrs.push(pyre_object::w_str_new(&addr_str));
+                p = p.add(1);
+            }
+        }
+        Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new(&name),
+            pyre_object::w_list_new(aliases),
+            pyre_object::w_list_new(addrs),
+        ]))
+    }
+}
+
+// ── default socket timeout cell ──
+// `rsocket.py:setdefaulttimeout|getdefaulttimeout` — process-wide
+// default for socket() construction.  None == blocking; Some(secs)
+// == timeout in seconds.
+
+thread_local! {
+    static DEFAULT_SOCKET_TIMEOUT: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn get_default_socket_timeout() -> pyre_object::PyObjectRef {
+    match DEFAULT_SOCKET_TIMEOUT.with(|c| c.get()) {
+        None => pyre_object::w_none(),
+        Some(s) => pyre_object::floatobject::w_float_new(s),
+    }
+}
+
+fn set_default_socket_timeout(v: Option<f64>) {
+    DEFAULT_SOCKET_TIMEOUT.with(|c| c.set(v));
+}
+
+// ── getaddrinfo / getnameinfo wiring ──
+//
+// PyPy's `interp_func.py:294-339` walks libc's `addrinfo` linked
+// list and packs each entry into a 5-tuple `(family, socktype,
+// proto, canonname, sockaddr)`.  `getnameinfo` is the symmetric
+// path used by stdlib socket.getnameinfo.
+
+#[cfg(unix)]
+fn init_socket_getaddrinfo(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "getaddrinfo",
+        crate::make_builtin_function("getaddrinfo", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(
+                    "getaddrinfo() missing host or port",
+                ));
+            }
+            // host: None | str
+            let host_obj = args[0];
+            let host: Option<std::ffi::CString> = unsafe {
+                if pyre_object::is_none(host_obj) {
+                    None
+                } else if pyre_object::is_str(host_obj) {
+                    let s = pyre_object::w_str_get_value(host_obj).to_string();
+                    Some(
+                        std::ffi::CString::new(s.as_bytes())
+                            .map_err(|_| crate::PyError::value_error("embedded null in host"))?,
+                    )
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "getaddrinfo() argument 1 must be string or None",
+                    ));
+                }
+            };
+            // port: None | int | str
+            let port_obj = args[1];
+            let port: Option<std::ffi::CString> = unsafe {
+                if pyre_object::is_none(port_obj) {
+                    None
+                } else if pyre_object::is_int(port_obj) {
+                    let v = pyre_object::w_int_get_value(port_obj);
+                    Some(std::ffi::CString::new(format!("{v}")).unwrap())
+                } else if pyre_object::is_str(port_obj) {
+                    let s = pyre_object::w_str_get_value(port_obj).to_string();
+                    Some(
+                        std::ffi::CString::new(s.as_bytes())
+                            .map_err(|_| crate::PyError::value_error("embedded null in port"))?,
+                    )
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "getaddrinfo() argument 2 must be integer or string",
+                    ));
+                }
+            };
+
+            let int_arg =
+                |idx: usize, default: libc::c_int| -> Result<libc::c_int, crate::PyError> {
+                    if args.len() > idx {
+                        if !unsafe { pyre_object::is_int(args[idx]) } {
+                            return Err(crate::PyError::type_error(
+                                "getaddrinfo: family/type/proto/flags must be integers",
+                            ));
+                        }
+                        Ok(unsafe { pyre_object::w_int_get_value(args[idx]) } as libc::c_int)
+                    } else {
+                        Ok(default)
+                    }
+                };
+            let family = int_arg(2, libc::AF_UNSPEC)?;
+            let socktype = int_arg(3, 0)?;
+            let proto = int_arg(4, 0)?;
+            let flags = int_arg(5, 0)?;
+
+            let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+            hints.ai_family = family;
+            hints.ai_socktype = socktype;
+            hints.ai_protocol = proto;
+            hints.ai_flags = flags;
+
+            let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+            let host_ptr = host
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null());
+            let port_ptr = port
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null());
+            let rc = unsafe { libc::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) };
+            if rc != 0 {
+                let msg = unsafe {
+                    std::ffi::CStr::from_ptr(libc::gai_strerror(rc))
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                return Err(socket_converted_error("gaierror", Some(rc), &msg));
+            }
+
+            let mut items = Vec::new();
+            let mut cur = res;
+            unsafe {
+                while !cur.is_null() {
+                    let ai = &*cur;
+                    let canon = if ai.ai_canonname.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(ai.ai_canonname)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    // Copy sockaddr into our sockaddr_storage so we can
+                    // reuse unpack_inet_addr.
+                    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                    let copy_len = (ai.ai_addrlen as usize)
+                        .min(core::mem::size_of::<libc::sockaddr_storage>());
+                    std::ptr::copy_nonoverlapping(
+                        ai.ai_addr as *const u8,
+                        &mut storage as *mut _ as *mut u8,
+                        copy_len,
+                    );
+                    let addr = unpack_inet_addr(&storage);
+                    items.push(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(ai.ai_family as i64),
+                        pyre_object::w_int_new(ai.ai_socktype as i64),
+                        pyre_object::w_int_new(ai.ai_protocol as i64),
+                        pyre_object::w_str_new(&canon),
+                        addr,
+                    ]));
+                    cur = ai.ai_next;
+                }
+                libc::freeaddrinfo(res);
+            }
+            Ok(pyre_object::w_list_new(items))
+        }),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "getnameinfo",
+        crate::make_builtin_function_with_arity(
+            "getnameinfo",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "getnameinfo() requires (sockaddr, flags)",
+                    ));
+                }
+                if !unsafe { pyre_object::is_tuple(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "getnameinfo: sockaddr must be a tuple",
+                    ));
+                }
+                if !unsafe { pyre_object::is_int(args[1]) } {
+                    return Err(crate::PyError::type_error(
+                        "getnameinfo: flags must be an integer",
+                    ));
+                }
+                let flags = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::c_int;
+                // Resolve sockaddr via getaddrinfo(AF_UNSPEC, SOCK_DGRAM,
+                // AI_NUMERICHOST) so we get a real sockaddr_storage,
+                // matching `interp_func.py:142-152`.
+                let host_obj = unsafe { pyre_object::w_tuple_getitem(args[0], 0) }
+                    .ok_or_else(|| crate::PyError::value_error("sockaddr: missing host"))?;
+                let port_obj = unsafe { pyre_object::w_tuple_getitem(args[0], 1) }
+                    .ok_or_else(|| crate::PyError::value_error("sockaddr: missing port"))?;
+                if !unsafe { pyre_object::is_str(host_obj) } {
+                    return Err(crate::PyError::type_error(
+                        "getnameinfo: sockaddr[0] must be a string",
+                    ));
+                }
+                if !unsafe { pyre_object::is_int(port_obj) } {
+                    return Err(crate::PyError::type_error(
+                        "getnameinfo: sockaddr[1] must be an integer",
+                    ));
+                }
+                let host = unsafe { pyre_object::w_str_get_value(host_obj).to_string() };
+                let port_v = unsafe { pyre_object::w_int_get_value(port_obj) };
+
+                let c_host = std::ffi::CString::new(host.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in host"))?;
+                let c_port = std::ffi::CString::new(format!("{port_v}")).unwrap();
+
+                let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+                hints.ai_family = libc::AF_UNSPEC;
+                hints.ai_socktype = libc::SOCK_DGRAM;
+                hints.ai_flags = libc::AI_NUMERICHOST;
+                let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+                let rc = unsafe {
+                    libc::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res)
+                };
+                if rc != 0 {
+                    let msg = unsafe {
+                        std::ffi::CStr::from_ptr(libc::gai_strerror(rc))
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    return Err(socket_converted_error("gaierror", Some(rc), &msg));
+                }
+                let head = res;
+                let ai = unsafe { &*head };
+                if !ai.ai_next.is_null() {
+                    unsafe { libc::freeaddrinfo(head) };
+                    return Err(socket_converted_error(
+                        "error",
+                        None,
+                        "sockaddr resolved to multiple addresses",
+                    ));
+                }
+                let mut host_buf = [0i8; libc::NI_MAXHOST as usize];
+                let mut serv_buf = [0i8; 32];
+                let nrc = unsafe {
+                    libc::getnameinfo(
+                        ai.ai_addr,
+                        ai.ai_addrlen,
+                        host_buf.as_mut_ptr(),
+                        host_buf.len() as libc::socklen_t,
+                        serv_buf.as_mut_ptr(),
+                        serv_buf.len() as libc::socklen_t,
+                        flags,
+                    )
+                };
+                unsafe { libc::freeaddrinfo(head) };
+                if nrc != 0 {
+                    let msg = unsafe {
+                        std::ffi::CStr::from_ptr(libc::gai_strerror(nrc))
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    return Err(socket_converted_error("gaierror", Some(nrc), &msg));
+                }
+                let host_s = unsafe {
+                    std::ffi::CStr::from_ptr(host_buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let serv_s = unsafe {
+                    std::ffi::CStr::from_ptr(serv_buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_new(&host_s),
+                    pyre_object::w_str_new(&serv_s),
+                ]))
+            },
+            2,
+        ),
+    );
 }
 
 // ── _socket socket() class implementation ─────────────────────────────
