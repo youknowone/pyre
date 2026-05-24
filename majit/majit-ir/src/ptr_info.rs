@@ -447,6 +447,28 @@ pub enum PtrInfo {
     Str(StrPtrInfo),
 }
 
+/// vstring.py:207-208 / 255-257 / 319-324: enumerate the child OpRefs that
+/// each `StrPtrInfo` variant registers via `_visitor_walk_recursive`.  Used
+/// by the generic walkers (`PtrInfo::visitor_walk_recursive`, `num_fields`)
+/// so Str-typed virtuals participate in GC rooting and resume encoding.
+fn str_child_oprefs(s: &StrPtrInfo) -> Vec<OpRef> {
+    match &s.variant {
+        VStringVariant::Ptr => Vec::new(),
+        VStringVariant::Plain(p) => p._chars.iter().filter_map(|slot| *slot).collect(),
+        VStringVariant::Slice(sl) => vec![sl.s, sl.start, sl.lgtop],
+        VStringVariant::Concat(c) => vec![c.vleft, c.vright],
+    }
+}
+
+fn str_child_count(s: &StrPtrInfo) -> usize {
+    match &s.variant {
+        VStringVariant::Ptr => 0,
+        VStringVariant::Plain(p) => p._chars.len(),
+        VStringVariant::Slice(_) => 3,
+        VStringVariant::Concat(_) => 2,
+    }
+}
+
 impl PtrInfo {
     // ── Constructors (info.py: factory methods) ──
 
@@ -680,6 +702,7 @@ impl PtrInfo {
             PtrInfo::VirtualStruct(v) => v.fields.len(),
             PtrInfo::VirtualArrayStruct(v) => v.element_fields.iter().map(Vec::len).sum(),
             PtrInfo::VirtualRawBuffer(v) => v.buffer.len(),
+            PtrInfo::Str(s) => str_child_count(s),
             _ => 0,
         }
     }
@@ -707,6 +730,12 @@ impl PtrInfo {
                 }
                 refs
             }
+            // vstring.py:207-208 / 255-257 / 319-324: each `StrPtrInfo`
+            // variant registers its child OpRefs via
+            // `_visitor_walk_recursive`. Mirror that here so GC rooting
+            // (`unroll.rs` exported_infos walk) and other generic-walker
+            // consumers see them.
+            PtrInfo::Str(s) => str_child_oprefs(s),
             _ => Vec::new(),
         }
     }
@@ -1189,6 +1218,8 @@ impl PtrInfo {
                 v.items[index] = FieldEntry::Value(value);
             }
             PtrInfo::VirtualArray(v) => {
+                // info.py:568-569 `if self.is_virtual(): return  # bogus
+                // setarrayitem_gc into virtual, drop the operation`.
                 if index < v.items.len() {
                     v.items[index] = value;
                 }

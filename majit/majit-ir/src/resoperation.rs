@@ -1005,9 +1005,11 @@ pub type OpRc = std::rc::Rc<Op>;
 /// A single IR operation.
 ///
 /// Mirrors `rpython/jit/metainterp/resoperation.py:250` `AbstractResOp`.
-/// The `_forwarded` slot (`resoperation.py:235`) lives on `BoxRef`
-/// (`majit-metainterp/src/box.rs`), which is pyre's mirror of RPython's
-/// `AbstractValue` object identity.
+/// The `_forwarded` slot (`resoperation.py:233-242
+/// AbstractResOpOrInputArg._forwarded`) lives directly on this struct in
+/// the [`forwarded`](Op::forwarded) field, matching RPython's
+/// object-identity model: every consumer holding the same `Rc<Op>` reads
+/// and writes the same slot.
 #[derive(Debug)]
 pub struct Op {
     pub opcode: OpCode,

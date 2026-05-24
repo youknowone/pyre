@@ -952,9 +952,22 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             .is_some_and(|info| info.is_virtual())
     }
 
-    fn is_virtual_raw(&self, _opref: OpRef) -> bool {
-        // pyre doesn't have Int-typed virtual objects
-        false
+    fn is_virtual_raw(&self, opref: OpRef) -> bool {
+        // info.py:865 `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
+        // virtuals.  `get_type()` already classifies these as Int; mirror
+        // the classification here so resume encoding (`resume.rs:3672`)
+        // picks them up via TAGVIRTUAL instead of TAGBOX.
+        let resolved_box = self.ctx.get_box_replacement_box(opref);
+        resolved_box
+            .as_ref()
+            .and_then(|b| self.ctx.peek_ptr_info(b))
+            .is_some_and(|info| {
+                matches!(
+                    info,
+                    crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
+                        | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
+                )
+            })
     }
 
     fn has_known_class(&self, opref: OpRef) -> bool {
