@@ -5,7 +5,6 @@
 //! provides a concrete `PyreFieldDescr` implementing majit's
 //! `FieldDescr` trait for pyre's `#[repr(C)]` object layout.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -149,8 +148,8 @@ static NEXT_ARRAY_DESCR_ID: AtomicU32 = AtomicU32::new(0);
 /// `FIELD_DESCR_TAG`.
 const ARRAY_DESCR_ID_MAX: u32 = 1 << 28;
 
-static ARRAY_DESCR_REGISTRY: LazyLock<Mutex<HashMap<ArrayDescrKey, DescrRef>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ARRAY_DESCR_REGISTRY: LazyLock<Mutex<majit_ir::VecAssoc<ArrayDescrKey, DescrRef>>> =
+    LazyLock::new(|| Mutex::new(majit_ir::VecAssoc::new()));
 
 fn alloc_array_descr_id() -> u32 {
     let id = NEXT_ARRAY_DESCR_ID.fetch_add(1, Ordering::Relaxed);
@@ -2373,7 +2372,7 @@ fn simple_field_spec_from_bh(
 /// the closest orthodox behaviour is "each call is a distinct
 /// STRUCT" — mint fresh per call.
 static SIMPLE_DESCR_GROUP_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<u64, majit_ir::descr::SimpleDescrGroup>>,
+    std::sync::Mutex<majit_ir::VecAssoc<u64, majit_ir::descr::SimpleDescrGroup>>,
 > = std::sync::OnceLock::new();
 
 fn simple_descr_group_from_bh_size(
@@ -2416,7 +2415,7 @@ fn simple_descr_group_from_bh_size(
     }
 
     let cache = SIMPLE_DESCR_GROUP_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        .get_or_init(|| std::sync::Mutex::new(majit_ir::VecAssoc::new()));
     {
         let cache = cache.lock().unwrap();
         if let Some(group) = cache.get(&spec.type_id) {
@@ -2425,7 +2424,7 @@ fn simple_descr_group_from_bh_size(
     }
     let group = mint();
     let mut cache = cache.lock().unwrap();
-    cache.entry(spec.type_id).or_insert(group).clone()
+    cache.entry_or_insert_with(spec.type_id, || group).clone()
 }
 
 #[derive(Debug)]
