@@ -787,9 +787,10 @@ fn remap_op_kind(
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(&remap_var).collect(),
         },
-        OpKind::LoadStatic { segments, ty } => OpKind::LoadStatic {
+        OpKind::LoadStatic { segments, ty, value } => OpKind::LoadStatic {
             segments: segments.clone(),
             ty: ty.clone(),
+            value: value.clone(),
         },
     }
 }

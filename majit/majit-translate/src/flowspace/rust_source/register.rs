@@ -4044,16 +4044,21 @@ pub fn extract_unsafe_fn_signatures(
 pub fn extract_static_decls(
     file: &File,
     prefix: &str,
-) -> Vec<(Vec<String>, crate::model::ValueType)> {
+) -> Vec<(
+    Vec<String>,
+    crate::model::ValueType,
+    Option<crate::flowspace::model::ConstValue>,
+)> {
     let mut out = Vec::new();
-    let mut push_entry = |ident: &syn::Ident, ty: &syn::Type| {
+    let mut push_entry = |ident: &syn::Ident, ty: &syn::Type, init: Option<&syn::Expr>| {
         let mut segments = Vec::with_capacity(2);
         if !prefix.is_empty() {
             segments.push(prefix.to_string());
         }
         segments.push(ident.to_string());
         let value_type = crate::front::ast::classify_fn_arg_ty(ty);
-        out.push((segments, value_type));
+        let const_value = init.and_then(eval_literal_init_to_const_value);
+        out.push((segments, value_type, const_value));
     };
     for item in &file.items {
         // `Item::Const` covers crate-level `const X: T = ...` declarations
@@ -4063,8 +4068,8 @@ pub fn extract_static_decls(
         // body-`OpKind::Input`, surface as "adapter cross-block body
         // Input" without a defining link.arg.
         match item {
-            Item::Static(s) => push_entry(&s.ident, &s.ty),
-            Item::Const(c) => push_entry(&c.ident, &c.ty),
+            Item::Static(s) => push_entry(&s.ident, &s.ty, Some(&s.expr)),
+            Item::Const(c) => push_entry(&c.ident, &c.ty, Some(&c.expr)),
             // `thread_local! { static X: T = ...; ... }` expands to a
             // set of TLS-keyed statics; the inner names are
             // single-segment crate-local references that
@@ -4075,7 +4080,7 @@ pub fn extract_static_decls(
             Item::Macro(m) if m.mac.path.is_ident("thread_local") => {
                 if let Ok(body) = syn::parse2::<ThreadLocalBody>(m.mac.tokens.clone()) {
                     for s in &body.statics {
-                        push_entry(&s.ident, &s.ty);
+                        push_entry(&s.ident, &s.ty, Some(&s.expr));
                     }
                 }
             }
@@ -4083,6 +4088,72 @@ pub fn extract_static_decls(
         }
     }
     out
+}
+
+/// Z2.5 Cat 2.1 Slice C — project a `static`/`const` initializer
+/// expression to a `ConstValue` when the RHS is a trivial literal.
+///
+/// PyPy `LOAD_GLOBAL` (`flowspace/flowcontext.py:856`) resolves the
+/// name to the actual host object at flowspace time and pushes a
+/// `Constant(value)`.  The pyre extraction runs at compile time and
+/// has no host-runtime evaluator; the safe subset is literal RHS:
+/// `bool` / integer / float / string literals plus the `const { LIT }`
+/// block wrapper used inside `thread_local!`.  Returns `None` for any
+/// non-literal initializer (function calls, struct constructors,
+/// references, offset_of!, etc.) — the caller falls back to the
+/// `UniStr(joined_path)` sentinel for those, preserving the
+/// pre-Slice-C lowering shape.
+///
+/// Unary `-LIT` is accepted for signed integer / float literals to
+/// match Rust's parse tree (`syn::Expr::Unary { op: Neg, expr: Lit }`).
+fn eval_literal_init_to_const_value(
+    expr: &syn::Expr,
+) -> Option<crate::flowspace::model::ConstValue> {
+    use crate::flowspace::model::ConstValue;
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Bool(b) => Some(ConstValue::Bool(b.value)),
+            syn::Lit::Int(i) => i.base10_parse::<i64>().ok().map(ConstValue::Int),
+            syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(ConstValue::float),
+            syn::Lit::Str(s) => Some(ConstValue::UniStr(s.value())),
+            syn::Lit::ByteStr(b) => Some(ConstValue::ByteStr(b.value())),
+            _ => None,
+        },
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => match inner.as_ref() {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(i),
+                ..
+            }) => i.base10_parse::<i64>().ok().map(|v| ConstValue::Int(-v)),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Float(f),
+                ..
+            }) => f
+                .base10_parse::<f64>()
+                .ok()
+                .map(|v| ConstValue::float(-v)),
+            _ => None,
+        },
+        // `thread_local! { static X: T = const { LIT }; }` — the
+        // initializer wraps a literal in a `syn::Expr::Const` block.
+        // Plain `syn::Expr::Block` is also accepted for static
+        // initializers that compute the value inside a non-const
+        // block (rare; `unsafe { LIT }` and `{ LIT }` shapes).
+        syn::Expr::Const(syn::ExprConst { block, .. })
+        | syn::Expr::Block(syn::ExprBlock { block, .. })
+            if block.stmts.len() == 1 =>
+        {
+            if let syn::Stmt::Expr(e, None) = &block.stmts[0] {
+                eval_literal_init_to_const_value(e)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// `thread_local! { ... }` body parser — accepts a sequence of
@@ -9051,6 +9122,44 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         // `LazyLock<...>` is not in the `Box | Rc | Arc` unwrap list;
         // also falls through to Ref.
         assert_eq!(decls[1].1, ValueType::Ref);
+        // Non-literal RHS: `ConstValue` resolution falls back to `None`,
+        // adapter retains the `UniStr(joined)` sentinel.
+        assert!(decls[0].2.is_none());
+        assert!(decls[1].2.is_none());
+    }
+
+    #[test]
+    fn extract_static_decls_literal_rhs_resolves_const_value() {
+        use crate::flowspace::model::ConstValue;
+        let file = parse_file(
+            "pub const I: i64 = 42;
+             pub const NEG: i32 = -7;
+             pub const B: bool = false;
+             pub const F: f64 = 1.5;
+             pub const S: &str = \"hi\";",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 5);
+        assert_eq!(decls[0].2, Some(ConstValue::Int(42)));
+        assert_eq!(decls[1].2, Some(ConstValue::Int(-7)));
+        assert_eq!(decls[2].2, Some(ConstValue::Bool(false)));
+        assert_eq!(decls[3].2, Some(ConstValue::float(1.5)));
+        assert_eq!(decls[4].2, Some(ConstValue::UniStr("hi".to_string())));
+    }
+
+    #[test]
+    fn extract_static_decls_thread_local_const_literal_resolves() {
+        use crate::flowspace::model::ConstValue;
+        // `thread_local! { static X: T = const { LIT }; }` — the
+        // `const { ... }` block wrapper unwraps to the inner literal.
+        let file = parse_file(
+            "thread_local! {\n\
+                 static FLAG: bool = const { true };\n\
+             }",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].2, Some(ConstValue::Bool(true)));
     }
 
     #[test]
@@ -9078,13 +9187,13 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         );
         let names: Vec<String> = decls
             .iter()
-            .map(|(seg, _)| seg.last().cloned().unwrap())
+            .map(|(seg, _, _)| seg.last().cloned().unwrap())
             .collect();
         assert!(names.contains(&"CALL_DEPTH".to_string()));
         assert!(names.contains(&"SHADOW_STACK".to_string()));
         // Compound types fall through to `ValueType::Ref` per the
         // `compound_type_classifies_as_ref` invariant.
-        assert!(decls.iter().all(|(_, ty)| matches!(ty, ValueType::Ref)));
+        assert!(decls.iter().all(|(_, ty, _)| matches!(ty, ValueType::Ref)));
     }
 
     #[test]
@@ -9117,7 +9226,7 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
             2,
             "Item::Static and Item::Const contribute; fn/struct/enum ignored",
         );
-        let names: Vec<String> = decls.iter().map(|(seg, _)| seg[0].clone()).collect();
+        let names: Vec<String> = decls.iter().map(|(seg, _, _)| seg[0].clone()).collect();
         assert!(names.contains(&"C".to_string()));
         assert!(names.contains(&"S".to_string()));
     }

@@ -3934,14 +3934,27 @@ thread_local! {
     /// distinct catalogue entries.  Populated by
     /// `populate_known_statics` from `analyze_pipeline_from_parsed`
     /// before the semantic build runs.  Read-only during `lower_expr`.
+    ///
+    /// Slice C: the value side carries an `Option<ConstValue>`
+    /// resolved from literal initializers at extract time.  `Some`
+    /// flows to the adapter as the concrete `Constant(value)` that
+    /// PyPy `LOAD_GLOBAL` would push; `None` retains the legacy
+    /// `UniStr(joined_path)` sentinel for non-literal RHS (function
+    /// calls, host constructors, expression RHS).
     pub(crate) static KNOWN_STATICS: std::cell::RefCell<
-        std::collections::HashMap<String, ValueType>,
+        std::collections::HashMap<
+            String,
+            (
+                ValueType,
+                Option<crate::flowspace::model::ConstValue>,
+            ),
+        >,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Z2.5 Cat 2.1 — install the static catalogue into the per-thread
 /// `KNOWN_STATICS` cell before semantic build runs.  `decls` is the
-/// flat list `[(segments, ty)]` produced by
+/// flat list `[(segments, ty, value)]` produced by
 /// `flowspace::rust_source::register::extract_static_decls`; each
 /// entry is published exactly once under its joined `::`-path.
 ///
@@ -3950,15 +3963,21 @@ thread_local! {
 /// last-writer-wins, breaking PyPy's per-module globals identity.
 /// Single-segment reads at the `lower_expr` lookup site must now
 /// qualify via `module_prefix` / `use_imports` before the lookup.
-pub fn populate_known_statics(decls: &[(Vec<String>, ValueType)]) {
+pub fn populate_known_statics(
+    decls: &[(
+        Vec<String>,
+        ValueType,
+        Option<crate::flowspace::model::ConstValue>,
+    )],
+) {
     KNOWN_STATICS.with(|cell| {
         let mut m = cell.borrow_mut();
         m.clear();
-        for (segments, ty) in decls {
+        for (segments, ty, value) in decls {
             if segments.is_empty() {
                 continue;
             }
-            m.insert(segments.join("::"), ty.clone());
+            m.insert(segments.join("::"), (ty.clone(), value.clone()));
         }
     });
 }
@@ -5972,21 +5991,53 @@ fn lower_expr(
             } else {
                 None
             };
-            let known_static_ty: Option<(String, ValueType)> =
-                qualified_lookup_key.as_ref().and_then(|key| {
-                    KNOWN_STATICS.with(|m| m.borrow().get(key).cloned().map(|ty| (key.clone(), ty)))
-                });
-            if let Some((qualified_key, static_ty)) = known_static_ty {
-                let segments: Vec<String> =
-                    qualified_key.split("::").map(|s| s.to_string()).collect();
-                let value_var = graph.push_op_var(
-                    *block,
+            let known_static_entry: Option<(
+                String,
+                ValueType,
+                Option<crate::flowspace::model::ConstValue>,
+            )> = qualified_lookup_key.as_ref().and_then(|key| {
+                KNOWN_STATICS.with(|m| {
+                    m.borrow()
+                        .get(key)
+                        .cloned()
+                        .map(|(ty, value)| (key.clone(), ty, value))
+                })
+            });
+            if let Some((qualified_key, static_ty, static_value)) = known_static_entry {
+                // Slice C: when the static's RHS resolves to a primitive
+                // literal `ConstValue` whose declared `ValueType` matches
+                // pyre's `OpKind::Const{Int,Bool,Float}` shape, emit the
+                // dedicated constant op directly — the same lowering
+                // PyPy `LOAD_GLOBAL` performs by pushing `Constant(value)`
+                // onto the value stack.  This bypasses `OpKind::
+                // LoadStatic` entirely for primitive literals, removing
+                // them from the post-jtransform `same_as` JITCode
+                // emission that the blackhole interp lacks a handler
+                // for (Task #85 snapshot drift).  Non-primitive
+                // values (`UniStr` / `ByteStr` / `None`-resolved) keep
+                // the `LoadStatic` carrier so the cross-block defining-
+                // var constraint stays satisfied while the typed
+                // host-evaluator infrastructure for the remaining
+                // shapes lands.
+                use crate::flowspace::model::ConstValue;
+                let const_op_kind: Option<OpKind> = match (&static_ty, &static_value) {
+                    (ValueType::Bool, Some(ConstValue::Bool(b))) => Some(OpKind::ConstBool(*b)),
+                    (ValueType::Int, Some(ConstValue::Int(i))) => Some(OpKind::ConstInt(*i)),
+                    (ValueType::Float, Some(ConstValue::Float(bits))) => {
+                        Some(OpKind::ConstFloat(*bits))
+                    }
+                    _ => None,
+                };
+                let op_kind = const_op_kind.unwrap_or_else(|| {
+                    let segments: Vec<String> =
+                        qualified_key.split("::").map(|s| s.to_string()).collect();
                     OpKind::LoadStatic {
                         segments,
                         ty: static_ty,
-                    },
-                    true,
-                );
+                        value: static_value,
+                    }
+                });
+                let value_var = graph.push_op_var(*block, op_kind, true);
                 if let Some(ref var) = value_var {
                     ctx.bind_local_id_var(name.clone(), var, graph, *block);
                 }

@@ -769,18 +769,27 @@ pub fn translate_op(
         // `checkgraph` defining-var set requires every operand to
         // trace to an op result or `Block.inputargs`).
         //
-        // The arg side carries a string sentinel `UniStr(segments)`
-        // — the rtyper's `same_as` arm (`rtyper.rs::translate_op
-        // "same_as"`) treats this as identity and binds the result
-        // Variable to the same constant; the concrete static address
-        // resolution is deferred to a future slice (rclass /
-        // jit_codewriter consume the same OpKind variant via the
-        // `static_decls` carrier on `CallControl`).
-        OpKind::LoadStatic { segments, .. } => {
-            let sentinel =
-                Hlvalue::Constant(Constant::new(ConstValue::UniStr(segments.join("::"))));
+        // Slice C: when `extract_static_decls` could fold the static's
+        // RHS to a `ConstValue` (`bool` / integer / float / string
+        // literals + `const { LIT }` block wrapper), the adapter
+        // emits `same_as(Constant(value))` — the concrete `Constant`
+        // shape PyPy `LOAD_GLOBAL` pushes.  For unresolved RHS
+        // (host calls, `LazyLock::new(...)`, `std::ptr::null_mut()`,
+        // struct ctors, etc.) the adapter falls back to a
+        // `UniStr(joined_path)` sentinel — the rtyper's `same_as`
+        // arm (`rtyper.rs::translate_op "same_as"`) still treats
+        // both shapes as identity, but only the resolved-value
+        // arm matches the upstream `Constant(value)` payload
+        // contract.
+        OpKind::LoadStatic {
+            segments, value, ..
+        } => {
+            let constant = match value {
+                Some(v) => Hlvalue::Constant(Constant::new(v.clone())),
+                None => Hlvalue::Constant(Constant::new(ConstValue::UniStr(segments.join("::")))),
+            };
             let result = resolve_result_hlvalue(op, value_map, graph)?;
-            Ok(vec![FlowspaceOp::new("same_as", vec![sentinel], result)])
+            Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
         }
 
         // ─── Pre-rtyper opname normalization ───

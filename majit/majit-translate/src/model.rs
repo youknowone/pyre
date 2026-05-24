@@ -924,9 +924,24 @@ pub enum OpKind {
     /// looked up by `LOAD_GLOBAL`.  The `segments` field carries the
     /// fully-qualified path (`["module_path", "STATIC_NAME"]`)
     /// matching the upstream lookup key shape.
+    ///
+    /// Slice C — `value` carries the literal-evaluated initializer
+    /// when `extract_static_decls` could fold the RHS to a
+    /// `ConstValue` (bool/int/float/string literals, including the
+    /// `-LIT` unary-neg shape and the `thread_local!` `const { LIT }`
+    /// wrapper).  `Some(v)` reaches the flowspace adapter as the
+    /// concrete `Constant(v)` operand of the synthetic `same_as` op,
+    /// matching PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) pushing the
+    /// resolved object.  `None` retains the legacy `UniStr(joined)`
+    /// sentinel for non-literal RHS (host calls, struct ctors,
+    /// `LazyLock::new(...)`, `std::ptr::null_mut()`, etc.); those
+    /// still surface as the `same_as/>i` / `same_as/>r` unwired
+    /// snapshot entry in `default_bh_builder_unwired_set_matches_
+    /// task_85_snapshot` pending host-evaluator infrastructure.
     LoadStatic {
         segments: Vec<String>,
         ty: ValueType,
+        value: Option<crate::flowspace::model::ConstValue>,
     },
 }
 

@@ -441,7 +441,11 @@ fn analyze_pipeline_from_parsed(
     // codewriter-side adapter consumer; deduplicating to a single
     // walk would couple the call-control population to semantic build
     // order, so the publish is kept as a cheap pre-pass.
-    let early_static_decls: Vec<(Vec<String>, crate::model::ValueType)> = parsed_files
+    let early_static_decls: Vec<(
+        Vec<String>,
+        crate::model::ValueType,
+        Option<crate::flowspace::model::ConstValue>,
+    )> = parsed_files
         .iter()
         .flat_map(|parsed| {
             crate::flowspace::rust_source::register::extract_static_decls(
