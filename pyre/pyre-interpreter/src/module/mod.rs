@@ -6,6 +6,8 @@
 pub mod __builtin__;
 pub mod _io;
 #[allow(non_snake_case)]
+pub mod _ctypes;
+#[allow(non_snake_case)]
 pub mod _socket;
 pub mod _sre;
 pub mod _weakref;
