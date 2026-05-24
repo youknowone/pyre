@@ -350,14 +350,9 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let argloc = self.loc(arg, Type::Int);
-        let resloc = self.rm.force_allocate_reg(
-            dst,
-            &[],
-            None,
-            false,
-            &mut self.longevity,
-            &mut self.fm,
-        );
+        let resloc =
+            self.rm
+                .force_allocate_reg(dst, &[], None, false, &mut self.longevity, &mut self.fm);
         self.perform(i, vec![argloc], Some(Loc::Reg(resloc)), output);
     }
 
@@ -389,8 +384,7 @@ impl<'a> RegAlloc<'a> {
             "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
         );
         assert!(
-            !matches!(l1, Loc::Reg(r) if r.value == EAX.value)
-                || arg1 == arg2,
+            !matches!(l1, Loc::Reg(r) if r.value == EAX.value) || arg1 == arg2,
             "consider_uint_mul_high_j2: l1==eax only allowed when arg1 is arg2"
         );
         self.possibly_free_var(arg2, Type::Int);
