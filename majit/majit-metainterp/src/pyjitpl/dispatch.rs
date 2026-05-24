@@ -5806,34 +5806,60 @@ pub fn build_state_field_snapshot(
     // requiring `OpRef::ty()` to be `Some` rather than silently dropping
     // misshapen entries (which would shrink the snapshot relative to
     // upstream and desync the resume reader).
-    let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
-    if !virtualizable_boxes.is_empty() {
-        let last = virtualizable_boxes.last().copied().unwrap();
-        let last_ty = last
-            .ty()
-            .expect("build_state_field_snapshot: virtualizable identity must be typed");
-        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
-        for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
-            let ty = opref
-                .ty()
-                .expect("build_state_field_snapshot: virtualizable_boxes entry must be typed");
-            vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
-        }
-    }
-    let vref_boxes_snap: Vec<crate::recorder::SnapshotTagged> = virtualref_boxes
-        .iter()
-        .map(|(opref, _ptr)| {
-            let ty = opref
-                .ty()
-                .expect("build_state_field_snapshot: virtualref_boxes entry must be typed");
-            crate::recorder::SnapshotTagged::Box(*opref, ty)
-        })
-        .collect();
+    let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes);
+    let vref_boxes_snap = build_vref_snapshot_boxes(virtualref_boxes);
     crate::recorder::Snapshot {
         frames: snapshot_frames,
         vable_boxes: vable_boxes_snap,
         vref_boxes: vref_boxes_snap,
     }
+}
+
+/// `opencoder.py:718-726 _list_of_boxes_virtualizable` parity: identity-front
+/// reorder for the virtualizable box list.  `virtualizable_boxes[-1]` is the
+/// virtualizable identity (placed there by
+/// `TraceCtx::init_virtualizable_boxes`); the snapshot moves it to slot 0 so
+/// the resume reader's `consume_vable_info` (`resume.rs:6477`, mirroring
+/// `resume.py:1404`) reads the identity first.  Each entry must carry
+/// `OpRef::ty()`; misshapen entries panic rather than silently shrink the
+/// snapshot relative to upstream.
+pub fn build_vable_snapshot_boxes(
+    virtualizable_boxes: &[OpRef],
+) -> Vec<crate::recorder::SnapshotTagged> {
+    let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
+    if !virtualizable_boxes.is_empty() {
+        let last = virtualizable_boxes.last().copied().unwrap();
+        let last_ty = last
+            .ty()
+            .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
+        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
+        for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
+            let ty = opref
+                .ty()
+                .expect("build_vable_snapshot_boxes: virtualizable_boxes entry must be typed");
+            vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
+        }
+    }
+    vable_boxes_snap
+}
+
+/// `opencoder.py:712-717 _list_of_boxes` parity for the virtualref array.
+/// `virtualref_boxes` carries `(opref, ptr)` pairs (`TraceCtx::virtualref_boxes`);
+/// the snapshot keeps the opref order verbatim — the resume reader walks the
+/// pairs in `consume_virtualref_info` (`resume.py:1417`).  As with vable, every
+/// entry must carry `OpRef::ty()`.
+pub fn build_vref_snapshot_boxes(
+    virtualref_boxes: &[(OpRef, usize)],
+) -> Vec<crate::recorder::SnapshotTagged> {
+    virtualref_boxes
+        .iter()
+        .map(|(opref, _ptr)| {
+            let ty = opref
+                .ty()
+                .expect("build_vref_snapshot_boxes: virtualref_boxes entry must be typed");
+            crate::recorder::SnapshotTagged::Box(*opref, ty)
+        })
+        .collect()
 }
 
 #[cfg(test)]
