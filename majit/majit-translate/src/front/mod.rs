@@ -112,6 +112,7 @@ pub mod ast;
 pub mod mir;
 pub mod raise;
 pub mod semantic;
+pub mod syn_metadata;
 
 pub use ast::{
     build_semantic_program, build_semantic_program_from_parsed_files,
