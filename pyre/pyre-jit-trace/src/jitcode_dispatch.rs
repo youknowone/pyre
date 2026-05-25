@@ -8218,6 +8218,22 @@ mod tests {
                             }
                         }
                     }
+                } else if op.key.starts_with("residual_call_") {
+                    let descr_byte_offset = op.next_pc - 3;
+                    let didx = u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]]) as usize;
+                    if let Some(d) = descrs.get(didx) {
+                        let cd = d.as_calldescr();
+                        let ei = &cd.extra_info;
+                        eprintln!(
+                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?} elidable={} canraise={}",
+                            cd.arg_classes,
+                            cd.result_type,
+                            ei.extraeffect,
+                            ei.oopspecindex,
+                            ei.check_is_elidable(),
+                            ei.check_can_raise(false),
+                        );
+                    }
                 }
             }
         }
