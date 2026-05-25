@@ -2377,12 +2377,22 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let cfd = unsafe {
-                    libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
+                let cfd = loop {
+                    let r = unsafe {
+                        libc::accept(
+                            fd,
+                            &mut storage as *mut _ as *mut libc::sockaddr,
+                            &mut slen,
+                        )
+                    };
+                    if r >= 0 {
+                        break r;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
                 };
-                if cfd < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
                 // `rsocket.py:RSocket._accept` returns the new fd with
                 // FD_CLOEXEC set (rsocket uses accept4(SOCK_CLOEXEC) on
                 // Linux; we use the portable fcntl path).
@@ -2412,12 +2422,22 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let fd = socket_fd(obj)?;
                 let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let cfd = unsafe {
-                    libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
+                let cfd = loop {
+                    let r = unsafe {
+                        libc::accept(
+                            fd,
+                            &mut storage as *mut _ as *mut libc::sockaddr,
+                            &mut slen,
+                        )
+                    };
+                    if r >= 0 {
+                        break r;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
                 };
-                if cfd < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
                 unsafe {
                     libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
@@ -2444,11 +2464,17 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let (storage, slen) = pack_inet_addr(family, args[1])?;
-                let r = unsafe {
-                    libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
-                };
-                if r != 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                loop {
+                    let r = unsafe {
+                        libc::connect(fd, &storage as *const _ as *const libc::sockaddr, slen)
+                    };
+                    if r == 0 {
+                        break;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
                 }
                 Ok(pyre_object::w_none())
             },
