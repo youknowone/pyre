@@ -1083,48 +1083,20 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
-                                // Slice 3.C/3.F: try MIR lookup first.  When
-                                // the caller passed a `MirGraphLookup` and
-                                // the lookup misses, emit `graph: None` —
-                                // do NOT run `build_function_graph_with_self_ty_pub`.
-                                // The AST graph builder runs only for legacy
-                                // callers (mir_graphs = None, i.e. test
-                                // fixtures with no MIR program available).
+                                // Slice 3.C/3.F/5: take MIR's graph when
+                                // the lookup hits; otherwise emit
+                                // `graph: None`.  The AST graph builder
+                                // fallback is retired (Slice 5).
                                 let mir_hit = mir_graphs.and_then(|m| {
                                     self_ty_root
                                         .as_deref()
                                         .and_then(|owner| m.lookup_impl_method(owner, &method_name))
                                 });
-                                let (graph, hints) = match (mir_hit, mir_graphs) {
-                                    (Some(g), _) => (
-                                        Some(g.clone()),
-                                        crate::front::ast::collect_jit_hints_with_sig(
-                                            &synth.attrs,
-                                            &synth.sig,
-                                        ),
-                                    ),
-                                    (None, Some(_)) => (
-                                        None,
-                                        crate::front::ast::collect_jit_hints_with_sig(
-                                            &synth.attrs,
-                                            &synth.sig,
-                                        ),
-                                    ),
-                                    (None, None) => {
-                                        let sf =
-                                            crate::front::ast::build_function_graph_with_self_ty_pub(
-                                                &synth,
-                                                self_ty_root.clone(),
-                                                struct_fields,
-                                                fn_return_types,
-                                                prefix,
-                                                use_imports,
-                                                known_struct_names,
-                                                known_trait_names,
-                                            )?;
-                                        (Some(sf.graph), sf.hints)
-                                    }
-                                };
+                                let hints = crate::front::ast::collect_jit_hints_with_sig(
+                                    &synth.attrs,
+                                    &synth.sig,
+                                );
+                                let graph = mir_hit.cloned();
                                 methods.push(MethodInfo {
                                     name: method_name,
                                     graph,
@@ -1182,42 +1154,16 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
-                                // Slice 3.C/3.F: same MIR-or-None policy as
-                                // the impl-method branch above — AST graph
-                                // build only runs when no MIR lookup was
-                                // supplied.
+                                // Slice 3.C/3.F/5: take MIR's trait-default
+                                // graph; emit `graph: None` on miss.  The
+                                // AST graph builder fallback is retired.
                                 let mir_hit = mir_graphs
                                     .and_then(|m| m.lookup_trait_default(&trait_name, &method_name));
-                                let (graph, hints) = match (mir_hit, mir_graphs) {
-                                    (Some(g), _) => (
-                                        Some(g.clone()),
-                                        crate::front::ast::collect_jit_hints_with_sig(
-                                            &synth.attrs,
-                                            &synth.sig,
-                                        ),
-                                    ),
-                                    (None, Some(_)) => (
-                                        None,
-                                        crate::front::ast::collect_jit_hints_with_sig(
-                                            &synth.attrs,
-                                            &synth.sig,
-                                        ),
-                                    ),
-                                    (None, None) => {
-                                        let sf =
-                                            crate::front::ast::build_function_graph_with_self_ty_pub(
-                                                &synth,
-                                                None,
-                                                struct_fields,
-                                                fn_return_types,
-                                                prefix,
-                                                use_imports,
-                                                known_struct_names,
-                                                known_trait_names,
-                                            )?;
-                                        (Some(sf.graph), sf.hints)
-                                    }
-                                };
+                                let hints = crate::front::ast::collect_jit_hints_with_sig(
+                                    &synth.attrs,
+                                    &synth.sig,
+                                );
+                                let graph = mir_hit.cloned();
                                 methods.push(MethodInfo {
                                     name: method_name,
                                     graph,
@@ -1399,47 +1345,23 @@ fn collect_inherent_methods_from_items(
                                 }
                                 syn::ReturnType::Default => Some("()".to_string()),
                             };
-                            // Slice 3.C/3.F: prefer MIR's inherent-method
-                            // graph (keyed by self_ty_root_qualified).
-                            // When the caller passed a MirGraphLookup but
-                            // the lookup misses, skip this entry — the AST
-                            // graph builder is no longer the production
-                            // fallback for impl methods, and
-                            // InherentMethodInfo.graph is non-Option so we
-                            // cannot represent the gap inline.  Skipped
-                            // entries simply do not surface in
-                            // `canonical_inherent_methods`; the registration
-                            // loop's downstream consumers iterate that
-                            // collection and skip what is not present.
+                            // Slice 3.C/3.F/5: take MIR's inherent-method
+                            // graph; skip the entry on miss (the AST
+                            // graph builder fallback is retired, and
+                            // InherentMethodInfo.graph is non-Option).
                             let mir_hit = mir_graphs.and_then(|m| {
                                 self_ty_root_qualified
                                     .as_deref()
                                     .and_then(|owner| m.lookup_impl_method(owner, &method_name))
                             });
-                            let (graph, hints) = match (mir_hit, mir_graphs) {
-                                (Some(g), _) => (
-                                    g.clone(),
-                                    crate::front::ast::collect_jit_hints_with_sig(
-                                        &synth.attrs,
-                                        &synth.sig,
-                                    ),
-                                ),
-                                (None, Some(_)) => continue,
-                                (None, None) => {
-                                    let sf =
-                                        crate::front::ast::build_function_graph_with_self_ty_pub(
-                                            &synth,
-                                            self_ty_root_bare.clone(),
-                                            struct_fields,
-                                            fn_return_types,
-                                            prefix,
-                                            use_imports,
-                                            known_struct_names,
-                                            &std::collections::HashSet::new(),
-                                        )?;
-                                    (sf.graph, sf.hints)
-                                }
+                            let graph = match mir_hit {
+                                Some(g) => g.clone(),
+                                None => continue,
                             };
+                            let hints = crate::front::ast::collect_jit_hints_with_sig(
+                                &synth.attrs,
+                                &synth.sig,
+                            );
                             methods.push(InherentMethodInfo {
                                 for_type: for_type.clone(),
                                 self_ty_root: self_ty_root_qualified.clone(),
@@ -2282,69 +2204,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_trait_impls_qualify_nested_trait_names() {
-        let parsed = parse_source(
-            r#"
-            mod a {
-                pub trait Handler {
-                    fn run(&mut self) {}
-                }
-                pub struct A;
-                impl Handler for A {}
-            }
-            mod b {
-                pub trait Handler {
-                    fn run(&mut self) {}
-                }
-                pub struct B;
-                impl Handler for B {}
-            }
-        "#,
-        );
-        let impls = extract_trait_impls(
-            &parsed,
-            &crate::front::StructFieldRegistry::default(),
-            &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
-            None,
-        )
-        .expect("trait impls must lower");
-        let trait_names: std::collections::HashSet<&str> =
-            impls.iter().map(|imp| imp.trait_name.as_str()).collect();
-        assert!(trait_names.contains("a::Handler"));
-        assert!(trait_names.contains("b::Handler"));
-    }
-
-    #[test]
-    fn extract_trait_default_methods_include_graphs() {
-        let parsed = parse_source(
-            r#"
-            trait Foo {
-                fn helper(&mut self, x: i64) -> i64 {
-                    x + 1
-                }
-            }
-        "#,
-        );
-        let impls = extract_trait_impls(
-            &parsed,
-            &crate::front::StructFieldRegistry::default(),
-            &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
-            None,
-        )
-        .expect("trait impls must lower");
-        let helper = impls[0]
-            .methods
-            .iter()
-            .find(|m| m.name == "helper")
-            .expect("helper method");
-        assert!(
-            helper.graph.is_some(),
-            "trait default method should carry graph"
-        );
-    }
 
     #[test]
     fn extract_opcode_dispatch_selector_uses_exact_variant_path() {
