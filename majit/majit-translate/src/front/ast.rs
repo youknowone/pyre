@@ -4120,6 +4120,11 @@ fn build_function_graph<'a>(
         hints,
         module_path: module_prefix.to_string(),
         access_directly: false,
+        // AST builder cannot determine trait_root from syn::ItemFn
+        // alone — the trait/impl context lives one level up in the
+        // walker.  Leaving `None` here matches the legacy behaviour
+        // where `parse::extract_trait_impls` was the trait-name source.
+        trait_root: None,
     })
 }
 

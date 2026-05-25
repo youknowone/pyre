@@ -400,6 +400,7 @@ mod tests {
             hints: hints.into_iter().map(|h| h.to_string()).collect(),
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         }
     }
 
@@ -448,6 +449,7 @@ mod tests {
             hints: vec![],
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
         assert!(!policy.look_inside_graph(&loopy));
@@ -462,6 +464,7 @@ mod tests {
             hints: vec!["unroll_safe".into()],
             module_path: String::new(),
             access_directly: false,
+            trait_root: None,
         };
         assert!(policy.look_inside_graph(&unroll_safe));
     }

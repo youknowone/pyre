@@ -256,6 +256,12 @@ pub fn build_semantic_program_from_llbc(
         // registration loop and the impl-key return-type / hint
         // registrations get dropped.
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+        // Step 6.E follow-up: surface trait identity for trait-impl
+        // methods so the canonical registration loop can call
+        // `register_trait_method` instead of routing through
+        // `extract_trait_impls`.  Inherent impls leave `trait_root =
+        // None`; trait-impl methods carry the trait's leaf name.
+        let trait_root = trait_impl_trait_root_for_fundecl(llbc, fd);
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
@@ -264,6 +270,7 @@ pub fn build_semantic_program_from_llbc(
             module_path,
             hints: Vec::new(),
             access_directly: false,
+            trait_root,
         });
     }
     if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !skipped.is_empty() {
@@ -1670,6 +1677,59 @@ fn resolve_impl_owner_adt_def_id_free(
         return resolve_tyexpr_to_adt_def_id_free(llbc, first_ty);
     }
     None
+}
+
+/// When `fd` is a trait-impl method (i.e. its NameSeg's penultimate
+/// segment is an `Impl` with a `{"Trait": <trait_impl_id>}` payload),
+/// return the implemented trait's leaf identifier.  Returns `None`
+/// for free functions, inherent impl methods, and trait default
+/// bodies (those carry the trait name directly in `name_path()`'s
+/// penultimate segment, so the caller can read it through
+/// [`trait_method_owner`] without a `trait_impls` indirection).
+///
+/// Used by `build_semantic_program_from_llbc` to populate
+/// `SemanticFunction.trait_root` so the canonical registration loop
+/// can call `CallControl::register_trait_method` instead of routing
+/// through the AST-side `extract_trait_impls`.
+fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let trait_impl_id = impl_payload
+        .as_object()?
+        .get("Trait")
+        .and_then(serde_json::Value::as_u64)?;
+    let trait_impls = llbc
+        .file
+        .translated
+        .rest
+        .get("trait_impls")?
+        .as_array()?;
+    let ti = trait_impls.get(trait_impl_id as usize)?;
+    let trait_id = ti
+        .as_object()?
+        .get("impl_trait")?
+        .as_object()?
+        .get("trait_id")?
+        .as_u64()?;
+    let td = llbc.trait_by_id(trait_id)?;
+    let trait_leaf = td
+        .item_meta
+        .name_path()
+        .rsplit("::")
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if trait_leaf.is_empty() {
+        return None;
+    }
+    Some(trait_leaf)
 }
 
 /// Free-function version of [`Lowering::resolve_tyexpr_to_adt_def_id`].

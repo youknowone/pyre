@@ -2807,6 +2807,7 @@ impl CallControl {
                         hints,
                         module_path: String::new(),
                         access_directly: false,
+                        trait_root: None,
                     };
                     if policy.look_inside_graph(&func) {
                         self.candidate_graphs.insert(callee_path.clone());

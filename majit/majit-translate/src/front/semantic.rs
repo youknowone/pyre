@@ -88,6 +88,19 @@ pub struct SemanticFunction {
     /// `policy.py:71-83` virtualizable safety gate without reaching back
     /// into the PyGraph layer.
     pub access_directly: bool,
+    /// Trait name when this function is an `impl Trait for Type {…}`
+    /// method, the trait's name when this is a trait default-body
+    /// method, otherwise `None` (free function or inherent impl).
+    ///
+    /// Added 2026-05-25 as the missing piece for Step 6.E:
+    /// `parse::extract_trait_impls` currently carries the trait_name
+    /// in a parallel `TraitImplInfo` record so the registration loop
+    /// in `lib.rs:905-1019` can distinguish trait-impl methods (which
+    /// need `register_trait_method`) from inherent methods (which
+    /// need `register_function_graph`).  Surfacing it here lets that
+    /// loop walk `program.functions` directly and the AST-side
+    /// extractors retire.
+    pub trait_root: Option<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
