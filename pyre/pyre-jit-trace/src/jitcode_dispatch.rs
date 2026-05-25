@@ -8427,6 +8427,59 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_push_exc_info_arm_bytes() {
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        let jc = jitcode_for_instruction(&Instruction::PushExcInfo)
+            .expect("PushExcInfo must resolve to an arm jitcode");
+        let code = jc.code.as_slice();
+        eprintln!(
+            "PushExcInfo arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
+            jc.name,
+            jc.num_regs_r(),
+            jc.num_regs_i(),
+            jc.num_regs_f(),
+            code.len(),
+        );
+        let descrs = all_descrs();
+        for op in decoded_ops(code) {
+            let operand_bytes = &code[op.pc + 1..op.next_pc];
+            eprintln!(
+                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                op.pc, op.next_pc, op.key, operand_bytes,
+            );
+            let mut cursor = 0usize;
+            let mut chars = op.argcodes.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'L' => cursor += 2,
+                    'd' | 'j' => {
+                        let idx =
+                            u16::from_le_bytes([operand_bytes[cursor], operand_bytes[cursor + 1]])
+                                as usize;
+                        let info = descrs
+                            .get(idx)
+                            .map(|d| format!("{:?}", d))
+                            .unwrap_or_else(|| "<oor>".to_string());
+                        eprintln!("      descr[{idx}] = {info}");
+                        cursor += 2;
+                    }
+                    'I' | 'R' | 'F' => {
+                        let n = operand_bytes[cursor] as usize;
+                        cursor += 1 + n;
+                    }
+                    '>' => {
+                        chars.next();
+                        cursor += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_exit_init_check_arm_bytes() {
         use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
         let jc = jitcode_for_instruction(&Instruction::ExitInitCheck)
