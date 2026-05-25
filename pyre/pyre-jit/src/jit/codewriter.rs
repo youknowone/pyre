@@ -1850,9 +1850,16 @@ fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValu
 fn exception_edge_vars(
     graph: &mut super::flow::FunctionGraph,
 ) -> (super::flow::Variable, super::flow::Variable) {
+    // `last_exception/>i` (Kind::Int) + `last_exc_value/>r` (Kind::Ref)
+    // per `assembler.py:220`.  Matches the walker emit at
+    // `codewriter.rs:4491` / `:4509` and the fixture etype/evalue kinds
+    // at `flatten.rs:5495-5496` / `:7649-7650`.  Untyped Variables
+    // crash the canonical SSARepr build's `regalloc_color` when an
+    // exception edge propagates them into a colored slot
+    // (raise_catch_loop reproducer 2026-05-25).
     (
-        graph.fresh_untyped_variable(),
-        graph.fresh_untyped_variable(),
+        graph.fresh_variable(Kind::Int),
+        graph.fresh_variable(Kind::Ref),
     )
 }
 
