@@ -85,6 +85,7 @@ fn collect_all_trait_impls() -> Vec<TraitImplInfo> {
                 &program.struct_fields,
                 &program.fn_return_types,
                 &program.known_struct_names,
+                None,
             )
             .expect("pyre source must lower"),
         );

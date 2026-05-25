@@ -281,6 +281,52 @@ pub fn qualify_module_path(module_path: &str, nested: &str) -> String {
     }
 }
 
+/// Step 6.E Slice 3.C — graph lookup table built from a
+/// `SemanticProgram` so the AST-side `extract_trait_impls` /
+/// `extract_inherent_impl_methods` collectors can skip
+/// `build_function_graph_with_self_ty_pub` when the MIR builder already
+/// produced a graph for the same (impl_type or trait_root, method)
+/// pair.  Cuts the largest single AST-graph-builder consumer in the
+/// MIR-covered surface and is a prerequisite for retiring the
+/// AST graph builder bulk under issue #97 Step 6.F.
+pub struct MirGraphLookup<'a> {
+    /// Impl methods (inherent + trait-impl): keyed by (self_ty_root, name).
+    impl_methods: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
+    /// Trait-default bodies: keyed by (trait_root, name) with self_ty_root None.
+    trait_defaults: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
+}
+
+impl<'a> MirGraphLookup<'a> {
+    /// Build the lookup by walking `program.functions` once.  The
+    /// borrows are tied to `program`'s lifetime, so the caller must
+    /// keep `program` alive for the duration of the lookup's use.
+    pub fn from_program(program: &'a SemanticProgram) -> Self {
+        let mut impl_methods = HashMap::new();
+        let mut trait_defaults = HashMap::new();
+        for f in &program.functions {
+            if let Some(owner) = f.self_ty_root.as_deref() {
+                impl_methods.insert((owner, f.name.as_str()), &f.graph);
+            } else if let Some(tr) = f.trait_root.as_deref() {
+                trait_defaults.insert((tr, f.name.as_str()), &f.graph);
+            }
+        }
+        Self {
+            impl_methods,
+            trait_defaults,
+        }
+    }
+
+    /// Returns the MIR graph for an inherent or trait-impl method.
+    pub fn lookup_impl_method(&self, impl_type: &str, name: &str) -> Option<&'a FunctionGraph> {
+        self.impl_methods.get(&(impl_type, name)).copied()
+    }
+
+    /// Returns the MIR graph for a trait-default body.
+    pub fn lookup_trait_default(&self, trait_root: &str, name: &str) -> Option<&'a FunctionGraph> {
+        self.trait_defaults.get(&(trait_root, name)).copied()
+    }
+}
+
 /// Qualify a bare type name with module prefix or, when the resolver
 /// knows the canonical defining module, with the canonical prefix.
 ///

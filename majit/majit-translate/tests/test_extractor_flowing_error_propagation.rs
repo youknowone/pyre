@@ -77,7 +77,7 @@ fn empty_names() -> std::collections::HashSet<String> {
 #[test]
 fn extract_trait_impls_propagates_flowing_error_from_impl_method_body() {
     let parsed = parse(TRAIT_IMPL_WITH_ASYNC);
-    let result = extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names());
+    let result = extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names(), None);
     // RPython: `build_flow()` would re-raise FlowingError at
     // `flowspace/objspace.py:49` — pyre must match with `Err`.
     assert!(
@@ -91,7 +91,7 @@ fn extract_trait_impls_propagates_flowing_error_from_impl_method_body() {
 #[test]
 fn extract_trait_impls_propagates_flowing_error_from_trait_default_body() {
     let parsed = parse(TRAIT_DEFAULT_WITH_ASYNC);
-    let result = extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names());
+    let result = extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names(), None);
     // Same re-raise semantic applies to trait defaults — upstream's
     // `buildflowgraph` pass does not distinguish concrete impl from
     // default body.
@@ -107,7 +107,7 @@ fn extract_trait_impls_propagates_flowing_error_from_trait_default_body() {
 #[test]
 fn extract_inherent_impl_methods_propagates_flowing_error() {
     let parsed = parse(INHERENT_METHOD_WITH_ASYNC);
-    let result = extract_inherent_impl_methods(&parsed, &empty_sf(), &empty_frt(), &empty_names());
+    let result = extract_inherent_impl_methods(&parsed, &empty_sf(), &empty_frt(), &empty_names(), None);
     assert!(
         result.is_err(),
         "extract_inherent_impl_methods must propagate FlowingError \
@@ -135,8 +135,8 @@ fn happy_path_still_returns_ok() {
         }
         "#,
     );
-    assert!(extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names()).is_ok());
+    assert!(extract_trait_impls(&parsed, &empty_sf(), &empty_frt(), &empty_names(), None).is_ok());
     assert!(
-        extract_inherent_impl_methods(&parsed, &empty_sf(), &empty_frt(), &empty_names()).is_ok()
+        extract_inherent_impl_methods(&parsed, &empty_sf(), &empty_frt(), &empty_names(), None).is_ok()
     );
 }

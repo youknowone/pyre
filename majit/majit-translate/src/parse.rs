@@ -993,6 +993,7 @@ pub fn extract_trait_impls(
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
+    mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
 ) -> Result<Vec<TraitImplInfo>, crate::front::ast::FlowingError> {
     let mut impls = Vec::new();
     let mut known_trait_names = std::collections::HashSet::new();
@@ -1005,6 +1006,7 @@ pub fn extract_trait_impls(
         &parsed.use_imports,
         known_struct_names,
         &known_trait_names,
+        mir_graphs,
         &mut impls,
     )?;
     Ok(impls)
@@ -1018,6 +1020,7 @@ fn collect_trait_impls_from_items(
     use_imports: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
+    mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
     impls: &mut Vec<TraitImplInfo>,
 ) -> Result<(), crate::front::ast::FlowingError> {
     for item in items {
@@ -1068,16 +1071,7 @@ fn collect_trait_impls_from_items(
                                 fake_fn,
                                 self_ty_root.as_deref(),
                             ) {
-                                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                    &synth,
-                                    self_ty_root.clone(),
-                                    struct_fields,
-                                    fn_return_types,
-                                    prefix,
-                                    use_imports,
-                                    known_struct_names,
-                                    known_trait_names,
-                                )?;
+                                let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
                                         crate::front::ast::qualified_full_type_string(
@@ -1089,11 +1083,41 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
+                                // Slice 3.C: try MIR lookup first; skip
+                                // `build_function_graph_with_self_ty_pub` on hit
+                                // and derive hints directly from syn attrs.
+                                let mir_hit = mir_graphs.and_then(|m| {
+                                    self_ty_root
+                                        .as_deref()
+                                        .and_then(|owner| m.lookup_impl_method(owner, &method_name))
+                                });
+                                let (graph, hints) = if let Some(g) = mir_hit {
+                                    (
+                                        g.clone(),
+                                        crate::front::ast::collect_jit_hints_with_sig(
+                                            &synth.attrs,
+                                            &synth.sig,
+                                        ),
+                                    )
+                                } else {
+                                    let sf =
+                                        crate::front::ast::build_function_graph_with_self_ty_pub(
+                                            &synth,
+                                            self_ty_root.clone(),
+                                            struct_fields,
+                                            fn_return_types,
+                                            prefix,
+                                            use_imports,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )?;
+                                    (sf.graph, sf.hints)
+                                };
                                 methods.push(MethodInfo {
-                                    name: synth.sig.ident.to_string(),
-                                    graph: Some(sf.graph),
+                                    name: method_name,
+                                    graph: Some(graph),
                                     return_type,
-                                    hints: sf.hints,
+                                    hints,
                                 });
                             }
                         }
@@ -1134,16 +1158,7 @@ fn collect_trait_impls_from_items(
                             // wrapper through this same path.
                             for synth in crate::front::ast::synthesize_or_passthrough(fake_fn, None)
                             {
-                                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                    &synth,
-                                    None,
-                                    struct_fields,
-                                    fn_return_types,
-                                    prefix,
-                                    use_imports,
-                                    known_struct_names,
-                                    known_trait_names,
-                                )?;
+                                let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
                                         crate::front::ast::qualified_full_type_string(
@@ -1155,11 +1170,37 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
+                                // Slice 3.C: try MIR trait-default lookup
+                                // before falling back to the AST build.
+                                let mir_hit = mir_graphs
+                                    .and_then(|m| m.lookup_trait_default(&trait_name, &method_name));
+                                let (graph, hints) = if let Some(g) = mir_hit {
+                                    (
+                                        g.clone(),
+                                        crate::front::ast::collect_jit_hints_with_sig(
+                                            &synth.attrs,
+                                            &synth.sig,
+                                        ),
+                                    )
+                                } else {
+                                    let sf =
+                                        crate::front::ast::build_function_graph_with_self_ty_pub(
+                                            &synth,
+                                            None,
+                                            struct_fields,
+                                            fn_return_types,
+                                            prefix,
+                                            use_imports,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )?;
+                                    (sf.graph, sf.hints)
+                                };
                                 methods.push(MethodInfo {
-                                    name: synth.sig.ident.to_string(),
-                                    graph: Some(sf.graph),
+                                    name: method_name,
+                                    graph: Some(graph),
                                     return_type,
-                                    hints: sf.hints,
+                                    hints,
                                 });
                             }
                         }
@@ -1190,6 +1231,7 @@ fn collect_trait_impls_from_items(
                         use_imports,
                         known_struct_names,
                         known_trait_names,
+                        mir_graphs,
                         impls,
                     )?;
                 }
@@ -1242,6 +1284,7 @@ pub fn extract_inherent_impl_methods(
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
+    mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
 ) -> Result<Vec<InherentMethodInfo>, crate::front::ast::FlowingError> {
     let mut methods = Vec::new();
     // Feed `parsed.module_path` so the inherent-impl receiver-root
@@ -1258,6 +1301,7 @@ pub fn extract_inherent_impl_methods(
         fn_return_types,
         &parsed.use_imports,
         known_struct_names,
+        mir_graphs,
         &mut methods,
     )?;
     Ok(methods)
@@ -1270,6 +1314,7 @@ fn collect_inherent_methods_from_items(
     fn_return_types: &std::collections::HashMap<String, String>,
     use_imports: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
+    mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
     methods: &mut Vec<InherentMethodInfo>,
 ) -> Result<(), crate::front::ast::FlowingError> {
     for item in items {
@@ -1320,16 +1365,7 @@ fn collect_inherent_methods_from_items(
                             fake_fn,
                             self_ty_root_bare.as_deref(),
                         ) {
-                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                &synth,
-                                self_ty_root_bare.clone(),
-                                struct_fields,
-                                fn_return_types,
-                                prefix,
-                                use_imports,
-                                known_struct_names,
-                                &std::collections::HashSet::new(),
-                            )?;
+                            let method_name = synth.sig.ident.to_string();
                             let return_type = match &synth.sig.output {
                                 syn::ReturnType::Type(_, ty) => {
                                     crate::front::ast::qualified_full_type_string(
@@ -1341,13 +1377,44 @@ fn collect_inherent_methods_from_items(
                                 }
                                 syn::ReturnType::Default => Some("()".to_string()),
                             };
+                            // Slice 3.C: prefer MIR's inherent-method
+                            // graph; lookup is keyed by `self_ty_root_qualified`
+                            // to match the MIR builder's
+                            // `strip_crate_prefix(name_path())` shape.
+                            let mir_hit = mir_graphs.and_then(|m| {
+                                self_ty_root_qualified
+                                    .as_deref()
+                                    .and_then(|owner| m.lookup_impl_method(owner, &method_name))
+                            });
+                            let (graph, hints) = if let Some(g) = mir_hit {
+                                (
+                                    g.clone(),
+                                    crate::front::ast::collect_jit_hints_with_sig(
+                                        &synth.attrs,
+                                        &synth.sig,
+                                    ),
+                                )
+                            } else {
+                                let sf =
+                                    crate::front::ast::build_function_graph_with_self_ty_pub(
+                                        &synth,
+                                        self_ty_root_bare.clone(),
+                                        struct_fields,
+                                        fn_return_types,
+                                        prefix,
+                                        use_imports,
+                                        known_struct_names,
+                                        &std::collections::HashSet::new(),
+                                    )?;
+                                (sf.graph, sf.hints)
+                            };
                             methods.push(InherentMethodInfo {
                                 for_type: for_type.clone(),
                                 self_ty_root: self_ty_root_qualified.clone(),
-                                name: synth.sig.ident.to_string(),
-                                graph: sf.graph,
+                                name: method_name,
+                                graph,
                                 return_type,
-                                hints: sf.hints,
+                                hints,
                             });
                         }
                     }
@@ -1368,6 +1435,7 @@ fn collect_inherent_methods_from_items(
                         fn_return_types,
                         use_imports,
                         known_struct_names,
+                        mir_graphs,
                         methods,
                     )?;
                 }
@@ -2207,6 +2275,7 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .expect("trait impls must lower");
         let trait_names: std::collections::HashSet<&str> =
@@ -2231,6 +2300,7 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
+            None,
         )
         .expect("trait impls must lower");
         let helper = impls[0]

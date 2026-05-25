@@ -152,6 +152,7 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
             &program.struct_fields,
             &program.fn_return_types,
             &program.known_struct_names,
+            None,
         )
         .expect("pyopcode trait impls must lower"),
     );
@@ -161,6 +162,7 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
             &program.struct_fields,
             &program.fn_return_types,
             &program.known_struct_names,
+            None,
         )
         .expect("eval trait impls must lower"),
     );

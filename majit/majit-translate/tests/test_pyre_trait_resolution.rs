@@ -127,6 +127,7 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
             &program.struct_fields,
             &program.fn_return_types,
             &program.known_struct_names,
+            None,
         )
         .expect("pyopcode trait impls must lower"),
     );
@@ -136,6 +137,7 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
             &program.struct_fields,
             &program.fn_return_types,
             &program.known_struct_names,
+            None,
         )
         .expect("eval trait impls must lower"),
     );

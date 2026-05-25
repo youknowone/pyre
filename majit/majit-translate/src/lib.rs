@@ -942,6 +942,12 @@ fn analyze_pipeline_from_parsed(
         String,
     > = std::collections::HashMap::new();
 
+    // Slice 3.C: build the MIR-graph lookup table once and pass it
+    // into both extract_* collectors so they can skip
+    // `build_function_graph_with_self_ty_pub` on hit and delegate to
+    // the MIR-built graph.  AST build runs only for entries MIR did
+    // not lower.
+    let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
     for parsed in parsed_files {
         canonical_trait_impls.extend(
             parse::extract_trait_impls(
@@ -949,6 +955,7 @@ fn analyze_pipeline_from_parsed(
                 &program.struct_fields,
                 &program.fn_return_types,
                 &program.known_struct_names,
+                Some(&mir_graph_lookup),
             )
             .expect("trait impls must lower without FlowingError"),
         );
@@ -958,6 +965,7 @@ fn analyze_pipeline_from_parsed(
                 &program.struct_fields,
                 &program.fn_return_types,
                 &program.known_struct_names,
+                Some(&mir_graph_lookup),
             )
             .expect("inherent methods must lower without FlowingError"),
         );
@@ -1196,39 +1204,15 @@ fn analyze_pipeline_from_parsed(
             );
         }
     }
-    // Step 6.E Slice 3.B — index `program.functions` so the registration
-    // loop below can substitute the MIR-built graph for the AST-built
-    // one carried in `canonical_trait_impls` / `canonical_inherent_methods`.
-    //
-    // Impl methods (trait-impl + inherent) live under `self_ty_root`;
-    // trait-default bodies live under `trait_root` with `self_ty_root =
-    // None`.  The lookup mirrors `audit_ast_extract_coverage`'s indexing
-    // shape so a covered entry guarantees a graph substitution path
-    // exists.  AST graphs remain the fallback for entries MIR did not
-    // build (CurrentFrameGuard::drop, PyFrame::__init__, etc.).
-    let program_impl_graphs: std::collections::HashMap<(String, String), &model::FunctionGraph> =
-        program
-            .functions
-            .iter()
-            .filter_map(|f| {
-                let owner = f.self_ty_root.as_deref()?;
-                Some(((owner.to_string(), f.name.clone()), &f.graph))
-            })
-            .collect();
-    let program_default_graphs: std::collections::HashMap<
-        (String, String),
-        &model::FunctionGraph,
-    > = program
-        .functions
-        .iter()
-        .filter_map(|f| {
-            if f.self_ty_root.is_some() {
-                return None;
-            }
-            let tr = f.trait_root.as_deref()?;
-            Some(((tr.to_string(), f.name.clone()), &f.graph))
-        })
-        .collect();
+    // Step 6.E Slice 3.B/3.C — the registration loop below substitutes
+    // the MIR-built graph for the AST-built one carried in
+    // `canonical_trait_impls` / `canonical_inherent_methods`.  The
+    // `mir_graph_lookup` built before the extract_* loop above is the
+    // same one extract_* consulted to skip its AST graph build, so a
+    // hit there means we already have the MIR graph in MethodInfo.graph;
+    // the lookup here covers the case where extract_* fell back to AST
+    // (e.g. a MIR builder failure) but MIR still produced a graph later
+    // — defensive and cheap.
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -1245,16 +1229,13 @@ fn analyze_pipeline_from_parsed(
         };
         let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
-            // Slice 3.B: prefer the MIR-built graph when program.functions
-            // covers this entry; fall back to the AST-built graph.
+            // Slice 3.B/3.C: prefer the MIR-built graph when
+            // program.functions covers this entry; fall back to the
+            // AST-built graph that extract_* carried in.
             let mir_graph: Option<&model::FunctionGraph> = if is_default {
-                program_default_graphs
-                    .get(&(impl_info.trait_name.clone(), method.name.clone()))
-                    .copied()
+                mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
             } else {
-                program_impl_graphs
-                    .get(&(impl_type.to_string(), method.name.clone()))
-                    .copied()
+                mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
             };
             let graph_source: Option<model::FunctionGraph> = mir_graph
                 .cloned()
@@ -1378,11 +1359,11 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
-        // Slice 3.B: prefer the MIR-built graph; fall back to the
+        // Slice 3.B/3.C: prefer the MIR-built graph; fall back to the
         // AST-built graph carried in InherentMethodInfo.
-        let graph: model::FunctionGraph = program_impl_graphs
-            .get(&(impl_type.to_string(), method_info.name.clone()))
-            .map(|g| (*g).clone())
+        let graph: model::FunctionGraph = mir_graph_lookup
+            .lookup_impl_method(impl_type, &method_info.name)
+            .map(|g| g.clone())
             .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
@@ -2095,6 +2076,7 @@ mod tests {
                     &metadata.struct_fields,
                     &metadata.fn_return_types,
                     &metadata.known_struct_names,
+                    None,
                 )
                 .expect("trait impls must lower")
             })
@@ -2653,6 +2635,7 @@ mod tests {
                     &metadata.struct_fields,
                     &metadata.fn_return_types,
                     &metadata.known_struct_names,
+                    None,
                 )
                 .expect("trait impls must lower")
             })
