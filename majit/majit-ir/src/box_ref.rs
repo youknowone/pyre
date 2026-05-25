@@ -143,6 +143,14 @@ pub enum Forwarded {
     /// underlying object alive through the trace `operations` list).
     Op(Weak<Op>),
 
+    /// `resoperation.py:699 AbstractInputArg` forwarding — direct
+    /// `Weak<InputArg>` reference, no `BoxRef`/`BoxKind::InputArg`
+    /// carrier. Same chain-walk semantics as `Op` (transient BoxRef
+    /// materialization via `BoxRef::from_bound_inputarg`). RPython
+    /// uses this for inputarg→inputarg redirects in bridge import and
+    /// retrace remap (compile.py:478 / unroll.py:497).
+    InputArg(Weak<InputArg>),
+
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`
     /// — forwarding terminates here; the constant value is carried
     /// inline. Chain walkers stop on this variant (`not_const=true`
@@ -231,6 +239,22 @@ impl BoxRef {
             value: Cell::new(None),
             op_handle: RefCell::new(Some(Rc::downgrade(op))),
             inputarg_handle: RefCell::new(None),
+        }))
+    }
+
+    /// Transient `AbstractInputArg` Box wrapping an already-bound
+    /// `InputArgRc`. Mirror of `from_bound_op` for the chain walker's
+    /// `Forwarded::InputArg` terminal materialization.
+    pub fn from_bound_inputarg(ia: &crate::value::InputArgRc) -> Self {
+        let type_ = ia.tp;
+        let position = ia.index;
+        Self(Rc::new(Box {
+            forwarded: RefCell::new(Forwarded::None),
+            type_,
+            kind: BoxKind::InputArg { position },
+            value: Cell::new(None),
+            op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(Some(Rc::downgrade(ia))),
         }))
     }
 
@@ -450,6 +474,19 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
+    /// `optimizer.py:394 op.set_forwarded(newop)` — InputArg variant.
+    /// Targets an `AbstractInputArg` identity directly via
+    /// `Weak<InputArg>`. Mirror of `set_forwarded_op` for the InputArg
+    /// chain-step case (compile.py:478, unroll.py:497).
+    pub fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_inputarg on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
+    }
+
     /// `optimizer.py:394 op.set_forwarded(newop)` — Op variant.
     /// Targets an `AbstractResOp` identity directly via `Weak<Op>`,
     /// retiring the `BoxKind::ResOp`-as-chain-target carrier. The
@@ -597,6 +634,12 @@ impl BoxRef {
                         return cur;
                     };
                     cur = BoxRef::from_bound_op(&op_rc);
+                }
+                Forwarded::InputArg(weak) => {
+                    let Some(ia_rc) = weak.upgrade() else {
+                        return cur;
+                    };
+                    cur = BoxRef::from_bound_inputarg(&ia_rc);
                 }
                 Forwarded::Const(c, idx) => {
                     if not_const {

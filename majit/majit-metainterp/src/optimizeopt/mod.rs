@@ -3541,10 +3541,13 @@ impl OptContext {
             // forwarded_to is an AbstractResOp), retiring the
             // BoxKind::ResOp-as-chain-target carrier.
             op.set_forwarded_op(&target_op);
+        } else if let Some(target_ia) = newop.bound_inputarg() {
+            // InputArg-target chain step (compile.py:478, unroll.py:497).
+            op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Unbound non-const target: legacy InputArg / pre-bind
+            // Unbound non-const target: pre-bind / test fixture
             // path; keep BoxRef-based Forwarded::Box until those
-            // sources are migrated in C.4.b / C.5.
+            // sources are migrated in C.5.
             op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
@@ -5993,7 +5996,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) | Forwarded::InputArg(_) => unreachable!(
                 "getrawptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6083,7 +6086,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) | Forwarded::InputArg(_) => unreachable!(
                 "getptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6409,7 +6412,7 @@ impl OptContext {
                     Forwarded::Info(_) | Forwarded::VectorInfo(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
-                    Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => {
+                    Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
