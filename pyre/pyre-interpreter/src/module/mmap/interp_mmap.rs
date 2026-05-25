@@ -124,6 +124,10 @@ fn init_mmap_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_mmap.py:98-103 descr_size` returns `mmap.file_size()` —
+    // the underlying file's current size via fstat, not the mapped
+    // length.  The two diverge after `resize()`, and an anonymous mmap
+    // (no fd) raises ValueError per rmmap.py:MMap.file_size.
     crate::dict_storage_store(
         ns,
         "size",
@@ -131,7 +135,24 @@ fn init_mmap_type(ns: &mut DictStorage) {
             "size",
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_int_new(mmap_get_attr_i64(obj, "_len")))
+                if mmap_get_attr_i64(obj, "_ptr") == 0 {
+                    return Err(crate::PyError::value_error("mmap closed or invalid"));
+                }
+                let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
+                if fd < 0 {
+                    return Err(crate::PyError::os_error(
+                        "mmap: cannot find file size for anonymous map",
+                    ));
+                }
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let r = unsafe { libc::fstat(fd, &mut st as *mut libc::stat) };
+                if r != 0 {
+                    return Err(crate::PyError::os_error_with_errno(
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        "mmap.size: fstat failed",
+                    ));
+                }
+                Ok(pyre_object::w_int_new(st.st_size as i64))
             },
             1,
         ),
@@ -193,7 +214,14 @@ fn init_mmap_type(ns: &mut DictStorage) {
             let (p, len) = mmap_ptr(obj)?;
             let pos = mmap_get_attr_i64(obj, "_pos") as usize;
             let remaining = len.saturating_sub(pos);
-            let n = if args.len() >= 2 {
+            // `interp_mmap.py:60-69 read(num=-1)` — None or -1 reads to
+            // end; positive value caps at remaining bytes.
+            let n = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
+                if !unsafe { pyre_object::is_int(args[1]) } {
+                    return Err(crate::PyError::type_error(
+                        "read: argument must be int or None",
+                    ));
+                }
                 let req = unsafe { pyre_object::w_int_get_value(args[1]) };
                 if req < 0 {
                     remaining
@@ -795,18 +823,26 @@ fn init_mmap_type(ns: &mut DictStorage) {
             "__repr__",
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let closed = mmap_get_attr_i64(obj, "_ptr") == 0;
+                // `interp_mmap.py:297-316 descr_repr`: closed mmaps
+                // suppress the inner fields and emit just
+                // `<mmap.mmap closed=True>`; otherwise dump
+                // access / length / pos / offset.  Capitalised True /
+                // False matches CPython's bool repr.
+                if mmap_get_attr_i64(obj, "_ptr") == 0 {
+                    return Ok(pyre_object::w_str_new("<mmap.mmap closed=True>"));
+                }
                 let len = mmap_get_attr_i64(obj, "_len");
+                let pos = mmap_get_attr_i64(obj, "_pos");
+                let offset = mmap_get_attr_i64(obj, "_offset");
                 let access = mmap_get_attr_i64(obj, "_access");
                 let access_str = match access {
-                    1 => "ACCESS_READ",
-                    2 => "ACCESS_WRITE",
-                    3 => "ACCESS_COPY",
+                    x if x == MMAP_ACCESS_READ => "ACCESS_READ",
+                    x if x == MMAP_ACCESS_WRITE => "ACCESS_WRITE",
+                    x if x == MMAP_ACCESS_COPY => "ACCESS_COPY",
                     _ => "ACCESS_DEFAULT",
                 };
                 Ok(pyre_object::w_str_new(&format!(
-                    "<mmap.mmap closed={closed}, access={access_str}, length={len}, pos={}, offset=0>",
-                    mmap_get_attr_i64(obj, "_pos")
+                    "<mmap.mmap closed=False, access={access_str}, length={len}, pos={pos}, offset={offset}>"
                 )))
             },
             1,
