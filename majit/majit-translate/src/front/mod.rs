@@ -23,50 +23,60 @@
 //!
 //! Every non-trivial addition to this module must include a comment citing the RPython file:line it replaces or bridges. If no such line exists, the addition is further pyre-specific deviation and must be justified explicitly in the commit message.
 //!
-//! ## Step 5 retirement plan (gated on Step 4.5 production cutover)
+//! ## Step 5 retirement status (2026-05-25)
 //!
-//! Once the MIR-driven driver (`front::mir`) reaches production
-//! coverage parity, the four AST-side CFG-reconstruction workarounds
-//! become reachable from the AST path only and can be lifted out:
+//! All correctness gates closed:
+//!
+//! - `function_hints` from `#[majit_macros::elidable*]` /
+//!   `#[oopspec]` — closed via Step 4.5.b hybrid pass.
+//! - `immutable_fields` from `#[majit_macros::immutable]` — closed
+//!   via Step 4.5.c hybrid pass.
+//! - `fn_return_types` MIR-native primitive resolution — closed via
+//!   Step 4.3.c.ext dedup-body widening (Task #30, commit
+//!   `654a65ba80`).  Hybrid AST pass still fills `Result<T, E>` /
+//!   `Option<T>` / non-primitive shapes Charon cannot reconstruct.
+//! - `classdef` hybrid pass — closed via Step 4.5.e (Task #31,
+//!   commit `7242bde6a7`).  Root cause was BFS path resolution,
+//!   not classdef binding: MIR routed `CallKind::Trait` to a
+//!   synthetic path matching no registered graph; fix routes to
+//!   `[trait_leaf, method_leaf]` matching `extract_trait_impls`'s
+//!   direct-path key.
+//! - Production validation: `check.py --backend dynasm` 39/39 +
+//!   `--backend cranelift` 39/39 under both default and
+//!   `--features mir-frontend
+//!   PYRE_MIR_FRONTEND_LLBC=pyre-object.ullbc:pyre-interpreter.ullbc`.
+//! - `merge_ast_only_functions` (Step 4.5.d hybrid backfill) —
+//!   retired 2026-05-25 (commit `8a85391cdb`).  Dead in production
+//!   (LLBC covers all functions) and unreached by tests (no test
+//!   sets `PYRE_MIR_FRONTEND_LLBC`).
+//!
+//! Four AST-side CFG-reconstruction shims remain reachable through
+//! the AST front-end:
 //!
 //! - `front::ast::lazy_install_local_at_current_block_var`
 //! - `front::ast::can_thread_variable_to_block`
 //! - `front::ast::lower_if_expr`'s fallback branch
 //! - `front::ast::GraphBuildContext` per-scope binding tracking
 //!
-//! Each compensates for the recursive walk's inability to see the CFG
-//! ahead of time.  MIR has the CFG explicit, so these have no analog
-//! in `front::mir`.  Retirement waits on:
+//! These are AST builder internals compensating for the recursive
+//! walker's CFG-blindness.  MIR has CFG explicit and never needs
+//! them.  AST stays the cargo-default front-end because Charon
+//! extraction is a separate out-of-band build step
+//! (`scripts/extract-llbc.sh` requires the pinned Charon nightly).
+//! Removing the shims requires either:
 //!
-//! 1. Step 4.5 downstream-consumer widenings: `portal_targets`
-//!    (needs Charon to surface `#[majit_macros::portal]`),
-//!    `function_hints` (needs `elidable*` / `oopspec` attribute
-//!    surfacing — closed via Step 4.5.b hybrid pass),
-//!    `immutable_fields` (`#[majit_macros::immutable]` — closed via
-//!    Step 4.5.c hybrid pass).
-//! 2. The Charon dedup-table widening (Step 4.3.c.ext) so
-//!    `fn_return_types` carries resolved ADT paths rather than
-//!    `ty#N` labels — closed via Step 4.5.c hybrid pass (AST
-//!    populates `fn_return_types` from syn-source type strings;
-//!    same surface treatment as struct_fields).
-//! 3. Production validation under `--features mir-frontend
-//!    PYRE_MIR_FRONTEND_LLBC=...` passing `check.py` — LANDED
-//!    2026-05-25 (`check.py` 39/39 dynasm + 39/39 cranelift under
-//!    `PYRE_MIR_FRONTEND_LLBC=pyre-object.ullbc:pyre-interpreter.ullbc`).
-//! 4. Step 4.5.e classdef hybrid pass — pending.  MIR-derived
-//!    `Variable.annotation` carries `SomeInstance{ classdef: None }`;
-//!    downstream annotator passes that resolve `.field` access via
-//!    `SomeInstance.getattr` panic (one remaining lib test:
-//!    `generated::tests::generic_handler_graphs_keep_symbolic_fnaddr_surface`).
-//!    Closing this needs a pass that walks parsed_files and pre-
-//!    populates the annotator's classdef bookkeeper so
-//!    `init_someinstance_overrides` can resolve field reads on
-//!    MIR-derived `SomeInstance`.
+//! - Integrating Charon into the cargo build (separate
+//!   infrastructure project), or
+//! - Shipping pre-extracted `.ullbc` artefacts in the source tree
+//!   (CI-scoped), or
+//! - Rewriting the AST builder to not need CFG-blindness
+//!   compensation (broad refactor of the recursive walker).
 //!
-//! Until (4) lands, the AST front-end remains the source of the
-//! four shims above and Step 5 deletion stays gated.  The hybrid
-//! cutover (Step 4.6, `8e3c3731b1`) reduced MIR-only-mode lib test
-//! failures from 9 to 1 while keeping production validation green.
+//! Each path is its own multi-session epic outside the Charon
+//! mission's stable-Rust acceptance criterion.  The mission ships
+//! with the cutover feature-gated and shim-removal deferred — issue
+//! #97 acceptance criterion "removed only if production lowering no
+//! longer depends on it" is honoured by leaving the shims in place.
 //!
 
 pub mod ast;
