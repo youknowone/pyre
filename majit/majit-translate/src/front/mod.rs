@@ -162,24 +162,34 @@
 //!   cutover asserts MIR-only.  Tests that exercise the AST builder
 //!   call `front::build_semantic_program_from_parsed_files` directly
 //!   and bypass this dispatch — they remain unaffected by the flag.
-//! - **Slice 5 (pending)** — delete the AST graph builder bulk
-//!   (~15k LOC: `build_function_graph_*`, `GraphBuildContext`,
-//!   `lower_*` walkers, the four CFG-blindness shims listed
-//!   below).  Gate condition is each test fixture either migrating
-//!   to MIR (requires pre-extracted `.ullbc` artefacts in the source
-//!   tree — see "Out-of-band paths" below) or being deleted.  The
-//!   following test surfaces currently keep the AST builder
-//!   reachable:
-//!     - `tests/test_pyre_transform_all_handlers.rs`
-//!     - `tests/test_pyre_transform_single_handler.rs`
-//!     - `tests/test_pyre_trait_resolution.rs`
-//!     - `tests/test_pyre_pyframe_trait_resolution.rs`
-//!     - `tests/test_pyre_find_all_graphs.rs`
-//!     - `tests/test_phase_f_all_jitcodes.rs`
-//!     - `tests/test_mir_vs_ast.rs` (explicit AST-vs-MIR comparison)
-//!     - 4 internal `front/ast.rs` `mod tests` invocations
-//!     - 2 lib.rs `mod tests` invocations (lib.rs:2038, 2096)
-//!     - 1 `jit_codewriter/call.rs:6858` `mod tests` invocation
+//! - **Slice 5 (in progress)** — delete the AST graph builder bulk
+//!   (~15k LOC).  Test surface reduction in this branch:
+//!     - 12 AST-builder-dependent integration tests deleted
+//!       (~2869 LOC across tests/test_mir_vs_ast.rs,
+//!       test_pyre_handler_graph_discovery.rs, test_pyre_*.rs,
+//!       test_phase_f_all_jitcodes.rs, test_question_mark_*.rs,
+//!       test_jit_marker_end_to_end.rs, test_raise_lowering_parity.rs,
+//!       test_phase_d0_eval_loop_jit_discovery.rs).
+//!     - `front/ast.rs::mod tests` block deleted (~4396 LOC).
+//!   Residual AST reach (blocks final deletion):
+//!     - `lib.rs::mod tests` and `mod tests` in
+//!       `translator/rtyper/{legacy_pipeline,cutover}.rs`,
+//!       `jit_codewriter/call.rs:6858` — exercise
+//!       `analyze_multiple_pipeline_with_config` /
+//!       `front::build_semantic_program` against real source.  Test
+//!       trial with `PYRE_MIR_FRONTEND_LLBC` set: 2714 pass / 4 fail
+//!       under MIR.  Failing tests are AST-shape-specific:
+//!         - `generated::tests::eval_loop_jit_portal_produces_jitcode_with_handler_closure`
+//!         - `generated::tests::generic_handler_graphs_keep_symbolic_fnaddr_surface`
+//!         - `tests::test_analyze_multiple_pipeline_with_fnaddr_bindings_stamps_real_jitcode_fnaddr`
+//!         - `tests::test_opcode_dispatch_uses_trait_bound_default_method_graphs`
+//!     - `parse.rs::collect_*_methods_from_items` (None, None) arm
+//!       still calls `build_function_graph_with_self_ty_pub` for
+//!       legacy callers passing `mir_graphs = None`.
+//!   Path to closure: delete or fix the 4 MIR-failing tests, plumb
+//!   `PYRE_MIR_FRONTEND_LLBC` into the remaining lib tests, retire
+//!   the `(None, None)` legacy arm in parse.rs, then delete
+//!   `front/ast.rs`'s AST graph builder (~10765 remaining LOC).
 //!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
