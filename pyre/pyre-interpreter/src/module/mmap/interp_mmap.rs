@@ -214,6 +214,31 @@ fn init_mmap_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_mmap.py:42 readline` — read bytes from current pos until
+    // the first '\n' (inclusive); if absent, read to end.  Mirrors
+    // `rmmap.py:421-432`.
+    crate::dict_storage_store(
+        ns,
+        "readline",
+        crate::make_builtin_function_with_arity(
+            "readline",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let (p, len) = mmap_ptr(obj)?;
+                let pos = mmap_get_attr_i64(obj, "_pos") as usize;
+                if pos >= len {
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+                }
+                let tail = unsafe { std::slice::from_raw_parts(p.add(pos), len - pos) };
+                let eol = tail.iter().position(|&b| b == b'\n').map_or(len, |i| pos + i + 1);
+                let data = unsafe { std::slice::from_raw_parts(p.add(pos), eol - pos) }.to_vec();
+                mmap_set_attr(obj, "_pos", pyre_object::w_int_new(eol as i64));
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+            },
+            1,
+        ),
+    );
+
     crate::dict_storage_store(
         ns,
         "write",
