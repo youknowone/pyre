@@ -2293,20 +2293,17 @@ impl MIFrame {
 
     /// Set the original PC for the current opcode (RPython orgpc).
     /// All guards within this opcode will use orgpc as their resume PC.
-    pub(crate) fn set_orgpc(&mut self, pc: usize) {
-        self.orgpc = pc;
-        self.publish_last_instr_to_vable(pc);
-    }
-
+    ///
     /// Pyre-only shadow refresh hook.  RPython's metainterp owns every opcode
     /// boundary so `metainterp.virtualizable_boxes` stays in lockstep with
     /// heap automatically.  Pyre splits dispatch between the walker (which
     /// mirrors via `vable_setfield → synchronize_virtualizable`) and
     /// `execute_opcode_step` (which mutates the heap PyFrame directly via
     /// `PyFrame::push` / `PyFrame::pop` etc.), so the shadow can lag the
-    /// heap between opcodes.  Pull the heap values into the shadow before
-    /// entering walker dispatch so the arm body's `getfield_vable_*` reads
-    /// and any `synchronize_virtualizable` write-back see up-to-date values.
+    /// heap between opcodes.  The refresh must run BEFORE
+    /// `capture_pre_opcode_state` reads from `virtualizable_boxes`
+    /// (`trace_opcode.rs:1014`) — otherwise guard fail_args would snapshot a
+    /// stale shadow whenever the prior opcode ran through trait dispatch.
     ///
     /// Inline-frame guard: when `self.parent_frames` is non-empty we are
     /// running `trace_code_step_inline` on a callee MIFrame.  The shared
@@ -2318,11 +2315,21 @@ impl MIFrame {
     /// When dispatch unification retires `execute_opcode_step`, this hook
     /// becomes a no-op (every mutation already lands in shadow) and can
     /// be removed.
-    fn refresh_vable_shadow_before_walker(&mut self) {
-        if !self.parent_frames.is_empty() {
-            return;
+    pub(crate) fn set_orgpc(&mut self, pc: usize) {
+        self.orgpc = pc;
+        // Refresh gating: only frames that own the vable shadow read
+        // through it in `capture_pre_opcode_state` (line 1055) and in the
+        // walker's `vable_getfield_*` arm bodies; non-owner frames snapshot
+        // `s.registers_r` (line 1072) instead, so a stale shadow cannot
+        // contaminate their guard fail_args.  Inline frames inherit the
+        // portal's shadow and must not refresh — the portal's preceding
+        // opcode boundary already ran the refresh and the inline body
+        // may have pushed walker-side updates that have not yet
+        // synchronized back to heap (refresh would clobber them).
+        if self.parent_frames.is_empty() && self.sym().owns_virtualizable_shadow() {
+            self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
         }
-        self.with_ctx(|_, ctx| ctx.refresh_virtualizable_shadow_from_heap());
+        self.publish_last_instr_to_vable(pc);
     }
 
     /// pyopcode.py:170-172 `dispatch_bytecode` parity (Slice 3a, Task #115):
@@ -6513,9 +6520,11 @@ impl MIFrame {
     /// trait-driven Python-opcode interpreter while
     /// `jitcode_dispatch::dispatch_via_miframe` walks the codewriter-
     /// emitted jitcode arm.  Phase 5 retires the trait path opcode-by-
-    /// opcode; this helper is the per-opcode walker entry that production
-    /// dispatch (`trace_code_step` / `trace_code_step_inline`) calls for
-    /// allow-listed instructions.
+    /// opcode; this helper is the per-opcode walker entry that root-frame
+    /// production dispatch (`trace_code_step`) calls for allow-listed
+    /// instructions.  Inline dispatch (`trace_code_step_inline`) remains
+    /// on the trait path until walker snapshot capture can represent the
+    /// full parent-frame chain.
     ///
     /// `is_top_level=false` so the arm's `ref_return/r` terminator
     /// surfaces as `DispatchOutcome::SubReturn` rather than emitting a
@@ -6778,7 +6787,6 @@ impl MIFrame {
                 // dispatch in inline frames.
                 let in_inline_frame = !self.parent_frames.is_empty();
                 if production_walker_handles(&instruction) && !in_inline_frame {
-                    self.refresh_vable_shadow_before_walker();
                     self.dispatch_via_walker_for_opcode(&instruction)
                 } else {
                     let shadow_outcome =
@@ -7499,11 +7507,13 @@ unsafe fn trace_check_exc_match_against(
 /// RPython parity: `pyjitpl.py:1892 MetaInterp._interpret` dispatches
 /// every opcode through the single jitcode-bytecode path; there is no
 /// dual trait/walker split upstream.  This predicate names the Python
-/// instructions for which pyre has already retired the trait dispatch
-/// — for those, `trace_code_step{,_inline}` route directly through
-/// `MIFrame::dispatch_via_walker_for_opcode` and the trait path is
-/// dead code at runtime (Phase 6 removes the trait impl once every
-/// opcode is in this set).
+/// instructions for which pyre has already retired the root-frame trait
+/// dispatch — for those, `trace_code_step` routes directly through
+/// `MIFrame::dispatch_via_walker_for_opcode` and the root-frame trait
+/// path is dead code at runtime.  `trace_code_step_inline` intentionally
+/// stays on the trait path until walker snapshots can encode the full
+/// parent-frame chain.  Phase 6 removes the trait impl once every opcode
+/// is in this set and the inline-frame snapshot gap is closed.
 ///
 /// Phase 5.A initial set: the Nop family of 5 zero-op opcodes
 /// (`Nop`, `ExtendedArg`, `Resume`, `Cache`, `NotTaken`).  All share

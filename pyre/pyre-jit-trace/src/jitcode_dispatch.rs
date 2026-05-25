@@ -8165,6 +8165,66 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_pop_top_sub_jitcode_ops() {
+        // PopTop arm body's `inline_call_r_r/dR>r` recurses into a sub-jitcode.
+        // Walk the chain down to the actual leaf (no more inline_call) so we
+        // can audit every IR op the walker emits per PopTop call.
+        use crate::jitcode_runtime::{
+            all_descrs, all_jitcodes, decoded_ops, jitcode_for_instruction,
+        };
+        let arm_jc = jitcode_for_instruction(&Instruction::PopTop)
+            .expect("PopTop must resolve to an arm jitcode");
+        let descrs = all_descrs();
+        let jitcodes = all_jitcodes();
+
+        let extract_sub_index = |descr_dbg: &str| -> Option<usize> {
+            let pos = descr_dbg.find("jitcode_index: ")?;
+            let rest = &descr_dbg[pos + "jitcode_index: ".len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].parse().ok()
+        };
+
+        let mut queue: Vec<(String, &[u8], String)> = vec![(
+            "PopTop arm".to_string(),
+            arm_jc.code.as_slice(),
+            arm_jc.name.clone(),
+        )];
+        let mut seen_indices: Vec<usize> = Vec::new();
+
+        while let Some((label, code, name)) = queue.pop() {
+            eprintln!("=== {label}: name={} code_len={}", name, code.len());
+            for op in decoded_ops(code) {
+                let operand_bytes = &code[op.pc + 1..op.next_pc];
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>32}  operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes,
+                );
+                if op.key.starts_with("inline_call_") {
+                    let didx =
+                        u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as usize;
+                    if let Some(d) = descrs.get(didx) {
+                        let s = format!("{:?}", d);
+                        if let Some(sub_idx) = extract_sub_index(&s) {
+                            eprintln!("      → sub-jitcode index {sub_idx}");
+                            if !seen_indices.contains(&sub_idx) {
+                                seen_indices.push(sub_idx);
+                                if let Some(sub_jc) = jitcodes.get(sub_idx) {
+                                    queue.push((
+                                        format!("{label}→{sub_idx}"),
+                                        sub_jc.code.as_slice(),
+                                        sub_jc.name.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_pop_top_arm_bytes() {
         use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
         let jc = jitcode_for_instruction(&Instruction::PopTop)
