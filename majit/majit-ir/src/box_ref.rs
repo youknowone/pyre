@@ -588,14 +588,15 @@ impl BoxRef {
         self.write_forwarded(Forwarded::None);
     }
 
-    /// Slice 8.D writer: dual-write to `op.forwarded` / `inputarg.forwarded`
-    /// AND `Box.forwarded`. Snapshot consumers (`ExportedState.box_pool_snapshot`,
-    /// retrace import) clone the `BoxRef` by value and may outlive the
-    /// originating `OpRc` / `InputArgRc`; once the `Weak` upgrade fails,
-    /// `get_forwarded` falls back to `Box.forwarded`, so that slot must
-    /// stay current. The cost is one extra `RefCell` write per
-    /// `set_forwarded_*` — `Forwarded` is `Clone`, payloads are `Rc`/`Copy`
-    /// handles.
+    /// Dual-write to `op.forwarded` / `inputarg.forwarded` (the canonical
+    /// `_forwarded` host, resoperation.py:233-242 / :700) AND
+    /// `Box.forwarded`. Snapshot consumers (`compile_retrace` partial
+    /// trace import, test fixtures) clone the `BoxRef` by value and may
+    /// outlive the originating `OpRc` / `InputArgRc`; once the `Weak`
+    /// upgrade fails, `get_forwarded` falls back to `Box.forwarded`, so
+    /// that slot must stay current. The cost is one extra `RefCell` write
+    /// per `set_forwarded_*` — `Forwarded` is `Clone`, payloads are
+    /// `Rc`/`Copy` handles.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(weak) = self.0.op_handle.borrow().as_ref() {
             if let Some(op) = weak.upgrade() {
@@ -1343,10 +1344,11 @@ mod tests {
         assert!(matches!(b.get_forwarded(), Forwarded::Info(_)));
     }
 
-    /// PR #93 review (Codex P1): `ExportedState.box_pool_snapshot` clones
-    /// `BoxRef`s by value and lives past the originating `OpRc`. Writes
-    /// done while the Op is alive must also land in `Box.forwarded` so the
-    /// snapshot keeps the latest forwarding once `Weak::upgrade` fails.
+    /// Cross-pass snapshots (e.g. test fixtures cloning a BoxRef whose
+    /// originating `OpRc` then drops) outlive the `Weak<Op>` referent.
+    /// Writes done while the Op is alive must also land in `Box.forwarded`
+    /// so the snapshot keeps the latest forwarding once `Weak::upgrade`
+    /// fails.
     #[test]
     fn write_forwarded_mirrors_to_box_so_snapshot_survives_op_drop() {
         use crate::resoperation::{Op, OpCode};
