@@ -20,7 +20,12 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
             crate::structseq::make_struct_seq(
                 "pwd.struct_passwd",
                 &[
-                    "pw_name", "pw_passwd", "pw_uid", "pw_gid", "pw_gecos", "pw_dir",
+                    "pw_name",
+                    "pw_passwd",
+                    "pw_uid",
+                    "pw_gid",
+                    "pw_gecos",
+                    "pw_dir",
                     "pw_shell",
                 ],
             )

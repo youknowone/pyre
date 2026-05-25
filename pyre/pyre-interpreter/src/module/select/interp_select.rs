@@ -61,11 +61,12 @@ pub fn register_module(ns: &mut DictStorage) {
                             let fd_val = if pyre_object::is_int(item) {
                                 pyre_object::w_int_get_value(item)
                             } else {
-                                let fileno = crate::baseobjspace::getattr(item, "fileno").map_err(|_| {
-                                    crate::PyError::type_error(
-                                        "argument must be an int, or have a fileno() method",
-                                    )
-                                })?;
+                                let fileno =
+                                    crate::baseobjspace::getattr(item, "fileno").map_err(|_| {
+                                        crate::PyError::type_error(
+                                            "argument must be an int, or have a fileno() method",
+                                        )
+                                    })?;
                                 let res = crate::baseobjspace::call_function(fileno, &[]);
                                 if res.is_null() || !pyre_object::is_int(res) {
                                     return Err(crate::PyError::type_error(

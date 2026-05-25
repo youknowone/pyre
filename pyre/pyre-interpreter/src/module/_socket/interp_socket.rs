@@ -1408,7 +1408,9 @@ pub fn register_module(ns: &mut DictStorage) {
                 let ty = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
                 let proto = if args.len() >= 4 {
                     if !unsafe { pyre_object::is_int(args[3]) } {
-                        return Err(crate::PyError::type_error("fromfd: proto must be an integer"));
+                        return Err(crate::PyError::type_error(
+                            "fromfd: proto must be an integer",
+                        ));
                     }
                     (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
                 } else {

@@ -249,9 +249,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     // null return is treated as the unsupported case.
                     let p = unsafe { libc::nl_langinfo(item) };
                     if p.is_null() {
-                        return Err(crate::PyError::value_error(
-                            "unsupported langinfo constant",
-                        ));
+                        return Err(crate::PyError::value_error("unsupported langinfo constant"));
                     }
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
                     return Ok(pyre_object::w_str_new(&s.to_string_lossy()));
@@ -265,9 +263,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     // No langinfo available → every constant counts as
                     // unsupported, matching `interp_locale.py:151-154`.
                     let _ = args;
-                    Err(crate::PyError::value_error(
-                        "unsupported langinfo constant",
-                    ))
+                    Err(crate::PyError::value_error("unsupported langinfo constant"))
                 }
             },
             1,

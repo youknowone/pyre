@@ -246,7 +246,10 @@ fn init_mmap_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
                 }
                 let tail = unsafe { std::slice::from_raw_parts(p.add(pos), len - pos) };
-                let eol = tail.iter().position(|&b| b == b'\n').map_or(len, |i| pos + i + 1);
+                let eol = tail
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(len, |i| pos + i + 1);
                 let data = unsafe { std::slice::from_raw_parts(p.add(pos), eol - pos) }.to_vec();
                 mmap_set_attr(obj, "_pos", pyre_object::w_int_new(eol as i64));
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
@@ -502,9 +505,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
                             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
                         }
                         let n = (stop - start) as usize;
-                        let data = unsafe {
-                            std::slice::from_raw_parts(p.add(start as usize), n)
-                        };
+                        let data = unsafe { std::slice::from_raw_parts(p.add(start as usize), n) };
                         return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
                     }
                     let mut out = Vec::new();
@@ -736,9 +737,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 let (p, old_len) = mmap_ptr(obj)?;
                 let newsize = unsafe { pyre_object::w_int_get_value(args[1]) };
                 if newsize < 0 {
-                    return Err(crate::PyError::value_error(
-                        "new_size must be positive",
-                    ));
+                    return Err(crate::PyError::value_error("new_size must be positive"));
                 }
                 let newsize = newsize as usize;
                 let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
@@ -771,11 +770,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
                             "mremap",
                         ));
                     }
-                    mmap_set_attr(
-                        obj,
-                        "_ptr",
-                        pyre_object::w_int_new(newptr as usize as i64),
-                    );
+                    mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(newptr as usize as i64));
                     mmap_set_attr(obj, "_len", pyre_object::w_int_new(newsize as i64));
                     Ok(pyre_object::w_none())
                 }
@@ -833,7 +828,9 @@ const MMAP_ACCESS_COPY: i64 = 3;
 // starting at index 0; the `__new__` typecall wrapper drops the class
 // from args[0] before invoking this helper.
 #[cfg(unix)]
-fn mmap_construct(args: &[pyre_object::PyObjectRef]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+fn mmap_construct(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
             "mmap() requires fileno + length",
@@ -1033,6 +1030,5 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // Register the type itself.
         crate::dict_storage_store(ns, "mmap", mmap_type());
-
     }
 }

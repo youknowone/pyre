@@ -4,7 +4,6 @@
 //! (e.g. `math/` ↔ `pypy/module/math/`).
 
 pub mod __builtin__;
-pub mod _io;
 #[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
@@ -15,13 +14,13 @@ pub mod _codecs;
 pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
-pub mod copyreg;
 #[allow(non_snake_case)]
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _imp;
+pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
@@ -36,13 +35,14 @@ pub mod _random;
 pub mod _signal;
 #[allow(non_snake_case)]
 pub mod _socket;
+pub mod _sre;
 #[allow(non_snake_case)]
 pub mod _struct;
 #[allow(non_snake_case)]
 pub mod _thread;
-pub mod _sre;
 pub mod _weakref;
 pub mod atexit;
+pub mod copyreg;
 pub mod errno;
 pub mod faulthandler;
 pub mod fcntl;
