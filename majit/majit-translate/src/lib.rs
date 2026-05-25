@@ -220,24 +220,49 @@ fn audit_ast_extract_coverage(
     canonical_inherent_methods: &[parse::InherentMethodInfo],
 ) {
     use std::collections::HashSet;
-    // Index program.functions by (impl_type, method_name) using
-    // self_ty_root (impl owner leaf) + name (method leaf).
-    // Trait-default bodies in program.functions live under
-    // self_ty_root = trait leaf (penultimate Ident) — handled below.
-    let mut indexed: HashSet<(String, String)> = HashSet::new();
+    // Index program.functions two ways:
+    //   - `impl_methods`: keyed by (self_ty_root, name) — every
+    //     inherent + trait-impl method's owner leaf.
+    //   - `trait_defaults`: keyed by (trait_root, name) — every
+    //     trait-default body (penultimate Ident matches a known
+    //     trait leaf).
+    let mut impl_methods: HashSet<(String, String)> = HashSet::new();
+    let mut trait_defaults: HashSet<(String, String)> = HashSet::new();
     for f in &program.functions {
         if let Some(owner) = &f.self_ty_root {
-            indexed.insert((owner.clone(), f.name.clone()));
+            impl_methods.insert((owner.clone(), f.name.clone()));
+        }
+        if let Some(tr) = &f.trait_root {
+            if f.self_ty_root.is_none() {
+                trait_defaults.insert((tr.clone(), f.name.clone()));
+            }
         }
     }
     let mut trait_total = 0usize;
     let mut trait_missing: Vec<String> = Vec::new();
     for ti in canonical_trait_impls {
-        let impl_type = ti.self_ty_root.as_deref().unwrap_or(&ti.for_type);
+        // Concrete trait-impl methods (impl Trait for Type { … }) have
+        // `self_ty_root = Some("Type")` and look up via `impl_methods`.
+        // Trait-default bodies (collect_trait_impls_from_items's
+        // `Item::Trait` arm) have `self_ty_root = None` and
+        // `for_type = "<default methods of <Trait>>"`; map them to
+        // the `trait_defaults` index keyed by trait_name.
+        let is_default = ti.for_type.starts_with("<default methods of ");
         for method in &ti.methods {
             trait_total += 1;
-            if !indexed.contains(&(impl_type.to_string(), method.name.clone())) {
-                trait_missing.push(format!("{}::{}", impl_type, method.name));
+            let hit = if is_default {
+                trait_defaults.contains(&(ti.trait_name.clone(), method.name.clone()))
+            } else {
+                let impl_type = ti.self_ty_root.as_deref().unwrap_or(&ti.for_type);
+                impl_methods.contains(&(impl_type.to_string(), method.name.clone()))
+            };
+            if !hit {
+                let key_kind = if is_default { "default" } else { "impl" };
+                trait_missing.push(format!(
+                    "{}::{} ({key_kind})",
+                    ti.self_ty_root.as_deref().unwrap_or(&ti.for_type),
+                    method.name
+                ));
             }
         }
     }
@@ -246,7 +271,7 @@ fn audit_ast_extract_coverage(
     for mi in canonical_inherent_methods {
         inherent_total += 1;
         let impl_type = mi.self_ty_root.as_deref().unwrap_or(&mi.for_type);
-        if !indexed.contains(&(impl_type.to_string(), mi.name.clone())) {
+        if !impl_methods.contains(&(impl_type.to_string(), mi.name.clone())) {
             inherent_missing.push(format!("{}::{}", impl_type, mi.name));
         }
     }

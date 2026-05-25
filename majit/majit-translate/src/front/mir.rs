@@ -261,7 +261,19 @@ pub fn build_semantic_program_from_llbc(
         // `register_trait_method` instead of routing through
         // `extract_trait_impls`.  Inherent impls leave `trait_root =
         // None`; trait-impl methods carry the trait's leaf name.
-        let trait_root = trait_impl_trait_root_for_fundecl(llbc, fd);
+        //
+        // Two sources feed `trait_root`:
+        //   1. trait-impl bodies — penultimate NameSeg is `Impl{Trait:id}`
+        //      indirecting through `trait_impls`.  `trait_impl_trait_root_for_fundecl`
+        //      reads the id.
+        //   2. trait-default bodies — Charon emits these as bare
+        //      functions inside the trait's namespace; the penultimate
+        //      NameSeg is `Ident{TraitLeaf}` with no `Impl` segment.
+        //      Detect by matching the parent ident against
+        //      `known_trait_names` (which derive_program_metadata seeds
+        //      with both qualified path and bare leaf).
+        let trait_root = trait_impl_trait_root_for_fundecl(llbc, fd)
+            .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
@@ -1733,6 +1745,29 @@ fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         return None;
     }
     Some(trait_leaf)
+}
+
+/// Detect a trait-default body — a function whose penultimate NameSeg
+/// is a bare `Ident` matching a known trait leaf (no `Impl` segment).
+/// Charon emits trait default impls inline in the trait's namespace,
+/// so they look like `pyre_interpreter::pyopcode::LocalOpcodeHandler::
+/// load_local_checked_value` with the trait leaf as the parent ident.
+///
+/// Returns the trait leaf so `build_semantic_program_from_llbc` can
+/// populate `SemanticFunction.trait_root` and the canonical
+/// registration loop (`lib.rs:985-1141`) can find the body without
+/// going through `extract_trait_impls`'s `<default methods of <T>>`
+/// pseudo-impl-type detour.
+fn trait_default_owner_for_fundecl(
+    fd: &FunDecl,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let (parent, _leaf) = trait_method_owner(fd)?;
+    if known_trait_names.contains(&parent) {
+        Some(parent)
+    } else {
+        None
+    }
 }
 
 /// Free-function version of [`Lowering::resolve_tyexpr_to_adt_def_id`].
