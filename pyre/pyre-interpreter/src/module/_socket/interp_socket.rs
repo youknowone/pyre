@@ -2283,6 +2283,40 @@ fn init_socket_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_socket.py:1090 socketmethodnames _accept` — primitive
+    // returning `(fd, addr)`.  CPython's app-level `socket.py:262 def
+    // accept` wraps this to construct the new socket object;
+    // pyre's `accept` above bundles both steps for callers that
+    // bypass the stdlib wrapper.
+    crate::dict_storage_store(
+        ns,
+        "_accept",
+        crate::make_builtin_function_with_arity(
+            "_accept",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let fd = socket_fd(obj)?;
+                let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let cfd = unsafe {
+                    libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
+                };
+                if cfd < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                unsafe {
+                    libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                let addr = unpack_inet_addr(&storage);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(cfd as i64),
+                    addr,
+                ]))
+            },
+            1,
+        ),
+    );
+
     crate::dict_storage_store(
         ns,
         "connect",
@@ -2846,6 +2880,158 @@ fn init_socket_type(ns: &mut DictStorage) {
             let addr = unpack_inet_addr(&storage);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                pyre_object::w_list_new(anc_items),
+                pyre_object::w_int_new(msg_flags as i64),
+                addr,
+            ]))
+        }),
+    );
+
+    // recvmsg_into(buffers, [ancbufsize, [flags]]) ->
+    //   (nbytes, ancdata, msg_flags, address)
+    // `interp_socket.py:572-652 recvmsg_into_w` — scatter-receive into
+    // a sequence of writable buffers.  Pyre only accepts a list/tuple
+    // of bytearray objects (PyPy's writebuf_w + buffer-protocol path
+    // is not yet wired for arbitrary writable objects); each bytearray
+    // contributes one iovec entry.
+    crate::dict_storage_store(
+        ns,
+        "recvmsg_into",
+        crate::make_builtin_function("recvmsg_into", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(
+                    "recvmsg_into() missing buffers",
+                ));
+            }
+            let seq = args[1];
+            let (is_list, is_tuple) = unsafe {
+                (pyre_object::is_list(seq), pyre_object::is_tuple(seq))
+            };
+            if !is_list && !is_tuple {
+                return Err(crate::PyError::type_error(
+                    "recvmsg_into: buffers must be a list or tuple of bytearray",
+                ));
+            }
+            let nbufs = unsafe {
+                if is_list {
+                    pyre_object::w_list_len(seq)
+                } else {
+                    pyre_object::w_tuple_len(seq)
+                }
+            };
+            let mut bytearrays: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(nbufs);
+            for i in 0..nbufs {
+                let item = unsafe {
+                    if is_list {
+                        pyre_object::w_list_getitem(seq, i as i64)
+                    } else {
+                        pyre_object::w_tuple_getitem(seq, i as i64)
+                    }
+                }
+                .ok_or_else(|| crate::PyError::type_error("recvmsg_into: buffer item missing"))?;
+                if !unsafe { pyre_object::bytearrayobject::is_bytearray(item) } {
+                    return Err(crate::PyError::type_error(
+                        "recvmsg_into: each buffer must be a bytearray",
+                    ));
+                }
+                bytearrays.push(item);
+            }
+            let ancbufsize = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvmsg_into: ancbufsize must be an integer",
+                    ));
+                }
+                let raw = unsafe { pyre_object::w_int_get_value(args[2]) };
+                if raw < 0 {
+                    return Err(crate::PyError::value_error(
+                        "invalid ancillary data buffer length",
+                    ));
+                }
+                raw as usize
+            } else {
+                0
+            };
+            let flags = if args.len() >= 4 {
+                if !unsafe { pyre_object::is_int(args[3]) } {
+                    return Err(crate::PyError::type_error(
+                        "recvmsg_into: flags must be an integer",
+                    ));
+                }
+                unsafe { pyre_object::w_int_get_value(args[3]) as libc::c_int }
+            } else {
+                0
+            };
+            let fd = socket_fd(args[0])?;
+
+            let mut iovs: Vec<libc::iovec> = bytearrays
+                .iter()
+                .map(|&ba| {
+                    let slice = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(ba) };
+                    libc::iovec {
+                        iov_base: slice.as_mut_ptr() as *mut libc::c_void,
+                        iov_len: slice.len(),
+                    }
+                })
+                .collect();
+            let mut control = vec![0u8; ancbufsize];
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let (got, msg_flags, controllen) = loop {
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+                msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                msg.msg_iov = iovs.as_mut_ptr();
+                msg.msg_iovlen = iovs.len() as _;
+                if ancbufsize > 0 {
+                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    msg.msg_controllen = ancbufsize as _;
+                }
+                let r = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+                if r >= 0 {
+                    break (r, msg.msg_flags, msg.msg_controllen);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(socket_io_err(err));
+                }
+            };
+
+            let mut anc_items = Vec::new();
+            if ancbufsize > 0 && controllen > 0 {
+                let mut dummy_iov = libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut dummy_iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = controllen;
+                unsafe {
+                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    while !cmsg.is_null() {
+                        let header = &*cmsg;
+                        let hdr_size = libc::CMSG_LEN(0) as usize;
+                        let total = header.cmsg_len as usize;
+                        if total < hdr_size {
+                            break;
+                        }
+                        let payload_len = total - hdr_size;
+                        let payload_ptr = libc::CMSG_DATA(cmsg);
+                        let payload =
+                            std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                        anc_items.push(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(header.cmsg_level as i64),
+                            pyre_object::w_int_new(header.cmsg_type as i64),
+                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
+                        ]));
+                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                    }
+                }
+            }
+            let addr = unpack_inet_addr(&storage);
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(got as i64),
                 pyre_object::w_list_new(anc_items),
                 pyre_object::w_int_new(msg_flags as i64),
                 addr,
