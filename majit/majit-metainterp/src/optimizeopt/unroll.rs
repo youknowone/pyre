@@ -1777,6 +1777,13 @@ enum ExportedGcRefField {
 
 impl ExportedState {
     /// unroll.py: ExportedState.__init__
+    ///
+    /// `box_pool` must be supplied at construction so the synthetic vs
+    /// canonical-export distinction is explicit at every callsite — PyPy
+    /// passes the same Box objects by identity end-to-end, so the
+    /// "no pool" / "fresh pool" case has to be a conscious choice (test
+    /// fixture, retrace base) rather than a silent default that misses
+    /// `_forwarded` chain coverage.
     pub fn new(
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
@@ -1789,6 +1796,7 @@ impl ExportedState {
         renamed_inputargs: Vec<OpRef>,
         renamed_inputarg_types: Vec<Type>,
         short_inputargs: Vec<OpRef>,
+        box_pool: crate::r#box::BoxPool,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
         // pre-derives the per-OpRef ProducedShortOp view (with label-arg
@@ -1815,7 +1823,7 @@ impl ExportedState {
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
-            box_pool: crate::r#box::BoxPool::default(),
+            box_pool,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2701,16 +2709,6 @@ impl OptUnroll {
         // via `produced_short_boxes_from_exported_boxes`
         // (`shortpreamble.rs:2100`). Storing both shapes on
         // `ExportedState` would risk drift across mutations.
-        let mut state = ExportedState::new(
-            label_args.clone(),
-            resolved_next_iteration_args,
-            virtual_state,
-            infos,
-            exported_short_boxes,
-            renamed_inputargs.to_vec(),
-            renamed_inputarg_types,
-            short_args,
-        );
         // Capture the full Phase 1 BoxRef pool so a subsequent
         // `compile_retrace` attempt can hand it back to Phase 2 as
         // `p1_full_prefix` (`unroll.rs:282-303`).  Doubles as the
@@ -2724,7 +2722,17 @@ impl OptUnroll {
         // BoxRef vector to recreate that observation across the
         // in-memory ExportedState hand-off.  Each entry is `Rc::clone`
         // cheap; vec retention is bounded by `ExportedState` lifetime.
-        state.box_pool = ctx.box_pool.clone();
+        let mut state = ExportedState::new(
+            label_args.clone(),
+            resolved_next_iteration_args,
+            virtual_state,
+            infos,
+            exported_short_boxes,
+            renamed_inputargs.to_vec(),
+            renamed_inputarg_types,
+            short_args,
+            ctx.box_pool.clone(),
+        );
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -5045,6 +5053,7 @@ mod tests {
             vec![OpRef::int_op(14)],
             Vec::new(),
             vec![OpRef::int_op(23)],
+            crate::r#box::BoxPool::default(),
         );
 
         assert_eq!(exported.opref_high_water(), 110);
@@ -5918,6 +5927,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![source],
+            crate::r#box::BoxPool::default(),
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
             8,
