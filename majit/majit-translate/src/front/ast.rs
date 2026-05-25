@@ -94,42 +94,6 @@ macro_rules! get_value_var {
     }};
 }
 
-/// Legacy alias: callers that pre-date the `FlowingError` / `Lowered`
-/// split in this file still reference `LoweringAbort`.  Keep the name
-/// pointing at `FlowingError` until all in-crate consumers migrate.
-pub fn build_semantic_program(parsed: &ParsedInterpreter) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_with_options(
-        parsed,
-        &AstGraphOptions::default(),
-        crate::HostStaticAddrs::default(),
-    )
-}
-
-pub fn build_semantic_program_from_parsed_files(
-    parsed_files: &[ParsedInterpreter],
-) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_from_parsed_files_with_options(
-        parsed_files,
-        &AstGraphOptions::default(),
-        crate::HostStaticAddrs::default(),
-    )
-}
-
-/// Like [`build_semantic_program_from_parsed_files`] but with
-/// host-supplied object-space singleton addresses threaded through to
-/// the `KnownStaticsCatalogue` (`HostStaticAddrs`).  The production
-/// driver (`pyre-jit-trace/build.rs`) uses this; test / legacy callers
-/// keep the no-statics wrapper above.
-pub fn build_semantic_program_from_parsed_files_with_statics(
-    parsed_files: &[ParsedInterpreter],
-    static_addrs: crate::HostStaticAddrs<'_>,
-) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_from_parsed_files_with_options(
-        parsed_files,
-        &AstGraphOptions::default(),
-        static_addrs,
-    )
-}
 
 /// RPython `annrpython.py:103-150 build_types` whole-program walk —
 /// runs `collect_struct_names` + `collect_trait_names` +
@@ -244,38 +208,6 @@ pub(crate) fn collect_struct_origins(
     }
 }
 
-/// RPython: annotator whole-program type collection.
-/// Recursively collects struct definitions, function return types, and impl
-/// method return types from items, handling `mod` blocks with qualified paths.
-/// The `prefix` carries the module path (e.g. "a::b") to produce exact callee
-/// identities matching what `canonical_call_target` generates at call sites.
-fn collect_types_from_items(
-    items: &[Item],
-    prefix: &str,
-    use_imports: &HashMap<String, String>,
-    known_struct_names: &mut std::collections::HashSet<String>,
-    known_trait_names: &mut std::collections::HashSet<String>,
-    struct_fields: &mut StructFieldRegistry,
-    fn_return_types: &mut HashMap<String, String>,
-    immutable_fields: &mut HashMap<String, Vec<(String, ImmutableRank)>>,
-) {
-    // RPython: annotator/rtyper resolves all types in a whole-program pass.
-    // Two-pass: first collect ALL struct names, then field types + return types.
-    // This ensures qualified_full_type_string can identify known structs
-    // regardless of source order (RPython's lltype T.TO identity).
-    collect_struct_names(items, prefix, known_struct_names);
-    collect_trait_names(items, prefix, known_trait_names);
-    collect_fields_and_returns(
-        items,
-        prefix,
-        use_imports,
-        known_struct_names,
-        known_trait_names,
-        struct_fields,
-        fn_return_types,
-        immutable_fields,
-    );
-}
 
 /// Read `#[jit_immutable_fields("a", "b?", "c[*]", "d?[*]")]` attributes
 /// off a struct declaration and return the declared field names paired
@@ -1087,385 +1019,6 @@ fn collect_nested_fn_returns(
     }
 }
 
-/// RPython: pass 2 graph building with Item::Mod recursion.
-/// Mirrors collect_types_from_items traversal so that module-internal
-/// functions get proper SemanticFunction entries with qualified names.
-///
-/// RPython `flowspace/objspace.py:49` + `flowspace/flowcontext.py:417`
-/// + `translator/translator.py:55` — `build_flow()` / `buildflowgraph()`
-/// re-raise `FlowingError`, and the top-level translator observes the
-/// unsupported construct as a hard failure.  This batch collector
-/// propagates `FlowingError` the same way rather than silently dropping
-/// a graph whose body hit an unsupported construct.
-fn build_graphs_from_items(
-    items: &[Item],
-    prefix: &str,
-    source_module: &str,
-    options: &AstGraphOptions,
-    struct_fields: &StructFieldRegistry,
-    fn_return_types: &HashMap<String, String>,
-    method_suffix_index: &MethodSuffixIndex,
-    use_imports: &HashMap<String, String>,
-    // Program-wide `pub const` / `pub static` table aggregated by the
-    // caller (`build_semantic_program_*_with_options`).  Empty for
-    // legacy test entry points; populated for the production pipeline.
-    // Threaded straight through to `build_function_graph` →
-    // `GraphBuildContext::with_module_statics`.
-    module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-    known_statics: &KnownStaticsCatalogue,
-    known_struct_names: &std::collections::HashSet<String>,
-    known_trait_names: &std::collections::HashSet<String>,
-    functions: &mut Vec<SemanticFunction>,
-) -> Result<(), FlowingError> {
-    for item in items {
-        match item {
-            Item::Fn(func) => {
-                // `rlib/jit.py:184-201 elidable_promote.decorator(func)`
-                // installs two callable objects on module import
-                // (closure-captured original + `exec`-built wrapper).
-                // `synthesize_or_passthrough` mirrors that for both
-                // free fns and impl methods so the lowering layer below
-                // stays wrapper-blind, exactly like RPython's flow-graph
-                // builder.
-                for synth in synthesize_or_passthrough(func.clone(), None) {
-                    let mut sf = build_function_graph(
-                        &synth,
-                        options,
-                        None,
-                        struct_fields,
-                        fn_return_types,
-                        method_suffix_index,
-                        prefix,
-                        source_module,
-                        use_imports,
-                        module_statics,
-                        known_statics,
-                        known_struct_names,
-                        known_trait_names,
-                    )?;
-                    if !prefix.is_empty() {
-                        sf.name = format!("{}::{}", prefix, sf.name);
-                    }
-                    functions.push(sf);
-                }
-            }
-            Item::Impl(impl_block) => {
-                // Qualify bare self type with module prefix (RPython: unique
-                // type identity).  Route through the imports-aware variant
-                // so this graph-build self_ty_root matches the
-                // `parse::collect_trait_impls_from_items` /
-                // `parse::collect_inherent_methods_from_items` registration
-                // key when the receiver is a `use <path> as alias` form.
-                let self_ty_root = type_root_ident(&impl_block.self_ty)
-                    .map(|t| qualify_type_name_with_imports(&t, prefix, use_imports));
-                for sub in &impl_block.items {
-                    if let syn::ImplItem::Fn(method) = sub {
-                        let fake_fn = ItemFn {
-                            attrs: method.attrs.clone(),
-                            vis: syn::Visibility::Inherited,
-                            sig: method.sig.clone(),
-                            block: Box::new(method.block.clone()),
-                        };
-                        // jit.py:184-201 — method-level `@elidable_promote`
-                        // gets the same wrapper/orig synthesis as free
-                        // fns; RPython decorators apply uniformly to any
-                        // callable.  The qualified `self_ty_root` lets
-                        // the wrapper's tail call hit the impl-method
-                        // registration path built by
-                        // `CallPath::for_impl_method`.
-                        for synth in synthesize_or_passthrough(fake_fn, self_ty_root.as_deref()) {
-                            let sf = build_function_graph(
-                                &synth,
-                                options,
-                                self_ty_root.clone(),
-                                struct_fields,
-                                fn_return_types,
-                                method_suffix_index,
-                                prefix,
-                                source_module,
-                                use_imports,
-                                module_statics,
-                                known_statics,
-                                known_struct_names,
-                                known_trait_names,
-                            )?;
-                            functions.push(sf);
-                        }
-                    }
-                }
-            }
-            Item::Mod(m) => {
-                if let Some((_, ref items)) = m.content {
-                    let mod_prefix = if prefix.is_empty() {
-                        m.ident.to_string()
-                    } else {
-                        format!("{}::{}", prefix, m.ident)
-                    };
-                    build_graphs_from_items(
-                        items,
-                        &mod_prefix,
-                        source_module,
-                        options,
-                        struct_fields,
-                        fn_return_types,
-                        method_suffix_index,
-                        use_imports,
-                        module_statics,
-                        known_statics,
-                        known_struct_names,
-                        known_trait_names,
-                        functions,
-                    )?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-pub fn build_semantic_program_with_options(
-    parsed: &ParsedInterpreter,
-    options: &AstGraphOptions,
-    static_addrs: crate::HostStaticAddrs<'_>,
-) -> Result<SemanticProgram, FlowingError> {
-    let mut functions = Vec::new();
-    let mut known_struct_names = std::collections::HashSet::new();
-    let mut known_trait_names = std::collections::HashSet::new();
-    let mut struct_fields = StructFieldRegistry::default();
-
-    // Pass 1: collect all struct definitions and function return types.
-    // RPython: annotator/rtyper resolves all types in a whole-program pass.
-    // We recursively traverse Item::Mod to register module-qualified paths
-    // matching the exact callee identity that canonical_call_target produces.
-    //
-    // `parsed.module_path` is the crate-stripped module path for the file
-    // (e.g. `"baseobjspace"`).  Pass 1 keeps prefix="" so existing
-    // `fn_return_types` / struct lookups (most of which key on
-    // bare names or `Type::method`) stay valid; Pass 2 uses
-    // `parsed.module_path` so each free function's `sf.name` carries
-    // the module prefix.  That makes `canonical_function_graphs`
-    // (`lib.rs:494`) register the function under
-    // `["module", "name"]` / `["crate", "module", "name"]`, matching
-    // the segments emitted by `canonical_call_target`
-    // (`front/ast.rs:7841`) for `crate::module::name` paths.  Empty
-    // `parsed.module_path` (legacy `parse_source` fixture) keeps the
-    // bare-name behaviour.
-    let mut fn_return_types: HashMap<String, String> = HashMap::new();
-    let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
-    collect_types_from_items(
-        &parsed.file.items,
-        "",
-        &parsed.use_imports,
-        &mut known_struct_names,
-        &mut known_trait_names,
-        &mut struct_fields,
-        &mut fn_return_types,
-        &mut immutable_fields,
-    );
-
-    // Pass 2: build function graphs with struct_fields + fn_return_types.
-    // Field types are already module-qualified at the source (via
-    // qualified_full_type_string), matching RPython's lltype identity.
-    // Aggregate the single-file `module_statics` ahead of the graph
-    // build so the `GraphBuildContext` attached at
-    // `build_function_graph` carries the same `(module_path, name) →
-    // ModuleStaticDecl` shape that the multi-file pipeline produces.
-    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
-        HashMap::new();
-    for ((nested, name), decl) in &parsed.module_statics {
-        let module = qualify_module_path(&parsed.module_path, nested);
-        module_statics.insert((module, name.clone()), decl.clone());
-    }
-    let known_statics =
-        KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed), static_addrs);
-    let start_len = functions.len();
-    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
-    build_graphs_from_items(
-        &parsed.file.items,
-        "",
-        &parsed.module_path,
-        options,
-        &struct_fields,
-        &fn_return_types,
-        &method_suffix_index,
-        &parsed.use_imports,
-        &module_statics,
-        &known_statics,
-        &known_struct_names,
-        &known_trait_names,
-        &mut functions,
-    )?;
-    // Stamp the parsed file's `module_path` onto each new
-    // SemanticFunction so the call-registry alias loop in `lib.rs`
-    // can register the function under additional module-qualified
-    if !parsed.module_path.is_empty() {
-        for sf in &mut functions[start_len..] {
-            if sf.module_path.is_empty() {
-                sf.module_path = parsed.module_path.clone();
-            }
-            sf.graph.source_module = Some(parsed.module_path.clone());
-        }
-    }
-
-    // `module_statics` was aggregated upstream of `build_graphs_from_items`
-    // so the per-graph `GraphBuildContext` carries it; reuse the same
-    // table for the `SemanticProgram` payload here.
-
-    Ok(SemanticProgram {
-        functions,
-        known_struct_names,
-        known_trait_names,
-        struct_fields,
-        fn_return_types,
-        immutable_fields,
-        module_statics,
-    })
-}
-
-pub fn build_semantic_program_from_parsed_files_with_options(
-    parsed_files: &[ParsedInterpreter],
-    options: &AstGraphOptions,
-    static_addrs: crate::HostStaticAddrs<'_>,
-) -> Result<SemanticProgram, FlowingError> {
-    // RPython: annotator/rtyper provides whole-program type info before
-    // the codewriter runs. We emulate this with a 2-pass approach:
-    // Pass 1: collect ALL struct definitions and function return types across ALL files.
-    // Uses collect_types_from_items to handle Item::Mod recursively with
-    // qualified paths matching canonical_call_target identity.
-    let mut known_struct_names = std::collections::HashSet::new();
-    let mut known_trait_names = std::collections::HashSet::new();
-    let mut struct_fields = StructFieldRegistry::default();
-    let mut fn_return_types: HashMap<String, String> = HashMap::new();
-    let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
-    // RPython: whole-program — ALL types visible everywhere.
-    // Collect struct names from ALL files first, then fields+returns.
-    // Pass 1 keeps prefix="" so existing `fn_return_types` / struct
-    // lookups (which key on bare names or `Type::method`) stay valid;
-    // Pass 2 then uses each file's `parsed.module_path` so the function
-    // graph's `sf.name` carries the module prefix.  The downstream
-    // `canonical_function_graphs` registration (`lib.rs:494`) splits on
-    // `::` and registers under `[module, name]` /
-    // `[crate, module, name]`, matching the segments emitted by
-    // `canonical_call_target` for `crate::module::name` paths.  Empty
-    // `parsed.module_path` (legacy `parse_source` fixture) falls back to
-    // the bare-name behaviour.
-    for parsed in parsed_files {
-        collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
-        collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
-    }
-    for parsed in parsed_files {
-        collect_fields_and_returns(
-            &parsed.file.items,
-            "",
-            &parsed.use_imports,
-            &known_struct_names,
-            &known_trait_names,
-            &mut struct_fields,
-            &mut fn_return_types,
-            &mut immutable_fields,
-        );
-    }
-    // Aggregate per-file `module_statics` ahead of Pass 2 so the
-    // `GraphBuildContext` attached at `build_function_graph` carries
-    // the program-wide `(module_path, name) → ModuleStaticDecl`
-    // table.  Mirrors the `use_imports` aggregation pattern at
-    // `collect_program_metadata_pub`.
-    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
-        HashMap::new();
-    for parsed in parsed_files {
-        for ((nested, name), decl) in &parsed.module_statics {
-            let module = qualify_module_path(&parsed.module_path, nested);
-            module_statics.insert((module, name.clone()), decl.clone());
-        }
-    }
-    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files, static_addrs);
-    // Glob expansion: each parsed file's `use <path>::*` resolves to
-    // explicit (alias → full_path) entries in `use_imports` here,
-    // mirroring Python's import-resolution step which binds glob-
-    // imported names into the importing module's namespace at module-
-    // load time.  The catalogue holds every crate-local
-    // `static` / `const` / `thread_local!` decl; for each file's
-    // glob roots we add a use_imports entry for every catalogue key
-    // under that root, leaving the leaf addressable via a bare
-    // single-segment `Expr::Path` read without the lower_expr glob
-    // fallback.
-    let mut expanded_use_imports: HashMap<String, HashMap<String, String>> = HashMap::new();
-    for parsed in parsed_files {
-        if parsed.use_globs.is_empty() {
-            continue;
-        }
-        let mut entries = parsed.use_imports.clone();
-        for glob_root in &parsed.use_globs {
-            if glob_root.is_empty() {
-                continue;
-            }
-            let prefix = format!("{}::", glob_root.join("::"));
-            for full_path in known_statics.keys_with_prefix(&prefix) {
-                // Rust `use root::*` binds only direct children, not
-                // nested `root::sub::NAME`; skip catalogue keys below
-                // the glob root so a bare `NAME` is not bound to a name
-                // the Rust source would leave out of scope.
-                let Some(leaf) = full_path.strip_prefix(&prefix) else {
-                    continue;
-                };
-                if leaf.contains("::") {
-                    continue;
-                }
-                entries
-                    .entry(leaf.to_string())
-                    .or_insert_with(|| full_path.to_string());
-            }
-        }
-        expanded_use_imports.insert(parsed.module_path.clone(), entries);
-    }
-    // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
-    // Field types already module-qualified at source (qualified_full_type_string).
-    let mut functions = Vec::new();
-    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
-    for parsed in parsed_files {
-        let functions_before = functions.len();
-        let use_imports = expanded_use_imports
-            .get(&parsed.module_path)
-            .unwrap_or(&parsed.use_imports);
-        build_graphs_from_items(
-            &parsed.file.items,
-            "",
-            &parsed.module_path,
-            options,
-            &struct_fields,
-            &fn_return_types,
-            &method_suffix_index,
-            use_imports,
-            &module_statics,
-            &known_statics,
-            &known_struct_names,
-            &known_trait_names,
-            &mut functions,
-        )?;
-        // Stamp the parsed file's `module_path` onto each new
-        // SemanticFunction so the free-function hint registry in
-        // `lib.rs` can add the `[module_path, name]` path alongside
-        // the bare-name and `crate::` alias paths (PyPy
-        if !parsed.module_path.is_empty() {
-            for sf in &mut functions[functions_before..] {
-                if sf.module_path.is_empty() {
-                    sf.module_path = parsed.module_path.clone();
-                }
-                sf.graph.source_module = Some(parsed.module_path.clone());
-            }
-        }
-    }
-    Ok(SemanticProgram {
-        functions,
-        known_struct_names,
-        known_trait_names,
-        struct_fields,
-        fn_return_types,
-        immutable_fields,
-        module_statics,
-    })
-}
 
 /// Public entry for building a graph from a single function AST node.
 /// Lower a standalone expression into an existing graph.
@@ -1480,8 +1033,7 @@ pub fn lower_expr_into_graph(
     graph: &mut FunctionGraph,
     expr: &syn::Expr,
 ) -> Result<(), FlowingError> {
-    let empty_fn_ret = HashMap::new();
-    lower_expr_into_graph_with_signature(graph, expr, None, &empty_fn_ret)
+    lower_expr_into_graph_with_signature(graph, expr, None)
 }
 
 /// Variant of [`lower_expr_into_graph`] that pre-registers a function
@@ -1506,28 +1058,20 @@ pub fn lower_expr_into_graph(
 /// (`front/ast.rs:3056-3156`) but skips module-prefix / use-imports /
 /// struct / trait registries, since opcode-dispatch arm graphs are
 /// synthesized without whole-program context.
-///
-/// `fn_return_types` carries the whole-program callee-return-type map
-/// (`ProgramMetadata.fn_return_types`) so callsites inside the arm
-/// body resolve a function's declared return type instead of falling
-/// back to `ValueType::Unknown = Type::Ref`.  RPython
-/// `annrpython.py:103-150 build_types` is a single whole-program pass
-/// before per-function graph build; the arm-graph synthesis sits
-/// after that pass so the map is fully populated.
 pub fn lower_expr_into_graph_with_signature(
     graph: &mut FunctionGraph,
     expr: &syn::Expr,
     sig: Option<&syn::Signature>,
-    fn_return_types: &HashMap<String, String>,
 ) -> Result<(), FlowingError> {
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
+    let empty_fn_ret = HashMap::new();
     let empty_suffix_index = MethodSuffixIndex::default();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let mut ctx = GraphBuildContext::new(
         &empty_registry,
-        fn_return_types,
+        &empty_fn_ret,
         &empty_suffix_index,
         "",
         HashMap::new(),
@@ -1541,16 +1085,11 @@ pub fn lower_expr_into_graph_with_signature(
                     let self_ty = classify_fn_arg_ty(&recv.ty);
                     ctx.local_value_types
                         .insert("self".to_string(), self_ty.clone());
-                    let self_class_root = match &self_ty {
-                        ValueType::Ref(Some(root)) => Some(root.clone()),
-                        _ => None,
-                    };
                     if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: "self".to_string(),
                             ty: self_ty,
-                            class_root: self_class_root,
                         },
                         true,
                     ) {
@@ -1566,16 +1105,11 @@ pub fn lower_expr_into_graph_with_signature(
                     }
                     let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                     ctx.local_value_types.insert(name.clone(), arg_ty.clone());
-                    let arg_class_root = match &arg_ty {
-                        ValueType::Ref(Some(root)) => Some(root.clone()),
-                        _ => None,
-                    };
                     if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: name.clone(),
                             ty: arg_ty,
-                            class_root: arg_class_root,
                         },
                         true,
                     ) {
@@ -1602,61 +1136,6 @@ pub fn lower_expr_into_graph_with_signature(
     Ok(())
 }
 
-pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, FlowingError> {
-    let empty_registry = StructFieldRegistry::default();
-    let empty_fn_ret = HashMap::new();
-    let empty_suffix_index = MethodSuffixIndex::default();
-    let empty_names = std::collections::HashSet::new();
-    let empty_trait_names = std::collections::HashSet::new();
-    let empty_use_imports = HashMap::new();
-    let empty_module_statics = HashMap::new();
-    let empty_known_statics = KnownStaticsCatalogue::empty();
-    build_function_graph(
-        func,
-        &AstGraphOptions::default(),
-        None,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_suffix_index,
-        "",
-        "",
-        &empty_use_imports,
-        &empty_module_statics,
-        &empty_known_statics,
-        &empty_names,
-        &empty_trait_names,
-    )
-}
-
-pub fn build_function_graph_with_self_ty_pub(
-    func: &ItemFn,
-    self_ty_root: Option<String>,
-    struct_fields: &StructFieldRegistry,
-    fn_return_types: &HashMap<String, String>,
-    module_prefix: &str,
-    use_imports: &HashMap<String, String>,
-    known_struct_names: &std::collections::HashSet<String>,
-    known_trait_names: &std::collections::HashSet<String>,
-) -> Result<SemanticFunction, FlowingError> {
-    let empty_module_statics = HashMap::new();
-    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(fn_return_types);
-    let empty_known_statics = KnownStaticsCatalogue::empty();
-    build_function_graph(
-        func,
-        &AstGraphOptions::default(),
-        self_ty_root,
-        struct_fields,
-        fn_return_types,
-        &method_suffix_index,
-        module_prefix,
-        "",
-        use_imports,
-        &empty_module_statics,
-        &empty_known_statics,
-        known_struct_names,
-        known_trait_names,
-    )
-}
 
 /// Expose `collect_jit_hints` so `parse.rs` can hoist trait-method
 /// hints from AST attributes when the strict graph build returns Err.
@@ -1826,15 +1305,6 @@ struct GraphBuildContext<'a> {
     /// build site; defaults to empty when callers (tests, legacy entry
     /// points) construct a context without program-wide aggregation.
     module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-    /// Program-wide catalogue of crate-local `static` / `const` /
-    /// `thread_local!` declarations available to the `Expr::Path`
-    /// arm.  Borrowed from
-    /// [`build_semantic_program_from_parsed_files_with_options`]'s
-    /// per-build catalogue.  `None` for legacy / test entry points
-    /// that construct a context without program-wide aggregation —
-    /// the `Expr::Path` lookup treats `None` as a fully-empty
-    /// catalogue.
-    known_statics: Option<&'a KnownStaticsCatalogue>,
     known_struct_names: &'a std::collections::HashSet<String>,
     known_trait_names: &'a std::collections::HashSet<String>,
     /// Loop targets active at the current lowering point.  Pushed on
@@ -2203,7 +1673,6 @@ impl<'a> GraphBuildContext<'a> {
             source_module: String::new(),
             use_imports,
             module_statics: HashMap::new(),
-            known_statics: None,
             known_struct_names,
             known_trait_names,
             loop_stack: Vec::new(),
@@ -2232,18 +1701,6 @@ impl<'a> GraphBuildContext<'a> {
         module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
     ) -> Self {
         self.module_statics = module_statics;
-        self
-    }
-
-    /// Builder that attaches the program-wide static catalogue to
-    /// this graph build context.  Same opt-in pattern as
-    /// [`Self::with_module_statics`]: the production pipeline calls
-    /// this with the per-build catalogue produced by
-    /// [`KnownStaticsCatalogue::from_parsed_files`], and legacy /
-    /// test entry points leave it unset so reads observe an empty
-    /// catalogue.
-    fn with_known_statics(mut self, known_statics: &'a KnownStaticsCatalogue) -> Self {
-        self.known_statics = Some(known_statics);
         self
     }
 
@@ -3510,17 +2967,12 @@ fn lazy_install_local_at_current_block_var(
     // header).
     let prior_ctx_lvi = ctx.local_var_of(name, graph);
     let prior_ctx_lvt = ctx.local_value_types.get(name).cloned();
-    let class_root = match &value_type {
-        ValueType::Ref(Some(root)) => Some(root.clone()),
-        _ => None,
-    };
     let new_var = if let Some(var) = pre_allocated_var {
         graph.push_op_with_result_var(
             current_block,
             OpKind::Input {
                 name: name.to_string(),
                 ty: value_type.clone(),
-                class_root: class_root.clone(),
             },
             var.clone(),
         );
@@ -3531,7 +2983,6 @@ fn lazy_install_local_at_current_block_var(
             OpKind::Input {
                 name: name.to_string(),
                 ty: value_type.clone(),
-                class_root,
             },
             true,
         )?
@@ -3674,168 +3125,6 @@ thread_local! {
     /// elsewhere — purely cosmetic for the dump output.
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
-
-}
-
-/// Catalogue of crate-local `static` / `const` / `thread_local!`
-/// declarations available to `lower_expr` so a single-segment
-/// `Expr::Path` whose joined name matches a registered static can
-/// emit `OpKind::LoadStatic` (or a primitive `OpKind::Const{Int,
-/// Bool,Float}` for resolved literal RHS) instead of the body-
-/// `OpKind::Input` fallthrough.
-///
-/// Keyed strictly on the fully-qualified joined `::`-path (e.g.
-/// `crate::weakref::GC_WEAKREF_TYPE`) — PyPy `LOAD_GLOBAL`
-/// (`flowcontext.py:856`) resolves the name through the frame's
-/// per-module globals namespace, which is module-scoped by host
-/// Python identity; pyre carries names as strings, so the
-/// equivalent narrowing is to require callers to qualify single-
-/// segment reads via `module_prefix` / `use_imports` before the
-/// lookup.  Bare-leaf entries are NOT installed.
-///
-/// `IndexMap` matches PyPy dict identity (preserved insertion
-/// order).  The catalogue is constructed once per build pipeline
-/// in `build_semantic_program_from_parsed_files_with_options` and
-/// borrowed by reference into each `GraphBuildContext`, mirroring
-/// PyPy `Bookkeeper.immutablevalue` resolution which reads from
-/// the analyzer-owned bookkeeper rather than from process-wide
-/// state.
-#[derive(Debug, Default, Clone)]
-pub struct KnownStaticsCatalogue {
-    entries: indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
-}
-
-impl KnownStaticsCatalogue {
-    /// Empty catalogue — used by test / legacy entry points that do
-    /// not have access to a parsed program.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Build the catalogue from a parsed program: walks each file's
-    /// top-level `Item::Static` / `Item::Const` / `thread_local!`
-    /// macro statics via `extract_static_decls`, then registers the
-    /// hand-coded stdlib enum variants pyre source carries through
-    /// the flowgraph as opaque constants.
-    pub fn from_parsed_files(
-        parsed_files: &[crate::parse::ParsedInterpreter],
-        static_addrs: crate::HostStaticAddrs<'_>,
-    ) -> Self {
-        let mut entries = indexmap::IndexMap::new();
-        for parsed in parsed_files {
-            for (segments, ty, value) in
-                crate::flowspace::rust_source::register::extract_static_decls(
-                    &parsed.file,
-                    &parsed.module_path,
-                )
-            {
-                if segments.is_empty() {
-                    continue;
-                }
-                entries.insert(segments.join("::"), (ty, value));
-            }
-        }
-        register_stdlib_known_statics(&mut entries, static_addrs);
-        Self { entries }
-    }
-
-    pub fn get(
-        &self,
-        key: &str,
-    ) -> Option<&(ValueType, Option<crate::flowspace::model::ConstValue>)> {
-        self.entries.get(key)
-    }
-
-    /// Iterate catalogue keys whose joined `::`-path starts with
-    /// `prefix`.  Used by `build_semantic_program_*` to expand each
-    /// parsed file's `use <path>::*` glob roots into explicit
-    /// `use_imports` entries (`name → glob_root::name`) at semantic
-    /// build time, mirroring Python's import-resolution step which
-    /// binds glob-imported names into the importing module's
-    /// namespace at module-load time.
-    pub fn keys_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> {
-        self.entries
-            .keys()
-            .filter(move |k| k.starts_with(prefix))
-            .map(String::as_str)
-    }
-}
-
-/// Pre-register stdlib enum variants that pyre source carries through
-/// the flowgraph as opaque constants.  PyPy `LOAD_GLOBAL`
-/// (`flowcontext.py:856`) pushes the per-module-globals namespace
-/// entry as a `Constant(value)`; pyre's `extract_static_decls` only
-/// scans crate-local `Item::Static` / `Item::Const` so external
-/// stdlib paths (`std::sync::atomic::Ordering::Relaxed` reached via
-/// the imported `Ordering` alias) miss the catalogue and reach the
-/// `lower_expr` `Expr::Path` arm's body-`OpKind::Input` fallback.
-/// Threading a body-Input across an `if`/`return`-induced block
-/// boundary requires `Link.args` predeclaration on the predecessor
-/// link, which producers downstream of `Expr::If` do not perform —
-/// the adapter then panics ("cross-block body Input — name X was not
-/// threaded through Link.args / target inputargs").
-///
-/// Memory-ordering arguments are semantically opaque to the JIT — the
-/// underlying atomic operation encodes the ordering inline; the
-/// `Ordering` arg is consumed at the Rust→LL boundary.  Map each
-/// variant to a distinct `ConstInt` so the catalogue lookup at
-/// `lower_expr` emits a `ConstX` directly (each callsite
-/// self-contained, no cross-block threading needed) and the rtyper
-/// sees `int_call(_, ConstInt(n))` instead of an unbound
-/// cross-block `Input` op.
-///
-/// The two-segment key matches the in-source spelling — every pyre
-/// caller imports `Ordering` and writes `Ordering::Relaxed`, so the
-/// catalogue's qualified key matches the `lower_expr` lookup key
-/// directly.
-fn register_stdlib_known_statics(
-    m: &mut indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
-    static_addrs: crate::HostStaticAddrs<'_>,
-) {
-    use crate::flowspace::model::ConstValue;
-    // Prebuilt static `PyType` pointers, host-supplied across the
-    // translation boundary (`HostStaticAddrs`).  Recorded as
-    // `ValueType::Int` so the `lower_expr` `Expr::Path` arm emits a
-    // `ConstInt` directly.  Empty for fixtures that do not reference
-    // these singletons.
-    for (path, addr) in static_addrs.pytypes {
-        m.insert(
-            (*path).to_string(),
-            (ValueType::Int, Some(ConstValue::Int(*addr))),
-        );
-    }
-    // `PY_NULL` is a null sentinel, not an object-space address, so it
-    // stays native here instead of arriving through `static_addrs`.
-    m.insert(
-        "pyobject::PY_NULL".to_string(),
-        (
-            ValueType::Ref(None),
-            Some(ConstValue::LLAddress(
-                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
-            )),
-        ),
-    );
-    // Prebuilt dict-strategy singletons, host-supplied refs.
-    for (path, addr) in static_addrs.refs {
-        m.insert(
-            (*path).to_string(),
-            (ValueType::Ref(None), Some(ConstValue::Int(*addr))),
-        );
-    }
-
-    let ordering_variants: &[(&str, i64)] = &[
-        ("Ordering::Relaxed", 0),
-        ("Ordering::Acquire", 1),
-        ("Ordering::Release", 2),
-        ("Ordering::AcqRel", 3),
-        ("Ordering::SeqCst", 4),
-    ];
-    for (path, code) in ordering_variants {
-        m.insert(
-            (*path).to_string(),
-            (ValueType::Int, Some(ConstValue::Int(*code))),
-        );
-    }
 }
 
 /// RAII guard for `CURRENT_LOWERING_FN_NAME` — restores the previous
@@ -3852,281 +3141,6 @@ impl Drop for LoweringFnNameGuard {
     }
 }
 
-fn build_function_graph<'a>(
-    func: &ItemFn,
-    options: &AstGraphOptions,
-    self_ty_root: Option<String>,
-    struct_fields: &'a StructFieldRegistry,
-    fn_return_types: &'a HashMap<String, String>,
-    method_suffix_index: &'a MethodSuffixIndex,
-    module_prefix: &str,
-    source_module: &str,
-    use_imports: &'a HashMap<String, String>,
-    // Program-wide `pub const` / `pub static` table — attached to
-    // `GraphBuildContext` via `with_module_statics` for the
-    // `Expr::Path` arm consumer.  Empty for the legacy public
-    // wrappers (`build_function_graph_pub` / `_with_self_ty_pub`)
-    // that don't have access to the aggregated program-wide table.
-    module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-    // Program-wide static catalogue — attached to `GraphBuildContext`
-    // via `with_known_statics`.  Empty (`KnownStaticsCatalogue::
-    // empty()`) for legacy public wrappers.
-    known_statics: &'a KnownStaticsCatalogue,
-    known_struct_names: &'a std::collections::HashSet<String>,
-    known_trait_names: &'a std::collections::HashSet<String>,
-) -> Result<SemanticFunction, FlowingError> {
-    let fn_name = func.sig.ident.to_string();
-    let previous = CURRENT_LOWERING_FN_NAME.with(|c| c.borrow_mut().replace(fn_name.clone()));
-    let _restore_fn = LoweringFnNameGuard { previous };
-    let mut graph = FunctionGraph::new(fn_name);
-    if let Some(owner) = &self_ty_root {
-        graph.owner_root = Some(owner.clone());
-    }
-    let mut entry = graph.startblock;
-    let mut ctx = GraphBuildContext::new(
-        struct_fields,
-        fn_return_types,
-        method_suffix_index,
-        module_prefix,
-        use_imports.clone(),
-        known_struct_names,
-        known_trait_names,
-    )
-    .with_module_statics(module_statics.clone())
-    .with_known_statics(known_statics)
-    .with_source_module(source_module);
-    ctx.generic_trait_roots =
-        collect_generic_trait_roots(&func.sig.generics, module_prefix, known_trait_names);
-
-    // Register function parameters as Input ops AND on `Block.inputargs`.
-    //
-    // RPython parity: `Block.inputargs` is the function's formal parameter
-    // list for the startblock (`flowspace/model.py` Block class).  Pyre
-    // originally only emitted `OpKind::Input` ops here — but because body
-    // `Expr::Path` lowering also emits `OpKind::Input` for plain variable
-    // references (`front/ast.rs:1271-1287`), counting startblock `Input`
-    // ops after lowering can no longer tell "parameter" from "body
-    // reference" apart.  Populating `inputargs` during parameter
-    // registration preserves the RPython `startblock.inputargs == params`
-    // invariant and is what `getcalldescr`'s `FUNC.ARGS` check reads
-    // (RPython `call.py:220-221`).
-    for param in &func.sig.inputs {
-        match param {
-            syn::FnArg::Receiver(recv) => {
-                if let Some(self_ty_root) = &self_ty_root {
-                    ctx.local_type_roots
-                        .insert("self".to_string(), self_ty_root.clone());
-                    ctx.local_type_strings
-                        .insert("self".to_string(), self_ty_root.clone());
-                }
-                // `self`, `&self`, `&mut self` — all three correspond to
-                // an `lltype.Ptr(<Self>)` register in RPython, so the
-                // formal parameter always lands in the Ref class.
-                let self_ty = classify_fn_arg_ty(&recv.ty);
-                ctx.local_value_types
-                    .insert("self".to_string(), self_ty.clone());
-                let self_class_root = match &self_ty {
-                    ValueType::Ref(Some(root)) => Some(root.clone()),
-                    _ => None,
-                };
-                if let Some(var) = graph.push_op_var(
-                    entry,
-                    OpKind::Input {
-                        name: "self".to_string(),
-                        ty: self_ty,
-                        class_root: self_class_root,
-                    },
-                    true,
-                ) {
-                    graph.name_value_var(&var, "self".to_string());
-                    graph.push_inputarg_var(entry, var.clone());
-                    // RPython `LOAD_FAST` parity: record the receiver
-                    // binding so a body `Expr::Path` reference to
-                    // `self` within the entry block reuses this
-                    // Variable instead of emitting a fresh
-                    // `OpKind::Input` — same treatment as typed
-                    // parameters on the `FnArg::Typed` arm below
-                    // (`flowspace/flowcontext.py:835`).
-                    ctx.bind_local_id_var("self".to_string(), &var, &graph, entry);
-                }
-            }
-            syn::FnArg::Typed(pat_type) => {
-                let name = canonical_pat_name(&pat_type.pat);
-                if let Some(type_root) = type_root_ident(&pat_type.ty) {
-                    // Qualify bare type with module prefix for exact identity.
-                    let qualified = qualify_type_name_with_imports(
-                        &type_root,
-                        &ctx.module_prefix,
-                        &ctx.use_imports,
-                    );
-                    ctx.local_type_roots.insert(name.clone(), qualified);
-                    if let Some(trait_root) = ctx.generic_trait_roots.get(&type_root) {
-                        ctx.local_trait_bound_roots
-                            .insert(name.clone(), trait_root.clone());
-                    }
-                }
-                if let Some(full_type) = qualified_full_type_string_with_imports(
-                    &pat_type.ty,
-                    &ctx.module_prefix,
-                    &ctx.use_imports,
-                    ctx.known_struct_names,
-                    ctx.known_trait_names,
-                ) {
-                    ctx.local_type_strings
-                        .insert(name.clone(), full_type.clone());
-                    ctx.local_array_types.insert(name.clone(), full_type);
-                }
-                if let Some(trait_root) = extract_dyn_trait_root_with_context(
-                    &pat_type.ty,
-                    &ctx.module_prefix,
-                    ctx.known_trait_names,
-                ) {
-                    ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
-                }
-                // RPython `rpython/jit/codewriter/support.py:getkind`
-                // mapping: classify the Rust parameter type to one of
-                // the three register classes so the annotator + rtyper
-                // receive a non-`Unknown` seed. Upstream's rtyper
-                // assigns a concretetype to every `Variable`, and
-                // `assembler.py:write_insn` relies on every operand
-                // having a coloring. Using `ValueType::Unknown` here
-                // used to cascade into `build_value_kinds` dropping
-                // the value, which produced the `(0, 'i')` fallback at
-                // `lookup_reg_with_kind` — the source of the pyre-only
-                // `getfield_gc_*/id>*` `_intbase` aliases.
-                let arg_ty = classify_fn_arg_ty(&pat_type.ty);
-                ctx.local_value_types.insert(name.clone(), arg_ty.clone());
-                let arg_class_root = match &arg_ty {
-                    ValueType::Ref(Some(root)) => Some(root.clone()),
-                    _ => None,
-                };
-                if let Some(var) = graph.push_op_var(
-                    entry,
-                    OpKind::Input {
-                        name: name.clone(),
-                        ty: arg_ty.clone(),
-                        class_root: arg_class_root,
-                    },
-                    true,
-                ) {
-                    graph.name_value_var(&var, name.clone());
-                    graph.push_inputarg_var(entry, var.clone());
-                    // RPython `LOAD_FAST` parity: record the parameter
-                    // binding so a body `Expr::Path` reference within
-                    // the entry block reuses this Variable instead of
-                    // emitting a fresh `OpKind::Input`
-                    // (`flowspace/flowcontext.py:835`).
-                    ctx.bind_local_id_var(name.clone(), &var, &graph, entry);
-                }
-            }
-        }
-    }
-
-    // Lower function body.  RPython `flowspace/flowcontext.py` stops
-    // abstract-interpreting the current graph on `FlowingError`
-    // (unsupported opcode) — the exception propagates out of
-    // `build_flow()` (`flowspace/objspace.py:38`) so the translator
-    // observes the failure instead of receiving a partial graph.  A
-    // path-closing `FlowSignal::Return` / `Raise` at the top level is
-    // orderly termination: after `return x` there's nothing more to
-    // walk but the graph is well-formed, so we break without
-    // propagating.
-    // Z4.B.0 tripwire: function-body entry is a simple-stmt boundary
-    // (`flowcontext.py:413` first `handle_bytecode` call) — stack
-    // depth 0 expected.  Today `value_stack` is never written; the
-    // assert is a no-op safety net ahead of Z4.B.1's leaf-push.
-    ctx.assert_stack_empty_at_stmt_boundary("build_function_graph body entry");
-    let lowered = lower_stmt_list_with_tail_value(
-        &mut graph,
-        &mut entry,
-        &func.block.stmts,
-        options,
-        &mut ctx,
-    )?;
-    // Function-body exit mirrors the entry invariant: every leaf push
-    // must have a matching consumer pop somewhere in the body, so the
-    // top-level stack must be empty again when the walk completes.
-    ctx.assert_stack_empty_at_stmt_boundary("build_function_graph body exit");
-
-    // Default terminator if none was set. RPython `RETURN_VALUE`
-    // carries the evaluated tail expression into `graph.returnblock`;
-    // only statement-only / empty bodies synthesize the void return
-    // value.
-    if !lowered.path_closed && graph.block(entry).is_open() {
-        graph.set_return(entry, lowered.value_var(&graph));
-    }
-
-    // RPython: op.result.concretetype — module-qualified for exact type identity.
-    let return_type = match &func.sig.output {
-        syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
-            ty,
-            module_prefix,
-            use_imports,
-            known_struct_names,
-            known_trait_names,
-        ),
-        syn::ReturnType::Default => Some("()".to_string()),
-    };
-
-    // RPython: function-level hints from decorators / GC transformer.
-    // Scan #[jit_*] attributes to detect elidable, loopinvariant,
-    // close_stack, cannot_collect, gc_effects.
-    let hints = collect_jit_hints(&func.attrs, Some(&func.sig));
-
-    // RPython `simplify_graph(graph)` (`simplify.py:1075-1081`) runs
-    // a fixed list of passes; pyre runs the subset whose AST-graph
-    // dependencies have landed:
-    //
-    //     transform_dead_op_vars         — `prune_dead_phis` (Z2.x)
-    //     eliminate_empty_blocks         — `eliminate_empty_blocks`
-    //     remove_assertion_errors        — pending
-    //     remove_identical_vars_SSA      — pending
-    //     constfold_exitswitch           — handled in optimizeopt
-    //     remove_trivial_links           — pending
-    //     SSA_to_SSI                     — pending
-    //     coalesce_bool                  — pending
-    //     transform_ovfcheck             — pending
-    //     simplify_exceptions            — pending
-    //     transform_xxxitem              — pending
-    //     remove_dead_exceptions         — pending
-    //
-    // `transform_dead_op_vars`: backward dataflow over operation
-    // operands + exitswitches + `Link.args`-as-dependencies.  Line-
-    // by-line port of `simplify.transform_dead_op_vars_in_blocks(blocks,
-    // graphs, translator=None)` (`simplify.py:422-524`).
-    //
-    // `eliminate_empty_blocks`: collapse empty-block forwarding
-    // chains.  Line-by-line port of `simplify.py:52-69`.  No-op on
-    // pyre's tree-recursive Match/If lowering today (no chain
-    // emitted); becomes load-bearing once Z4's flowcontext-walker
-    // rewrite materialises intermediate `SpamBlock`s per fold step.
-    //
-    // Convergence path for the remaining `pending` passes: port each
-    // under its upstream name as the corresponding pyre IR construct
-    // lands.
-    crate::model::prune_dead_phis(&mut graph);
-    crate::model::eliminate_empty_blocks(&mut graph);
-
-    let graph = if module_prefix.is_empty() {
-        graph
-    } else {
-        graph.with_source_module(module_prefix)
-    };
-    Ok(SemanticFunction {
-        name: func.sig.ident.to_string(),
-        graph,
-        return_type,
-        self_ty_root,
-        hints,
-        module_path: module_prefix.to_string(),
-        access_directly: false,
-        // AST builder cannot determine trait_root from syn::ItemFn
-        // alone — the trait/impl context lives one level up in the
-        // walker.  Leaving `None` here matches the legacy behaviour
-        // where `parse::extract_trait_impls` was the trait-name source.
-        trait_root: None,
-    })
-}
 
 /// RPython: extract function-level JIT hints from attributes.
 /// Maps JIT hint attributes to effectinfo classification strings.
@@ -4966,16 +3980,11 @@ fn lower_if_expr(
         };
         for (slot_idx, phi_var, ty) in phi_info {
             let name = ctx.local_first_bind_order[slot_idx].clone();
-            let class_root = match &ty {
-                ValueType::Ref(Some(root)) => Some(root.clone()),
-                _ => None,
-            };
             graph.push_op_with_result_var(
                 merge_block,
                 OpKind::Input {
                     name: name.clone(),
                     ty: ty.clone(),
-                    class_root,
                 },
                 phi_var.clone(),
             );
@@ -5108,31 +4117,6 @@ fn lower_if_expr(
 /// with a Branch, new blocks are created for each arm, and `block`
 /// is updated to the merge/continuation block.
 fn lower_expr(
-    graph: &mut FunctionGraph,
-    block: &mut BlockId,
-    expr: &syn::Expr,
-    options: &AstGraphOptions,
-    ctx: &mut GraphBuildContext,
-) -> Result<Lowered, FlowingError> {
-    // `lower_expr` recurses through `syn::Expr` and `lower_if_expr` /
-    // `lower_stmt_list_with_tail_value` cycle back into `lower_expr`.
-    // Deeply-nested handler bodies — most notably
-    // `pyre-jit/src/eval.rs::eval_loop_jit` and its giant nested
-    // `match` over `Instruction` — push the recursion past 30+
-    // levels with sizeable per-frame locals (several `Vec`s + closure
-    // captures, ~50 KB per frame in debug builds), exhausting the
-    // default 2 MB test-thread stack on `cargo test`.  Guarding the
-    // entry with `stacker::maybe_grow` spills further frames onto a
-    // heap-allocated chunk so the lowering is depth-bounded only by
-    // heap rather than the OS thread stack.  `red_zone` is sized
-    // above the largest observed per-frame slot so the growth
-    // triggers before the next call frame can run off the end.
-    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
-        lower_expr_inner(graph, block, expr, options, ctx)
-    })
-}
-
-fn lower_expr_inner(
     graph: &mut FunctionGraph,
     block: &mut BlockId,
     expr: &syn::Expr,
@@ -5571,62 +4555,6 @@ fn lower_expr_inner(
                 args_vars.push(ctx.popvid_var(graph));
             }
             args_vars.reverse();
-
-            // Rust requires explicit `.wrapping_mul()` / `.wrapping_add()`
-            // etc. for wrap-around integer arithmetic because the bare
-            // `*`/`+`/`-` operators panic on debug overflow.  RPython
-            // expresses the same arithmetic as `r_uint(a) * r_uint(b)` on
-            // `SomeInteger * SomeInteger` where `rarithmetic.r_uint`
-            // silently wraps; its annotator never sees a method shape,
-            // only `int_mul(SomeInteger, SomeInteger)`.  Intercept the
-            // method-call shape here so annotator/rtyper see the same
-            // `BinOp`/`UnaryOp` ops as a direct `*` / `abs()` would
-            // produce — no method-resolution path through SomeInteger
-            // getattr.
-            let method_name = mc.method.to_string();
-            let wrapping_binop_op = match method_name.as_str() {
-                "wrapping_add" => Some("add"),
-                "wrapping_sub" => Some("sub"),
-                "wrapping_mul" => Some("mul"),
-                _ => None,
-            };
-            if let Some(binop) = wrapping_binop_op
-                && args_vars.len() == 2
-            {
-                let lhs = args_vars[0].clone();
-                let rhs = args_vars[1].clone();
-                let result_ty = binary_result_value_type_var(graph, &lhs, &rhs, binop);
-                let var = graph
-                    .push_op_var(
-                        *block,
-                        OpKind::BinOp {
-                            op: binop.into(),
-                            lhs,
-                            rhs,
-                            result_ty,
-                        },
-                        true,
-                    )
-                    .expect("OpKind::BinOp has has_result=true");
-                return Ok(Lowered::from_value_var(graph, &var));
-            }
-            if method_name == "wrapping_abs" && args_vars.len() == 1 {
-                let operand = args_vars[0].clone();
-                let result_ty = graph_value_type_var(graph, &operand).unwrap_or(ValueType::Int);
-                let var = graph
-                    .push_op_var(
-                        *block,
-                        OpKind::UnaryOp {
-                            op: "abs".into(),
-                            operand,
-                            result_ty,
-                        },
-                        true,
-                    )
-                    .expect("OpKind::UnaryOp has has_result=true");
-                return Ok(Lowered::from_value_var(graph, &var));
-            }
-
             // RPython `jtransform.py:410-412`: a polymorphic receiver
             // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
             // Detect via the collected local_dyn_trait_roots map so
@@ -5920,143 +4848,16 @@ fn lower_expr_inner(
                     .map(|var| Lowered::from_value_var(graph, &var))
                     .unwrap_or_else(Lowered::no_value));
             }
-            // Static catalogue lookup — `ctx.known_statics` carries
-            // the program-wide `KnownStaticsCatalogue` built by
-            // [`KnownStaticsCatalogue::from_parsed_files`]; a path
-            // identifier that matches a registered crate-level
-            // `static` / `const` decl (or a `thread_local!` static)
-            // emits `OpKind::LoadStatic` instead of the body-
-            // `OpKind::Input` fallthrough.  The flowspace adapter only
-            // accepts entries that carry a folded `ConstValue`; unresolved
-            // statics must gain a real host-evaluator lowering before
-            // they can reach JitCode.
-            //
-            // Qualified-only lookup: single-segment reads must be
-            // qualified through `use_imports` (alias → fully
-            // qualified path) or `module_prefix` (same-module
-            // qualification) before the catalogue hit.  Multi-
-            // segment reads use the joined path directly.
-            // Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`)
-            // resolving the name through the frame's per-module
-            // globals namespace.
-            // Multi-segment paths whose leading segment is `crate` /
-            // `self` / a `PYRE_INTERNAL_CRATES` alias are normalised
-            // by dropping that root so the lookup key matches the
-            // catalogue, which is published under crate-stripped
-            // paths (parse.rs::joined_use_path / strip_glob_root).
-            let strip_crate_root = |segs: Vec<String>| -> Vec<String> {
-                if segs.len() > 1 {
-                    let first = segs[0].as_str();
-                    if first == "crate"
-                        || first == "self"
-                        || crate::parse::PYRE_INTERNAL_CRATES.contains(&first)
-                    {
-                        return segs[1..].to_vec();
-                    }
-                }
-                segs
-            };
-            let qualified_lookup_key: Option<String> = if path.qself.is_some() {
-                None
-            } else if path.path.segments.len() > 1 {
-                let segs: Vec<String> = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect();
-                Some(strip_crate_root(segs).join("::"))
-            } else if let Some(full) = ctx.use_imports.get(&name) {
-                Some(full.clone())
-            } else if !ctx.module_prefix.is_empty() {
-                Some(format!("{}::{}", ctx.module_prefix, name))
-            } else {
-                None
-            };
-            // `use <path>::*` globs are expanded into explicit
-            // `use_imports` entries inside
-            // `build_semantic_program_*_with_options` (Python's import-
-            // resolution step binds glob-imported names into the
-            // importing module's namespace at module-load time), so
-            // the primary lookup above already covers glob-imported
-            // bare names — no separate fallback needed here.
-            let known_static_entry: Option<(
-                String,
-                ValueType,
-                Option<crate::flowspace::model::ConstValue>,
-            )> = qualified_lookup_key.as_ref().and_then(|key| {
-                ctx.known_statics
-                    .and_then(|c| c.get(key))
-                    .map(|(ty, value)| (key.clone(), ty.clone(), value.clone()))
-            });
-            if let Some((qualified_key, static_ty, static_value)) = known_static_entry {
-                // Slice C: when the static's RHS resolves to a primitive
-                // literal `ConstValue` whose declared `ValueType` matches
-                // pyre's `OpKind::Const{Int,Bool,Float}` shape, emit the
-                // dedicated constant op directly — the same lowering
-                // PyPy `LOAD_GLOBAL` performs by pushing `Constant(value)`
-                // onto the value stack.  This bypasses `OpKind::
-                // LoadStatic` entirely for primitive literals, removing
-                // them from the post-jtransform `same_as` JITCode
-                // emission that the blackhole interp lacks a handler
-                // for (Task #85 snapshot drift).  Non-primitive
-                // values (`UniStr` / `ByteStr` / `None`-resolved) keep
-                // the `LoadStatic` carrier so the cross-block defining-
-                // var constraint stays satisfied while the typed
-                // host-evaluator infrastructure for the remaining
-                // shapes lands.
-                use crate::flowspace::model::ConstValue;
-                let const_op_kind: Option<OpKind> = match (&static_ty, &static_value) {
-                    (ValueType::Bool, Some(ConstValue::Bool(b))) => Some(OpKind::ConstBool(*b)),
-                    (ValueType::Int, Some(ConstValue::Int(i))) => Some(OpKind::ConstInt(*i)),
-                    (ValueType::Float, Some(ConstValue::Float(bits))) => {
-                        Some(OpKind::ConstFloat(*bits))
-                    }
-                    (ValueType::Ref(_), Some(ConstValue::LLAddress(addr)))
-                        if matches!(
-                            addr,
-                            crate::translator::rtyper::lltypesystem::lltype::_address::Null
-                        ) =>
-                    {
-                        Some(OpKind::ConstRefNull)
-                    }
-                    (ValueType::Ref(_), Some(ConstValue::Int(addr))) => {
-                        Some(OpKind::ConstRefAddr(*addr))
-                    }
-                    _ => None,
-                };
-                let op_kind = const_op_kind.unwrap_or_else(|| {
-                    let segments: Vec<String> =
-                        qualified_key.split("::").map(|s| s.to_string()).collect();
-                    OpKind::LoadStatic {
-                        segments,
-                        ty: static_ty,
-                        value: static_value,
-                    }
-                });
-                let value_var = graph.push_op_var(*block, op_kind, true);
-                if let Some(ref var) = value_var {
-                    ctx.bind_local_id_var(name.clone(), var, graph, *block);
-                }
-                return Ok(value_var
-                    .map(|var| Lowered::from_value_var(graph, &var))
-                    .unwrap_or_else(Lowered::no_value));
-            }
             let ty = ctx
                 .local_value_types
                 .get(&name)
                 .cloned()
                 .unwrap_or(ValueType::Unknown);
-            let class_root = match &ty {
-                ValueType::Ref(Some(root)) => Some(root.clone()),
-                _ => None,
-            };
             let value_var = graph.push_op_var(
                 *block,
                 OpKind::Input {
                     name: name.clone(),
                     ty: ty.clone(),
-                    class_root,
                 },
                 true,
             );
@@ -7727,25 +6528,26 @@ fn lower_expr_inner(
         // ── tuple (a, b, c) ──
         syn::Expr::Tuple(t) => {
             // RPython `BUILD_TUPLE` (`pypy/interpreter/pyopcode.py:955`,
-            // `flowspace/flowcontext.py:1163`) pops N items and pushes
-            // a fresh tuple via `space.newtuple(items)` —
-            // `PureOperation` `newtuple` (`operation.py:542-548`).
-            // Each element is lowered for its value and feeds the
-            // `OpKind::NewTuple { args }` argument list.
-            let mut elem_vars: Vec<crate::flowspace::model::Variable> =
-                Vec::with_capacity(t.elems.len());
+            // `flowspace/flowcontext.py:1163`) always pushes a fresh
+            // tuple object — the result is a NEW value distinct from
+            // any individual element.  Pyre has no `NewTuple` op yet
+            // (deferred), so the construct lowers to a single
+            // `Unknown` marker tagged `Tuple` that stands in for the
+            // whole tuple-builder; callers that read the result get a
+            // well-formed Variable but coverage audits still flag the
+            // port gap.  Elements lower for their side effects and
+            // path-closed propagation but do NOT feed the result.
             for e in &t.elems {
-                let v_pre_var = get_value_var!(lower_expr(graph, block, e, options, ctx)?, graph);
-                ctx.pushvid_var(&v_pre_var);
+                let lowered = lower_expr(graph, block, e, options, ctx)?;
+                if lowered.path_closed {
+                    return Ok(Lowered::path_closed());
+                }
             }
-            for _ in 0..t.elems.len() {
-                elem_vars.push(ctx.popvid_var(graph));
-            }
-            elem_vars.reverse();
-            let var = graph
-                .push_op_var(*block, OpKind::NewTuple { args: elem_vars }, true)
-                .expect("OpKind::NewTuple has has_result=true");
-            Ok(Lowered::from_value_var(graph, &var))
+            Ok(continue_with_unknown(
+                graph,
+                *block,
+                UnsupportedExprKind::Tuple,
+            ))
         }
 
         // ── try expr? ──
@@ -9469,21 +8271,9 @@ fn member_name(member: &syn::Member) -> String {
 }
 
 /// RPython: direct_call carries the exact callee graph identity.
-/// Qualify single-segment bare function names per the lexical scope of
-/// the caller, matching PyPy's `flowcontext.py:845 find_global`:
-///
-/// 1. **`use foo::bar; bar();`** — single-ident `bar` whose alias
-///    appears in `ctx.use_imports` expands to the full registered
-///    path (`["foo", "bar"]`) verbatim.  Eliminates the need for the
-///    cross-module leaf-match fallback in
-///    `call.rs::target_to_path` for the common imported-callable
-///    case.  PyPy parity: `bookkeeper.getdesc(value)` resolves the
-///    alias to the source function identity directly.
-/// 2. **Same-module bare call** — when no `use` alias matches and the
-///    caller has a non-empty `module_prefix`, qualify with the
-///    caller's prefix (`["caller_mod", "bar"]`).  Matches the
-///    same-module registration shape that `lib.rs` publishes for
-///    `Item::Fn` graphs declared in the same file.
+/// Qualify single-segment bare function names with module prefix so that
+/// `helper()` inside `mod a` produces `["a", "helper"]`, matching the
+/// registered graph path.
 fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarget {
     match expr {
         syn::Expr::Path(path) => {
@@ -9778,25 +8568,13 @@ fn lookup_module_static_literal(
     None
 }
 
-/// Pyre-side `Class::Variant` ctors covered by the
-/// `SyntheticTransparentCtor` route.  Despite the name, the routing
-/// accepts both 0-arg unit-variants (lower to a 0-arg
-/// `HostObject::new_class(name, []) → SomeInstance(classdef)`) AND
-/// 1-arg or multi-arg variant ctors (`LoopResult::Done(PyResult)` is
-/// 1-arg; the adapter packs args after the class HostObject into the
-/// same `simple_call`).  jtransform does not elide these (in contrast
-/// to the `Result`/`Option` wrapper list, which IS elided).  These are
-/// valid as bare path-expression values; `flowspace_adapter` pre-folds
-/// the 0-arg ones to `Hlvalue::Constant(ConstValue::HostObject(...))`
+/// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
+/// as bare path-expression values; `flowspace_adapter` pre-folds them
+/// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
 /// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
 /// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
-/// before `jtransform`).
-///
-/// Each entry must be a real pyre-source enum variant — the predicate
-/// is consulted before the registry lookup and a stale spelling here
-/// silently routes a real `FunctionPath` call to the ctor path.
-///
-/// Exposed `pub(crate)` so `translator::rtyper::flowspace_adapter`
+/// before `jtransform`).  Exposed `pub(crate)` so
+/// `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
 /// reads the same allowlist.
 pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();
@@ -9806,11 +8584,7 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
             | ["LoopResult", "ContinueRunningNormally"]
             | ["JitAction", "Return"]
             | ["JitAction", "Continue"]
-            | ["JitAction", "ContinueRunningNormally"]
             | ["StepResult", "Continue"]
-            | ["StepResult", "Return"]
-            | ["StepResult", "Yield"]
-            | ["StepResult", "CloseLoop"]
             | ["CompareOp", "Lt"]
             | ["CompareOp", "Le"]
             | ["CompareOp", "Gt"]
@@ -10145,7 +8919,7 @@ fn transparent_option_method_result_type(
 ) -> Option<ValueType> {
     match method.to_string().as_str() {
         // Rust `usize`/`*const T::len` etc — RPython `lltype.Signed`.
-        "as_usize" | "len" => Some(ValueType::Int),
+        "as_usize" | "len" | "wrapping_mul" => Some(ValueType::Int),
         // Bool-returning predicates: RPython `SomeBool` (`annotator/
         // model.py:185-198`). Was `Int` until the Bool lattice landed
         // (`model.rs:18-42`); split out so the call result reaches
@@ -10198,7 +8972,10 @@ fn primitive_method_result_type(
         (ValueType::Float, "is_nan" | "is_infinite" | "is_finite" | "is_sign_negative") => {
             Some(ValueType::Bool)
         }
-        (ValueType::Int, "abs") => Some(ValueType::Int),
+        (
+            ValueType::Int,
+            "abs" | "wrapping_abs" | "wrapping_mul" | "wrapping_add" | "wrapping_sub",
+        ) => Some(ValueType::Int),
         _ => None,
     }
 }

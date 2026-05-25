@@ -1437,45 +1437,6 @@ pub fn extract_opcode_dispatch_receiver_traits(
     ReceiverTraitBindings::default()
 }
 
-/// Collect canonical function names and graphs for the active pipeline path.
-///
-/// Test-only helper.  RPython `flowspace/objspace.py:49` re-raise
-/// semantics — `FlowingError` propagates out rather than silently
-/// dropping the graph.
-///
-/// `metadata` carries the whole-program registries
-/// (`struct_fields` / `fn_return_types` / `known_struct_names` /
-/// `known_trait_names`) the per-function `build_function_graph_*`
-/// call needs; callers build it once across all parsed files so a
-/// callsite in one file can resolve a free function defined in
-/// another (RPython `annrpython.py:103-150 build_types` is a single
-/// whole-program pass before per-function graph build).
-#[cfg(test)]
-pub fn collect_function_graphs(
-    parsed: &ParsedInterpreter,
-    metadata: &crate::front::ast::ProgramMetadata,
-    graphs: &mut std::collections::HashMap<CallPath, crate::model::FunctionGraph>,
-) -> Result<(), crate::front::ast::FlowingError> {
-    for item in &parsed.file.items {
-        if let Item::Fn(func) = item {
-            let name = func.sig.ident.to_string();
-            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                func,
-                None,
-                &metadata.struct_fields,
-                &metadata.fn_return_types,
-                "",
-                &parsed.use_imports,
-                &metadata.known_struct_names,
-                &metadata.known_trait_names,
-            )?;
-            graphs.insert(CallPath::from_segments([name.clone()]), sf.graph.clone());
-            graphs.insert(CallPath::from_segments(["crate", name.as_str()]), sf.graph);
-        }
-    }
-    Ok(())
-}
-
 /// Extract opcode-dispatch arms from the canonical dispatch match only.
 ///
 /// RPython `flowspace/objspace.py:49` + `flowcontext.py:417` —

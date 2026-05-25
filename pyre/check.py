@@ -312,15 +312,7 @@ class Check:
         print("  $ " + " ".join(cmd))
         cargo_path = shutil.which("cargo") or "(not found on PATH)"
         print(f"  cargo resolved to: {cargo_path}")
-        # Slice 4 (Step 6.E): production cutover must run through the
-        # MIR front-end.  Set the assertion env-var on the cargo build
-        # so `pyre-jit-trace/build.rs`'s call to
-        # `analyze_multiple_pipeline_with_modules` panics if the LLBC
-        # artefacts fail to resolve instead of silently downgrading to
-        # the syn-AST builder.
-        env = os.environ.copy()
-        env.setdefault("PYRE_REQUIRE_MIR_FRONTEND", "1")
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             print(f"ERROR: cargo build failed (exit {proc.returncode})")
             if proc.stdout:
