@@ -9442,18 +9442,24 @@ impl CodeWriter {
         // chordal coloring assign them the same color so
         // `enforce_input_args`'s rotation lands the scratch on its
         // semantic local-i slot — matching walker's
-        // `walker_slot_for_variable` pinning regime exactly.  Walker
-        // pin pairs are pyre-only (scratch and inputarg may never
-        // appear in the canonical graph) and bypass the normal
-        // `coalesce_variables` interference check by design.
+        // `walker_slot_for_variable` pinning regime exactly.
         //
-        // CFG `link.args ↔ target.inputargs` pairs are NOT routed
-        // through the pre-merge: `RegAllocator::coalesce_variables`
-        // (`regalloc.py:79-96`) already walks every block's exits
-        // post-`make_dependencies`, calling `_try_coalesce` which
-        // honours the interference check.  Pre-merging CFG pairs
-        // here would silently merge variables that `_try_coalesce`
-        // would reject.
+        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): CFG
+        // `link.args ↔ target.inputargs` pairs are also threaded
+        // through the pre-merge.  In PyPy
+        // (`regalloc.py:79-96 coalesce_variables` + `:98-112
+        // _try_coalesce`), CFG pairs are coalesced post-
+        // `make_dependencies` with an interference check;
+        // pre-merging here bypasses that check and silently merges
+        // pairs PyPy would reject.  The walker downstream path
+        // `walker_post_walk_insert_renamings` currently depends on
+        // these pairs sharing colors to keep the emitted `ref_copy`
+        // count bounded — honouring PyPy's interference check
+        // surfaces multi-bench timeouts (fib_recursive, fannkuch,
+        // synth/comprehensions).  The interference-aware path needs
+        // `walker_post_walk_insert_renamings` to absorb the extra
+        // copies efficiently before this can flip — separate
+        // restructure.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
@@ -9461,13 +9467,19 @@ impl CodeWriter {
         );
         // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
         // `flatten.py:154 insert_renamings` mutates the graph.
-        // Collect once here so the SSARepr-side regalloc below
-        // (which receives slot-projected pairs) sees the same
-        // pre-renaming pair set as the canonical pass above.
+        // Collect once here so both the canonical (above) and
+        // SSARepr-side (below at `allocate_registers`) consumers
+        // share the same pre-renaming pair set.
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        let canonical_ref_coalesce_pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> =
+            walker_pin_pairs
+                .iter()
+                .copied()
+                .chain(cfg_variable_pairs.iter().copied())
+                .collect();
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
-            &walker_pin_pairs,
+            &canonical_ref_coalesce_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
