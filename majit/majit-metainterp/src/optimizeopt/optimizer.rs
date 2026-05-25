@@ -1905,14 +1905,30 @@ impl Optimizer {
         box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
-        // Test-only: auto-seed `trace_inputarg_types` when unit tests
-        // pass bare `num_inputs` without staging a recorder. Production
-        // callers always populate `trace_inputarg_types` from the
-        // recorder's InputArg{Int,Ref,Float} entries before calling —
-        // the guard never fires outside `#[cfg(test)]`.
+        // Test-only auto-seed of `trace_inputarg_types` from the variant
+        // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
+        // a slot index in `[0, num_inputs)`. Production callers populate
+        // the side table from the recorder's InputArg{Int,Ref,Float}
+        // entries via `setup_optimizations` before calling
+        // (history.py:220 box.type).
+        //
+        // Falls back to `Type::Ref` for slots that no arg references —
+        // RPython never sees that case (every InputArg flows through some
+        // op), but unit fixtures can omit references to unused slots.
         #[cfg(test)]
         if self.trace_inputarg_types.is_empty() && num_inputs > 0 {
-            self.trace_inputarg_types = vec![majit_ir::Type::Ref; num_inputs];
+            let mut types = vec![majit_ir::Type::Ref; num_inputs];
+            for op in ops.iter() {
+                for arg in op.getarglist().iter() {
+                    let idx = arg.raw() as usize;
+                    if idx < num_inputs {
+                        if let Some(tp) = arg.ty() {
+                            types[idx] = tp;
+                        }
+                    }
+                }
+            }
+            self.trace_inputarg_types = types;
         }
         self.imported_label_args = None;
         self.terminal_op = None;
