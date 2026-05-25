@@ -3646,16 +3646,19 @@ impl OptContext {
             // forwarded_to is an AbstractResOp), retiring the
             // BoxKind::ResOp-as-chain-target carrier.
             op.set_forwarded_op(&target_op);
-        } else if let Some(target_ia) = newop.bound_inputarg() {
-            // InputArg-target chain step (compile.py:478, unroll.py:497).
-            op.set_forwarded_inputarg(&target_ia);
         } else {
-            // C.6 panic probe to identify residual fixtures.
-            panic!(
-                "make_equal_to.C6 PROBE: unbound non-Const target \
-                 {newop:?} (position={:?})",
-                newop.position(),
+            // InputArg-target chain step (compile.py:478, unroll.py:497).
+            // Const / Op / InputArg are the only `newop` shapes
+            // make_equal_to ever receives — InputArg BoxRefs are bound at
+            // OptContext entry via `ensure_inputarg_bindings`, ResOp
+            // BoxRefs at `ensure_box` (lazy stand-in synthesis when the
+            // producer has not yet emitted).
+            let target_ia = newop.bound_inputarg().expect(
+                "make_equal_to: non-Const target carries neither bound Op \
+                 nor bound InputArg — every BoxRef reaching this point \
+                 must be bound (resoperation.py:233-242 _forwarded host)",
             );
+            op.set_forwarded_inputarg(&target_ia);
         }
         // optimizer.py:395-396
         //   if opinfo is not None and not newop.is_constant():
