@@ -1037,6 +1037,10 @@ pub fn register_module(ns: &mut DictStorage) {
     // a None so attribute lookups succeed.
     crate::dict_storage_store(ns, "_default_timeout", pyre_object::w_none());
 
+    // `_rsocket_rffi.py:1155 constants['has_ipv6'] = True` — exposed by
+    // PyPy's moduledef.py constants loop as a module-level boolean.
+    crate::dict_storage_store(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(true));
+
     // ── module-level getdefaulttimeout / setdefaulttimeout ──
     // `interp_func.py:378-397` — None means "blocking", float means
     // "timeout in seconds".  Stored as a process-wide cell.
@@ -1838,6 +1842,10 @@ fn socket_from_fd(
     socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
     socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
     socket_set_attr(obj, "_timeout", pyre_object::w_none());
+    // `interp_socket.py:977 usecount = 1` — start the refcount at 1 so
+    // `_drop` followed by no `_reuse` closes the underlying fd exactly
+    // once.
+    socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
     obj
 }
 
@@ -2200,6 +2208,50 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let fd = socket_get_attr_i64(obj, "_fd");
                 socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
                 Ok(pyre_object::w_int_new(fd))
+            },
+            1,
+        ),
+    );
+
+    // `interp_socket.py:978-996 _reuse_w / _drop_w` — refcount methods
+    // the app-level `socket._socketobject` wrapper uses to share one
+    // underlying fd across `socket.makefile()` file-like aliases.
+    // `_reuse` increments the usecount; `_drop` decrements and closes
+    // when it reaches zero.
+    crate::dict_storage_store(
+        ns,
+        "_reuse",
+        crate::make_builtin_function_with_arity(
+            "_reuse",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let n = socket_get_attr_i64(obj, "_usecount");
+                let n = if n < 0 { 1 } else { n };
+                socket_set_attr(obj, "_usecount", pyre_object::w_int_new(n + 1));
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "_drop",
+        crate::make_builtin_function_with_arity(
+            "_drop",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let n = socket_get_attr_i64(obj, "_usecount");
+                let n = if n < 0 { 1 } else { n };
+                let next = n - 1;
+                socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next));
+                if next <= 0 {
+                    let fd = socket_get_attr_i64(obj, "_fd") as libc::c_int;
+                    if fd >= 0 {
+                        let _ = unsafe { libc::close(fd) };
+                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    }
+                }
+                Ok(pyre_object::w_none())
             },
             1,
         ),
