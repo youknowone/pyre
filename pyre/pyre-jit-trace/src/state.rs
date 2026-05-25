@@ -7676,9 +7676,6 @@ mod tests {
                 .expect("namespace should contain c")
         };
 
-        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
-        // `load_method`'s residual call requires a populated jitcode so the
-        // guard's resumedata snapshot can be captured (pyjitpl.py:2082).
         install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -8141,9 +8138,6 @@ mod tests {
         let code_ref =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
-        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
-        // `trace_binary_value` requires a populated jitcode so the guard's
-        // resumedata snapshot can be captured (pyjitpl.py:2082).
         install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let lhs = OpRef::input_arg_float(0);
@@ -8177,9 +8171,8 @@ mod tests {
         .expect("generic helper call should box raw operands first");
 
         let recorder = ctx.into_recorder();
-        // EC-Z Path B (task #311/#322): per-caller `GuardNoException`
-        // (pyjitpl.py:2082) follows the residual Call*, so look up the
-        // Call* op explicitly rather than relying on `ops().last()`.
+        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
+        // look up the Call* op explicitly rather than via `ops().last()`.
         let call = recorder
             .ops()
             .iter()
@@ -8201,9 +8194,6 @@ mod tests {
         let code_ref =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
-        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
-        // `trace_known_builtin_call` requires a populated jitcode so the
-        // guard's resumedata snapshot can be captured (pyjitpl.py:2082).
         install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let callable = OpRef::input_arg_ref(0);
@@ -8233,9 +8223,8 @@ mod tests {
             .expect("known builtin helper boundary should box raw int args");
 
         let recorder = ctx.into_recorder();
-        // EC-Z Path B (task #311/#322): per-caller `GuardNoException`
-        // (pyjitpl.py:2082) follows the residual Call*, so look up the
-        // Call* op explicitly rather than relying on `ops().last()`.
+        // GuardNoException (pyjitpl.py:2082) follows the residual Call*, so
+        // look up the Call* op explicitly rather than via `ops().last()`.
         let call = recorder
             .ops()
             .iter()
