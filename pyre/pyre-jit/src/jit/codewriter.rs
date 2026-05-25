@@ -1240,6 +1240,17 @@ fn collect_cfg_coalesce_pairs(
                 if src_variable.kind != Some(Kind::Ref) || dst_variable.kind != Some(Kind::Ref) {
                     continue;
                 }
+                // `regalloc.py:98 _try_coalesce` rejects `v is w` before
+                // any further work — an inputarg forwarded unchanged
+                // through `link.args[i] == target.inputargs[i]` has
+                // nothing to coalesce with itself.  Pyre's pre-merge
+                // into union-find treats same-VariableId as a no-op,
+                // but emitting the pair still costs a `find` lookup
+                // per side; drop it at the source to match PyPy's
+                // self-pair short-circuit.
+                if src_variable.id == dst_variable.id {
+                    continue;
+                }
                 pairs.push((src_variable.id, dst_variable.id));
             }
         }
