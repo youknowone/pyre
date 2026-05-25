@@ -5981,9 +5981,11 @@ impl OptContext {
                  (info.py:876), got VectorizationInfo",
             ),
             // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (box.rs:295-322).
-            Forwarded::Box(_) => unreachable!(
-                "getrawptrinfo: chain terminal must not carry Forwarded::Box \
+            // or `Info(_)` per the chain walker (box.rs:295-322); a
+            // `Forwarded::Const` terminal is materialized inline by the
+            // walker into a fresh BoxRef whose own slot is None.
+            Forwarded::Box(_) | Forwarded::Const(_) => unreachable!(
+                "getrawptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
         }
@@ -6069,9 +6071,11 @@ impl OptContext {
                 panic!("getptrinfo: forwarded must be PtrInfo (info.py:892), got VectorizationInfo",)
             }
             // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (box.rs:295-322).
-            Forwarded::Box(_) => unreachable!(
-                "getptrinfo: chain terminal must not carry Forwarded::Box \
+            // or `Info(_)` per the chain walker (box.rs:295-322); a
+            // `Forwarded::Const` terminal is materialized inline by the
+            // walker into a fresh BoxRef whose own slot is None.
+            Forwarded::Box(_) | Forwarded::Const(_) => unreachable!(
+                "getptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
         }
@@ -6396,7 +6400,9 @@ impl OptContext {
                     Forwarded::Info(_) | Forwarded::VectorInfo(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
-                    Forwarded::Box(_) => unreachable!("chain walker terminal"),
+                    Forwarded::Box(_) | Forwarded::Const(_) => {
+                        unreachable!("chain walker terminal")
+                    }
                     Forwarded::None => {}
                 }
             }

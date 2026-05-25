@@ -29,7 +29,7 @@ use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{Op, VectorizationInfo};
-use crate::value::InputArg;
+use crate::value::{Const, InputArg};
 use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
@@ -120,15 +120,25 @@ pub enum BoxKind {
 
 /// Variant of the `_forwarded` slot.
 ///
-/// RPython's `_forwarded` is `None | another AbstractResOpOrInputArg |
-/// AbstractInfo`. Const forwarding is one case of "another box", so we
-/// represent it as `Box(BoxRef)` carrying a `BoxKind::Const(...)`.
+/// `Const` is an `AbstractValue` subclass too (`history.py:220
+/// ConstInt`), so forwarding to a constant is its own shape: `Const`
+/// is a value-typed `Copy` payload with no `_forwarded` slot of its
+/// own, unlike `ResOp`/`InputArg`. Keeping it as a separate variant
+/// retires the dedicated `BoxKind::Const`-as-chain-target carrier.
 #[derive(Clone, Debug)]
 pub enum Forwarded {
     None,
 
-    /// Forwarding to another `AbstractResOpOrInputArg` or `Const`.
+    /// Forwarding to another `AbstractResOpOrInputArg`. Const targets
+    /// route through [`Forwarded::Const`] instead.
     Box(BoxRef),
+
+    /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`
+    /// — forwarding terminates here; the constant value is carried
+    /// inline. Chain walkers stop on this variant (`not_const=true`
+    /// returns the pre-Const box; `not_const=false` materializes a
+    /// terminal const-bearing `BoxRef` for legacy callers).
+    Const(Const),
 
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
@@ -394,6 +404,22 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
+    /// `optimizer.py:432 make_constant(box, constbox)` — Const variant.
+    /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
+    /// `box.set_forwarded(constbox)` is well-typed; here it terminates
+    /// the chain in a value-typed payload rather than allocating a
+    /// `BoxKind::Const` carrier.
+    pub fn set_forwarded_const(&self, value: Const) {
+        // Same Const-as-source invariant as the other set_forwarded_*
+        // variants — Const has no `_forwarded` slot per PyPy.
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_const on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::Const(value));
+    }
+
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
     pub fn set_forwarded_info(&self, info: OpInfo) {
         // PyPy `AbstractValue.set_forwarded` raises unconditionally on
@@ -498,6 +524,17 @@ impl BoxRef {
                         return cur;
                     }
                     cur = b;
+                }
+                Forwarded::Const(c) => {
+                    if not_const {
+                        return cur;
+                    }
+                    // Materialize a terminal Const-bearing BoxRef so
+                    // legacy callers that expect `.const_value()` /
+                    // `BoxKind::Const` on the walker output keep
+                    // working until the BoxRef return type itself is
+                    // retired.
+                    return BoxRef::new_const(c.to_value());
                 }
             }
         }
