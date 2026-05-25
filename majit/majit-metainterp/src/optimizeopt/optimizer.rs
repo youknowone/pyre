@@ -2400,21 +2400,20 @@ impl Optimizer {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
-        // PyPy parity: a folded ResOperation keeps its Python identity
-        // through `_forwarded` links; Phase 2 chain walks via
-        // `partial_trace.operations` reach it directly
-        // (resoperation.py:233 `_forwarded` host).
+        // PyPy parity: a folded `ResOperation` keeps its Python identity
+        // through `_forwarded` links (resoperation.py:233-242); the
+        // `optimize_peeled_loop` (compile.py:291) chain walk reaches it
+        // via `partial_trace.operations`.
         //
-        // pyre's per-iter `TraceIterator::next()` pushes a fresh
-        // `BoxRef::new_resop` slot for every visited op
-        // (opencoder.rs:500) BEFORE the optimizer pipeline decides
-        // whether to emit it. When the pipeline drops the op, no
-        // `ctx.emit` is called and the slot stays unbound; the BoxRef
-        // is then a phase-1 orphan with no producer `OpRc`. Seal each
-        // orphan now by synthesising a SameAs stand-in OpRc, binding
-        // the slot, and appending the stand-in to `phase1_emit_ops`
-        // so Phase 2 / retrace `ensure_box` can late-bind through it
-        // (mod.rs::ensure_box existing-pool-slot path).
+        // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
+        // pushes a fresh `BoxRef::new_resop` slot for every visited op
+        // BEFORE the optimizer pipeline decides whether to emit. When
+        // the pipeline drops the op no `ctx.emit` is called and the
+        // slot stays unbound; the BoxRef is then an orphan with no
+        // producer `OpRc`. Seal each orphan now by synthesising a
+        // SameAs stand-in OpRc, binding the slot, and appending the
+        // stand-in to the emit-op carry list so the retrace
+        // `ensure_box` existing-pool-slot late-bind reaches it.
         for (idx, b) in ctx.box_pool.iter_indexed() {
             if !b.is_resop() || b.bound_op().is_some() {
                 continue;
