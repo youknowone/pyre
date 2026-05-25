@@ -4194,7 +4194,7 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                portal_frame_reg,
+                portal_frame_var: Some(frame_var),
             });
         }
 
