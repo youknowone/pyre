@@ -4,5 +4,4 @@
 //! ispeed, ospeed, [cc_chars]]`.  `tcsetattr(fd, when, attrs)` takes the
 //! same shape and writes it back via `termios::Termios`.
 
-pub mod interp_termios;
-pub use interp_termios::register_module as init;
+crate::pyre_module_init!(interp_termios);

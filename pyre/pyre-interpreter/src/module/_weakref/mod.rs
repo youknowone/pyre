@@ -17,19 +17,26 @@
 
 pub mod interp_weakref;
 
+fn _remove_dead_weakref(_args: &[pyre_object::PyObjectRef])
+    -> Result<pyre_object::PyObjectRef, crate::PyError>
+{
+    Ok(pyre_object::w_none())
+}
+
 crate::py_module! {
     "_weakref",
     interpleveldefs: {
-        "ref" => interp_weakref::weakref_type(),
-        "ReferenceType" => interp_weakref::weakref_type(),
-        "ProxyType" => interp_weakref::proxy_type(),
+        "ref"               => interp_weakref::weakref_type(),
+        "ReferenceType"     => interp_weakref::weakref_type(),
+        "ProxyType"         => interp_weakref::proxy_type(),
         "CallableProxyType" => interp_weakref::callable_proxy_type(),
-        "proxy" => crate::make_builtin_function("proxy", interp_weakref::proxy),
-        "getweakrefcount" => crate::make_module_builtin_function_with_arity(
-            "getweakrefcount", interp_weakref::getweakrefcount, 1),
-        "getweakrefs" => crate::make_module_builtin_function_with_arity(
-            "getweakrefs", interp_weakref::getweakrefs, 1),
-        "_remove_dead_weakref" => crate::make_module_builtin_function_with_arity(
-            "_remove_dead_weakref", |_| Ok(pyre_object::w_none()), 2),
-    }
+    },
+    functions: {
+        "proxy" / * = interp_weakref::proxy,
+    },
+    module_functions: {
+        "getweakrefcount"      / 1 = interp_weakref::getweakrefcount,
+        "getweakrefs"          / 1 = interp_weakref::getweakrefs,
+        "_remove_dead_weakref" / 2 = _remove_dead_weakref,
+    },
 }

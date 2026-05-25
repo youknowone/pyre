@@ -4,5 +4,4 @@
 //! generator — enough for `random.py` to construct its `_inst` at
 //! module import time.
 
-pub mod interp_random;
-pub use interp_random::register_module as init;
+crate::pyre_module_init!(interp_random);

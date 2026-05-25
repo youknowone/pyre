@@ -3,5 +3,4 @@
 //! Minimal subset required by importlib._bootstrap to decide which
 //! loader handles a name.
 
-pub mod interp_imp;
-pub use interp_imp::register_module as init;
+crate::pyre_module_init!(interp_imp);

@@ -7,27 +7,28 @@ use interp_time as t;
 crate::py_module! {
     "time",
     interpleveldefs: {
-        "time"         => crate::make_builtin_function_with_arity("time",         t::time,         0),
-        "time_ns"      => crate::make_builtin_function_with_arity("time_ns",      t::time_ns,      0),
-        "monotonic"    => crate::make_builtin_function_with_arity("monotonic",    t::monotonic,    0),
-        "sleep"        => crate::make_builtin_function_with_arity("sleep",        t::sleep,        1),
-        "perf_counter" => crate::make_builtin_function_with_arity("perf_counter", t::perf_counter, 0),
-        "localtime"    => crate::make_builtin_function("localtime", t::localtime),
-        "gmtime"       => crate::make_builtin_function("gmtime",    t::gmtime),
-        "strftime"     => crate::make_builtin_function("strftime",  t::strftime),
-        "mktime"       => crate::make_builtin_function_with_arity("mktime", t::mktime, 1),
-        "asctime"      => crate::make_builtin_function("asctime",   t::asctime),
-        "ctime"        => crate::make_builtin_function("ctime",     t::ctime),
-
         // `app_time.py:5-23 class struct_time` — exposed as `time.struct_time`.
-        "struct_time"  => t::struct_time_type(),
-        "timezone"     => pyre_object::w_int_new(0),
-        "altzone"      => pyre_object::w_int_new(0),
-        "daylight"     => pyre_object::w_int_new(0),
-        "tzname"       => pyre_object::w_tuple_new(vec![
+        "struct_time" => t::struct_time_type(),
+        "timezone"    => pyre_object::w_int_new(0),
+        "altzone"     => pyre_object::w_int_new(0),
+        "daylight"    => pyre_object::w_int_new(0),
+        "tzname"      => pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new("UTC"),
             pyre_object::w_str_new("UTC"),
         ]),
+    },
+    functions: {
+        "time"         / 0 = t::time,
+        "time_ns"      / 0 = t::time_ns,
+        "monotonic"    / 0 = t::monotonic,
+        "sleep"        / 1 = t::sleep,
+        "perf_counter" / 0 = t::perf_counter,
+        "localtime"    / * = t::localtime,
+        "gmtime"       / * = t::gmtime,
+        "strftime"     / * = t::strftime,
+        "mktime"       / 1 = t::mktime,
+        "asctime"      / * = t::asctime,
+        "ctime"        / * = t::ctime,
     },
     extra_init: |ns| {
         // POSIX clock identifiers + clock_gettime / clock_getres

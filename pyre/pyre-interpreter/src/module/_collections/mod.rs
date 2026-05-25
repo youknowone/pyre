@@ -4,5 +4,4 @@
 //! stubs are backed by lists/dicts, which is correct semantically but
 //! not performant.
 
-pub mod interp_collections;
-pub use interp_collections::register_module as init;
+crate::pyre_module_init!(interp_collections);

@@ -6,25 +6,27 @@
 //! sort order (str / int / tuple of those — pyre's stdlib doesn't
 //! exercise other shapes).
 
+use pyre_object::*;
+
+fn reduce(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error("reduce not implemented"))
+}
+
+// `functools.cmp_to_key(cmp)` — pyre's identity wrapper covers the
+// str / int / tuple sort key cases the stdlib actually uses; arbitrary
+// cmp callables are not honoured.
+fn cmp_to_key(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(crate::make_builtin_function_with_arity(
+        "cmp_to_key.K",
+        |args| Ok(args.first().copied().unwrap_or(w_none())),
+        1,
+    ))
+}
+
 crate::py_module! {
     "_functools",
-    interpleveldefs: {
-        "reduce" => crate::make_builtin_function("reduce", |_| {
-            Err(crate::PyError::type_error("reduce not implemented"))
-        }),
-        // `functools.cmp_to_key(cmp)` — pyre's identity wrapper covers
-        // the str / int / tuple sort key cases the stdlib actually
-        // uses; arbitrary cmp callables are not honoured.
-        "cmp_to_key" => crate::make_builtin_function_with_arity(
-            "cmp_to_key",
-            |_args| {
-                Ok(crate::make_builtin_function_with_arity(
-                    "cmp_to_key.K",
-                    |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
-                    1,
-                ))
-            },
-            1,
-        ),
-    }
+    functions: {
+        "reduce"     / * = reduce,
+        "cmp_to_key" / 1 = cmp_to_key,
+    },
 }

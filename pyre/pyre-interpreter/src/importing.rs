@@ -96,120 +96,117 @@ pub fn register_builtin_module(name: &'static str, init: fn(&mut DictStorage)) {
 
 /// Install all standard builtin modules.
 ///
-/// PyPy equivalent: baseobjspace.py `make_builtins()` +
-/// `install_mixedmodule()` for each module in objspace.usemodules.
+/// Mirrors PyPy's `baseobjspace.make_builtins()` +
+/// `install_mixedmodule()` walk of `objspace.usemodules`.  The
+/// `pyre_install_module!` arms below give a per-line declarative shape:
+///
+/// * `name(module)`               — register `crate::module::module::init` under `"name"` (alias arm).
+/// * `module`                     — `name` defaults to the module identifier.
+/// * `name => path`               — explicit init function path.
 pub fn install_builtin_modules() {
-    register_builtin_module("math", crate::module::math::init);
-    register_builtin_module("cmath", crate::module::cmath::init);
-    register_builtin_module("time", crate::module::time::init);
-    register_builtin_module("sys", crate::module::sys::init);
-    register_builtin_module("operator", crate::module::operator::init);
-    register_builtin_module("_operator", crate::module::operator::init);
-    register_builtin_module("builtins", crate::module::__builtin__::init);
-    register_builtin_module("_io", crate::module::_io::init);
-    register_builtin_module("_sre", crate::module::_sre::init);
+    macro_rules! pyre_install_module {
+        // `module` — `register_builtin_module("module", crate::module::module::init)`.
+        ($mod:ident) => {
+            register_builtin_module(stringify!($mod), crate::module::$mod::init);
+        };
+        // `name(module)` — re-register `module::init` under a different name.
+        ($name:literal ( $mod:ident )) => {
+            register_builtin_module($name, crate::module::$mod::init);
+        };
+        // `name => path::to::fn` — explicit init fn.
+        ($name:literal => $path:path) => {
+            register_builtin_module($name, $path);
+        };
+    }
 
-    // Minimal C-extension stubs required for stdlib import chains.
-    // PyPy: these are all implemented as mixed modules under pypy/module/.
-    register_builtin_module("_weakref", crate::module::_weakref::init);
-    register_builtin_module("_abc", crate::module::_abc::init);
-    register_builtin_module("_functools", crate::module::_functools::init);
-    register_builtin_module("_thread", crate::module::_thread::init);
-    register_builtin_module("itertools", crate::module::itertools::init);
-    register_builtin_module("_contextvars", crate::module::_contextvars::init);
-    register_builtin_module("copyreg", crate::module::copyreg::init);
-    register_builtin_module("_codecs", crate::module::_codecs::init);
-    register_builtin_module("posix", crate::module::posix::init);
-    register_builtin_module("errno", crate::module::errno::init);
-    register_builtin_module("_collections", crate::module::_collections::init);
-    register_builtin_module("_ast", crate::module::_ast::init);
-    register_builtin_module("_opcode", crate::module::_opcode::init);
-    register_builtin_module("_imp", crate::module::_imp::init);
-    register_builtin_module(
-        "importlib.machinery",
-        crate::module::importlib::interp_importlib::register_machinery,
+    // Core pyre modules backed by `interpleveldefs` tables.
+    pyre_install_module!(math);
+    pyre_install_module!(cmath);
+    pyre_install_module!(time);
+    pyre_install_module!(sys);
+    pyre_install_module!(operator);
+    pyre_install_module!("_operator"(operator));
+    pyre_install_module!("builtins"(__builtin__));
+    pyre_install_module!(_io);
+    pyre_install_module!(_sre);
+
+    // C-extension stubs required for stdlib import chains
+    // (PyPy: pypy/module/* mixed modules).
+    pyre_install_module!(_weakref);
+    pyre_install_module!(_abc);
+    pyre_install_module!(_functools);
+    pyre_install_module!(_thread);
+    pyre_install_module!(itertools);
+    pyre_install_module!(_contextvars);
+    pyre_install_module!(copyreg);
+    pyre_install_module!(_codecs);
+    pyre_install_module!(posix);
+    pyre_install_module!(errno);
+    pyre_install_module!(_collections);
+    pyre_install_module!(_ast);
+    pyre_install_module!(_opcode);
+    pyre_install_module!(_imp);
+
+    // importlib package — four submodules backed by distinct init fns.
+    pyre_install_module!(
+        "importlib.machinery" =>
+        crate::module::importlib::interp_importlib::register_machinery
     );
-    register_builtin_module(
-        "importlib",
-        crate::module::importlib::interp_importlib::register_pkg,
+    pyre_install_module!(
+        "importlib" =>
+        crate::module::importlib::interp_importlib::register_pkg
     );
-    register_builtin_module(
-        "importlib.util",
-        crate::module::importlib::interp_importlib::register_util,
+    pyre_install_module!(
+        "importlib.util" =>
+        crate::module::importlib::interp_importlib::register_util
     );
-    register_builtin_module(
-        "importlib.abc",
-        crate::module::importlib::interp_importlib::register_abc,
+    pyre_install_module!(
+        "importlib.abc" =>
+        crate::module::importlib::interp_importlib::register_abc
     );
-    register_builtin_module("_signal", crate::module::_signal::init);
-    register_builtin_module("atexit", crate::module::atexit::init);
-    register_builtin_module("pwd", crate::module::pwd::init);
-    register_builtin_module("grp", crate::module::grp::init);
-    #[cfg(unix)]
-    register_builtin_module("resource", crate::module::resource::init);
-    #[cfg(unix)]
-    register_builtin_module("fcntl", crate::module::fcntl::init);
-    #[cfg(unix)]
-    register_builtin_module("syslog", crate::module::syslog::init);
-    register_builtin_module("select", crate::module::select::init);
-    register_builtin_module("termios", crate::module::termios::init);
-    register_builtin_module("_socket", crate::module::_socket::init);
-    register_builtin_module("mmap", crate::module::mmap::init);
-    register_builtin_module("faulthandler", crate::module::faulthandler::init);
-    register_builtin_module("_ctypes", crate::module::_ctypes::init);
-    register_builtin_module("_posixshmem", crate::module::_posixshmem::init);
-    register_builtin_module(
-        "_multiprocessing",
-        crate::module::_multiprocessing::init,
-    );
-    register_builtin_module("_locale", crate::module::_locale::init);
-    register_builtin_module("_random", crate::module::_random::init);
-    register_builtin_module("_struct", crate::module::_struct::init);
-    register_builtin_module("gc", crate::module::gc::init);
-    register_builtin_module("unicodedata", crate::module::unicodedata::init);
+
+    pyre_install_module!(_signal);
+    pyre_install_module!(atexit);
+    pyre_install_module!(pwd);
+    pyre_install_module!(grp);
+    #[cfg(unix)] pyre_install_module!(resource);
+    #[cfg(unix)] pyre_install_module!(fcntl);
+    #[cfg(unix)] pyre_install_module!(syslog);
+    pyre_install_module!(select);
+    pyre_install_module!(termios);
+    pyre_install_module!(_socket);
+    pyre_install_module!(mmap);
+    pyre_install_module!(faulthandler);
+    pyre_install_module!(_ctypes);
+    pyre_install_module!(_posixshmem);
+    pyre_install_module!(_multiprocessing);
+    pyre_install_module!(_locale);
+    pyre_install_module!(_random);
+    pyre_install_module!(_struct);
+    pyre_install_module!(gc);
+    pyre_install_module!(unicodedata);
+
     // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
     // Python module containing `build_time_vars = {...}` that sysconfig
-    // imports from `_init_posix`. We stub it out with an empty dict so
-    // `sysconfig.get_config_vars()` returns an empty mapping.
-    // PyPy equivalent: pypy/tool/build_cffi_imports.py creates the same
-    // file during translation.
-    register_builtin_module("_sysconfigdata__darwin_", init_sysconfigdata_empty);
-    register_builtin_module("_sysconfigdata__linux_", init_sysconfigdata_empty);
-    register_builtin_module(
-        "_sysconfigdata__linux_x86_64-linux-gnu",
-        init_sysconfigdata_empty,
-    );
-    register_builtin_module(
-        "_sysconfigdata__linux_aarch64-linux-gnu",
-        init_sysconfigdata_empty,
-    );
-    // _opcode_metadata.py exists in the stdlib; load the real file instead.
+    // imports from `_init_posix`.  Empty dict suffices.
+    // PyPy: `pypy/tool/build_cffi_imports.py` creates the same file.
     for name in &[
-        "_string",
-        "_warnings",
-        "_heapq",
-        "_tokenize",
-        "_typing",
-        "_bisect",
-        "binascii",
-        "_hashlib",
-        "_sha2",
-        "_md5",
-        "_sha1",
-        "_sha3",
-        "_blake2",
-        "_decimal",
-        "_pickle",
-        "_datetime",
-        "_json",
-        "_csv",
-        "marshal",
-        "_tracemalloc",
-        "_stat",
-        "_asyncio",
-        "_queue",
-        "_zoneinfo",
-        "array",
+        "_sysconfigdata__darwin_",
+        "_sysconfigdata__linux_",
+        "_sysconfigdata__linux_x86_64-linux-gnu",
+        "_sysconfigdata__linux_aarch64-linux-gnu",
+    ] {
+        register_builtin_module(name, init_sysconfigdata_empty);
+    }
+
+    // Empty C-extension stubs — `_opcode_metadata.py` etc. exist in the
+    // real stdlib and are loaded from disk, but their builtin shims here
+    // simply succeed at `import X`.
+    for name in &[
+        "_string", "_warnings", "_heapq", "_tokenize", "_typing", "_bisect",
+        "binascii", "_hashlib", "_sha2", "_md5", "_sha1", "_sha3", "_blake2",
+        "_decimal", "_pickle", "_datetime", "_json", "_csv", "marshal",
+        "_tracemalloc", "_stat", "_asyncio", "_queue", "_zoneinfo", "array",
         "zlib",
     ] {
         register_builtin_module(name, empty_module_init);

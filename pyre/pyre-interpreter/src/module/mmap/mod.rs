@@ -4,6 +4,4 @@
 //! state lives in the instance dict (`_ptr`/`_len`/`_pos`/`_access`); the
 //! pointer is invalidated on close/`__exit__` via munmap.
 
-pub mod interp_mmap;
-
-pub use interp_mmap::register_module as init;
+crate::pyre_module_init!(interp_mmap);

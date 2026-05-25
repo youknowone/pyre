@@ -4,5 +4,4 @@
 //! plus the host_env-backed implementations of the calls pyre actually
 //! exercises.  The shared `stat_result` builtin type lives here too.
 
-pub mod interp_posix;
-pub use interp_posix::register_module as init;
+crate::pyre_module_init!(interp_posix);

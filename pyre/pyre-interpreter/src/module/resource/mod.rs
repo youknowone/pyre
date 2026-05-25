@@ -5,5 +5,4 @@
 //! Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 //! / RLIMIT_* constants and `struct_rusage`.
 
-pub mod interp_resource;
-pub use interp_resource::register_module as init;
+crate::pyre_module_init!(interp_resource);

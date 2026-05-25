@@ -4,5 +4,4 @@
 //! `sem_unlink(name)`.  Single-threaded pyre still needs the methods to
 //! exist so multiprocessing.py teardown survives.
 
-pub mod interp_multiprocessing;
-pub use interp_multiprocessing::register_module as init;
+crate::pyre_module_init!(interp_multiprocessing);

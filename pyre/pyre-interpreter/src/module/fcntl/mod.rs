@@ -4,5 +4,4 @@
 //! lockf(fd, cmd, len=0, start=0, whence=0).  Integer-argument forms
 //! only.
 
-pub mod interp_fcntl;
-pub use interp_fcntl::register_module as init;
+crate::pyre_module_init!(interp_fcntl);

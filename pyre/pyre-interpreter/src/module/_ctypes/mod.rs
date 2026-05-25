@@ -4,5 +4,4 @@
 //! full c_int / Structure / CFUNCTYPE / Pointer machinery still requires
 //! libffi-style argument marshalling and per-instance heap state.
 
-pub mod interp_ctypes;
-pub use interp_ctypes::register_module as init;
+crate::pyre_module_init!(interp_ctypes);

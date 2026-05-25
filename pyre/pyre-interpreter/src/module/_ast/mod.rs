@@ -4,5 +4,4 @@
 //! satisfy `from _ast import *` in `ast.py`.  Real AST construction is
 //! not supported (pyre uses RustPython's compiler).
 
-pub mod interp_ast;
-pub use interp_ast::register_module as init;
+crate::pyre_module_init!(interp_ast);

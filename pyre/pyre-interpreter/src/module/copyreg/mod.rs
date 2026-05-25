@@ -5,16 +5,20 @@
 //! so callers' `dispatch_table[type]` lookups raise KeyError as they
 //! would on CPython with no registered reducer.
 
+use pyre_object::*;
+
+// `copyreg.pickle(type, reduce_func, constructor=None)` — register a
+// pickle reducer.  Stub ignores the call.
+fn copyreg_pickle(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_none())
+}
+
 crate::py_module! {
     "copyreg",
     interpleveldefs: {
-        // `copyreg.pickle(type, reduce_func, constructor=None)` —
-        // register a pickle reducer.  Stub ignores the call.
-        "pickle" => crate::make_builtin_function_with_arity(
-            "pickle",
-            |_| Ok(pyre_object::w_none()),
-            3,
-        ),
-        "dispatch_table" => pyre_object::w_dict_new(),
-    }
+        "dispatch_table" => w_dict_new(),
+    },
+    functions: {
+        "pickle" / 3 = copyreg_pickle,
+    },
 }

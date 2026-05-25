@@ -4,5 +4,4 @@
 //! `rustpython_host_env::select`.  poll/epoll/kqueue object types are
 //! not implemented yet.
 
-pub mod interp_select;
-pub use interp_select::register_module as init;
+crate::pyre_module_init!(interp_select);

@@ -79,6 +79,7 @@ pub mod pyframe;
 ///     interpleveldefs = {
 ///         'pickle': 'interp_copyreg.pickle',
 ///         'dispatch_table': 'space.newdict()',
+///         'sin':            'interp_math.sin',     # arity inferred upstream
 ///     }
 /// ```
 ///
@@ -86,14 +87,28 @@ pub mod pyframe;
 ///
 /// ```ignore
 /// crate::py_module! {
-///     "copyreg",
+///     "math",
 ///     interpleveldefs: {
-///         "pickle" => crate::make_builtin_function_with_arity(
-///             "pickle", |_| Ok(pyre_object::w_none()), 3),
-///         "dispatch_table" => pyre_object::w_dict_new(),
-///     }
+///         "pi"  => pyre_object::floatobject::w_float_new(pymath::math::PI),
+///     },
+///     functions: {
+///         "sin"   / 1 = interp_math::sin,           // fixed-arity
+///         "atan2" / 2 = interp_math::atan2,
+///         "log"   / *  = interp_math::log,          // varargs
+///     },
+///     module_functions: {
+///         "getweakrefcount" / 1 = interp_weakref::getweakrefcount,
+///     },
 /// }
 /// ```
+///
+/// `interpleveldefs` carries arbitrary `PyObjectRef` expressions;
+/// `functions` / `module_functions` are PyPy's `interp_X.fn` string-ref
+/// shorthand expanded inline — the name appears once on the LHS, the
+/// function path once on the RHS, and the macro injects the
+/// `make_builtin_function*` call.  `extra_init: |ns| { ... }` is the
+/// escape hatch for `buildloaders` / `startup` post-processing
+/// (constants loops, cfg gating).
 ///
 /// The `name:` slot is currently informational — `importing.rs` still
 /// owns the module-name -> init-fn map.  A follow-up may use it to drive
@@ -101,21 +116,30 @@ pub mod pyframe;
 #[macro_export]
 macro_rules! py_module {
     (
-        $name:literal,
-        interpleveldefs: { $($key:literal => $value:expr),* $(,)? }
+        $name:literal
+        $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr),* $(,)? })?
+        $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr),* $(,)? })?
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
         pub fn init(ns: &mut $crate::DictStorage) {
             let _name = $name;
-            $(
+            $($(
                 $crate::dict_storage_store(ns, $key, $value);
-            )*
-            // `extra_init: |ns| { ... }` is the escape hatch for
-            // PyPy's `buildloaders` / `startup` post-processing — array
-            // loops for constants, cfg-gated entries, helper-typed
-            // registration that doesn't fit a single PyObjectRef
-            // expression.
+            )*)?
+            $($(
+                $crate::dict_storage_store(
+                    ns, $fn_key,
+                    $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                );
+            )*)?
+            $($(
+                $crate::dict_storage_store(
+                    ns, $mfn_key,
+                    $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                );
+            )*)?
             $(
                 {
                     let $ns: &mut $crate::DictStorage = ns;
@@ -123,6 +147,54 @@ macro_rules! py_module {
                 }
             )?
         }
+    };
+}
+
+/// Helper for `py_module!`'s `functions:` arm.  `*` → varargs
+/// (`make_builtin_function`); numeric arity → `make_builtin_function_with_arity`.
+#[macro_export]
+macro_rules! py_module_fn {
+    ($key:literal, *, $path:expr) => {
+        $crate::make_builtin_function($key, $path)
+    };
+    ($key:literal, $arity:literal, $path:expr) => {
+        $crate::make_builtin_function_with_arity($key, $path, $arity)
+    };
+}
+
+/// Helper for `py_module!`'s `module_functions:` arm — same shape as
+/// `py_module_fn!` but emits the module-builtin variant (no `self`
+/// binding when stored on a class).
+#[macro_export]
+macro_rules! py_module_module_fn {
+    ($key:literal, *, $path:expr) => {
+        $crate::make_module_builtin_function($key, $path)
+    };
+    ($key:literal, $arity:literal, $path:expr) => {
+        $crate::make_module_builtin_function_with_arity($key, $path, $arity)
+    };
+}
+
+/// Declare the standard `pub mod interp_X; pub use init` pair for a
+/// module whose body is too large to inline into `py_module!`.  Matches
+/// PyPy's split between `moduledef.py` (declarative table) and
+/// `interp_<name>.py` (implementations).
+///
+/// ```ignore
+/// pyre_module_init!(interp_socket);
+/// ```
+///
+/// expands to
+///
+/// ```ignore
+/// pub mod interp_socket;
+/// pub use interp_socket::register_module as init;
+/// ```
+#[macro_export]
+macro_rules! pyre_module_init {
+    ($interp_mod:ident) => {
+        pub mod $interp_mod;
+        pub use $interp_mod::register_module as init;
     };
 }
 
