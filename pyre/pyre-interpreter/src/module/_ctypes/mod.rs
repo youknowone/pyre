@@ -5,4 +5,4 @@
 //! libffi-style argument marshalling and per-instance heap state.
 
 pub mod interp_ctypes;
-pub mod moduledef;
+pub use interp_ctypes::register_module as init;

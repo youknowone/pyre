@@ -5,4 +5,4 @@
 //! only.
 
 pub mod interp_fcntl;
-pub mod moduledef;
+pub use interp_fcntl::register_module as init;

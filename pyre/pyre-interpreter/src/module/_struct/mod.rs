@@ -5,4 +5,4 @@
 //! format codes pyre actually uses during import (`<q`, `<d`, etc.).
 
 pub mod interp_struct;
-pub mod moduledef;
+pub use interp_struct::register_module as init;

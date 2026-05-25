@@ -4,4 +4,4 @@
 //! `rustpython_host_env::syslog`.  Unix-only.
 
 pub mod interp_syslog;
-pub mod moduledef;
+pub use interp_syslog::register_module as init;

@@ -5,4 +5,4 @@
 //! module import time.
 
 pub mod interp_random;
-pub mod moduledef;
+pub use interp_random::register_module as init;

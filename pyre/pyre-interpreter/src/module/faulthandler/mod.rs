@@ -5,4 +5,4 @@
 //! default disposition + reraise the signal so the process dies normally.
 
 pub mod interp_faulthandler;
-pub mod moduledef;
+pub use interp_faulthandler::register_module as init;

@@ -5,4 +5,4 @@
 //! not implemented yet.
 
 pub mod interp_select;
-pub mod moduledef;
+pub use interp_select::register_module as init;

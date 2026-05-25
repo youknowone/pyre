@@ -4,4 +4,4 @@
 //! loader handles a name.
 
 pub mod interp_imp;
-pub mod moduledef;
+pub use interp_imp::register_module as init;

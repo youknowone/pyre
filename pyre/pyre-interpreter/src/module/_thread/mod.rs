@@ -5,4 +5,4 @@
 //! stubs.
 
 pub mod interp_thread;
-pub mod moduledef;
+pub use interp_thread::register_module as init;

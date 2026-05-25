@@ -7,4 +7,4 @@
 //! backed by `rustpython_host_env::signal`.
 
 pub mod interp_signal;
-pub mod moduledef;
+pub use interp_signal::register_module as init;

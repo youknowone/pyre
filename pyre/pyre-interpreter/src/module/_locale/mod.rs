@@ -4,4 +4,4 @@
 //! succeeds and Lib/locale.py exposes working `localeconv` / `setlocale`.
 
 pub mod interp_locale;
-pub mod moduledef;
+pub use interp_locale::register_module as init;

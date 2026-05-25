@@ -5,4 +5,4 @@
 //! same shape and writes it back via `termios::Termios`.
 
 pub mod interp_termios;
-pub mod moduledef;
+pub use interp_termios::register_module as init;

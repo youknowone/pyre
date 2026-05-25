@@ -5,4 +5,4 @@
 //! not performant.
 
 pub mod interp_collections;
-pub mod moduledef;
+pub use interp_collections::register_module as init;

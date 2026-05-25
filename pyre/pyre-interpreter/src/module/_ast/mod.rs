@@ -5,4 +5,4 @@
 //! not supported (pyre uses RustPython's compiler).
 
 pub mod interp_ast;
-pub mod moduledef;
+pub use interp_ast::register_module as init;

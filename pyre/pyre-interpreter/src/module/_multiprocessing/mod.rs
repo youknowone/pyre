@@ -5,4 +5,4 @@
 //! exist so multiprocessing.py teardown survives.
 
 pub mod interp_multiprocessing;
-pub mod moduledef;
+pub use interp_multiprocessing::register_module as init;

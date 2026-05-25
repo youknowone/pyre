@@ -6,4 +6,4 @@
 //! / RLIMIT_* constants and `struct_rusage`.
 
 pub mod interp_resource;
-pub mod moduledef;
+pub use interp_resource::register_module as init;
