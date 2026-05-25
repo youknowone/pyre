@@ -8362,6 +8362,59 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_load_fast_family_arm_bytes() {
+        // B1 allow-list batch diagnostic — dump LoadFast and LoadFastBorrow
+        // arm bytes side-by-side with LoadFastCheck so we can decide which
+        // of the three lands first.  Same decoder loop as
+        // `dump_load_fast_check_arm_bytes` above.
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        use pyre_interpreter::bytecode::Arg;
+        let descrs = all_descrs();
+        for instr in [
+            Instruction::LoadFast {
+                var_num: Arg::marker(),
+            },
+            Instruction::LoadFastBorrow {
+                var_num: Arg::marker(),
+            },
+        ] {
+            let jc = jitcode_for_instruction(&instr)
+                .expect("LoadFast family must resolve to an arm jitcode");
+            let code = jc.code.as_slice();
+            eprintln!(
+                "{} arm: num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
+                jc.name,
+                jc.num_regs_r(),
+                jc.num_regs_i(),
+                jc.num_regs_f(),
+                code.len(),
+            );
+            for op in decoded_ops(code) {
+                let operand_bytes = &code[op.pc + 1..op.next_pc];
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes,
+                );
+                if op.key.starts_with("residual_call_") {
+                    let descr_byte_offset = op.next_pc - 3;
+                    let didx =
+                        u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]])
+                            as usize;
+                    if let Some(d) = descrs.get(didx) {
+                        let cd = d.as_calldescr();
+                        let ei = &cd.extra_info;
+                        eprintln!(
+                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?}",
+                            cd.arg_classes, cd.result_type, ei.extraeffect, ei.oopspecindex,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_nop_arm_bytes() {
         // Phase D-3 Blocker #2 diagnostic: decode `Instruction::Nop`'s
         // arm jitcode by following per-opname argcode arity (NOT a
