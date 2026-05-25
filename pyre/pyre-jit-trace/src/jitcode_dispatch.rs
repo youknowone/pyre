@@ -3579,7 +3579,11 @@ fn collect_outer_active_boxes(
         )
     };
     for &idx in &banks.int {
-        let v = sym.registers_i[idx as usize];
+        let v = sym
+            .registers_i
+            .get(idx as usize)
+            .copied()
+            .unwrap_or_else(|| panic!("{}", dump_ctx("int", idx)));
         if v == OpRef::NONE {
             panic!("{}", dump_ctx("int", idx));
         }
@@ -3588,7 +3592,11 @@ fn collect_outer_active_boxes(
     for &idx in &banks.ref_ {
         let reg_idx = idx as usize;
         // Vable-first read for portal frames (see comment at function top).
-        let mut v = sym.registers_r[reg_idx];
+        let mut v = sym
+            .registers_r
+            .get(reg_idx)
+            .copied()
+            .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)));
         if v == OpRef::NONE && portal_vable_owner {
             if let Some(vable_box) = trace_ctx.virtualizable_box_at(nvs + reg_idx) {
                 if vable_box != OpRef::NONE {
@@ -3602,7 +3610,11 @@ fn collect_outer_active_boxes(
         active.push(v);
     }
     for &idx in &banks.float {
-        let v = sym.registers_f[idx as usize];
+        let v = sym
+            .registers_f
+            .get(idx as usize)
+            .copied()
+            .unwrap_or_else(|| panic!("{}", dump_ctx("float", idx)));
         if v == OpRef::NONE {
             panic!("{}", dump_ctx("float", idx));
         }
