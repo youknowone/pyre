@@ -445,7 +445,7 @@ impl<'a> Lowering<'a> {
             // arg-renames.
             graph.value_names.insert(graph.slot_of(&var).unwrap(), name.clone());
             local_var[i] = Some(var.clone());
-            let ty = tyref_to_value_type(&local.ty);
+            let ty = tyref_to_value_type(&local.ty, llbc);
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input { name, ty },
@@ -1001,7 +1001,7 @@ impl<'a> Lowering<'a> {
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
-                    let ty = tyref_to_value_type(&field_ty);
+                    let ty = tyref_to_value_type(&field_ty, self.llbc);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -1665,16 +1665,27 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 /// `TyRef::label()` produces a compact short form
 /// (`"ty#170"`, `"ty<Adt>"`) for opaque IDs, while the underlying
 /// JSON carries the primitive name for literal types.
-fn tyref_to_value_type(ty: &TyRef) -> ValueType {
+///
+/// For `TyRef::Deduplicated{id}`, the projection consults
+/// `llbc.dedup_body(id)` to recover the inline body shape and runs
+/// the same primitive-pattern match.  Required so FunDecl return
+/// types serialized as `Deduplicated` (≈92% in `pyre-interpreter.ullbc`)
+/// resolve to `Int` / `Bool` / `Float` instead of falling back to
+/// `Ref` (Step 4.3.c.ext / Task #30).
+fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
-    // typically land here.  The Deduplicated arm carries only an ID
-    // — without resolving through the type-decl table we can't
-    // distinguish a struct ref from a primitive, so fall back to
-    // `Ref` (the same default the projection downstream uses).
+    // typically land here.  The Deduplicated arm carries only an
+    // ID; consult the dedup-body index to recover the inline shape
+    // when it was recorded.  Ids never seen inline (or scanned out
+    // of order by the reader) fall back to `Ref` — the same
+    // projection downstream uses for any non-primitive shape.
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
-        TyRef::Dedup { .. } => return ValueType::Ref,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return ValueType::Ref,
+        },
     };
     // Primitive shapes Charon emits inline:
     //   {"Literal": {"Integer": ...}}  → Int

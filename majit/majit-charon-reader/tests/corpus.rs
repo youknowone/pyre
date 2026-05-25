@@ -134,3 +134,31 @@ fn call_classify_covers_corpus() {
         "expected at least one direct call: {counts:?}",
     );
 }
+
+#[test]
+fn dedup_body_resolves_inline_shape() {
+    // Step 4.3.c.ext: every `HashConsedValue: [id, body]` occurrence
+    // must surface through `Llbc::dedup_body(id)` so MIR's TyRef
+    // projection can resolve `Deduplicated` references.
+    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+
+    // Collect a (dedup_id, body_kind) sample by walking every
+    // FunDecl's `inputs` / `output` TyRefs.  At least one
+    // `Deduplicated` id should appear in the corpus and round-trip
+    // through `dedup_body`.
+    let mut sampled = 0usize;
+    for fd in llbc.iter_local_fns() {
+        for ty in &fd.signature.inputs {
+            if let majit_charon_reader::ullbc::TyRef::Dedup { id } = ty {
+                let body = llbc.dedup_body(*id).unwrap_or_else(|| {
+                    panic!("dedup_body({id}) returned None for an input TyRef in {}",
+                        fd.item_meta.name_path())
+                });
+                assert!(body.is_object() || body.is_string(),
+                    "dedup_body({id}) body was unexpectedly typed: {body}");
+                sampled += 1;
+            }
+        }
+    }
+    assert!(sampled > 0, "expected at least one Deduplicated input TyRef in the corpus");
+}

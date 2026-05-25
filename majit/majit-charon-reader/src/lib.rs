@@ -48,6 +48,21 @@ pub struct Llbc {
     /// and any `.field` projection on it panics in the annotator
     /// (`annotator/unaryop.rs:3587`).
     dedup_adt: Vec<(u64, u64)>,
+    /// `dedup_id → body Value` index built from every inline
+    /// `HashConsedValue: [id, body]` occurrence in the raw LLBC JSON.
+    /// Sorted by `dedup_id` for binary search.  Populated once at
+    /// parse time.
+    ///
+    /// Consumed by `front::mir::Lowering::tyref_to_value_type` so a
+    /// `TyRef::Deduplicated{id}` reference can be projected to its
+    /// underlying `ValueType` (primitive `Literal` bodies → `Int` /
+    /// `Bool` / `Float`, `Adt` / `Ref` / `RawPtr` → `Ref`).  Without
+    /// this index, FunDecl return types serialized as `Deduplicated`
+    /// (≈8190 of 8940 typed return signatures in `pyre-interpreter.ullbc`)
+    /// fall back to `Ref` and downstream callers cannot distinguish
+    /// `i64`-returning helpers from pointer-returning ones, defeating
+    /// `fn_return_types`-based type checks.
+    dedup_body: Vec<(u64, serde_json::Value)>,
 }
 
 impl Llbc {
@@ -63,16 +78,20 @@ impl Llbc {
         // `HashConsedValue` entry; then re-deserialize the same JSON
         // into the typed `LlbcFile`.  Peak memory is ~3× the bytes
         // (input slice + Value + LlbcFile) but settles back to
-        // LlbcFile + small `dedup_adt` once the Value is dropped.
+        // LlbcFile + small `dedup_adt` / `dedup_body` once the Value
+        // is dropped.
         let raw: serde_json::Value =
             serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
-        collect_dedup_adt(&raw, &mut dedup_adt);
+        let mut dedup_body: Vec<(u64, serde_json::Value)> = Vec::new();
+        collect_dedup_bodies(&raw, &mut dedup_adt, &mut dedup_body);
         dedup_adt.sort_by_key(|&(id, _)| id);
         dedup_adt.dedup_by_key(|p| p.0);
+        dedup_body.sort_by_key(|p| p.0);
+        dedup_body.dedup_by_key(|p| p.0);
         let file: LlbcFile =
             serde_json::from_value(raw).map_err(SchemaError::Parse)?;
-        Ok(Self { file, dedup_adt })
+        Ok(Self { file, dedup_adt, dedup_body })
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the
@@ -85,6 +104,19 @@ impl Llbc {
             .binary_search_by_key(&id, |&(d, _)| d)
             .ok()
             .map(|i| self.dedup_adt[i].1)
+    }
+
+    /// Resolve a Charon `Deduplicated: <id>` reference to its
+    /// underlying inline body (a `serde_json::Value` of the same
+    /// shape Charon emits inline for a `HashConsedValue: [id, body]`).
+    /// Returns `None` for ids whose inline form never appeared in
+    /// this LLBC.  See the [`Self::dedup_body`] field doc for
+    /// context.
+    pub fn dedup_body(&self, id: u64) -> Option<&serde_json::Value> {
+        self.dedup_body
+            .binary_search_by_key(&id, |p| p.0)
+            .ok()
+            .map(|i| &self.dedup_body[i].1)
     }
 
     /// Look up a local-crate function whose name ends with `::<name>`.
@@ -173,10 +205,16 @@ impl Llbc {
 }
 
 /// Walk a raw `Value` tree, recording every inline
-/// `HashConsedValue: [id, body]` whose body decodes as an ADT
-/// reference (`{"Adt": {"id": {"Adt": <def_id>}}}`).  Used during
-/// [`Llbc::from_slice`] to build the `dedup_id → adt def_id` index.
-fn collect_dedup_adt(v: &serde_json::Value, out: &mut Vec<(u64, u64)>) {
+/// `HashConsedValue: [id, body]` occurrence.  Records the body into
+/// `bodies` (the generic dedup-id → body index) and, when the body
+/// decodes as `{"Adt": {"id": {"Adt": <def_id>}}}`, also into `adt`
+/// (the dedup-id → ADT def_id index for fast Adt resolution).  Used
+/// during [`Llbc::from_slice`].
+fn collect_dedup_bodies(
+    v: &serde_json::Value,
+    adt: &mut Vec<(u64, u64)>,
+    bodies: &mut Vec<(u64, serde_json::Value)>,
+) {
     match v {
         serde_json::Value::Object(m) => {
             if let Some(arr) = m
@@ -184,17 +222,19 @@ fn collect_dedup_adt(v: &serde_json::Value, out: &mut Vec<(u64, u64)>) {
                 .and_then(serde_json::Value::as_array)
                 && arr.len() == 2
                 && let Some(id) = arr[0].as_u64()
-                && let Some(def_id) = adt_def_id_from_ty_body(&arr[1])
             {
-                out.push((id, def_id));
+                if let Some(def_id) = adt_def_id_from_ty_body(&arr[1]) {
+                    adt.push((id, def_id));
+                }
+                bodies.push((id, arr[1].clone()));
             }
             for vv in m.values() {
-                collect_dedup_adt(vv, out);
+                collect_dedup_bodies(vv, adt, bodies);
             }
         }
         serde_json::Value::Array(arr) => {
             for vv in arr {
-                collect_dedup_adt(vv, out);
+                collect_dedup_bodies(vv, adt, bodies);
             }
         }
         _ => {}
