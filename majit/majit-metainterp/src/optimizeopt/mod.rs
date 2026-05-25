@@ -7344,25 +7344,46 @@ mod boxref_forwarding_tests {
     use crate::r#box::{BoxRef, Forwarded as BoxForwarded};
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{OpRef, Type, Value};
+    use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
 
-    fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef) {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let b0 = BoxRef::new_inputarg(Type::Int, 0);
-        let b1 = BoxRef::new_inputarg(Type::Int, 1);
-        ctx.box_pool = vec![b0.clone(), b1.clone()].into();
-        (ctx, b0, b1)
+    /// Create a `BoxRef::new_inputarg(tp, index)` already bound to a fresh
+    /// `InputArgRc` (`box_ref.rs:354 bind_inputarg`), matching the
+    /// recorder→TreeLoop production handoff invariant that every
+    /// `AbstractInputArg` BoxRef has an `inputarg.forwarded` target. The
+    /// returned `InputArgRc` must outlive every read of `box.get_forwarded()`
+    /// so the bound `Weak<InputArg>` stays upgradable.
+    fn bound_inputarg_box(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
+        let b = BoxRef::new_inputarg(tp, index);
+        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        b.bind_inputarg(&ia);
+        (b, ia)
     }
 
-    /// `make_equal_to(old, new)` mirrors `old_box.set_forwarded_box(new_box)`.
+    fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef, Vec<InputArgRc>) {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
+        let (b0, ia0) = bound_inputarg_box(Type::Int, 0);
+        let (b1, ia1) = bound_inputarg_box(Type::Int, 1);
+        ctx.box_pool = vec![b0.clone(), b1.clone()].into();
+        (ctx, b0, b1, vec![ia0, ia1])
+    }
+
+    /// `make_equal_to(old, new)` plants an `InputArg`-target chain step on
+    /// `old`'s `_forwarded` slot (`optimizer.py:394 op.set_forwarded(newop)`
+    /// — `newop` is an `AbstractInputArg` here), and `get_box_replacement`
+    /// (`resoperation.py:57-68`) walks to a BoxRef bound to `new`'s
+    /// `AbstractInputArg` identity. The walker materialises a transient
+    /// BoxRef wrapping the same `InputArgRc`, so identity is checked via
+    /// the bound handle, not outer `Rc<Box>` pointer equality.
     #[test]
     fn h3_1_replace_op_mirrors_box_forward() {
-        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
-        match &b0.get_forwarded() {
-            BoxForwarded::Box(target) => assert_eq!(target, &b1),
-            other => panic!("expected Forwarded::Box, got {:?}", other),
-        }
+        assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
+        let walked = b0.get_box_replacement(false);
+        assert!(std::rc::Rc::ptr_eq(
+            &walked.bound_inputarg().expect("walked terminal carries bound InputArg"),
+            &ia_holder[1],
+        ));
     }
 
     /// `box.clear_forwarded()` resets a previously-set forwarding slot
@@ -7370,7 +7391,7 @@ mod boxref_forwarding_tests {
     /// path; chain reset happens on the box directly.
     #[test]
     fn h3_1_clear_forwarded_resets_box_forward() {
-        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
         b0.clear_forwarded();
         assert!(matches!(b0.get_forwarded(), BoxForwarded::None));
@@ -7381,7 +7402,7 @@ mod boxref_forwarding_tests {
     /// non-constant `new`, the IntBound moves to `new`'s slot.
     #[test]
     fn h3_1_replace_op_transfers_int_bound_to_new() {
-        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
         ctx.setintbound(&b0, &bound);
         ctx.make_equal_to(&b0, &b1);
@@ -7391,18 +7412,23 @@ mod boxref_forwarding_tests {
             BoxForwarded::Info(OpInfo::IntBound(b)) => assert_eq!(b.borrow().lower, 7),
             other => panic!("BoxRef[1] should carry IntBound, got {:?}", other),
         }
-        // old's slot now points to new (forwarding chain head).
-        match &b0.get_forwarded() {
-            BoxForwarded::Box(target) => assert_eq!(target, &b1),
-            other => panic!("expected b0 to forward to b1, got {:?}", other),
-        }
+        // old's slot now points to new. Bound-InputArg target routes through
+        // `set_forwarded_inputarg`, so the slot carries
+        // `Forwarded::InputArg(Weak<InputArg>)`; chain walk lands on a
+        // transient BoxRef sharing `ia_holder[1]`'s identity.
+        assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
+        let walked = b0.get_box_replacement(false);
+        assert!(std::rc::Rc::ptr_eq(
+            &walked.bound_inputarg().expect("walked terminal carries bound InputArg"),
+            &ia_holder[1],
+        ));
     }
 
     /// `optimizer.py:400` guard: transfer is **skipped** when `new` is
     /// constant. PyPy short-circuits via `not newop.is_constant()`.
     #[test]
     fn h3_1_replace_op_skips_info_transfer_when_new_is_constant() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         // Seed an IntBound on old.
         let bound = IntBound::from_constant(42);
         ctx.setintbound(&b0, &bound);
@@ -7510,7 +7536,7 @@ mod boxref_forwarding_tests {
     /// `box.set_forwarded(constbox)` — Const variant.
     #[test]
     fn h3_1_make_constant_mirrors_box_info_constant() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
         match &b0.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Int(v), _) => {
@@ -7523,7 +7549,7 @@ mod boxref_forwarding_tests {
     /// `setintbound(opref, bound)` mirrors `box.set_forwarded(IntBound)`.
     #[test]
     fn h3_1_setintbound_mirrors_box_info() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
         ctx.setintbound(&b0, &bound);
         match &b0.get_forwarded() {
@@ -7544,7 +7570,7 @@ mod boxref_forwarding_tests {
     /// BoxRef carrying the same Value as the seeded constant.
     #[test]
     fn h3_4_replace_op_const_target_mirrors_value_box() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
@@ -7566,7 +7592,7 @@ mod boxref_forwarding_tests {
     /// keep the runtime Box identity.
     #[test]
     fn get_box_replacement_not_const_stops_before_const_target() {
-        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
@@ -7599,7 +7625,7 @@ mod boxref_forwarding_tests {
     #[test]
     #[should_panic(expected = "missing from const_pool")]
     fn h3_4_replace_op_const_target_without_const_pool_panics() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         // const_pool is empty — bug in caller.
         let const_opref = OpRef::const_int(0);
         let b_const = ctx
@@ -7775,7 +7801,7 @@ mod boxref_forwarding_tests {
     /// `resoperation.py:57-68` walker terminates on `None` immediately.
     #[test]
     fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
-        let (ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
@@ -7786,16 +7812,21 @@ mod boxref_forwarding_tests {
     /// H-3.2b: with a forwarding chain installed via `make_equal_to`, the
     /// BoxRef walker reaches the terminal Box (`b1`). RPython parity:
     /// `optimizer.py:393 box.set_forwarded(newop)` → reader walks until
-    /// `Forwarded::None` and returns the last Box.
+    /// `Forwarded::None` and returns the last Box. The walker materialises
+    /// a transient BoxRef wrapping `b1`'s bound `InputArgRc`, so terminal
+    /// identity is checked via the shared `InputArg` handle rather than
+    /// outer `Rc<Box>` pointer equality.
     #[test]
     fn h3_2b_get_box_replacement_box_walks_forwarded_chain() {
-        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
-        // b0 → b1 through the BoxRef `_forwarded` slot; terminal is b1.
-        assert_eq!(got, b1);
+        assert!(std::rc::Rc::ptr_eq(
+            &got.bound_inputarg().expect("walked terminal carries bound InputArg"),
+            &ia_holder[1],
+        ));
         // b0 itself is not the terminal.
         assert_ne!(got, b0);
     }
@@ -7816,7 +7847,7 @@ mod boxref_forwarding_tests {
     /// the sentinel independently by returning it unchanged.
     #[test]
     fn h3_2b_get_box_replacement_box_handles_none_sentinel() {
-        let (ctx, _b0, _b1) = ctx_with_two_int_boxes();
+        let (ctx, _b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         assert!(ctx.get_box_replacement_box(OpRef::NONE).is_none());
     }
 
@@ -7826,7 +7857,7 @@ mod boxref_forwarding_tests {
     /// construction. Identity is irrelevant; readers compare via Value.
     #[test]
     fn h3_4_get_box_replacement_box_materializes_const_from_const_pool() {
-        let (mut ctx, _b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, _b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
@@ -7843,7 +7874,7 @@ mod boxref_forwarding_tests {
     /// PyPy `resoperation.py:60 isinstance(next, AbstractInfo)`.
     #[test]
     fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
@@ -7911,7 +7942,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_peek_intbound_box_matches_legacy_when_pool_plumbed() {
-        let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(42));
         let legacy = ctx
             .peek_intbound(OpRef::input_arg_int(0))
@@ -7925,7 +7956,7 @@ mod boxref_forwarding_tests {
 
     #[test]
     fn h3_2c_peek_intbound_box_returns_none_for_unset() {
-        let (ctx, b0, _b1) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         assert!(ctx.peek_intbound_box(&b0).is_none());
     }
 
