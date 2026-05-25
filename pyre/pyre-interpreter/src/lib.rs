@@ -55,14 +55,20 @@ pub mod pyframe;
 // PyPy's MixedModule machinery walks the dict at import time.  Pyre
 // mirrors that with the `py_module!` macro below: each call expands to
 // a `pub fn init(ns: &mut DictStorage)` that stores every entry via
-// `dict_storage_store`, eliminating the one-line `moduledef.rs` files
-// that previously did nothing but `super::interp_x::register_module(ns)`.
+// `dict_storage_store`.  The previous one-line `moduledef.rs` shim
+// (which did nothing but `super::interp_x::register_module(ns)`) has
+// been retired across every builtin module.
 //
 // The macro is intentionally minimal at the value layer — each entry's
 // RHS is just a `PyObjectRef` expression — so call-site code stays the
-// same as the hand-written `dict_storage_store` calls it replaces.  More
-// PyPy-ish sugars (`function!`, `int_constants!`, cfg-gating) are layered
-// on top in the same module; the core macro stays declarative.
+// same as the hand-written `dict_storage_store` calls it replaces.  An
+// `extra_init: |ns| { ... }` escape hatch covers PyPy's
+// `buildloaders` / `startup` post-processing (constants loops, cfg
+// gating, helper-typed registration).  For modules whose
+// `register_module` body is too large to inline (`_socket`, `_sre`,
+// `sys`), `mod.rs` falls back to `pub use interp_x::register_module
+// as init;` — semantically identical to the macro form, deferred to a
+// later pass.
 
 /// PyPy MixedModule-style declarative module registration.
 ///

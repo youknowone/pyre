@@ -2,8 +2,8 @@
 //!
 //! Provides the lowest-level socket API exposed to Python.  The
 //! interp_socket submodule carries the W_Socket class implementation
-//! plus address conversion / IDNA / error mapping helpers; moduledef
-//! wires the resulting names into the ns dict at import time.
+//! plus address conversion / IDNA / error mapping helpers.
 
 pub mod interp_socket;
-pub mod moduledef;
+
+pub use interp_socket::register_module as init;

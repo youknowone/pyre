@@ -5,4 +5,5 @@
 //! pointer is invalidated on close/`__exit__` via munmap.
 
 pub mod interp_mmap;
-pub mod moduledef;
+
+pub use interp_mmap::register_module as init;

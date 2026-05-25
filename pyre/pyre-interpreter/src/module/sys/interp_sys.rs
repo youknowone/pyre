@@ -217,7 +217,7 @@ pub fn exc_info_direct() -> PyObjectRef {
     }
 }
 
-pub fn init(ns: &mut DictStorage) {
+pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
     dict_storage_store(ns, "version", w_str_new("3.13.0 (pyre 0.0.1)"));

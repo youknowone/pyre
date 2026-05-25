@@ -99,19 +99,19 @@ pub fn register_builtin_module(name: &'static str, init: fn(&mut DictStorage)) {
 /// PyPy equivalent: baseobjspace.py `make_builtins()` +
 /// `install_mixedmodule()` for each module in objspace.usemodules.
 pub fn install_builtin_modules() {
-    register_builtin_module("math", crate::module::math::moduledef::init);
-    register_builtin_module("cmath", crate::module::math::cmath_moduledef::init);
-    register_builtin_module("time", crate::module::time::moduledef::init);
-    register_builtin_module("sys", crate::module::sys::moduledef::init);
-    register_builtin_module("operator", crate::module::operator::moduledef::init);
-    register_builtin_module("_operator", crate::module::operator::moduledef::init);
-    register_builtin_module("builtins", crate::module::__builtin__::moduledef::init);
-    register_builtin_module("_io", crate::module::_io::moduledef::init);
-    register_builtin_module("_sre", crate::module::_sre::moduledef::init);
+    register_builtin_module("math", crate::module::math::init);
+    register_builtin_module("cmath", crate::module::cmath::init);
+    register_builtin_module("time", crate::module::time::init);
+    register_builtin_module("sys", crate::module::sys::init);
+    register_builtin_module("operator", crate::module::operator::init);
+    register_builtin_module("_operator", crate::module::operator::init);
+    register_builtin_module("builtins", crate::module::__builtin__::init);
+    register_builtin_module("_io", crate::module::_io::init);
+    register_builtin_module("_sre", crate::module::_sre::init);
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
-    register_builtin_module("_weakref", crate::module::_weakref::moduledef::init);
+    register_builtin_module("_weakref", crate::module::_weakref::init);
     register_builtin_module("_abc", crate::module::_abc::init);
     register_builtin_module("_functools", crate::module::_functools::init);
     register_builtin_module("_thread", crate::module::_thread::init);
@@ -127,23 +127,24 @@ pub fn install_builtin_modules() {
     register_builtin_module("_imp", crate::module::_imp::init);
     register_builtin_module(
         "importlib.machinery",
-        crate::module::importlib::moduledef::init_machinery,
+        crate::module::importlib::interp_importlib::register_machinery,
     );
-    register_builtin_module("importlib", crate::module::importlib::moduledef::init_pkg);
+    register_builtin_module(
+        "importlib",
+        crate::module::importlib::interp_importlib::register_pkg,
+    );
     register_builtin_module(
         "importlib.util",
-        crate::module::importlib::moduledef::init_util,
+        crate::module::importlib::interp_importlib::register_util,
     );
     register_builtin_module(
         "importlib.abc",
-        crate::module::importlib::moduledef::init_abc,
+        crate::module::importlib::interp_importlib::register_abc,
     );
     register_builtin_module("_signal", crate::module::_signal::init);
     register_builtin_module("atexit", crate::module::atexit::init);
-    #[cfg(unix)]
-    register_builtin_module("pwd", crate::module::pwd::moduledef::init);
-    #[cfg(unix)]
-    register_builtin_module("grp", crate::module::grp::moduledef::init);
+    register_builtin_module("pwd", crate::module::pwd::init);
+    register_builtin_module("grp", crate::module::grp::init);
     #[cfg(unix)]
     register_builtin_module("resource", crate::module::resource::init);
     #[cfg(unix)]
@@ -152,8 +153,8 @@ pub fn install_builtin_modules() {
     register_builtin_module("syslog", crate::module::syslog::init);
     register_builtin_module("select", crate::module::select::init);
     register_builtin_module("termios", crate::module::termios::init);
-    register_builtin_module("_socket", crate::module::_socket::moduledef::init);
-    register_builtin_module("mmap", crate::module::mmap::moduledef::init);
+    register_builtin_module("_socket", crate::module::_socket::init);
+    register_builtin_module("mmap", crate::module::mmap::init);
     register_builtin_module("faulthandler", crate::module::faulthandler::init);
     register_builtin_module("_ctypes", crate::module::_ctypes::init);
     register_builtin_module("_posixshmem", crate::module::_posixshmem::init);

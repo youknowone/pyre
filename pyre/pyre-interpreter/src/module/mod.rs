@@ -42,6 +42,7 @@ pub mod _struct;
 pub mod _thread;
 pub mod _weakref;
 pub mod atexit;
+pub mod cmath;
 pub mod copyreg;
 pub mod errno;
 pub mod faulthandler;

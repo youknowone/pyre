@@ -17,7 +17,7 @@ thread_local! {
     static SRE_MATCH_TYPE: RefCell<PyObjectRef> = const { RefCell::new(pyre_object::PY_NULL) };
 }
 
-pub fn init(ns: &mut DictStorage) {
+pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
     dict_storage_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
     dict_storage_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));

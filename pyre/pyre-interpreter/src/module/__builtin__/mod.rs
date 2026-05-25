@@ -1,3 +1,12 @@
-//! builtins module — PyPy equivalent: pypy/module/__builtin__/
+//! builtins module — PyPy: pypy/module/__builtin__/
+//!
+//! `import builtins` exposes the same names as the default builtins
+//! namespace; we seed the module dict via `install_default_builtins`.
 
-pub mod moduledef;
+crate::py_module! {
+    "builtins",
+    interpleveldefs: {},
+    extra_init: |ns| {
+        crate::install_default_builtins(ns);
+    }
+}
