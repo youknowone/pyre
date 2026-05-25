@@ -1,0 +1,22 @@
+[package]
+name = "pyre-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Proc macros for pyre builtin module declarations (PyPy @unwrap_spec equivalent)"
+
+[lib]
+proc-macro = true
+
+[features]
+# Pyre crates declare `dynasm = []` / `cranelift = []` feature stubs so
+# `cargo test --features X --all` doesn't error on packages that lack the
+# feature.  See feedback memory `Workspace dynasm/cranelift feature stubs`.
+dynasm = []
+cranelift = []
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

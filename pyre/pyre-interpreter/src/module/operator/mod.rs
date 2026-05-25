@@ -48,8 +48,8 @@ fn op_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // `baseobjspace::OP(args[0], args[1])` and unwrap-or-none the result.
 // Inline closures below preserve the per-name `assert!` checks.
 use crate::baseobjspace::{
-    self, CompareOp, add, and_, contains, delitem, floordiv, getitem, invert, is_true,
-    lshift, mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
+    self, CompareOp, add, and_, contains, delitem, floordiv, getitem, invert, is_true, lshift,
+    mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
 };
 
 crate::py_module! {

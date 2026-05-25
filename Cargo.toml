@@ -32,6 +32,7 @@ members = [
     "majit/examples/calc",
     # pyre
     "pyre/pyre-object",
+    "pyre/pyre-macros",
     "pyre/pyre-interpreter",
     "pyre/pyre-module",
     "pyre/pyre-jit",
@@ -44,6 +45,7 @@ members = [
 [workspace.dependencies]
 # pyre internal crates
 pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
+pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
 pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
 pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit" }

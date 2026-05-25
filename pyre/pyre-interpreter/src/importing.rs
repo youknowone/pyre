@@ -169,9 +169,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(atexit);
     pyre_install_module!(pwd);
     pyre_install_module!(grp);
-    #[cfg(unix)] pyre_install_module!(resource);
-    #[cfg(unix)] pyre_install_module!(fcntl);
-    #[cfg(unix)] pyre_install_module!(syslog);
+    #[cfg(unix)]
+    pyre_install_module!(resource);
+    #[cfg(unix)]
+    pyre_install_module!(fcntl);
+    #[cfg(unix)]
+    pyre_install_module!(syslog);
     pyre_install_module!(select);
     pyre_install_module!(termios);
     pyre_install_module!(_socket);
@@ -203,10 +206,31 @@ pub fn install_builtin_modules() {
     // real stdlib and are loaded from disk, but their builtin shims here
     // simply succeed at `import X`.
     for name in &[
-        "_string", "_warnings", "_heapq", "_tokenize", "_typing", "_bisect",
-        "binascii", "_hashlib", "_sha2", "_md5", "_sha1", "_sha3", "_blake2",
-        "_decimal", "_pickle", "_datetime", "_json", "_csv", "marshal",
-        "_tracemalloc", "_stat", "_asyncio", "_queue", "_zoneinfo", "array",
+        "_string",
+        "_warnings",
+        "_heapq",
+        "_tokenize",
+        "_typing",
+        "_bisect",
+        "binascii",
+        "_hashlib",
+        "_sha2",
+        "_md5",
+        "_sha1",
+        "_sha3",
+        "_blake2",
+        "_decimal",
+        "_pickle",
+        "_datetime",
+        "_json",
+        "_csv",
+        "marshal",
+        "_tracemalloc",
+        "_stat",
+        "_asyncio",
+        "_queue",
+        "_zoneinfo",
+        "array",
         "zlib",
     ] {
         register_builtin_module(name, empty_module_init);

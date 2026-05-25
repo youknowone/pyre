@@ -118,6 +118,11 @@ macro_rules! py_module {
     (
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, inline_functions: {
+            $(
+                fn $ifn_name:ident ( $($ifn_args:tt)* ) $(-> $ifn_ret:ty)? $ifn_body:block
+            )*
+        })?
         $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr),* $(,)? })?
         $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr),* $(,)? })?
         $(, extra_init: |$ns:ident| $body:block)?
@@ -127,6 +132,24 @@ macro_rules! py_module {
             let _name = $name;
             $($(
                 $crate::dict_storage_store(ns, $key, $value);
+            )*)?
+            // inline_functions: `#[pyre_function]` typed defs whose name +
+            // arity are derived from the signature.  Replaces the
+            // separate `#[pyre_function] fn X` + `"X" / N = X` pair.
+            $($(
+                {
+                    #[$crate::pyre_function]
+                    fn $ifn_name ( $($ifn_args)* ) $(-> $ifn_ret)? $ifn_body
+                    $crate::dict_storage_store(
+                        ns,
+                        stringify!($ifn_name),
+                        $crate::make_builtin_function_with_arity(
+                            stringify!($ifn_name),
+                            $ifn_name,
+                            $crate::pyre_count_typed_args!($($ifn_args)*) as u16,
+                        ),
+                    );
+                }
             )*)?
             $($(
                 $crate::dict_storage_store(
@@ -147,6 +170,19 @@ macro_rules! py_module {
                 }
             )?
         }
+    };
+}
+
+/// Count typed `name: ty` arguments in a `fn` parameter list.  Used by
+/// `py_module!`'s `inline_functions:` arm to derive arity from the
+/// signature.  Treats `&[PyObjectRef]` varargs as zero (caller should
+/// route those through path-ref `functions:` form instead).
+#[macro_export]
+macro_rules! pyre_count_typed_args {
+    () => { 0usize };
+    ($a:ident : $t:ty) => { 1usize };
+    ($a:ident : $t:ty, $($rest:tt)*) => {
+        1usize + $crate::pyre_count_typed_args!($($rest)*)
     };
 }
 
@@ -222,6 +258,9 @@ pub use pyopcode::*;
 pub use pytraceback::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
+
+/// PyPy `@unwrap_spec(...)` equivalent.  See `pyre-macros/src/lib.rs`.
+pub use pyre_macros::pyre_function;
 
 /// Every interpreter-level `PyType` static that represents a
 /// `PyObject`-layout type (instances carry `ob_type` at offset 0,

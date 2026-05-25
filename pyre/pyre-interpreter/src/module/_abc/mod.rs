@@ -18,7 +18,9 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args[0];
     let instance = args[1];
     unsafe {
-        Ok(w_bool_from(crate::baseobjspace::isinstance_w(instance, cls)))
+        Ok(w_bool_from(crate::baseobjspace::isinstance_w(
+            instance, cls,
+        )))
     }
 }
 
