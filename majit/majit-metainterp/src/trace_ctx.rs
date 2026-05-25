@@ -1576,7 +1576,14 @@ impl TraceCtx {
         let Some(values) = self.virtualizable_values.as_mut() else {
             return;
         };
-        for i in 0..static_count.min(values.len()) {
+        // `virtualizable_values`'s last slot stores the standard-vable identity
+        // (`virtualizable_boxes[-1]` in RPython terms, see comment at
+        // `virtualizable_box_at`).  `synchronize_virtualizable` already stops
+        // at `static_count + sum(lengths)`; mirror that here so a
+        // short/misaligned shadow (only the identity slot present, or fewer
+        // data slots than expected) can never overwrite the identity.
+        let shadow_data_len = values.len().saturating_sub(1);
+        for i in 0..static_count.min(shadow_data_len) {
             let ty = info.static_fields[i].field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             values[i] = crate::pyjitpl::heap_value_for_pub(ty, bits);
@@ -1588,7 +1595,7 @@ impl TraceCtx {
             }
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
-                if cursor >= values.len() {
+                if cursor >= shadow_data_len {
                     break;
                 }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
