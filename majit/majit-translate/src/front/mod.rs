@@ -154,16 +154,32 @@
 //!     legacy AST graph build for every method.  This shrinks the
 //!     AST graph builder reach in production to the residual ≈44
 //!     entries from 3.E.
-//! - **Slice 4** — replace the AST-fallback arm in
-//!   `build_semantic_program_via_active_frontend` with a loud
-//!   `panic!` requesting `scripts/extract-llbc.sh`.  Deferred
-//!   until Slice 3.D closes (and `extract_*` no longer reaches
-//!   AST graph builders for the registered surface).
-//! - **Slice 5** — delete the AST graph builder bulk
+//! - **Slice 4** (LANDED, `bde9afa8dd`) — env-gated panic in the
+//!   AST-fallback arm of `build_semantic_program_via_active_frontend`.
+//!   Setting `PYRE_REQUIRE_MIR_FRONTEND=1` makes the function panic
+//!   when no LLBC source resolves.  `pyre/check.py::build_backend`
+//!   sets the flag on the cargo build subprocess so production
+//!   cutover asserts MIR-only.  Tests that exercise the AST builder
+//!   call `front::build_semantic_program_from_parsed_files` directly
+//!   and bypass this dispatch — they remain unaffected by the flag.
+//! - **Slice 5 (pending)** — delete the AST graph builder bulk
 //!   (~15k LOC: `build_function_graph_*`, `GraphBuildContext`,
 //!   `lower_*` walkers, the four CFG-blindness shims listed
-//!   below).  Gated on Slice 4 + every test fixture either
-//!   migrating to MIR or being deleted.
+//!   below).  Gate condition is each test fixture either migrating
+//!   to MIR (requires pre-extracted `.ullbc` artefacts in the source
+//!   tree — see "Out-of-band paths" below) or being deleted.  The
+//!   following test surfaces currently keep the AST builder
+//!   reachable:
+//!     - `tests/test_pyre_transform_all_handlers.rs`
+//!     - `tests/test_pyre_transform_single_handler.rs`
+//!     - `tests/test_pyre_trait_resolution.rs`
+//!     - `tests/test_pyre_pyframe_trait_resolution.rs`
+//!     - `tests/test_pyre_find_all_graphs.rs`
+//!     - `tests/test_phase_f_all_jitcodes.rs`
+//!     - `tests/test_mir_vs_ast.rs` (explicit AST-vs-MIR comparison)
+//!     - 4 internal `front/ast.rs` `mod tests` invocations
+//!     - 2 lib.rs `mod tests` invocations (lib.rs:2038, 2096)
+//!     - 1 `jit_codewriter/call.rs:6858` `mod tests` invocation
 //!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
