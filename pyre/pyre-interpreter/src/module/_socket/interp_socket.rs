@@ -1381,6 +1381,49 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
+
+        // fromfd(fd, family, type, proto=0) — `interp_func.py:75
+        // fromfd_w`: dup() the supplied fd (so the caller still owns the
+        // original) and wrap it in a fresh `_socket.socket`.  CPython
+        // requires the dup so close() on the returned socket leaves the
+        // input descriptor intact.
+        crate::dict_storage_store(
+            ns,
+            "fromfd",
+            crate::make_builtin_function("fromfd", |args| {
+                if args.len() < 3 {
+                    return Err(crate::PyError::type_error(
+                        "fromfd() requires fd, family and type",
+                    ));
+                }
+                for (idx, label) in [(0, "fd"), (1, "family"), (2, "type")] {
+                    if !unsafe { pyre_object::is_int(args[idx]) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "fromfd: {label} must be an integer"
+                        )));
+                    }
+                }
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                let family = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                let ty = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
+                let proto = if args.len() >= 4 {
+                    if !unsafe { pyre_object::is_int(args[3]) } {
+                        return Err(crate::PyError::type_error("fromfd: proto must be an integer"));
+                    }
+                    (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
+                } else {
+                    0
+                };
+                let new_fd = unsafe { libc::dup(fd) };
+                if new_fd < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                unsafe {
+                    libc::fcntl(new_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                Ok(socket_from_fd(new_fd, family, ty, proto))
+            }),
+        );
     }
 }
 
