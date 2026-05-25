@@ -79,6 +79,48 @@
 //!   `flatten.rs:1155 "switch exitswitch must be int"` for graphs
 //!   that switched on integer-typed arguments.
 //!
+//! ### Step 6.E — AST graph builder retirement (in progress)
+//!
+//! AST's `build_function_graph_*` family is still reachable through
+//! `parse::extract_trait_impls` / `extract_inherent_impl_methods`
+//! which build per-method graphs parallel to the MIR-built
+//! `program.functions`.  Replacement is multi-slice:
+//!
+//! - **Slice 1** (`382b21e0ec`) — carve `SemanticProgram`,
+//!   `SemanticFunction`, `StructFieldRegistry`, `AstGraphOptions`,
+//!   `FlowingError`, `ProgramMetadata` and the
+//!   `qualify_type_name_with_imports` helper out of `front::ast`
+//!   into `front::semantic`.  `front::ast` retains `pub use`
+//!   re-exports.
+//! - **Slice 2 (partial, `7a538de2a9`)** — move the leaf
+//!   string-utility helpers `transparent_result_ok_type` and
+//!   `nolength_from_array_type_id` (used by `jit_codewriter::call`)
+//!   into `front::syn_metadata`.  Larger metadata collectors
+//!   (`collect_program_metadata_pub`, `collect_jit_hints_with_sig`,
+//!   `collect_struct_origins`) still live in `ast.rs` until their
+//!   internal graph-builder dependencies retire.
+//! - **Slice 3 (in progress)** — populate
+//!   `SemanticFunction.self_ty_root` (`66423f0fc4`) and
+//!   `SemanticFunction.trait_root` (`36e3a6520b`) on MIR-built
+//!   impl methods so the canonical registration loop in
+//!   `lib.rs:905-1019` can walk `program.functions` instead of the
+//!   AST-side `canonical_trait_impls` /
+//!   `canonical_inherent_methods`.  Coverage audit
+//!   (`PYRE_AST_EXTRACT_COVERAGE_AUDIT=1`, `29db020eeb`) reports
+//!   inherent 336/509 (66%) covered, trait 26/498 (5%) covered;
+//!   trait gap stems from AST setting `self_ty_root=None` and
+//!   falling back to an unqualified `for_type` key.  Aligning the
+//!   remaining keys is the next slice.
+//! - **Slice 4** — replace the AST-fallback arm in
+//!   `build_semantic_program_via_active_frontend` with a loud
+//!   `panic!` requesting `scripts/extract-llbc.sh`.  Deferred
+//!   until Slice 3 closes (and parse.rs no longer reaches AST
+//!   graph builders).
+//! - **Slice 5** — delete the AST graph builder bulk
+//!   (~15k LOC: `build_function_graph_*`, `GraphBuildContext`,
+//!   `lower_*` walkers, the four CFG-blindness shims listed
+//!   below).  Gated on Slice 3 reaching 100% coverage.
+//!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
 //! Four AST-side CFG-reconstruction shims remain reachable through
