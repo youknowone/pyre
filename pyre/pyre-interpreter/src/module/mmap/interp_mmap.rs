@@ -71,6 +71,22 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::Py
 
 #[cfg(unix)]
 fn init_mmap_type(ns: &mut DictStorage) {
+    // `interp_mmap.py:341 __new__ = interp2app(mmap)` — the class call
+    // `mmap.mmap(fileno, length, ...)` lands here.  args[0] is the
+    // type, the rest are the constructor positionals.
+    crate::dict_storage_store(
+        ns,
+        "__new__",
+        crate::make_builtin_function("__new__", |args| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "mmap() requires fileno + length",
+                ));
+            }
+            mmap_construct(&args[1..])
+        }),
+    );
+
     // close() — munmap and zero the pointer.
     crate::dict_storage_store(
         ns,
@@ -812,6 +828,78 @@ const MMAP_ACCESS_WRITE: i64 = 2;
 #[cfg(unix)]
 const MMAP_ACCESS_COPY: i64 = 3;
 
+// `interp_mmap.py:55-130 mmap_new` — `args` carries the positional
+// constructor arguments (fileno, length, flags, prot, access, offset)
+// starting at index 0; the `__new__` typecall wrapper drops the class
+// from args[0] before invoking this helper.
+#[cfg(unix)]
+fn mmap_construct(args: &[pyre_object::PyObjectRef]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "mmap() requires fileno + length",
+        ));
+    }
+    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+    let length = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::size_t;
+    let flags_arg = if args.len() >= 3 {
+        (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+    } else {
+        libc::MAP_SHARED
+    };
+    let prot_arg = if args.len() >= 4 {
+        (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
+    } else {
+        libc::PROT_READ | libc::PROT_WRITE
+    };
+    let access = if args.len() >= 5 {
+        unsafe { pyre_object::w_int_get_value(args[4]) }
+    } else {
+        MMAP_ACCESS_DEFAULT
+    };
+    let offset = if args.len() >= 6 {
+        (unsafe { pyre_object::w_int_get_value(args[5]) }) as libc::off_t
+    } else {
+        0
+    };
+    let (flags, prot) = match access {
+        x if x == MMAP_ACCESS_READ => (libc::MAP_SHARED, libc::PROT_READ),
+        x if x == MMAP_ACCESS_WRITE => (libc::MAP_SHARED, libc::PROT_READ | libc::PROT_WRITE),
+        x if x == MMAP_ACCESS_COPY => (libc::MAP_PRIVATE, libc::PROT_READ | libc::PROT_WRITE),
+        _ => (flags_arg, prot_arg),
+    };
+    // fileno == -1 → anonymous mapping.
+    let real_fd = fd;
+    let final_flags = if real_fd == -1 {
+        flags | libc::MAP_ANON
+    } else {
+        flags
+    };
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            prot,
+            final_flags,
+            real_fd,
+            offset,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(crate::PyError::os_error_with_errno(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            "mmap",
+        ));
+    }
+    let obj = pyre_object::w_instance_new(mmap_type());
+    mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(ptr as usize as i64));
+    mmap_set_attr(obj, "_len", pyre_object::w_int_new(length as i64));
+    mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
+    mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
+    mmap_set_attr(obj, "_fd", pyre_object::w_int_new(real_fd as i64));
+    mmap_set_attr(obj, "_offset", pyre_object::w_int_new(offset as i64));
+    Ok(obj)
+}
+
 pub fn register_module(ns: &mut DictStorage) {
     #[cfg(unix)]
     {
@@ -946,82 +1034,5 @@ pub fn register_module(ns: &mut DictStorage) {
         // Register the type itself.
         crate::dict_storage_store(ns, "mmap", mmap_type());
 
-        // mmap.mmap(fileno, length, flags=MAP_SHARED, prot=PROT_READ|WRITE,
-        //          access=ACCESS_DEFAULT, offset=0) factory.  Resolves
-        // access→flags/prot per CPython if access != ACCESS_DEFAULT.
-        crate::dict_storage_store(
-            ns,
-            "_mmap_new",
-            crate::make_builtin_function("_mmap_new", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error(
-                        "mmap() requires fileno + length",
-                    ));
-                }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let length = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::size_t;
-                let flags_arg = if args.len() >= 3 {
-                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
-                } else {
-                    libc::MAP_SHARED
-                };
-                let prot_arg = if args.len() >= 4 {
-                    (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
-                } else {
-                    libc::PROT_READ | libc::PROT_WRITE
-                };
-                let access = if args.len() >= 5 {
-                    unsafe { pyre_object::w_int_get_value(args[4]) }
-                } else {
-                    MMAP_ACCESS_DEFAULT
-                };
-                let offset = if args.len() >= 6 {
-                    (unsafe { pyre_object::w_int_get_value(args[5]) }) as libc::off_t
-                } else {
-                    0
-                };
-                let (flags, prot) = match access {
-                    x if x == MMAP_ACCESS_READ => (libc::MAP_SHARED, libc::PROT_READ),
-                    x if x == MMAP_ACCESS_WRITE => {
-                        (libc::MAP_SHARED, libc::PROT_READ | libc::PROT_WRITE)
-                    }
-                    x if x == MMAP_ACCESS_COPY => {
-                        (libc::MAP_PRIVATE, libc::PROT_READ | libc::PROT_WRITE)
-                    }
-                    _ => (flags_arg, prot_arg),
-                };
-                // fileno == -1 → anonymous mapping.
-                let real_fd = if fd == -1 { -1 } else { fd };
-                let final_flags = if real_fd == -1 {
-                    flags | libc::MAP_ANON
-                } else {
-                    flags
-                };
-                let ptr = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        length,
-                        prot,
-                        final_flags,
-                        real_fd,
-                        offset,
-                    )
-                };
-                if ptr == libc::MAP_FAILED {
-                    return Err(crate::PyError::os_error_with_errno(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                        "mmap",
-                    ));
-                }
-                let obj = pyre_object::w_instance_new(mmap_type());
-                mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(ptr as usize as i64));
-                mmap_set_attr(obj, "_len", pyre_object::w_int_new(length as i64));
-                mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
-                mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
-                mmap_set_attr(obj, "_fd", pyre_object::w_int_new(real_fd as i64));
-                mmap_set_attr(obj, "_offset", pyre_object::w_int_new(offset as i64));
-                Ok(obj)
-            }),
-        );
     }
 }
