@@ -196,7 +196,7 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     }
 }
 
-fn call_user_function_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
+fn jit_call_user_function_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
     let Some(caller) = JIT_FUNCTION_CALLER.get().copied() else {
         let callable = callable as PyObjectRef;
         let code_ptr = unsafe { function_get_code(callable) };
@@ -238,7 +238,7 @@ macro_rules! define_known_function_call_helper {
     ($name:ident $(, $arg:ident)*) => {
         #[majit_macros::jit_may_force]
         pub extern "C" fn $name(frame_ptr: i64, callable: i64 $(, $arg: i64)*) -> i64 {
-            call_user_function_with_args(frame_ptr, callable, &[$($arg),*])
+            jit_call_user_function_with_args(frame_ptr, callable, &[$($arg),*])
         }
     };
 }

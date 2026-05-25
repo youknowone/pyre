@@ -412,8 +412,20 @@ fn collect_single_file(path: &str, sources: &mut Vec<String>, paths: &mut Vec<St
 }
 
 /// Collect all `.rs` files from a directory tree.
+///
+/// Sorts entries by path so the collected source order is stable
+/// across platforms.  Without this, `WalkDir` yields entries in the
+/// filesystem's native `readdir` order — APFS (macOS) and ext4
+/// (Linux) and NTFS (Windows) return different sequences, which
+/// causes the analyzer to encounter type/method definitions in a
+/// different order and exposes platform-divergent classdef-less
+/// SomeInstance failures (PR 91 CI: Ubuntu/Windows fail with
+/// `SomeBuiltin.call(): no analyser registered for std.ptr.null_mut`
+/// and `SomeInstance.getattr on classdef-less instance` while macOS
+/// passes).  Stable lexicographic order makes the build reproducible
+/// and lets one fix cover every platform.
 fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
-    for entry in WalkDir::new(dir) {
+    for entry in WalkDir::new(dir).sort_by_file_name() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
             continue;
