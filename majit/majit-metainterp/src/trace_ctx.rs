@@ -1374,18 +1374,35 @@ impl TraceCtx {
     }
 
     /// Whether the recorder contains any `Call*` family op at or after
-    /// position `start`. Used by `handle_possible_exception` to decide
-    /// if the current bytecode actually performed a residual call that
-    /// could have set the exception flag; absent any such call no
-    /// `GUARD_NO_EXCEPTION` need be recorded (PyPy parity: `do_residual_call`
-    /// pyjitpl.py:2082 is the only emit site).
+    /// position `start` that is not already followed by a
+    /// `GuardNoException`. Used by `handle_possible_exception` to decide
+    /// if the bytecode-end fallback should emit a guard; PyPy parity:
+    /// `do_residual_call` (pyjitpl.py:2082) emits the guard inline per
+    /// call site, and pyre's per-caller emission (EC-Z Path B, task #311)
+    /// migrates one site at a time. The dedup keeps the bytecode-end
+    /// fallback emitting exactly one guard until every caller migrates;
+    /// once the last site migrates this fallback retires entirely.
     pub fn any_call_recorded_since(&self, start: u32) -> bool {
         let start = start as usize;
         let ops = self.recorder.ops();
         if start >= ops.len() {
             return false;
         }
-        ops[start..].iter().any(|op| op.opcode.is_call())
+        let mut last_call: Option<usize> = None;
+        let mut last_guard: Option<usize> = None;
+        for (i, op) in ops[start..].iter().enumerate() {
+            if op.opcode.is_call() {
+                last_call = Some(i);
+            }
+            if op.opcode == OpCode::GuardNoException {
+                last_guard = Some(i);
+            }
+        }
+        match (last_call, last_guard) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(c), Some(g)) => c > g,
+        }
     }
 
     /// The structured green key values, if provided.
@@ -5078,6 +5095,50 @@ mod tests {
         );
         ctx.record_op_with_descr(OpCode::CallI, &[a], descr);
         // A CALL_* op was recorded after the snapshot — gate fires.
+        assert!(ctx.any_call_recorded_since(start));
+    }
+
+    #[test]
+    fn any_call_recorded_since_call_followed_by_guard_is_false() {
+        let mut recorder = Trace::new();
+        let a = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let start = ctx.num_ops() as u32;
+        let descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int],
+            Type::Int,
+            majit_ir::EffectInfo::default(),
+        );
+        ctx.record_op_with_descr(OpCode::CallI, &[a], descr);
+        // Per-caller GuardNoException emit immediately after the call.
+        ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        // Gate now sees the call as already guarded — no bytecode-end emit.
+        assert!(!ctx.any_call_recorded_since(start));
+    }
+
+    #[test]
+    fn any_call_recorded_since_unguarded_call_after_guarded_call_is_true() {
+        let mut recorder = Trace::new();
+        let a = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let start = ctx.num_ops() as u32;
+        let descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int],
+            Type::Int,
+            majit_ir::EffectInfo::default(),
+        );
+        ctx.record_op_with_descr(OpCode::CallI, &[a], descr.clone());
+        ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        ctx.record_op_with_descr(OpCode::CallI, &[a], descr);
+        // The second call is unguarded — gate must still fire.
         assert!(ctx.any_call_recorded_since(start));
     }
 

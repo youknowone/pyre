@@ -352,17 +352,27 @@ pub trait TraceHelperAccess {
     fn trace_frame(&self) -> OpRef;
     fn trace_globals_ptr(&mut self) -> OpRef;
     fn trace_record_not_forced_guard(&mut self);
+    /// EC-Z Path B (task #311) per-caller emit hook for `GuardNoException`.
+    /// PyPy parity: `do_residual_call` (pyjitpl.py:2082) emits this guard
+    /// inline immediately after every can-raise CALL_*. Pyre's
+    /// `handle_possible_exception` bytecode-end fallback dedups against
+    /// these emissions via the guard-aware `any_call_recorded_since`,
+    /// and retires once every can-raise call site has migrated.
+    fn trace_record_no_exception_guard(&mut self);
 
     fn trace_make_function(&mut self, code_obj: OpRef) -> Result<OpRef, PyError> {
         let globals = self.trace_globals_ptr();
-        self.with_trace_ctx(|ctx| {
-            Ok(emit_trace_call_ref_typed(
+        let result = self.with_trace_ctx(|ctx| {
+            emit_trace_call_ref_typed(
                 ctx,
                 jit_make_function_from_globals as *const (),
                 &[globals, code_obj],
                 &[Type::Ref, Type::Ref],
-            ))
-        })
+            )
+        });
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_call_callable(&mut self, callable: OpRef, args: &[OpRef]) -> Result<OpRef, PyError> {
@@ -370,11 +380,16 @@ pub trait TraceHelperAccess {
         let result =
             self.with_trace_ctx(|ctx| emit_trace_call_callable(ctx, frame, callable, args))?;
         self.trace_record_not_forced_guard();
+        // EC-Z Path B (task #311): `emit_trace_call_callable` routes through
+        // `call_may_force_ref_typed` (CanRaise + may-force) — PyPy
+        // `execute_varargs` (pyjitpl.py:1990-2000) emits GUARD_NOT_FORCED
+        // followed by GUARD_NO_EXCEPTION for the exc=True/may_force case.
+        self.trace_record_no_exception_guard();
         Ok(result)
     }
 
     fn trace_build_list(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
+        let result = self.with_trace_ctx(|ctx| {
             // STRUCTURAL ADAPTATION: PyPy lowers `newlist(*items)` as
             // trace-visible allocation + item stores, so virtual boxed items
             // remain live through the list construction naturally.  Pyre still
@@ -387,11 +402,15 @@ pub trait TraceHelperAccess {
                 ctx.record_op(OpCode::Keepalive, &[item]);
             }
             emit_trace_build_flat(ctx, FlatBuildKind::List, items)
-        })
+        })?;
+        // EC-Z Path B (task #311): `emit_trace_build_flat` records via
+        // `default_effect_info()` (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_build_tuple(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
+        let result = self.with_trace_ctx(|ctx| {
             // Same helper-call adaptation as trace_build_list: tuple
             // construction still goes through an opaque helper, so virtual
             // items that are only consumed by that helper must stay live until
@@ -400,11 +419,18 @@ pub trait TraceHelperAccess {
                 ctx.record_op(OpCode::Keepalive, &[item]);
             }
             emit_trace_build_flat(ctx, FlatBuildKind::Tuple, items)
-        })
+        })?;
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_build_map(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| emit_trace_build_flat(ctx, FlatBuildKind::Map, items))
+        let result =
+            self.with_trace_ctx(|ctx| emit_trace_build_flat(ctx, FlatBuildKind::Map, items))?;
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_store_subscr(&mut self, obj: OpRef, key: OpRef, value: OpRef) -> Result<(), PyError> {
@@ -415,20 +441,31 @@ pub trait TraceHelperAccess {
                 &[obj, key, value],
                 &[Type::Ref, Type::Ref, Type::Ref],
             );
-            Ok(())
-        })
+        });
+        // EC-Z Path B (task #311) per-caller emit: `jit_setitem` is recorded
+        // via `default_effect_info()` (MOST_GENERAL, CanRaise), matching
+        // `do_residual_call` (pyjitpl.py:2082). The bytecode-end fallback
+        // in `handle_possible_exception` dedups via the guard-aware
+        // `any_call_recorded_since`.
+        self.trace_record_no_exception_guard();
+        Ok(())
     }
 
     fn trace_load_attr(&mut self, obj: OpRef, name: &str) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
+        let result = self.with_trace_ctx(|ctx| {
             let [name_ptr, name_len] = trace_name_args(ctx, name);
-            Ok(emit_trace_call_ref_typed(
+            emit_trace_call_ref_typed(
                 ctx,
                 jit_getattr as *const (),
                 &[obj, name_ptr, name_len],
                 &[Type::Ref, Type::Int, Type::Int],
-            ))
-        })
+            )
+        });
+        // EC-Z Path B (task #311): `jit_getattr` records via
+        // `default_effect_info()` (CanRaise) — per-caller emit matches
+        // `do_residual_call` (pyjitpl.py:2082).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_store_attr(&mut self, obj: OpRef, name: &str, value: OpRef) -> Result<(), PyError> {
@@ -440,8 +477,11 @@ pub trait TraceHelperAccess {
                 &[obj, name_ptr, name_len, value],
                 &[Type::Ref, Type::Int, Type::Int, Type::Ref],
             );
-            Ok(())
-        })
+        });
+        // EC-Z Path B (task #311): `jit_setattr` records via
+        // `default_effect_info()` (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(())
     }
 
     fn trace_list_append(&mut self, list: OpRef, value: OpRef) -> Result<(), PyError> {
@@ -452,20 +492,38 @@ pub trait TraceHelperAccess {
                 &[list, value],
                 &[Type::Ref, Type::Ref],
             );
-            Ok(())
-        })
+        });
+        // EC-Z Path B (task #311): `jit_list_append` records via
+        // `call_void_typed` (default_effect_info, CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(())
     }
 
     fn trace_unpack_sequence(&mut self, seq: OpRef, count: usize) -> Result<Vec<OpRef>, PyError> {
-        self.with_trace_ctx(|ctx| emit_trace_unpack_sequence(ctx, seq, count))
+        let items = self.with_trace_ctx(|ctx| emit_trace_unpack_sequence(ctx, seq, count))?;
+        // EC-Z Path B (task #311): `jit_sequence_getitem` is recorded via
+        // `default_effect_info()` (CanRaise). A single guard after the loop
+        // satisfies the dedup gate; the per-call PyPy parity (one guard per
+        // call) is a strict-parity follow-up that requires plumbing the
+        // MIFrame guard hook into `emit_trace_unpack_sequence`.
+        if count > 0 {
+            self.trace_record_no_exception_guard();
+        }
+        Ok(items)
     }
 
     fn trace_iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_range_iter_next_or_null(ctx, iter)))
+        let result = self.with_trace_ctx(|ctx| emit_trace_range_iter_next_or_null(ctx, iter));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_truth_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_truth_value(ctx, value)))
+        let result = self.with_trace_ctx(|ctx| emit_trace_truth_value(ctx, value));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_bool_value_from_truth(
@@ -473,7 +531,11 @@ pub trait TraceHelperAccess {
         truth: OpRef,
         negate: bool,
     ) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_bool_value_from_truth(ctx, truth, negate)))
+        let result =
+            self.with_trace_ctx(|ctx| emit_trace_bool_value_from_truth(ctx, truth, negate));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_binary_value(
@@ -482,7 +544,12 @@ pub trait TraceHelperAccess {
         b: OpRef,
         op: pyre_interpreter::bytecode::BinaryOperator,
     ) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| emit_trace_binary_value(ctx, a, b, op))
+        let result = self.with_trace_ctx(|ctx| emit_trace_binary_value(ctx, a, b, op))?;
+        // EC-Z Path B (task #311): default_effect_info (CanRaise). The `?`
+        // above short-circuits on unsupported binary ops before any call is
+        // recorded, so the guard only fires when a call was emitted.
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_compare_value(
@@ -491,15 +558,24 @@ pub trait TraceHelperAccess {
         b: OpRef,
         op: pyre_interpreter::bytecode::ComparisonOperator,
     ) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_compare_value(ctx, a, b, op)))
+        let result = self.with_trace_ctx(|ctx| emit_trace_compare_value(ctx, a, b, op));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_unary_negative_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_unary_negative_value(ctx, value)))
+        let result = self.with_trace_ctx(|ctx| emit_trace_unary_negative_value(ctx, value));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_unary_invert_value(&mut self, value: OpRef) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(emit_trace_unary_invert_value(ctx, value)))
+        let result = self.with_trace_ctx(|ctx| emit_trace_unary_invert_value(ctx, value));
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     fn trace_int_constant(&mut self, value: i64) -> Result<OpRef, PyError> {

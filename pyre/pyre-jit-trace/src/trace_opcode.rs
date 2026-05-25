@@ -5126,7 +5126,7 @@ impl MIFrame {
         if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
             return self.trace_call_callable(callable, &[]);
         }
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
             crate::helpers::emit_trace_call_void_typed(
                 ctx,
@@ -5134,8 +5134,12 @@ impl MIFrame {
                 &[list],
                 &[Type::Ref],
             );
-            Ok(ctx.const_ref(pyre_object::w_none() as i64))
-        })
+            ctx.const_ref(pyre_object::w_none() as i64)
+        });
+        // EC-Z Path B (task #311): `jit_list_reverse` records via
+        // `call_void_typed` (default_effect_info, CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     pub(crate) fn concrete_iter_continues(
@@ -5150,10 +5154,14 @@ impl MIFrame {
         callable: OpRef,
         args: &[OpRef],
     ) -> Result<OpRef, PyError> {
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             let boxed_args = box_args_for_python_helper(this, ctx, args);
             crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
-        })
+        })?;
+        // EC-Z Path B (task #311): `emit_trace_call_known_builtin` records via
+        // `call_ref_typed_with_effect(default_effect_info)` (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 
     pub(crate) fn direct_len_value(
@@ -5483,11 +5491,14 @@ impl MIFrame {
                     return self
                         .direct_minmax_value(callable, args[0], args[1], true, c_arg0, c_arg1);
                 }
-                return self.with_ctx(|this, ctx| {
+                let result = self.with_ctx(|this, ctx| {
                     this.implement_guard_value(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
                     crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
-                });
+                })?;
+                // EC-Z Path B (task #311): default_effect_info (CanRaise).
+                self.trace_record_no_exception_guard();
+                return Ok(result);
             }
             if is_function(concrete_callable) {
                 let w_callee_code = pyre_interpreter::getcode(concrete_callable);
@@ -5731,6 +5742,8 @@ impl MIFrame {
                             // pyjitpl.py:2079
                             this.push_call_replay_stack(ctx, callable, args, call_pc);
                             this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                            // EC-Z Path B (task #311): CALL_ASSEMBLER CanRaise.
+                            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                             ctx.heap_cache_mut().invalidate_caches_for_escaped();
                             this.pop_call_replay_stack(ctx, args.len())?;
                             let result = if inline_framestack_active {
@@ -5805,6 +5818,9 @@ impl MIFrame {
                                 )?;
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                // EC-Z Path B (task #311): may-force CanRaise →
+                                // GuardNoException after GuardNotForced.
+                                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 Ok(result)
@@ -5866,6 +5882,11 @@ impl MIFrame {
                                 // pyjitpl.py:2079
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                // EC-Z Path B (task #311): CALL_ASSEMBLER +
+                                // surrounding helpers (callee_frame build,
+                                // drop_callee_frame) are CanRaise — emit
+                                // GuardNoException after GuardNotForced.
+                                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 let result = if inline_framestack_active {
@@ -5897,6 +5918,8 @@ impl MIFrame {
                     )?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    // EC-Z Path B (task #311): may-force CanRaise.
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     Ok(result)
@@ -6079,6 +6102,10 @@ impl MIFrame {
                     panic!("no frame helper for {} args", frame_args.len());
                 }
             });
+            // EC-Z Path B (task #311): callee-frame build helper records via
+            // `default_effect_info()` (CanRaise) — PyPy's `recursive_call_*`
+            // emits GUARD_NO_EXCEPTION immediately (pyjitpl.py:2106).
+            self.trace_record_no_exception_guard();
 
             let mut sym = PyreSym::new_uninit(callee_frame_opref);
             sym.nlocals = callee_nlocals;
@@ -6330,6 +6357,9 @@ impl MIFrame {
                     // residual-call path (CA and CALL_MAY_FORCE alike).
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    // EC-Z Path B (task #311): pyjitpl.py:2082 GUARD_NO_EXCEPTION
+                    // after may-force residual call (default_effect_info CanRaise).
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     // CA-path-only: unbox boxed result via guard_class + getfield_gc_i.
@@ -6354,6 +6384,9 @@ impl MIFrame {
                     this.vable_after_residual_call()?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    // EC-Z Path B (task #311): pyjitpl.py:2082 GUARD_NO_EXCEPTION
+                    // after may-force residual call (default_effect_info CanRaise).
+                    this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                     ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     result
@@ -6379,6 +6412,9 @@ impl MIFrame {
                 this.vable_after_residual_call()?;
                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                 this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                // EC-Z Path B (task #311): pyjitpl.py:2082 GUARD_NO_EXCEPTION
+                // after may-force residual call (default_effect_info CanRaise).
+                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
                 ctx.heap_cache_mut().invalidate_caches_for_escaped();
                 this.pop_call_replay_stack(ctx, args.len())?;
                 ctx.call_void(
@@ -7733,6 +7769,12 @@ impl TraceHelperAccess for MIFrame {
         });
     }
 
+    fn trace_record_no_exception_guard(&mut self) {
+        self.with_ctx(|this, ctx| {
+            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+        });
+    }
+
     fn trace_call_callable(&mut self, callable: OpRef, args: &[OpRef]) -> Result<OpRef, PyError> {
         let frame = self.trace_frame();
         let result = self.with_ctx(|this, ctx| {
@@ -7740,6 +7782,9 @@ impl TraceHelperAccess for MIFrame {
             crate::helpers::emit_trace_call_callable(ctx, frame, callable, &boxed_args)
         })?;
         self.trace_record_not_forced_guard();
+        // EC-Z Path B (task #311): may-force CanRaise — emit GuardNoException
+        // after GuardNotForced, matching PyPy `execute_varargs` ordering.
+        self.trace_record_no_exception_guard();
         Ok(result)
     }
 
@@ -7749,11 +7794,14 @@ impl TraceHelperAccess for MIFrame {
         b: OpRef,
         op: pyre_interpreter::bytecode::BinaryOperator,
     ) -> Result<OpRef, PyError> {
-        self.with_ctx(|this, ctx| {
+        let result = self.with_ctx(|this, ctx| {
             let lhs = box_value_for_python_helper(this, ctx, a);
             let rhs = box_value_for_python_helper(this, ctx, b);
             crate::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
-        })
+        })?;
+        // EC-Z Path B (task #311): default_effect_info (CanRaise).
+        self.trace_record_no_exception_guard();
+        Ok(result)
     }
 }
 
