@@ -9463,20 +9463,21 @@ impl CodeWriter {
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
         //
-        // Task #228 ADAPTATION: thread walker pin pairs into canonical
-        // Ref regalloc via `perform_register_allocation_all_kinds_with_pairs`.
-        // Each pair `(scratch_var, inputarg_var)` requests that the
+        // PRE-EXISTING-ADAPTATION: thread walker pin pairs into
+        // canonical Ref regalloc via
+        // `perform_register_allocation_all_kinds_with_pairs`.  Each
+        // pair `(scratch_var, inputarg_var)` requests that the
         // chordal coloring assign them the same color so
         // `enforce_input_args`'s rotation lands the scratch on its
         // semantic local-i slot — matching walker's
         // `walker_slot_for_variable` pinning regime exactly.
         //
-        // P4.B.2: also thread CFG `link.args ↔ target.inputargs`
-        // Variable pairs from `collect_cfg_coalesce_pairs` (PyPy
-        // `regalloc.py:79-96 coalesce_variables`).  The CFG sweep
-        // already feeds the SSARepr-side regalloc below; routing
-        // the same Variable-keyed pairs here puts the canonical
-        // Ref regalloc on the same pre-coalesce surface PyPy uses.
+        // Also thread CFG `link.args ↔ target.inputargs` Variable
+        // pairs from `collect_cfg_coalesce_pairs` (`regalloc.py:79-96
+        // coalesce_variables`).  The CFG sweep already feeds the
+        // SSARepr-side regalloc below; routing the same Variable-keyed
+        // pairs here puts the canonical Ref regalloc on the same
+        // pre-coalesce surface PyPy uses.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
@@ -10299,18 +10300,16 @@ impl CodeWriter {
                     }
                 }
             }
-            // Task #229 splice-5 force-splice action.  Replaces walker
-            // SSA bytes with canonical SSA bytes for named graphs;
-            // downstream `allocate_registers` (line ~10246) will then
-            // re-color the spliced insns against walker's regalloc
-            // state.  If the canonical Insns reference Variable colors
-            // that don't exist in walker's regalloc, this will surface
-            // as a regalloc panic or assemble-time
-            // `ref reg-or-pool out of bounds` PANIC.  Either failure
-            // is informative — it pinpoints which divergence class
-            // (color budget, Variable identity, opname shape) blocks
-            // the named graph.  Production behavior unchanged when
-            // env var is unset.
+            // Replace walker SSA bytes with canonical SSA bytes for
+            // named graphs; the downstream `allocate_registers` call
+            // re-colors the spliced insns against walker's regalloc
+            // state.  If canonical Insns reference Variable colors
+            // outside walker's regalloc model this surfaces as a
+            // regalloc panic or an assemble-time
+            // `ref reg-or-pool out of bounds` PANIC — both pinpoint
+            // which divergence class (color budget, Variable identity,
+            // opname shape) blocks the named graph.  Production
+            // behavior unchanged when the env var is unset.
             if phase4_splice_enable
                 && phase4_splice_enable_names
                     .iter()
