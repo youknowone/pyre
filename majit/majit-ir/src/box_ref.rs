@@ -1287,11 +1287,7 @@ mod tests {
     fn bind_inputarg_on_resop_panics() {
         use crate::value::InputArg;
         let b = BoxRef::new_resop(Type::Int, 0);
-        let ia = std::rc::Rc::new(InputArg {
-            tp: Type::Int,
-            index: 0,
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-        });
+        let ia = InputArg::new_int_rc(0);
         b.bind_inputarg(&ia);
     }
 
@@ -1303,11 +1299,7 @@ mod tests {
         let b = BoxRef::new_inputarg(Type::Int, 3);
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(7)));
 
-        let ia = std::rc::Rc::new(InputArg {
-            tp: Type::Int,
-            index: 3,
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-        });
+        let ia = InputArg::new_int_rc(3);
         b.bind_inputarg(&ia);
 
         // The pre-bind Info forwarding survives on the InputArg slot.
@@ -1334,11 +1326,7 @@ mod tests {
     fn bind_inputarg_makes_set_forwarded_dual_write_to_inputarg() {
         use crate::value::InputArg;
         let b = BoxRef::new_inputarg(Type::Int, 0);
-        let ia = std::rc::Rc::new(InputArg {
-            tp: Type::Int,
-            index: 0,
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-        });
+        let ia = InputArg::new_int_rc(0);
         b.bind_inputarg(&ia);
 
         // Initial state.
@@ -1372,11 +1360,7 @@ mod tests {
         use crate::value::InputArg;
         let b = BoxRef::new_inputarg(Type::Int, 0);
         {
-            let ia = std::rc::Rc::new(InputArg {
-                tp: Type::Int,
-                index: 0,
-                forwarded: std::cell::RefCell::new(Forwarded::None),
-            });
+            let ia = InputArg::new_int_rc(0);
             b.bind_inputarg(&ia);
             // ia drops here.
         }
@@ -1440,21 +1424,13 @@ mod tests {
     fn rebind_inputarg_carries_forwarded_state_to_new_ia() {
         use crate::value::InputArg;
         let b = BoxRef::new_inputarg(Type::Int, 0);
-        let ia_a = std::rc::Rc::new(InputArg {
-            tp: Type::Int,
-            index: 0,
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-        });
+        let ia_a = InputArg::new_int_rc(0);
         b.bind_inputarg(&ia_a);
         b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(11)));
 
         *ia_a.forwarded.borrow_mut() = Forwarded::Info(OpInfo::Unknown);
 
-        let ia_b = std::rc::Rc::new(InputArg {
-            tp: Type::Int,
-            index: 0,
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-        });
+        let ia_b = InputArg::new_int_rc(0);
         b.bind_inputarg(&ia_b);
 
         match &*ia_b.forwarded.borrow() {
@@ -1470,11 +1446,7 @@ mod tests {
         let b = BoxRef::new_inputarg(Type::Int, 0);
         let snapshot = b.clone();
         {
-            let ia = std::rc::Rc::new(InputArg {
-                tp: Type::Int,
-                index: 0,
-                forwarded: std::cell::RefCell::new(Forwarded::None),
-            });
+            let ia = InputArg::new_int_rc(0);
             b.bind_inputarg(&ia);
             b.set_forwarded_info(OpInfo::Unknown);
             // ia drops here.

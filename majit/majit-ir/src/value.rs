@@ -338,6 +338,28 @@ impl InputArg {
         }
     }
 
+    /// `Rc`-wrapped variants of the typed factories, matching PyPy's
+    /// `InputArgInt(index)` / `InputArgFloat(index)` / `InputArgRef(index)`
+    /// at `resoperation.py:719/727/739`. Every call yields a fresh
+    /// identity (no interning), so two `new_*_rc` results compare equal
+    /// only when both `tp` and `index` match — identity is shared only
+    /// when callers `Rc::clone` the same handle.
+    pub fn new_int_rc(index: u32) -> InputArgRc {
+        std::rc::Rc::new(Self::new_int(index))
+    }
+
+    pub fn new_ref_rc(index: u32) -> InputArgRc {
+        std::rc::Rc::new(Self::new_ref(index))
+    }
+
+    pub fn new_float_rc(index: u32) -> InputArgRc {
+        std::rc::Rc::new(Self::new_float(index))
+    }
+
+    pub fn from_type_rc(tp: Type, index: u32) -> InputArgRc {
+        std::rc::Rc::new(Self::from_type(tp, index))
+    }
+
     /// Returns the OpRef referencing this input arg's slot.
     ///
     /// RPython's `InputArg*` Box object IS its own reference — there is
