@@ -4052,13 +4052,11 @@ impl OptContext {
 
     /// True only when opref has a non-const forwarding redirect.
     ///
-    /// `make_equal_to(_, non_const)` writes `Forwarded::Box(target)` where
-    /// `target` is a non-Const box. Both `make_equal_to(_, const_target)`
-    /// and `make_constant` write `Forwarded::Box(const_box)` per
-    /// `optimizer.py:432 box.set_forwarded(constbox)`. Splitting on
-    /// `target.is_constant()` excludes the const-target shape so this
-    /// returns true only for the inputarg-redirect case used by
-    /// `import_state`.
+    /// `make_equal_to(_, non_const)` writes either `Forwarded::Op(_)` or
+    /// `Forwarded::InputArg(_)`; the const branches go through
+    /// `Forwarded::Const`. Splitting on the variant excludes the
+    /// const-target shape so this returns true only for the AbstractValue
+    /// redirect case used by `import_state`.
     ///
     /// `Const.get_forwarded()` returns `None` upstream
     /// (`resoperation.py:1162`); short-circuit on the const-namespace
@@ -4070,7 +4068,9 @@ impl OptContext {
         }
         matches!(
             &op.get_forwarded(),
-            crate::r#box::Forwarded::Box(target) if !target.is_constant()
+            crate::r#box::Forwarded::Op(_)
+                | crate::r#box::Forwarded::InputArg(_)
+                | crate::r#box::Forwarded::Box(_)
         )
     }
 
