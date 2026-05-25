@@ -6419,14 +6419,29 @@ mod tests {
     /// `MetaInterpStaticData.jitcodes` list is now populated only by
     /// `CodeWriter.make_jitcodes()` (warmspot.py:281-282); tests that
     /// exercise tracer logic directly must still arrive at that
-    /// post-`make_jitcodes` state, so we install a minimal populated
-    /// stub here.
+    /// post-`make_jitcodes` state, so we install a minimal assembled
+    /// jitcode with a `live/` anchor at offset 0 — every can-raise
+    /// CALL_* in the tracer now emits an inline `GuardNoException`
+    /// (pyjitpl.py:2082) whose resumedata snapshot routes through
+    /// `get_list_of_active_boxes` → `JitCode::get_live_vars_info`
+    /// (jitcode.py:80-93), so the test fixture must satisfy that
+    /// liveness lookup.
     fn install_test_jitcode(code: &CodeObject, code_ref: *const ()) {
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef)
                 as *const CodeObject
         };
+        let mut builder = majit_metainterp::JitCodeBuilder::default();
+        let live_patch = builder.live_placeholder();
+        builder.patch_live_offset(live_patch, 0);
+        let mut insns = majit_ir::VecAssoc::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
         let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
+        pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
             r.borrow_mut()
@@ -7650,7 +7665,7 @@ mod tests {
     fn test_load_method_accepts_plain_python_instance_method() {
         let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
             .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
+        let mut frame = pyre_interpreter::PyFrame::new(code.clone());
         frame
             .execute_frame(None, None)
             .expect("class body should execute");
@@ -7661,8 +7676,13 @@ mod tests {
                 .expect("namespace should contain c")
         };
 
+        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
+        // `load_method`'s residual call requires a populated jitcode so the
+        // guard's resumedata snapshot can be captured (pyjitpl.py:2082).
+        install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(frame.pycode);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -8117,10 +8137,19 @@ mod tests {
 
     #[test]
     fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
+        let code = compile_exec("x = 1.0 ** 2").expect("test code should compile");
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
+        // `trace_binary_value` requires a populated jitcode so the guard's
+        // resumedata snapshot can be captured (pyjitpl.py:2082).
+        install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let lhs = OpRef::input_arg_float(0);
         let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(code_ref);
         sym.registers_r = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
         sym.nlocals = 2;
@@ -8148,21 +8177,39 @@ mod tests {
         .expect("generic helper call should box raw operands first");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
-        assert!(matches!(
-            call.opcode,
-            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
-        ));
+        // EC-Z Path B (task #311/#322): per-caller `GuardNoException`
+        // (pyjitpl.py:2082) follows the residual Call*, so look up the
+        // Call* op explicitly rather than relying on `ops().last()`.
+        let call = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+                )
+            })
+            .expect("call op should be present");
         assert_ne!(call.arg(0), lhs);
         assert_ne!(call.arg(1), rhs);
     }
 
     #[test]
     fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
+        let code = compile_exec("x = abs(1)").expect("test code should compile");
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        // EC-Z Path B (task #311/#322): per-caller GuardNoException after
+        // `trace_known_builtin_call` requires a populated jitcode so the
+        // guard's resumedata snapshot can be captured (pyjitpl.py:2082).
+        install_test_jitcode(&code, code_ref);
         let mut ctx = TraceCtx::for_test(2);
         let callable = OpRef::input_arg_ref(0);
         let arg = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(code_ref);
         sym.registers_r = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
@@ -8186,11 +8233,20 @@ mod tests {
             .expect("known builtin helper boundary should box raw int args");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
-        assert!(matches!(
-            call.opcode,
-            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
-        ));
+        // EC-Z Path B (task #311/#322): per-caller `GuardNoException`
+        // (pyjitpl.py:2082) follows the residual Call*, so look up the
+        // Call* op explicitly rather than relying on `ops().last()`.
+        let call = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+                )
+            })
+            .expect("call op should be present");
         assert_ne!(call.getarglist().last().copied(), Some(arg));
     }
 
