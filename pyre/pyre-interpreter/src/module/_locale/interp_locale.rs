@@ -4,6 +4,20 @@
 
 use crate::DictStorage;
 
+/// Raise `_locale.Error` with the supplied message.  Mirrors
+/// `interp_locale.py:15-20 make_error`.
+fn locale_error(message: &str) -> crate::PyError {
+    let cls = crate::builtins::lookup_exc_class("_locale.Error")
+        .or_else(|| crate::builtins::lookup_exc_class("Exception"))
+        .expect("Exception must be installed");
+    let args = vec![cls, pyre_object::w_str_new(message)];
+    let exc = crate::builtins::exc_exception_new(&args)
+        .expect("exc_exception_new is infallible for str args");
+    let mut err = crate::PyError::value_error(message);
+    err.exc_object = exc;
+    err
+}
+
 /// `_locale` C-extension stub — PyPy: pypy/module/_locale/.
 ///
 /// Provides the 'C' locale defaults so locale.py's `from _locale import *`
@@ -62,10 +76,15 @@ pub fn register_module(ns: &mut DictStorage) {
     {
         crate::dict_storage_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
     }
-    // Error alias — locale.py does `Error = ValueError` when _locale is
-    // missing; here we expose a real placeholder that is a str so that
-    // `except _locale.Error` still compiles (match falls through).
-    crate::dict_storage_store(ns, "Error", pyre_object::w_str_new("Error"));
+    // `interp_locale.py:11 W_Error = _new_exception('Error', W_Exception, 'locale error')`
+    let exception_base = crate::builtins::lookup_exc_class("Exception")
+        .expect("Exception must be installed before _locale init");
+    let w_error = crate::builtins::make_exc_type(
+        "_locale.Error",
+        crate::builtins::exc_exception_new,
+        exception_base,
+    );
+    crate::dict_storage_store(ns, "Error", w_error);
 
     // localeconv() — returns the 'C' locale parameters as a dict.
     crate::dict_storage_store(
@@ -184,7 +203,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 let out = rustpython_host_env::locale::setlocale(cat, c_locale.as_deref());
                 match out {
                     Some(bytes) => Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes))),
-                    None => Err(crate::PyError::os_error("setlocale failed")),
+                    None => Err(locale_error("unsupported locale setting")),
                 }
             }
             #[cfg(not(all(unix, feature = "host_env")))]
@@ -224,9 +243,15 @@ pub fn register_module(ns: &mut DictStorage) {
                             return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes)));
                         }
                     }
+                    // `interp_locale.py:151-154` — unknown items raise
+                    // ValueError("unsupported langinfo constant").  POSIX
+                    // nl_langinfo never returns NULL for valid items, so a
+                    // null return is treated as the unsupported case.
                     let p = unsafe { libc::nl_langinfo(item) };
                     if p.is_null() {
-                        return Ok(pyre_object::w_str_new(""));
+                        return Err(crate::PyError::value_error(
+                            "unsupported langinfo constant",
+                        ));
                     }
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
                     return Ok(pyre_object::w_str_new(&s.to_string_lossy()));
@@ -237,8 +262,12 @@ pub fn register_module(ns: &mut DictStorage) {
                     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
                 )))]
                 {
+                    // No langinfo available → every constant counts as
+                    // unsupported, matching `interp_locale.py:151-154`.
                     let _ = args;
-                    Ok(pyre_object::w_str_new(""))
+                    Err(crate::PyError::value_error(
+                        "unsupported langinfo constant",
+                    ))
                 }
             },
             1,

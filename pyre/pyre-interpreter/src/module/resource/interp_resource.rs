@@ -158,26 +158,35 @@ pub fn register_module(ns: &mut DictStorage) {
                         }
                         pyre_object::w_int_get_value(args[0]) as libc::rlim_t
                     };
-                    // limits is a 2-tuple (soft, hard).
-                    let (soft, hard) = unsafe {
-                        if !pyre_object::is_tuple(args[1]) || pyre_object::w_tuple_len(args[1]) != 2
+                    // `lib_pypy/resource.py:81-86` — `soft, hard = limits;
+                    // soft = int(soft); hard = int(hard)`.  Accept any
+                    // 2-item tuple or list and coerce each entry to int
+                    // (PyPy unpacks via Python iteration; pyre's surface
+                    // covers the two concrete sequence shapes callers
+                    // actually use).
+                    let (w_soft, w_hard) = unsafe {
+                        if pyre_object::is_tuple(args[1])
+                            && pyre_object::w_tuple_len(args[1]) == 2
                         {
+                            (
+                                pyre_object::w_tuple_getitem(args[1], 0).unwrap(),
+                                pyre_object::w_tuple_getitem(args[1], 1).unwrap(),
+                            )
+                        } else if pyre_object::is_list(args[1])
+                            && pyre_object::w_list_len(args[1]) == 2
+                        {
+                            (
+                                pyre_object::w_list_getitem(args[1], 0).unwrap(),
+                                pyre_object::w_list_getitem(args[1], 1).unwrap(),
+                            )
+                        } else {
                             return Err(crate::PyError::type_error(
-                                "setrlimit(): limits should be a tuple of (soft, hard)",
+                                "expected a tuple of 2 integers",
                             ));
                         }
-                        let s = pyre_object::w_tuple_getitem(args[1], 0).unwrap();
-                        let h = pyre_object::w_tuple_getitem(args[1], 1).unwrap();
-                        if !pyre_object::is_int(s) || !pyre_object::is_int(h) {
-                            return Err(crate::PyError::type_error(
-                                "setrlimit(): limits members must be integers",
-                            ));
-                        }
-                        (
-                            pyre_object::w_int_get_value(s) as libc::rlim_t,
-                            pyre_object::w_int_get_value(h) as libc::rlim_t,
-                        )
                     };
+                    let soft = crate::baseobjspace::int_w(w_soft)? as libc::rlim_t;
+                    let hard = crate::baseobjspace::int_w(w_hard)? as libc::rlim_t;
                     let rl = libc::rlimit {
                         rlim_cur: soft,
                         rlim_max: hard,

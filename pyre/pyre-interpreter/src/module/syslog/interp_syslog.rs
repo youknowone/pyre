@@ -4,6 +4,14 @@
 
 use crate::DictStorage;
 
+#[cfg(all(unix, feature = "host_env"))]
+thread_local! {
+    /// `lib_pypy/syslog.py:35-44` — track whether `openlog()` has been
+    /// called so the first `syslog()` can auto-open with the default
+    /// libc ident (NULL → program name).
+    static SYSLOG_OPENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// syslog module — PyPy: pypy/module/syslog/interp_syslog.py.
 ///
 /// openlog / syslog / closelog / setlogmask.  Backed by
@@ -42,6 +50,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
                     .unwrap_or(libc::LOG_USER);
                 rustpython_host_env::syslog::openlog(ident, logoption, facility);
+                SYSLOG_OPENED.with(|f| f.set(true));
                 Ok(pyre_object::w_none())
             }
             #[cfg(not(all(unix, feature = "host_env")))]
@@ -81,6 +90,14 @@ pub fn register_module(ns: &mut DictStorage) {
                 }
                 let msg = unsafe { pyre_object::w_str_get_value(msg_obj) };
                 if let Ok(cmsg) = std::ffi::CString::new(msg) {
+                    // `lib_pypy/syslog.py:42-44` — auto-call openlog() with
+                    // a NULL ident (libc falls back to argv[0]) so the
+                    // first syslog() call delivers correctly even when the
+                    // caller skipped openlog().
+                    if !SYSLOG_OPENED.with(|f| f.get()) {
+                        rustpython_host_env::syslog::openlog(None, 0, libc::LOG_USER);
+                        SYSLOG_OPENED.with(|f| f.set(true));
+                    }
                     rustpython_host_env::syslog::syslog(priority, &cmsg);
                 }
                 Ok(pyre_object::w_none())

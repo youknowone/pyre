@@ -659,7 +659,16 @@ pub fn register_module(ns: &mut DictStorage) {
         pyre_object::w_int_new(host_termios::VTIME as i64),
     );
 
-    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    // `interp_termios.py:18 class W_TermiosError(OperationError)` —
+    // wraps OSError so `except termios.error` catches tcsetattr failures.
+    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+        .expect("OSError must be installed before termios init");
+    let w_error = crate::builtins::make_exc_type(
+        "termios.error",
+        crate::builtins::exc_exception_new,
+        w_os_error,
+    );
+    crate::dict_storage_store(ns, "error", w_error);
 }
 
 #[cfg(not(all(unix, feature = "host_env")))]

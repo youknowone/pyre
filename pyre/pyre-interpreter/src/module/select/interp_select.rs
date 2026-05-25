@@ -157,7 +157,11 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
 
-    crate::dict_storage_store(ns, "error", pyre_object::w_str_new("OSError"));
+    // `interp_select.py:35 W_Error = OSError` — expose the real type so
+    // `except select.error` catches what selectors raise.
+    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+        .expect("OSError must be installed before select init");
+    crate::dict_storage_store(ns, "error", w_os_error);
     #[cfg(unix)]
     {
         crate::dict_storage_store(
