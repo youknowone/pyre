@@ -539,6 +539,41 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyframe_ncells_method as *const (),
     );
 
+    // B1 LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
+    // carry `#[elidable_cannot_raise]` so `has_cannot_raise_assertion`
+    // requires the fnaddr registration to fire (`call.rs:3626-3631`
+    // gates the assertion on `function_fnaddrs.contains_key(p)`).
+    // Without these the chained `Arg::get` / `VarNum::as_usize` /
+    // `Vec::len` third-party helpers reach the walker as unfolded
+    // `residual_call` ops and the walker's `goto_if_not` bounds-check
+    // aborts with `GotoIfNotValueNotConcrete`.
+    //
+    // `push_alias_pair` (vs plain `push_fnaddr`) is required because the
+    // in-module call site `load_fast_var_num_to_index(var_num, op_arg)`
+    // inside `pyopcode.rs` resolves to a bare-segment `CallPath`
+    // (`["load_fast_var_num_to_index"]`) that the assertion-aware hint
+    // walker DOES populate but the module-qualified-only fnaddr
+    // registration would miss.  Register the bare alias alongside the
+    // canonical `pyopcode::name` form so the assertion gate fires.
+    let load_fast_var_num_to_index: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::VarNum>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::load_fast_var_num_to_index;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::load_fast_var_num_to_index",
+        "pyre_interpreter::load_fast_var_num_to_index",
+        load_fast_var_num_to_index as *const (),
+    );
+
+    let code_varnames_len: fn(&crate::CodeObject) -> usize = crate::pyopcode::code_varnames_len;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::code_varnames_len",
+        "pyre_interpreter::code_varnames_len",
+        code_varnames_len as *const (),
+    );
+
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
     // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
     // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:

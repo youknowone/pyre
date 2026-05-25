@@ -8404,8 +8404,13 @@ mod tests {
                         let cd = d.as_calldescr();
                         let ei = &cd.extra_info;
                         eprintln!(
-                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?}",
-                            cd.arg_classes, cd.result_type, ei.extraeffect, ei.oopspecindex,
+                            "      → descr#{didx} args={:?} result={} extraeffect={:?} oopspec={:?} elidable={} canraise={}",
+                            cd.arg_classes,
+                            cd.result_type,
+                            ei.extraeffect,
+                            ei.oopspecindex,
+                            ei.check_is_elidable(),
+                            ei.check_can_raise(false),
                         );
                     }
                 }

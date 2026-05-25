@@ -1407,6 +1407,35 @@ fn op_arg_as_usize(arg: OpArg) -> usize {
         .expect("u32 fits in usize on supported pyre targets (64-bit only)")
 }
 
+/// Walker-fold helper for `var_num.get(op_arg).as_usize()` — chains
+/// the third-party `Arg::get` + `VarNum::as_usize` calls under a single
+/// `#[elidable_cannot_raise]` first-party wrapper.  Without it, the
+/// codewriter sees two unfolded `residual_call` ops with
+/// `oopspec=None CanRaise`, and the walker's bounds-check `goto_if_not`
+/// downstream aborts with `GotoIfNotValueNotConcrete`.  The wrapper's
+/// body still emits a residual_call to the third-party helpers, but
+/// the OUTER call site is tagged elidable so the walker's
+/// `try_fold_pure_call_via_executor` fold path runs end-to-end.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn load_fast_var_num_to_index(
+    var_num: crate::bytecode::Arg<crate::bytecode::oparg::VarNum>,
+    op_arg: OpArg,
+) -> usize {
+    var_num.get(op_arg).as_usize()
+}
+
+/// Walker-fold helper for `code.varnames.len()` — `Vec::len` is a std
+/// method the analyzer cannot tag elidable from its definition site,
+/// so the bounds-check upper bound reaches the walker as an unfolded
+/// `residual_call`.  Same `#[elidable_cannot_raise]` rationale as
+/// [`load_fast_var_num_to_index`].
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+pub fn code_varnames_len(code: &CodeObject) -> usize {
+    code.varnames.len()
+}
+
 /// Extract a [`RaiseKind`]'s discriminant as `usize`. Same parity
 /// rationale as [`u32_as_i64`] / [`u32_as_usize`]: upstream Python
 /// has no enum-discriminant cast syntax, so the bare `kind as usize`
@@ -1460,7 +1489,7 @@ where
         }
 
         Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
-            let idx = var_num.get(op_arg).as_usize();
+            let idx = load_fast_var_num_to_index(var_num, op_arg);
             // closure-free, Option-pattern-free `varnames.get(idx)` rewrite to
             // keep the body within the Rust-AST adapter's RPython-orthodox
             // subset (Position-2 adaptation per the annotator-monomorphization
@@ -1468,7 +1497,7 @@ where
             // at the annotator layer). The bounds check stays a plain `<`
             // comparison + indexed access so the lowered op sequence stays
             // `lt + getitem` rather than walking into an `Option<&str>` enum.
-            let name = if idx < code.varnames.len() {
+            let name = if idx < code_varnames_len(code) {
                 code.varnames[idx].as_ref()
             } else {
                 "<cell>"
@@ -1496,10 +1525,10 @@ where
         }
 
         Instruction::LoadFastCheck { var_num } => {
-            let idx = var_num.get(op_arg).as_usize();
+            let idx = load_fast_var_num_to_index(var_num, op_arg);
             // closure-free, Option-pattern-free rewrite — see LoadFast above
             // for the rationale.
-            let name = if idx < code.varnames.len() {
+            let name = if idx < code_varnames_len(code) {
                 code.varnames[idx].as_ref()
             } else {
                 "<cell>"
