@@ -12561,8 +12561,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
         };
 
         let ret_byte = *insns_opname_to_byte()
@@ -12648,8 +12646,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
         };
 
         let raise_byte = *insns_opname_to_byte()
@@ -12733,8 +12729,6 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
-            suppress_guard_no_exception_for_opcode: false,
-            pre_opcode_op_count: None,
         };
         let ret_byte = *insns_opname_to_byte()
             .get("ref_return/r")

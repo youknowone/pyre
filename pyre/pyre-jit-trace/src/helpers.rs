@@ -352,12 +352,10 @@ pub trait TraceHelperAccess {
     fn trace_frame(&self) -> OpRef;
     fn trace_globals_ptr(&mut self) -> OpRef;
     fn trace_record_not_forced_guard(&mut self);
-    /// EC-Z Path B (task #311) per-caller emit hook for `GuardNoException`.
-    /// PyPy parity: `do_residual_call` (pyjitpl.py:2082) emits this guard
-    /// inline immediately after every can-raise CALL_*. Pyre's
-    /// `handle_possible_exception` bytecode-end fallback dedups against
-    /// these emissions via the guard-aware `any_call_recorded_since`,
-    /// and retires once every can-raise call site has migrated.
+    /// EC-Z Path B (task #311/#322) per-caller emit hook for
+    /// `GuardNoException`. PyPy parity: `do_residual_call`
+    /// (pyjitpl.py:2082) emits this guard inline immediately after every
+    /// can-raise CALL_*.
     fn trace_record_no_exception_guard(&mut self);
 
     fn trace_make_function(&mut self, code_obj: OpRef) -> Result<OpRef, PyError> {
@@ -442,11 +440,9 @@ pub trait TraceHelperAccess {
                 &[Type::Ref, Type::Ref, Type::Ref],
             );
         });
-        // EC-Z Path B (task #311) per-caller emit: `jit_setitem` is recorded
-        // via `default_effect_info()` (MOST_GENERAL, CanRaise), matching
-        // `do_residual_call` (pyjitpl.py:2082). The bytecode-end fallback
-        // in `handle_possible_exception` dedups via the guard-aware
-        // `any_call_recorded_since`.
+        // EC-Z Path B (task #311/#322) per-caller emit: `jit_setitem` is
+        // recorded via `default_effect_info()` (MOST_GENERAL, CanRaise),
+        // matching `do_residual_call` (pyjitpl.py:2082).
         self.trace_record_no_exception_guard();
         Ok(())
     }
