@@ -619,17 +619,13 @@ struct SpamBlock {
     framestate: Option<FrameState>,
     /// `flowcontext.py:41` `block.dead`.
     dead: bool,
-    /// Task #227 per-block ssarepr accumulator — pyre-side mirror of
-    /// upstream `block.operations` recorded inside `record_block`
+    /// Per-block ssarepr accumulator — pyre-side mirror of upstream
+    /// `block.operations` recorded inside `record_block`
     /// (`flowcontext.py:407-416`).  Populated alongside the program-
-    /// wide `ssarepr.insns` push so a future post-walk `flatten_graph`
-    /// can iterate `graph.iterblocks()` and consume the per-block
-    /// emit sequence in graph-DFS order, matching
+    /// wide `ssarepr.insns` push so a post-walk `flatten_graph` can
+    /// iterate `graph.iterblocks()` and consume the per-block emit
+    /// sequence in graph-DFS order, matching
     /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu=...)`.
-    /// While the walker still drives production, this shadow only
-    /// records label-equivalent block entries; once Task #227.2 wires
-    /// every `emit_*!` macro through `push_insn` the shadow becomes
-    /// the authoritative source consumed by the post-walk flatten.
     per_block_ssarepr: Vec<super::flatten::Insn>,
     /// Length of `per_block_ssarepr` at the moment the multi-pred
     /// trampoline fallthrough fallback first appended `goto + ---`
@@ -702,21 +698,21 @@ impl SpamBlockRef {
     /// `flowcontext.py:407-416 record_block` runs inside the recorder
     /// loop.  Walker emit macros call this alongside their program-
     /// wide `ssarepr.insns.push(...)` so the per-block shadow stays
-    /// in sync until production flips to consume it (Task #227.3).
+    /// in sync with the production stream.
     fn push_insn(&self, insn: super::flatten::Insn) {
         self.0.borrow_mut().per_block_ssarepr.push(insn);
     }
 
-    /// Snapshot the per-block accumulator — used by Task #227.2
-    /// verification probes and by the post-walk flatten driver to
-    /// drain the per-block emit sequence in graph-DFS order.
+    /// Snapshot the per-block accumulator — used by verification
+    /// probes and by the post-walk flatten driver to drain the
+    /// per-block emit sequence in graph-DFS order.
     fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
         self.0.borrow().per_block_ssarepr.clone()
     }
 
     /// Length of the per-block accumulator without cloning.  Used by
-    /// the T6.1 walker-time PC dispatch tracker to record per-PC
-    /// `-live-` marker positions at emit time.
+    /// the walker-time PC dispatch tracker to record per-PC `-live-`
+    /// marker positions at emit time.
     fn per_block_ssarepr_len(&self) -> usize {
         self.0.borrow().per_block_ssarepr.len()
     }
@@ -736,12 +732,12 @@ impl std::hash::Hash for SpamBlockRef {
     }
 }
 
-/// Task #227.4 walker emit helper — pushes `insn` into
-/// `current_block`'s per-block accumulator.  The program-wide
-/// `ssarepr.insns` is populated post-walk via the drain swap at
+/// Walker emit helper — pushes `insn` into `current_block`'s
+/// per-block accumulator.  The program-wide `ssarepr.insns` is
+/// populated post-walk via the drain swap at
 /// `transform_graph_to_jitcode`'s end (matching `codewriter.py:53
 /// flatten_graph(graph, regallocs, cpu)`).  Every walker emit site
-/// uniformly routes through this helper now — no direct
+/// uniformly routes through this helper — no direct
 /// `ssarepr.insns.push` calls remain in production.
 fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
@@ -2350,9 +2346,7 @@ fn mergeblock(
             // a different block's FrameState.  The supersede branch
             // and the fresh-path `candidates.insert(0, ...)` already
             // preserve the head-of-list invariant; the match branch
-            // does the same.  Retires when the Task #227 walker
-            // restructure replaces PC sequencing with a pendingblocks-driven
-            // walker.
+            // does the same.
             if index != 0 {
                 candidates.remove(index);
                 candidates.insert(0, block.clone());
@@ -2366,8 +2360,8 @@ fn mergeblock(
             }
         }
         let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
-        // Task #227.3 SpamBlockRef enumeration — record the
-        // supersede-newblock in walker-visit order.
+        // Record the supersede-newblock in walker-visit order so the
+        // post-walk drain enumerates it.
         all_walker_blocks.push(newblock.clone());
         newblock.block().borrow_mut().inputargs = newstate.getvariables();
         append_exit(
@@ -3013,14 +3007,6 @@ fn emit_frontend_bool(
     // `SSARepr` registers still live in two regalloc colorings even
     // though Phase 3c (commit `bc0d6a06c4`) has already collapsed the
     // dual emitter into a single walker-local `SSARepr`.
-    //
-    // Convergence path: Task #229 (TmpVarEnv) replaces the SSA-side
-    // `scratch_truth` slot with a `fresh_var(Kind::Int)` graph Variable so
-    // the same Variable drives both the front-end exitswitch and the
-    // flatten-emitted `goto_if_not`. Once that lands, lower `bool` as a
-    // residual_call to `truth_fn` in the same pass that lowers other
-    // graph ops to assembler Insns and drop the second emit at the
-    // call sites below.
     emit_graph_op_with_result(
         graph,
         block,
@@ -4551,19 +4537,18 @@ impl CodeWriter {
                 all_walker_blocks.push(synthetic.clone());
                 synthetic
             });
-        // Task #227.5 per-block contiguous walker — `emit_mark_label_pc!`
-        // sets `block_switch_pending = true` at block transitions
-        // instead of switching `current_block` inline; the inner
-        // for-loop checks the flag after each per-PC emit and breaks,
-        // yielding to the outer `while let Some(pending_block) =
+        // Per-block contiguous walker — `emit_mark_label_pc!` sets
+        // `block_switch_pending = true` at block transitions instead
+        // of switching `current_block` inline; the inner for-loop
+        // checks the flag after each per-PC emit and breaks, yielding
+        // to the outer `while let Some(pending_block) =
         // pendingblocks.pop_front()` which picks up the queued new
         // block in the next iteration.  Mirrors upstream's
         // `flowcontext.py:407-416 record_block` shape where each
         // block is processed contiguously without mid-iteration
         // re-entry.  Correctness relies on the explicit `goto
         // Label("pcN")` + `Unreachable` pair emitted on the yield
-        // path (Phase 4 alignment with `flatten.py:177-258
-        // insert_exits`).
+        // path, aligning with `flatten.py:177-258 insert_exits`.
         let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
@@ -4655,14 +4640,12 @@ impl CodeWriter {
         // stays in sync at every guard/call point — matching RPython's
         // per-push/per-pop semantics.
         //
-        // Task #229 Session 1 slice: record a matching graph op pair
-        // (constant-source `int_copy` producing a fresh Int Variable +
-        // `setfield_vable_i` consuming it) alongside the SSA emission.
-        // The SSA side now mirrors that shape via
-        // `ssarepr.fresh_var(Kind::Int, ...)`,
-        // lifting `graph_num` toward `ssa_num` as Task #227 Phase 4
-        // prepares to flip `flatten_graph(graph, regallocs)` as the
-        // source of truth.
+        // Records a matching graph op pair (constant-source `int_copy`
+        // producing a fresh Int Variable + `setfield_vable_i`
+        // consuming it) alongside the SSA emission.  The SSA side
+        // mirrors that shape via `ssarepr.fresh_var(Kind::Int, ...)`
+        // so the canonical and walker streams agree on the VSD-sync
+        // scratch's liverange.
         macro_rules! emit_vsd {
             ($depth:expr, $py_pc:expr) => {
                 if is_portal {
@@ -5240,12 +5223,11 @@ impl CodeWriter {
                     // joinpoint candidate list (`flowcontext.py:426
                     // candidates = self.joinpoints.setdefault(...)`).
                     //
-                    // Task #227.5 per-block contiguous walker: when
-                    // the gate is on AND the joinpoint target differs
-                    // from `current_block`, queue the target to
-                    // `pendingblocks` (mergeblock-path queuing is
-                    // already done by mergeblock itself; joinpoint
-                    // match doesn't push automatically).
+                    // Per-block contiguous walker: when the joinpoint
+                    // target differs from `current_block`, queue the
+                    // target to `pendingblocks` (mergeblock-path
+                    // queuing is already done by mergeblock itself;
+                    // joinpoint match doesn't push automatically).
                     //
                     // Gate the re-push on `target.exits.is_empty()`
                     // matching upstream `flowcontext.py:407-475
@@ -5306,17 +5288,14 @@ impl CodeWriter {
                         py_pc,
                     );
                 };
-                // Task #227.5 yield-on-switch: when the gate is on and
-                // `new_block` differs from `current_block`, set the
-                // `block_switch_pending` flag and SKIP the inline
-                // switch (the new block has been queued to
-                // `pendingblocks` above; the outer walker loop will
-                // pop it and process its emit sequence
-                // contiguously).  The inner for-loop body checks
-                // `block_switch_pending` after each per-PC emit and
-                // breaks, yielding control.  Default (gate off):
-                // switch inline as before, preserving the PC-
-                // sequential walker's behaviour.
+                // Yield-on-switch: when `new_block` differs from
+                // `current_block`, set the `block_switch_pending`
+                // flag and SKIP the inline switch (the new block has
+                // been queued to `pendingblocks` above; the outer
+                // walker loop will pop it and process its emit
+                // sequence contiguously).  The inner for-loop body
+                // checks `block_switch_pending` after each per-PC
+                // emit and breaks, yielding control.
                 if new_block != current_block {
                     // Yield without pushing Label — the new block's
                     // outer iter at start_pc=py_pc will emit its
@@ -5379,17 +5358,16 @@ impl CodeWriter {
                     current_state = state;
                 }
                 needs_fallthrough = true;
-                // Task #227.5 emission-order tracking: push the catch
-                // landing block to `all_walker_blocks` AT FIRST EMIT
-                // (not at creation) so the drain order reflects
-                // walker emission order — catch landings emit after
-                // the main walker loop per `codewriter.rs::6907+`,
-                // so creation-order tracking would misalign with
-                // ssarepr.insns ordering.  Guard against double-push:
-                // a single catch landing may be entered multiple
-                // times if multiple catch sites share a landing
-                // label (unusual but possible per the catch_sites
-                // dedup at codewriter.rs:catch_sites).
+                // Emission-order tracking: push the catch landing
+                // block to `all_walker_blocks` AT FIRST EMIT (not at
+                // creation) so the drain order reflects walker
+                // emission order — catch landings emit after the
+                // main walker loop, so creation-order tracking would
+                // misalign with ssarepr.insns ordering.  Guard against
+                // double-push: a single catch landing may be entered
+                // multiple times if multiple catch sites share a
+                // landing label (unusual but possible per the
+                // `catch_sites` dedup).
                 if !all_walker_blocks.iter().any(|b| b == &current_block) {
                     all_walker_blocks.push(current_block.clone());
                 }
@@ -6239,9 +6217,9 @@ impl CodeWriter {
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
                 needs_fallthrough = true;
-                // Task #227.5 per-block walker: reset switch flag at the
-                // start of every new block iteration so a previous
-                // block's queued switch doesn't bleed into this one.
+                // Per-block walker: reset switch flag at the start of
+                // every new block iteration so a previous block's
+                // queued switch doesn't bleed into this one.
                 block_switch_pending = false;
                 // Block-entry `Label(block)` per `flatten.py:116
                 // self.emitline(Label(block))`.  Emitted at the moment
@@ -6264,22 +6242,20 @@ impl CodeWriter {
                 // `record_block` assigns `block.operations` from the
                 // recorder.  Pyre iterates PCs linearly because the walker
                 // emits directly into program-wide `ssarepr.insns`.
-                // Convergence: Task #227 Phase 4 + Task #212 (per-block
-                // `record_block` + post-walk `flatten_graph(graph,
-                // regallocs)` per `codewriter.py:44-67`).
                 for py_pc in start_pc..num_instrs {
                     // Exception handler entry: Python resets stack depth to the
                     // handler's specified depth and arrives only from
                     // `catch_exception` edges, not from sequential fallthrough.
                     if handler_depth_at.get(py_pc).map_or(false, |v| v.is_some()) {
-                        // Phase 4 slice 4: when reached sequentially from
-                        // a prior PC (start_pc != py_pc), break.  Handler
-                        // PCs are reached only via exception edges in
-                        // upstream RPython (`flowcontext.py:130-156
-                        // guessexception`); pyre's analogous catch landings
-                        // `emit_goto!(handler_py_pc)` creates the
-                        // handler-entry block, which the outer-loop second
-                        // drain pass walks when start_pc == handler_py_pc.
+                        // When reached sequentially from a prior PC
+                        // (start_pc != py_pc), break.  Handler PCs are
+                        // reached only via exception edges in upstream
+                        // RPython (`flowcontext.py:130-156
+                        // guessexception`); pyre's analogous catch
+                        // landings `emit_goto!(handler_py_pc)` create
+                        // the handler-entry block, which the outer-loop
+                        // second drain pass walks when start_pc ==
+                        // handler_py_pc.
                         if start_pc != py_pc {
                             break;
                         }
@@ -6312,9 +6288,9 @@ impl CodeWriter {
                     }
                     // RPython flatten.py: Label(block) at block entry
                     emit_mark_label_pc!(py_pc);
-                    // Task #227.5 yield-on-switch: if `emit_mark_label_pc!`
-                    // detected a block boundary at this PC and queued the
-                    // new block to `pendingblocks`, break the inner loop
+                    // Yield-on-switch: if `emit_mark_label_pc!` detected
+                    // a block boundary at this PC and queued the new
+                    // block to `pendingblocks`, break the inner loop
                     // and let the outer walker pop the new block in its
                     // own iteration.  The new block's outer iter then
                     // re-enters at PC=py_pc and the same
@@ -6323,12 +6299,10 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    // T6.1 Slice 6: per-PC `Insn::Label("pc{N}")`
-                    // emission retired.  The walker emits one
-                    // block-identity `Label(block)` at block entry
-                    // (`flatten.py:116` parity) and tracks each
-                    // Python PC's `-live-` marker position in
-                    // `walker_pc_live_marker_pos` for `pc_map`
+                    // The walker emits one block-identity `Label(block)`
+                    // at block entry (`flatten.py:116` parity) and
+                    // tracks each Python PC's `-live-` marker position
+                    // in `walker_pc_live_marker_pos` for `pc_map`
                     // population at finalize time.
                     depth_at_pc[py_pc] = current_depth;
 
@@ -9147,15 +9121,14 @@ impl CodeWriter {
 
             for site in &catch_sites {
                 emit_mark_label_catch_landing!(site.landing_label);
-                // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
-                // reassigns `current_block` to the pre-allocated catch
-                // landing block on every iteration, so subsequent graph
-                // emits in this loop body land in a block reachable from
+                // `emit_mark_label_catch_landing!` reassigns
+                // `current_block` to the pre-allocated catch landing
+                // block on every iteration, so subsequent graph emits
+                // in this loop body land in a block reachable from
                 // `graph.iterblocks()`.  Lock the invariant in debug
-                // builds — Session 17's exception unwind PY_NULL graph
-                // dual-write (codewriter.rs:5481-5491) and any future
-                // catch-landing dual-write rely on this targeting being
-                // intact.
+                // builds: the exception unwind PY_NULL graph dual-
+                // write below and any future catch-landing dual-write
+                // rely on this targeting being intact.
                 debug_assert_eq!(
                     current_block, site.landing,
                     "catch_landing block-targeting invariant violated: \
@@ -9350,7 +9323,7 @@ impl CodeWriter {
                         exc_slot
                     );
                 }
-                // CATCH-LANDING dual-write follow-up (Task #227).
+                // CATCH-LANDING dual-write follow-up.
                 // RPython parity: `pypy/interpreter/pyopcode.py` exception
                 // handler entry pushes the lasti box (`push_lasti` arm) and
                 // the captured exc_value onto the value stack; both writes
@@ -9367,8 +9340,7 @@ impl CodeWriter {
                 // Push lasti graph dual-write — STILL DEFERRED:
                 //   - `box_int(lasti_py_pc)` lowers to a `residual_call_*`
                 //     shape that pyre's graph layer does not yet record
-                //     (the `residual_call_*` family has zero graph
-                //     coverage as of Session 17 — `flatten_arg` panics on
+                //     (`flatten_arg` panics on
                 //     `SpaceOperationArg::Descr`, and per-call-shape
                 //     variant routing for `residual_call_ir_r` / `_r_r` /
                 //     `_r_v` / `_r_i` is absent).  Adding the
@@ -9377,12 +9349,12 @@ impl CodeWriter {
                 //     use: setarrayitem) that breaks RPython's
                 //     "every Variable has exactly one def" invariant.
                 //
-                // Block-targeting (was Session 17 blocker #1) is CLOSED:
-                // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
-                // runs at the head of every iteration and reassigns
-                // `current_block` to the pre-allocated catch landing
-                // block.  The invariant is locked in via
-                // `debug_assert_eq!` at the head of the loop body.
+                // Block-targeting is handled by
+                // `emit_mark_label_catch_landing!`, which runs at the
+                // head of every iteration and reassigns `current_block`
+                // to the pre-allocated catch landing block.  The
+                // invariant is locked in via `debug_assert_eq!` at the
+                // head of the loop body.
                 //
                 // The push_lasti dual-write joins when graph coverage for
                 // `residual_call_*` (via `flatten_arg` Descr handling +
@@ -9391,7 +9363,7 @@ impl CodeWriter {
                 emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
             }
-        } // end outer drain loop (Phase 4 slice 4)
+        } // end outer drain loop
 
         // RPython flatten.py parity: every code path ends with an explicit
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
@@ -9432,7 +9404,7 @@ impl CodeWriter {
         // Seed `walker_slot_for_variable` with block inputarg slots
         // BEFORE graph regalloc + `walker_post_walk_insert_renamings`
         // read it.  The same pairing pass also runs downstream
-        // (idempotent via `pair_walker_slot_if_absent`), but Task #228
+        // (idempotent via `pair_walker_slot_if_absent`);
         // `derive_walker_pin_coalesce_pairs` needs the full pin map
         // to project scratch↔inputarg pre-coalesce pairs onto the
         // canonical graph regalloc below.
