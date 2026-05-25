@@ -7173,19 +7173,29 @@ impl CodeWriter {
                                 .expect("load_global_fn returns Ref result")
                             } else {
                                 // Non-portal helpers: emit_vable_getfield_ref!
-                                // returns None (no graph dual-write of ns / code
-                                // reads because frame_var is not a startblock
-                                // inputarg there), so no graph SpaceOp produces
-                                // the loaded callable.  Allocate a fresh Ref
-                                // Variable anyway so the downstream simple_call
-                                // HLOp's callable arg has a Variable identity to
-                                // resolve through walker_slot; without this the
-                                // simple_call sees a Variable produced by
-                                // fresh_ref_value with no graph op AND no
-                                // walker_slot pairing, causing canonical's
-                                // get_register to fall through to graph regalloc
-                                // and return u16::MAX (Reg(65535)).
-                                graph.fresh_variable(Kind::Ref)
+                                // returned None (frame_var is not a startblock
+                                // inputarg here), so no ns/code Ref Variables
+                                // exist.  Still record a graph SpaceOp with
+                                // `loaded` as op.result and just `namei` as the
+                                // Int arg, so canonical SSARepr build's
+                                // `make_dependencies` (regalloc.py:38-77) sees
+                                // `loaded` as an op.result rather than an
+                                // unbound Variable; without this the downstream
+                                // simple_call HLOp panics in `regalloc_color`
+                                // with "missing color for Variable".
+                                record_residual_call_graph_op(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    load_global_fn_idx,
+                                    CallFlavor::Plain,
+                                    vec![super::flow::Constant::signed(raw_namei).into()],
+                                    vec![],
+                                    vec![],
+                                    vec![Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                )
+                                .expect("load_global_fn returns Ref result")
                             };
                             pair_walker_slot(
                                 &mut walker_slot_for_variable,
