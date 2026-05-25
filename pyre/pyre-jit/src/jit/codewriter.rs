@@ -2497,6 +2497,16 @@ fn record_graph_op(
 /// `Variable` with the SSARepr slot the walker assigned in the same
 /// emit.  No-op when `var` is `None` (residual_call with `ResKind::Void`,
 /// non-portal CodeWriter, etc.).
+///
+/// **Overwrite semantics**: when the same `Variable` is paired across
+/// multiple emit sites (e.g. an inputarg `Variable` initially paired
+/// with its parameter slot, then re-paired with a stack slot when a
+/// `LOAD_FAST` push lands the same `Variable` on the stack), the most
+/// recent pairing wins.  `walker_slot_for_variable[v.id]` therefore
+/// reflects "the slot this Variable currently lives in" at the walk
+/// point of the last `pair_walker_slot` call — not "the Variable's
+/// home slot".  Use [`pair_walker_slot_if_absent`] when the caller
+/// wants first-write-wins instead.
 fn pair_walker_slot(
     table: &mut Vec<Option<u16>>,
     var: Option<super::flow::Variable>,
