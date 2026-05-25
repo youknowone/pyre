@@ -1238,7 +1238,6 @@ struct GraphBuildContext<'a> {
     /// owns the same-block half of the parity.
     local_value_ids: HashMap<String, (crate::flowspace::model::Variable, BlockId)>,
     local_trait_bound_roots: HashMap<String, String>,
-    generic_trait_roots: HashMap<String, String>,
     /// RPython: ARRAY element type identity — maps variable name to the
     /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
@@ -1662,7 +1661,6 @@ impl<'a> GraphBuildContext<'a> {
             local_value_types: HashMap::new(),
             local_value_ids: HashMap::new(),
             local_trait_bound_roots: HashMap::new(),
-            generic_trait_roots: HashMap::new(),
             local_array_types: HashMap::new(),
             local_dyn_trait_roots: HashMap::new(),
             local_closure_returns: HashMap::new(),
@@ -3126,21 +3124,6 @@ thread_local! {
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
-
-/// RAII guard for `CURRENT_LOWERING_FN_NAME` — restores the previous
-/// fn name on Drop so a `?` early-exit inside `build_function_graph`
-/// still leaves the thread-local in a sane state for sibling lowerings.
-struct LoweringFnNameGuard {
-    previous: Option<String>,
-}
-
-impl Drop for LoweringFnNameGuard {
-    fn drop(&mut self) {
-        let prev = self.previous.take();
-        CURRENT_LOWERING_FN_NAME.with(|c| *c.borrow_mut() = prev);
-    }
-}
-
 
 /// RPython: extract function-level JIT hints from attributes.
 /// Maps JIT hint attributes to effectinfo classification strings.
@@ -9891,37 +9874,6 @@ fn trait_object_root_name(
     })
 }
 
-fn collect_generic_trait_roots(
-    generics: &syn::Generics,
-    prefix: &str,
-    known_trait_names: &std::collections::HashSet<String>,
-) -> HashMap<String, String> {
-    let mut roots = HashMap::new();
-    for param in &generics.params {
-        if let syn::GenericParam::Type(type_param) = param {
-            if let Some(root) =
-                trait_object_root_name_qualified(&type_param.bounds, prefix, known_trait_names)
-            {
-                roots.insert(type_param.ident.to_string(), root);
-            }
-        }
-    }
-    if let Some(where_clause) = &generics.where_clause {
-        for predicate in &where_clause.predicates {
-            if let syn::WherePredicate::Type(pred_ty) = predicate {
-                let Some(type_name) = type_root_ident(&pred_ty.bounded_ty) else {
-                    continue;
-                };
-                if let Some(root) =
-                    trait_object_root_name_qualified(&pred_ty.bounds, prefix, known_trait_names)
-                {
-                    roots.insert(type_name, root);
-                }
-            }
-        }
-    }
-    roots
-}
 
 fn qualify_known_trait_name(
     bare: &str,
