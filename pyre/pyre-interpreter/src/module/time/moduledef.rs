@@ -64,6 +64,8 @@ pub fn init(ns: &mut DictStorage) {
         "ctime",
         make_builtin_function("ctime", interp_time::ctime),
     );
+    // `app_time.py:5-23 class struct_time` — exposed as `time.struct_time`.
+    dict_storage_store(ns, "struct_time", interp_time::struct_time_type());
     dict_storage_store(ns, "timezone", pyre_object::w_int_new(0));
     dict_storage_store(ns, "altzone", pyre_object::w_int_new(0));
     dict_storage_store(ns, "daylight", pyre_object::w_int_new(0));

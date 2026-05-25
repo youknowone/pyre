@@ -422,19 +422,46 @@ fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
     }
 }
 
-/// Build a Python time tuple from our portable `c_tm`.
+/// `app_time.py:5-23 class struct_time(metaclass=structseqtype)` —
+/// process-wide cached subclass-of-tuple type.  Pyre exposes the
+/// 9-field positional core; `tm_zone` / `tm_gmtoff` (PyPy indices
+/// 10/12 in the metaclass extras table) are not yet wired up because
+/// the structseq factory only handles the positional path today.
+thread_local! {
+    static STRUCT_TIME_TYPE: std::cell::OnceCell<PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+pub(crate) fn struct_time_type() -> PyObjectRef {
+    STRUCT_TIME_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "time.struct_time",
+                &[
+                    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday",
+                    "tm_yday", "tm_isdst",
+                ],
+            )
+        })
+    })
+}
+
+/// Build a `time.struct_time` from our portable `c_tm`.
 fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
-    w_tuple_new(vec![
-        w_int_new((tm.tm_year + 1900) as i64),
-        w_int_new((tm.tm_mon + 1) as i64),
-        w_int_new(tm.tm_mday as i64),
-        w_int_new(tm.tm_hour as i64),
-        w_int_new(tm.tm_min as i64),
-        w_int_new(tm.tm_sec as i64),
-        w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
-        w_int_new((tm.tm_yday + 1) as i64),
-        w_int_new(tm.tm_isdst as i64),
-    ])
+    crate::structseq::new_instance(
+        struct_time_type(),
+        vec![
+            w_int_new((tm.tm_year + 1900) as i64),
+            w_int_new((tm.tm_mon + 1) as i64),
+            w_int_new(tm.tm_mday as i64),
+            w_int_new(tm.tm_hour as i64),
+            w_int_new(tm.tm_min as i64),
+            w_int_new(tm.tm_sec as i64),
+            w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
+            w_int_new((tm.tm_yday + 1) as i64),
+            w_int_new(tm.tm_isdst as i64),
+        ],
+    )
 }
 
 /// Extract epoch seconds from an optional argument (int, float, or None/absent → now).
