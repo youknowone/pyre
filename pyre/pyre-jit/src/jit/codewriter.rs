@@ -757,10 +757,9 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// mixed push_front / push_back) so this pass undoes the materialisation
 /// when the layout makes it redundant.
 ///
-/// Phase 4 endgame slice 4 / 5 helper.  Returns a stable opname key
-/// per insn variant so the diff probe can compare and tally across
-/// the walker / canonical streams without dragging in operand
-/// equality.
+/// Diagnostic helper for the walker↔canonical diff probe: returns a
+/// stable opname key per Insn variant so the probe can compare and
+/// tally across the two streams without dragging in operand equality.
 fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
     match insn {
         super::flatten::Insn::Label(_) => "Label".to_string(),
@@ -769,12 +768,12 @@ fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
     }
 }
 
-/// Phase 4 endgame slice 4 helper.  Tally per-opname occurrences of
-/// the given Insn slice, using `"Label"` / `"---"` for the non-`Op`
-/// variants so the resulting `Vec<(String, i64)>` is sortable and
-/// comparable across walker and canonical SSARepr.  `Vec` keyed by
-/// `String` per [[feedback-no-hashmap-ever]] — opname cardinality
-/// stays in the dozens, so linear scan is acceptable.
+/// Diagnostic helper: tally per-opname occurrences of the given Insn
+/// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
+/// resulting `Vec<(String, i64)>` is sortable and comparable across
+/// walker and canonical SSARepr.  `Vec` keyed by `String` (HashMap
+/// banned project-wide); opname cardinality stays in the dozens so a
+/// linear scan is acceptable.
 fn phase4_tally_insn_opnames(insns: &[super::flatten::Insn]) -> Vec<(String, i64)> {
     let mut tally: Vec<(String, i64)> = Vec::new();
     for insn in insns {
@@ -2516,8 +2515,10 @@ fn pair_walker_slot_if_absent(
     }
 }
 
-/// Phase 4 endgame Task #228 helper: derive scratch↔inputarg coalesce
-/// pairs from `walker_slot_for_variable`.
+/// Derive scratch↔inputarg coalesce pairs from
+/// `walker_slot_for_variable`, feeding
+/// [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
+/// so the canonical graph regalloc reproduces walker's slot pinning.
 ///
 /// Walker pins every Variable it writes to a Python local-`i` register
 /// to `walker_slot=i` via [`pair_walker_slot`].  Canonical graph
