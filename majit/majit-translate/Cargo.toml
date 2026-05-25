@@ -68,16 +68,18 @@ majit-charon-reader = { workspace = true }
 
 [features]
 default = []
-# Issue #97 Step 4.4: when enabled, lib.rs routes the production
-# SemanticProgram builder through the MIR-driven `front::mir`
-# pipeline (consuming a pre-extracted .ullbc) instead of the
-# syn-AST `front::ast::build_semantic_program_from_parsed_files`
-# path. The flag is opt-in because the MIR-driven builder currently
-# produces a SemanticProgram with degraded metadata (TyRef::label()
-# instead of resolved ADT paths, no `immutable_fields`, empty
-# `module_path`/`hints`); downstream consumers can fail when one of
-# those gaps reaches an assertion. Build a .ullbc snapshot via
-# `scripts/extract-llbc.sh` before enabling.
+# Issue #97 Step 6.C — DEFERRED 2026-05-25.  Flipping default to
+# `["mir-frontend"]` surfaced real cutover defects in the
+# `pyre-jit-trace/build.rs` path: `compute_at_fixpoint failed` +
+# `OpKind::Call::FunctionPath { segments: ["SharedOpcodeHandler",
+# "pop_value"] } not registered` + classdef-less getattr panics on
+# `locals_w` / `locals_cells_stack_w` / `store_name_value`.  These
+# are real MIR cutover gaps that were previously masked because
+# `check.py` builds with `--no-default-features --features
+# dynasm/cranelift` and lib tests bypass the cutover via the
+# module_path auto-discovery gate.  Step 6.C is therefore gated on
+# closing the build.rs panics first; until then `mir-frontend`
+# stays opt-in.
 mir-frontend = []
 
 [dev-dependencies]
