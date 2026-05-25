@@ -882,6 +882,157 @@ fn phase4_scan_color_budget_violations(
     violations
 }
 
+/// Phase 4 #229 splice helper: filter pyre-only walker emits so the
+/// resulting sequence can be compared to canonical SSARepr for byte-
+/// equivalence.  `-live-` is walker NEW DEVIATION (canonical emits
+/// 0-or-1 per graph, walker emits per-PC); `ref_copy` is walker's
+/// slot-keyed stack/local mirror that canonical defers to
+/// `flatten.py:306-334 insert_renamings` link-rewrites.
+fn phase4_filter_walker_pyre_only(
+    insns: &[super::flatten::Insn],
+) -> Vec<&super::flatten::Insn> {
+    insns
+        .iter()
+        .filter(|insn| match insn {
+            super::flatten::Insn::Op { opname, .. } => {
+                opname.as_str() != super::flatten::OPNAME_LIVE && opname.as_str() != "ref_copy"
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// Phase 4 #229 splice helper: filter canonical's per-link trampoline
+/// `Label("link*")` entries (per `flatten.py:306-334 insert_renamings`
+/// + ε.3 slice trampoline synthesis); walker doesn't emit link Labels.
+/// Block Labels (`Label("block*")`) survive.
+fn phase4_filter_canonical_trampoline(
+    insns: &[super::flatten::Insn],
+) -> Vec<&super::flatten::Insn> {
+    insns
+        .iter()
+        .filter(|insn| match insn {
+            super::flatten::Insn::Label(label) => !label.name.starts_with("link"),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Phase 4 #229 splice helper: structural equality on `Operand`.
+/// Compares Register kind+index, Const literal values, ListOfKind
+/// content recursively.  Descr identity is intentionally IGNORED:
+/// `assembler.py:197-206` dedups descrs by Python `id(x)`, but two
+/// `Rc<DescrOperand>` constructed from the same semantic descr at
+/// different walker vs canonical emit sites compare equal in shape
+/// even when their `Rc` pointers differ.  `ignore_label_names` is
+/// set under the lax audit mode where walker's pointer-derived
+/// `block<addr>` names and canonical's ordinal `block<N>` names are
+/// treated as positionally equivalent (T6-epic naming bridge).
+fn phase4_operand_eq(
+    a: &super::flatten::Operand,
+    b: &super::flatten::Operand,
+    ignore_label_names: bool,
+) -> bool {
+    use super::flatten::Operand;
+    match (a, b) {
+        (Operand::Register(x), Operand::Register(y)) => x.kind == y.kind && x.index == y.index,
+        (Operand::ConstInt(x), Operand::ConstInt(y)) => x == y,
+        (Operand::ConstRef(x), Operand::ConstRef(y)) => x == y,
+        (Operand::ConstFloat(x), Operand::ConstFloat(y)) => x == y,
+        (Operand::TLabel(x), Operand::TLabel(y)) => ignore_label_names || x.name == y.name,
+        (Operand::ListOfKind(x), Operand::ListOfKind(y)) => {
+            x.kind == y.kind && phase4_operand_slice_eq(&x.content, &y.content, ignore_label_names)
+        }
+        (Operand::Descr(_), Operand::Descr(_)) => true,
+        (Operand::IndirectCallTargets(_), Operand::IndirectCallTargets(_)) => true,
+        _ => false,
+    }
+}
+
+fn phase4_operand_slice_eq(
+    a: &[super::flatten::Operand],
+    b: &[super::flatten::Operand],
+    ignore_label_names: bool,
+) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| phase4_operand_eq(x, y, ignore_label_names))
+}
+
+fn phase4_register_opt_eq(
+    a: &Option<super::flatten::Register>,
+    b: &Option<super::flatten::Register>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.kind == y.kind && x.index == y.index,
+        _ => false,
+    }
+}
+
+/// Phase 4 #229 splice helper: structural equality on a single `Insn`.
+fn phase4_insn_eq(
+    a: &super::flatten::Insn,
+    b: &super::flatten::Insn,
+    ignore_label_names: bool,
+) -> bool {
+    use super::flatten::Insn;
+    match (a, b) {
+        (Insn::Label(x), Insn::Label(y)) => ignore_label_names || x.name == y.name,
+        (Insn::Unreachable, Insn::Unreachable) => true,
+        (
+            Insn::Op { opname: ao, args: aa, result: ar },
+            Insn::Op { opname: bo, args: ba, result: br },
+        ) => {
+            ao == bo
+                && phase4_operand_slice_eq(aa, ba, ignore_label_names)
+                && phase4_register_opt_eq(ar, br)
+        }
+        _ => false,
+    }
+}
+
+/// Phase 4 #229 splice readiness predicate.  Returns `true` if walker
+/// and canonical Insn sequences are byte-equivalent modulo pyre-only
+/// walker emits (`-live-`, `ref_copy`) and canonical-only trampoline
+/// Labels.  Filtering follows the same conventions as the
+/// `[phase4-diff-nolive-noref_copy]` probe and additionally drops
+/// canonical link Labels so the comparison reflects what production
+/// runtime actually consumes.
+///
+/// `ignore_label_names=false` (strict): block Label names must match
+/// exactly — walker today emits `block<SpamBlock-Rc-addr>` while
+/// canonical emits `block<ordinal>`, so strict mode reports 0 / N
+/// graphs eligible pending the T6-epic naming bridge.
+///
+/// `ignore_label_names=true` (lax): position-aligned Labels compare
+/// equal regardless of name.  Lax-eligible counts measure how many
+/// graphs would land splice-ready once the naming bridge replaces
+/// walker's address-based names with canonical ordinals.
+///
+/// PyPy parity: byte_equivalent => walker emits the same Insn
+/// sequence that `flatten_graph(graph, regallocs, cpu)` would emit
+/// (`flatten.py:63-70`), modulo documented walker deviations.  A
+/// `true` strict result is the gate that lets a follow-up slice
+/// replace walker's `ssarepr.insns` with canonical's at zero behavior
+/// change.
+fn phase4_byte_equivalent(
+    walker_insns: &[super::flatten::Insn],
+    canonical_insns: &[super::flatten::Insn],
+    ignore_label_names: bool,
+) -> bool {
+    let w_filtered = phase4_filter_walker_pyre_only(walker_insns);
+    let c_filtered = phase4_filter_canonical_trampoline(canonical_insns);
+    if w_filtered.len() != c_filtered.len() {
+        return false;
+    }
+    w_filtered
+        .iter()
+        .zip(c_filtered.iter())
+        .all(|(w, c)| phase4_insn_eq(w, c, ignore_label_names))
+}
+
 /// The next-block label is recognised as `Insn::Label(L)`, matching
 /// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
 /// catch-landing labels.  The corresponding `goto TLabel(...)` carries
@@ -9427,7 +9578,17 @@ impl CodeWriter {
             std::env::var("PYRE_PHASE4_BUILD_CANONICAL").ok().as_deref() == Some("1");
         let phase4_diff_canonical =
             std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1");
-        if phase4_build_canonical || phase4_diff_canonical {
+        // Task #229 splice-1: per-graph byte_equivalent audit.  Reports
+        // which graphs are READY for canonical SSARepr swap (production
+        // splice) — when walker and canonical Insn sequences match
+        // modulo pyre-only walker emits and canonical-only trampolines,
+        // the graph is a splice candidate.  No production behavior
+        // change — just `[phase4-splice-audit]` stderr report.  The
+        // actual swap lands in a follow-up slice once audit data shows
+        // a stable byte_equivalent ratio across benches.
+        let phase4_splice_audit =
+            std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
+        if phase4_build_canonical || phase4_diff_canonical || phase4_splice_audit {
             let mut canonical_regallocs = graph_regallocs.clone();
             let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
@@ -9974,6 +10135,37 @@ impl CodeWriter {
                         ssarepr.name,
                     );
                 }
+            }
+            // Task #229 splice-1: per-graph byte_equivalent audit.
+            // `phase4_byte_equivalent` filters pyre-only walker emits
+            // (`-live-` / `ref_copy`) and canonical-only trampoline
+            // Labels, then performs structural equality on the
+            // resulting Insn sequence (Register kind+index, Const
+            // literal values, opname).  PyPy parity: an `eligible=true`
+            // graph emits the same Insn sequence
+            // `flatten.py:63-70 flatten_graph` would emit, modulo the
+            // documented walker deviations — a follow-up slice can
+            // replace `ssarepr.insns` with `canonical_ssarepr.insns`
+            // on these graphs without runtime behavior change.
+            if phase4_splice_audit || phase4_diff_canonical {
+                let eligible_strict =
+                    phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, false);
+                let eligible_lax =
+                    phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, true);
+                let walker_filtered_len =
+                    phase4_filter_walker_pyre_only(&ssarepr.insns).len();
+                let canonical_filtered_len =
+                    phase4_filter_canonical_trampoline(&canonical_ssarepr.insns).len();
+                eprintln!(
+                    "[phase4-splice-audit] graph={} eligible_strict={eligible_strict} \
+                     eligible_lax={eligible_lax} \
+                     walker_filtered_len={walker_filtered_len} \
+                     canonical_filtered_len={canonical_filtered_len} \
+                     walker_raw_len={} canonical_raw_len={}",
+                    ssarepr.name,
+                    ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len(),
+                );
             }
         }
 
