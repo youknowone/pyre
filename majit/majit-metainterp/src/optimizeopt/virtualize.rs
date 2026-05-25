@@ -3052,12 +3052,20 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::Label,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
             ),
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(1)]),
             Op::new(
                 OpCode::Jump,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
             ),
         ];
         ops[1].setfailargs(Default::default());

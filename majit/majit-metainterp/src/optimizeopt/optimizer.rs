@@ -4971,10 +4971,10 @@ mod tests {
         opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
 
         let mut ops = vec![
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_int(0)]),
             Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(4)]),
-            Op::new(OpCode::IntGt, &[OpRef::int_op(5), OpRef::int_op(1)]),
+            Op::new(OpCode::IntGt, &[OpRef::int_op(5), OpRef::input_arg_int(1)]),
         ];
         ops[0].pos.set(OpRef::int_op(3));
         ops[1].pos.set(OpRef::int_op(4));
@@ -5013,10 +5013,10 @@ mod tests {
         }));
 
         let mut ops = vec![
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(1)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntGt, &[OpRef::int_op(3), OpRef::input_arg_int(1)]),
         ];
         ops[0].pos.set(OpRef::int_op(3));
         ops[1].pos.set(OpRef::int_op(4));
@@ -5049,7 +5049,7 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::IntGt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
         )];
         ops[0].pos.set(OpRef::int_op(3));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5073,7 +5073,7 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::IntGt,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
         )];
         ops[0].pos.set(OpRef::int_op(3));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -5099,7 +5099,10 @@ mod tests {
         opt.skip_flush = true;
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
             Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
         ops[0].pos.set(OpRef::int_op(2));
@@ -5214,8 +5217,14 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::unroll::OptUnroll::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5285,8 +5294,14 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5338,8 +5353,14 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -5390,8 +5411,14 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         ops[0].pos.set(OpRef::int_op(66));
         ops[1].pos.set(OpRef::void_op(67));
