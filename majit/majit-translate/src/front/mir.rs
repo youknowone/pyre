@@ -125,15 +125,29 @@ pub fn build_semantic_program_from_llbcs(
     llbcs: &[Llbc],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
-    let mut seen_function_names = std::collections::HashSet::new();
+    // Dedup key is the full qualified path (`{module_path}::{name}` or
+    // just `name` for module-less entries), NOT the bare leaf.  Keying
+    // on the leaf alone collapsed every same-named method across the
+    // pyre-object → pyre-interpreter merge (`Vec::push` dropping
+    // `PyFrame::push`, `Code::new` dropping `Code::new` from the other
+    // crate, …), which surfaced as ≈20 audit gaps in
+    // `audit_ast_extract_coverage` under MIR cutover.
+    let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
+    let dedup_key = |f: &crate::front::semantic::SemanticFunction| -> String {
+        if f.module_path.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{}::{}", f.module_path, f.name)
+        }
+    };
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc(llbc)?;
         match &mut merged {
             None => {
                 for f in &prog.functions {
-                    seen_function_names.insert(f.name.clone());
+                    seen_function_keys.insert(dedup_key(f));
                 }
                 for n in &prog.known_struct_names {
                     seen_struct_names.insert(n.clone());
@@ -145,7 +159,7 @@ pub fn build_semantic_program_from_llbcs(
             }
             Some(acc) => {
                 for f in prog.functions {
-                    if seen_function_names.insert(f.name.clone()) {
+                    if seen_function_keys.insert(dedup_key(&f)) {
                         acc.functions.push(f);
                     }
                 }
