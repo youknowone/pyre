@@ -744,6 +744,17 @@ pub struct OptContext {
     /// the optimizer carries the Box list and reads `.type` per Box.
     /// Populated by `setup_optimizations`; emptied initially.
     pub inputargs: Vec<majit_ir::OpRef>,
+    /// Strong `InputArgRc` ownership for the BoxRefs seeded by
+    /// `with_inputarg_types`. Production traces own their `InputArgRc`s
+    /// via `TreeLoop.inputargs` and re-bind the optimizer's `box_pool`
+    /// via `BoxPool::bind_inputargs`; the test-and-fallback helper
+    /// `with_inputarg_types` has no upstream `TreeLoop`, so it stashes
+    /// fresh `InputArgRc`s here to keep the `Weak<InputArg>` stored
+    /// inside each `BoxRef.inputarg_handle` upgradable. `make_equal_to`
+    /// then routes the chain step through `Forwarded::InputArg(_)`
+    /// (`optimizer.py:394 op.set_forwarded(newop)`) instead of the
+    /// deprecated `Forwarded::Box(_)` fallback.
+    pub(crate) inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -1609,6 +1620,7 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
+            inputarg_refs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1653,10 +1665,25 @@ impl OptContext {
         let mut ctx =
             Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32);
         let mut seed = crate::r#box::BoxPool::with_capacity(inputarg_types.len());
+        let mut refs: Vec<majit_ir::InputArgRc> = Vec::with_capacity(inputarg_types.len());
         for (i, &tp) in inputarg_types.iter().enumerate() {
-            seed.push(crate::r#box::BoxRef::new_inputarg(tp, i as u32));
+            let b = crate::r#box::BoxRef::new_inputarg(tp, i as u32);
+            // Bind each seeded BoxRef to a fresh `InputArgRc` so the
+            // optimizer's `make_equal_to` routes a chain step that
+            // targets one of these BoxRefs through
+            // `Forwarded::InputArg(_)`, matching the production
+            // recorder→TreeLoop handoff invariant
+            // (`BoxPool::bind_inputargs`). The strong `InputArgRc`s
+            // are stashed in `ctx.inputarg_refs` so the bound
+            // `Weak<InputArg>` stays upgradable for the OptContext's
+            // lifetime.
+            let ia = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32));
+            b.bind_inputarg(&ia);
+            seed.push(b);
+            refs.push(ia);
         }
         ctx.box_pool = seed;
+        ctx.inputarg_refs = refs;
         // Mirror the production wiring at `setup_optimizations`
         // (optimizer.rs `ctx.inputargs = self.trace_inputargs.clone()`):
         // seed `ctx.inputargs` in lockstep with the `box_pool` so the
@@ -1736,6 +1763,7 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
+            inputarg_refs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -3545,13 +3573,12 @@ impl OptContext {
             // InputArg-target chain step (compile.py:478, unroll.py:497).
             op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Unbound non-const BoxRef target — only constructible
-            // from test fixtures that build `BoxRef::new_resop` /
-            // `BoxRef::new_inputarg` without calling `bind_op` /
-            // `bind_inputarg`. Production paths bind every BoxRef at
-            // the recorder→TreeLoop handoff. Keep the legacy path for
-            // those callers; migrating each test individually is
-            // C.8's scope.
+            // Unbound non-const BoxRef target — remaining test fixtures
+            // that flow custom BoxRef constructions through
+            // `make_equal_to` without binding. Probe 2026-05-25 (post
+            // with_inputarg_types bind) counts 40 such tests across
+            // heap / pure / unroll / virtualize / jitdriver, migrated
+            // incrementally per [[box-pool-v2 C.6]].
             op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
