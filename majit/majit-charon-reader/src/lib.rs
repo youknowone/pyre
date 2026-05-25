@@ -34,6 +34,20 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct Llbc {
     pub file: LlbcFile,
+    /// `dedup_id → ADT def_id` index built from inline
+    /// `HashConsedValue: [id, body]` occurrences whose body decodes as
+    /// `{"Adt": {"id": {"Adt": <def_id>}}}`.  Sorted by `dedup_id` for
+    /// binary search.  Populated once at parse time.
+    ///
+    /// Consumed by `front::mir::Lowering` to resolve a Charon `Impl`
+    /// segment's `skip_binder: {"Deduplicated": <id>}` reference to
+    /// the receiver type's small `def_id` so `CallTarget::Method` can
+    /// carry the leaf type name.  Without this, an inherent-impl
+    /// method called through `CallTarget::FunctionPath` leaves the
+    /// callee body's `self` arg typed as `SomeInstance(classdef=None)`
+    /// and any `.field` projection on it panics in the annotator
+    /// (`annotator/unaryop.rs:3587`).
+    dedup_adt: Vec<(u64, u64)>,
 }
 
 impl Llbc {
@@ -45,8 +59,32 @@ impl Llbc {
 
     /// Parse a `.llbc` / `.ullbc` artefact from an in-memory byte slice.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, SchemaError> {
-        let file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
-        Ok(Self { file })
+        // Parse to `Value` first so we can scan every nested
+        // `HashConsedValue` entry; then re-deserialize the same JSON
+        // into the typed `LlbcFile`.  Peak memory is ~3× the bytes
+        // (input slice + Value + LlbcFile) but settles back to
+        // LlbcFile + small `dedup_adt` once the Value is dropped.
+        let raw: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
+        collect_dedup_adt(&raw, &mut dedup_adt);
+        dedup_adt.sort_by_key(|&(id, _)| id);
+        dedup_adt.dedup_by_key(|p| p.0);
+        let file: LlbcFile =
+            serde_json::from_value(raw).map_err(SchemaError::Parse)?;
+        Ok(Self { file, dedup_adt })
+    }
+
+    /// Resolve a Charon `Deduplicated: <id>` type reference to the
+    /// underlying ADT `def_id` (suitable for [`Self::type_by_id`]).
+    /// Returns `None` for non-ADT types (primitives, references,
+    /// tuples) and for ids whose inline form never appeared in the
+    /// LLBC.  See the [`Self::dedup_adt`] field doc for context.
+    pub fn dedup_to_adt_def_id(&self, id: u64) -> Option<u64> {
+        self.dedup_adt
+            .binary_search_by_key(&id, |&(d, _)| d)
+            .ok()
+            .map(|i| self.dedup_adt[i].1)
     }
 
     /// Look up a local-crate function whose name ends with `::<name>`.
@@ -132,6 +170,48 @@ impl Llbc {
     pub fn crate_name(&self) -> &str {
         &self.file.translated.crate_name
     }
+}
+
+/// Walk a raw `Value` tree, recording every inline
+/// `HashConsedValue: [id, body]` whose body decodes as an ADT
+/// reference (`{"Adt": {"id": {"Adt": <def_id>}}}`).  Used during
+/// [`Llbc::from_slice`] to build the `dedup_id → adt def_id` index.
+fn collect_dedup_adt(v: &serde_json::Value, out: &mut Vec<(u64, u64)>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(arr) = m
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+                && let Some(id) = arr[0].as_u64()
+                && let Some(def_id) = adt_def_id_from_ty_body(&arr[1])
+            {
+                out.push((id, def_id));
+            }
+            for vv in m.values() {
+                collect_dedup_adt(vv, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for vv in arr {
+                collect_dedup_adt(vv, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Project a type-expression body to its underlying ADT `def_id`,
+/// when the body has shape `{"Adt": {"id": {"Adt": <def_id>}}}`.
+/// Returns `None` for non-ADT bodies (`Literal`, `Ref`, `Tuple`, …).
+fn adt_def_id_from_ty_body(body: &serde_json::Value) -> Option<u64> {
+    body.as_object()?
+        .get("Adt")?
+        .as_object()?
+        .get("id")?
+        .as_object()?
+        .get("Adt")?
+        .as_u64()
 }
 
 /// Errors produced when loading / parsing a `.llbc` artefact.

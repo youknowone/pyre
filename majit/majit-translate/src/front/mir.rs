@@ -88,9 +88,9 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, Operand, Place,
-        PlaceKind, ProjectionElem, Rvalue, StmtKind, SwitchTargets, TermKind, TypeDeclKind,
-        Unstructured,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, NameSeg, Operand,
+        Place, PlaceKind, ProjectionElem, Rvalue, StmtKind, SwitchTargets, TermKind, TyRef,
+        TypeDeclKind, Unstructured,
     },
 };
 
@@ -949,16 +949,47 @@ impl<'a> Lowering<'a> {
                 ))
             }),
             PlaceKind::Projection(inner, elem) => {
-                // The `straight_line_add` shape uses tuple field
-                // projections (`%t.Tuple2_0` for `AddChecked.0`).
-                // We collapse them to the underlying Variable: the
-                // overflow-checked variant returns `(value, bool)`
-                // and reading `.0` of an `AddChecked` result is
-                // morally a plain `BinOp`. This works because we also
-                // *drop* the paired `Assert` on `.1` in
-                // `lower_statement`. Anything more substantial (named
-                // field reads on real ADTs) needs a typed
-                // `FieldRead` and is not yet emitted.
+                // Adt-container `Field` projections emit a typed
+                // `OpKind::FieldRead` so downstream consumers
+                // (codewriter inlining + annotator GetAttr dispatch
+                // on cross-procedural callers like
+                // `flowspace/rust_source/build_flow.rs:4770
+                // lower_field`) see the same field/owner_root shape
+                // the AST front-end emits at `front/ast.rs:4923`.
+                //
+                // Tuple-container `Field` projections still collapse
+                // (the `straight_line_add` / AddChecked `(value,
+                // bool)` shape needs `.0` reads to fall through to
+                // the underlying Variable; the paired `.1` Assert is
+                // dropped in `lower_statement`).
+                //
+                // Atom projections (`Deref` and others) still
+                // collapse: `Deref` is a no-op for typed refs at the
+                // JIT IR level, and any other Atom variant has no
+                // typed analogue today.
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) =
+                        v.as_object().and_then(|m| m.get("Field"))
+                    && let Some((owner_root, field_name, field_ty)) =
+                        self.resolve_adt_field(field_payload)
+                {
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let ty = tyref_to_value_type(&field_ty);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(field_name, Some(owner_root)),
+                            ty,
+                            pure: false,
+                        },
+                    });
+                    return Ok(res);
+                }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
                         self.resolve_place(mir_bb, *inner)
@@ -990,6 +1021,65 @@ impl<'a> Lowering<'a> {
             PlaceKind::Unknown => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: Place::Unknown"
             ))),
+        }
+    }
+
+    /// Resolve a Charon `Field` projection payload to the
+    /// `(owner_root_leaf, field_name, field_ty)` triple suitable for
+    /// `OpKind::FieldRead` emission.
+    ///
+    /// Charon encodes a Field as `[{"Adt": [type_id, variant_idx]}, idx]`
+    /// where `variant_idx` is `null` for structs and the variant
+    /// position for enums.  Returns `None` when:
+    ///
+    /// - the container is not `Adt` (Tuple etc. — caller falls back
+    ///   to the existing collapse-to-base behaviour);
+    /// - the `type_id` is missing from the LLBC's type table
+    ///   (forward-decl / opaque);
+    /// - the resolved TypeDecl is not `Struct(_)` / `Enum(_)`;
+    /// - the field index is out of range for the resolved variant.
+    ///
+    /// The owner_root is the LLBC TypeDecl's leaf name
+    /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
+    /// downstream `struct_fields` registry — populated in
+    /// AST-format by `merge_fn_return_types_from_parsed_files`
+    /// (lib.rs:286) — resolves with the same leaf key.
+    fn resolve_adt_field(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Option<(String, String, TyRef)> {
+        let arr = payload.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let container = arr[0].as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        let type_id = adt.first()?.as_u64()?;
+        let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
+        let field_idx = arr[1].as_u64()? as usize;
+        let td = self.llbc.type_by_id(type_id)?;
+        let owner_root = td
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        match (&td.kind, variant_idx) {
+            (TypeDeclKind::Struct(fields), None) => {
+                let f = fields.get(field_idx)?;
+                let name = f.name.clone().unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let ty = clone_tyref(&f.ty);
+                Some((owner_root, name, ty))
+            }
+            (TypeDeclKind::Enum(variants), Some(vidx)) => {
+                let variant = variants.get(vidx as usize)?;
+                let f = variant.fields.get(field_idx)?;
+                let name = f.name.clone().unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let ty = clone_tyref(&f.ty);
+                Some((owner_root, name, ty))
+            }
+            _ => None,
         }
     }
 
@@ -1119,9 +1209,28 @@ impl<'a> Lowering<'a> {
                 // Charon's "trait-bound generic resolved at extraction
                 // time", which is itself a direct call once the impl
                 // is selected — same OpKind shape as Direct.
-                let segments = self.call_target_segments(mir_bb, &reg.kind)?;
+                //
+                // When the FunDecl's name path encodes an `Impl`
+                // segment whose owner type is resolvable, emit
+                // `CallTarget::Method` instead of `FunctionPath` so the
+                // annotator's `MethodDesc.func_args`
+                // (`annotator/description.rs:2278`) prepends a
+                // classdef-bound `SomeInstance` for `self`.  AST does
+                // the same at `front/ast.rs:5205` for
+                // `syn::Expr::MethodCall`; without it, the callee
+                // body's `self` lands with `classdef=None` and any
+                // `.field` projection on it panics at
+                // `unaryop.rs:3587` (lib test
+                // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
+                let (segments, method_hint) =
+                    self.call_target_segments(mir_bb, &reg.kind)?;
+                let target = if let Some((owner_root, leaf)) = method_hint {
+                    CallTarget::method(leaf, Some(owner_root))
+                } else {
+                    CallTarget::FunctionPath { segments }
+                };
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target,
                     args,
                     result_ty: ValueType::Int,
                 }
@@ -1192,22 +1301,35 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve a Charon `CallKind` to a flattened path segment list the
-    /// codewriter consumes as `CallTarget::FunctionPath`.
+    /// codewriter consumes as `CallTarget::FunctionPath`, plus an
+    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods.
+    ///
+    /// The method hint is `Some` when the FunDecl's raw name segments
+    /// encode an `Impl` block immediately before the leaf `Ident` —
+    /// the standard Charon shape for inherent / trait-impl methods
+    /// (e.g. `pyre_interpreter::pyframe::<Impl>::locals_w_mut`).  The
+    /// caller uses the hint to pick `CallTarget::Method` over
+    /// `CallTarget::FunctionPath` so the annotator can prepend a
+    /// classdef-bound `SomeInstance` for `self`; see the comment at
+    /// the use site in [`Self::lower_call`].
     fn call_target_segments(
         &self,
         mir_bb: usize,
         kind: &CallKind,
-    ) -> Result<Vec<String>, LowerError> {
+    ) -> Result<(Vec<String>, Option<(String, String)>), LowerError> {
         match kind {
             CallKind::Fun(FunId::Regular { id }) => self
                 .llbc
                 .fn_by_id(*id)
                 .map(|fd| {
-                    fd.item_meta
+                    let segments: Vec<String> = fd
+                        .item_meta
                         .name_path()
                         .split("::")
                         .map(|s| s.to_string())
-                        .collect()
+                        .collect();
+                    let method_hint = self.impl_method_owner(fd);
+                    (segments, method_hint)
                 })
                 .ok_or_else(|| {
                     LowerError::Schema(format!(
@@ -1230,7 +1352,7 @@ impl<'a> Lowering<'a> {
             // driver follows for dyn Trait method calls).
             CallKind::Trait(v) => {
                 let label = trait_call_label(v);
-                Ok(vec!["__trait_method".to_string(), label])
+                Ok((vec!["__trait_method".to_string(), label], None))
             }
             CallKind::Ptr(v) => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: CallKind::Ptr not yet supported: {v}"
@@ -1239,6 +1361,115 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: CallKind::Unknown"
             ))),
         }
+    }
+
+    /// Return `(owner_root_leaf, method_leaf)` when the FunDecl's name
+    /// path encodes an impl block (inherent or trait-impl) whose owner
+    /// type is resolvable through the LLBC tables.
+    ///
+    /// Charon serialises an impl method's name as:
+    ///   `[Ident("crate"), Ident("mod"), Other({"Impl": ...}), Ident("method_name")]`
+    /// where the `Impl` segment carries either
+    ///   `{"Ty": {"skip_binder": {"Deduplicated": <type_id>}, "kind": "InherentImplBlock"}}`
+    /// for inherent impls or `{"Trait": <trait_impl_id>}` for trait-impls.
+    /// Trait-impl lookups indirect through the top-level `trait_impls`
+    /// table, kept opaque (`schema::Translated.rest["trait_impls"]`)
+    /// because no other consumer needs it typed.
+    fn impl_method_owner(&self, fd: &FunDecl) -> Option<(String, String)> {
+        let segs = &fd.item_meta.name;
+        let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+        let leaf = match &segs[last_idx] {
+            NameSeg::Ident { ident: (s, _) } => s.clone(),
+            _ => return None,
+        };
+        if last_idx == 0 {
+            return None;
+        }
+        let impl_payload = match &segs[last_idx - 1] {
+            NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+            _ => return None,
+        };
+        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_payload)?;
+        let td = self.llbc.type_by_id(adt_def_id)?;
+        let owner_leaf = td
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if owner_leaf.is_empty() {
+            return None;
+        }
+        Some((owner_leaf, leaf))
+    }
+
+    /// Decode the receiver type's ADT `def_id` from an `Impl` NameSeg
+    /// payload.  Two shapes:
+    ///
+    /// - **InherentImplBlock**: `{"Ty": {"skip_binder": <TyExpr>}}` where
+    ///   `<TyExpr>` is the type expression of `Self` in the impl block.
+    ///   It can be inline (`HashConsedValue: [id, body]`) or
+    ///   deduplicated (`Deduplicated: id`).  When inline, the body
+    ///   carries the ADT def_id directly (`{"Adt": {"id": {"Adt": <def_id>}}}`);
+    ///   when deduplicated, we consult [`Self::dedup_to_adt_def_id`]
+    ///   which lazy-builds a per-LLBC `dedup_id → adt_def_id` index
+    ///   from the inline forms scattered across the LLBC.
+    ///
+    /// - **TraitImplBlock**: `{"Trait": <trait_impl_id>}` — indirect
+    ///   through the opaque `trait_impls` array to find the impl's
+    ///   first concrete type argument, then resolve through the same
+    ///   inline-or-dedup path.
+    fn resolve_impl_owner_adt_def_id(
+        &self,
+        impl_payload: &serde_json::Value,
+    ) -> Option<u64> {
+        let obj = impl_payload.as_object()?;
+        if let Some(ty) = obj.get("Ty") {
+            let sb = ty.as_object()?.get("skip_binder")?;
+            return self.resolve_tyexpr_to_adt_def_id(sb);
+        }
+        if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
+            let trait_impls = self
+                .llbc
+                .file
+                .translated
+                .rest
+                .get("trait_impls")?
+                .as_array()?;
+            let ti = trait_impls.get(trait_impl_id as usize)?;
+            let first_ty = ti
+                .as_object()?
+                .get("impl_trait")?
+                .as_object()?
+                .get("generics")?
+                .as_object()?
+                .get("types")?
+                .as_array()?
+                .first()?;
+            return self.resolve_tyexpr_to_adt_def_id(first_ty);
+        }
+        None
+    }
+
+    /// Resolve a Charon type expression to the underlying ADT
+    /// `def_id`, whether the expression is inline
+    /// (`HashConsedValue: [_, body]`) or deduplicated
+    /// (`Deduplicated: id`).  Returns `None` for non-ADT shapes
+    /// (primitives, references, tuples).
+    fn resolve_tyexpr_to_adt_def_id(&self, ty: &serde_json::Value) -> Option<u64> {
+        let obj = ty.as_object()?;
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && let Some(body) = arr.get(1)
+        {
+            return inline_adt_def_id(body);
+        }
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            return self.llbc.dedup_to_adt_def_id(id);
+        }
+        None
     }
 
     fn lower_switch(
@@ -1339,6 +1570,75 @@ fn aggregate_ctor_name(kind: &serde_json::Value) -> String {
         }
     }
     "ctor".to_string()
+}
+
+/// Project a `HashConsedValue` body to the underlying ADT
+/// `def_id` when the body has shape `{"Adt": {"id": {"Adt": <def_id>}}}`.
+/// Mirrors the reader's private helper used to build
+/// `Llbc::dedup_to_adt_def_id`; reproduced here because the inline
+/// arm of [`Lowering::resolve_tyexpr_to_adt_def_id`] decodes the
+/// same body shape without going through the dedup cache.
+fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
+    body.as_object()?
+        .get("Adt")?
+        .as_object()?
+        .get("id")?
+        .as_object()?
+        .get("Adt")?
+        .as_u64()
+}
+
+/// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
+/// [`Lowering::resolve_adt_field`] when handing the resolved field's
+/// type to [`tyref_to_value_type`].
+fn clone_tyref(ty: &TyRef) -> TyRef {
+    match ty {
+        TyRef::Dedup { id } => TyRef::Dedup { id: *id },
+        TyRef::Inline { value: (id, v) } => TyRef::Inline { value: (*id, v.clone()) },
+        TyRef::Other(v) => TyRef::Other(v.clone()),
+    }
+}
+
+/// Project a Charon [`TyRef`] to the JIT-visible [`ValueType`].
+///
+/// Mirrors AST's `type_string_to_value_type` (front/ast.rs:10310)
+/// surface: numeric scalars → `Int` / `Float`, bool → `Bool`, unit
+/// → `Void`, everything else (structs, pointers, references) →
+/// `Ref`.  The TyRef's serialized form is the source of truth —
+/// `TyRef::label()` produces a compact short form
+/// (`"ty#170"`, `"ty<Adt>"`) for opaque IDs, while the underlying
+/// JSON carries the primitive name for literal types.
+fn tyref_to_value_type(ty: &TyRef) -> ValueType {
+    // The HashConsedValue arm carries the body inline; primitives
+    // typically land here.  The Deduplicated arm carries only an ID
+    // — without resolving through the type-decl table we can't
+    // distinguish a struct ref from a primitive, so fall back to
+    // `Ref` (the same default the projection downstream uses).
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { .. } => return ValueType::Ref,
+    };
+    // Primitive shapes Charon emits inline:
+    //   {"Literal": {"Integer": ...}}  → Int
+    //   {"Literal": {"Bool": null}}    → Bool
+    //   {"Literal": {"Float": ...}}    → Float
+    //   {"Literal": {"Char": null}}    → Int
+    //   {"Adt": [tuple_arity = 0, []]} for `()` → Void
+    if let Some(obj) = value.as_object()
+        && let Some(lit) = obj.get("Literal").and_then(serde_json::Value::as_object)
+    {
+        if lit.contains_key("Integer") || lit.contains_key("Char") {
+            return ValueType::Int;
+        }
+        if lit.contains_key("Bool") {
+            return ValueType::Bool;
+        }
+        if lit.contains_key("Float") {
+            return ValueType::Float;
+        }
+    }
+    ValueType::Ref
 }
 
 /// Stable short label for an [`Rvalue::Aggregate`]'s [`Field`]
