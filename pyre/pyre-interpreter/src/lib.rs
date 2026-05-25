@@ -233,12 +233,17 @@ macro_rules! pyre_count_typed_args {
 #[macro_export]
 macro_rules! py_class {
     (
-        $name:literal,
-        methods: {
+        $name:literal
+        $(, methods: {
             $(
                 fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
             )*
-        }
+        })?
+        $(, properties: {
+            $(
+                fn $pname:ident ( $($pargs:tt)* ) $(-> $pret:ty)? $pbody:block
+            )*
+        })?
         $(,)?
     ) => {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
@@ -249,24 +254,42 @@ macro_rules! py_class {
             CELL.with(|c| {
                 *c.get_or_init(|| {
                     let tp = $crate::typedef::make_builtin_type($name, |ns| {
-                        $(
+                        // `make_builtin_function` (varargs, no arity check) is
+                        // used here rather than `_with_arity` because methods
+                        // with `Option<T>` parameters need to accept calls with
+                        // fewer args (PyPy `def f(self, s=None)`).  The
+                        // `#[pyre_function]` wrapper uses bounds-checked
+                        // `args.len()` for Option arms so missing-arg → None,
+                        // while required args still index `args[N]` directly.
+                        $($(
                             {
                                 #[$crate::pyre_function]
                                 fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                                // `make_builtin_function` (varargs, no arity check) is
-                                // used here rather than `_with_arity` because methods
-                                // with `Option<T>` parameters need to accept calls with
-                                // fewer args (PyPy `def f(self, s=None)`).  The
-                                // `#[pyre_function]` wrapper uses bounds-checked
-                                // `args.len()` for Option arms so missing-arg → None,
-                                // while required args still index `args[N]` directly.
                                 $crate::dict_storage_store(
                                     ns,
                                     stringify!($mname),
                                     $crate::make_builtin_function(stringify!($mname), $mname),
                                 );
                             }
-                        )*
+                        )*)?
+                        // `properties:` — each fn registered as a
+                        // `GetSetProperty` descriptor so `obj.name`
+                        // returns the value directly (PyPy
+                        // `GetSetProperty(W_X.fget_name)`).
+                        $($(
+                            {
+                                #[$crate::pyre_function]
+                                fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
+                                $crate::dict_storage_store(
+                                    ns,
+                                    stringify!($pname),
+                                    $crate::typedef::make_getset_descriptor_named(
+                                        $crate::make_builtin_function(stringify!($pname), $pname),
+                                        stringify!($pname),
+                                    ),
+                                );
+                            }
+                        )*)?
                     });
                     unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
                     tp
