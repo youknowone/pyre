@@ -6083,9 +6083,11 @@ impl CodeWriter {
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
-                    // live_marker_indices_by_pc uses last-wins to resolve
-                    // to op2 so blackhole guard-failure resume lands past
-                    // the merge point.
+                    // `walker_pc_live_marker_pos[py_pc]` accumulates both
+                    // positions; the post-walk resolver in `resolve_walker_pc`
+                    // picks the FIRST per-PC entry whose block contributes
+                    // non-empty content to the final SSARepr, so blackhole
+                    // guard-failure resume lands consistently.
                     if loop_header_pcs.contains(&py_pc) {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
