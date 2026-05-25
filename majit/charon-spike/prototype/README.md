@@ -1,5 +1,17 @@
 # Step 0.4 — Minimal MIR → `FunctionGraph` prototype
 
+> **DELETION CANDIDATE (2026-05-25).**  Step 3's real MIR driver
+> (`majit-translate::front::mir`) supersedes this prototype.  It is
+> retained only as a Step 0.4 reference for the
+> ULLBC-shape-vs-FunctionGraph mapping notes below.  The text
+> snapshots in `expected/` are no longer the canonical regression
+> oracle — `majit-charon-reader::tests::corpus` and
+> `majit-translate::tests::test_mir_frontend` consume the same
+> `corpus.ullbc` directly and are the authoritative checks.  Safe
+> to delete once issue #97's Step 6.F (front::ast retirement)
+> lands; corpus.ullbc + corpus/ + inspect_llbc.py + step1-
+> compatibility.md stay because they have downstream consumers.
+
 A tiny Rust crate that reads `../corpus.ullbc` (Charon's basic-block IR
 for the spike corpus), lowers each function into a `FunctionGraph`-**shaped**
 structure, and prints a stable canonical text form for diffing.

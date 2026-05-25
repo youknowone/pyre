@@ -117,18 +117,21 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 
 /// Issue #97 Step 4.4 — feature-gated SemanticProgram builder cutover.
 ///
-/// When the `mir-frontend` feature is enabled AND the environment
-/// variable `PYRE_MIR_FRONTEND_LLBC` is set to a path of a
-/// Charon-extracted `.ullbc` snapshot, route the build through
-/// [`front::mir::build_semantic_program_from_llbc`]. Otherwise fall
-/// back to the syn-AST builder so partial enablement is a no-op.
+/// When the `mir-frontend` feature is enabled, route the build
+/// through [`front::mir::build_semantic_program_from_llbcs`] using
+/// LLBC artefacts discovered via, in priority order:
 ///
-/// The env-var split (rather than purely cfg) is deliberate: the
-/// `.ullbc` file must exist for the build to succeed, and producing
-/// it requires running Charon out-of-band via
-/// `scripts/extract-llbc.sh`. Letting the env-var gate the actual
-/// switch keeps cargo's default build path working even with the
-/// feature compiled in.
+/// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (colon-separated paths).
+///    Explicit override for CI / test fixtures targeting a specific
+///    LLBC set.
+/// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`
+///    (Step 6.B 2026-05-25).  `scripts/extract-llbc.sh` writes here.
+///    If every expected file exists, MIR cutover engages
+///    automatically.
+///
+/// Falls back to the syn-AST builder when neither source resolves
+/// (Charon not installed, contributor on stable Rust without
+/// LLBC extraction).
 fn build_semantic_program_via_active_frontend(
     parsed_files: &[parse::ParsedInterpreter],
 ) -> front::SemanticProgram {
@@ -140,8 +143,20 @@ fn build_semantic_program_via_active_frontend(
         // (and any future per-crate ullbc) in one env-var.  The
         // single-path form continues to work — it parses as a
         // length-one slice.
-        if let Ok(llbc_paths_var) = std::env::var("PYRE_MIR_FRONTEND_LLBC") {
-            let paths: Vec<&str> = llbc_paths_var.split(':').filter(|s| !s.is_empty()).collect();
+        //
+        // Step 6.B: if the env-var is unset, auto-discover the
+        // canonical workspace LLBC artefacts before falling through
+        // to AST.
+        let resolved_paths: Option<Vec<String>> = std::env::var("PYRE_MIR_FRONTEND_LLBC")
+            .ok()
+            .map(|v| {
+                v.split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .or_else(|| auto_discover_workspace_llbc_paths(parsed_files));
+        if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
                 .iter()
                 .map(|p| {
@@ -184,6 +199,65 @@ fn build_semantic_program_via_active_frontend(
     let _ = parsed_files; // silence unused warning when only AST is reachable
     front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError")
+}
+
+/// Step 6.B: locate the workspace's `build/llbc/` directory and
+/// return paths to the canonical pyre LLBC artefacts when every
+/// expected file is present *and* the caller looks like a
+/// production build (not a test fixture).
+///
+/// Returns `None` when:
+///   - no parsed_file carries a `module_path` (test fixtures use
+///     `parse::parse_source` which leaves `module_path` empty;
+///     production uses `parse::parse_source_with_module`),
+///   - the caller passed fewer than `PROD_PARSED_FILES_FLOOR`
+///     parsed_files (single-source diagnostic),
+///   - any expected artefact is missing (contributor without
+///     Charon installed), or
+///   - the workspace anchoring fails.
+///
+/// The two gates together match the production fingerprint:
+/// `pyre-jit-trace/build.rs:157` calls
+/// `analyze_multiple_pipeline_with_modules` with ≈100 files and a
+/// per-file `module_path`.  Tests via
+/// `analyze_multiple_pipeline_with_config` parse without module
+/// paths and stay below the floor, so auto-discovery does not
+/// silently swap their front-end.
+///
+/// The workspace root is anchored at compile time via
+/// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
+/// resolves up to `<workspace>` via two `..` segments.  The
+/// `scripts/extract-llbc.sh` script writes to the same
+/// `<workspace>/build/llbc/` directory by convention, so the two
+/// halves stay in sync.
+#[cfg(feature = "mir-frontend")]
+fn auto_discover_workspace_llbc_paths(
+    parsed_files: &[parse::ParsedInterpreter],
+) -> Option<Vec<String>> {
+    const PROD_PARSED_FILES_FLOOR: usize = 50;
+    if parsed_files.len() < PROD_PARSED_FILES_FLOOR {
+        return None;
+    }
+    if !parsed_files.iter().any(|p| !p.module_path.is_empty()) {
+        return None;
+    }
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let llbc_dir = workspace_root.join("build").join("llbc");
+    // Canonical production set.  `pyre-module.ullbc` is intentionally
+    // omitted — it is empty in current builds and adds nothing.
+    // `corpus.ullbc` is the charon-spike fixture, not production.
+    const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let mut paths = Vec::with_capacity(REQUIRED.len());
+    for name in REQUIRED {
+        let p = llbc_dir.join(name);
+        if !p.exists() {
+            return None;
+        }
+        paths.push(p.to_string_lossy().into_owned());
+    }
+    Some(paths)
 }
 
 /// Step 4.5.c helper — populate the MIR program's
