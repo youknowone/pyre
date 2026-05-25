@@ -48,6 +48,65 @@ pub mod module;
 pub mod objspace;
 pub mod pyframe;
 
+// ── Declarative builtin-module registration ──
+//
+// `pypy/module/<name>/moduledef.py` declares its surface as a dict
+// literal — `interpleveldefs = { 'name': 'interp_x.func', ... }` — and
+// PyPy's MixedModule machinery walks the dict at import time.  Pyre
+// mirrors that with the `py_module!` macro below: each call expands to
+// a `pub fn init(ns: &mut DictStorage)` that stores every entry via
+// `dict_storage_store`, eliminating the one-line `moduledef.rs` files
+// that previously did nothing but `super::interp_x::register_module(ns)`.
+//
+// The macro is intentionally minimal at the value layer — each entry's
+// RHS is just a `PyObjectRef` expression — so call-site code stays the
+// same as the hand-written `dict_storage_store` calls it replaces.  More
+// PyPy-ish sugars (`function!`, `int_constants!`, cfg-gating) are layered
+// on top in the same module; the core macro stays declarative.
+
+/// PyPy MixedModule-style declarative module registration.
+///
+/// Mirrors `pypy/module/<name>/moduledef.py`:
+///
+/// ```text
+/// class Module(MixedModule):
+///     interpleveldefs = {
+///         'pickle': 'interp_copyreg.pickle',
+///         'dispatch_table': 'space.newdict()',
+///     }
+/// ```
+///
+/// Becomes:
+///
+/// ```ignore
+/// crate::py_module! {
+///     "copyreg",
+///     interpleveldefs: {
+///         "pickle" => crate::make_builtin_function_with_arity(
+///             "pickle", |_| Ok(pyre_object::w_none()), 3),
+///         "dispatch_table" => pyre_object::w_dict_new(),
+///     }
+/// }
+/// ```
+///
+/// The `name:` slot is currently informational — `importing.rs` still
+/// owns the module-name -> init-fn map.  A follow-up may use it to drive
+/// an inventory-style auto-registration.
+#[macro_export]
+macro_rules! py_module {
+    (
+        $name:literal,
+        interpleveldefs: { $($key:literal => $value:expr),* $(,)? } $(,)?
+    ) => {
+        pub fn init(ns: &mut $crate::DictStorage) {
+            let _name = $name;
+            $(
+                $crate::dict_storage_store(ns, $key, $value);
+            )*
+        }
+    };
+}
+
 // ── Re-exports ──
 pub use baseobjspace::*;
 pub use builtins::*;

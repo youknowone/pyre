@@ -2379,11 +2379,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = loop {
                     let r = unsafe {
-                        libc::accept(
-                            fd,
-                            &mut storage as *mut _ as *mut libc::sockaddr,
-                            &mut slen,
-                        )
+                        libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
                     };
                     if r >= 0 {
                         break r;
@@ -2424,11 +2420,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                 let mut slen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let cfd = loop {
                     let r = unsafe {
-                        libc::accept(
-                            fd,
-                            &mut storage as *mut _ as *mut libc::sockaddr,
-                            &mut slen,
-                        )
+                        libc::accept(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut slen)
                     };
                     if r >= 0 {
                         break r;
@@ -3039,14 +3031,11 @@ fn init_socket_type(ns: &mut DictStorage) {
         "recvmsg_into",
         crate::make_builtin_function("recvmsg_into", |args| {
             if args.len() < 2 {
-                return Err(crate::PyError::type_error(
-                    "recvmsg_into() missing buffers",
-                ));
+                return Err(crate::PyError::type_error("recvmsg_into() missing buffers"));
             }
             let seq = args[1];
-            let (is_list, is_tuple) = unsafe {
-                (pyre_object::is_list(seq), pyre_object::is_tuple(seq))
-            };
+            let (is_list, is_tuple) =
+                unsafe { (pyre_object::is_list(seq), pyre_object::is_tuple(seq)) };
             if !is_list && !is_tuple {
                 return Err(crate::PyError::type_error(
                     "recvmsg_into: buffers must be a list or tuple of bytearray",
@@ -3158,8 +3147,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                         }
                         let payload_len = total - hdr_size;
                         let payload_ptr = libc::CMSG_DATA(cmsg);
-                        let payload =
-                            std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                        let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
                         anc_items.push(pyre_object::w_tuple_new(vec![
                             pyre_object::w_int_new(header.cmsg_level as i64),
                             pyre_object::w_int_new(header.cmsg_type as i64),
@@ -3601,9 +3589,7 @@ fn init_socket_type(ns: &mut DictStorage) {
                         }
                     };
                     if v < 0.0 {
-                        return Err(crate::PyError::value_error(
-                            "Timeout value out of range",
-                        ));
+                        return Err(crate::PyError::value_error("Timeout value out of range"));
                     }
                     v
                 };

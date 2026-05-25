@@ -113,11 +113,11 @@ pub fn install_builtin_modules() {
     // PyPy: these are all implemented as mixed modules under pypy/module/.
     register_builtin_module("_weakref", crate::module::_weakref::moduledef::init);
     register_builtin_module("_abc", crate::module::_abc::moduledef::init);
-    register_builtin_module("_functools", crate::module::_functools::moduledef::init);
+    register_builtin_module("_functools", crate::module::_functools::init);
     register_builtin_module("_thread", crate::module::_thread::moduledef::init);
     register_builtin_module("itertools", crate::module::itertools::moduledef::init);
     register_builtin_module("_contextvars", crate::module::_contextvars::moduledef::init);
-    register_builtin_module("copyreg", crate::module::copyreg::moduledef::init);
+    register_builtin_module("copyreg", crate::module::copyreg::init);
     register_builtin_module("_codecs", crate::module::_codecs::moduledef::init);
     register_builtin_module("posix", crate::module::posix::moduledef::init);
     register_builtin_module("errno", crate::module::errno::moduledef::init);
