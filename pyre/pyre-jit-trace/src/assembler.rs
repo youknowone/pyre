@@ -114,6 +114,10 @@ pub fn publish_state(
         asm.all_liveness.extend_from_slice(all_liveness);
         asm.all_liveness_length = all_liveness_length;
         asm.num_liveness_ops = num_liveness_ops;
+        // The dedup table is keyed by offsets into the previous
+        // all_liveness buffer; clear it so subsequent intern_liveness
+        // lookups cannot reuse stale offsets against the fresh buffer.
+        asm.all_liveness_positions.clear();
     });
     crate::state::publish_liveness_info(all_liveness.to_vec());
 }
