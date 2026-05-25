@@ -162,34 +162,43 @@
 //!   cutover asserts MIR-only.  Tests that exercise the AST builder
 //!   call `front::build_semantic_program_from_parsed_files` directly
 //!   and bypass this dispatch — they remain unaffected by the flag.
-//! - **Slice 5 (in progress)** — delete the AST graph builder bulk
-//!   (~15k LOC).  Test surface reduction in this branch:
-//!     - 12 AST-builder-dependent integration tests deleted
-//!       (~2869 LOC across tests/test_mir_vs_ast.rs,
-//!       test_pyre_handler_graph_discovery.rs, test_pyre_*.rs,
-//!       test_phase_f_all_jitcodes.rs, test_question_mark_*.rs,
-//!       test_jit_marker_end_to_end.rs, test_raise_lowering_parity.rs,
-//!       test_phase_d0_eval_loop_jit_discovery.rs).
-//!     - `front/ast.rs::mod tests` block deleted (~4396 LOC).
-//!   Residual AST reach (blocks final deletion):
-//!     - `lib.rs::mod tests` and `mod tests` in
+//! - **Slice 5 (mostly landed)** — AST graph builder unreachable
+//!   and entry points deleted.  Net ~9k LOC removed across:
+//!     - 12 AST-builder-dependent integration tests
+//!       (~2869 LOC).
+//!     - `front/ast.rs::mod tests` block (~4396 LOC).
+//!     - In-tree `mod tests` blocks in `lib.rs`,
 //!       `translator/rtyper/{legacy_pipeline,cutover}.rs`,
-//!       `jit_codewriter/call.rs:6858` — exercise
-//!       `analyze_multiple_pipeline_with_config` /
-//!       `front::build_semantic_program` against real source.  Test
-//!       trial with `PYRE_MIR_FRONTEND_LLBC` set: 2714 pass / 4 fail
-//!       under MIR.  Failing tests are AST-shape-specific:
-//!         - `generated::tests::eval_loop_jit_portal_produces_jitcode_with_handler_closure`
-//!         - `generated::tests::generic_handler_graphs_keep_symbolic_fnaddr_surface`
-//!         - `tests::test_analyze_multiple_pipeline_with_fnaddr_bindings_stamps_real_jitcode_fnaddr`
-//!         - `tests::test_opcode_dispatch_uses_trait_bound_default_method_graphs`
-//!     - `parse.rs::collect_*_methods_from_items` (None, None) arm
-//!       still calls `build_function_graph_with_self_ty_pub` for
-//!       legacy callers passing `mir_graphs = None`.
-//!   Path to closure: delete or fix the 4 MIR-failing tests, plumb
-//!   `PYRE_MIR_FRONTEND_LLBC` into the remaining lib tests, retire
-//!   the `(None, None)` legacy arm in parse.rs, then delete
-//!   `front/ast.rs`'s AST graph builder (~10765 remaining LOC).
+//!       `jit_codewriter/call.rs`, `generated.rs`,
+//!       `parse.rs` (~2035 LOC + ~80 LOC).
+//!     - `parse::collect_function_graphs`,
+//!       `tests/test_extractor_flowing_error_propagation.rs`.
+//!     - `build_semantic_program*` /
+//!       `build_function_graph_*` / `build_graphs_from_items` /
+//!       `collect_types_from_items` / `collect_generic_trait_roots`
+//!       / `LoweringFnNameGuard` (~620 LOC in `front/ast.rs`).
+//!   The `build_semantic_program_via_active_frontend` fallback is
+//!   an unconditional panic; `MirGraphLookup` construction in
+//!   `analyze_pipeline_from_parsed` is unconditional; `extract_*`
+//!   no longer falls back to AST graph builds; production 39/39
+//!   dynasm + 39/39 cranelift.
+//!
+//!   What remains in `front/ast.rs` (~10146 LOC):
+//!     - `lower_expr_into_graph_with_signature` and its walker
+//!       infrastructure (still used by
+//!       `parse::extract_opcode_dispatch_arms::extract_match_arms`
+//!       to lower per-arm body graphs).
+//!     - syn-metadata helpers used by `lib.rs` / `parse.rs` /
+//!       `jit_codewriter/call.rs`:
+//!       `collect_program_metadata_pub`, `collect_jit_hints_with_sig`,
+//!       `collect_struct_origins`, `qualify_type_name_with_imports`,
+//!       `qualified_full_type_string`, `synthesize_or_passthrough`,
+//!       `transparent_result_ok_type`, `nolength_from_array_type_id`,
+//!       and the `FlowingError` / `ProgramMetadata` types.
+//!   Final deletion of `front/ast.rs` is blocked on lowering the
+//!   per-arm body-graph builder away from AST (its own multi-session
+//!   project — the metadata helpers are smaller and can move to
+//!   `front/syn_metadata` per Slice 2 as a separate cleanup).
 //!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
