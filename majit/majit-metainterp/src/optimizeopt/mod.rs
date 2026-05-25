@@ -7344,6 +7344,7 @@ mod boxref_forwarding_tests {
     use crate::r#box::{BoxRef, Forwarded as BoxForwarded};
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
+    use majit_ir::resoperation::{Op, OpCode, OpRc};
     use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
 
     /// Create a `BoxRef::new_inputarg(tp, index)` already bound to a fresh
@@ -7357,6 +7358,29 @@ mod boxref_forwarding_tests {
         let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
         b.bind_inputarg(&ia);
         (b, ia)
+    }
+
+    /// Create a `BoxRef::new_resop(tp, position)` already bound to a fresh
+    /// `OpRc` (`box_ref.rs:322 bind_op`), matching the
+    /// recorder→TreeLoop handoff for `AbstractResOp` BoxRefs. The Op's
+    /// `pos` is seeded to a typed OpRef matching `(position, tp)` so
+    /// `BoxRef::from_bound_op` (`box_ref.rs:226`) materialises a
+    /// transient terminal box of the same type during chain walks.
+    /// `OpCode::SameAsI/F/R` is a no-op placeholder result for the
+    /// requested type (`resoperation.py:600+`); `Type::Void` lands on
+    /// `OpCode::Guard` which has Void result.
+    fn bound_resop_box(tp: Type, position: u32) -> (BoxRef, OpRc) {
+        let b = BoxRef::new_resop(tp, position);
+        let opcode = match tp {
+            Type::Int => OpCode::SameAsI,
+            Type::Float => OpCode::SameAsF,
+            Type::Ref => OpCode::SameAsR,
+            Type::Void => OpCode::Jump,
+        };
+        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        op.pos.set(OpRef::op_typed(position, tp));
+        b.bind_op(&op);
+        (b, op)
     }
 
     fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef, Vec<InputArgRc>) {
@@ -7659,10 +7683,10 @@ mod boxref_forwarding_tests {
         // so place Ref-typed boxes on both sides — the test models a
         // Phase 1 RefOp result acting as the import target.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 4, 0, 4);
-        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 0);
-        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 1);
-        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 2);
-        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 3);
+        let (placeholder_target, _op_target) = bound_resop_box(Type::Ref, 0);
+        let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
+        let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
+        let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
         ctx.box_pool = vec![
             placeholder_target.clone(),
             placeholder_other,
@@ -7733,10 +7757,10 @@ mod boxref_forwarding_tests {
         // Same Ref-typed alignment as the sibling test: forwarding a Ref
         // source to the placeholder requires placeholder type to match
         // (PyPy `box.type` invariant; `make_equal_to` cross-type assertion).
-        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 0);
-        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Ref, 1);
-        let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 2);
-        let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 3);
+        let (placeholder_target, _op_target) = bound_resop_box(Type::Ref, 0);
+        let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
+        let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
+        let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
         ctx.box_pool = vec![
             placeholder_target.clone(),
             placeholder_other,
@@ -8254,9 +8278,9 @@ mod boxref_forwarding_tests {
     #[test]
     fn chain_walk_preserves_ptr_info_rc_identity_across_two_hops() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 3, 0, 3);
-        let a = BoxRef::new_inputarg(Type::Ref, 0);
-        let b = BoxRef::new_inputarg(Type::Ref, 1);
-        let c = BoxRef::new_inputarg(Type::Ref, 2);
+        let (a, _ia_a) = bound_inputarg_box(Type::Ref, 0);
+        let (b, _ia_b) = bound_inputarg_box(Type::Ref, 1);
+        let (c, _ia_c) = bound_inputarg_box(Type::Ref, 2);
         ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
         ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
@@ -8286,8 +8310,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Int, 0);
-        let new_box = BoxRef::new_inputarg(Type::Int, 1);
+        let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
+        let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.setintbound(
             &old_box,
@@ -8323,8 +8347,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Ref, 0);
-        let new_box = BoxRef::new_inputarg(Type::Ref, 1);
+        let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
+        let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
@@ -8358,8 +8382,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Int, 0);
-        let new_box = BoxRef::new_inputarg(Type::Int, 1);
+        let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
+        let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.setintbound(
             &old_box,
@@ -8382,8 +8406,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let old_box = BoxRef::new_inputarg(Type::Ref, 0);
-        let new_box = BoxRef::new_inputarg(Type::Ref, 1);
+        let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
+        let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
         ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
