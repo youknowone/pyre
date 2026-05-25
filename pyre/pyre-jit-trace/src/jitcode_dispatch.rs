@@ -3127,6 +3127,17 @@ fn try_fold_pure_call_via_executor(
     // pyjitpl.py:1960-1993 `_build_allboxes`: slot 0 is funcbox, slots
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
     // [`build_allboxes`] preserves the same layout.
+    //
+    // pyjitpl.py:1352 invariant: `_record_helper_pure` requires
+    // `funcbox` to be a Const so its `getint()` is the actual fn
+    // pointer.  Non-constant funcboxes carry a stale-stamped Int
+    // (from `cast_ptr_to_int` of a Ref-bank receiver, etc.) and
+    // dereferencing as a code address yields SIGSEGV.  Skip the fold
+    // when the funcbox is non-constant; the recorded `CallPure*` op
+    // stays in the trace for the optimizer to consume later.
+    if !allboxes[0].is_constant() {
+        return;
+    }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
@@ -8200,8 +8211,7 @@ mod tests {
                     op.pc, op.next_pc, op.key, operand_bytes,
                 );
                 if op.key.starts_with("inline_call_") {
-                    let didx =
-                        u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as usize;
+                    let didx = u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as usize;
                     if let Some(d) = descrs.get(didx) {
                         let s = format!("{:?}", d);
                         if let Some(sub_idx) = extract_sub_index(&s) {
@@ -8220,7 +8230,9 @@ mod tests {
                     }
                 } else if op.key.starts_with("residual_call_") {
                     let descr_byte_offset = op.next_pc - 3;
-                    let didx = u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]]) as usize;
+                    let didx =
+                        u16::from_le_bytes([code[descr_byte_offset], code[descr_byte_offset + 1]])
+                            as usize;
                     if let Some(d) = descrs.get(didx) {
                         let cd = d.as_calldescr();
                         let ei = &cd.extra_info;

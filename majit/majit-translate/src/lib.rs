@@ -807,12 +807,8 @@ fn analyze_pipeline_from_parsed(
         for hint in &method_info.hints {
             match hint.as_str() {
                 "elidable" => call_control.mark_elidable(path.clone()),
-                "elidable_cannot_raise" => {
-                    call_control.mark_cannot_raise_assertion(path.clone())
-                }
-                "elidable_or_memerror" => {
-                    call_control.mark_memerror_only_assertion(path.clone())
-                }
+                "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
+                "elidable_or_memerror" => call_control.mark_memerror_only_assertion(path.clone()),
                 "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
                 "close_stack" => call_control.mark_close_stack(path.clone()),
                 "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
@@ -904,12 +900,8 @@ fn analyze_pipeline_from_parsed(
                 }
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(p.clone()),
-                    "elidable_cannot_raise" => {
-                        call_control.mark_cannot_raise_assertion(p.clone())
-                    }
-                    "elidable_or_memerror" => {
-                        call_control.mark_memerror_only_assertion(p.clone())
-                    }
+                    "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
+                    "elidable_or_memerror" => call_control.mark_memerror_only_assertion(p.clone()),
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(p.clone()),

@@ -3609,9 +3609,25 @@ impl CallControl {
 
     /// Pyre extension: check if `target` carries the
     /// `#[elidable_cannot_raise]` assertion.
+    ///
+    /// Additionally requires the target's fnaddr to be registered via
+    /// `register_function_fnaddr`.  Without a real fnaddr,
+    /// `fnaddr_for_target` returns a synthetic 64-bit hash via
+    /// [`symbolic_fnaddr_for_path`]; that hash lands in the sub-jitcode
+    /// `constants_i` slot for the funcbox.  When the walker observes
+    /// `EF_ELIDABLE_CANNOT_RAISE` on the descr it routes through
+    /// `try_fold_pure_call_via_executor`
+    /// (pyre-jit-trace/src/jitcode_dispatch.rs:3099) which dereferences
+    /// the constant_i as a C function pointer — SIGSEGV on the hash.
+    /// Pyre's symbolic placeholder is a NEW-DEVIATION vs RPython (where
+    /// every callee has a real `MixLevelHelperAnnotator.constfunc(impl)`
+    /// address); the gate restores the upstream-equivalent invariant
+    /// that `EF_ELIDABLE_CANNOT_RAISE` callees are always executable.
     pub fn has_cannot_raise_assertion(&self, target: &CallTarget) -> bool {
-        self.target_to_path(target)
-            .is_some_and(|p| self.cannot_raise_assertion_targets.contains(&p))
+        self.target_to_path(target).is_some_and(|p| {
+            self.cannot_raise_assertion_targets.contains(&p)
+                && self.function_fnaddrs.contains_key(&p)
+        })
     }
 
     /// Pyre extension: register a target as carrying the
@@ -3622,9 +3638,17 @@ impl CallControl {
 
     /// Pyre extension: check if `target` carries the
     /// `#[elidable_or_memerror]` assertion.
+    ///
+    /// Same fnaddr-registration gate as
+    /// [`Self::has_cannot_raise_assertion`]: `EF_ELIDABLE_OR_MEMORYERROR`
+    /// walker arms also route through the executor fold path when the
+    /// caller has no MemoryError stamping, so a symbolic placeholder
+    /// would crash there too.
     pub fn has_memerror_only_assertion(&self, target: &CallTarget) -> bool {
-        self.target_to_path(target)
-            .is_some_and(|p| self.memerror_only_assertion_targets.contains(&p))
+        self.target_to_path(target).is_some_and(|p| {
+            self.memerror_only_assertion_targets.contains(&p)
+                && self.function_fnaddrs.contains_key(&p)
+        })
     }
 
     /// RPython: call.py:240 — check if target has `_jit_loop_invariant_`.
