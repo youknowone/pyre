@@ -372,6 +372,17 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
 /// outside the canonical layout (synthesized files, fixtures) keep
 /// the simple-name registration.
 fn module_path_from_source_file(path: &str) -> String {
+    // Windows `WalkDir` yields native paths with `\` separators; the marker
+    // search + `/lib` / `/mod` suffix strips + final `/` → `::` rewrite
+    // below all assume forward slashes, so an unnormalised Windows path
+    // falls into the `rfind` `None` branch and every source file ends up
+    // with an empty `module_path`.  Empty module paths skip
+    // `register_struct_origins` (`lib.rs:374-382`), which breaks
+    // classdef-keyed method resolution downstream and silently drops
+    // graphs from the analyzer — surfacing later as missing opcodes in
+    // `pipeline.insns` (e.g. `setfield_vable_i/rid`).
+    let normalized_path = path.replace('\\', "/");
+    let path = normalized_path.as_str();
     let marker = "/src/";
     let Some(idx) = path.rfind(marker) else {
         return String::new();
