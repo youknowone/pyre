@@ -215,6 +215,24 @@ fn build_semantic_program_via_active_frontend(
         }
     }
     let _ = parsed_files; // silence unused warning when only AST is reachable
+    // Slice 4: production opt-in assertion.  Setting
+    // `PYRE_REQUIRE_MIR_FRONTEND=1` makes the AST fallback panic so
+    // any production build that fails to resolve LLBC surfaces the
+    // misconfiguration immediately instead of silently downgrading
+    // to the syn-AST front-end.  Tests that exercise the AST builder
+    // directly call `front::build_semantic_program_from_parsed_files`
+    // and bypass this dispatch, so they stay unaffected.
+    if std::env::var("PYRE_REQUIRE_MIR_FRONTEND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        panic!(
+            "PYRE_REQUIRE_MIR_FRONTEND=1 set but no LLBC source resolved.\n\
+             Run `scripts/extract-llbc.sh` to produce \
+             `build/llbc/{{pyre-object,pyre-interpreter}}.ullbc`, \
+             or set `PYRE_MIR_FRONTEND_LLBC=path1:path2:...` explicitly."
+        );
+    }
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
     (program, ActiveFrontend::Ast)
