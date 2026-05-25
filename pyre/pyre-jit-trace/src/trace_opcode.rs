@@ -7330,9 +7330,16 @@ impl MIFrame {
                 // remains disabled here until multi-frame walker
                 // snapshots land; route every opcode through trait
                 // dispatch so the snapshot encoder sees a fully formed
-                // framestack at every guard.
-                let shadow_outcome =
-                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                // framestack at every guard.  Shadow validation is gated
+                // the same way: `shadow_validate_pre` runs the symbolic
+                // walker, which captures a single-frame snapshot under
+                // `MAJIT_SHADOW_WALKER=1` and would diverge from the
+                // trait dispatcher's multi-frame view in inline frames.
+                let shadow_outcome = if self.parent_frames.is_empty() {
+                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg)
+                } else {
+                    None
+                };
                 let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
                 if result.is_ok() {
                     if let Some(outcome) = shadow_outcome {
