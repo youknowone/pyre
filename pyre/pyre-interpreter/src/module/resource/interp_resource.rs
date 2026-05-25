@@ -1,8 +1,44 @@
-//! resource implementation — derived from Modules/resource.c (CPython).
+//! resource implementation — `lib_pypy/resource.py`.
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::DictStorage;
+
+thread_local! {
+    /// `lib_pypy/resource.py:15-37 class struct_rusage(
+    /// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
+    /// type.
+    static STRUCT_RUSAGE_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+fn struct_rusage_type() -> pyre_object::PyObjectRef {
+    STRUCT_RUSAGE_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "resource.struct_rusage",
+                &[
+                    "ru_utime",
+                    "ru_stime",
+                    "ru_maxrss",
+                    "ru_ixrss",
+                    "ru_idrss",
+                    "ru_isrss",
+                    "ru_minflt",
+                    "ru_majflt",
+                    "ru_nswap",
+                    "ru_inblock",
+                    "ru_oublock",
+                    "ru_msgsnd",
+                    "ru_msgrcv",
+                    "ru_nsignals",
+                    "ru_nvcsw",
+                    "ru_nivcsw",
+                ],
+            )
+        })
+    })
+}
 
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level
 /// via `_resource_cffi`).  pyre takes CPython's `Modules/resource.c`
@@ -17,33 +53,32 @@ pub fn register_module(ns: &mut DictStorage) {
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");
     crate::dict_storage_store(ns, "error", w_os_error);
-    crate::dict_storage_store(
-        ns,
-        "struct_rusage",
-        crate::typedef::make_builtin_type("resource.struct_rusage", |_| {}),
-    );
+    crate::dict_storage_store(ns, "struct_rusage", struct_rusage_type());
     // ── struct_rusage tuple (16-field layout matches CPython) ──
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
         let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
-        pyre_object::w_tuple_new(vec![
-            pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),
-            pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)),
-            pyre_object::w_int_new(r.ru_maxrss as i64),
-            pyre_object::w_int_new(r.ru_ixrss as i64),
-            pyre_object::w_int_new(r.ru_idrss as i64),
-            pyre_object::w_int_new(r.ru_isrss as i64),
-            pyre_object::w_int_new(r.ru_minflt as i64),
-            pyre_object::w_int_new(r.ru_majflt as i64),
-            pyre_object::w_int_new(r.ru_nswap as i64),
-            pyre_object::w_int_new(r.ru_inblock as i64),
-            pyre_object::w_int_new(r.ru_oublock as i64),
-            pyre_object::w_int_new(r.ru_msgsnd as i64),
-            pyre_object::w_int_new(r.ru_msgrcv as i64),
-            pyre_object::w_int_new(r.ru_nsignals as i64),
-            pyre_object::w_int_new(r.ru_nvcsw as i64),
-            pyre_object::w_int_new(r.ru_nivcsw as i64),
-        ])
+        crate::structseq::new_instance(
+            struct_rusage_type(),
+            vec![
+                pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),
+                pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)),
+                pyre_object::w_int_new(r.ru_maxrss as i64),
+                pyre_object::w_int_new(r.ru_ixrss as i64),
+                pyre_object::w_int_new(r.ru_idrss as i64),
+                pyre_object::w_int_new(r.ru_isrss as i64),
+                pyre_object::w_int_new(r.ru_minflt as i64),
+                pyre_object::w_int_new(r.ru_majflt as i64),
+                pyre_object::w_int_new(r.ru_nswap as i64),
+                pyre_object::w_int_new(r.ru_inblock as i64),
+                pyre_object::w_int_new(r.ru_oublock as i64),
+                pyre_object::w_int_new(r.ru_msgsnd as i64),
+                pyre_object::w_int_new(r.ru_msgrcv as i64),
+                pyre_object::w_int_new(r.ru_nsignals as i64),
+                pyre_object::w_int_new(r.ru_nvcsw as i64),
+                pyre_object::w_int_new(r.ru_nivcsw as i64),
+            ],
+        )
     }
     crate::dict_storage_store(
         ns,
@@ -165,8 +200,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     // covers the two concrete sequence shapes callers
                     // actually use).
                     let (w_soft, w_hard) = unsafe {
-                        if pyre_object::is_tuple(args[1])
-                            && pyre_object::w_tuple_len(args[1]) == 2
+                        if pyre_object::is_tuple(args[1]) && pyre_object::w_tuple_len(args[1]) == 2
                         {
                             (
                                 pyre_object::w_tuple_getitem(args[1], 0).unwrap(),

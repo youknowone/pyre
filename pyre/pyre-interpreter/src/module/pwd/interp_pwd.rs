@@ -4,6 +4,30 @@
 
 use crate::DictStorage;
 
+#[cfg(unix)]
+thread_local! {
+    /// `app_pwd.py:3-19 class struct_passwd(metaclass=structseqtype)`.
+    /// Process-wide cached subclass-of-tuple type so every getpwuid /
+    /// getpwnam / getpwall result materialises into the same structseq.
+    static STRUCT_PASSWD_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+#[cfg(unix)]
+fn struct_passwd_type() -> pyre_object::PyObjectRef {
+    STRUCT_PASSWD_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "pwd.struct_passwd",
+                &[
+                    "pw_name", "pw_passwd", "pw_uid", "pw_gid", "pw_gecos", "pw_dir",
+                    "pw_shell",
+                ],
+            )
+        })
+    })
+}
+
 /// `interp_pwd.py:50-73 uid_converter` — narrow a python int to `uid_t`.
 ///
 /// `-1` is the "current uid" sentinel and passes through unchanged
@@ -56,15 +80,18 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 pub fn register_module(ns: &mut DictStorage) {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&pw.name),
-            pyre_object::w_str_new(&pw.passwd),
-            pyre_object::w_int_new(pw.uid as i64),
-            pyre_object::w_int_new(pw.gid as i64),
-            pyre_object::w_str_new(&pw.gecos),
-            pyre_object::w_str_new(&pw.dir),
-            pyre_object::w_str_new(&pw.shell),
-        ])
+        crate::structseq::new_instance(
+            struct_passwd_type(),
+            vec![
+                pyre_object::w_str_new(&pw.name),
+                pyre_object::w_str_new(&pw.passwd),
+                pyre_object::w_int_new(pw.uid as i64),
+                pyre_object::w_int_new(pw.gid as i64),
+                pyre_object::w_str_new(&pw.gecos),
+                pyre_object::w_str_new(&pw.dir),
+                pyre_object::w_str_new(&pw.shell),
+            ],
+        )
     }
     // `interp_pwd.py:75-87 make_struct_passwd` libc backend, used when
     // the host_env abstraction layer is disabled.  Mirrors the same
@@ -78,20 +105,22 @@ pub fn register_module(ns: &mut DictStorage) {
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         }
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&cstr((*pw).pw_name)),
-            pyre_object::w_str_new(&cstr((*pw).pw_passwd)),
-            pyre_object::w_int_new((*pw).pw_uid as i64),
-            pyre_object::w_int_new((*pw).pw_gid as i64),
-            pyre_object::w_str_new(&cstr((*pw).pw_gecos)),
-            pyre_object::w_str_new(&cstr((*pw).pw_dir)),
-            pyre_object::w_str_new(&cstr((*pw).pw_shell)),
-        ])
+        crate::structseq::new_instance(
+            struct_passwd_type(),
+            vec![
+                pyre_object::w_str_new(&cstr((*pw).pw_name)),
+                pyre_object::w_str_new(&cstr((*pw).pw_passwd)),
+                pyre_object::w_int_new((*pw).pw_uid as i64),
+                pyre_object::w_int_new((*pw).pw_gid as i64),
+                pyre_object::w_str_new(&cstr((*pw).pw_gecos)),
+                pyre_object::w_str_new(&cstr((*pw).pw_dir)),
+                pyre_object::w_str_new(&cstr((*pw).pw_shell)),
+            ],
+        )
     }
-    // `app_pwd.py:1-21` — `pwd.struct_passwd` / `pwd.struct_pwent`.
-    let struct_passwd_type = crate::typedef::make_builtin_type("pwd.struct_passwd", |_| {});
-    crate::dict_storage_store(ns, "struct_passwd", struct_passwd_type);
-    crate::dict_storage_store(ns, "struct_pwent", struct_passwd_type);
+    // `app_pwd.py:1-21 class struct_passwd(metaclass=structseqtype)`.
+    crate::dict_storage_store(ns, "struct_passwd", struct_passwd_type());
+    crate::dict_storage_store(ns, "struct_pwent", struct_passwd_type());
     crate::dict_storage_store(
         ns,
         "getpwuid",
