@@ -882,13 +882,24 @@ fn phase4_scan_color_budget_violations(
     violations
 }
 
-/// Phase 4 #229 splice helper: filter pyre-only walker emits so the
-/// resulting sequence can be compared to canonical SSARepr for byte-
-/// equivalence.  `-live-` is walker NEW DEVIATION (canonical emits
-/// 0-or-1 per graph, walker emits per-PC); `ref_copy` is walker's
-/// slot-keyed stack/local mirror that canonical defers to
-/// `flatten.py:306-334 insert_renamings` link-rewrites.
-fn phase4_filter_walker_pyre_only(
+/// Phase 4 #229 splice helper: filter pyre-only walker emits + canonical
+/// trampoline Labels so the resulting sequence is comparable for byte
+/// equivalence.  Applied symmetrically to both walker and canonical:
+///
+/// - `-live-` per `liveness.py:5-12` — walker emits per Python PC (NEW
+///   DEVIATION); canonical emits 0-or-1 per graph from
+///   `flatten.py:259, 285` bare-live insertion.  Either way, the
+///   liveness pass collapses adjacent markers, so per-PC emit
+///   alignment is not required at compare time.
+/// - `ref_copy` per `flatten.py:319-333 insert_renamings` — walker
+///   emits slot-keyed stack/local mirrors at emit time; canonical
+///   emits them at link rewrite time.  Both express the same renaming
+///   semantics.
+/// - `Label("link*")` per `flatten.py:306-334 insert_renamings` + ε.3
+///   slice — canonical synthesises a trampoline Label per multi-pred
+///   link rewrite; walker handles the same renaming inline.  Block
+///   Labels (`Label("block*")`) and catch-landing Labels survive.
+fn phase4_filter_compare_eligible(
     insns: &[super::flatten::Insn],
 ) -> Vec<&super::flatten::Insn> {
     insns
@@ -897,21 +908,6 @@ fn phase4_filter_walker_pyre_only(
             super::flatten::Insn::Op { opname, .. } => {
                 opname.as_str() != super::flatten::OPNAME_LIVE && opname.as_str() != "ref_copy"
             }
-            _ => true,
-        })
-        .collect()
-}
-
-/// Phase 4 #229 splice helper: filter canonical's per-link trampoline
-/// `Label("link*")` entries (per `flatten.py:306-334 insert_renamings`
-/// + ε.3 slice trampoline synthesis); walker doesn't emit link Labels.
-/// Block Labels (`Label("block*")`) survive.
-fn phase4_filter_canonical_trampoline(
-    insns: &[super::flatten::Insn],
-) -> Vec<&super::flatten::Insn> {
-    insns
-        .iter()
-        .filter(|insn| match insn {
             super::flatten::Insn::Label(label) => !label.name.starts_with("link"),
             _ => true,
         })
@@ -1022,8 +1018,8 @@ fn phase4_byte_equivalent(
     canonical_insns: &[super::flatten::Insn],
     ignore_label_names: bool,
 ) -> bool {
-    let w_filtered = phase4_filter_walker_pyre_only(walker_insns);
-    let c_filtered = phase4_filter_canonical_trampoline(canonical_insns);
+    let w_filtered = phase4_filter_compare_eligible(walker_insns);
+    let c_filtered = phase4_filter_compare_eligible(canonical_insns);
     if w_filtered.len() != c_filtered.len() {
         return false;
     }
@@ -10153,9 +10149,9 @@ impl CodeWriter {
                 let eligible_lax =
                     phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, true);
                 let walker_filtered_len =
-                    phase4_filter_walker_pyre_only(&ssarepr.insns).len();
+                    phase4_filter_compare_eligible(&ssarepr.insns).len();
                 let canonical_filtered_len =
-                    phase4_filter_canonical_trampoline(&canonical_ssarepr.insns).len();
+                    phase4_filter_compare_eligible(&canonical_ssarepr.insns).len();
                 eprintln!(
                     "[phase4-splice-audit] graph={} eligible_strict={eligible_strict} \
                      eligible_lax={eligible_lax} \
