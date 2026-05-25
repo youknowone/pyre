@@ -552,6 +552,7 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
 /// `def repeat(n): def wrap(fn): def inner(): return (n, fn)`
 /// where `n` resolved to `fn` because of the off-by-one slot.
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 pub fn npure_cellvars(code: &CodeObject) -> usize {
     code.cellvars
         .iter()
@@ -566,6 +567,7 @@ pub fn npure_cellvars(code: &CodeObject) -> usize {
 }
 
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 pub fn ncells(code: &CodeObject) -> usize {
     npure_cellvars(code) + code.freevars.len()
 }
@@ -1135,6 +1137,7 @@ impl PyFrame {
     }
 
     /// Number of cell + free variable slots.
+    #[majit_macros::elidable_cannot_raise]
     #[inline]
     pub fn ncells(&self) -> usize {
         unsafe { ncells(&*pyframe_get_pycode(self)) }

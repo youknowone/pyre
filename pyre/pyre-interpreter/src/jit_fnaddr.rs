@@ -504,6 +504,41 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         stack_underflow as *const (),
     );
 
+    // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
+    // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
+    // only honours the assertion when `function_fnaddrs.contains_key(p)`,
+    // so without a registration the descr falls back to
+    // `EF_ELIDABLE_CAN_RAISE`.
+    let pyframe_get_pycode_fn: unsafe fn(&crate::pyframe::PyFrame) -> *const crate::CodeObject =
+        crate::pyframe::pyframe_get_pycode;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::pyframe_get_pycode",
+        pyframe_get_pycode_fn as *const (),
+    );
+
+    let pyframe_ncells_free: fn(&crate::CodeObject) -> usize = crate::pyframe::ncells;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::ncells",
+        pyframe_ncells_free as *const (),
+    );
+
+    let pyframe_npure_cellvars: fn(&crate::CodeObject) -> usize = crate::pyframe::npure_cellvars;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::npure_cellvars",
+        pyframe_npure_cellvars as *const (),
+    );
+
+    let pyframe_ncells_method: fn(&crate::pyframe::PyFrame) -> usize =
+        crate::pyframe::PyFrame::ncells;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::ncells",
+        pyframe_ncells_method as *const (),
+    );
+
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
     // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
     // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
