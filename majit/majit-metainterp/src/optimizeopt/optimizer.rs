@@ -297,11 +297,9 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if b.is_inputarg() {
             continue;
         }
-        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-            continue;
-        };
-        let Some(value) = target.const_value() else {
-            continue;
+        let value = match b.get_forwarded() {
+            crate::r#box::Forwarded::Const(c, _) => c.to_value(),
+            _ => continue,
         };
         if idx < live_positions.len() && live_positions[idx] {
             continue;
@@ -354,10 +352,7 @@ impl Optimizer {
         let Some(b) = box_pool.get(op.pos.get()) else {
             return false;
         };
-        let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-            return false;
-        };
-        if target.const_value().is_none() {
+        if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -2877,10 +2872,10 @@ impl Optimizer {
                 if old_idx < num_inputs as u32 {
                     continue;
                 }
-                let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() else {
-                    continue;
-                };
-                if target.const_value().is_none() {
+                if !matches!(
+                    b.get_forwarded(),
+                    crate::r#box::Forwarded::Const(_, _)
+                ) {
                     continue;
                 }
                 remap.insert(old_idx, next_const_pos);

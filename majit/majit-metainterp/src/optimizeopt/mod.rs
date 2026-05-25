@@ -2054,7 +2054,7 @@ impl OptContext {
             .box_pool
             .get_at_position(self.next_pos as usize)
             .is_some_and(|b| {
-                matches!(b.get_forwarded(), crate::r#box::Forwarded::Box(ref t) if t.const_value().is_some())
+                matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _))
             })
         {
             self.next_pos += 1;
@@ -2971,20 +2971,19 @@ impl OptContext {
                 crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
                     Some(OpInfo::FloatConst(*f))
                 }
-                crate::r#box::Forwarded::Box(target) if target.is_constant() => {
+                crate::r#box::Forwarded::Const(c, _) => {
                     // optimizer.py:329-338 `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
-                    target.const_value().and_then(|v| match v {
-                        Value::Ref(gcref) => Some(OpInfo::ptr(
+                    match *c {
+                        majit_ir::Const::Ref(gcref) => Some(OpInfo::ptr(
                             crate::optimizeopt::info::PtrInfo::Constant(gcref),
                         )),
-                        Value::Float(f) => Some(OpInfo::FloatConst(f)),
-                        Value::Int(i) => Some(OpInfo::int_bound(
+                        majit_ir::Const::Float(f) => Some(OpInfo::FloatConst(f)),
+                        majit_ir::Const::Int(i) => Some(OpInfo::int_bound(
                             crate::optimizeopt::intutils::IntBound::from_constant(i),
                         )),
-                        Value::Void => None,
-                    })
+                    }
                 }
                 _ => None,
             }
@@ -3416,12 +3415,10 @@ impl OptContext {
                 // value and the downstream `ExtendedShortPreambleBuilder::setup`
                 // `constants_set` check accepts them as resolved deps.
                 for (idx, b) in self.box_pool.iter_indexed() {
-                    if let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() {
-                        if let Some(val) = target.const_value() {
-                            if !loop_constants.contains_key(&(idx as u32)) {
-                                loop_constants.insert(idx as u32, val.to_const());
-                            }
-                        }
+                    if let crate::r#box::Forwarded::Const(c, _) = b.get_forwarded()
+                        && !loop_constants.contains_key(&(idx as u32))
+                    {
+                        loop_constants.insert(idx as u32, c);
                     }
                 }
                 builder.build_short_preamble_struct(&loop_constants)
@@ -4652,12 +4649,10 @@ impl OptContext {
         if opref.is_constant() {
             return self.const_pool.get(&opref.const_index()).copied();
         }
-        if let Some(b) = self.box_pool.get(opref) {
-            if let crate::r#box::Forwarded::Box(target) = &b.get_forwarded() {
-                if let Some(value) = target.const_value() {
-                    return Some(value);
-                }
-            }
+        if let Some(b) = self.box_pool.get(opref)
+            && let crate::r#box::Forwarded::Const(c, _) = b.get_forwarded()
+        {
+            return Some(c.to_value());
         }
         None
     }

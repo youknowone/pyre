@@ -2165,19 +2165,16 @@ impl ExportedState {
                     }
                     _ => {}
                 }
-            } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
-                if target.is_constant() {
-                    if let Some(Value::Ref(gcref)) = target.const_value() {
-                        if !gcref.is_null() {
-                            let ss_idx = majit_gc::shadow_stack::push(gcref);
-                            self.rooted_refs.push((
-                                dummy_key,
-                                ExportedGcRefField::BoxPoolBoxConstRef(i),
-                                ss_idx,
-                            ));
-                        }
-                    }
-                }
+            } else if let crate::r#box::Forwarded::Const(majit_ir::Const::Ref(gcref), _) =
+                &forwarded
+                && !gcref.is_null()
+            {
+                let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                self.rooted_refs.push((
+                    dummy_key,
+                    ExportedGcRefField::BoxPoolBoxConstRef(i),
+                    ss_idx,
+                ));
             }
         }
     }
