@@ -218,8 +218,7 @@ impl<'a> RegAllocator<'a> {
             }
             // upstream: `livevars = set(livevars)` — shadow the list
             // with the set rather than renaming to `alive`.
-            let mut livevars: HashSet<super::flow::VariableId> =
-                livevar_reps.into_iter().collect();
+            let mut livevars: HashSet<super::flow::VariableId> = livevar_reps.into_iter().collect();
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -306,11 +305,7 @@ impl<'a> RegAllocator<'a> {
     /// skip a coalesced surviving node that was never explicitly
     /// added — yielding `None` for `getcolor` and dropping the chain's
     /// inputarg from the final coloring map.
-    fn try_coalesce_ids(
-        &mut self,
-        v_id: super::flow::VariableId,
-        w_id: super::flow::VariableId,
-    ) {
+    fn try_coalesce_ids(&mut self, v_id: super::flow::VariableId, w_id: super::flow::VariableId) {
         self._depgraph.add_node(v_id);
         self._depgraph.add_node(w_id);
         let v0 = self._unionfind.find_rep(v_id);

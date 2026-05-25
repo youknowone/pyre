@@ -866,15 +866,34 @@ fn phase4_scan_color_budget_violations(
 ) -> Vec<Phase4ColorBudgetViolation> {
     let mut violations: Vec<Phase4ColorBudgetViolation> = Vec::new();
     for (insn_idx, insn) in insns.iter().enumerate() {
-        if let super::flatten::Insn::Op { opname, args, result } = insn {
+        if let super::flatten::Insn::Op {
+            opname,
+            args,
+            result,
+        } = insn
+        {
             for arg in args {
                 phase4_check_operand_budget(
-                    insn_idx, opname, "arg", arg, num_int, num_ref, num_float, &mut violations,
+                    insn_idx,
+                    opname,
+                    "arg",
+                    arg,
+                    num_int,
+                    num_ref,
+                    num_float,
+                    &mut violations,
                 );
             }
             if let Some(reg) = result {
                 phase4_check_register_budget(
-                    insn_idx, opname, "result", reg, num_int, num_ref, num_float, &mut violations,
+                    insn_idx,
+                    opname,
+                    "result",
+                    reg,
+                    num_int,
+                    num_ref,
+                    num_float,
+                    &mut violations,
                 );
             }
         }
@@ -899,9 +918,7 @@ fn phase4_scan_color_budget_violations(
 ///   slice — canonical synthesises a trampoline Label per multi-pred
 ///   link rewrite; walker handles the same renaming inline.  Block
 ///   Labels (`Label("block*")`) and catch-landing Labels survive.
-fn phase4_filter_compare_eligible(
-    insns: &[super::flatten::Insn],
-) -> Vec<&super::flatten::Insn> {
+fn phase4_filter_compare_eligible(insns: &[super::flatten::Insn]) -> Vec<&super::flatten::Insn> {
     insns
         .iter()
         .filter(|insn| match insn {
@@ -978,8 +995,16 @@ fn phase4_insn_eq(
         (Insn::Label(x), Insn::Label(y)) => ignore_label_names || x.name == y.name,
         (Insn::Unreachable, Insn::Unreachable) => true,
         (
-            Insn::Op { opname: ao, args: aa, result: ar },
-            Insn::Op { opname: bo, args: ba, result: br },
+            Insn::Op {
+                opname: ao,
+                args: aa,
+                result: ar,
+            },
+            Insn::Op {
+                opname: bo,
+                args: ba,
+                result: br,
+            },
         ) => {
             ao == bo
                 && phase4_operand_slice_eq(aa, ba, ignore_label_names)
@@ -1027,6 +1052,41 @@ fn phase4_byte_equivalent(
         .iter()
         .zip(c_filtered.iter())
         .all(|(w, c)| phase4_insn_eq(w, c, ignore_label_names))
+}
+
+/// Phase 4 #229 splice diagnostic: return the index + (walker, canonical)
+/// of the first divergent Insn pair in the filter-eligible sequence, or
+/// `None` if the two streams are byte-equivalent.  Filtered_len mismatch
+/// returns `Some((min_len, …))` with the diverging length-boundary pair
+/// (or `None`-sentinel pair on the shorter side).  Used by the
+/// `PYRE_PHASE4_SPLICE_AUDIT` probe to surface the first concrete
+/// Register-index / opname divergence on graphs where filtered_len
+/// matches but eligibility fails — the next splice slice's data.
+fn phase4_first_divergence(
+    walker_insns: &[super::flatten::Insn],
+    canonical_insns: &[super::flatten::Insn],
+    ignore_label_names: bool,
+) -> Option<(
+    usize,
+    Option<super::flatten::Insn>,
+    Option<super::flatten::Insn>,
+)> {
+    let w_filtered = phase4_filter_compare_eligible(walker_insns);
+    let c_filtered = phase4_filter_compare_eligible(canonical_insns);
+    let n = w_filtered.len().min(c_filtered.len());
+    for i in 0..n {
+        if !phase4_insn_eq(w_filtered[i], c_filtered[i], ignore_label_names) {
+            return Some((i, Some(w_filtered[i].clone()), Some(c_filtered[i].clone())));
+        }
+    }
+    if w_filtered.len() != c_filtered.len() {
+        return Some((
+            n,
+            w_filtered.get(n).map(|insn| (*insn).clone()),
+            c_filtered.get(n).map(|insn| (*insn).clone()),
+        ));
+    }
+    None
 }
 
 /// The next-block label is recognised as `Insn::Label(L)`, matching
@@ -9384,19 +9444,16 @@ impl CodeWriter {
         // sequence and avoiding sensitivity to any
         // `walker_post_walk_insert_renamings` graph mutation.
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
-        let canonical_ref_coalesce_pairs: Vec<(
-            super::flow::VariableId,
-            super::flow::VariableId,
-        )> = walker_pin_pairs
-            .iter()
-            .copied()
-            .chain(cfg_variable_pairs.iter().copied())
-            .collect();
-        let mut graph_regallocs =
-            super::regalloc::perform_register_allocation_all_kinds_with_pairs(
-                &graph,
-                &canonical_ref_coalesce_pairs,
-            );
+        let canonical_ref_coalesce_pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> =
+            walker_pin_pairs
+                .iter()
+                .copied()
+                .chain(cfg_variable_pairs.iter().copied())
+                .collect();
+        let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
+            &graph,
+            &canonical_ref_coalesce_pairs,
+        );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
@@ -10148,8 +10205,7 @@ impl CodeWriter {
                     phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, false);
                 let eligible_lax =
                     phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, true);
-                let walker_filtered_len =
-                    phase4_filter_compare_eligible(&ssarepr.insns).len();
+                let walker_filtered_len = phase4_filter_compare_eligible(&ssarepr.insns).len();
                 let canonical_filtered_len =
                     phase4_filter_compare_eligible(&canonical_ssarepr.insns).len();
                 eprintln!(
@@ -10162,6 +10218,17 @@ impl CodeWriter {
                     ssarepr.insns.len(),
                     canonical_ssarepr.insns.len(),
                 );
+                if !eligible_lax && walker_filtered_len == canonical_filtered_len {
+                    if let Some((idx, w, c)) =
+                        phase4_first_divergence(&ssarepr.insns, &canonical_ssarepr.insns, true)
+                    {
+                        eprintln!(
+                            "[phase4-splice-audit-diverge] graph={} pos={idx} walker={w:?} \
+                             canonical={c:?}",
+                            ssarepr.name,
+                        );
+                    }
+                }
             }
         }
 
