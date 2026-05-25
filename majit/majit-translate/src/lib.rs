@@ -221,16 +221,22 @@ fn audit_ast_extract_coverage(
 ) {
     use std::collections::HashSet;
     // Index program.functions two ways:
-    //   - `impl_methods`: keyed by (self_ty_root, name) — every
-    //     inherent + trait-impl method's owner leaf.
-    //   - `trait_defaults`: keyed by (trait_root, name) — every
-    //     trait-default body (penultimate Ident matches a known
-    //     trait leaf).
+    //   - `impl_methods`: keyed by (owner, name) where owner is BOTH
+    //     the qualified self_ty_root ("pyframe::PyFrame") AND the
+    //     bare leaf ("PyFrame").  AST extract qualifies inherent
+    //     methods through `module_path` but emits trait-impl
+    //     owner as the bare type ident; the dual key absorbs the
+    //     asymmetry.
+    //   - `trait_defaults`: keyed by (trait_root, name).
     let mut impl_methods: HashSet<(String, String)> = HashSet::new();
     let mut trait_defaults: HashSet<(String, String)> = HashSet::new();
     for f in &program.functions {
         if let Some(owner) = &f.self_ty_root {
             impl_methods.insert((owner.clone(), f.name.clone()));
+            let leaf = owner.rsplit("::").next().unwrap_or(owner.as_str());
+            if leaf != owner {
+                impl_methods.insert((leaf.to_string(), f.name.clone()));
+            }
         }
         if let Some(tr) = &f.trait_root {
             if f.self_ty_root.is_none() {

@@ -289,9 +289,23 @@ pub fn qualify_module_path(module_path: &str, nested: &str) -> String {
 /// pair.  Cuts the largest single AST-graph-builder consumer in the
 /// MIR-covered surface and is a prerequisite for retiring the
 /// AST graph builder bulk under issue #97 Step 6.F.
+///
+/// AST callers spell `self_ty_root` two ways depending on extraction
+/// path: inherent extract qualifies through `module_path` ("pyframe::
+/// PyFrame"), but trait-impl extract uses prefix="" so a top-level
+/// `impl Drop for PyFrame` yields the bare leaf "PyFrame".  MIR
+/// always stores the module-qualified spelling.  To bridge the
+/// asymmetry without forcing AST callers to re-qualify, the lookup
+/// indexes every impl method TWICE: once by qualified owner, once by
+/// the bare leaf (rsplit on "::").  Bare-leaf collisions across
+/// distinct types (e.g. `Drop::drop` on both `PyFrame` and
+/// `Other`) are tracked as ambiguous and return None — the caller
+/// must then qualify.
 pub struct MirGraphLookup<'a> {
     /// Impl methods (inherent + trait-impl): keyed by (self_ty_root, name).
-    impl_methods: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
+    /// `Ok(&graph)` is a unique hit; `Err(())` marks the slot ambiguous
+    /// (two or more graphs share the (owner-spelling, name) tuple).
+    impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
     /// Trait-default bodies: keyed by (trait_root, name) with self_ty_root None.
     trait_defaults: HashMap<(&'a str, &'a str), &'a FunctionGraph>,
 }
@@ -301,11 +315,26 @@ impl<'a> MirGraphLookup<'a> {
     /// borrows are tied to `program`'s lifetime, so the caller must
     /// keep `program` alive for the duration of the lookup's use.
     pub fn from_program(program: &'a SemanticProgram) -> Self {
-        let mut impl_methods = HashMap::new();
+        let mut impl_methods: HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>> =
+            HashMap::new();
         let mut trait_defaults = HashMap::new();
         for f in &program.functions {
             if let Some(owner) = f.self_ty_root.as_deref() {
-                impl_methods.insert((owner, f.name.as_str()), &f.graph);
+                Self::insert_or_mark_ambiguous(&mut impl_methods, owner, f.name.as_str(), &f.graph);
+                // Also index by the bare leaf for AST callers (e.g.
+                // top-level `impl Drop for PyFrame`) whose
+                // self_ty_root is unqualified.  Bare leaf is the
+                // last "::"-separated segment; identical to qualified
+                // when self_ty_root has no module prefix.
+                let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                if leaf != owner {
+                    Self::insert_or_mark_ambiguous(
+                        &mut impl_methods,
+                        leaf,
+                        f.name.as_str(),
+                        &f.graph,
+                    );
+                }
             } else if let Some(tr) = f.trait_root.as_deref() {
                 trait_defaults.insert((tr, f.name.as_str()), &f.graph);
             }
@@ -316,9 +345,40 @@ impl<'a> MirGraphLookup<'a> {
         }
     }
 
+    fn insert_or_mark_ambiguous(
+        map: &mut HashMap<(&'a str, &'a str), Result<&'a FunctionGraph, ()>>,
+        owner: &'a str,
+        name: &'a str,
+        graph: &'a FunctionGraph,
+    ) {
+        use std::collections::hash_map::Entry;
+        match map.entry((owner, name)) {
+            Entry::Vacant(v) => {
+                v.insert(Ok(graph));
+            }
+            Entry::Occupied(mut o) => {
+                let existing = *o.get();
+                if let Ok(g0) = existing {
+                    // Same FunctionGraph reference is fine (same entry
+                    // visited via dual-key insert); only mark ambiguous
+                    // when the pointer differs.
+                    if !std::ptr::eq(g0, graph) {
+                        let _ = o.insert(Err(()));
+                    }
+                }
+                // already Err(()): stays ambiguous.
+            }
+        }
+    }
+
     /// Returns the MIR graph for an inherent or trait-impl method.
+    /// Returns None when the (owner, name) tuple does not resolve to
+    /// a unique graph (either no entry or ambiguous bare-leaf).
     pub fn lookup_impl_method(&self, impl_type: &str, name: &str) -> Option<&'a FunctionGraph> {
-        self.impl_methods.get(&(impl_type, name)).copied()
+        match self.impl_methods.get(&(impl_type, name)).copied()? {
+            Ok(g) => Some(g),
+            Err(()) => None,
+        }
     }
 
     /// Returns the MIR graph for a trait-default body.

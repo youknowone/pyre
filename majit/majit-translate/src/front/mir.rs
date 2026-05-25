@@ -125,21 +125,29 @@ pub fn build_semantic_program_from_llbcs(
     llbcs: &[Llbc],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
-    // Dedup key is the full qualified path (`{module_path}::{name}` or
-    // just `name` for module-less entries), NOT the bare leaf.  Keying
-    // on the leaf alone collapsed every same-named method across the
-    // pyre-object → pyre-interpreter merge (`Vec::push` dropping
-    // `PyFrame::push`, `Code::new` dropping `Code::new` from the other
-    // crate, …), which surfaced as ≈20 audit gaps in
-    // `audit_ast_extract_coverage` under MIR cutover.
+    // Dedup key combines `self_ty_root` (the impl owner, when known),
+    // `module_path`, and `name`.  Without `self_ty_root`, two distinct
+    // impl methods can collide on a shared `{module_path}::{name}`:
+    // both `impl FrameDebugData { fn new(...) }` and `impl PyFrame {
+    // fn new(...) }` land under `module_path = "pyframe::<Impl>"`
+    // (the Impl NameSeg renders as `<Impl>`), and the second was
+    // silently dropped before this key widening.  AST-extract coverage
+    // audit went 88% → 99%+ trait + inherent on the test_phase_f LLBC
+    // fixture after including the owner.  Falls back to the bare
+    // `{module_path}::{name}` shape (or just `name`) for entries that
+    // have no `self_ty_root`.
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
     let dedup_key = |f: &crate::front::semantic::SemanticFunction| -> String {
-        if f.module_path.is_empty() {
+        let path = if f.module_path.is_empty() {
             f.name.clone()
         } else {
             format!("{}::{}", f.module_path, f.name)
+        };
+        match f.self_ty_root.as_deref() {
+            Some(owner) => format!("{path}@{owner}"),
+            None => path,
         }
     };
     for llbc in llbcs {
