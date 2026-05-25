@@ -3604,6 +3604,11 @@ impl CallControl {
     /// Pyre extension: register a target as carrying the
     /// `#[elidable_cannot_raise]` user assertion.
     pub fn mark_cannot_raise_assertion(&mut self, path: CallPath) {
+        assert!(
+            !self.memerror_only_assertion_targets.contains(&path),
+            "conflicting elidable exception assertions for {path:?}: \
+             already marked memerror-only, cannot also mark cannot-raise"
+        );
         self.cannot_raise_assertion_targets.insert(path);
     }
 
@@ -3626,13 +3631,21 @@ impl CallControl {
     pub fn has_cannot_raise_assertion(&self, target: &CallTarget) -> bool {
         self.target_to_path(target).is_some_and(|p| {
             self.cannot_raise_assertion_targets.contains(&p)
-                && self.function_fnaddrs.contains_key(&p)
+                && self
+                    .function_fnaddrs
+                    .get(&p)
+                    .is_some_and(|&fnaddr| fnaddr != 0)
         })
     }
 
     /// Pyre extension: register a target as carrying the
     /// `#[elidable_or_memerror]` user assertion.
     pub fn mark_memerror_only_assertion(&mut self, path: CallPath) {
+        assert!(
+            !self.cannot_raise_assertion_targets.contains(&path),
+            "conflicting elidable exception assertions for {path:?}: \
+             already marked cannot-raise, cannot also mark memerror-only"
+        );
         self.memerror_only_assertion_targets.insert(path);
     }
 
@@ -3647,7 +3660,10 @@ impl CallControl {
     pub fn has_memerror_only_assertion(&self, target: &CallTarget) -> bool {
         self.target_to_path(target).is_some_and(|p| {
             self.memerror_only_assertion_targets.contains(&p)
-                && self.function_fnaddrs.contains_key(&p)
+                && self
+                    .function_fnaddrs
+                    .get(&p)
+                    .is_some_and(|&fnaddr| fnaddr != 0)
         })
     }
 
