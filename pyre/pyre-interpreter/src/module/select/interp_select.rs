@@ -26,6 +26,12 @@ pub fn register_module(ns: &mut DictStorage) {
                     ));
                 }
 
+                // `interp_select.py:as_fdescr` — each item is either an
+                // int file descriptor or an object exposing fileno().
+                // pyre's list/tuple coverage matches CPython's
+                // PySequence_Fast usage; bare iterables (generators)
+                // would require iterator-protocol plumbing not yet
+                // exposed at this layer.
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
                 ) -> Result<Vec<(pyre_object::PyObjectRef, i32)>, crate::PyError> {
@@ -52,18 +58,28 @@ pub fn register_module(ns: &mut DictStorage) {
                             .ok_or_else(|| {
                                 crate::PyError::value_error("select() sequence item missing")
                             })?;
-                            if !pyre_object::is_int(item) {
-                                return Err(crate::PyError::type_error(
-                                    "argument must be an int, or have a fileno() method",
-                                ));
-                            }
-                            let fd = pyre_object::w_int_get_value(item) as i32;
-                            if fd < 0 {
+                            let fd_val = if pyre_object::is_int(item) {
+                                pyre_object::w_int_get_value(item)
+                            } else {
+                                let fileno = crate::baseobjspace::getattr(item, "fileno").map_err(|_| {
+                                    crate::PyError::type_error(
+                                        "argument must be an int, or have a fileno() method",
+                                    )
+                                })?;
+                                let res = crate::baseobjspace::call_function(fileno, &[]);
+                                if res.is_null() || !pyre_object::is_int(res) {
+                                    return Err(crate::PyError::type_error(
+                                        "fileno() must return an integer",
+                                    ));
+                                }
+                                pyre_object::w_int_get_value(res)
+                            };
+                            if fd_val < 0 {
                                 return Err(crate::PyError::value_error(
                                     "file descriptor cannot be a negative integer",
                                 ));
                             }
-                            out.push((item, fd));
+                            out.push((item, fd_val as i32));
                         }
                         Ok(out)
                     }
