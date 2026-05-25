@@ -138,7 +138,16 @@ pub enum Forwarded {
     /// inline. Chain walkers stop on this variant (`not_const=true`
     /// returns the pre-Const box; `not_const=false` materializes a
     /// terminal const-bearing `BoxRef` for legacy callers).
-    Const(Const),
+    ///
+    /// The trailing `Option<u32>` is the pyre-only `const_pool`
+    /// constant-namespace index that lets `box_to_opref` reconstruct
+    /// an `OpRef::Const{Int,Float,Ptr}(idx)` from a chain-walked-to-
+    /// Const terminal. PyPy has no analog (callers hold the Python
+    /// `Const` object directly). Sidecar to be retired alongside the
+    /// broader OpRef-reverse-lookup machinery; tagged `None` for
+    /// indexless seed_constant plantings (`optimizer.py:432` body
+    /// arm) and test plantings.
+    Const(Const, Option<u32>),
 
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
@@ -408,8 +417,10 @@ impl BoxRef {
     /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
     /// `box.set_forwarded(constbox)` is well-typed; here it terminates
     /// the chain in a value-typed payload rather than allocating a
-    /// `BoxKind::Const` carrier.
-    pub fn set_forwarded_const(&self, value: Const) {
+    /// `BoxKind::Const` carrier. `const_index` is the pyre-side sidecar
+    /// for `box_to_opref` OpRef reconstruction; pass `None` when the
+    /// const has no const-namespace OpRef (PyPy parity site).
+    pub fn set_forwarded_const(&self, value: Const, const_index: Option<u32>) {
         // Same Const-as-source invariant as the other set_forwarded_*
         // variants — Const has no `_forwarded` slot per PyPy.
         assert!(
@@ -417,7 +428,7 @@ impl BoxRef {
             "set_forwarded_const on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        self.write_forwarded(Forwarded::Const(value));
+        self.write_forwarded(Forwarded::Const(value, const_index));
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
@@ -525,7 +536,7 @@ impl BoxRef {
                     }
                     cur = b;
                 }
-                Forwarded::Const(c) => {
+                Forwarded::Const(c, idx) => {
                     if not_const {
                         return cur;
                     }
@@ -533,8 +544,13 @@ impl BoxRef {
                     // legacy callers that expect `.const_value()` /
                     // `BoxKind::Const` on the walker output keep
                     // working until the BoxRef return type itself is
-                    // retired.
-                    return BoxRef::new_const(c.to_value());
+                    // retired. Index sidecar round-trips so
+                    // `box_to_opref` can rebuild
+                    // `OpRef::Const{Int,Float,Ptr}(idx)`.
+                    return match idx {
+                        Some(i) => BoxRef::new_const_with_index(c.to_value(), i),
+                        None => BoxRef::new_const(c.to_value()),
+                    };
                 }
             }
         }

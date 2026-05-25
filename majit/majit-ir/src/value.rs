@@ -184,6 +184,17 @@ impl Const {
         }
     }
 
+    /// Inverse of [`Const::to_value`]. Panics on `Value::Void` since
+    /// PyPy has no void-typed `Const` (`history.py:182`).
+    pub fn from_value(value: Value) -> Self {
+        match value {
+            Value::Int(v) => Const::Int(v),
+            Value::Float(v) => Const::Float(v),
+            Value::Ref(v) => Const::Ref(v),
+            Value::Void => panic!("Const::from_value: Void has no Const counterpart"),
+        }
+    }
+
     /// history.py:225 ConstInt.getint — unsigned/signed integer value.
     /// Method belongs to ConstInt upstream; Rust single-enum collapses
     /// all variants, so assert variant at call time instead of

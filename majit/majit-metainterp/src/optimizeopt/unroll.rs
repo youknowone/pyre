@@ -2325,26 +2325,18 @@ impl ExportedState {
                         // index, so the `None` arm is reachable for
                         // body-position keys whose forwarded slot points
                         // at an index-less Const.
-                        let swap: Option<(bool, Option<u32>)> = {
-                            let f = b.get_forwarded();
-                            if let crate::r#box::Forwarded::Box(target) = &f
-                                && target.is_constant()
-                                && matches!(target.const_value(), Some(Value::Ref(_)))
-                            {
-                                Some((true, target.const_index()))
-                            } else {
-                                None
-                            }
+                        let swap: Option<(bool, Option<u32>)> = match b.get_forwarded() {
+                            crate::r#box::Forwarded::Const(
+                                majit_ir::Const::Ref(_),
+                                idx,
+                            ) => Some((true, idx)),
+                            _ => None,
                         };
                         if let Some((_present, orig_idx)) = swap {
-                            let new_target = match orig_idx {
-                                Some(idx) => crate::r#box::BoxRef::new_const_with_index(
-                                    Value::Ref(updated),
-                                    idx,
-                                ),
-                                None => crate::r#box::BoxRef::new_const(Value::Ref(updated)),
-                            };
-                            b.set_forwarded_box(new_target);
+                            b.set_forwarded_const(
+                                majit_ir::Const::Ref(updated),
+                                orig_idx,
+                            );
                         }
                     }
                 }

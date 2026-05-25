@@ -3532,7 +3532,14 @@ impl OptContext {
             _ => None,
         };
         // optimizer.py:394 op.set_forwarded(newop)
-        op.set_forwarded_box(newop.clone());
+        if newop.is_constant() {
+            let value = newop
+                .const_value()
+                .expect("is_constant() implies const_value() Some");
+            op.set_forwarded_const(majit_ir::Const::from_value(value), newop.const_index());
+        } else {
+            op.set_forwarded_box(newop.clone());
+        }
         // optimizer.py:395-396
         //   if opinfo is not None and not newop.is_constant():
         //       newop.set_forwarded(opinfo)
@@ -4116,7 +4123,7 @@ impl OptContext {
                 .ensure_box(opref)
                 .expect("body-namespace OpRef must have a BoxRef slot");
             if matches!(box_at.get_forwarded(), crate::r#box::Forwarded::None) {
-                box_at.set_forwarded_box(crate::r#box::BoxRef::new_const(value));
+                box_at.set_forwarded_const(majit_ir::Const::from_value(value), None);
             }
         }
     }
@@ -4459,10 +4466,7 @@ impl OptContext {
         let b = self
             .ensure_box(replaced)
             .expect("body-namespace OpRef must have a BoxRef slot");
-        b.set_forwarded_box(crate::r#box::BoxRef::new_const_with_index(
-            value,
-            new_const_idx,
-        ));
+        b.set_forwarded_const(majit_ir::Const::from_value(value), Some(new_const_idx));
     }
 
     /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
@@ -5984,7 +5988,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) => unreachable!(
                 "getrawptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6074,7 +6078,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) => unreachable!(
                 "getptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6400,7 +6404,7 @@ impl OptContext {
                     Forwarded::Info(_) | Forwarded::VectorInfo(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
-                    Forwarded::Box(_) | Forwarded::Const(_) => {
+                    Forwarded::Box(_) | Forwarded::Const(_, _) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
