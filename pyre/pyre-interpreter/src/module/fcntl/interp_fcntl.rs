@@ -174,7 +174,10 @@ pub fn register_module(ns: &mut DictStorage) {
                     0
                 };
                 match rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence) {
-                    Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
+                    // `interp_fcntl.py:226 fcntl_lockf` returns
+                    // space.w_None; the integer return value of the C
+                    // helper was an internal pyre detail.
+                    Ok(_) => Ok(pyre_object::w_none()),
                     Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
                         Err(crate::PyError::value_error("lockf: invalid cmd"))
                     }

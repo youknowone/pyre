@@ -223,7 +223,29 @@ impl RealDir {
     }
 
     // vfs.py:94
+    //
+    // Sandbox-hardening deviation from RPython upstream
+    // `rpython/translator/sandbox/vfs.py:94`, which does a bare
+    // `os.path.join(self.path, name)`.  RPython's sandbox is a separate
+    // trusted parent process that intercepts every syscall; pyre's VFS
+    // runs in-process so we must reject any `name` that would escape the
+    // base directory.  Forbidden inputs: absolute paths (`PathBuf::join`
+    // silently swaps the base when joined with an absolute), parent
+    // traversal (`..`) and embedded path separators (single-component
+    // child names only).  This keeps the join inside `self.path`
+    // unconditionally — the rest of the sandbox depends on that
+    // invariant.
     pub fn join(&self, name: &str) -> VfsResult<FsNode> {
+        if name.is_empty()
+            || name == ".."
+            || name.contains(std::path::MAIN_SEPARATOR)
+            || std::path::Path::new(name).is_absolute()
+        {
+            return Err(VfsError {
+                errno: libc::ENOENT,
+                object: name.to_owned(),
+            });
+        }
         if name.starts_with('.') && !self.show_dotfiles {
             return Err(VfsError {
                 errno: libc::ENOENT,

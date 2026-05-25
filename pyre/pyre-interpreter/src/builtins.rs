@@ -4632,6 +4632,11 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
         #[cfg(not(feature = "host_env"))]
         {
+            // Sandbox-intentional: with the host_env feature off the
+            // interpreter must not reach `std::fs` directly.  Callers in
+            // sandbox builds route file I/O through the VFS shim instead;
+            // returning NotImplementedError keeps the open() builtin from
+            // silently leaking real-FS reads here.
             let _ = (binary, &path);
             return Err(crate::PyError::not_implemented(
                 "open() for reading requires host_env feature",

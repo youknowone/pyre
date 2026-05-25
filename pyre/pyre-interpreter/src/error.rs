@@ -961,6 +961,11 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     }
     #[cfg(not(feature = "host_env"))]
     {
+        // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
+        // also returns silently when the source can't be read; with
+        // host_env off the interpreter must not reach `std::fs`
+        // directly, so we treat every source as unreadable and let the
+        // traceback render `^^^` markers without the offending line.
         let _ = (filename, lineno);
         None
     }
