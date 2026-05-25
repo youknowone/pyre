@@ -3646,19 +3646,23 @@ impl OptContext {
             // forwarded_to is an AbstractResOp), retiring the
             // BoxKind::ResOp-as-chain-target carrier.
             op.set_forwarded_op(&target_op);
-        } else {
+        } else if let Some(target_ia) = newop.bound_inputarg() {
             // InputArg-target chain step (compile.py:478, unroll.py:497).
-            // Const / Op / InputArg are the only `newop` shapes
-            // make_equal_to ever receives — InputArg BoxRefs are bound at
-            // OptContext entry via `ensure_inputarg_bindings`, ResOp
-            // BoxRefs at `ensure_box` (lazy stand-in synthesis when the
-            // producer has not yet emitted).
-            let target_ia = newop.bound_inputarg().expect(
-                "make_equal_to: non-Const target carries neither bound Op \
-                 nor bound InputArg — every BoxRef reaching this point \
-                 must be bound (resoperation.py:233-242 _forwarded host)",
-            );
             op.set_forwarded_inputarg(&target_ia);
+        } else {
+            // Orphan unbound non-Const BoxRef target. Phase 1's per-iter
+            // `TraceIterator::next()` (opencoder.rs:500) plants
+            // `BoxRef::new_resop` slots in the pool *without* binding to
+            // an `OpRc`; when Phase 1 folds/drops the op before it lands
+            // in `new_operations` / `phase1_emit_ops`, the pool slot stays
+            // unbound. Chain walks via `Forwarded::Box(...)` can still
+            // reach it through `Box.forwarded` (the mirror is canonical
+            // for unbound slots), so the chain step terminates safely on
+            // a `Forwarded::Box(newop)` write — `get_box_replacement` will
+            // continue reading Phase 1's forwarded state off the same
+            // `Box`. Test fixtures that build `BoxRef::new_resop` /
+            // `new_inputarg` without binding also rely on this path.
+            op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
         //   if opinfo is not None and not newop.is_constant():
@@ -3912,7 +3916,32 @@ impl OptContext {
         // would round-trip to `op_at(pos)` (None) instead of
         // `inputargs[i]`.
         if let Some(existing) = self.box_pool.get(opref) {
-            return Some(existing.clone());
+            let cloned = existing.clone();
+            // Phase 1's per-iter BoxPool plants unbound `BoxRef::new_resop`
+            // slots in `TraceIterator::next()` (opencoder.rs:500) without a
+            // producer OpRc to bind to. When Phase 2 (or a retrace) sees
+            // those slots via `p1_full_prefix` carry-over and the
+            // corresponding producer arrives via `phase1_emit_ops` or
+            // `new_operations`, late-bind here so the chain-walk reads
+            // through to `op.forwarded` (resoperation.py:233 `_forwarded`
+            // host) and `make_equal_to`'s strict bound-target invariant
+            // holds.
+            if cloned.is_resop() && cloned.bound_op().is_none() {
+                let op_rc = self
+                    .new_operations
+                    .iter()
+                    .rfind(|op| op.pos.get() == opref)
+                    .or_else(|| {
+                        self.phase1_emit_ops
+                            .iter()
+                            .rfind(|op| op.pos.get() == opref)
+                    })
+                    .cloned();
+                if let Some(op_rc) = op_rc {
+                    cloned.bind_op(&op_rc);
+                }
+            }
+            return Some(cloned);
         }
         let idx = opref.raw() as usize;
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);

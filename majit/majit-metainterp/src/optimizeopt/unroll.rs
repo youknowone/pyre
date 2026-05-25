@@ -595,6 +595,8 @@ impl UnrollOptimizer {
                             patchguardop: None,
                             box_pool: state.box_pool.clone(),
                             phase1_emit_high_water: self.next_global_opref,
+                            phase1_inputargs_snapshot: Vec::new(),
+                            phase1_emit_ops_snapshot: Vec::new(),
                             rooted_refs: Vec::new(),
                             shadow_stack_base: 0,
                         };
@@ -1821,6 +1823,21 @@ pub struct ExportedState {
     /// disjointness from Python identity for free; pyre's numeric
     /// OpRefs need an explicit position floor.
     pub phase1_emit_high_water: u32,
+    /// Snapshot of Phase 1's `OptContext::inputarg_refs` taken at export
+    /// time. PyPy parity: `partial_trace.inputargs` (history.py:528) keeps
+    /// the inputarg `AbstractValue` instances alive so a follow-up
+    /// `compile_retrace` Phase 2 reads `_forwarded` off the same objects
+    /// (resoperation.py:700 `AbstractInputArg._forwarded`). Each entry is
+    /// `Rc::clone` cheap; the vec is bounded by `ExportedState` lifetime.
+    /// Populated only by `export_state_with_bounds`.
+    pub(crate) phase1_inputargs_snapshot: Vec<majit_ir::InputArgRc>,
+    /// Snapshot of Phase 1's emit ops (the same `Optimizer.phase1_emit_ops`
+    /// `Vec<OpRc>` Phase 2 already receives at spawn; mirrored here so
+    /// `compile_retrace`'s Phase 2 — which spawns a *new* Optimizer and
+    /// only sees the imported `ExportedState` — can reach Phase 1's
+    /// `_forwarded` through the same OpRc identities. Companion to
+    /// `phase1_inputargs_snapshot`.
+    pub(crate) phase1_emit_ops_snapshot: Vec<majit_ir::OpRc>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1913,6 +1930,8 @@ impl ExportedState {
             patchguardop: None,
             box_pool,
             phase1_emit_high_water: 0,
+            phase1_inputargs_snapshot: Vec::new(),
+            phase1_emit_ops_snapshot: Vec::new(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2395,6 +2414,8 @@ impl Clone for ExportedState {
             patchguardop: self.patchguardop.clone(),
             box_pool: self.box_pool.clone(),
             phase1_emit_high_water: self.phase1_emit_high_water,
+            phase1_inputargs_snapshot: self.phase1_inputargs_snapshot.clone(),
+            phase1_emit_ops_snapshot: self.phase1_emit_ops_snapshot.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2821,6 +2842,16 @@ impl OptUnroll {
         // emit position even when `box_pool` was not extended (zero-
         // inputarg / retrace baselines — `optimizeopt/mod.rs:2026`).
         state.phase1_emit_high_water = ctx.next_pos;
+        // PyPy `partial_trace.inputargs` / `partial_trace.operations` identity
+        // carriage (compile.py:362, history.py:528): snapshot the InputArgRc /
+        // OpRc lists Phase 1 mutated `_forwarded` on. Cross-call
+        // `compile_retrace` Phase 2 reads `Op.forwarded` / `InputArg.forwarded`
+        // directly off the same objects (resoperation.py:233-242 `_forwarded`
+        // host), the PyPy-orthodox identity carry that replaces the
+        // BoxPool-snapshot indirection. Populated here only; consumer
+        // migration follows.
+        state.phase1_inputargs_snapshot = ctx.inputarg_refs.clone();
+        state.phase1_emit_ops_snapshot = optimizer.phase1_emit_ops.clone();
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
