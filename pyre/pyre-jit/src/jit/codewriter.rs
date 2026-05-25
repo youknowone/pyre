@@ -9641,7 +9641,35 @@ impl CodeWriter {
         // a stable byte_equivalent ratio across benches.
         let phase4_splice_audit =
             std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
-        if phase4_build_canonical || phase4_diff_canonical || phase4_splice_audit {
+        // Task #229 splice-5 (experimental, default-off): force-splice
+        // `ssarepr.insns` with `canonical_ssarepr.insns` for graphs whose
+        // name appears in the comma-separated `PYRE_PHASE4_SPLICE_ENABLE`
+        // list, regardless of byte_equivalent eligibility.  Surveys
+        // which graphs are *runtime-equivalent* even when not
+        // byte-equivalent — the splice-3a investigation showed
+        // walker-vs-canonical Register indices diverge by +nlocals due
+        // to walker stack-slot mediation, but the `ref_copy`-mirrored
+        // values are runtime-identical, so canonical's lower-indexed
+        // reads should still see the same values.  Confirming this
+        // per-graph would unblock the Task #229 splice without waiting
+        // for Path 4's multi-month walker_slot_for_variable retirement.
+        let phase4_splice_enable_names: Vec<String> = std::env::var("PYRE_PHASE4_SPLICE_ENABLE")
+            .ok()
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let phase4_splice_enable = !phase4_splice_enable_names.is_empty();
+        if phase4_build_canonical
+            || phase4_diff_canonical
+            || phase4_splice_audit
+            || phase4_splice_enable
+        {
             let mut canonical_regallocs = graph_regallocs.clone();
             let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
@@ -10229,6 +10257,31 @@ impl CodeWriter {
                         );
                     }
                 }
+            }
+            // Task #229 splice-5 force-splice action.  Replaces walker
+            // SSA bytes with canonical SSA bytes for named graphs;
+            // downstream `allocate_registers` (line ~10246) will then
+            // re-color the spliced insns against walker's regalloc
+            // state.  If the canonical Insns reference Variable colors
+            // that don't exist in walker's regalloc, this will surface
+            // as a regalloc panic or assemble-time
+            // `ref reg-or-pool out of bounds` PANIC.  Either failure
+            // is informative — it pinpoints which divergence class
+            // (color budget, Variable identity, opname shape) blocks
+            // the named graph.  Production behavior unchanged when
+            // env var is unset.
+            if phase4_splice_enable
+                && phase4_splice_enable_names
+                    .iter()
+                    .any(|n| n == ssarepr.name.as_str())
+            {
+                eprintln!(
+                    "[phase4-splice-enable] graph={} walker_len={} -> canonical_len={}",
+                    ssarepr.name,
+                    ssarepr.insns.len(),
+                    canonical_ssarepr.insns.len(),
+                );
+                ssarepr.insns = canonical_ssarepr.insns.clone();
             }
         }
 
