@@ -2400,6 +2400,39 @@ impl Optimizer {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
+        // PyPy parity: a folded ResOperation keeps its Python identity
+        // through `_forwarded` links; Phase 2 chain walks via
+        // `partial_trace.operations` reach it directly
+        // (resoperation.py:233 `_forwarded` host).
+        //
+        // pyre's per-iter `TraceIterator::next()` pushes a fresh
+        // `BoxRef::new_resop` slot for every visited op
+        // (opencoder.rs:500) BEFORE the optimizer pipeline decides
+        // whether to emit it. When the pipeline drops the op, no
+        // `ctx.emit` is called and the slot stays unbound; the BoxRef
+        // is then a phase-1 orphan with no producer `OpRc`. Seal each
+        // orphan now by synthesising a SameAs stand-in OpRc, binding
+        // the slot, and appending the stand-in to `phase1_emit_ops`
+        // so Phase 2 / retrace `ensure_box` can late-bind through it
+        // (mod.rs::ensure_box existing-pool-slot path).
+        for (idx, b) in ctx.box_pool.iter_indexed() {
+            if !b.is_resop() || b.bound_op().is_some() {
+                continue;
+            }
+            use majit_ir::resoperation::Op;
+            let opcode = match b.type_() {
+                majit_ir::Type::Int => OpCode::SameAsI,
+                majit_ir::Type::Float => OpCode::SameAsF,
+                majit_ir::Type::Ref => OpCode::SameAsR,
+                majit_ir::Type::Void => continue,
+            };
+            let stand_in = std::rc::Rc::new(Op::new(opcode, &[]));
+            stand_in
+                .pos
+                .set(majit_ir::OpRef::op_typed(idx as u32, b.type_()));
+            b.bind_op(&stand_in);
+            self.phase1_emit_ops.push(stand_in);
+        }
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);

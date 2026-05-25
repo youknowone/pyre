@@ -74,27 +74,65 @@ fn is_trace_runtime_ref(
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
-/// Reconstruct Phase 1's `box_pool` prefix for a Phase 2 retrace.
+/// Reconstruct Phase 1's `box_pool` prefix directly from the snapshotted
+/// `InputArgRc` / `OpRc` lists. PyPy parity: `partial_trace.inputargs`
+/// and `partial_trace.operations` (compile.py:362, history.py:528) hold the
+/// AbstractValue instances Phase 1 mutated `_forwarded` on; chain walks via
+/// the bound handles read `inputarg.forwarded` / `op.forwarded` directly
+/// (resoperation.py:233-242 `_forwarded` host, `:700
+/// AbstractInputArg._forwarded`).
 ///
-/// The `BoxPool::clone` here is intentionally shallow: `BoxRef` is
-/// `Rc<Box>`, so cloning shares the same `Box` cells — matching
-/// `unroll.py` Phase 2's behaviour of seeing Phase 1's `_forwarded`
-/// mutations through Python object identity (resoperation.py:233-240).
-/// A "deep" snapshot (cloning each `Box` so Phase 2 cannot reach into
-/// `phase1_out`) would diverge from upstream: PyPy explicitly relies on
-/// shared identity to read Phase 1 forwarding from Phase 2 — see
-/// `unroll.py:55-64` `setinfo_from_preamble`.
+/// Each slot uses `BoxRef::from_bound_{op,inputarg}` so the box handle is
+/// installed *without* the carry-over that `bind_*` performs — Phase 1's
+/// state already lives on the bound `Op` / `InputArg`, and we want
+/// `Box.get_forwarded()` to read through to it, not overwrite it from the
+/// fresh box's empty mirror.
 ///
-/// Returns `None` for an empty pool so callers feed the iterator the
-/// same `None`/`Some` distinction the `p1_full_prefix` argument
-/// expects.  GcRef rooting via `ExportedState::root_all_gcrefs` is the
-/// canonical safety net, not snapshot copying.
-fn p1_full_prefix_from_box_pool(pool: &crate::r#box::BoxPool) -> Option<crate::r#box::BoxPool> {
-    if pool.is_empty() {
-        None
-    } else {
-        Some(pool.clone())
+/// Phase 1 export seals orphan unbound ResOp pool slots with synthesized
+/// SameAs OpRc stand-ins (`optimizer.rs::optimize_with_constants_and_inputs_at`),
+/// so every Phase 1 BoxRef position is reachable through one of the two
+/// snapshot lists here.
+fn build_p1_full_prefix(
+    inputargs: &[majit_ir::InputArgRc],
+    emit_ops: &[majit_ir::OpRc],
+) -> Option<crate::r#box::BoxPool> {
+    if inputargs.is_empty() && emit_ops.is_empty() {
+        return None;
     }
+    let max_inputarg_pos = inputargs
+        .iter()
+        .map(|ia| ia.index as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let max_op_pos = emit_ops
+        .iter()
+        .filter_map(|op| {
+            let pos = op.pos.get();
+            if pos.is_none() || pos.is_constant() {
+                None
+            } else {
+                Some(pos.raw() as usize + 1)
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let size = max_inputarg_pos.max(max_op_pos);
+    let mut slots: Vec<Option<crate::r#box::BoxRef>> = vec![None; size];
+    for ia in inputargs {
+        let idx = ia.index as usize;
+        slots[idx] = Some(crate::r#box::BoxRef::from_bound_inputarg(ia));
+    }
+    for op in emit_ops {
+        let pos = op.pos.get();
+        if pos.is_none() || pos.is_constant() {
+            continue;
+        }
+        let raw = pos.raw() as usize;
+        if raw < slots.len() {
+            slots[raw] = Some(crate::r#box::BoxRef::from_bound_op(op));
+        }
+    }
+    Some(crate::r#box::BoxPool::from_slots(slots))
 }
 
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
@@ -382,18 +420,24 @@ impl UnrollOptimizer {
                     self.phase1_patchguardop = pre_imported.patchguardop.clone();
                 }
                 // compile_retrace has no `opt_p1.final_ctx` (Phase 1 was
-                // skipped), but the failed attempt's Phase 1 captured its full
-                // `box_pool` into `ExportedState.box_pool` at export time
+                // skipped), but the failed attempt's Phase 1 captured its
+                // inputarg + emit-op identity into
+                // `ExportedState.phase1_inputargs_snapshot` /
+                // `phase1_emit_ops_snapshot` at export time
                 // (`export_state_with_bounds`). TraceIterator's
                 // `p1_full_prefix` contract: deliver the full Phase 1 box_pool
                 // including inputarg BoxRefs at `[0..num_inputs)`, so
                 // `import_state` setting `Forwarded::Box(target)` for
                 // `target.raw() < num_inputs` lands the chain on the same
                 // Phase 1 inputarg cell — PyPy Phase 2 reads Phase 1
-                // `_forwarded` through shared Box identity; preserving the full
-                // raw position alignment (inputargs + emit ops) reproduces
-                // that identity here.
-                let prefix = p1_full_prefix_from_box_pool(&pre_imported.box_pool);
+                // `_forwarded` through shared `AbstractValue` identity
+                // (resoperation.py:233-242), and `build_p1_full_prefix`
+                // reproduces that by installing `BoxRef::from_bound_*` handles
+                // pointing at the snapshotted `InputArgRc` / `OpRc` objects.
+                let prefix = build_p1_full_prefix(
+                    &pre_imported.phase1_inputargs_snapshot,
+                    &pre_imported.phase1_emit_ops_snapshot,
+                );
                 (pre_imported, constants.clone(), Vec::new(), prefix)
             } else {
                 // ── Phase 1: PreambleCompileData.optimize() ──
@@ -5133,32 +5177,33 @@ mod tests {
     }
 
     #[test]
-    fn test_retrace_box_pool_preserves_inputargs_for_p1_full_prefix() {
-        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, 0);
-        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, 1);
-        let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
-        let emit3 = crate::r#box::BoxRef::new_resop(Type::Int, 3);
-        let snapshot = crate::r#box::BoxPool::from_slots(vec![
-            Some(input0.clone()),
-            Some(input1.clone()),
-            Some(emit2.clone()),
-            Some(emit3.clone()),
-        ]);
+    fn test_build_p1_full_prefix_carries_forwarded_state_via_bound_handles() {
+        // Phase 1 InputArg / Op carry `_forwarded` mutations on the
+        // AbstractValue object itself (resoperation.py:233-242 / :700);
+        // a retrace's Phase 2 must read that state through the same
+        // identity. The builder installs `BoxRef::from_bound_*` so
+        // `Box.get_forwarded()` routes through the bound handle.
+        let ia0 = std::rc::Rc::new(majit_ir::InputArg::from_type(Type::Int, 0));
+        let ia1 = std::rc::Rc::new(majit_ir::InputArg::from_type(Type::Ref, 1));
+        *ia1.forwarded.borrow_mut() =
+            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Int(42), None);
+        let op2 = std::rc::Rc::new(majit_ir::Op::new(
+            OpCode::IntAdd,
+            &[OpRef::int_op(0), OpRef::int_op(1)],
+        ));
+        op2.pos.set(OpRef::int_op(2));
 
-        let prefix = p1_full_prefix_from_box_pool(&snapshot).expect("non-empty pool");
+        let prefix = build_p1_full_prefix(&[ia0.clone(), ia1.clone()], &[op2.clone()])
+            .expect("non-empty inputs build a prefix");
+        assert_eq!(prefix.len(), 3);
 
-        let prefix_slots: Vec<Option<crate::r#box::BoxRef>> = (0..prefix.len())
-            .map(|i| prefix.get_at_position(i).cloned())
-            .collect();
-        assert_eq!(
-            prefix_slots,
-            vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
-        );
-
-        assert!(
-            p1_full_prefix_from_box_pool(&crate::r#box::BoxPool::default()).is_none(),
-            "empty pool maps to None for TraceIterator p1_full_prefix"
-        );
+        let slot1 = prefix.get_at_position(1).expect("ia1 slot present");
+        match slot1.get_forwarded() {
+            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Int(42), _) => {}
+            other => panic!("expected Const(42), got {other:?}"),
+        }
+        let slot2 = prefix.get_at_position(2).expect("op2 slot present");
+        assert!(slot2.bound_op().is_some(), "op2 slot binds the OpRc");
     }
 
     #[test]
