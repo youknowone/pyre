@@ -115,13 +115,15 @@ pub fn register_module(ns: &mut DictStorage) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    // PyPy passes NSIG (64) here; we match that bound.
+                    // `interp_signal.py:550-574 valid_signals` returns
+                    // `set(...)` via `_sigset_to_signals` (line 513),
+                    // not a frozenset.  PyPy passes NSIG (64) here.
                     let sigs = rustpython_host_env::signal::valid_signals(64).unwrap_or_default();
                     let items: Vec<pyre_object::PyObjectRef> = sigs
                         .into_iter()
                         .map(|n| pyre_object::w_int_new(n as i64))
                         .collect();
-                    return Ok(pyre_object::w_frozenset_from_items(&items));
+                    return Ok(pyre_object::w_set_from_items(&items));
                 }
                 #[cfg(not(feature = "host_env"))]
                 Err(crate::PyError::not_implemented(
