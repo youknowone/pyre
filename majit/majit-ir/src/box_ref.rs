@@ -130,8 +130,18 @@ pub enum Forwarded {
     None,
 
     /// Forwarding to another `AbstractResOpOrInputArg`. Const targets
-    /// route through [`Forwarded::Const`] instead.
+    /// route through [`Forwarded::Const`] instead; `ResOp` targets route
+    /// through [`Forwarded::Op`] once C.5 retires this variant.
     Box(BoxRef),
+
+    /// `resoperation.py:250 AbstractResOp` forwarding — direct
+    /// `Weak<Op>` reference, no `BoxRef`/`BoxKind::ResOp` carrier.
+    /// Chain walker upgrades the `Weak`, wraps the `Op` in a transient
+    /// `BoxRef` (via `BoxRef::from_bound_op`), and continues from
+    /// there. A dropped `Weak` terminates the chain at the predecessor
+    /// (PyPy never observes a dropped target — RPython keeps the
+    /// underlying object alive through the trace `operations` list).
+    Op(Weak<Op>),
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`
     /// — forwarding terminates here; the constant value is carried
@@ -193,6 +203,33 @@ impl BoxRef {
             },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
+            inputarg_handle: RefCell::new(None),
+        }))
+    }
+
+    /// Transient `AbstractResOp` Box wrapping an already-bound
+    /// `OpRc`. Used by the chain walker to materialize a `BoxRef`
+    /// terminal from a `Forwarded::Op(Weak<Op>)` payload without
+    /// going through the pool; the new box does not live in
+    /// `BoxPool`, but its `bound_op` immediately answers with the
+    /// same `Rc<Op>` and its `_forwarded` slot reads via the bound op
+    /// per `get_forwarded`. Type and position are mirrored from
+    /// `op.pos.get()`.
+    pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
+        let opref = op.pos.get();
+        let type_ = opref.ty().unwrap_or(Type::Void);
+        let position = opref.raw();
+        Self(Rc::new(Box {
+            // `Box.forwarded` is the legacy mirror — the bound op's
+            // own slot is canonical so this stays None; `get_forwarded`
+            // returns op.forwarded via the `bound_op()` fastpath.
+            forwarded: RefCell::new(Forwarded::None),
+            type_,
+            kind: BoxKind::ResOp {
+                position: std::cell::Cell::new(position),
+            },
+            value: Cell::new(None),
+            op_handle: RefCell::new(Some(Rc::downgrade(op))),
             inputarg_handle: RefCell::new(None),
         }))
     }
@@ -413,6 +450,21 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
+    /// `optimizer.py:394 op.set_forwarded(newop)` — Op variant.
+    /// Targets an `AbstractResOp` identity directly via `Weak<Op>`,
+    /// retiring the `BoxKind::ResOp`-as-chain-target carrier. The
+    /// caller passes the canonical `OpRc` (typically a `TreeLoop.ops`
+    /// entry) — chain walkers upgrade the `Weak` and continue from
+    /// there.
+    pub fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
+        assert!(
+            !matches!(self.0.kind, BoxKind::Const { .. }),
+            "set_forwarded_op on Const violates RPython AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.write_forwarded(Forwarded::Op(Rc::downgrade(target)));
+    }
+
     /// `optimizer.py:432 make_constant(box, constbox)` — Const variant.
     /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
     /// `box.set_forwarded(constbox)` is well-typed; here it terminates
@@ -535,6 +587,16 @@ impl BoxRef {
                         return cur;
                     }
                     cur = b;
+                }
+                Forwarded::Op(weak) => {
+                    let Some(op_rc) = weak.upgrade() else {
+                        // Dropped target: PyPy has no analog (Python
+                        // GC keeps targets alive through `operations`).
+                        // Terminate the chain at `cur` to avoid a
+                        // dangling read.
+                        return cur;
+                    };
+                    cur = BoxRef::from_bound_op(&op_rc);
                 }
                 Forwarded::Const(c, idx) => {
                     if not_const {

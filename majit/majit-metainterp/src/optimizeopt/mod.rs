@@ -3534,7 +3534,17 @@ impl OptContext {
                 .const_value()
                 .expect("is_constant() implies const_value() Some");
             op.set_forwarded_const(majit_ir::Const::from_value(value), newop.const_index());
+        } else if let Some(target_op) = newop.bound_op() {
+            // Op-target chain step: route through Forwarded::Op(Weak<Op>)
+            // so the chain refers to the canonical Rc<Op> (PyPy
+            // resoperation.py:240 set_forwarded(forwarded_to) where
+            // forwarded_to is an AbstractResOp), retiring the
+            // BoxKind::ResOp-as-chain-target carrier.
+            op.set_forwarded_op(&target_op);
         } else {
+            // Unbound non-const target: legacy InputArg / pre-bind
+            // path; keep BoxRef-based Forwarded::Box until those
+            // sources are migrated in C.4.b / C.5.
             op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
@@ -5983,7 +5993,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_, _) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => unreachable!(
                 "getrawptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6073,7 +6083,7 @@ impl OptContext {
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh BoxRef whose own slot is None.
-            Forwarded::Box(_) | Forwarded::Const(_, _) => unreachable!(
+            Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => unreachable!(
                 "getptrinfo: chain terminal must not carry Forwarded::Box / Const \
                  (box.rs:295 get_box_replacement walker invariant)",
             ),
@@ -6399,7 +6409,7 @@ impl OptContext {
                     Forwarded::Info(_) | Forwarded::VectorInfo(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
-                    Forwarded::Box(_) | Forwarded::Const(_, _) => {
+                    Forwarded::Box(_) | Forwarded::Const(_, _) | Forwarded::Op(_) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
@@ -7400,8 +7410,8 @@ mod boxref_forwarding_tests {
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &b0.get_forwarded() {
-            BoxForwarded::Box(target) => assert!(target.is_constant()),
-            other => panic!("expected b0 to forward to const_box, got {:?}", other),
+            BoxForwarded::Const(majit_ir::Const::Int(v), _) => assert_eq!(*v, 42),
+            other => panic!("expected b0 to forward to Const, got {:?}", other),
         }
     }
 
@@ -7422,9 +7432,9 @@ mod boxref_forwarding_tests {
     }
 
     /// PyPy optimizer.py:432 parity: after
-    /// `make_constant(opref, Value::Ref(_))` writes `Forwarded::Box(constbox)`
-    /// on the InputArg's BoxRef, a subsequent `make_nonnull(opref)` MUST NOT
-    /// overwrite the Const slot with `OpInfo::Ptr(NonNull)`.
+    /// `make_constant(opref, Value::Ref(_))` writes the constant onto
+    /// the InputArg's `_forwarded` slot, a subsequent `make_nonnull(opref)`
+    /// MUST NOT overwrite the Const with `OpInfo::Ptr(NonNull)`.
     #[test]
     fn audit_a_make_nonnull_preserves_box_constant_slot() {
         use majit_ir::GcRef;
@@ -7434,22 +7444,22 @@ mod boxref_forwarding_tests {
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
-            BoxForwarded::Box(target) => {
-                assert_eq!(target.const_value(), Some(Value::Ref(GcRef(0xdead_beef))));
+            BoxForwarded::Const(majit_ir::Const::Ref(g), _) => {
+                assert_eq!(*g, GcRef(0xdead_beef));
             }
-            other => panic!("expected Box(ConstRef) post make_constant, got {:?}", other),
+            other => panic!("expected Forwarded::Const(Ref) post make_constant, got {:?}", other),
         }
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
         ctx.make_nonnull(&b);
         match &b.get_forwarded() {
-            BoxForwarded::Box(target) => {
+            BoxForwarded::Const(majit_ir::Const::Ref(g), _) => {
                 assert_eq!(
-                    target.const_value(),
-                    Some(Value::Ref(GcRef(0xdead_beef))),
-                    "make_nonnull must not overwrite the Const Box slot"
+                    *g,
+                    GcRef(0xdead_beef),
+                    "make_nonnull must not overwrite the Const slot"
                 );
             }
-            other => panic!("make_nonnull clobbered Const Box slot — got {:?}", other),
+            other => panic!("make_nonnull clobbered Const slot — got {:?}", other),
         }
     }
 
@@ -7490,16 +7500,16 @@ mod boxref_forwarding_tests {
     }
 
     /// `make_constant` mirrors PyPy optimizer.py:432
-    /// `box.set_forwarded(constbox)` as `Forwarded::Box(Const)`.
+    /// `box.set_forwarded(constbox)` — Const variant.
     #[test]
     fn h3_1_make_constant_mirrors_box_info_constant() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
         ctx.make_constant(OpRef::int_op(0), Value::Int(42));
         match &b0.get_forwarded() {
-            BoxForwarded::Box(target) => {
-                assert_eq!(target.const_value(), Some(Value::Int(42)));
+            BoxForwarded::Const(majit_ir::Const::Int(v), _) => {
+                assert_eq!(*v, 42);
             }
-            other => panic!("expected Forwarded::Box(ConstInt 42), got {:?}", other),
+            other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }
 
@@ -7536,11 +7546,10 @@ mod boxref_forwarding_tests {
             .expect("const_pool seeded above");
         ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
-            BoxForwarded::Box(target) => {
-                assert!(target.is_constant());
-                assert_eq!(target.const_value(), Some(Value::Int(42)));
+            BoxForwarded::Const(majit_ir::Const::Int(v), _) => {
+                assert_eq!(*v, 42);
             }
-            other => panic!("expected Forwarded::Box(Const), got {:?}", other),
+            other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }
 
