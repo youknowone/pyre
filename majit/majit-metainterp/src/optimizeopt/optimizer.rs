@@ -1970,6 +1970,13 @@ impl Optimizer {
         //    Mirrors `PyPy Optimizer.__init__: self.inputargs = inputargs`
         //    (optimizer.py:34).
         ctx.inputargs = self.trace_inputargs.clone();
+        // Bind inputarg BoxRefs handed in via `box_pool` so
+        // `make_equal_to` routes InputArg-targeted chain steps through
+        // `Forwarded::InputArg(_)` rather than the deprecated
+        // `Forwarded::Box(_)` fallback. `TraceIterator::new` builds the
+        // per-iter pool with fresh unbound `BoxRef::new_inputarg(tp, _)`;
+        // the TreeLoop-owned strong `InputArgRc`s never reach it.
+        ctx.ensure_inputarg_bindings();
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);

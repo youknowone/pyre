@@ -1712,6 +1712,54 @@ impl OptContext {
         ctx
     }
 
+    /// Walk every materialized `box_pool` slot and bind any InputArg BoxRef
+    /// whose `bound_inputarg()` is None to a fresh `InputArgRc` carrying
+    /// the BoxRef's intrinsic type. Strong refs are stashed in
+    /// `inputarg_refs` so the bound `Weak<InputArg>` stays upgradable for
+    /// the OptContext's lifetime.
+    ///
+    /// `TraceIterator::new` (opencoder.rs) builds the per-iter pool by
+    /// pushing fresh `BoxRef::new_inputarg(tp, _fresh)` for each inputarg
+    /// without calling `bind_inputarg`; the TreeLoop-owned strong
+    /// `InputArgRc`s never reach this freshly-built pool. Phase 2 inherits
+    /// Phase 1's box_pool snapshot via `iter.box_pool.clone()`, so Phase 1
+    /// inputarg slots reappear at Phase 2 entry with their earlier
+    /// `Weak<InputArg>` dangling (the previous OptContext's
+    /// `inputarg_refs` strong owners were dropped). Re-binding here
+    /// restores `Forwarded::InputArg(_)` reachability for every
+    /// InputArg BoxRef the optimizer will hand to `make_equal_to`
+    /// (`optimizer.py:394 op.set_forwarded(newop)`, unroll.py:497).
+    /// Idempotent — already-bound entries skip.
+    pub(crate) fn ensure_inputarg_bindings(&mut self) {
+        if self.box_pool.is_empty() {
+            return;
+        }
+        // Walk every materialized slot; any InputArg BoxRef whose
+        // `bound_inputarg()` is None gets a fresh `InputArgRc` and bind.
+        // Cross-phase: Phase 2 inherits Phase 1's box_pool snapshot, so
+        // Phase 1 inputarg slots reappear at Phase 2 entry with their
+        // earlier `Weak<InputArg>` dangling (the previous OptContext's
+        // `inputarg_refs` strong owners were dropped). Re-binding here
+        // restores `Forwarded::InputArg(_)` reachability across phases.
+        let needs: Vec<(usize, majit_ir::Type)> = self
+            .box_pool
+            .iter_indexed()
+            .filter_map(|(pos, b)| {
+                if !b.is_inputarg() || b.bound_inputarg().is_some() {
+                    return None;
+                }
+                Some((pos, b.type_()))
+            })
+            .collect();
+        for (pos, tp) in needs {
+            let ia = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+            if let Some(b) = self.box_pool.get_at_position(pos) {
+                b.bind_inputarg(&ia);
+            }
+            self.inputarg_refs.push(ia);
+        }
+    }
+
     /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
     /// shifted to start above a parent trace's high water mark.
     ///
