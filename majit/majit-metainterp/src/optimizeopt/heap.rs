@@ -3949,7 +3949,7 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputarg_types = types;
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(

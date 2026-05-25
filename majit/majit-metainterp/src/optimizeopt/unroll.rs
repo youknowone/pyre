@@ -118,11 +118,13 @@ pub struct UnrollOptimizer {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
-    /// RPython Box type parity: trace inputarg types from recorder.
-    /// Each RPython Box carries its type; in majit OpRef is untyped u32.
-    /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputarg_types
-    /// so value_types covers inputarg OpRefs.
-    pub trace_inputarg_types: Vec<majit_ir::Type>,
+    /// Recorder-side trace inputargs as typed `OpRef::InputArg{Int,Ref,Float}`
+    /// variants. `box.type` (history.py:220) is the variant tag —
+    /// resoperation.py:719/727/739 `InputArg{Int,Ref,Float}.type`.
+    /// Propagated to the inner Phase 1 / Phase 2 `Optimizer.trace_inputargs`
+    /// so each phase carries the same Box list (optimizer.py:34
+    /// `self.inputargs = inputargs`).
+    pub trace_inputargs: Vec<majit_ir::OpRef>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
@@ -183,7 +185,7 @@ impl UnrollOptimizer {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
-            trace_inputarg_types: Vec::new(),
+            trace_inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
@@ -365,7 +367,7 @@ impl UnrollOptimizer {
                 opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
                 opt_p1.callinfocollection = self.callinfocollection.clone();
                 opt_p1.cpu = self.cpu.clone();
-                opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
+                opt_p1.trace_inputargs = self.trace_inputargs.clone();
                 opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
                 opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
                 opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
@@ -394,10 +396,16 @@ impl UnrollOptimizer {
                 // structural alignment with RPython's `trace.get_iter()`
                 // call site, not a functional change.
                 // opencoder.py:264 `inputarg_from_tp(arg.type)` — fresh inputargs
-                // are typed via `self.trace_inputarg_types`, the recorder-supplied
-                // per-arg type list (length must equal `num_inputs`).
-                let p1_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
-                debug_assert_eq!(p1_inputarg_types.len(), num_inputs);
+                // are typed via `self.trace_inputargs`, the recorder-supplied
+                // Box list (length must equal `num_inputs`). Derive the &[Type]
+                // surface TraceIterator expects from each Box's variant tag
+                // (resoperation.py:719/727/739).
+                debug_assert_eq!(self.trace_inputargs.len(), num_inputs);
+                let p1_inputarg_types: Vec<majit_ir::Type> = self
+                    .trace_inputargs
+                    .iter()
+                    .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
+                    .collect();
                 // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
                 // surface receives shared identity (history.py:528). The
                 // deep-clone here corresponds to PyPy's `cls()` per-op fresh
@@ -409,7 +417,7 @@ impl UnrollOptimizer {
                     0,
                     ops_oprc.len(),
                     None,
-                    p1_inputarg_types,
+                    &p1_inputarg_types,
                     0,    // start_fresh = 0 — inputargs at [0..num_inputs)
                     None, // p1_full_prefix — Phase 1 has no prior phase
                 );
@@ -628,7 +636,7 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();
-        opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
+        opt_p2.trace_inputargs = self.trace_inputargs.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -722,8 +730,12 @@ impl UnrollOptimizer {
         let phase2_inputarg_base = self.next_global_opref.max(body_num_inputs as u32);
         // opencoder.py:264 `inputarg_from_tp(arg.type)` — same per-arg types
         // as Phase 1 (Phase 2 walks the body half of the same trace).
-        let p2_inputarg_types: &[majit_ir::Type] = &self.trace_inputarg_types;
-        debug_assert_eq!(p2_inputarg_types.len(), body_num_inputs);
+        debug_assert_eq!(self.trace_inputargs.len(), body_num_inputs);
+        let p2_inputarg_types: Vec<majit_ir::Type> = self
+            .trace_inputargs
+            .iter()
+            .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
+            .collect();
         // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
         let ops_oprc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
@@ -732,7 +744,7 @@ impl UnrollOptimizer {
             0,
             ops_oprc.len(),
             None,
-            p2_inputarg_types,
+            &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
             p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
         );
@@ -1202,7 +1214,7 @@ impl UnrollOptimizer {
                         // equivalent (resoperation.py:29
                         // `AbstractValue.type`); legacy untyped paths fall
                         // through to Phase 2's `final_ctx.opref_type` and
-                        // the recorder's `trace_inputarg_types`.
+                        // the recorder's `trace_inputargs` Box list.
                         let tp = ub
                             .ty()
                             .or_else(|| {
@@ -1210,7 +1222,7 @@ impl UnrollOptimizer {
                             })
                             .or_else(|| {
                                 let raw = ub.raw() as usize;
-                                opt_p2.trace_inputarg_types.get(raw).copied()
+                                opt_p2.trace_inputargs.get(raw).and_then(|op| op.ty())
                             })
                             .unwrap_or_else(|| {
                                 panic!(
@@ -1241,9 +1253,13 @@ impl UnrollOptimizer {
                 // carry the same producer-side types as Phase 1's; fall back
                 // to Ref when types are unavailable.
                 let types: Vec<majit_ir::Type> = opt_p2
-                    .trace_inputarg_types
+                    .trace_inputargs
                     .get(..body_num_inputs)
-                    .map(|s| s.to_vec())
+                    .map(|s| {
+                        s.iter()
+                            .map(|op| op.ty().unwrap_or(majit_ir::Type::Ref))
+                            .collect()
+                    })
                     .unwrap_or_else(|| vec![majit_ir::Type::Ref; body_num_inputs]);
                 crate::optimizeopt::OptContext::with_inputarg_types(32, &types)
             });
@@ -5066,7 +5082,7 @@ mod tests {
         // rationale — the preamble exporter needs an intrinsic type
         // for every renamed inputarg, which production derives from
         // the recorder's trace_inputarg_types.
-        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Ref; 1024]);
         // Production trace iteration gets rd_resume_position from
         // opencoder.py:399-401.  Direct unit-test guards must seed the
         // corresponding snapshot explicitly before store_final_boxes_in_guard.
@@ -5522,7 +5538,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
-        opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Ref; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
@@ -5640,10 +5656,10 @@ mod tests {
         // `OpRef::int_op` (`AbstractResOp` mixin) at inputarg slots, so
         // the type check passed but the variant tag PyPy's
         // `isinstance(x, InputArgInt)` reads diverged.  Seeding
-        // `trace_inputarg_types` mirrors the same intent for the
+        // `trace_inputargs` mirrors the same intent for the
         // intbounds pass / `with_inputarg_types` BoxRef planter.
         let inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int, majit_ir::Type::Int]);
-        unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
+        unroll_opt.trace_inputargs = inputargs.clone();
         let mut ops = vec![
             Op::new(OpCode::IntAdd, &[inputargs[0], inputargs[1]]),
             Op::new(OpCode::Jump, &[inputargs[0]]),

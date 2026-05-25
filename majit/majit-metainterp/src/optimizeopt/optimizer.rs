@@ -87,24 +87,17 @@ pub struct Optimizer {
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
     pub imported_virtuals: Vec<ImportedVirtual>,
-    /// Types of the original trace inputargs (from LABEL or inputarg_types).
-    /// RPython Boxes carry type intrinsically; we store it here so
-    /// export_state can propagate to ExportedState.renamed_inputarg_types.
+    /// Original trace inputargs as typed `OpRef::InputArg{Int,Ref,Float}`
+    /// variants. Mirrors PyPy `Optimizer.__init__: self.inputargs = inputargs`
+    /// (optimizer.py:34) where the optimizer carries the recorder's Box
+    /// list verbatim and reads `.type` per Box (history.py:220). Each
+    /// entry's variant tag IS `box.type` (resoperation.py:719/727/739),
+    /// so there is no parallel `Vec<Type>` side table — the OpRef is the
+    /// single source of truth.
     ///
-    /// Production redundancy: `OpRef::ty()` (resoperation.rs:133-135)
-    /// already derives `Type::Int` / `Float` / `Ref` from the
-    /// `InputArg*` variant tag, mirroring PyPy `isinstance(x,
-    /// InputArgInt)` class-derived type lookup.  This field carries the
-    /// same information and survives as a compatibility shim for the
-    /// test-only auto-seed at
-    /// [`Self::optimize_with_constants_and_inputs_at`] — many fixtures
-    /// still use `OpRef::int_op(N)` (`AbstractResOp::IntOp` mixin) at
-    /// inputarg slots, where `OpRef::ty()` returns the IntOp type
-    /// regardless of whether the slot is genuinely an inputarg.  Once
-    /// fixtures are migrated to `InputArg*` variants (via
-    /// [`OpRef::inputarg_refs`]) this field can be dropped in favour of
-    /// per-slot `OpRef::ty()` resolution.
-    pub trace_inputarg_types: Vec<majit_ir::Type>,
+    /// `export_state` propagates these into
+    /// `ExportedState.renamed_inputarg_types` (Phase 1 → Phase 2 carry).
+    pub trace_inputargs: Vec<OpRef>,
     /// unroll.py / compile.py parity: original live values at the jump
     /// point, threaded into export_state as `runtime_boxes`. Dormant
     /// until the export/import pair starts reading it.
@@ -1081,7 +1074,7 @@ impl Optimizer {
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),
             imported_virtuals: Vec::new(),
-            trace_inputarg_types: Vec::new(),
+            trace_inputargs: Vec::new(),
             runtime_boxes: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
@@ -1905,30 +1898,35 @@ impl Optimizer {
         box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
-        // Test-only auto-seed of `trace_inputarg_types` from the variant
+        // Test-only auto-seed of `trace_inputargs` from the variant
         // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
         // a slot index in `[0, num_inputs)`. Production callers populate
-        // the side table from the recorder's InputArg{Int,Ref,Float}
-        // entries via `setup_optimizations` before calling
-        // (history.py:220 box.type).
+        // the list from the recorder's InputArg{Int,Ref,Float} objects
+        // via `setup_optimizations` (optimizer.py:34 self.inputargs).
         //
         // Falls back to `Type::Ref` for slots that no arg references —
         // RPython never sees that case (every InputArg flows through some
         // op), but unit fixtures can omit references to unused slots.
         #[cfg(test)]
-        if self.trace_inputarg_types.is_empty() && num_inputs > 0 {
+        if self.trace_inputargs.is_empty() && num_inputs > 0 {
+            // RPython InputArg variants are Int/Ref/Float only
+            // (resoperation.py:719/727/739) — Void inputargs do not exist.
+            // VoidOp args at inputarg slots leave the slot at the Ref
+            // fallback because the actual inputarg-side Box would have
+            // been Int/Ref/Float per producer-side typing.
             let mut types = vec![majit_ir::Type::Ref; num_inputs];
             for op in ops.iter() {
                 for arg in op.getarglist().iter() {
                     let idx = arg.raw() as usize;
                     if idx < num_inputs {
-                        if let Some(tp) = arg.ty() {
-                            types[idx] = tp;
+                        match arg.ty() {
+                            Some(majit_ir::Type::Void) | None => {}
+                            Some(tp) => types[idx] = tp,
                         }
                     }
                 }
             }
-            self.trace_inputarg_types = types;
+            self.trace_inputargs = OpRef::inputarg_refs(&types);
         }
         self.imported_label_args = None;
         self.terminal_op = None;
@@ -1971,11 +1969,12 @@ impl Optimizer {
         // 1. Phase 1 → Phase 2 carry: `phase1_emit_ops` below; `op_at`
         //    resolves cross-phase OpRefs through `op.type_` directly
         //    (history.py:220 box.type parity).
-        // 2. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
-        //    Slice 0.5: inputarg slot lookups live on the dedicated
-        //    `ctx.inputarg_types` Vec exclusively, mirroring RPython's
-        //    `InputArg{Int,Ref,Float}.type` (history.py:220 parity).
-        ctx.inputarg_types = self.trace_inputarg_types.clone();
+        // 2. Inputarg list (from recorder — RPython InputArgInt/Ref/Float).
+        //    Each entry is a typed `OpRef::InputArg{Int,Ref,Float}` so
+        //    `box.type` is the variant tag (resoperation.py:719/727/739).
+        //    Mirrors `PyPy Optimizer.__init__: self.inputargs = inputargs`
+        //    (optimizer.py:34).
+        ctx.inputargs = self.trace_inputargs.clone();
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
@@ -2309,7 +2308,7 @@ impl Optimizer {
             // Additionally, in majit OpRef forwarding is typeless, so a Ref
             // virtual can forward to a Float (SameAsF). When that happens,
             // force_box materializes the virtual to preserve Ref type.
-            let inputarg_types = self.trace_inputarg_types.clone();
+            let inputargs = self.trace_inputargs.clone();
             // Phase 1: resolve and call force_at_the_end_of_preamble on all args
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
@@ -2328,12 +2327,12 @@ impl Optimizer {
                 let arg = terminal_op.arg(i);
                 let resolved = ctx.get_box_replacement(arg);
                 let expected_ref =
-                    i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
-                // setup_optimizations seeds `trace_inputarg_types` into
-                // ctx.inputarg_types (this fn, line 1837), and `opref_type`
-                // consults it via the inputarg-slot fallback after the
-                // op/value_types chain. PtrInfo presence is an additional
-                // Ref-only side channel for inputargs not in `new_operations`.
+                    inputargs.get(i).and_then(|op| op.ty()) == Some(majit_ir::Type::Ref);
+                // setup_optimizations seeds `trace_inputargs` into
+                // ctx.inputargs (this fn), and `opref_type` consults it
+                // via the inputarg-slot fallback after the op/value_types
+                // chain. PtrInfo presence is an additional Ref-only side
+                // channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
                     .get_box_replacement_box(arg)
                     .as_ref()
@@ -3230,14 +3229,18 @@ impl Optimizer {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
                     // BoxRefs with the producer-side types when available; the
                     // Ref fallback covers the rare case the recorder hasn't
-                    // populated `trace_inputarg_types` (e.g. test-only entry
-                    // paths) and matches the historical Type::Void behaviour
-                    // for ptr-handle slots.
+                    // populated `trace_inputargs` (e.g. test-only entry paths)
+                    // and matches the historical Type::Void behaviour for
+                    // ptr-handle slots.
                     let ni = self.final_num_inputs();
                     let types: Vec<majit_ir::Type> = self
-                        .trace_inputarg_types
+                        .trace_inputargs
                         .get(..ni)
-                        .map(|s| s.to_vec())
+                        .map(|s| {
+                            s.iter()
+                                .map(|op| op.ty().unwrap_or(majit_ir::Type::Ref))
+                                .collect()
+                        })
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
@@ -3263,9 +3266,13 @@ impl Optimizer {
             // as the inline_short_preamble path above.
             let ni = self.final_num_inputs();
             let types: Vec<majit_ir::Type> = self
-                .trace_inputarg_types
+                .trace_inputargs
                 .get(..ni)
-                .map(|s| s.to_vec())
+                .map(|s| {
+                    s.iter()
+                        .map(|op| op.ty().unwrap_or(majit_ir::Type::Ref))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
             OptContext::with_inputarg_types(32, &types)
         });
@@ -4716,7 +4723,7 @@ mod tests {
     fn test_restart_from_extra_operation_rediscovers_first_pass() {
         let hits = Rc::new(Cell::new(0));
         let mut opt = Optimizer::new();
-        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 8];
+        opt.trace_inputargs = OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 8]);
         opt.add_pass(Box::new(QueueRestartCandidate { queued: false }));
         opt.add_pass(Box::new(RestartIntAddAsSub));
         opt.add_pass(Box::new(CountRestartedIntSub { hits: hits.clone() }));
@@ -4956,7 +4963,7 @@ mod tests {
     fn test_default_pipeline_processes_trace() {
         let mut opt = Optimizer::default_pipeline();
         // IntAdd operates on Int-typed inputs — override the test default.
-        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
+        opt.trace_inputargs = OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
         // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
         // should eliminate the duplicate.
         let mut ops = vec![
@@ -5148,7 +5155,7 @@ mod tests {
         // This test only exercises the ops/guard counter; each inputarg
         // is read by at least one Int-shape consumer (GuardTrue, IntAdd),
         // so seed Int to keep intbounds' type asserts happy.
-        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
+        opt.trace_inputargs = OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
         // optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`:
         // the first GuardTrue becomes the sharing donor for the
         // descrless GuardNonnull below — give it a real descr so
@@ -5573,10 +5580,13 @@ mod tests {
         // `ctx.new_operations` filtered by non-NONE pos and non-Void type
         // (resoperation.py:1693 parity). Phase 1 inputarg slot OpRefs are
         // resolved from Phase 2 through `OptContext::inputarg_type`
-        // (history.py:220 parity) against the shared `inputarg_types`
-        // Vec, so they are NOT carried here.
+        // (history.py:220 parity) against the shared `inputargs` list,
+        // so they are NOT carried here.
         let mut opt = Optimizer::new();
-        opt.trace_inputarg_types = vec![Type::Void, Type::Int, Type::Ref];
+        // resoperation.py:719/727/739 — InputArg type is always
+        // Int/Ref/Float (no Void inputargs). Slot 0 unused by this
+        // fixture; Int picked arbitrarily.
+        opt.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int, Type::Ref]);
         opt.phase1_emit_ops.push(std::rc::Rc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
             &[OpRef::int_op(50)],
@@ -5603,10 +5613,10 @@ mod tests {
         // Slice 0.6 step 1: from a Phase-2-like context (`inputarg_base > 0`)
         // `OptContext::inputarg_type` must resolve low OpRefs in
         // `[0, num_inputs)` as Phase 1 inputarg slot lookups against the
-        // shared `inputarg_types` Vec (history.py:220 parity for
-        // `box.type` reads through `imported_label_args`).
+        // shared `inputargs` list (history.py:220 parity for `box.type`
+        // reads through `imported_label_args`).
         let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 3, 100, 103);
-        ctx.inputarg_types = vec![Type::Int, Type::Ref, Type::Float];
+        ctx.inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Ref, Type::Float]);
         // Phase 2's own inputargs at [100..103) — own range still resolves.
         assert_eq!(ctx.inputarg_type(OpRef::int_op(100)), Some(Type::Int));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(101)), Some(Type::Ref));
@@ -5628,7 +5638,7 @@ mod tests {
         // In Phase 1 (`inputarg_base == 0`) the low-range fallback must
         // NOT trigger — only the canonical own-range path applies.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref, Type::Ref]);
-        ctx.inputarg_types = vec![Type::Int, Type::Ref, Type::Float];
+        ctx.inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Ref, Type::Float]);
         // OpRefs in [0..3) resolve through the own range (inputarg_base=0).
         assert_eq!(ctx.inputarg_type(OpRef::int_op(0)), Some(Type::Int));
         assert_eq!(ctx.inputarg_type(OpRef::int_op(2)), Some(Type::Float));
@@ -5889,12 +5899,12 @@ mod tests {
     fn test_resumedata_memo_encodes_rd_numb_on_guard() {
         let mut opt = Optimizer::default_pipeline();
         // OptIntBound (mod.rs:2624 getintbound) requires IntAdd's args to be
-        // Type::Int.  trace_inputarg_types defaults to all-Ref, so we must
+        // Type::Int.  trace_inputargs defaults to all-Ref, so we must
         // override slots 100 and 101.
         let mut input_types = vec![Type::Ref; 1024];
         input_types[100] = Type::Int;
         input_types[101] = Type::Int;
-        opt.trace_inputarg_types = input_types;
+        opt.trace_inputargs = OpRef::inputarg_refs(&input_types);
 
         let mut ops = vec![
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),

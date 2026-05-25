@@ -2604,7 +2604,7 @@ mod tests {
         for &idx in int_slots {
             types[idx as usize] = Type::Int;
         }
-        opt.trace_inputarg_types = types;
+        opt.trace_inputargs = OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(
@@ -2617,7 +2617,7 @@ mod tests {
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
-        opt.trace_inputarg_types = vec![Type::Ref; 1024];
+        opt.trace_inputargs = OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(
@@ -2637,7 +2637,7 @@ mod tests {
         for &idx in float_slots {
             types[idx as usize] = Type::Float;
         }
-        opt.trace_inputarg_types = types;
+        opt.trace_inputargs = OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
         opt.optimize_with_constants_and_inputs(

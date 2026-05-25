@@ -1421,7 +1421,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         // Overflow guards and IntMulOvf work on Int-typed args — override
         // the test default so renamed_inputarg_types sees Int, not Ref.
-        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(

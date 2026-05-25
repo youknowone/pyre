@@ -727,11 +727,15 @@ pub struct OptContext {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// Inputarg types indexed by slot, mirroring `Optimizer.trace_inputarg_types`
-    /// (recorder side `InputArg{Int,Ref,Float}.tp`). Slot `i` corresponds to
-    /// `OpRef(inputarg_base + i)`. Populated in `setup_optimizations` so
-    /// readers can resolve inputarg `box.type` (history.py:220 parity).
-    pub inputarg_types: Vec<majit_ir::Type>,
+    /// Inputarg list as typed `OpRef::InputArg{Int,Ref,Float}` variants
+    /// (recorder side `InputArg{Int,Ref,Float}` objects). Slot `i` of
+    /// this Vec corresponds to the `OpRef` at position `inputarg_base + i`
+    /// in the current trace's namespace. `box.type` (history.py:220) is
+    /// derived from each entry's variant tag via `OpRef::ty()`, mirroring
+    /// PyPy's `self.inputargs = inputargs` pattern (optimizer.py:34) where
+    /// the optimizer carries the Box list and reads `.type` per Box.
+    /// Populated by `setup_optimizations`; emptied initially.
+    pub inputargs: Vec<majit_ir::OpRef>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -1596,7 +1600,7 @@ impl OptContext {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            inputarg_types: Vec::new(),
+            inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1646,14 +1650,15 @@ impl OptContext {
         }
         ctx.box_pool = seed;
         // Mirror the production wiring at `setup_optimizations`
-        // (optimizer.rs `ctx.inputarg_types = self.trace_inputarg_types
-        // .clone()`): seed `ctx.inputarg_types` in lockstep with the
-        // `box_pool` so the typed-Box parity contract holds — strict
-        // accessors like `inputarg_type_at_strict` (and `inputarg_type_at`)
-        // return `Some(tp)` matching `box.type` for slot i. Test fixtures
-        // that call `with_inputarg_types` no longer need to set
-        // `inputarg_types` separately.
-        ctx.inputarg_types = inputarg_types.to_vec();
+        // (optimizer.rs `ctx.inputargs = self.trace_inputargs.clone()`):
+        // seed `ctx.inputargs` in lockstep with the `box_pool` so the
+        // typed-Box parity contract holds — strict accessors like
+        // `inputarg_type_at_strict` (and `inputarg_type_at`) return
+        // `Some(tp)` matching `box.type` for slot i. Test fixtures that
+        // call `with_inputarg_types` no longer need to set `inputargs`
+        // separately. Each entry is `OpRef::input_arg_typed(i, tp)` so
+        // the variant tag IS the type (resoperation.py:719/727/739).
+        ctx.inputargs = majit_ir::OpRef::inputarg_refs(inputarg_types);
         ctx
     }
 
@@ -1722,7 +1727,7 @@ impl OptContext {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
-            inputarg_types: Vec::new(),
+            inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -5710,9 +5715,9 @@ impl OptContext {
         } else if self.inputarg_base > 0 && raw < self.num_inputs {
             // Phase 1 inputarg slot accessed from a non-Phase-1 context
             // (Phase 2 / bridge).  RPython resolves these through Box
-            // identity; flat-OpRef pyre uses the shared `inputarg_types`
-            // Vec — no materialization, just the recorder-seeded type
-            // table.
+            // identity; flat-OpRef pyre uses the shared `inputargs` list
+            // — no materialization, just the recorder-seeded Box list
+            // (optimizer.py:34 self.inputargs).
             raw as usize
         } else {
             return None;
@@ -5720,32 +5725,26 @@ impl OptContext {
         if idx >= ni {
             return None;
         }
-        let tp = *self.inputarg_types.get(idx)?;
-        if tp == majit_ir::Type::Void {
-            None
-        } else {
-            Some(tp)
-        }
+        self.inputarg_type_at(idx)
     }
 
-    /// Look up the declared type of inputarg slot `idx` (zero-based) from
-    /// the `inputarg_types` Vec seeded by `setup_optimizations`. Returns
-    /// `None` if the slot is out of range, the type is `Void`, or the Vec
-    /// has not been populated. Mirrors the per-Box `box.type` lookup that
-    /// `init_virtualizable` and other consumers use to mint typed
-    /// `OpRef::input_arg_*` matching the producer side.
+    /// Look up the declared type of inputarg slot `idx` (zero-based) by
+    /// reading the variant tag of `self.inputargs[idx]`. Returns `None`
+    /// if the slot is out of range, the variant tag yields `Void`, or
+    /// the Vec has not been populated. Mirrors the per-Box `box.type`
+    /// lookup (history.py:220) that `init_virtualizable` and other
+    /// consumers use to mint typed `OpRef::input_arg_*` matching the
+    /// producer side.
     pub fn inputarg_type_at(&self, idx: usize) -> Option<majit_ir::Type> {
-        let tp = *self.inputarg_types.get(idx)?;
-        if tp == majit_ir::Type::Void {
-            None
-        } else {
-            Some(tp)
+        match self.inputargs.get(idx)?.ty()? {
+            majit_ir::Type::Void => None,
+            tp => Some(tp),
         }
     }
 
     /// Strict counterpart to `inputarg_type_at`. Panics when the slot is
-    /// out of range, the type is `Void`, or `inputarg_types` was not
-    /// populated by `setup_optimizations`. Mirrors RPython's
+    /// out of range, the variant tag yields `Void`, or `inputargs` was
+    /// not populated by `setup_optimizations`. Mirrors RPython's
     /// `box.type` invariant (history.py:220) — every InputArg always
     /// carries a `.type`, so a miss here is a structural bookkeeping
     /// bug.
@@ -5753,19 +5752,28 @@ impl OptContext {
     /// Used by Slice P5 sites that mint `OpRef::input_arg_typed(...)`
     /// for Phase 2 inputargs and have no legitimate untyped fallback.
     pub fn inputarg_type_at_strict(&self, idx: usize) -> majit_ir::Type {
-        match self.inputarg_types.get(idx).copied() {
-            Some(majit_ir::Type::Void) => panic!(
-                "inputarg_type_at_strict: slot {idx} is Void; \
-                 RPython invariant violated (history.py:220 box.type)"
-            ),
-            Some(tp) => tp,
+        match self.inputargs.get(idx).copied() {
+            Some(op) => match op.ty() {
+                Some(majit_ir::Type::Void) | None => panic!(
+                    "inputarg_type_at_strict: slot {idx} ({op:?}) is Void / untyped; \
+                     RPython invariant violated (history.py:220 box.type)"
+                ),
+                Some(tp) => tp,
+            },
             None => panic!(
                 "inputarg_type_at_strict: slot {idx} out of range \
-                 (inputarg_types.len() = {}); setup_optimizations did not \
-                 seed the parallel type vector",
-                self.inputarg_types.len()
+                 (inputargs.len() = {}); setup_optimizations did not \
+                 seed the inputarg list",
+                self.inputargs.len()
             ),
         }
+    }
+
+    /// Read-only access to the inputarg slot's typed `OpRef` (variant tag
+    /// is `box.type`). Returns `None` when the slot is out of range.
+    /// Mirrors PyPy `self.inputargs[idx]` (optimizer.py:34).
+    pub fn inputarg_at(&self, idx: usize) -> Option<majit_ir::OpRef> {
+        self.inputargs.get(idx).copied()
     }
 
     /// `Box.type` strict accessor. Panics when no source carries a type for
