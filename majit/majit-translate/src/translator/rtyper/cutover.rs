@@ -970,19 +970,33 @@ pub(crate) fn lift_callee_to_pygraph(
 /// callee whose real body cannot be lowered through the adapter
 /// (`unsafe fn` in `pyre-object` / `pyre-interpreter`).  The stub has
 /// a single Link from `startblock` to `returnblock` carrying a
-/// `Constant(default_for_<return_lltype>)` so the annotator's
-/// `flowin` projects the callsite result to the declared return type
-/// without touching the (non-modellable) body.
+/// pre-annotated `Variable` so the annotator's `flowin` projects the
+/// callsite result to the declared return type without touching the
+/// (non-modellable) body.
 ///
 /// `name` becomes the synthetic graph's `FunctionGraph.name`.
 /// `signature.argnames` are turned into named `Variable`s on the
-/// startblock; `return_lltype` is projected to a default-value
-/// `ConstValue` by [`default_constvalue_for_lltype`] and carried on
-/// the Link to the returnblock.  Returns `None` when the return type
-/// has no representable default (`Func` / `Struct` / `Array` /
-/// `Opaque` / `ForwardReference` / `FixedSizeArray` / `InteriorPtr`)
-/// — the caller skips registration for that fn and the original
+/// startblock; `return_lltype` is projected through
+/// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
+/// to a `SomeValue` shell (no `const_box`) attached to a fresh
+/// `Variable` carried on the Link to the returnblock.  Returns
+/// `None` when the return type is a container
+/// (`Func` / `Struct` / `Array` / `Opaque` / `ForwardReference` /
+/// `FixedSizeArray`) or `Address` (no `SomeAddress` port yet) —
+/// the caller skips registration for that fn and the original
 /// "not registered in PyreCallRegistry" Skip path covers it.
+///
+/// **Why pre-annotated Variable rather than `Constant`.** A
+/// `Constant(default_value)` in the return Link routes through
+/// `Bookkeeper::immutableconstant`, which lifts e.g.
+/// `ConstValue::Bool(false)` to `SomeBool { const_box = Some(...) }`.
+/// That constant slot leaks into the rtyper as a fold-eligible
+/// "known false" annotation and can mis-specialise downstream code
+/// that observes the callsite result.  Upstream `ExtRegistryEntry.
+/// compute_result_annotation` (`extregistry.py:33`) returns a
+/// `SomeXXX()` shell with no `const`; the pre-annotated Variable
+/// here carries exactly that shape via `binding(arg)` reading
+/// `v.annotation` directly (`annrpython.py:282-287`).
 ///
 /// Mirrors how `description.py:193-203` test fixtures build a
 /// `FunctionDesc` with a minimal `PyGraph` body — the upstream
@@ -995,7 +1009,7 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
     signature: Signature,
     return_lltype: LowLevelType,
 ) -> Option<Rc<PyGraph>> {
-    let return_const_value = default_constvalue_for_lltype(&return_lltype)?;
+    let return_someval = default_someshell_for_lltype(&return_lltype)?;
     let inputargs: Vec<Hlvalue> = signature
         .argnames
         .iter()
@@ -1008,12 +1022,11 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
     );
     let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
     graph_inner.func = Some(func.clone());
-    let return_constant = Hlvalue::Constant(Constant::with_concretetype(
-        return_const_value,
-        return_lltype,
-    ));
+    let return_var = Variable::named("__unsafe_stub_result");
+    *return_var.annotation.borrow_mut() = Some(Rc::new(return_someval));
+    let return_hlvalue = Hlvalue::Variable(return_var);
     let link = Rc::new(RefCell::new(Link::new(
-        vec![return_constant],
+        vec![return_hlvalue],
         Some(graph_inner.returnblock.clone()),
         None,
     )));
@@ -1027,42 +1040,37 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
     }))
 }
 
-/// Project a `LowLevelType` to a default `ConstValue` suitable for the
-/// stub-graph return Constant ([`build_stub_pygraph_for_unsafe_fn`]).
-/// Mirrors the per-lltype "zero / null" choice the C backend would
-/// emit for an uninitialised local of that type:
+/// Project a `LowLevelType` to a `SomeValue` shell suitable for
+/// pre-annotating the stub-graph return Variable
+/// ([`build_stub_pygraph_for_unsafe_fn`]).
 ///
-/// - integer family (Signed / Unsigned / longlong / longlonglong /
-///   Char / UniChar / Bool / Address) → `ConstValue::Int(0)`
-///   (Address represents `NULL` per `llmemory.py:650`; the boolean
-///   `false` projection matches upstream's "Bool is integer-encoded
-///   at the backend" model)
-/// - float family (Float / SingleFloat / LongFloat) →
-///   `ConstValue::float(0.0)`
-/// - `Void` → `ConstValue::None` (sentinel matching
-///   `RPython rtype_void_constant` semantics — Void carries no value
-///   at runtime but `Constant.value` needs a placeholder)
-/// - `Ptr(_)` → `ConstValue::None` (the flowspace placeholder for a
-///   null pointer; the rtyper later widens this via
-///   `rptr.py::rtype_pointer_arg`)
+/// Delegates to
+/// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
+/// for every primitive lltype `lltype_to_annotation` itself handles
+/// (Void / Bool / Float family / Char / UniChar / integer family /
+/// `Ptr(_)` / `InteriorPtr(_)`), so this helper inherits the
+/// upstream `lltype_to_annotation` (`llannotation.py:172-185`) shape
+/// — every returned `SomeXXX` has no `const_box` set, matching
+/// `ExtRegistryEntry.compute_result_annotation` semantics.
 ///
-/// Returns `None` for compound types (`Func` / `Struct` / `Array` /
-/// `Opaque` / `ForwardReference` / `FixedSizeArray` / `InteriorPtr`) —
-/// these would need full layout-aware constant construction, which
-/// is outside slice 2's scope.  Slice 3's caller treats `None` as
-/// "skip this fn"; the unported path then surfaces the original
-/// "not registered" Skip.
-pub(crate) fn default_constvalue_for_lltype(lltype: &LowLevelType) -> Option<ConstValue> {
-    use LowLevelType::*;
+/// Returns `None` for container types
+/// (`Func` / `Struct` / `Array` / `FixedSizeArray` / `Opaque` /
+/// `ForwardReference`) that `lltype_to_annotation` rejects, and for
+/// `Address` (upstream `SomeAddress`; not yet ported to the pyre
+/// `SomeValue` enum — see `model.rs:21` TODO).  The slice 3c caller
+/// treats `None` as "skip this fn"; the unported path then surfaces
+/// the original "not registered" Skip.
+pub(crate) fn default_someshell_for_lltype(
+    lltype: &LowLevelType,
+) -> Option<crate::annotator::model::SomeValue> {
+    if lltype.is_container_type() {
+        return None;
+    }
     match lltype {
-        Void => Some(ConstValue::None),
-        Signed | Unsigned | SignedLongLong | SignedLongLongLong | UnsignedLongLong
-        | UnsignedLongLongLong | Char | UniChar | Address => Some(ConstValue::Int(0)),
-        Bool => Some(ConstValue::Bool(false)),
-        Float | SingleFloat | LongFloat => Some(ConstValue::float(0.0)),
-        Ptr(_) => Some(ConstValue::None),
-        Func(_) | Struct(_) | Array(_) | FixedSizeArray(_) | Opaque(_) | ForwardReference(_)
-        | InteriorPtr(_) => None,
+        // SomeAddress is not yet present in the SomeValue enum
+        // (model.rs:21 TODO); skip until ported.
+        LowLevelType::Address => None,
+        _ => Some(crate::translator::rtyper::llannotation::lltype_to_annotation(lltype.clone())),
     }
 }
 
@@ -3097,53 +3105,77 @@ fn cross_block(x: i64, cond: bool) -> i64 {
 
     // ─── Z2.5 Path C slice 2 helpers ───
     #[test]
-    fn default_constvalue_for_lltype_integer_family_yields_int_zero() {
+    fn default_someshell_for_lltype_integer_family_yields_someinteger_no_const() {
+        use crate::annotator::model::SomeValue;
         for ll in [
             LowLevelType::Signed,
             LowLevelType::Unsigned,
             LowLevelType::SignedLongLong,
             LowLevelType::UnsignedLongLong,
-            LowLevelType::Char,
-            LowLevelType::UniChar,
-            LowLevelType::Address,
         ] {
-            assert!(
-                matches!(default_constvalue_for_lltype(&ll), Some(ConstValue::Int(0))),
-                "{ll:?} must project to ConstValue::Int(0)"
-            );
+            let s = default_someshell_for_lltype(&ll)
+                .unwrap_or_else(|| panic!("{ll:?} must project to a SomeValue"));
+            match s {
+                SomeValue::Integer(ref si) => assert!(
+                    si.base.const_box.is_none(),
+                    "{ll:?}: SomeInteger must carry no const_box"
+                ),
+                other => panic!("{ll:?}: expected SomeInteger, got {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn default_constvalue_for_lltype_bool_yields_bool_false() {
-        assert!(matches!(
-            default_constvalue_for_lltype(&LowLevelType::Bool),
-            Some(ConstValue::Bool(false))
-        ));
+    fn default_someshell_for_lltype_bool_yields_somebool_no_const() {
+        use crate::annotator::model::SomeValue;
+        let s = default_someshell_for_lltype(&LowLevelType::Bool)
+            .expect("Bool must project to SomeBool");
+        match s {
+            SomeValue::Bool(b) => assert!(
+                b.base.const_box.is_none(),
+                "SomeBool must carry no const_box (ExtRegistryEntry parity)"
+            ),
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
     }
 
     #[test]
-    fn default_constvalue_for_lltype_void_yields_none() {
-        assert!(matches!(
-            default_constvalue_for_lltype(&LowLevelType::Void),
-            Some(ConstValue::None)
-        ));
+    fn default_someshell_for_lltype_void_yields_somenone() {
+        use crate::annotator::model::SomeValue;
+        let s = default_someshell_for_lltype(&LowLevelType::Void)
+            .expect("Void must project to SomeNone");
+        assert!(matches!(s, SomeValue::None_(_)), "got {s:?}");
     }
 
     #[test]
-    fn default_constvalue_for_lltype_float_family_yields_float_zero() {
+    fn default_someshell_for_lltype_float_family_yields_somefloat_no_const() {
+        use crate::annotator::model::SomeValue;
         for ll in [
             LowLevelType::Float,
             LowLevelType::SingleFloat,
             LowLevelType::LongFloat,
         ] {
-            let cv = default_constvalue_for_lltype(&ll).expect("float lltype must project");
-            assert!(matches!(cv, ConstValue::Float(_)), "{ll:?}: {cv:?}");
+            let s = default_someshell_for_lltype(&ll)
+                .unwrap_or_else(|| panic!("{ll:?} must project to a SomeValue"));
+            let const_present = match &s {
+                SomeValue::Float(f) => f.base.const_box.is_some(),
+                SomeValue::SingleFloat(f) => f.base.const_box.is_some(),
+                SomeValue::LongFloat(f) => f.base.const_box.is_some(),
+                other => panic!("{ll:?}: expected float family, got {other:?}"),
+            };
+            assert!(!const_present, "{ll:?}: float shell must have no const_box");
         }
     }
 
     #[test]
+    fn default_someshell_for_lltype_address_yields_none() {
+        // SomeAddress not yet ported (model.rs:21 TODO).
+        assert!(default_someshell_for_lltype(&LowLevelType::Address).is_none());
+    }
+
+    #[test]
     fn build_stub_pygraph_carries_signature_and_links_to_returnblock() {
+        use crate::annotator::model::SomeValue;
         let sig = Signature::new(vec!["obj".to_string()], None, None);
         let pygraph = build_stub_pygraph_for_unsafe_fn(
             "is_none".to_string(),
@@ -3169,7 +3201,7 @@ fn cross_block(x: i64, cond: bool) -> i64 {
         assert_eq!(
             link.args.len(),
             1,
-            "stub Link carries exactly the return constant"
+            "stub Link carries exactly the pre-annotated return Variable"
         );
         // The link's target must be the graph's returnblock.
         let link_target = link.target.as_ref().expect("Link must target a block");
@@ -3177,6 +3209,25 @@ fn cross_block(x: i64, cond: bool) -> i64 {
             std::rc::Rc::ptr_eq(link_target, &graph.returnblock),
             "stub Link must target the graph's returnblock"
         );
+        // The return arg must be a Variable carrying a const-free
+        // SomeBool annotation (ExtRegistryEntry parity).
+        let ret_arg = link.args[0]
+            .as_ref()
+            .expect("stub return arg must be Some(Hlvalue::Variable)");
+        match ret_arg {
+            Hlvalue::Variable(v) => {
+                let ann = v.annotation.borrow();
+                let s = ann.as_ref().expect("return Variable must be pre-annotated");
+                match &**s {
+                    SomeValue::Bool(b) => assert!(
+                        b.base.const_box.is_none(),
+                        "stub return SomeBool must not leak a const_box"
+                    ),
+                    other => panic!("expected SomeBool annotation, got {other:?}"),
+                }
+            }
+            other => panic!("stub return must be Hlvalue::Variable, got {other:?}"),
+        }
     }
 
     #[test]
