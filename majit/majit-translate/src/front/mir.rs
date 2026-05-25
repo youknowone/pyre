@@ -1687,23 +1687,45 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             None => return ValueType::Ref,
         },
     };
-    // Primitive shapes Charon emits inline:
-    //   {"Literal": {"Integer": ...}}  → Int
-    //   {"Literal": {"Bool": null}}    → Bool
-    //   {"Literal": {"Float": ...}}    → Float
-    //   {"Literal": {"Char": null}}    → Int
-    //   {"Adt": [tuple_arity = 0, []]} for `()` → Void
+    // Primitive shapes Charon emits inline.  The literal-type schema
+    // splits across two forms:
+    //
+    //   - atom: `{"Literal": "Bool"}`, `{"Literal": "Char"}`.
+    //   - object: `{"Literal": {"Int": "Isize"}}`,
+    //     `{"Literal": {"UInt": "Usize"}}`,
+    //     `{"Literal": {"Float": "F64"}}`.
+    //
+    // (Older Charon revisions used a single `{"Literal": {"Integer":
+    // …}}` shape, which we still accept for forward-compat with any
+    // pre-extracted .ullbc artefacts still floating around.)
+    //
+    // Unit type `()` lowers to `{"Adt": [tuple_arity = 0, []]}` which
+    // routes through the final `Ref` fallback; the codewriter treats
+    // void-typed Variables uniformly via `getkind`'s 'v' arm.
     if let Some(obj) = value.as_object()
-        && let Some(lit) = obj.get("Literal").and_then(serde_json::Value::as_object)
+        && let Some(lit) = obj.get("Literal")
     {
-        if lit.contains_key("Integer") || lit.contains_key("Char") {
-            return ValueType::Int;
+        if let Some(lit_atom) = lit.as_str() {
+            return match lit_atom {
+                "Bool" => ValueType::Bool,
+                "Char" => ValueType::Int,
+                _ => ValueType::Ref,
+            };
         }
-        if lit.contains_key("Bool") {
-            return ValueType::Bool;
-        }
-        if lit.contains_key("Float") {
-            return ValueType::Float;
+        if let Some(lit_obj) = lit.as_object() {
+            if lit_obj.contains_key("Int")
+                || lit_obj.contains_key("UInt")
+                || lit_obj.contains_key("Integer")
+                || lit_obj.contains_key("Char")
+            {
+                return ValueType::Int;
+            }
+            if lit_obj.contains_key("Bool") {
+                return ValueType::Bool;
+            }
+            if lit_obj.contains_key("Float") {
+                return ValueType::Float;
+            }
         }
     }
     ValueType::Ref

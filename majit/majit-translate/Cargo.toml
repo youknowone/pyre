@@ -67,19 +67,26 @@ stacker = { workspace = true }
 majit-charon-reader = { workspace = true }
 
 [features]
-default = []
-# Issue #97 Step 6.C — DEFERRED 2026-05-25.  Flipping default to
-# `["mir-frontend"]` surfaced real cutover defects in the
-# `pyre-jit-trace/build.rs` path: `compute_at_fixpoint failed` +
-# `OpKind::Call::FunctionPath { segments: ["SharedOpcodeHandler",
-# "pop_value"] } not registered` + classdef-less getattr panics on
-# `locals_w` / `locals_cells_stack_w` / `store_name_value`.  These
-# are real MIR cutover gaps that were previously masked because
-# `check.py` builds with `--no-default-features --features
-# dynasm/cranelift` and lib tests bypass the cutover via the
-# module_path auto-discovery gate.  Step 6.C is therefore gated on
-# closing the build.rs panics first; until then `mir-frontend`
-# stays opt-in.
+default = ["mir-frontend"]
+# Issue #97 Step 6.C: enabled by default 2026-05-25.  When the
+# feature is on, `build_semantic_program_via_active_frontend`
+# resolves LLBC artefacts via `PYRE_MIR_FRONTEND_LLBC` env-var or
+# auto-discovers `<workspace>/build/llbc/{pyre-object,
+# pyre-interpreter}.ullbc`; falls back to the syn-AST builder when
+# neither source resolves (contributor without Charon installed).
+#
+# Step 6.C.1 (Task #38) closed by widening `tyref_to_value_type`
+# to recognise Charon's current literal-type schema — `Literal::Int`
+# (signed) / `Literal::UInt` (unsigned) for integers, and the atom
+# forms `"Bool"` / `"Char"`.  Earlier the helper only matched the
+# pre-split `Literal::Integer` shape, so every `usize` / `isize`
+# argument fell back to `Ref` and tripped
+# `flatten.rs:1155 "switch exitswitch must be int"` for graphs
+# that switched on integer-typed arguments (e.g.
+# `pyre_interpreter::shared_opcode::opcode_call`).
+#
+# Disable via `--no-default-features` to force AST end-to-end
+# (legacy regression mode).
 mir-frontend = []
 
 [dev-dependencies]
