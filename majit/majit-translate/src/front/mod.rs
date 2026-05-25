@@ -120,16 +120,26 @@
 //!     `build_function_graph_with_self_ty_pub`.  The AST graph build
 //!     now runs only for entries MIR did not lower (the residual
 //!     coverage gap below).
-//!   - **3.D (pending)** — close MIR residual gaps so the AST build
-//!     never runs in covered configurations.  Audit names the
-//!     uncovered set: trait-impl gaps `CurrentFrameGuard::drop`,
-//!     `PyFrame::{make_function,call_callable,build_list,build_tuple,
-//!     build_map}`; trait-default gaps under `OpcodeStepExecutor`
-//!     (`swap`, `call`, `import_from`, `format_with_spec`); inherent
-//!     gaps `pyopcode::FrameBlock::new`, `eval::Code::{new,__repr__}`,
-//!     `pyframe::FrameDebugData::new`, `pyframe::PyFrame::{__init__,
-//!     __repr__,getcode,new,ncells,push}`.  Diagnosis requires
-//!     `PYRE_MIR_FRONTEND_DEBUG=1` per-fundecl skip reasons.
+//!   - **3.D** (`102883ec7b`) — `build_semantic_program_from_llbcs`
+//!     was deduping merged entries by the bare `SemanticFunction.name`
+//!     leaf, so `pyre-object::FloatArray::push` seeded the dedup map
+//!     with `"push"` and every later same-named pyre-interpreter impl
+//!     method (`PyFrame::{push,__init__,new,ncells,…}`, etc.) was
+//!     silently dropped.  Switched dedup key to the full qualified
+//!     path (`{module_path}::{name}`).  Audit on the test_phase_f
+//!     LLBC fixture:
+//!       - trait covered 150 → 242 / 275 (55% → 88%)
+//!       - inherent covered 102 → 114 / 125 (82% → 91%)
+//!   - **3.E (pending)** — close the residual ≈44 MIR-uncovered
+//!     entries.  Pattern groups: `XXX::drop` (Drop trait glue Charon
+//!     emits with a synthetic NameSeg shape MIR's
+//!     `impl_method_owner_for_fundecl` does not classify),
+//!     `PyPyJitDriver::{can_enter_jit,jit_merge_point}` (macro-
+//!     generated entries), `pyopcode::__extend__::*` (PyPy class-
+//!     extension methods AST treats as inherent under their owner type
+//!     but Charon files under a synthetic module).  Each subgroup
+//!     wants its own diagnostic dive; AST fallback covers them today
+//!     so the registration loop stays correct in the meantime.
 //! - **Slice 4** — replace the AST-fallback arm in
 //!   `build_semantic_program_via_active_frontend` with a loud
 //!   `panic!` requesting `scripts/extract-llbc.sh`.  Deferred
