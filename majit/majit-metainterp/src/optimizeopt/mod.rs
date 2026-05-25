@@ -3545,9 +3545,13 @@ impl OptContext {
             // InputArg-target chain step (compile.py:478, unroll.py:497).
             op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Unbound non-const target: pre-bind / test fixture
-            // path; keep BoxRef-based Forwarded::Box until those
-            // sources are migrated in C.5.
+            // Unbound non-const BoxRef target — only constructible
+            // from test fixtures that build `BoxRef::new_resop` /
+            // `BoxRef::new_inputarg` without calling `bind_op` /
+            // `bind_inputarg`. Production paths bind every BoxRef at
+            // the recorder→TreeLoop handoff. Keep the legacy path for
+            // those callers; migrating each test individually is
+            // C.8's scope.
             op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
