@@ -1820,6 +1820,68 @@ fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, v: pyre_object::PyO
     }
 }
 
+/// `rsocket.py:RSocket.settimeout` — apply a timeout value to a live fd.
+///
+/// `timeout < 0` (the "None" sentinel) clears `O_NONBLOCK` so the socket
+/// blocks indefinitely.  `timeout == 0` flips `O_NONBLOCK` on for
+/// non-blocking mode.  `timeout > 0` clears `O_NONBLOCK` and writes the
+/// duration to `SO_RCVTIMEO` + `SO_SNDTIMEO` so the kernel returns
+/// `EAGAIN`/`EWOULDBLOCK` after the elapsed time.
+///
+/// Until this helper landed, `settimeout` only stashed the value in the
+/// instance dict and `recv`/`send` blocked indefinitely regardless.
+#[cfg(unix)]
+fn socket_apply_timeout(fd: libc::c_int, timeout: f64) -> Result<(), crate::PyError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(socket_io_err(std::io::Error::last_os_error()));
+    }
+    let want_nonblock = timeout == 0.0;
+    // Bit-clear without unary `!` so the static analyzer accepts the
+    // helper (the analyzer rejects bitwise-not on signed `c_int`).
+    let new_flags = if want_nonblock {
+        flags | libc::O_NONBLOCK
+    } else if (flags & libc::O_NONBLOCK) != 0 {
+        flags - libc::O_NONBLOCK
+    } else {
+        flags
+    };
+    if new_flags != flags {
+        let r = unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) };
+        if r < 0 {
+            return Err(socket_io_err(std::io::Error::last_os_error()));
+        }
+    }
+    let tv = if timeout > 0.0 {
+        let sec = timeout.trunc() as libc::time_t;
+        let usec = ((timeout - timeout.trunc()) * 1_000_000.0).round() as libc::suseconds_t;
+        libc::timeval {
+            tv_sec: sec,
+            tv_usec: usec,
+        }
+    } else {
+        libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        }
+    };
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        let r = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &tv as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(socket_io_err(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<libc::c_int, crate::PyError> {
     let fd = socket_get_attr_i64(obj, "_fd") as libc::c_int;
@@ -3432,11 +3494,11 @@ fn init_socket_type(ns: &mut DictStorage) {
         }),
     );
 
-    // Timeout / blocking helpers.  We only store the timeout in the
-    // instance dict — actually setting O_NONBLOCK + SO_RCVTIMEO/SNDTIMEO
-    // is done lazily at I/O time, which is fine since the methods above
-    // pass through the kernel default.  Calling setblocking(False) does
-    // immediately flip O_NONBLOCK so existing fd consumers see it.
+    // `interp_socket.py:777-797 setblocking_w` per PyPy docstring: True
+    // is equivalent to `settimeout(None)`, False to `settimeout(0.0)`.
+    // Routing through `socket_apply_timeout` keeps the SO_*TIMEO state
+    // consistent with the timeout attribute and prevents a stale
+    // SO_RCVTIMEO from surviving a `setblocking(True)` call.
     crate::dict_storage_store(
         ns,
         "setblocking",
@@ -3446,21 +3508,19 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("setblocking() missing argument"));
                 }
-                let fd = socket_fd(args[0])?;
                 let blocking = unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-                if flags < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
-                let new_flags = if blocking {
-                    flags & !libc::O_NONBLOCK
-                } else {
-                    flags | libc::O_NONBLOCK
-                };
-                let r = unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) };
-                if r < 0 {
-                    return Err(socket_io_err(std::io::Error::last_os_error()));
-                }
+                let fd = socket_fd(args[0])?;
+                let timeout = if blocking { -1.0 } else { 0.0 };
+                socket_apply_timeout(fd, timeout)?;
+                socket_set_attr(
+                    args[0],
+                    "_timeout",
+                    if blocking {
+                        pyre_object::w_none()
+                    } else {
+                        pyre_object::floatobject::w_float_new(0.0)
+                    },
+                );
                 Ok(pyre_object::w_none())
             },
             2,
@@ -3484,6 +3544,11 @@ fn init_socket_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_socket.py:811-828 settimeout_w` then `rsocket.py:RSocket.
+    // settimeout`: None → blocking (no O_NONBLOCK, no SO_*TIMEO); 0.0 →
+    // non-blocking (O_NONBLOCK on); >0 → blocking + SO_RCVTIMEO +
+    // SO_SNDTIMEO set to the duration; <0 → ValueError "Timeout value
+    // out of range".
     crate::dict_storage_store(
         ns,
         "settimeout",
@@ -3493,7 +3558,32 @@ fn init_socket_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("settimeout() missing argument"));
                 }
-                socket_set_attr(args[0], "_timeout", args[1]);
+                let obj = args[0];
+                let w_t = args[1];
+                let timeout: f64 = if unsafe { pyre_object::is_none(w_t) } {
+                    -1.0
+                } else {
+                    let v = unsafe {
+                        if pyre_object::is_float(w_t) {
+                            pyre_object::floatobject::w_float_get_value(w_t)
+                        } else if pyre_object::is_int(w_t) {
+                            pyre_object::w_int_get_value(w_t) as f64
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "settimeout: timeout must be a float or None",
+                            ));
+                        }
+                    };
+                    if v < 0.0 {
+                        return Err(crate::PyError::value_error(
+                            "Timeout value out of range",
+                        ));
+                    }
+                    v
+                };
+                let fd = socket_fd(obj)?;
+                socket_apply_timeout(fd, timeout)?;
+                socket_set_attr(obj, "_timeout", w_t);
                 Ok(pyre_object::w_none())
             },
             2,
