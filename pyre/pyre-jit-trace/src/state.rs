@@ -5531,27 +5531,19 @@ impl JitState for PyreJitState {
         _header_pc: usize,
         original_boxes: &[majit_metainterp::GreenBox],
     ) -> PyreMeta {
-        let original_box_types: Vec<Type> = original_boxes.iter().map(|gb| gb.ty).collect();
-        let original_box_types = &original_box_types[..];
+        let original_box_count = original_boxes.len();
         // `NUM_SCALAR_INPUTARGS` already counts `NUM_EXTRA_REDS` (frame +
         // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let _ = provisional.trace_extra_reds; // staging copy only
         // RPython parity: Python locals/stack are always Ref.
-        let slot_types = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            vec![
-                Type::Ref;
-                original_box_types
-                    .len()
-                    .saturating_sub(NUM_SCALAR_INPUTARGS)
-            ]
+        let slot_types = if original_box_count >= NUM_SCALAR_INPUTARGS {
+            vec![Type::Ref; original_box_count.saturating_sub(NUM_SCALAR_INPUTARGS)]
         } else {
             Vec::new()
         };
-        let array_capacity = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            original_box_types
-                .len()
-                .saturating_sub(NUM_SCALAR_INPUTARGS)
+        let array_capacity = if original_box_count >= NUM_SCALAR_INPUTARGS {
+            original_box_count.saturating_sub(NUM_SCALAR_INPUTARGS)
         } else {
             provisional.array_capacity
         };
