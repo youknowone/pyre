@@ -468,17 +468,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
 
     // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
-    // at `eval.rs:844 Ok(PyFrame::pop(self))`. The codewriter resolves
-    // the qualified `PyFrame::pop(self)` syntax to a 2-segment CallPath
-    // `["PyFrame", "pop"]` (without the `pyframe::` module prefix that a
-    // bare method call like `self.nlocals()` would have).
+    // at `eval.rs:844 Ok(self.pop())`.  Two CallPath shapes need binding:
+    //
+    // 1. The qualified `PyFrame::pop(self)` spelling resolves to the
+    //    2-segment CallPath `["PyFrame", "pop"]` via `for_impl_method`.
+    // 2. The bare `self.pop()` spelling goes through `target_to_path`'s
+    //    suffix-match fallback (call.rs:3069-3112), which returns the
+    //    3-segment module-qualified key `["pyframe", "PyFrame", "pop"]`
+    //    that `function_graphs` actually stores inherent impl methods
+    //    under (per `parse::extract_inherent_impl_methods`).
+    //
     // `register_macro_helper_trace_fnaddr` strips the leading segment,
-    // so the 3-segment input string `pyre_interpreter::PyFrame::pop`
-    // produces the matching 2-segment canonical form.
+    // so we register both spellings via `push_alias_pair`: the 3-segment
+    // input `pyre_interpreter::PyFrame::pop` produces the 2-segment
+    // canonical, and the 4-segment input `pyre_interpreter::pyframe::PyFrame::pop`
+    // produces the 3-segment module-qualified form.  Without the second
+    // binding, `fnaddr_for_target` for `self.pop()` falls back to the
+    // symbolic hash from [`symbolic_fnaddr_for_path`], which SEGVs at
+    // trace-time call.
     let pyframe_pop: fn(&mut crate::pyframe::PyFrame) -> pyre_object::PyObjectRef =
         crate::pyframe::PyFrame::pop;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::pop",
         "pyre_interpreter::PyFrame::pop",
         pyframe_pop as *const (),
     );
