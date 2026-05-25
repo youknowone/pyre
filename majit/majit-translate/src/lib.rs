@@ -132,9 +132,27 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// Falls back to the syn-AST builder when neither source resolves
 /// (Charon not installed, contributor on stable Rust without
 /// LLBC extraction).
+/// Which frontend produced the `SemanticProgram` returned by
+/// `build_semantic_program_via_active_frontend`.  Slice 3.F gates
+/// `MirGraphLookup` construction in `analyze_pipeline_from_parsed`
+/// on this: AST-only mode must not consult a lookup built from an
+/// AST-only `program.functions`, because `extract_*`'s
+/// `build_function_graph_with_self_ty_pub` and
+/// `build_graphs_from_items`'s `build_function_graph` produce
+/// subtly different graphs for the same syn::ImplItemFn (different
+/// option threading).  Routing extract_* to read its sibling
+/// builder's output breaks downstream consumers (the
+/// `generic_handler_graphs_keep_symbolic_fnaddr_surface` regression
+/// pin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveFrontend {
+    Mir,
+    Ast,
+}
+
 fn build_semantic_program_via_active_frontend(
     parsed_files: &[parse::ParsedInterpreter],
-) -> front::SemanticProgram {
+) -> (front::SemanticProgram, ActiveFrontend) {
     #[cfg(feature = "mir-frontend")]
     {
         // Step 4.6 multi-LLBC cutover: accept colon-separated paths
@@ -193,12 +211,13 @@ fn build_semantic_program_via_active_frontend(
             // Charon does not yet expose; MIR replaces only the
             // function bodies the codewriter consumes.
             merge_fn_return_types_from_parsed_files(&mut program, parsed_files);
-            return program;
+            return (program, ActiveFrontend::Mir);
         }
     }
     let _ = parsed_files; // silence unused warning when only AST is reachable
-    front::build_semantic_program_from_parsed_files(parsed_files)
-        .expect("pyre-interpreter source must lower without FlowingError")
+    let program = front::build_semantic_program_from_parsed_files(parsed_files)
+        .expect("pyre-interpreter source must lower without FlowingError");
+    (program, ActiveFrontend::Ast)
 }
 
 /// Step 6.E audit helper — count how many methods produced by the
@@ -924,7 +943,7 @@ fn analyze_pipeline_from_parsed(
     // `scripts/extract-llbc.sh`). The flag without the env-var still
     // takes the AST path so partial enablement stays a no-op.
     mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(parsed_files);
+    let (program, active_frontend) = build_semantic_program_via_active_frontend(parsed_files);
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
@@ -948,12 +967,19 @@ fn analyze_pipeline_from_parsed(
         String,
     > = std::collections::HashMap::new();
 
-    // Slice 3.C: build the MIR-graph lookup table once and pass it
+    // Slice 3.C/3.F: build the MIR-graph lookup table once and pass it
     // into both extract_* collectors so they can skip
     // `build_function_graph_with_self_ty_pub` on hit and delegate to
-    // the MIR-built graph.  AST build runs only for entries MIR did
-    // not lower.
-    let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
+    // the MIR-built graph.  Only build the lookup when the active
+    // frontend is MIR — in AST-only mode `program.functions` is itself
+    // AST-built (via `build_graphs_from_items` / `build_function_graph`),
+    // and routing extract_* to read its sibling builder's output breaks
+    // graphs that the two builders thread differently
+    // (`generic_handler_graphs_keep_symbolic_fnaddr_surface` pin).
+    let mir_graph_lookup = match active_frontend {
+        ActiveFrontend::Mir => Some(front::semantic::MirGraphLookup::from_program(&program)),
+        ActiveFrontend::Ast => None,
+    };
     for parsed in parsed_files {
         canonical_trait_impls.extend(
             parse::extract_trait_impls(
@@ -961,7 +987,7 @@ fn analyze_pipeline_from_parsed(
                 &program.struct_fields,
                 &program.fn_return_types,
                 &program.known_struct_names,
-                Some(&mir_graph_lookup),
+                mir_graph_lookup.as_ref(),
             )
             .expect("trait impls must lower without FlowingError"),
         );
@@ -971,7 +997,7 @@ fn analyze_pipeline_from_parsed(
                 &program.struct_fields,
                 &program.fn_return_types,
                 &program.known_struct_names,
-                Some(&mir_graph_lookup),
+                mir_graph_lookup.as_ref(),
             )
             .expect("inherent methods must lower without FlowingError"),
         );
@@ -1237,12 +1263,19 @@ fn analyze_pipeline_from_parsed(
         for method in &impl_info.methods {
             // Slice 3.B/3.C: prefer the MIR-built graph when
             // program.functions covers this entry; fall back to the
-            // AST-built graph that extract_* carried in.
-            let mir_graph: Option<&model::FunctionGraph> = if is_default {
-                mir_graph_lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
-            } else {
-                mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
-            };
+            // AST-built graph that extract_* carried in.  When the
+            // active frontend is AST, `mir_graph_lookup` is None
+            // (Slice 3.F) and every lookup returns None — the
+            // method.graph fallback handles the rest.
+            let mir_graph: Option<&model::FunctionGraph> = mir_graph_lookup
+                .as_ref()
+                .and_then(|lookup| {
+                    if is_default {
+                        lookup.lookup_trait_default(&impl_info.trait_name, &method.name)
+                    } else {
+                        lookup.lookup_impl_method(impl_type, &method.name)
+                    }
+                });
             let graph_source: Option<model::FunctionGraph> = mir_graph
                 .cloned()
                 .or_else(|| method.graph.clone());
@@ -1366,9 +1399,12 @@ fn analyze_pipeline_from_parsed(
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
         // Slice 3.B/3.C: prefer the MIR-built graph; fall back to the
-        // AST-built graph carried in InherentMethodInfo.
+        // AST-built graph carried in InherentMethodInfo.  When the
+        // active frontend is AST, `mir_graph_lookup` is None (Slice
+        // 3.F) and the lookup short-circuits to the AST graph.
         let graph: model::FunctionGraph = mir_graph_lookup
-            .lookup_impl_method(impl_type, &method_info.name)
+            .as_ref()
+            .and_then(|lookup| lookup.lookup_impl_method(impl_type, &method_info.name))
             .map(|g| g.clone())
             .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven

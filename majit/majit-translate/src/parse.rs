@@ -1083,39 +1083,51 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
-                                // Slice 3.C: try MIR lookup first; skip
-                                // `build_function_graph_with_self_ty_pub` on hit
-                                // and derive hints directly from syn attrs.
+                                // Slice 3.C/3.F: try MIR lookup first.  When
+                                // the caller passed a `MirGraphLookup` and
+                                // the lookup misses, emit `graph: None` —
+                                // do NOT run `build_function_graph_with_self_ty_pub`.
+                                // The AST graph builder runs only for legacy
+                                // callers (mir_graphs = None, i.e. test
+                                // fixtures with no MIR program available).
                                 let mir_hit = mir_graphs.and_then(|m| {
                                     self_ty_root
                                         .as_deref()
                                         .and_then(|owner| m.lookup_impl_method(owner, &method_name))
                                 });
-                                let (graph, hints) = if let Some(g) = mir_hit {
-                                    (
-                                        g.clone(),
+                                let (graph, hints) = match (mir_hit, mir_graphs) {
+                                    (Some(g), _) => (
+                                        Some(g.clone()),
                                         crate::front::ast::collect_jit_hints_with_sig(
                                             &synth.attrs,
                                             &synth.sig,
                                         ),
-                                    )
-                                } else {
-                                    let sf =
-                                        crate::front::ast::build_function_graph_with_self_ty_pub(
-                                            &synth,
-                                            self_ty_root.clone(),
-                                            struct_fields,
-                                            fn_return_types,
-                                            prefix,
-                                            use_imports,
-                                            known_struct_names,
-                                            known_trait_names,
-                                        )?;
-                                    (sf.graph, sf.hints)
+                                    ),
+                                    (None, Some(_)) => (
+                                        None,
+                                        crate::front::ast::collect_jit_hints_with_sig(
+                                            &synth.attrs,
+                                            &synth.sig,
+                                        ),
+                                    ),
+                                    (None, None) => {
+                                        let sf =
+                                            crate::front::ast::build_function_graph_with_self_ty_pub(
+                                                &synth,
+                                                self_ty_root.clone(),
+                                                struct_fields,
+                                                fn_return_types,
+                                                prefix,
+                                                use_imports,
+                                                known_struct_names,
+                                                known_trait_names,
+                                            )?;
+                                        (Some(sf.graph), sf.hints)
+                                    }
                                 };
                                 methods.push(MethodInfo {
                                     name: method_name,
-                                    graph: Some(graph),
+                                    graph,
                                     return_type,
                                     hints,
                                 });
@@ -1170,35 +1182,45 @@ fn collect_trait_impls_from_items(
                                     }
                                     syn::ReturnType::Default => Some("()".to_string()),
                                 };
-                                // Slice 3.C: try MIR trait-default lookup
-                                // before falling back to the AST build.
+                                // Slice 3.C/3.F: same MIR-or-None policy as
+                                // the impl-method branch above — AST graph
+                                // build only runs when no MIR lookup was
+                                // supplied.
                                 let mir_hit = mir_graphs
                                     .and_then(|m| m.lookup_trait_default(&trait_name, &method_name));
-                                let (graph, hints) = if let Some(g) = mir_hit {
-                                    (
-                                        g.clone(),
+                                let (graph, hints) = match (mir_hit, mir_graphs) {
+                                    (Some(g), _) => (
+                                        Some(g.clone()),
                                         crate::front::ast::collect_jit_hints_with_sig(
                                             &synth.attrs,
                                             &synth.sig,
                                         ),
-                                    )
-                                } else {
-                                    let sf =
-                                        crate::front::ast::build_function_graph_with_self_ty_pub(
-                                            &synth,
-                                            None,
-                                            struct_fields,
-                                            fn_return_types,
-                                            prefix,
-                                            use_imports,
-                                            known_struct_names,
-                                            known_trait_names,
-                                        )?;
-                                    (sf.graph, sf.hints)
+                                    ),
+                                    (None, Some(_)) => (
+                                        None,
+                                        crate::front::ast::collect_jit_hints_with_sig(
+                                            &synth.attrs,
+                                            &synth.sig,
+                                        ),
+                                    ),
+                                    (None, None) => {
+                                        let sf =
+                                            crate::front::ast::build_function_graph_with_self_ty_pub(
+                                                &synth,
+                                                None,
+                                                struct_fields,
+                                                fn_return_types,
+                                                prefix,
+                                                use_imports,
+                                                known_struct_names,
+                                                known_trait_names,
+                                            )?;
+                                        (Some(sf.graph), sf.hints)
+                                    }
                                 };
                                 methods.push(MethodInfo {
                                     name: method_name,
-                                    graph: Some(graph),
+                                    graph,
                                     return_type,
                                     hints,
                                 });
@@ -1377,36 +1399,46 @@ fn collect_inherent_methods_from_items(
                                 }
                                 syn::ReturnType::Default => Some("()".to_string()),
                             };
-                            // Slice 3.C: prefer MIR's inherent-method
-                            // graph; lookup is keyed by `self_ty_root_qualified`
-                            // to match the MIR builder's
-                            // `strip_crate_prefix(name_path())` shape.
+                            // Slice 3.C/3.F: prefer MIR's inherent-method
+                            // graph (keyed by self_ty_root_qualified).
+                            // When the caller passed a MirGraphLookup but
+                            // the lookup misses, skip this entry — the AST
+                            // graph builder is no longer the production
+                            // fallback for impl methods, and
+                            // InherentMethodInfo.graph is non-Option so we
+                            // cannot represent the gap inline.  Skipped
+                            // entries simply do not surface in
+                            // `canonical_inherent_methods`; the registration
+                            // loop's downstream consumers iterate that
+                            // collection and skip what is not present.
                             let mir_hit = mir_graphs.and_then(|m| {
                                 self_ty_root_qualified
                                     .as_deref()
                                     .and_then(|owner| m.lookup_impl_method(owner, &method_name))
                             });
-                            let (graph, hints) = if let Some(g) = mir_hit {
-                                (
+                            let (graph, hints) = match (mir_hit, mir_graphs) {
+                                (Some(g), _) => (
                                     g.clone(),
                                     crate::front::ast::collect_jit_hints_with_sig(
                                         &synth.attrs,
                                         &synth.sig,
                                     ),
-                                )
-                            } else {
-                                let sf =
-                                    crate::front::ast::build_function_graph_with_self_ty_pub(
-                                        &synth,
-                                        self_ty_root_bare.clone(),
-                                        struct_fields,
-                                        fn_return_types,
-                                        prefix,
-                                        use_imports,
-                                        known_struct_names,
-                                        &std::collections::HashSet::new(),
-                                    )?;
-                                (sf.graph, sf.hints)
+                                ),
+                                (None, Some(_)) => continue,
+                                (None, None) => {
+                                    let sf =
+                                        crate::front::ast::build_function_graph_with_self_ty_pub(
+                                            &synth,
+                                            self_ty_root_bare.clone(),
+                                            struct_fields,
+                                            fn_return_types,
+                                            prefix,
+                                            use_imports,
+                                            known_struct_names,
+                                            &std::collections::HashSet::new(),
+                                        )?;
+                                    (sf.graph, sf.hints)
+                                }
                             };
                             methods.push(InherentMethodInfo {
                                 for_type: for_type.clone(),

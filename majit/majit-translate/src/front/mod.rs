@@ -140,6 +140,20 @@
 //!     but Charon files under a synthetic module).  Each subgroup
 //!     wants its own diagnostic dive; AST fallback covers them today
 //!     so the registration loop stays correct in the meantime.
+//!   - **3.F** — `extract_trait_impls` /
+//!     `extract_inherent_impl_methods` no longer call
+//!     `build_function_graph_with_self_ty_pub` when the caller
+//!     passes a `MirGraphLookup` and the lookup misses.  The
+//!     trait-impl branch emits `graph: None` on miss; the inherent
+//!     branch skips the method entirely (its `graph` field is
+//!     non-Option).  `analyze_pipeline_from_parsed` only constructs
+//!     `MirGraphLookup` when the active frontend is genuinely MIR
+//!     (`build_semantic_program_via_active_frontend` now returns
+//!     `(SemanticProgram, ActiveFrontend)`).  In AST-only mode
+//!     (test fixtures with no LLBC) the extractors still run the
+//!     legacy AST graph build for every method.  This shrinks the
+//!     AST graph builder reach in production to the residual ≈44
+//!     entries from 3.E.
 //! - **Slice 4** — replace the AST-fallback arm in
 //!   `build_semantic_program_via_active_frontend` with a loud
 //!   `panic!` requesting `scripts/extract-llbc.sh`.  Deferred
