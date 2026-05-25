@@ -422,15 +422,34 @@ impl<'a> Lowering<'a> {
         // Arguments become startblock inputargs in source order
         // (RPython parity: `flowcontext.py:333` populates `locals_w[:argcount]`
         // from `flowmodel.py:130` `Block(inputargs)`).
+        //
+        // Each parameter is also emitted as a paired `OpKind::Input { name,
+        // ty }` op into the startblock, mirroring AST
+        // (`front/ast.rs:1636-1646 / 1656-1665`).  Downstream consumers
+        // — `flowspace_adapter::derive_subject_inputcells`
+        // (`translator/rtyper/flowspace_adapter.rs:1464+`),
+        // `graph_non_void_arg_types` (`jit_codewriter/call.rs:2748+`),
+        // `type_state` (`jit_codewriter/type_state.rs:131`) — locate
+        // each inputarg's declared `ValueType` by scanning the leading
+        // `OpKind::Input` ops with `op.result == &arg`.  Without the
+        // Input op, `derive_subject_inputcells` fails-loud at
+        // `flowspace_adapter.rs:1504` for any MIR-built graph that
+        // reaches the real-rtyper dual-gate.
         let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
+        let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
         for i in 1..=arg_count {
             let local = &body.locals.locals[i];
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             // Register a stable name so canonical comparison can spot
             // arg-renames.
-            graph.value_names.insert(graph.slot_of(&var).unwrap(), name);
+            graph.value_names.insert(graph.slot_of(&var).unwrap(), name.clone());
             local_var[i] = Some(var.clone());
+            let ty = tyref_to_value_type(&local.ty);
+            input_ops.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Input { name, ty },
+            });
             startblock_args.push(var);
         }
         // Startblock gets the args as its inputargs. The startblock is
@@ -438,6 +457,13 @@ impl<'a> Lowering<'a> {
         for var in &startblock_args {
             graph.push_inputarg_var(graph.startblock, var.clone());
         }
+        // Push the paired `OpKind::Input` ops into the startblock so
+        // `derive_subject_inputcells` can project each inputarg's
+        // declared ValueType to a SomeValue shell.
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .extend(input_ops);
 
         // Pre-allocate a Block for each MIR basic block so terminators
         // can refer to successors via stable BlockId. MIR bb0 maps to
