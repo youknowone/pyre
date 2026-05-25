@@ -7968,9 +7968,18 @@ mod tests {
             0,
         );
         let mut get_register = |var: Variable| match var.id {
-            VariableId(7) => Register { kind: Kind::Ref, index: 100 },
-            VariableId(8) => Register { kind: Kind::Ref, index: 101 },
-            VariableId(9) => Register { kind: Kind::Ref, index: 102 },
+            VariableId(7) => Register {
+                kind: Kind::Ref,
+                index: 100,
+            },
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
             _ => panic!("unexpected var id {:?}", var.id),
         };
         let mut lower_constant = |_c: &Constant| unreachable!("test uses Variables only");
@@ -7982,9 +7991,16 @@ mod tests {
         )
         .expect("simple_call lowering must succeed when portal_frame_var is set");
         match insn {
-            Insn::Op { opname, args, result } => {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
                 assert_eq!(opname, "residual_call_r_r");
-                let frame_reg = Register { kind: Kind::Ref, index: 100 };
+                let frame_reg = Register {
+                    kind: Kind::Ref,
+                    index: 100,
+                };
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
@@ -8002,7 +8018,10 @@ mod tests {
                 }
                 assert_eq!(
                     result,
-                    Some(Register { kind: Kind::Ref, index: 102 }),
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
                     "result register must come from the op's result Variable"
                 );
             }
@@ -8033,7 +8052,10 @@ mod tests {
             Some(result_var.into()),
             0,
         );
-        let mut get_register = |_var: Variable| Register { kind: Kind::Ref, index: 0 };
+        let mut get_register = |_var: Variable| Register {
+            kind: Kind::Ref,
+            index: 0,
+        };
         let mut lower_constant = |_c: &Constant| unreachable!();
         let _ = super::lower_simple_call_hlop_to_insn(
             &op,

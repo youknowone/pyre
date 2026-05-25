@@ -896,7 +896,7 @@ fn phase4_scan_color_budget_violations(
     violations
 }
 
-/// Phase 4 #229 splice helper: filter pyre-only walker emits + canonical
+/// Splice-audit helper: filter pyre-only walker emits + canonical
 /// trampoline Labels so the resulting sequence is comparable for byte
 /// equivalence.  Applied symmetrically to both walker and canonical:
 ///
@@ -909,10 +909,13 @@ fn phase4_scan_color_budget_violations(
 ///   emits slot-keyed stack/local mirrors at emit time; canonical
 ///   emits them at link rewrite time.  Both express the same renaming
 ///   semantics.
-/// - `Label("link*")` per `flatten.py:306-334 insert_renamings` + ε.3
-///   slice — canonical synthesises a trampoline Label per multi-pred
-///   link rewrite; walker handles the same renaming inline.  Block
-///   Labels (`Label("block*")`) and catch-landing Labels survive.
+/// - `Label("link*")` per `flatten.py:306-334 insert_renamings` —
+///   canonical synthesises a trampoline Label per multi-pred link
+///   rewrite.  Walker handles the same renaming via
+///   `emit_trampoline_for_multi_pred_link`, which names its
+///   trampoline blocks `epsilon3_link_*`; both prefixes filter out.
+///   Block Labels (`Label("block*")`) and catch-landing Labels
+///   survive.
 fn phase4_filter_compare_eligible(insns: &[super::flatten::Insn]) -> Vec<&super::flatten::Insn> {
     insns
         .iter()
@@ -920,22 +923,35 @@ fn phase4_filter_compare_eligible(insns: &[super::flatten::Insn]) -> Vec<&super:
             super::flatten::Insn::Op { opname, .. } => {
                 opname.as_str() != super::flatten::OPNAME_LIVE && opname.as_str() != "ref_copy"
             }
-            super::flatten::Insn::Label(label) => !label.name.starts_with("link"),
+            super::flatten::Insn::Label(label) => {
+                // Trampoline labels — canonical synthesises `link*`
+                // names via `flatten.py:306-334 insert_renamings`;
+                // walker uses `epsilon3_link_*` names via
+                // `emit_trampoline_for_multi_pred_link`.  Both express
+                // the same per-link renaming; filter both so the
+                // comparison only sees runtime-visible Labels.
+                !label.name.starts_with("link") && !label.name.starts_with("epsilon3_link")
+            }
             _ => true,
         })
         .collect()
 }
 
-/// Phase 4 #229 splice helper: structural equality on `Operand`.
+/// Splice-audit helper: structural equality on `Operand`.
 /// Compares Register kind+index, Const literal values, ListOfKind
-/// content recursively.  Descr identity is intentionally IGNORED:
-/// `assembler.py:197-206` dedups descrs by Python `id(x)`, but two
-/// `Rc<DescrOperand>` constructed from the same semantic descr at
-/// different walker vs canonical emit sites compare equal in shape
-/// even when their `Rc` pointers differ.  `ignore_label_names` is
-/// set under the lax audit mode where walker's pointer-derived
-/// `block<addr>` names and canonical's ordinal `block<N>` names are
-/// treated as positionally equivalent (T6-epic naming bridge).
+/// content recursively.  `Operand::Descr` and
+/// `Operand::IndirectCallTargets` compare by pointer identity
+/// (`Rc::ptr_eq` / `Arc::ptr_eq`); `assembler.py:197-206` dedups
+/// runtime descrs by Python `id(x)`, so the splice-audit treats two
+/// distinct Rc/Arc allocations as different descrs even when their
+/// semantic payload happens to match.  This is the conservative
+/// choice: splice eligibility errs toward false negatives (denying
+/// splice when descrs are structurally equal but allocated twice)
+/// rather than false positives (marking splice-ready when descrs
+/// actually differ).  `ignore_label_names` is set under the lax
+/// audit mode where walker's pointer-derived `block<addr>` names and
+/// canonical's ordinal `block<N>` names are treated as positionally
+/// equivalent.
 fn phase4_operand_eq(
     a: &super::flatten::Operand,
     b: &super::flatten::Operand,
@@ -951,7 +967,7 @@ fn phase4_operand_eq(
         (Operand::ListOfKind(x), Operand::ListOfKind(y)) => {
             x.kind == y.kind && phase4_operand_slice_eq(&x.content, &y.content, ignore_label_names)
         }
-        (Operand::Descr(_), Operand::Descr(_)) => true,
+        (Operand::Descr(x), Operand::Descr(y)) => std::rc::Rc::ptr_eq(x, y),
         (Operand::IndirectCallTargets(x), Operand::IndirectCallTargets(y)) => {
             // Compare the per-call-site target list by element identity
             // (`Arc::ptr_eq`).  `assembler.py:197-206` dedups the runtime
@@ -990,7 +1006,7 @@ fn phase4_register_opt_eq(
     }
 }
 
-/// Phase 4 #229 splice helper: structural equality on a single `Insn`.
+/// Splice-audit helper: structural equality on a single `Insn`.
 fn phase4_insn_eq(
     a: &super::flatten::Insn,
     b: &super::flatten::Insn,
@@ -1020,8 +1036,8 @@ fn phase4_insn_eq(
     }
 }
 
-/// Phase 4 #229 splice readiness predicate.  Returns `true` if walker
-/// and canonical Insn sequences are byte-equivalent modulo pyre-only
+/// Splice-audit readiness predicate.  Returns `true` if walker and
+/// canonical Insn sequences are byte-equivalent modulo pyre-only
 /// walker emits (`-live-`, `ref_copy`) and canonical-only trampoline
 /// Labels.  Filtering follows the same conventions as the
 /// `[phase4-diff-nolive-noref_copy]` probe and additionally drops
@@ -1031,7 +1047,7 @@ fn phase4_insn_eq(
 /// `ignore_label_names=false` (strict): block Label names must match
 /// exactly — walker today emits `block<SpamBlock-Rc-addr>` while
 /// canonical emits `block<ordinal>`, so strict mode reports 0 / N
-/// graphs eligible pending the T6-epic naming bridge.
+/// graphs eligible pending the naming bridge.
 ///
 /// `ignore_label_names=true` (lax): position-aligned Labels compare
 /// equal regardless of name.  Lax-eligible counts measure how many
@@ -1041,7 +1057,7 @@ fn phase4_insn_eq(
 /// PyPy parity: byte_equivalent => walker emits the same Insn
 /// sequence that `flatten_graph(graph, regallocs, cpu)` would emit
 /// (`flatten.py:63-70`), modulo documented walker deviations.  A
-/// `true` strict result is the gate that lets a follow-up slice
+/// `true` strict result is the gate that lets a follow-up change
 /// replace walker's `ssarepr.insns` with canonical's at zero behavior
 /// change.
 fn phase4_byte_equivalent(
@@ -1060,14 +1076,14 @@ fn phase4_byte_equivalent(
         .all(|(w, c)| phase4_insn_eq(w, c, ignore_label_names))
 }
 
-/// Phase 4 #229 splice diagnostic: return the index + (walker, canonical)
-/// of the first divergent Insn pair in the filter-eligible sequence, or
-/// `None` if the two streams are byte-equivalent.  Filtered_len mismatch
-/// returns `Some((min_len, …))` with the diverging length-boundary pair
-/// (or `None`-sentinel pair on the shorter side).  Used by the
-/// `PYRE_PHASE4_SPLICE_AUDIT` probe to surface the first concrete
-/// Register-index / opname divergence on graphs where filtered_len
-/// matches but eligibility fails — the next splice slice's data.
+/// Splice-audit diagnostic: return the index + (walker, canonical)
+/// of the first divergent Insn pair in the filter-eligible sequence,
+/// or `None` if the two streams are byte-equivalent.  Filtered_len
+/// mismatch returns `Some((min_len, …))` with the diverging length-
+/// boundary pair (or `None`-sentinel pair on the shorter side).  Used
+/// by the `PYRE_PHASE4_SPLICE_AUDIT` probe to surface the first
+/// concrete Register-index / opname divergence on graphs where
+/// filtered_len matches but eligibility fails.
 fn phase4_first_divergence(
     walker_insns: &[super::flatten::Insn],
     canonical_insns: &[super::flatten::Insn],
@@ -4392,6 +4408,21 @@ impl CodeWriter {
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
+        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
+        // — RPython looks up portal-ness in the registry that
+        // `setup_jitdriver` populates. pyre matches that: a code is a
+        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
+        // path (`register_portal_jitdriver`) registers before the drain
+        // runs `transform_graph_to_jitcode`, so the lookup must happen
+        // before creating the shadow graph / entry FrameState below.
+        // `merge_point_pc` is only a pyre refinement hint; `None` still
+        // means "registered portal whose exact merge PC is not known yet",
+        // not "non-portal".
+        let portal_jd_index = self
+            .callcontrol()
+            .jitdriver_sd_from_portal_graph(code as *const CodeObject);
+        let is_portal = portal_jd_index.is_some();
+
         // Populate `cpu.lowering_ctx` with the four retired-family fn
         // indices so the canonical `flatten.rs::flatten_graph(graph,
         // regallocs, _include_all_exc_links, cpu)` driver can dispatch
@@ -4423,7 +4454,18 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                portal_frame_var: Some(frame_var),
+                // Only portal graphs include `frame_var` in
+                // `graph_entry_inputargs(code, true)`; for non-portal
+                // graphs `frame_var.id` collides with the synthesised
+                // `return_var` slot (`new_shadow_graph_with_portal_inputs`
+                // assigns `return_var = Variable(VariableId(start_inputargs.len()))`,
+                // which equals `entry_arg_slots(code)` when
+                // `portal_inputs=false` — the same id `portal_graph_inputvars`
+                // returns for `frame_var`).  Threading a non-portal
+                // `Some(frame_var)` through `get_register` resolves the
+                // call-frame operand from `return_var`'s color, corrupting
+                // canonical `lower_simple_call_hlop_to_insn` lowering.
+                portal_frame_var: if is_portal { Some(frame_var) } else { None },
             });
         }
 
@@ -4434,21 +4476,6 @@ impl CodeWriter {
         for _ in 0..num_instrs {
             labels.push(assembler.new_label());
         }
-
-        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
-        // — RPython looks up portal-ness in the registry that
-        // `setup_jitdriver` populates. pyre matches that: a code is a
-        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
-        // path (`register_portal_jitdriver`) registers before the drain
-        // runs `transform_graph_to_jitcode`, so the lookup must happen
-        // before creating the shadow graph / entry FrameState below.
-        // `merge_point_pc` is only a pyre refinement hint; `None` still
-        // means "registered portal whose exact merge PC is not known yet",
-        // not "non-portal".
-        let portal_jd_index = self
-            .callcontrol()
-            .jitdriver_sd_from_portal_graph(code as *const CodeObject);
-        let is_portal = portal_jd_index.is_some();
 
         // shadow `FunctionGraph` alongside `ssarepr`.
         //
