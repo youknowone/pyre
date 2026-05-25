@@ -573,25 +573,37 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,
     // so without a registration the descr falls back to
     // `EF_ELIDABLE_CAN_RAISE`.
+    //
+    // These free functions are also called unqualified inside `pyframe.rs`
+    // itself (`pyframe_get_pycode(self)` / `ncells(code)` / `npure_cellvars(code)`).
+    // `target_to_path` for a `FunctionPath` returns the segments verbatim,
+    // so an in-module bare call resolves to a 1-segment CallPath
+    // `["<name>"]` while a cross-module qualified call resolves to
+    // `["pyframe", "<name>"]`.  Use `push_alias_pair` to register both
+    // shapes via the strip-one-segment rule in
+    // `register_macro_helper_trace_fnaddr`.
     let pyframe_get_pycode_fn: unsafe fn(&crate::pyframe::PyFrame) -> *const crate::CodeObject =
         crate::pyframe::pyframe_get_pycode;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
         "pyre_interpreter::pyframe::pyframe_get_pycode",
+        "pyre_interpreter::pyframe_get_pycode",
         pyframe_get_pycode_fn as *const (),
     );
 
     let pyframe_ncells_free: fn(&crate::CodeObject) -> usize = crate::pyframe::ncells;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
         "pyre_interpreter::pyframe::ncells",
+        "pyre_interpreter::ncells",
         pyframe_ncells_free as *const (),
     );
 
     let pyframe_npure_cellvars: fn(&crate::CodeObject) -> usize = crate::pyframe::npure_cellvars;
-    push_fnaddr(
+    push_alias_pair(
         &mut entries,
         "pyre_interpreter::pyframe::npure_cellvars",
+        "pyre_interpreter::npure_cellvars",
         pyframe_npure_cellvars as *const (),
     );
 
