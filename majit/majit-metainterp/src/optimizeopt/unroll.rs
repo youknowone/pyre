@@ -41,25 +41,29 @@ fn is_trace_runtime_ref(
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
-/// Reconstruct Phase 1's `box_pool` prefix from the exported snapshot
-/// so a Phase 2 retrace observes the same `_forwarded` chain Phase 1
-/// produced. The `BoxPool::clone` here is intentionally shallow:
-/// `BoxRef` is `Rc<Box>`, so cloning shares the same `Box` cells —
-/// matching `unroll.py` Phase 2's behaviour of seeing Phase 1's
-/// `_forwarded` mutations through Python object identity
-/// (resoperation.py:233-240).
+/// Reconstruct Phase 1's `box_pool` prefix for a Phase 2 retrace.
 ///
+/// The `BoxPool::clone` here is intentionally shallow: `BoxRef` is
+/// `Rc<Box>`, so cloning shares the same `Box` cells — matching
+/// `unroll.py` Phase 2's behaviour of seeing Phase 1's `_forwarded`
+/// mutations through Python object identity (resoperation.py:233-240).
 /// A "deep" snapshot (cloning each `Box` so Phase 2 cannot reach into
 /// `phase1_out`) would diverge from upstream: PyPy explicitly relies on
 /// shared identity to read Phase 1 forwarding from Phase 2 — see
-/// `unroll.py:55-64` `setinfo_from_preamble`. The defensive copy is the
-/// wrong direction for parity. The GcRef-rooting bookkeeping that
-/// `ExportedState::root_all_gcrefs` does is the canonical safety net,
-/// not snapshot copying.
-fn p1_full_prefix_from_box_pool_snapshot(
-    snapshot: Option<&crate::r#box::BoxPool>,
+/// `unroll.py:55-64` `setinfo_from_preamble`.
+///
+/// Returns `None` for an empty pool so callers feed the iterator the
+/// same `None`/`Some` distinction the `p1_full_prefix` argument
+/// expects.  GcRef rooting via `ExportedState::root_all_gcrefs` is the
+/// canonical safety net, not snapshot copying.
+fn p1_full_prefix_from_box_pool(
+    pool: &crate::r#box::BoxPool,
 ) -> Option<crate::r#box::BoxPool> {
-    snapshot.cloned()
+    if pool.is_empty() {
+        None
+    } else {
+        Some(pool.clone())
+    }
 }
 
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
@@ -336,8 +340,8 @@ impl UnrollOptimizer {
                 }
                 // compile_retrace has no `opt_p1.final_ctx` (Phase 1 was
                 // skipped), but the failed attempt's Phase 1 captured its full
-                // `box_pool` into `ExportedState.box_pool_snapshot` at export
-                // time (`export_state_with_bounds`). TraceIterator's
+                // `box_pool` into `ExportedState.box_pool` at export time
+                // (`export_state_with_bounds`). TraceIterator's
                 // `p1_full_prefix` contract: deliver the full Phase 1 box_pool
                 // including inputarg BoxRefs at `[0..num_inputs)`, so
                 // `import_state` setting `Forwarded::Box(target)` for
@@ -346,8 +350,7 @@ impl UnrollOptimizer {
                 // `_forwarded` through shared Box identity; preserving the full
                 // raw position alignment (inputargs + emit ops) reproduces
                 // that identity here.
-                let prefix =
-                    p1_full_prefix_from_box_pool_snapshot(pre_imported.box_pool_snapshot.as_ref());
+                let prefix = p1_full_prefix_from_box_pool(&pre_imported.box_pool);
                 (pre_imported, constants.clone(), Vec::new(), prefix)
             } else {
                 // ── Phase 1: PreambleCompileData.optimize() ──
@@ -528,8 +531,7 @@ impl UnrollOptimizer {
                             short_inputargs: Vec::new(),
                             runtime_boxes: Vec::new(),
                             patchguardop: None,
-                            phase1_emit_high_water: state.phase1_emit_high_water,
-                            box_pool_snapshot: None,
+                            box_pool: state.box_pool.clone(),
                             rooted_refs: Vec::new(),
                             shadow_stack_base: 0,
                         });
@@ -1714,25 +1716,25 @@ pub struct ExportedState {
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
-    /// Smallest fresh OpRef strictly above every Phase 1 emit position
-    /// (i.e. `max(op.pos.raw()) + 1` over `phase1_emit_ops`). Used by
-    /// `opref_high_water` so retrace's Phase 2 namespace stays disjoint
-    /// from intermediate Phase 1 emit OpRefs that were forwarded /
-    /// folded and never survive as an end_arg / short_op source.
-    /// `0` when there are no Phase 1 emit positions to track.
-    pub phase1_emit_high_water: u32,
-    /// Snapshot of Phase 1's `OptContext::box_pool` taken at export time.
-    /// Used by `compile_retrace`'s Phase 2 TraceIterator as the
-    /// `p1_full_prefix` (inputarg + emit BoxRefs) so chain walks via
-    /// `Forwarded::Box(rc)` observe the failed attempt's accumulated
-    /// `_forwarded` info on every Phase 1 position — `unroll.py` Phase 2
-    /// reading Phase 1 box.\_forwarded through Python identity parity.
+    /// Phase 1's `OptContext::box_pool` slot table at export time — the
+    /// raw OpRef position → `Rc<Box>` lookup table Phase 2 consults when
+    /// chain-walking a Phase 1 OpRef.  Carries `Rc::clone`d handles, so
+    /// `Forwarded::Box(rc)` walks land on the same cells Phase 1 mutated
+    /// during its run — `unroll.py` Phase 2 reading Phase 1
+    /// `box._forwarded` through Python object identity parity.
     ///
-    /// `None` for ExportedStates produced by paths that do not feed into a
-    /// retrace attempt (test fixtures, in-flight construction). Populated
-    /// only by `export_state_with_bounds` at the canonical Phase 1 export
-    /// site.
-    pub(crate) box_pool_snapshot: Option<crate::r#box::BoxPool>,
+    /// Empty when no Phase 1 ran (test fixtures, fresh constructor) or
+    /// when Phase 1 forced-returned without producing a chain.  Always
+    /// populated by `export_state_with_bounds` at the canonical Phase 1
+    /// export site.  PyPy has no analog because Box references pass by
+    /// Python identity end-to-end; pyre's numeric `OpRef` indirection
+    /// makes this table the explicit lookup.  Doubles as the
+    /// `opref_high_water` ceiling (`box_pool.len()` covers every
+    /// Phase 1 emit position, including intermediates that were
+    /// forwarded/folded and never survive as an end_arg / short_op
+    /// source — `reserve_pos` extends `box_pool` even when the resulting
+    /// op is later dropped).
+    pub(crate) box_pool: crate::r#box::BoxPool,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1765,11 +1767,11 @@ enum ExportedGcRefField {
     VirtualStateConstantRef(usize),
     /// short_box_const_values[OpRef] = Value::Ref(...)
     ShortBoxConstValue(OpRef),
-    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
+    /// box_pool[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
     BoxPoolInfoPtrInfoConstant(usize),
-    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
+    /// box_pool[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
     BoxPoolInfoPtrInfoKnownClass(usize),
-    /// box_pool_snapshot[index].forwarded = Box(target) where target is
+    /// box_pool[index].forwarded = Box(target) where target is
     /// `BoxKind::Const(Value::Ref(_))` — `make_constant` /
     /// `make_equal_to(... const ...)` writer mirror shape.
     BoxPoolBoxConstRef(usize),
@@ -1815,8 +1817,7 @@ impl ExportedState {
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
-            phase1_emit_high_water: 0,
-            box_pool_snapshot: None,
+            box_pool: crate::r#box::BoxPool::default(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1910,23 +1911,19 @@ impl ExportedState {
             }
         }
 
-        // `phase1_emit_high_water` covers Phase 1 emit positions that are
-        // not reachable via any of the structure-stored OpRef fields above
-        // (e.g. intermediate ops that were forwarded and never survive as
-        // an end_arg / short_op source). Retrace must keep its Phase 2
-        // namespace disjoint from every one of those.
-        high = high.max(self.phase1_emit_high_water);
-        // `box_pool_snapshot.len()` covers every Phase 1 BoxRef the failed
-        // attempt allocated, including positions whose only carrier is the
-        // pool itself (no end_arg / short_op / phase1_emit_op trace). When
+        // `box_pool.len()` covers every Phase 1 BoxRef the failed
+        // attempt allocated — inputargs, emitted ops, and intermediates
+        // that were forwarded/folded and never survive as an end_arg /
+        // short_op source.  `OptContext::reserve_pos` extends `box_pool`
+        // even when the resulting op is later dropped, so this is the
+        // raw position ceiling Phase 2's namespace must clear.  When
         // retrace's Phase 2 `start_fresh` is below that ceiling, the
-        // `TraceIterator::new` `p1_prefix.len().min(start_fresh)` truncation
-        // would drop the tail of the snapshot and re-issue the same raw
-        // positions for Phase 2 input/result OpRefs — a numeric collision
-        // PyPy's object-identity Boxes structurally cannot have.
-        if let Some(snapshot) = &self.box_pool_snapshot {
-            high = high.max(snapshot.len() as u32);
-        }
+        // `TraceIterator::new` `p1_prefix.len().min(start_fresh)`
+        // truncation would drop the tail of the pool and re-issue the
+        // same raw positions for Phase 2 input/result OpRefs — a numeric
+        // collision PyPy's object-identity Boxes structurally cannot
+        // have.
+        high = high.max(self.box_pool.len() as u32);
 
         high
     }
@@ -2035,49 +2032,47 @@ impl ExportedState {
                     .push((key, ExportedGcRefField::ShortBoxConstValue(key), ss_idx));
             }
         }
-        // ── box_pool_snapshot Forwarded::Info GcRef fields ──
+        // ── box_pool Forwarded::Info GcRef fields ──
         // Phase 2 chain walks land on these BoxRef cells and read their
         // _forwarded info; if GC moves a Ref between Phase 1 export and
         // retrace those reads see a stale handle.
-        if let Some(snapshot) = &self.box_pool_snapshot {
-            for (i, b) in snapshot.iter_indexed() {
-                let forwarded = b.get_forwarded();
-                if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &forwarded {
-                    let info = rc.borrow();
-                    match &*info {
-                        PtrInfo::Constant(gcref) if !gcref.is_null() => {
-                            let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                            self.rooted_refs.push((
-                                dummy_key,
-                                ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i),
-                                ss_idx,
-                            ));
-                        }
-                        PtrInfo::Instance(iinfo) => {
-                            if let Some(gcref) = iinfo.known_class {
-                                if !gcref.is_null() {
-                                    let ss_idx = majit_gc::shadow_stack::push(gcref);
-                                    self.rooted_refs.push((
-                                        dummy_key,
-                                        ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i),
-                                        ss_idx,
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
+        for (i, b) in self.box_pool.iter_indexed() {
+            let forwarded = b.get_forwarded();
+            if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = &forwarded {
+                let info = rc.borrow();
+                match &*info {
+                    PtrInfo::Constant(gcref) if !gcref.is_null() => {
+                        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                        self.rooted_refs.push((
+                            dummy_key,
+                            ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i),
+                            ss_idx,
+                        ));
                     }
-                } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
-                    if target.is_constant() {
-                        if let Some(Value::Ref(gcref)) = target.const_value() {
+                    PtrInfo::Instance(iinfo) => {
+                        if let Some(gcref) = iinfo.known_class {
                             if !gcref.is_null() {
                                 let ss_idx = majit_gc::shadow_stack::push(gcref);
                                 self.rooted_refs.push((
                                     dummy_key,
-                                    ExportedGcRefField::BoxPoolBoxConstRef(i),
+                                    ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i),
                                     ss_idx,
                                 ));
                             }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let crate::r#box::Forwarded::Box(target) = &forwarded {
+                if target.is_constant() {
+                    if let Some(Value::Ref(gcref)) = target.const_value() {
+                        if !gcref.is_null() {
+                            let ss_idx = majit_gc::shadow_stack::push(gcref);
+                            self.rooted_refs.push((
+                                dummy_key,
+                                ExportedGcRefField::BoxPoolBoxConstRef(i),
+                                ss_idx,
+                            ));
                         }
                     }
                 }
@@ -2178,9 +2173,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         // RPython object identity: mutate the live Rc<RefCell<PtrInfo>>
                         // in place so any other handle sharing it sees the post-GC
                         // address. Matches PyPy's `_forwarded` Python object reference
@@ -2199,9 +2192,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         let rc = match &b.get_forwarded() {
                             crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
                                 if matches!(&*rc.borrow(), PtrInfo::Instance(_)) =>
@@ -2218,9 +2209,7 @@ impl ExportedState {
                     }
                 }
                 ExportedGcRefField::BoxPoolBoxConstRef(i) => {
-                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
-                        && let Some(b) = snapshot.get_at_position(*i)
-                    {
+                    if let Some(b) = self.box_pool.get_at_position(*i) {
                         // BoxKind::Const is immutable, so swap in a fresh
                         // ConstRef BoxRef carrying the updated handle.
                         // `set_forwarded_box` enforces the AbstractValue
@@ -2317,8 +2306,7 @@ impl Clone for ExportedState {
             short_inputargs: self.short_inputargs.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
-            phase1_emit_high_water: self.phase1_emit_high_water,
-            box_pool_snapshot: self.box_pool_snapshot.clone(),
+            box_pool: self.box_pool.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2725,26 +2713,20 @@ impl OptUnroll {
             renamed_inputarg_types,
             short_args,
         );
-        // Smallest fresh OpRef strictly above every Phase 1 emit position.
-        // Retrace's `opref_high_water` consults this so Phase 2's namespace
-        // stays disjoint from intermediate Phase 1 ops that were forwarded
-        // and never survive as an end_arg / short_op source. `op.pos.0`
-        // is already non-NONE / non-Void by the rebuild filter.
-        state.phase1_emit_high_water = optimizer
-            .phase1_emit_ops
-            .iter()
-            .map(|op| op.pos.get().raw().saturating_add(1))
-            .max()
-            .unwrap_or(0);
         // Capture the full Phase 1 BoxRef pool so a subsequent
         // `compile_retrace` attempt can hand it back to Phase 2 as
-        // `p1_full_prefix` (`unroll.rs:282-303`). PyPy `unroll.py` Phase 2
-        // observes Phase 1's `_forwarded` mutations through Python identity
-        // on the same Box objects; pyre needs the Rc::cloned BoxRef vector
-        // to recreate that observation across the in-memory ExportedState
-        // hand-off. Each entry is `Rc::clone` cheap; vec retention is
-        // bounded by `ExportedState` lifetime.
-        state.box_pool_snapshot = Some(ctx.box_pool.clone());
+        // `p1_full_prefix` (`unroll.rs:282-303`).  Doubles as the
+        // `opref_high_water` ceiling — `reserve_pos` extends `box_pool`
+        // for every Phase 1 emit position, including intermediates that
+        // were forwarded/folded and never survive as an end_arg /
+        // short_op source, so retrace's Phase 2 namespace must clear
+        // `box_pool.len()` to stay disjoint.  PyPy `unroll.py` Phase 2
+        // observes Phase 1's `_forwarded` mutations through Python
+        // identity on the same Box objects; pyre needs the Rc::cloned
+        // BoxRef vector to recreate that observation across the
+        // in-memory ExportedState hand-off.  Each entry is `Rc::clone`
+        // cheap; vec retention is bounded by `ExportedState` lifetime.
+        state.box_pool = ctx.box_pool.clone();
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -5026,7 +5008,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retrace_box_pool_snapshot_preserves_inputargs_for_p1_full_prefix() {
+    fn test_retrace_box_pool_preserves_inputargs_for_p1_full_prefix() {
         let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, 0);
         let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, 1);
         let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
@@ -5038,8 +5020,7 @@ mod tests {
             Some(emit3.clone()),
         ]);
 
-        let prefix =
-            p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
+        let prefix = p1_full_prefix_from_box_pool(&snapshot).expect("non-empty pool");
 
         let prefix_slots: Vec<Option<crate::r#box::BoxRef>> = (0..prefix.len())
             .map(|i| prefix.get_at_position(i).cloned())
@@ -5047,6 +5028,11 @@ mod tests {
         assert_eq!(
             prefix_slots,
             vec![Some(input0), Some(input1), Some(emit2), Some(emit3)]
+        );
+
+        assert!(
+            p1_full_prefix_from_box_pool(&crate::r#box::BoxPool::default()).is_none(),
+            "empty pool maps to None for TraceIterator p1_full_prefix"
         );
     }
 
