@@ -247,11 +247,20 @@ pub fn build_semantic_program_from_llbc(
         // resolution gap is open — TyRef labels (`ty#170`) would
         // otherwise be classified as `Type::Ref` and trip a spurious
         // mismatch panic against a real `Type::Int` callee result.
+        // Step 6.E prerequisite: surface impl-method owner on the
+        // SemanticFunction so `lib.rs:868` / `lib.rs:1086` and the
+        // (still-AST-side) `extract_inherent_impl_methods` /
+        // `extract_trait_impls` consumers see the same
+        // `self_ty_root` MIR records.  Without this, every impl method
+        // built by MIR looks like a free function to the canonical
+        // registration loop and the impl-key return-type / hint
+        // registrations get dropped.
+        let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
             return_type: None,
-            self_ty_root: None,
+            self_ty_root,
             module_path,
             hints: Vec::new(),
             access_directly: false,
@@ -1592,6 +1601,92 @@ impl<'a> Lowering<'a> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Free-function version of [`Lowering::impl_method_owner`] for callers
+/// that only have the `Llbc` + `FunDecl` and do not want to instantiate
+/// a full `Lowering` context just to ask the question.  Used by
+/// `build_semantic_program_from_llbc` to populate
+/// `SemanticFunction.self_ty_root` on the canonical SemanticProgram
+/// produced by the MIR driver.
+///
+/// Mirrors the instance method line-for-line; any change here must be
+/// kept in sync with the `&self` version.
+fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let leaf = match &segs[last_idx] {
+        NameSeg::Ident { ident: (s, _) } => s.clone(),
+        _ => return None,
+    };
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let owner_leaf = td
+        .item_meta
+        .name_path()
+        .rsplit("::")
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if owner_leaf.is_empty() {
+        return None;
+    }
+    Some((owner_leaf, leaf))
+}
+
+/// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
+fn resolve_impl_owner_adt_def_id_free(
+    llbc: &Llbc,
+    impl_payload: &serde_json::Value,
+) -> Option<u64> {
+    let obj = impl_payload.as_object()?;
+    if let Some(ty) = obj.get("Ty") {
+        let sb = ty.as_object()?.get("skip_binder")?;
+        return resolve_tyexpr_to_adt_def_id_free(llbc, sb);
+    }
+    if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
+        let trait_impls = llbc
+            .file
+            .translated
+            .rest
+            .get("trait_impls")?
+            .as_array()?;
+        let ti = trait_impls.get(trait_impl_id as usize)?;
+        let first_ty = ti
+            .as_object()?
+            .get("impl_trait")?
+            .as_object()?
+            .get("generics")?
+            .as_object()?
+            .get("types")?
+            .as_array()?
+            .first()?;
+        return resolve_tyexpr_to_adt_def_id_free(llbc, first_ty);
+    }
+    None
+}
+
+/// Free-function version of [`Lowering::resolve_tyexpr_to_adt_def_id`].
+fn resolve_tyexpr_to_adt_def_id_free(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
+    let obj = ty.as_object()?;
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && let Some(body) = arr.get(1)
+    {
+        return inline_adt_def_id(body);
+    }
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_to_adt_def_id(id);
+    }
+    None
+}
 
 fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
     // Plain atom: `"Add"`, `"Eq"`, …
