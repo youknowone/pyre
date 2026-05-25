@@ -1196,6 +1196,39 @@ fn analyze_pipeline_from_parsed(
             );
         }
     }
+    // Step 6.E Slice 3.B — index `program.functions` so the registration
+    // loop below can substitute the MIR-built graph for the AST-built
+    // one carried in `canonical_trait_impls` / `canonical_inherent_methods`.
+    //
+    // Impl methods (trait-impl + inherent) live under `self_ty_root`;
+    // trait-default bodies live under `trait_root` with `self_ty_root =
+    // None`.  The lookup mirrors `audit_ast_extract_coverage`'s indexing
+    // shape so a covered entry guarantees a graph substitution path
+    // exists.  AST graphs remain the fallback for entries MIR did not
+    // build (CurrentFrameGuard::drop, PyFrame::__init__, etc.).
+    let program_impl_graphs: std::collections::HashMap<(String, String), &model::FunctionGraph> =
+        program
+            .functions
+            .iter()
+            .filter_map(|f| {
+                let owner = f.self_ty_root.as_deref()?;
+                Some(((owner.to_string(), f.name.clone()), &f.graph))
+            })
+            .collect();
+    let program_default_graphs: std::collections::HashMap<
+        (String, String),
+        &model::FunctionGraph,
+    > = program
+        .functions
+        .iter()
+        .filter_map(|f| {
+            if f.self_ty_root.is_some() {
+                return None;
+            }
+            let tr = f.trait_root.as_deref()?;
+            Some(((tr.to_string(), f.name.clone()), &f.graph))
+        })
+        .collect();
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
@@ -1210,15 +1243,30 @@ fn analyze_pipeline_from_parsed(
         } else {
             Some(impl_info.trait_name.as_str())
         };
+        let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
-            if let Some(graph) = &method.graph {
+            // Slice 3.B: prefer the MIR-built graph when program.functions
+            // covers this entry; fall back to the AST-built graph.
+            let mir_graph: Option<&model::FunctionGraph> = if is_default {
+                program_default_graphs
+                    .get(&(impl_info.trait_name.clone(), method.name.clone()))
+                    .copied()
+            } else {
+                program_impl_graphs
+                    .get(&(impl_type.to_string(), method.name.clone()))
+                    .copied()
+            };
+            let graph_source: Option<model::FunctionGraph> = mir_graph
+                .cloned()
+                .or_else(|| method.graph.clone());
+            if let Some(graph) = graph_source {
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
                 let graph = match &method.return_type {
-                    Some(rt) => graph.clone().with_return_type(rt),
-                    None => graph.clone(),
+                    Some(rt) => graph.with_return_type(rt),
+                    None => graph,
                 };
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // Parity with upstream `rpython/annotator/classdesc.py:749
@@ -1235,20 +1283,24 @@ fn analyze_pipeline_from_parsed(
                 // at `call.rs:1921,1970 resolve_method*` and
                 // `lib.rs:935 push_matching_trait_methods` can continue
                 // to distinguish "trait default" from "concrete impl".
-                if impl_info.for_type.starts_with("<default methods of ") {
+                if is_default {
                     let direct_path = crate::parse::CallPath::from_segments([
                         impl_info.trait_name.as_str(),
                         method.name.as_str(),
                     ]);
-                    let direct_graph = match &method.return_type {
-                        Some(rt) => method
-                            .graph
-                            .clone()
-                            .expect("method.graph populated above")
-                            .with_return_type(rt),
-                        None => method.graph.clone().expect("method.graph populated above"),
-                    };
-                    call_control.register_function_graph(direct_path, direct_graph);
+                    // Slice 3.B: prefer MIR's graph for the direct_path
+                    // registration too; fall back to AST when MIR has
+                    // no entry.
+                    let direct_source: Option<model::FunctionGraph> = mir_graph
+                        .cloned()
+                        .or_else(|| method.graph.clone());
+                    if let Some(g) = direct_source {
+                        let direct_graph = match &method.return_type {
+                            Some(rt) => g.with_return_type(rt),
+                            None => g,
+                        };
+                        call_control.register_function_graph(direct_path, direct_graph);
+                    }
                 }
             }
             let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
@@ -1326,6 +1378,12 @@ fn analyze_pipeline_from_parsed(
             .as_deref()
             .unwrap_or(&method_info.for_type);
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
+        // Slice 3.B: prefer the MIR-built graph; fall back to the
+        // AST-built graph carried in InherentMethodInfo.
+        let graph: model::FunctionGraph = program_impl_graphs
+            .get(&(impl_type.to_string(), method_info.name.clone()))
+            .map(|g| (*g).clone())
+            .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
         // `_reject_function("elidable")` mirrors RPython's
