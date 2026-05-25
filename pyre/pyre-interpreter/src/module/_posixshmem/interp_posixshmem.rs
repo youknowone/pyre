@@ -33,13 +33,20 @@ pub fn register_module(ns: &mut DictStorage) {
                     0o600
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
-                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                let fd = rustpython_host_env::shm::shm_open(&c_name, flags, mode).map_err(|e| {
-                    crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("shm_open: {e}"),
-                    )
-                })?;
+                    .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                // `lib_pypy/_posixshmem.py:13-20` retries on EINTR.
+                let fd = loop {
+                    match rustpython_host_env::shm::shm_open(&c_name, flags, mode) {
+                        Ok(fd) => break fd,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(e) => {
+                            return Err(crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("shm_open: {e}"),
+                            ));
+                        }
+                    }
+                };
                 Ok(pyre_object::w_int_new(fd as i64))
             }),
         );
@@ -61,13 +68,20 @@ pub fn register_module(ns: &mut DictStorage) {
                         pyre_object::w_str_get_value(args[0]).to_string()
                     };
                     let c_name = std::ffi::CString::new(name.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    rustpython_host_env::shm::shm_unlink(&c_name).map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("shm_unlink: {e}"),
-                        )
-                    })?;
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                    // `lib_pypy/_posixshmem.py:33-40` retries on EINTR.
+                    loop {
+                        match rustpython_host_env::shm::shm_unlink(&c_name) {
+                            Ok(()) => break,
+                            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                            Err(e) => {
+                                return Err(crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("shm_unlink: {e}"),
+                                ));
+                            }
+                        }
+                    }
                     Ok(pyre_object::w_none())
                 },
                 1,
