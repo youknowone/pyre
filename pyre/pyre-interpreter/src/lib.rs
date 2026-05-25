@@ -96,13 +96,26 @@ pub mod pyframe;
 macro_rules! py_module {
     (
         $name:literal,
-        interpleveldefs: { $($key:literal => $value:expr),* $(,)? } $(,)?
+        interpleveldefs: { $($key:literal => $value:expr),* $(,)? }
+        $(, extra_init: |$ns:ident| $body:block)?
+        $(,)?
     ) => {
         pub fn init(ns: &mut $crate::DictStorage) {
             let _name = $name;
             $(
                 $crate::dict_storage_store(ns, $key, $value);
             )*
+            // `extra_init: |ns| { ... }` is the escape hatch for
+            // PyPy's `buildloaders` / `startup` post-processing — array
+            // loops for constants, cfg-gated entries, helper-typed
+            // registration that doesn't fit a single PyObjectRef
+            // expression.
+            $(
+                {
+                    let $ns: &mut $crate::DictStorage = ns;
+                    $body
+                }
+            )?
         }
     };
 }

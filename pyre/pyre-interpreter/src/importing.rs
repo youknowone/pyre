@@ -112,18 +112,18 @@ pub fn install_builtin_modules() {
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
     register_builtin_module("_weakref", crate::module::_weakref::moduledef::init);
-    register_builtin_module("_abc", crate::module::_abc::moduledef::init);
+    register_builtin_module("_abc", crate::module::_abc::init);
     register_builtin_module("_functools", crate::module::_functools::init);
     register_builtin_module("_thread", crate::module::_thread::moduledef::init);
     register_builtin_module("itertools", crate::module::itertools::moduledef::init);
-    register_builtin_module("_contextvars", crate::module::_contextvars::moduledef::init);
+    register_builtin_module("_contextvars", crate::module::_contextvars::init);
     register_builtin_module("copyreg", crate::module::copyreg::init);
-    register_builtin_module("_codecs", crate::module::_codecs::moduledef::init);
+    register_builtin_module("_codecs", crate::module::_codecs::init);
     register_builtin_module("posix", crate::module::posix::moduledef::init);
-    register_builtin_module("errno", crate::module::errno::moduledef::init);
+    register_builtin_module("errno", crate::module::errno::init);
     register_builtin_module("_collections", crate::module::_collections::moduledef::init);
     register_builtin_module("_ast", crate::module::_ast::moduledef::init);
-    register_builtin_module("_opcode", crate::module::_opcode::moduledef::init);
+    register_builtin_module("_opcode", crate::module::_opcode::init);
     register_builtin_module("_imp", crate::module::_imp::moduledef::init);
     register_builtin_module(
         "importlib.machinery",
@@ -139,7 +139,7 @@ pub fn install_builtin_modules() {
         crate::module::importlib::moduledef::init_abc,
     );
     register_builtin_module("_signal", crate::module::_signal::moduledef::init);
-    register_builtin_module("atexit", crate::module::atexit::moduledef::init);
+    register_builtin_module("atexit", crate::module::atexit::init);
     #[cfg(unix)]
     register_builtin_module("pwd", crate::module::pwd::moduledef::init);
     #[cfg(unix)]
@@ -156,7 +156,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("mmap", crate::module::mmap::moduledef::init);
     register_builtin_module("faulthandler", crate::module::faulthandler::moduledef::init);
     register_builtin_module("_ctypes", crate::module::_ctypes::moduledef::init);
-    register_builtin_module("_posixshmem", crate::module::_posixshmem::moduledef::init);
+    register_builtin_module("_posixshmem", crate::module::_posixshmem::init);
     register_builtin_module(
         "_multiprocessing",
         crate::module::_multiprocessing::moduledef::init,
@@ -164,8 +164,8 @@ pub fn install_builtin_modules() {
     register_builtin_module("_locale", crate::module::_locale::moduledef::init);
     register_builtin_module("_random", crate::module::_random::moduledef::init);
     register_builtin_module("_struct", crate::module::_struct::moduledef::init);
-    register_builtin_module("gc", crate::module::gc::moduledef::init);
-    register_builtin_module("unicodedata", crate::module::unicodedata::moduledef::init);
+    register_builtin_module("gc", crate::module::gc::init);
+    register_builtin_module("unicodedata", crate::module::unicodedata::init);
     // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
     // Python module containing `build_time_vars = {...}` that sysconfig
     // imports from `_init_posix`. We stub it out with an empty dict so
