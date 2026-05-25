@@ -7943,4 +7943,106 @@ mod tests {
         let mut ssarepr = SSARepr::new("ovf_no_catch");
         flatten_graph_for_test(&graph, &mut ssarepr);
     }
+
+    #[test]
+    fn lower_simple_call_hlop_prepends_portal_frame_register() {
+        // `flatten.py:382-391` simple_call lowering: the residual_call's
+        // first Ref operand is the portal frame (via
+        // `get_register(portal_frame_var)`), not part of the original
+        // graph-side `simple_call(callable, args...)`.
+        let frame_var = Variable::new(VariableId(7), Kind::Ref);
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let mut call_fn_idx_by_nargs = [0u16; 9];
+        call_fn_idx_by_nargs[0] = 42;
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs,
+            portal_frame_var: Some(frame_var),
+        };
+        let op = super::super::flow::SpaceOperation::new(
+            "simple_call",
+            vec![callable_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(7) => Register { kind: Kind::Ref, index: 100 },
+            VariableId(8) => Register { kind: Kind::Ref, index: 101 },
+            VariableId(9) => Register { kind: Kind::Ref, index: 102 },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = |_c: &Constant| unreachable!("test uses Variables only");
+        let insn = super::lower_simple_call_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("simple_call lowering must succeed when portal_frame_var is set");
+        match insn {
+            Insn::Op { opname, args, result } => {
+                assert_eq!(opname, "residual_call_r_r");
+                let frame_reg = Register { kind: Kind::Ref, index: 100 };
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[0] {
+                            Operand::Register(r) => {
+                                assert_eq!(r.kind, frame_reg.kind);
+                                assert_eq!(r.index, frame_reg.index);
+                            }
+                            other => panic!(
+                                "portal frame must be the leading Ref operand, got {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("expected ListOfKind Ref, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register { kind: Kind::Ref, index: 102 }),
+                    "result register must come from the op's result Variable"
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "portal_frame_var")]
+    fn lower_simple_call_hlop_panics_without_portal_frame_var() {
+        // The contract is fail-loud when `portal_frame_var` is None —
+        // simple_call needs the portal frame in the lowered residual_call
+        // operand list and there is no defensible default.
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+            portal_frame_var: None,
+        };
+        let op = super::super::flow::SpaceOperation::new(
+            "simple_call",
+            vec![callable_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |_var: Variable| Register { kind: Kind::Ref, index: 0 };
+        let mut lower_constant = |_c: &Constant| unreachable!();
+        let _ = super::lower_simple_call_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        );
+    }
 }

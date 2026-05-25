@@ -957,7 +957,18 @@ fn phase4_operand_eq(
             x.kind == y.kind && phase4_operand_slice_eq(&x.content, &y.content, ignore_label_names)
         }
         (Operand::Descr(_), Operand::Descr(_)) => true,
-        (Operand::IndirectCallTargets(_), Operand::IndirectCallTargets(_)) => true,
+        (Operand::IndirectCallTargets(x), Operand::IndirectCallTargets(y)) => {
+            // Compare the per-call-site target list by element identity
+            // (`Arc::ptr_eq`).  `assembler.py:197-206` dedups the runtime
+            // set by Python `id(x)`, so distinct JitCode runtime adapters
+            // for the same call site would diverge there even when their
+            // structural payload happens to match.
+            x.lst.len() == y.lst.len()
+                && x.lst
+                    .iter()
+                    .zip(y.lst.iter())
+                    .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+        }
         _ => false,
     }
 }
@@ -6276,14 +6287,16 @@ impl CodeWriter {
                             current_depth = handler_depth;
                             // Bare handler entry without a recorded
                             // FrameState: only the depth is known, so
-                            // fill the symbolic stack with null
-                            // sentinels.  A consumer reading
+                            // overwrite the whole symbolic stack with
+                            // null sentinels.  `resize` would preserve
+                            // any prefix carried over from the predecessor
+                            // block, leaking stale symbolic values into
+                            // the handler entry; a consumer reading
                             // `current_state.stack[i]` here sees the
                             // sentinel and falls back to the raw
                             // `stack_base + i` register.
-                            current_state
-                                .stack
-                                .resize(handler_depth as usize, null_stack_sentinel());
+                            current_state.stack =
+                                vec![null_stack_sentinel(); handler_depth as usize];
                         }
                     }
                     // RPython flatten.py: Label(block) at block entry
@@ -9666,32 +9679,7 @@ impl CodeWriter {
         // no production behavior change.
         let phase4_splice_audit =
             std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
-        // Default-off experimental knob: replace walker's
-        // inline-emitted `ssarepr.insns` with `canonical_ssarepr.insns`
-        // for graphs whose name appears in the comma-separated
-        // `PYRE_PHASE4_SPLICE_ENABLE` list, regardless of
-        // byte-equivalent eligibility.  Used to characterise which
-        // graphs are runtime-equivalent under the swap even when the
-        // two byte streams diverge — diagnostic only; failures (e.g.
-        // `enforce_ssarepr_input_args` color-budget panic) are the
-        // informative signal.
-        let phase4_splice_enable_names: Vec<String> = std::env::var("PYRE_PHASE4_SPLICE_ENABLE")
-            .ok()
-            .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let phase4_splice_enable = !phase4_splice_enable_names.is_empty();
-        if phase4_build_canonical
-            || phase4_diff_canonical
-            || phase4_splice_audit
-            || phase4_splice_enable
-        {
+        if phase4_build_canonical || phase4_diff_canonical || phase4_splice_audit {
             let mut canonical_regallocs = graph_regallocs.clone();
             let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
@@ -10279,29 +10267,6 @@ impl CodeWriter {
                     }
                 }
             }
-            // Replace walker SSA bytes with canonical SSA bytes for
-            // named graphs; the downstream `allocate_registers` call
-            // re-colors the spliced insns against walker's regalloc
-            // state.  If canonical Insns reference Variable colors
-            // outside walker's regalloc model this surfaces as a
-            // regalloc panic or an assemble-time
-            // `ref reg-or-pool out of bounds` PANIC — both pinpoint
-            // which divergence class (color budget, Variable identity,
-            // opname shape) blocks the named graph.  Production
-            // behavior unchanged when the env var is unset.
-            if phase4_splice_enable
-                && phase4_splice_enable_names
-                    .iter()
-                    .any(|n| n == ssarepr.name.as_str())
-            {
-                eprintln!(
-                    "[phase4-splice-enable] graph={} walker_len={} -> canonical_len={}",
-                    ssarepr.name,
-                    ssarepr.insns.len(),
-                    canonical_ssarepr.insns.len(),
-                );
-                ssarepr.insns = canonical_ssarepr.insns.clone();
-            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -10340,12 +10305,14 @@ impl CodeWriter {
         // same union-find + depgraph.
         //
         // SSARepr-side regalloc is u16-keyed PRE-EXISTING-ADAPTATION;
-        // project the Variable pairs (already collected pre-renaming
-        // above as `cfg_variable_pairs`) through `walker_slot_for_variable`
+        // project the Variable pairs (collected pre-renaming above as
+        // `cfg_variable_pairs`) through `walker_slot_for_variable`
         // at the consumer.  Pairs whose endpoints have no walker slot
-        // pinning are silently dropped here — the canonical
-        // graph-side regalloc (Task #228 with_pairs entry) already
-        // consumed the un-projected Variable pairs above.
+        // pinning are silently dropped here — they still participate
+        // in the canonical graph regalloc's normal
+        // `RegAllocator::coalesce_variables` sweep
+        // (`regalloc.py:79-96`), so coloring information is not lost,
+        // only the SSARepr-side u16 projection is.
         let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
             .iter()
             .filter_map(|(src, dst)| {

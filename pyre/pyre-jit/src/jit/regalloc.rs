@@ -1318,33 +1318,63 @@ mod tests {
 
     #[test]
     fn perform_register_allocation_with_pairs_shares_color_for_pinned_scratch() {
-        // Two non-interfering Ref variables in a single block:
-        // v0 (inputarg, dies after use) and v1 (scratch, defined later).
-        // Without pins they pick different colors via chordal coloring.
-        // With pin (v1.id, v0.id) they coalesce and share a color.
-        let v0 = flow_var(0, Kind::Ref);
-        let v1 = flow_var(1, Kind::Ref);
-        let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("pin_share_color", start.clone(), None);
-        push_op(
-            &start,
-            SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
-        );
-        let next = graph.new_block(vec![v1.into()]);
-        start.closeblock(vec![
-            Link::new(vec![v1.into()], Some(next.clone()), None).into_ref(),
-        ]);
-        next.closeblock(vec![
-            Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
-        ]);
+        // Two INTERFERING Ref variables: v0 (inputarg) is kept live
+        // past v1's definition by carrying both on the outgoing link,
+        // so the unpinned chordal coloring must assign them different
+        // colors.  `extra_coalesce_pairs` pre-merges them in the
+        // union-find before `make_dependencies` so they collapse into
+        // a single node and share a color — bypassing the interference
+        // edge that `_try_coalesce` (regalloc.py:106) would otherwise
+        // honour.
+        let build_graph = || {
+            let v0 = flow_var(0, Kind::Ref);
+            let v1 = flow_var(1, Kind::Ref);
+            let start = Block::shared(vec![v0.into()]);
+            let mut graph = FunctionGraph::new("pin_share_color", start.clone(), None);
+            push_op(
+                &start,
+                SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
+            );
+            let v2 = flow_var(2, Kind::Ref);
+            let v3 = flow_var(3, Kind::Ref);
+            let next = graph.new_block(vec![v2.into(), v3.into()]);
+            // Both v0 and v1 carried forward so the live-set at the
+            // outgoing link contains both, forcing an interference
+            // edge under the unpinned allocator.
+            start.closeblock(vec![
+                Link::new(vec![v0.into(), v1.into()], Some(next.clone()), None).into_ref(),
+            ]);
+            // returnblock arity is always 1 (a fresh untyped variable
+            // when `return_var = None` was passed to FunctionGraph::new).
+            next.closeblock(vec![
+                Link::new(vec![v2.into()], Some(graph.returnblock.clone()), None).into_ref(),
+            ]);
+            (graph, v0, v1)
+        };
 
-        let pin_pairs = vec![(v1.id, v0.id)];
-        let result = perform_register_allocation_with_pairs(&graph, Kind::Ref, &pin_pairs);
-        let color_v0 = result.coloring.get(&v0.id).copied();
-        let color_v1 = result.coloring.get(&v1.id).copied();
-        assert!(color_v0.is_some(), "v0 must have a color");
-        assert!(color_v1.is_some(), "v1 must have a color after pin");
-        assert_eq!(color_v0, color_v1, "pin must unify v0 and v1's colors");
+        // Baseline: without pins, the interference forces distinct colors.
+        let (graph_unpinned, v0_u, v1_u) = build_graph();
+        let unpinned = perform_register_allocation_with_pairs(&graph_unpinned, Kind::Ref, &[]);
+        let unpinned_v0 = unpinned.coloring.get(&v0_u.id).copied();
+        let unpinned_v1 = unpinned.coloring.get(&v1_u.id).copied();
+        assert!(unpinned_v0.is_some() && unpinned_v1.is_some());
+        assert_ne!(
+            unpinned_v0, unpinned_v1,
+            "without pins, interfering v0 and v1 must get distinct colors"
+        );
+
+        // Pinned: pre-merge unifies them into one node before
+        // make_dependencies so the interference edge never gets recorded.
+        let (graph_pinned, v0_p, v1_p) = build_graph();
+        let pin_pairs = vec![(v1_p.id, v0_p.id)];
+        let pinned = perform_register_allocation_with_pairs(&graph_pinned, Kind::Ref, &pin_pairs);
+        let pinned_v0 = pinned.coloring.get(&v0_p.id).copied();
+        let pinned_v1 = pinned.coloring.get(&v1_p.id).copied();
+        assert!(pinned_v0.is_some() && pinned_v1.is_some());
+        assert_eq!(
+            pinned_v0, pinned_v1,
+            "pin must unify v0 and v1 even across an interference edge"
+        );
     }
 
     #[test]
