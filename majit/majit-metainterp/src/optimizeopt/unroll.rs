@@ -2323,17 +2323,13 @@ impl ExportedState {
                         // body-position keys whose forwarded slot points
                         // at an index-less Const.
                         let swap: Option<(bool, Option<u32>)> = match b.get_forwarded() {
-                            crate::r#box::Forwarded::Const(
-                                majit_ir::Const::Ref(_),
-                                idx,
-                            ) => Some((true, idx)),
+                            crate::r#box::Forwarded::Const(majit_ir::Const::Ref(_), idx) => {
+                                Some((true, idx))
+                            }
                             _ => None,
                         };
                         if let Some((_present, orig_idx)) = swap {
-                            b.set_forwarded_const(
-                                majit_ir::Const::Ref(updated),
-                                orig_idx,
-                            );
+                            b.set_forwarded_const(majit_ir::Const::Ref(updated), orig_idx);
                         }
                     }
                 }

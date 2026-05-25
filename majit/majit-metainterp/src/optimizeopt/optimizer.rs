@@ -2872,10 +2872,7 @@ impl Optimizer {
                 if old_idx < num_inputs as u32 {
                     continue;
                 }
-                if !matches!(
-                    b.get_forwarded(),
-                    crate::r#box::Forwarded::Const(_, _)
-                ) {
+                if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
                     continue;
                 }
                 remap.insert(old_idx, next_const_pos);

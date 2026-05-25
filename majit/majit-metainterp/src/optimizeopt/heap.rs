@@ -721,7 +721,6 @@ pub struct OptHeap {
     // ── Aliasing analysis state — RPython: PtrInfo flags ──
     seen_allocation: Vec<bool>,
     unescaped: Vec<bool>,
-    known_nonnull: Vec<bool>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
@@ -772,7 +771,6 @@ impl OptHeap {
             postponed_op: None,
             seen_allocation: Vec::new(),
             unescaped: Vec::new(),
-            known_nonnull: Vec::new(),
             heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_emitted_removed: false,
             cached_dict_reads: crate::optimizeopt::vec_assoc::VecAssoc::new(),
@@ -2059,18 +2057,9 @@ impl OptHeap {
         }
 
         // Cache miss: emit the load and cache the result.
-        // heap.py line 652: make_nonnull(op.getarg(0))
-        // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
         // heap.py postprocess_GETFIELD_GC_I:
         //     structinfo = self.ensure_ptr_info_arg0(op)
         //     structinfo.setfield(descr, op.getarg(0), op, ...)
-        //
-        // The PyPy primitive returns the same structinfo regardless of
-        // whether it was newly installed or already present, so the
-        // line-by-line port reuses the EnsuredPtrInfo handle for both
-        // the nonnull bookkeeping and the field write.
-        let struct_ref = ctx.get_box_replacement(op.arg(0));
-        vb_set(&mut self.known_nonnull, struct_ref.raw());
         self.cache_field(obj, &descr);
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
@@ -2639,7 +2628,6 @@ impl OptHeap {
             //      `const_infos[gcref]` and regular arg0 through
             //      `ensure_ptr_info_arg0(op).as_mut().setitem(...)`.
             let array_ref = ctx.get_box_replacement(op.arg(0));
-            vb_set(&mut self.known_nonnull, array_ref.raw());
             if const_index >= 0 {
                 ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
                     if let Some(mut bound) = arrayinfo.getlenbound(None) {
@@ -2684,9 +2672,7 @@ impl OptHeap {
                 .cache_varindex_read(arrayinfo, indexbox, op.pos.get());
         }
 
-        // heap.py line 701: make_nonnull(op.getarg(0))
-        vb_set(&mut self.known_nonnull, array_ref.raw());
-        // OpRef → BoxRef shim until this caller migrates (Phase D-2).
+        // heap.py line 701: make_nonnull(op.getarg(0)) (optimizer.py:440-451).
         if let Some(arg0_box) = ctx.ensure_box(op.arg(0)) {
             ctx.make_nonnull(&arg0_box);
         }
@@ -2743,7 +2729,6 @@ impl OptHeap {
         if opcode.is_malloc() {
             vb_set(&mut self.seen_allocation, op.pos.get().raw());
             vb_set(&mut self.unescaped, op.pos.get().raw());
-            vb_set(&mut self.known_nonnull, op.pos.get().raw());
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -2756,20 +2741,6 @@ impl OptHeap {
         // RPython heap.py does NOT handle GuardNonnull — that is handled
         // exclusively by rewrite.py. Only track nullity for cache purposes.
         if opcode.is_guard() {
-            if opcode == OpCode::GuardNonnull {
-                vb_set(&mut self.known_nonnull, op.arg(0).raw());
-            }
-
-            // GuardClass / GuardNonnullClass imply non-null.
-            // GuardValue does NOT imply non-null: the guarded constant
-            // may be NULL (rewrite.py:320 handles GUARD_VALUE(..., NULL)).
-            match opcode {
-                OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                    vb_set(&mut self.known_nonnull, op.arg(0).raw());
-                }
-                _ => {}
-            }
-
             // force_lazy_sets_for_guard is now called via emitting_operation
             // callback (which runs for ALL guards regardless of which pass emits
             // them). No need to force here — it was already done.
@@ -2904,7 +2875,6 @@ impl OptHeap {
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
                 vb_set(&mut self.seen_allocation, op.pos.get().raw());
                 vb_set(&mut self.unescaped, op.pos.get().raw());
-                vb_set(&mut self.known_nonnull, op.pos.get().raw());
                 OptimizationResult::PassOn
             }
 
@@ -3102,7 +3072,6 @@ impl OptHeap {
             | OpCode::GcLoadIndexedF => {
                 self.force_all_lazy_setfields(ctx.current_pass_idx, ctx);
                 self.force_all_lazy_setarrayitems(ctx.current_pass_idx, ctx);
-                vb_set(&mut self.known_nonnull, op.arg(0).raw());
                 OptimizationResult::Emit(op.clone())
             }
 
@@ -3167,7 +3136,6 @@ impl Optimization for OptHeap {
         self.postponed_op = None;
         self.seen_allocation.clear();
         self.unescaped.clear();
-        self.known_nonnull.clear();
         self.last_emitted_removed = false;
         self.cached_dict_reads.clear();
         self.corresponding_array_descrs.clear();
