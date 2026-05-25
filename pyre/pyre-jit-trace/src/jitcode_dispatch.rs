@@ -3580,19 +3580,28 @@ fn collect_outer_active_boxes(
     }
     for &idx in &banks.ref_ {
         let reg_idx = idx as usize;
-        // Vable-first read for portal frames (see comment at function top).
-        let mut v = sym
-            .registers_r
-            .get(reg_idx)
-            .copied()
-            .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)));
-        if v == OpRef::NONE && portal_vable_owner {
-            if let Some(vable_box) = trace_ctx.virtualizable_box_at(nvs + reg_idx) {
-                if vable_box != OpRef::NONE {
-                    v = vable_box;
-                }
+        // Vable-first read for portal frames.  The trait dispatch path
+        // intentionally stops mutating `registers_r` once the portal owns
+        // the vable shadow, so a non-`NONE` slot there can be stale.
+        // Reading `virtualizable_box_at(nvs + reg_idx)` first keeps the
+        // outer snapshot in lockstep with the live shadow; fall back to
+        // `registers_r` only when the vable lookup misses (non-portal
+        // sub-frames, or out-of-range indices the vable info doesn't
+        // cover).
+        let registers_r_slot = || {
+            sym.registers_r
+                .get(reg_idx)
+                .copied()
+                .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
+        };
+        let v = if portal_vable_owner {
+            match trace_ctx.virtualizable_box_at(nvs + reg_idx) {
+                Some(vable_box) if vable_box != OpRef::NONE => vable_box,
+                _ => registers_r_slot(),
             }
-        }
+        } else {
+            registers_r_slot()
+        };
         if v == OpRef::NONE {
             panic!("{}", dump_ctx("ref", idx));
         }
