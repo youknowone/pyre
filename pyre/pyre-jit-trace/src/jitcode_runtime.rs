@@ -312,21 +312,41 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::vec_assoc::VecAssoc<String, u8>>
                     BYTES.len(),
                 )
             });
-        // Overlay the helper-side `_pyre/P` adapter keys so the static
-        // decoder shares a key set with the production blackhole builder.
-        // pyre_extension_insns() is the same source the runtime builder
-        // hands to `setup_insns(...)`.
-        for (key, byte) in majit_translate::insns::pyre_extension_insns() {
-            if let Some(&prev) = table.get(key) {
-                assert_eq!(
-                    prev, byte,
-                    "pyre extension insns: opname {key:?} disagrees with build-time \
-                     pipeline.insns (build={prev}, extension={byte})",
-                );
-            } else {
-                table.insert(key.to_string(), byte);
+        // Overlay the canonical `wellknown_bh_insns` and pyre-only
+        // `pyre_extension_insns` keys so the runtime table covers every
+        // opname a `BlackholeInterpBuilder` could be asked to dispatch.
+        //
+        // RPython parity: `blackhole.py:55-65 BlackholeInterpBuilder.__init__`
+        // populates `self.insns = asm.insns` and then `wire_bhimpl_handlers`
+        // (`:152-179`) iterates that map to bind every bhimpl handler.
+        // Pyre's build-time `pipeline.insns` only records opnames the
+        // assembler actually emitted during `make_jitcodes`; canonical
+        // opnames the analyzed source set did not exercise (e.g.
+        // `ref_guard_value/r`, `newtuple/rr>r`) are absent.  Overlaying
+        // both `wellknown_bh_insns` and `pyre_extension_insns` restores
+        // the closed key universe RPython's runtime sees, so callers
+        // (`build_default_bh_builder_with_unwired_report`, dispatch
+        // tests) treat opname coverage as a property of the codebase,
+        // not of which paths the build observed.
+        fn overlay_insns(
+            table: &mut majit_ir::vec_assoc::VecAssoc<String, u8>,
+            source: &majit_ir::VecAssoc<&'static str, u8>,
+        ) {
+            for (key, byte) in source.iter() {
+                let owned = (*key).to_string();
+                if let Some(&prev) = table.get(&owned) {
+                    assert_eq!(
+                        prev, *byte,
+                        "insns overlay: opname {key:?} disagrees with build-time \
+                         pipeline.insns (build={prev}, overlay={byte})",
+                    );
+                } else {
+                    table.insert(owned, *byte);
+                }
             }
         }
+        overlay_insns(&mut table, &majit_translate::insns::wellknown_bh_insns());
+        overlay_insns(&mut table, &majit_translate::insns::pyre_extension_insns());
         table
     });
 
