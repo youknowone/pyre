@@ -462,6 +462,155 @@ fn init_mmap_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_mmap.py:188 descr_getitem` — integer index returns a
+    // single int byte; slice returns bytes (contiguous fast path for
+    // step=1, stepped extraction otherwise).
+    crate::dict_storage_store(
+        ns,
+        "__getitem__",
+        crate::make_builtin_function_with_arity(
+            "__getitem__",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("__getitem__() requires index"));
+                }
+                let obj = args[0];
+                let index = args[1];
+                let (p, len) = mmap_ptr(obj)?;
+                let len_i64 = len as i64;
+                if unsafe { pyre_object::is_slice(index) } {
+                    let (start, stop, step) =
+                        unsafe { crate::baseobjspace::normalize_slice(index, len_i64)? };
+                    if step == 1 {
+                        if stop <= start {
+                            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+                        }
+                        let n = (stop - start) as usize;
+                        let data = unsafe {
+                            std::slice::from_raw_parts(p.add(start as usize), n)
+                        };
+                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
+                    }
+                    let mut out = Vec::new();
+                    let mut i = start;
+                    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                        out.push(unsafe { *p.add(i as usize) });
+                        i += step;
+                    }
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
+                }
+                if !unsafe { pyre_object::is_int(index) } {
+                    return Err(crate::PyError::type_error(
+                        "mmap indices must be integers or slices",
+                    ));
+                }
+                let mut idx = unsafe { pyre_object::w_int_get_value(index) };
+                if idx < 0 {
+                    idx += len_i64;
+                }
+                if idx < 0 || idx >= len_i64 {
+                    return Err(crate::PyError::index_error("mmap index out of range"));
+                }
+                let b = unsafe { *p.add(idx as usize) };
+                Ok(pyre_object::w_int_new(b as i64))
+            },
+            2,
+        ),
+    );
+
+    // `interp_mmap.py:206 descr_setitem` — integer index writes a
+    // single byte (0..256); slice writes a buffer whose length matches
+    // the slice length.  Read-only mmaps raise TypeError.
+    crate::dict_storage_store(
+        ns,
+        "__setitem__",
+        crate::make_builtin_function_with_arity(
+            "__setitem__",
+            |args| {
+                if args.len() < 3 {
+                    return Err(crate::PyError::type_error(
+                        "__setitem__() requires index and value",
+                    ));
+                }
+                let obj = args[0];
+                let index = args[1];
+                let value = args[2];
+                let access = mmap_get_attr_i64(obj, "_access");
+                if access == MMAP_ACCESS_READ {
+                    return Err(crate::PyError::type_error("mmap is read-only"));
+                }
+                let (p, len) = mmap_ptr(obj)?;
+                let len_i64 = len as i64;
+                if unsafe { pyre_object::is_slice(index) } {
+                    let (start, stop, step) =
+                        unsafe { crate::baseobjspace::normalize_slice(index, len_i64)? };
+                    let length = if step > 0 {
+                        ((stop - start).max(0) + step - 1) / step
+                    } else {
+                        ((start - stop).max(0) + (-step) - 1) / (-step)
+                    };
+                    if !unsafe { pyre_object::bytesobject::is_bytes_like(value) } {
+                        return Err(crate::PyError::type_error(
+                            "mmap slice assignment must be bytes-like",
+                        ));
+                    }
+                    let buf = unsafe { pyre_object::bytesobject::bytes_like_data(value) };
+                    if (buf.len() as i64) != length {
+                        return Err(crate::PyError::value_error(
+                            "mmap slice assignment is wrong size",
+                        ));
+                    }
+                    if step == 1 {
+                        if length > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    buf.as_ptr(),
+                                    p.add(start as usize),
+                                    length as usize,
+                                );
+                            }
+                        }
+                    } else {
+                        let mut i = start;
+                        let mut k = 0usize;
+                        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                            unsafe { *p.add(i as usize) = buf[k] };
+                            i += step;
+                            k += 1;
+                        }
+                    }
+                    return Ok(pyre_object::w_none());
+                }
+                if !unsafe { pyre_object::is_int(index) } {
+                    return Err(crate::PyError::type_error(
+                        "mmap indices must be integers or slices",
+                    ));
+                }
+                let mut idx = unsafe { pyre_object::w_int_get_value(index) };
+                if idx < 0 {
+                    idx += len_i64;
+                }
+                if idx < 0 || idx >= len_i64 {
+                    return Err(crate::PyError::index_error("mmap index out of range"));
+                }
+                if !unsafe { pyre_object::is_int(value) } {
+                    return Err(crate::PyError::type_error(
+                        "mmap item value must be an integer",
+                    ));
+                }
+                let v = unsafe { pyre_object::w_int_get_value(value) };
+                if !(0..256).contains(&v) {
+                    return Err(crate::PyError::value_error(
+                        "mmap item value must be in range(0, 256)",
+                    ));
+                }
+                unsafe { *p.add(idx as usize) = v as u8 };
+                Ok(pyre_object::w_none())
+            },
+            3,
+        ),
+    );
+
     // `interp_mmap.py:descr_madvise` — call madvise(addr+start, length,
     // advice).  Defaults: start=0, length=remaining bytes.
     crate::dict_storage_store(

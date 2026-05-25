@@ -533,6 +533,16 @@ impl PyError {
         }
     }
 
+    pub fn index_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::IndexError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
     pub fn os_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::OSError,
