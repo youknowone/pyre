@@ -3891,15 +3891,29 @@ fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>) -> 
                 // a citation to `jit.py:172-178 _get_args(func)`, so
                 // there is no silent single-graph fallback.
                 //
-                // `call.py:292-299 getcalldescr` still runs the
-                // `_canraise(op)` analysis on every elidable callsite,
-                // so collapsing `elidable_cannot_raise` /
-                // `elidable_or_memerror` to a single `"elidable"` hint
-                // remains parity-correct — `getcalldescr` recovers the
-                // `EF_ELIDABLE_*` 3-way from the per-op raise analysis
-                // at `jit_codewriter/call.rs:2773-2782`.
-                "elidable_cannot_raise" | "elidable_or_memerror" => {
+                // `call.py:292-299 getcalldescr` runs `_canraise(op)` on
+                // every elidable callsite to recover the `EF_ELIDABLE_*`
+                // 3-way split.  Pyre's `_canraise` is conservative for
+                // callees outside `function_graphs` (Vec::len,
+                // pyframe_get_pycode, etc.) — `analyze_external_call`
+                // defaults to `True` (`call.rs:3631`), so the analyser
+                // alone cannot recover `EF_ELIDABLE_CANNOT_RAISE` /
+                // `EF_ELIDABLE_OR_MEMORYERROR` even on callees the user
+                // has explicitly annotated.  Preserve the assertion as a
+                // distinct hint string alongside the canonical
+                // `"elidable"` so `lib.rs` can register it with
+                // `mark_cannot_raise_assertion` /
+                // `mark_memerror_only_assertion` and
+                // `getcalldescr`'s elidable branch can honour the
+                // user-asserted shape before falling back to
+                // `_canraise`.
+                "elidable_cannot_raise" => {
                     hints.push("elidable".into());
+                    hints.push("elidable_cannot_raise".into());
+                }
+                "elidable_or_memerror" => {
+                    hints.push("elidable".into());
+                    hints.push("elidable_or_memerror".into());
                 }
                 "dont_look_inside" => hints.push("dont_look_inside".into()),
                 "unroll_safe" => hints.push("unroll_safe".into()),

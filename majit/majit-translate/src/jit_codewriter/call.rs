@@ -624,6 +624,25 @@ pub struct CallControl {
     /// Targets known to be elidable (pure, no side effects).
     elidable_targets: HashSet<CallPath>,
 
+    /// Pyre extension: targets whose source carries
+    /// `#[majit_macros::elidable_cannot_raise]` — a user assertion that
+    /// the callee never raises.  Honoured by `getcalldescr`'s elidable
+    /// branch before consulting `_canraise`, because pyre's exception
+    /// analyser defaults to `analyze_external_call → True` for any
+    /// callee outside `function_graphs` (Vec::len, pyframe_get_pycode,
+    /// etc.) and cannot recover `EF_ELIDABLE_CANNOT_RAISE` on its own
+    /// the way RPython's analyser does upstream.  Without honouring the
+    /// assertion, every `#[elidable_cannot_raise]` callsite is downgraded
+    /// to `ElidableCanRaise` and pays an unnecessary GUARD_NO_EXCEPTION.
+    cannot_raise_assertion_targets: HashSet<CallPath>,
+
+    /// Pyre extension: targets whose source carries
+    /// `#[majit_macros::elidable_or_memerror]` — a user assertion that
+    /// the callee raises only MemoryError.  Mirrors
+    /// `cannot_raise_assertion_targets` for the `EF_ELIDABLE_OR_MEMORYERROR`
+    /// branch of RPython's `call.py:292-298` 3-way split.
+    memerror_only_assertion_targets: HashSet<CallPath>,
+
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
     /// Targets known to be loop-invariant (call once per loop).
     loopinvariant_targets: HashSet<CallPath>,
@@ -1044,6 +1063,8 @@ impl CallControl {
             quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
             randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
             elidable_targets: HashSet::new(),
+            cannot_raise_assertion_targets: HashSet::new(),
+            memerror_only_assertion_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
@@ -3536,6 +3557,32 @@ impl CallControl {
             .is_some_and(|p| self.elidable_targets.contains(&p))
     }
 
+    /// Pyre extension: register a target as carrying the
+    /// `#[elidable_cannot_raise]` user assertion.
+    pub fn mark_cannot_raise_assertion(&mut self, path: CallPath) {
+        self.cannot_raise_assertion_targets.insert(path);
+    }
+
+    /// Pyre extension: check if `target` carries the
+    /// `#[elidable_cannot_raise]` assertion.
+    pub fn has_cannot_raise_assertion(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target)
+            .is_some_and(|p| self.cannot_raise_assertion_targets.contains(&p))
+    }
+
+    /// Pyre extension: register a target as carrying the
+    /// `#[elidable_or_memerror]` user assertion.
+    pub fn mark_memerror_only_assertion(&mut self, path: CallPath) {
+        self.memerror_only_assertion_targets.insert(path);
+    }
+
+    /// Pyre extension: check if `target` carries the
+    /// `#[elidable_or_memerror]` assertion.
+    pub fn has_memerror_only_assertion(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target)
+            .is_some_and(|p| self.memerror_only_assertion_targets.contains(&p))
+    }
+
     /// RPython: call.py:240 — check if target has `_jit_loop_invariant_`.
     pub fn is_loopinvariant(&self, target: &CallTarget) -> bool {
         self.target_to_path(target)
@@ -4365,14 +4412,43 @@ impl CallControl {
                 ExtraEffect::LoopInvariant
             } else if elidable {
                 // call.py:292-298 — direct branch only.
-                let canraise = match shape {
-                    CallShape::Direct(target) => self._canraise(target, cache),
+                //
+                // Pyre extension: the user-facing
+                // `#[majit_macros::elidable_cannot_raise]` /
+                // `#[majit_macros::elidable_or_memerror]` macros assert
+                // an `EF_ELIDABLE_*` shape the on-graph `_canraise`
+                // analyser cannot recover on its own — pyre's
+                // `analyze_external_call` defaults to `True` (call.rs:3631)
+                // so any callee that reaches Vec::len / pyframe_get_pycode
+                // / etc. propagates back as CanRaise::Yes.  Honour the
+                // assertion before consulting `_canraise` so the
+                // `EF_ELIDABLE_CANNOT_RAISE` walker arm (no trailing
+                // GUARD_NO_EXCEPTION) actually fires on annotated
+                // callees.
+                let assertion = match shape {
+                    CallShape::Direct(target) => {
+                        if self.has_cannot_raise_assertion(target) {
+                            Some(ExtraEffect::ElidableCannotRaise)
+                        } else if self.has_memerror_only_assertion(target) {
+                            Some(ExtraEffect::ElidableOrMemoryError)
+                        } else {
+                            None
+                        }
+                    }
                     CallShape::Indirect(_) => unreachable!("indirect cannot be elidable"),
                 };
-                match canraise {
-                    CanRaise::No => ExtraEffect::ElidableCannotRaise,
-                    CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
-                    CanRaise::Yes => ExtraEffect::ElidableCanRaise,
+                if let Some(ee) = assertion {
+                    ee
+                } else {
+                    let canraise = match shape {
+                        CallShape::Direct(target) => self._canraise(target, cache),
+                        CallShape::Indirect(_) => unreachable!("indirect cannot be elidable"),
+                    };
+                    match canraise {
+                        CanRaise::No => ExtraEffect::ElidableCannotRaise,
+                        CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
+                        CanRaise::Yes => ExtraEffect::ElidableCanRaise,
+                    }
                 }
             } else {
                 let canraise = match shape {
