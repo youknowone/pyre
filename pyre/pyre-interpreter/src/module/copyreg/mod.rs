@@ -7,18 +7,14 @@
 
 use pyre_object::*;
 
-// `copyreg.pickle(type, reduce_func, constructor=None)` — register a
-// pickle reducer.  Stub ignores the call.
-fn copyreg_pickle(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
 crate::py_module! {
     "copyreg",
     interpleveldefs: {
         "dispatch_table" => w_dict_new(),
     },
     functions: {
-        "pickle" / 3 = copyreg_pickle,
+        // `copyreg.pickle(type, reduce_func, constructor=None)` — register
+        // a pickle reducer.  Stub ignores the call.
+        "pickle" / 3 = |_| Ok(w_none()),
     },
 }

@@ -32,16 +32,12 @@ fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(obj)
 }
 
-fn none_stub(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
 crate::py_module! {
     "_contextvars",
     functions: {
         "ContextVar"   / * = context_var,
-        "Context"      / 0 = none_stub,
-        "Token"        / 0 = none_stub,
-        "copy_context" / 0 = none_stub,
+        "Context"      / 0 = |_| Ok(w_none()),
+        "Token"        / 0 = |_| Ok(w_none()),
+        "copy_context" / 0 = |_| Ok(w_none()),
     },
 }

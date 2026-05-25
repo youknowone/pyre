@@ -8,57 +8,20 @@
 
 use pyre_object::*;
 
-fn normalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() >= 2 {
-        Ok(args[1])
-    } else {
-        Ok(w_str_new(""))
-    }
-}
-
-fn category(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new("Cn"))
-}
-
-fn name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() >= 2 {
-        Ok(args[1])
-    } else {
-        Err(crate::PyError::value_error("no such name"))
-    }
-}
-
-fn lookup(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::key_error("character not found"))
-}
-
-fn decimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() >= 2 {
-        Ok(args[1])
-    } else {
-        Err(crate::PyError::value_error("not a decimal"))
-    }
-}
-
-fn numeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() >= 2 {
-        Ok(args[1])
-    } else {
-        Err(crate::PyError::value_error("not a numeric character"))
-    }
-}
-
 crate::py_module! {
     "unicodedata",
     interpleveldefs: {
         "unidata_version" => w_str_new("15.1.0"),
     },
     functions: {
-        "normalize" / 2 = normalize,
-        "category"  / 1 = category,
-        "name"      / * = name,
-        "lookup"    / 1 = lookup,
-        "decimal"   / * = decimal,
-        "numeric"   / * = numeric,
+        "normalize" / 2 = |args| Ok(args.get(1).copied().unwrap_or_else(|| w_str_new(""))),
+        "category"  / 1 = |_| Ok(w_str_new("Cn")),
+        "name"      / * = |args| args.get(1).copied()
+            .ok_or_else(|| crate::PyError::value_error("no such name")),
+        "lookup"    / 1 = |_| Err(crate::PyError::key_error("character not found")),
+        "decimal"   / * = |args| args.get(1).copied()
+            .ok_or_else(|| crate::PyError::value_error("not a decimal")),
+        "numeric"   / * = |args| args.get(1).copied()
+            .ok_or_else(|| crate::PyError::value_error("not a numeric character")),
     },
 }

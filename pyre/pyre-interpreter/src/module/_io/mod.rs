@@ -7,30 +7,6 @@
 
 use pyre_object::*;
 
-fn stub_stringio(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(""))
-}
-
-fn stub_bytesio(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(""))
-}
-
-fn stub_fileio(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
-fn stub_noop_ctor(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
-fn text_encoding(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(if args.is_empty() {
-        w_str_new("utf-8")
-    } else {
-        args[0]
-    })
-}
-
 crate::py_module! {
     "_io",
     interpleveldefs: {
@@ -40,18 +16,18 @@ crate::py_module! {
         "BlockingIOError"      => w_str_new("BlockingIOError"),
     },
     functions: {
-        "StringIO"        / * = stub_stringio,
-        "BytesIO"         / * = stub_bytesio,
-        "FileIO"          / * = stub_fileio,
-        "BufferedReader"  / * = stub_noop_ctor,
-        "BufferedWriter"  / * = stub_noop_ctor,
-        "BufferedRWPair"  / * = stub_noop_ctor,
-        "BufferedRandom"  / * = stub_noop_ctor,
-        "TextIOWrapper"   / * = stub_noop_ctor,
-        "IncrementalNewlineDecoder" / * = stub_noop_ctor,
-        "open"            / * = stub_noop_ctor,
-        "open_code"       / * = stub_noop_ctor,
-        "text_encoding"   / * = text_encoding,
+        "StringIO"        / * = |_| Ok(w_str_new("")),
+        "BytesIO"         / * = |_| Ok(w_str_new("")),
+        "FileIO"          / * = |_| Ok(w_none()),
+        "BufferedReader"  / * = |_| Ok(w_none()),
+        "BufferedWriter"  / * = |_| Ok(w_none()),
+        "BufferedRWPair"  / * = |_| Ok(w_none()),
+        "BufferedRandom"  / * = |_| Ok(w_none()),
+        "TextIOWrapper"   / * = |_| Ok(w_none()),
+        "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
+        "open"            / * = |_| Ok(w_none()),
+        "open_code"       / * = |_| Ok(w_none()),
+        "text_encoding"   / * = |args| Ok(args.first().copied().unwrap_or_else(|| w_str_new("utf-8"))),
     },
     extra_init: |ns| {
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).

@@ -16,147 +16,6 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(crate::call_function_or_identity(obj, "__index__"))
 }
 
-fn op_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(crate::baseobjspace::add(args[0], args[1]).unwrap_or(w_none()))
-}
-
-fn op_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(crate::baseobjspace::sub(args[0], args[1]).unwrap_or(w_none()))
-}
-
-fn op_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(crate::baseobjspace::mul(args[0], args[1]).unwrap_or(w_none()))
-}
-
-fn op_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(
-        crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
-            .unwrap_or(w_none()),
-    )
-}
-
-fn op_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(
-        crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Lt)
-            .unwrap_or(w_none()),
-    )
-}
-
-fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
-    Ok(
-        crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Gt)
-            .unwrap_or(w_none()),
-    )
-}
-
-fn op_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
-}
-
-fn op_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
-}
-
-fn op_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ne)
-}
-
-fn op_truediv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::truediv(args[0], args[1])
-}
-
-fn op_floordiv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::floordiv(args[0], args[1])
-}
-
-fn op_mod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::mod_(args[0], args[1])
-}
-
-fn op_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::pow(args[0], args[1])
-}
-
-fn op_neg(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::neg(args[0])
-}
-
-fn op_pos(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::pos(args[0])
-}
-
-fn op_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::builtins::builtin_abs(args)
-}
-
-fn op_invert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::invert(args[0])
-}
-
-fn op_lshift(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::lshift(args[0], args[1])
-}
-
-fn op_rshift(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::rshift(args[0], args[1])
-}
-
-fn op_and(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::and_(args[0], args[1])
-}
-
-fn op_or(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::or_(args[0], args[1])
-}
-
-fn op_xor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::xor(args[0], args[1])
-}
-
-fn op_not(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(!crate::baseobjspace::is_true(args[0])))
-}
-
-fn op_truth(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
-}
-
-fn op_is(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(std::ptr::eq(args[0], args[1])))
-}
-
-fn op_is_not(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(!std::ptr::eq(args[0], args[1])))
-}
-
-fn op_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(crate::baseobjspace::contains(args[0], args[1])?))
-}
-
-fn op_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::getitem(args[0], args[1])
-}
-
-fn op_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::setitem(args[0], args[1], args[2])?;
-    Ok(w_none())
-}
-
-fn op_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::delitem(args[0], args[1])?;
-    Ok(w_none())
-}
-
-fn op_first_or_none(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(if args.is_empty() { w_none() } else { args[0] })
-}
-
 /// `interp_operator.py:213-219`:
 /// ```text
 /// @unwrap_spec(default='index')
@@ -185,49 +44,57 @@ fn op_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(n))
 }
 
+// Binary arithmetic / comparison thunks share one shape — call
+// `baseobjspace::OP(args[0], args[1])` and unwrap-or-none the result.
+// Inline closures below preserve the per-name `assert!` checks.
+use crate::baseobjspace::{
+    self, CompareOp, add, and_, contains, delitem, floordiv, getitem, invert, is_true,
+    lshift, mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
+};
+
 crate::py_module! {
     "operator",
     functions: {
         "index"    / 1 = op_index,
-        "add"      / 2 = op_add,
-        "sub"      / 2 = op_sub,
-        "mul"      / 2 = op_mul,
-        "truediv"  / 2 = op_truediv,
-        "floordiv" / 2 = op_floordiv,
-        "mod"      / 2 = op_mod,
-        "pow"      / 2 = op_pow,
-        "neg"      / 1 = op_neg,
-        "pos"      / 1 = op_pos,
-        "abs"      / 1 = op_abs,
-        "invert"   / 1 = op_invert,
-        "lshift"   / 2 = op_lshift,
-        "rshift"   / 2 = op_rshift,
-        "and_"     / 2 = op_and,
-        "or_"      / 2 = op_or,
-        "xor"      / 2 = op_xor,
-        "not_"     / 1 = op_not,
+        "add"      / 2 = |args| { assert!(args.len() == 2); Ok(add(args[0], args[1]).unwrap_or(w_none())) },
+        "sub"      / 2 = |args| { assert!(args.len() == 2); Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
+        "mul"      / 2 = |args| { assert!(args.len() == 2); Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
+        "truediv"  / 2 = |args| truediv(args[0], args[1]),
+        "floordiv" / 2 = |args| floordiv(args[0], args[1]),
+        "mod"      / 2 = |args| mod_(args[0], args[1]),
+        "pow"      / 2 = |args| pow(args[0], args[1]),
+        "neg"      / 1 = |args| neg(args[0]),
+        "pos"      / 1 = |args| pos(args[0]),
+        "abs"      / 1 = |args| crate::builtins::builtin_abs(args),
+        "invert"   / 1 = |args| invert(args[0]),
+        "lshift"   / 2 = |args| lshift(args[0], args[1]),
+        "rshift"   / 2 = |args| rshift(args[0], args[1]),
+        "and_"     / 2 = |args| and_(args[0], args[1]),
+        "or_"      / 2 = |args| or_(args[0], args[1]),
+        "xor"      / 2 = |args| xor(args[0], args[1]),
+        "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0]))),
         // interp_operator.py:138
-        "truth"    / 1 = op_truth,
-        "is_"      / 2 = op_is,
-        "is_not"   / 2 = op_is_not,
-        "contains" / 2 = op_contains,
-        "getitem"  / 2 = op_getitem,
-        "setitem"  / 3 = op_setitem,
-        "delitem"  / 2 = op_delitem,
+        "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0]))),
+        "is_"      / 2 = |args| Ok(w_bool_from(std::ptr::eq(args[0], args[1]))),
+        "is_not"   / 2 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], args[1]))),
+        "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),
+        "getitem"  / 2 = |args| getitem(args[0], args[1]),
+        "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
+        "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },
         // Underscore aliases (__add__ / __sub__ / __mul__ via operator).
-        "__add__"  / 2 = op_add,
-        "__sub__"  / 2 = op_sub,
-        "__mul__"  / 2 = op_mul,
-        "eq"       / 2 = op_eq,
-        "lt"       / 2 = op_lt,
-        "gt"       / 2 = op_gt,
-        "le"       / 2 = op_le,
-        "ge"       / 2 = op_ge,
-        "ne"       / 2 = op_ne,
+        "__add__"  / 2 = |args| { assert!(args.len() == 2); Ok(add(args[0], args[1]).unwrap_or(w_none())) },
+        "__sub__"  / 2 = |args| { assert!(args.len() == 2); Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
+        "__mul__"  / 2 = |args| { assert!(args.len() == 2); Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
+        "eq" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Eq).unwrap_or(w_none())) },
+        "lt" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Lt).unwrap_or(w_none())) },
+        "gt" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Gt).unwrap_or(w_none())) },
+        "le" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Le),
+        "ge" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ge),
+        "ne" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ne),
         // itemgetter / attrgetter / methodcaller stubs — return first arg.
-        "itemgetter"   / * = op_first_or_none,
-        "attrgetter"   / * = op_first_or_none,
-        "methodcaller" / * = op_first_or_none,
+        "itemgetter"   / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
+        "attrgetter"   / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
+        "methodcaller" / * = |args| Ok(if args.is_empty() { w_none() } else { args[0] }),
         "length_hint"  / * = op_length_hint,
     },
 }

@@ -7,26 +7,14 @@
 
 use pyre_object::*;
 
-fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Return the function so `@atexit.register` works.
-    Ok(args.first().copied().unwrap_or(w_none()))
-}
-
-fn noop(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
-fn ncallbacks(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_int_new(0))
-}
-
 crate::py_module! {
     "atexit",
     functions: {
-        "register"        / * = register,
-        "unregister"      / 1 = noop,
-        "_run_exitfuncs"  / 0 = noop,
-        "_clear"          / 0 = noop,
-        "_ncallbacks"     / 0 = ncallbacks,
+        // Return the function so `@atexit.register` works.
+        "register"        / * = |args| Ok(args.first().copied().unwrap_or(w_none())),
+        "unregister"      / 1 = |_| Ok(w_none()),
+        "_run_exitfuncs"  / 0 = |_| Ok(w_none()),
+        "_clear"          / 0 = |_| Ok(w_none()),
+        "_ncallbacks"     / 0 = |_| Ok(w_int_new(0)),
     },
 }

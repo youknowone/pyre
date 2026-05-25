@@ -8,36 +8,12 @@
 use crate::module::math::interp_math;
 use pyre_object::*;
 
-fn phase_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(floatobject::w_float_new(
-        interp_math::get_double(args[0]).atan2(0.0),
-    ))
-}
-
 fn polar_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let x = interp_math::get_double(args[0]);
     Ok(w_tuple_new(vec![
         floatobject::w_float_new(x.abs()),
         floatobject::w_float_new(0.0),
     ]))
-}
-
-fn rect_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let r = interp_math::get_double(args[0]);
-    let phi = interp_math::get_double(args[1]);
-    Ok(floatobject::w_float_new(r * phi.cos()))
-}
-
-fn isfinite_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(interp_math::get_double(args[0]).is_finite()))
-}
-
-fn isinf_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(interp_math::get_double(args[0]).is_infinite()))
-}
-
-fn isnan_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_bool_from(interp_math::get_double(args[0]).is_nan()))
 }
 
 crate::py_module! {
@@ -50,13 +26,15 @@ crate::py_module! {
         "nan" => floatobject::w_float_new(pymath::math::NAN),
     },
     functions: {
-        "phase" / 1 = phase_impl,
+        "phase" / 1 = |args| Ok(floatobject::w_float_new(interp_math::get_double(args[0]).atan2(0.0))),
         "polar" / 1 = polar_impl,
-        "rect"  / 2 = rect_impl,
+        "rect"  / 2 = |args| Ok(floatobject::w_float_new(
+            interp_math::get_double(args[0]) * interp_math::get_double(args[1]).cos()
+        )),
 
-        "isfinite" / 1 = isfinite_impl,
-        "isinf"    / 1 = isinf_impl,
-        "isnan"    / 1 = isnan_impl,
+        "isfinite" / 1 = |args| Ok(w_bool_from(interp_math::get_double(args[0]).is_finite())),
+        "isinf"    / 1 = |args| Ok(w_bool_from(interp_math::get_double(args[0]).is_infinite())),
+        "isnan"    / 1 = |args| Ok(w_bool_from(interp_math::get_double(args[0]).is_nan())),
 
         // Real-valued forwards (pending complex type)
         "sqrt"  / 1 = interp_math::sqrt,

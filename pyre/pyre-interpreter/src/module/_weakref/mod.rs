@@ -17,12 +17,6 @@
 
 pub mod interp_weakref;
 
-fn _remove_dead_weakref(_args: &[pyre_object::PyObjectRef])
-    -> Result<pyre_object::PyObjectRef, crate::PyError>
-{
-    Ok(pyre_object::w_none())
-}
-
 crate::py_module! {
     "_weakref",
     interpleveldefs: {
@@ -37,6 +31,6 @@ crate::py_module! {
     module_functions: {
         "getweakrefcount"      / 1 = interp_weakref::getweakrefcount,
         "getweakrefs"          / 1 = interp_weakref::getweakrefs,
-        "_remove_dead_weakref" / 2 = _remove_dead_weakref,
+        "_remove_dead_weakref" / 2 = |_| Ok(pyre_object::w_none()),
     },
 }

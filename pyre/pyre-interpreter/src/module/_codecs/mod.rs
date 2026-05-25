@@ -17,30 +17,18 @@ fn lookup_error(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
-fn noop(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
-// encode / decode / _forget_codec return input unchanged — matches
-// PyPy `_codecs.encode` when the codec is the identity.
-fn first_or_none(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(args.first().copied().unwrap_or(w_none()))
-}
-
-fn charmap_build(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_dict_new())
-}
-
 crate::py_module! {
     "_codecs",
     functions: {
         "lookup_error"   / 1 = lookup_error,
-        "register_error" / 2 = noop,
-        "register"       / 1 = noop,
-        "lookup"         / 1 = noop,
-        "encode"         / 1 = first_or_none,
-        "decode"         / 1 = first_or_none,
-        "_forget_codec"  / 1 = first_or_none,
-        "charmap_build"  / 1 = charmap_build,
+        "register_error" / 2 = |_| Ok(w_none()),
+        "register"       / 1 = |_| Ok(w_none()),
+        "lookup"         / 1 = |_| Ok(w_none()),
+        // encode / decode / _forget_codec return input unchanged — matches
+        // PyPy `_codecs.encode` when the codec is the identity.
+        "encode"         / 1 = |args| Ok(args.first().copied().unwrap_or(w_none())),
+        "decode"         / 1 = |args| Ok(args.first().copied().unwrap_or(w_none())),
+        "_forget_codec"  / 1 = |args| Ok(args.first().copied().unwrap_or(w_none())),
+        "charmap_build"  / 1 = |_| Ok(w_dict_new()),
     },
 }

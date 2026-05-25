@@ -8,10 +8,6 @@
 
 use pyre_object::*;
 
-fn reduce(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::type_error("reduce not implemented"))
-}
-
 // `functools.cmp_to_key(cmp)` — pyre's identity wrapper covers the
 // str / int / tuple sort key cases the stdlib actually uses; arbitrary
 // cmp callables are not honoured.
@@ -26,7 +22,7 @@ fn cmp_to_key(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 crate::py_module! {
     "_functools",
     functions: {
-        "reduce"     / * = reduce,
+        "reduce"     / * = |_| Err(crate::PyError::type_error("reduce not implemented")),
         "cmp_to_key" / 1 = cmp_to_key,
     },
 }

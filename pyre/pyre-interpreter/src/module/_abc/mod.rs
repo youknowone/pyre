@@ -8,14 +8,6 @@
 
 use pyre_object::*;
 
-fn get_cache_token(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_int_new(0))
-}
-
-fn noop(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
-}
-
 // `Modules/_abc.c _abc__abc_instancecheck` — delegate to
 // baseobjspace::isinstance_w so `isinstance(Fraction(1,2),
 // numbers.Rational)` works via direct MRO inheritance.
@@ -49,20 +41,16 @@ fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bool_from(false))
 }
 
-fn empty_tuple(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_tuple_new(vec![]))
-}
-
 crate::py_module! {
     "_abc",
     functions: {
-        "get_cache_token"     / 0 = get_cache_token,
-        "_abc_init"           / 1 = noop,
-        "_abc_register"       / 2 = noop,
+        "get_cache_token"     / 0 = |_| Ok(w_int_new(0)),
+        "_abc_init"           / 1 = |_| Ok(w_none()),
+        "_abc_register"       / 2 = |_| Ok(w_none()),
         "_abc_instancecheck"  / 2 = instancecheck,
         "_abc_subclasscheck"  / 2 = subclasscheck,
-        "_get_dump"           / 1 = empty_tuple,
-        "_reset_registry"     / 1 = noop,
-        "_reset_caches"       / 1 = noop,
+        "_get_dump"           / 1 = |_| Ok(w_tuple_new(vec![])),
+        "_reset_registry"     / 1 = |_| Ok(w_none()),
+        "_reset_caches"       / 1 = |_| Ok(w_none()),
     },
 }
