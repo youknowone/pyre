@@ -103,23 +103,43 @@
 //!   `SemanticFunction.self_ty_root` (`66423f0fc4`) and
 //!   `SemanticFunction.trait_root` (`36e3a6520b`) on MIR-built
 //!   impl methods so the canonical registration loop in
-//!   `lib.rs:905-1019` can walk `program.functions` instead of the
-//!   AST-side `canonical_trait_impls` /
-//!   `canonical_inherent_methods`.  Coverage audit
-//!   (`PYRE_AST_EXTRACT_COVERAGE_AUDIT=1`, `29db020eeb`) reports
-//!   inherent 336/509 (66%) covered, trait 26/498 (5%) covered;
-//!   trait gap stems from AST setting `self_ty_root=None` and
-//!   falling back to an unqualified `for_type` key.  Aligning the
-//!   remaining keys is the next slice.
+//!   `lib.rs:1010-1190` can substitute MIR graphs for AST graphs.
+//!   - **3.A** (`6fc8da1327`) — trait-default body detection in MIR
+//!     via `trait_default_owner_for_fundecl(fd, known_trait_names)`.
+//!     Audit on test_phase_f LLBC fixture: trait covered 26→150 / 275
+//!     (9% → 55%) after MIR populates `trait_root` for default
+//!     bodies; inherent unchanged at 102/125 (82%).
+//!   - **3.B** (`fce8698259`) — registration loop in
+//!     `analyze_pipeline_from_parsed` (`lib.rs:1010+`) indexes
+//!     `program.functions` and substitutes MIR graphs for the
+//!     AST graphs `extract_trait_impls`/`extract_inherent_impl_methods`
+//!     carried.  AST graph remains the fallback when MIR has no entry.
+//!   - **3.C** (`24ecf9e865`) — new `front::semantic::MirGraphLookup`
+//!     threaded into `extract_*`; on hit the collector returns the
+//!     MIR graph and computes hints from syn attrs directly, skipping
+//!     `build_function_graph_with_self_ty_pub`.  The AST graph build
+//!     now runs only for entries MIR did not lower (the residual
+//!     coverage gap below).
+//!   - **3.D (pending)** — close MIR residual gaps so the AST build
+//!     never runs in covered configurations.  Audit names the
+//!     uncovered set: trait-impl gaps `CurrentFrameGuard::drop`,
+//!     `PyFrame::{make_function,call_callable,build_list,build_tuple,
+//!     build_map}`; trait-default gaps under `OpcodeStepExecutor`
+//!     (`swap`, `call`, `import_from`, `format_with_spec`); inherent
+//!     gaps `pyopcode::FrameBlock::new`, `eval::Code::{new,__repr__}`,
+//!     `pyframe::FrameDebugData::new`, `pyframe::PyFrame::{__init__,
+//!     __repr__,getcode,new,ncells,push}`.  Diagnosis requires
+//!     `PYRE_MIR_FRONTEND_DEBUG=1` per-fundecl skip reasons.
 //! - **Slice 4** — replace the AST-fallback arm in
 //!   `build_semantic_program_via_active_frontend` with a loud
 //!   `panic!` requesting `scripts/extract-llbc.sh`.  Deferred
-//!   until Slice 3 closes (and parse.rs no longer reaches AST
-//!   graph builders).
+//!   until Slice 3.D closes (and `extract_*` no longer reaches
+//!   AST graph builders for the registered surface).
 //! - **Slice 5** — delete the AST graph builder bulk
 //!   (~15k LOC: `build_function_graph_*`, `GraphBuildContext`,
 //!   `lower_*` walkers, the four CFG-blindness shims listed
-//!   below).  Gated on Slice 3 reaching 100% coverage.
+//!   below).  Gated on Slice 4 + every test fixture either
+//!   migrating to MIR or being deleted.
 //!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
