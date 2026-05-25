@@ -201,6 +201,72 @@ fn build_semantic_program_via_active_frontend(
         .expect("pyre-interpreter source must lower without FlowingError")
 }
 
+/// Step 6.E audit helper — count how many methods produced by the
+/// AST-side `parse::extract_trait_impls` /
+/// `parse::extract_inherent_impl_methods` are reachable through
+/// `program.functions`'s `self_ty_root` + `trait_root` indexing.
+///
+/// Prints a summary of the form `[ast-extract-audit] trait_methods=X
+/// covered=Y missing=N inherent=A covered=B missing=N` plus the
+/// first few missing entries.  Side-effect-only; the registration
+/// loop still consumes the existing `canonical_*` vectors.
+///
+/// Goal: prove `program.functions` is a superset of the extractors'
+/// output before the registration loop is re-routed to walk
+/// `program.functions` directly and the extractors retire.
+fn audit_ast_extract_coverage(
+    program: &front::SemanticProgram,
+    canonical_trait_impls: &[TraitImplInfo],
+    canonical_inherent_methods: &[parse::InherentMethodInfo],
+) {
+    use std::collections::HashSet;
+    // Index program.functions by (impl_type, method_name) using
+    // self_ty_root (impl owner leaf) + name (method leaf).
+    // Trait-default bodies in program.functions live under
+    // self_ty_root = trait leaf (penultimate Ident) — handled below.
+    let mut indexed: HashSet<(String, String)> = HashSet::new();
+    for f in &program.functions {
+        if let Some(owner) = &f.self_ty_root {
+            indexed.insert((owner.clone(), f.name.clone()));
+        }
+    }
+    let mut trait_total = 0usize;
+    let mut trait_missing: Vec<String> = Vec::new();
+    for ti in canonical_trait_impls {
+        let impl_type = ti.self_ty_root.as_deref().unwrap_or(&ti.for_type);
+        for method in &ti.methods {
+            trait_total += 1;
+            if !indexed.contains(&(impl_type.to_string(), method.name.clone())) {
+                trait_missing.push(format!("{}::{}", impl_type, method.name));
+            }
+        }
+    }
+    let mut inherent_total = 0usize;
+    let mut inherent_missing: Vec<String> = Vec::new();
+    for mi in canonical_inherent_methods {
+        inherent_total += 1;
+        let impl_type = mi.self_ty_root.as_deref().unwrap_or(&mi.for_type);
+        if !indexed.contains(&(impl_type.to_string(), mi.name.clone())) {
+            inherent_missing.push(format!("{}::{}", impl_type, mi.name));
+        }
+    }
+    eprintln!(
+        "[ast-extract-audit] trait_methods={trait_total} \
+         covered={} missing={} inherent={} covered={} missing={}",
+        trait_total - trait_missing.len(),
+        trait_missing.len(),
+        inherent_total,
+        inherent_total - inherent_missing.len(),
+        inherent_missing.len(),
+    );
+    for s in trait_missing.iter().take(10) {
+        eprintln!("  trait_missing: {s}");
+    }
+    for s in inherent_missing.iter().take(10) {
+        eprintln!("  inherent_missing: {s}");
+    }
+}
+
 /// Step 6.B: locate the workspace's `build/llbc/` directory and
 /// return paths to the canonical pyre LLBC artefacts when every
 /// expected file is present *and* the caller looks like a
@@ -869,6 +935,20 @@ fn analyze_pipeline_from_parsed(
                 &program.known_struct_names,
             )
             .expect("inherent methods must lower without FlowingError"),
+        );
+    }
+    // Step 6.E audit (env-gated): measure how much of the AST-side
+    // `canonical_trait_impls` / `canonical_inherent_methods` surface
+    // is already covered by `program.functions`'s impl-method
+    // entries.  Goal — confirm we can route every registration the
+    // AST extractors do today through `program.functions` and retire
+    // the extractors.  Set `PYRE_AST_EXTRACT_COVERAGE_AUDIT=1` to
+    // emit a per-method diff to stderr.
+    if std::env::var("PYRE_AST_EXTRACT_COVERAGE_AUDIT").is_ok() {
+        audit_ast_extract_coverage(
+            &program,
+            &canonical_trait_impls,
+            &canonical_inherent_methods,
         );
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.

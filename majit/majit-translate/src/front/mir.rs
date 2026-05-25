@@ -1634,17 +1634,20 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     };
     let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
     let td = llbc.type_by_id(adt_def_id)?;
-    let owner_leaf = td
-        .item_meta
-        .name_path()
-        .rsplit("::")
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if owner_leaf.is_empty() {
+    // Match the AST builder's owner-qualification convention: bare
+    // ident qualified by the type's defining module path.  AST does
+    // `qualify_type_name_with_imports(type_root, module_prefix, …)`
+    // → `gc_roots::RootScope`; mirror that by stripping the crate
+    // name from the TypeDecl's full name_path so MIR's
+    // `self_ty_root` keys land on the same `[module::Owner, method]`
+    // CallPath the AST extractors use.  Without this alignment the
+    // canonical registration loop at `lib.rs:864-902` cannot find
+    // the MIR-built graph keyed by `[qualified_owner, method]`.
+    let owner_qualified = strip_crate_prefix(&td.item_meta.name_path());
+    if owner_qualified.is_empty() {
         return None;
     }
-    Some((owner_leaf, leaf))
+    Some((owner_qualified, leaf))
 }
 
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
