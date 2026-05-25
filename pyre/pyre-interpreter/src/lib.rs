@@ -186,6 +186,96 @@ macro_rules! pyre_count_typed_args {
     };
 }
 
+/// PyPy `class W_X(W_Root) + TypeDef(...)` equivalent — emits a thread-
+/// local `type_object()` accessor that lazily builds a `W_TypeObject`
+/// inheriting from `object`, populated with typed methods.  Each method
+/// receives `self_obj: PyObjectRef` as its first parameter (PyPy's
+/// `self` post-`@interp2app`) and any remaining typed parameters are
+/// auto-unwrapped via `#[pyre_function]`.  Method arity (including
+/// `self_obj`) is derived from the signature.  Instances carry
+/// `__dict__` by default (matching PyPy `hasdict=True` for most
+/// W_Root subclasses); state is stored as Python attributes on `self`
+/// via `getattr`/`setattr` until a typed-payload backend is added.
+///
+/// ```ignore
+/// crate::py_class! {
+///     "_random.Random",
+///     methods: {
+///         fn __init__(self_obj: PyObjectRef, seed: i64) -> Result<(), crate::PyError> {
+///             crate::baseobjspace::setattr(self_obj, "_state", ::pyre_object::w_int_new(seed))?;
+///             Ok(())
+///         }
+///         fn random(self_obj: PyObjectRef) -> f64 {
+///             // ... read self._state, mutate, write back
+///         }
+///     }
+/// }
+/// ```
+///
+/// expands to (roughly):
+///
+/// ```ignore
+/// pub fn type_object() -> ::pyre_object::PyObjectRef {
+///     thread_local! { static CELL: ... = const { ... }; }
+///     CELL.with(|c| *c.get_or_init(|| {
+///         let tp = crate::typedef::make_builtin_type("_random.Random", |ns| {
+///             #[crate::pyre_function]
+///             fn __init__(self_obj: PyObjectRef, seed: i64) -> Result<(), crate::PyError> { ... }
+///             crate::dict_storage_store(ns, "__init__",
+///                 crate::make_builtin_function_with_arity("__init__", __init__, 2));
+///             // ... more methods
+///         });
+///         unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+///         tp
+///     }))
+/// }
+/// ```
+#[macro_export]
+macro_rules! py_class {
+    (
+        $name:literal,
+        methods: {
+            $(
+                fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
+            )*
+        }
+        $(,)?
+    ) => {
+        pub fn type_object() -> ::pyre_object::PyObjectRef {
+            thread_local! {
+                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
+                    = const { ::std::cell::OnceCell::new() };
+            }
+            CELL.with(|c| {
+                *c.get_or_init(|| {
+                    let tp = $crate::typedef::make_builtin_type($name, |ns| {
+                        $(
+                            {
+                                #[$crate::pyre_function]
+                                fn $mname ( $($margs)* ) $(-> $mret)? $mbody
+                                // `make_builtin_function` (varargs, no arity check) is
+                                // used here rather than `_with_arity` because methods
+                                // with `Option<T>` parameters need to accept calls with
+                                // fewer args (PyPy `def f(self, s=None)`).  The
+                                // `#[pyre_function]` wrapper uses bounds-checked
+                                // `args.len()` for Option arms so missing-arg → None,
+                                // while required args still index `args[N]` directly.
+                                $crate::dict_storage_store(
+                                    ns,
+                                    stringify!($mname),
+                                    $crate::make_builtin_function(stringify!($mname), $mname),
+                                );
+                            }
+                        )*
+                    });
+                    unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                    tp
+                })
+            })
+        }
+    };
+}
+
 /// Helper for `py_module!`'s `functions:` arm.  `*` → varargs
 /// (`make_builtin_function`); numeric arity → `make_builtin_function_with_arity`.
 #[macro_export]

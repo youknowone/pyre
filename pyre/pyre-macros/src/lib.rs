@@ -144,6 +144,14 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
         if type_is_py_object_ref(ty) {
             return Ok(quote! { args[#idx] });
         }
+        // `Option<T>` — `if args.len() > idx { Some(unwrap(args[idx])) } else { None }`.
+        // Mirrors PyPy `@unwrap_spec(s=W_Root)` with `def f(self, space, s=None)`.
+        if let Some(inner) = option_inner(ty) {
+            let inner_unwrap = unwrap_expr(inner, idx)?;
+            return Ok(quote! {
+                if args.len() > #idx { Some(#inner_unwrap) } else { None }
+            });
+        }
         if let Some(seg) = p.path.segments.last() {
             let name = seg.ident.to_string();
             match name.as_str() {
@@ -173,6 +181,24 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
              add a mapping in pyre-macros/src/lib.rs::unwrap_expr"
         ),
     ))
+}
+
+/// `Option<T>` → `Some(&T)`; anything else → None.
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let ty = unwrap_type_group(ty);
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let first = args.args.iter().next()?;
+    let syn::GenericArgument::Type(t) = first else {
+        return None;
+    };
+    Some(t)
 }
 
 fn wrap_return(
