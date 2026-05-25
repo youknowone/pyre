@@ -8504,6 +8504,90 @@ mod tests {
         }
     }
 
+    /// M4 Phase B inventory: report IR-emit cost per walker arm to
+    /// identify the next production-walker candidates beyond the
+    /// Nop family. Counts the opname classes that drive cranelift
+    /// bridge compilation overhead (residual_call_*,
+    /// setarrayitem_vable_r, setfield_vable_i, inline_call_*) so
+    /// candidates with low or zero counts can be considered for
+    /// `production_walker_handles` expansion without the ~100x
+    /// compile-time blowup that blocked PopTop's activation.
+    #[test]
+    #[ignore]
+    fn dump_walker_arm_ir_emit_cost_inventory() {
+        use crate::jitcode_runtime::{all_jitcodes, decoded_ops};
+
+        struct Stat {
+            name: String,
+            residual_calls: usize,
+            inline_calls: usize,
+            vable_writes: usize,
+            other_emit_ops: usize,
+            total_ops: usize,
+            code_len: usize,
+        }
+
+        let mut stats: Vec<Stat> = Vec::new();
+        for jc in all_jitcodes() {
+            let code = jc.code.as_slice();
+            let mut s = Stat {
+                name: jc.name.clone(),
+                residual_calls: 0,
+                inline_calls: 0,
+                vable_writes: 0,
+                other_emit_ops: 0,
+                total_ops: 0,
+                code_len: code.len(),
+            };
+            for op in decoded_ops(code) {
+                s.total_ops += 1;
+                if op.key.starts_with("residual_call") {
+                    s.residual_calls += 1;
+                } else if op.key.starts_with("inline_call") {
+                    s.inline_calls += 1;
+                } else if op.key.starts_with("setarrayitem_vable")
+                    || op.key.starts_with("setfield_vable")
+                {
+                    s.vable_writes += 1;
+                } else if op.key.starts_with("getfield_gc")
+                    || op.key.starts_with("setfield_gc")
+                    || op.key.starts_with("getarrayitem_gc")
+                    || op.key.starts_with("setarrayitem_gc")
+                    || op.key.starts_with("new")
+                    || op.key.starts_with("call_")
+                {
+                    s.other_emit_ops += 1;
+                }
+            }
+            stats.push(s);
+        }
+        // Sort by total IR-cost ascending — lowest-cost arms first
+        // are the first candidates for production_walker_handles
+        // expansion.
+        stats.sort_by_key(|s| {
+            s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops
+        });
+        eprintln!(
+            "{:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>6}  {}",
+            "code", "ops", "resid", "inline", "vable_w", "gc_emit", "total", "name"
+        );
+        for s in &stats {
+            let total_emit =
+                s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops;
+            eprintln!(
+                "{:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>6}  {}",
+                s.code_len,
+                s.total_ops,
+                s.residual_calls,
+                s.inline_calls,
+                s.vable_writes,
+                s.other_emit_ops,
+                total_emit,
+                s.name
+            );
+        }
+    }
+
     #[test]
     fn dump_rvmprof_code_presence() {
         // Throw-away check: rvmprof_code/ii presence in pyre's insns
