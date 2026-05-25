@@ -7341,47 +7341,11 @@ mod boxref_forwarding_tests {
     //! `setintbound`, `make_constant`, `make_equal_to`) install PyPy-style
     //! forwarding state on the authoritative BoxRef slot.
     use super::*;
+    use crate::r#box::test_support::{bound_inputarg_box, bound_resop_box};
     use crate::r#box::{BoxRef, Forwarded as BoxForwarded};
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::resoperation::{Op, OpCode, OpRc};
-    use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
-
-    /// Create a `BoxRef::new_inputarg(tp, index)` already bound to a fresh
-    /// `InputArgRc` (`box_ref.rs:354 bind_inputarg`), matching the
-    /// recorder→TreeLoop production handoff invariant that every
-    /// `AbstractInputArg` BoxRef has an `inputarg.forwarded` target. The
-    /// returned `InputArgRc` must outlive every read of `box.get_forwarded()`
-    /// so the bound `Weak<InputArg>` stays upgradable.
-    fn bound_inputarg_box(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
-        let b = BoxRef::new_inputarg(tp, index);
-        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
-        b.bind_inputarg(&ia);
-        (b, ia)
-    }
-
-    /// Create a `BoxRef::new_resop(tp, position)` already bound to a fresh
-    /// `OpRc` (`box_ref.rs:322 bind_op`), matching the
-    /// recorder→TreeLoop handoff for `AbstractResOp` BoxRefs. The Op's
-    /// `pos` is seeded to a typed OpRef matching `(position, tp)` so
-    /// `BoxRef::from_bound_op` (`box_ref.rs:226`) materialises a
-    /// transient terminal box of the same type during chain walks.
-    /// `OpCode::SameAsI/F/R` is a no-op placeholder result for the
-    /// requested type (`resoperation.py:600+`); `Type::Void` lands on
-    /// `OpCode::Guard` which has Void result.
-    fn bound_resop_box(tp: Type, position: u32) -> (BoxRef, OpRc) {
-        let b = BoxRef::new_resop(tp, position);
-        let opcode = match tp {
-            Type::Int => OpCode::SameAsI,
-            Type::Float => OpCode::SameAsF,
-            Type::Ref => OpCode::SameAsR,
-            Type::Void => OpCode::Jump,
-        };
-        let op = std::rc::Rc::new(Op::new(opcode, &[]));
-        op.pos.set(OpRef::op_typed(position, tp));
-        b.bind_op(&op);
-        (b, op)
-    }
+    use majit_ir::{InputArgRc, OpRef, Type, Value};
 
     fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef, Vec<InputArgRc>) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
