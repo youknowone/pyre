@@ -322,7 +322,7 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::vec_assoc::VecAssoc<String, u8>>
         // Pyre's build-time `pipeline.insns` only records opnames the
         // assembler actually emitted during `make_jitcodes`; canonical
         // opnames the analyzed source set did not exercise (e.g.
-        // `ref_guard_value/r`, `newtuple/rr>r`) are absent.  Overlaying
+        // `ref_guard_value/r`) are absent.  Overlaying
         // both `wellknown_bh_insns` and `pyre_extension_insns` restores
         // the closed key universe RPython's runtime sees, so callers
         // (`build_default_bh_builder_with_unwired_report`, dispatch
@@ -1437,7 +1437,6 @@ mod tests {
             "newtuple/>r".to_string(),
             "newtuple/ff>r".to_string(),
             "newtuple/ii>r".to_string(),
-            "newtuple/rr>r".to_string(),
             "same_as/>i".to_string(),
             "same_as/>r".to_string(),
         ];
