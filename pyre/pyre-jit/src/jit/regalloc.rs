@@ -308,6 +308,16 @@ impl<'a> RegAllocator<'a> {
     /// added — yielding `None` for `getcolor` and dropping the chain's
     /// inputarg from the final coloring map.
     fn try_coalesce_ids(&mut self, v_id: super::flow::VariableId, w_id: super::flow::VariableId) {
+        // `regalloc.py:98-99 _try_coalesce` short-circuits `if v is w:
+        // return` before touching the depgraph or union-find — a
+        // `link.arg is target.inputarg` self-edge from
+        // `coalesce_variables` has nothing to do.  The `v0 == w0` check
+        // below catches it after `find_rep`, but the identity guard
+        // avoids two `add_node` calls plus two `find_rep` lookups in
+        // the same case.
+        if v_id == w_id {
+            return;
+        }
         self._depgraph.add_node(v_id);
         self._depgraph.add_node(w_id);
         let v0 = self._unionfind.find_rep(v_id);
@@ -679,8 +689,7 @@ pub(super) fn allocate_registers(
             for i in 0..nlocals as u16 {
                 external.push(i);
             }
-            // Phase 2.1c (plan staged-sauteeing-koala): stack slots are
-            // no longer pinned to colors `nlocals..nlocals+max_stackdepth`.
+            // Stack slots are not pinned to fixed colors;
             // `stack_slot_color_map` (PyJitCodeMetadata) records the
             // post-rename color so decoders / blackhole resume can
             // translate slot → color without assuming identity.
@@ -776,9 +785,9 @@ fn enforce_ssarepr_input_args(
 ) {
     let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
-    // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
-    // rotated into fixed colors. The decoder consults
-    // `stack_slot_color_map` to recover the post-rename color.
+    // Stack slots are not rotated into fixed colors; the decoder
+    // consults `stack_slot_color_map` to recover the post-rename
+    // color.
     if inputs.portal_inputs {
         if inputs.portal_frame_reg != u16::MAX {
             input_indices.push(inputs.portal_frame_reg);
