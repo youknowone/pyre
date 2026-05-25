@@ -695,6 +695,87 @@ fn init_mmap_type(ns: &mut DictStorage) {
         ),
     );
 
+    // `interp_mmap.py:146 resize` → `rmmap.py:589-601`.  POSIX path:
+    // ftruncate the backing fd (if any) to `offset + newsize`, then
+    // mremap(MREMAP_MAYMOVE).  Platforms without mremap (e.g. macOS)
+    // raise SystemError to match PyPy's RValueError→SystemError
+    // translation at `interp_mmap.py:155-157`.  Read-only / copy
+    // mappings reject with TypeError.
+    crate::dict_storage_store(
+        ns,
+        "resize",
+        crate::make_builtin_function_with_arity(
+            "resize",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("resize() requires newsize"));
+                }
+                let obj = args[0];
+                let access = mmap_get_attr_i64(obj, "_access");
+                if !(access == MMAP_ACCESS_WRITE || access == MMAP_ACCESS_DEFAULT) {
+                    return Err(crate::PyError::type_error(
+                        "mmap can't resize a readonly or copy-on-write memory map.",
+                    ));
+                }
+                let (p, old_len) = mmap_ptr(obj)?;
+                let newsize = unsafe { pyre_object::w_int_get_value(args[1]) };
+                if newsize < 0 {
+                    return Err(crate::PyError::value_error(
+                        "new_size must be positive",
+                    ));
+                }
+                let newsize = newsize as usize;
+                let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
+                let offset = mmap_get_attr_i64(obj, "_offset");
+
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    if fd >= 0 {
+                        let r = unsafe {
+                            libc::ftruncate(fd, (offset as libc::off_t) + newsize as libc::off_t)
+                        };
+                        if r != 0 {
+                            return Err(crate::PyError::os_error_with_errno(
+                                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                                "ftruncate",
+                            ));
+                        }
+                    }
+                    let newptr = unsafe {
+                        libc::mremap(
+                            p as *mut libc::c_void,
+                            old_len,
+                            newsize,
+                            libc::MREMAP_MAYMOVE,
+                        )
+                    };
+                    if newptr == libc::MAP_FAILED {
+                        return Err(crate::PyError::os_error_with_errno(
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                            "mremap",
+                        ));
+                    }
+                    mmap_set_attr(
+                        obj,
+                        "_ptr",
+                        pyre_object::w_int_new(newptr as usize as i64),
+                    );
+                    mmap_set_attr(obj, "_len", pyre_object::w_int_new(newsize as i64));
+                    Ok(pyre_object::w_none())
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    let _ = (p, old_len, fd, offset, newsize);
+                    Err(crate::PyError::new(
+                        crate::error::PyErrorKind::SystemError,
+                        "mmap: resizing not available--no mremap()",
+                    ))
+                }
+            },
+            2,
+        ),
+    );
+
     // `interp_mmap.py:descr_repr` — `<mmap.mmap closed=False, access=...>`.
     crate::dict_storage_store(
         ns,
@@ -937,6 +1018,8 @@ pub fn register_module(ns: &mut DictStorage) {
                 mmap_set_attr(obj, "_len", pyre_object::w_int_new(length as i64));
                 mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
                 mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
+                mmap_set_attr(obj, "_fd", pyre_object::w_int_new(real_fd as i64));
+                mmap_set_attr(obj, "_offset", pyre_object::w_int_new(offset as i64));
                 Ok(obj)
             }),
         );
