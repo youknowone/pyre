@@ -7540,8 +7540,15 @@ unsafe fn trace_check_exc_match_against(
 /// PopTop walker activation is structurally blocked.  Documented in
 /// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    let _ = instruction;
-    false
+    matches!(
+        instruction,
+        Instruction::Nop
+            | Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Cache
+            | Instruction::NotTaken
+            | Instruction::ExitInitCheck
+    )
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
@@ -7578,7 +7585,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::ExtendedArg
         | Instruction::Resume { .. }
         | Instruction::Cache
-        | Instruction::NotTaken => {
+        | Instruction::NotTaken
+        | Instruction::ExitInitCheck => {
             // delta = 0, no shadow mutation.
         }
         other => panic!(
