@@ -123,8 +123,8 @@ pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph,
 /// `parsed_files` entries.
 pub fn build_semantic_program_from_llbcs(
     llbcs: &[Llbc],
-) -> Result<crate::front::ast::SemanticProgram, LowerError> {
-    let mut merged: Option<crate::front::ast::SemanticProgram> = None;
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     let mut seen_function_names = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
@@ -165,13 +165,14 @@ pub fn build_semantic_program_from_llbcs(
             }
         }
     }
-    Ok(merged.unwrap_or_else(|| crate::front::ast::SemanticProgram {
+    Ok(merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
         functions: Vec::new(),
         known_struct_names: std::collections::HashSet::new(),
         known_trait_names: std::collections::HashSet::new(),
-        struct_fields: crate::front::ast::StructFieldRegistry::default(),
+        struct_fields: crate::front::semantic::StructFieldRegistry::default(),
         fn_return_types: std::collections::HashMap::new(),
         immutable_fields: std::collections::HashMap::new(),
+        module_statics: std::collections::HashMap::new(),
     }))
 }
 
@@ -199,7 +200,7 @@ pub fn build_semantic_program_from_llbcs(
 /// failure model from [`lower_function`] applies unchanged.
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
-) -> Result<crate::front::ast::SemanticProgram, LowerError> {
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls (Step 4.3.b) ────────
     let (known_struct_names, known_trait_names, struct_fields) =
         derive_program_metadata(llbc);
@@ -246,7 +247,7 @@ pub fn build_semantic_program_from_llbc(
         // resolution gap is open — TyRef labels (`ty#170`) would
         // otherwise be classified as `Type::Ref` and trip a spurious
         // mismatch panic against a real `Type::Int` callee result.
-        functions.push(crate::front::ast::SemanticFunction {
+        functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
             return_type: None,
@@ -265,7 +266,7 @@ pub fn build_semantic_program_from_llbc(
             eprintln!("  {name}: {msg}");
         }
     }
-    Ok(crate::front::ast::SemanticProgram {
+    Ok(crate::front::semantic::SemanticProgram {
         functions,
         known_struct_names,
         known_trait_names,
@@ -279,6 +280,12 @@ pub fn build_semantic_program_from_llbc(
         // (the `attributes` array carries DocComment / Outer but not our
         // proc-macro hints). Tracked under Step 4.3.d.
         immutable_fields: std::collections::HashMap::new(),
+        // Module-static literals come from the AST pre-walk
+        // (collect_program_metadata_pub via merge_module_statics_from_
+        // parsed_files); LLBC carries the encoded const values without
+        // their source spelling, so MIR leaves this empty and the AST
+        // merge populates it.
+        module_statics: std::collections::HashMap::new(),
     })
 }
 
@@ -295,11 +302,11 @@ fn derive_program_metadata(
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
-    crate::front::ast::StructFieldRegistry,
+    crate::front::semantic::StructFieldRegistry,
 ) {
     let mut known_struct_names = std::collections::HashSet::new();
     let mut known_trait_names = std::collections::HashSet::new();
-    let mut struct_fields = crate::front::ast::StructFieldRegistry::default();
+    let mut struct_fields = crate::front::semantic::StructFieldRegistry::default();
 
     for td in llbc.iter_type_decls() {
         let name = td.item_meta.name_path();
@@ -794,9 +801,7 @@ impl<'a> Lowering<'a> {
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 Ok((
                     Some(OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor {
-                            name: "Box".to_string(),
-                        },
+                        target: CallTarget::synthetic_transparent_ctor("Box"),
                         args: vec![arg],
                         result_ty: ValueType::Int,
                     }),
@@ -875,7 +880,7 @@ impl<'a> Lowering<'a> {
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 Ok((
                     Some(OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { name: ctor_name },
+                        target: CallTarget::synthetic_transparent_ctor(ctor_name),
                         args,
                         result_ty: ValueType::Int,
                     }),
@@ -1684,7 +1689,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => match llbc.dedup_body(*id) {
             Some(v) => v,
-            None => return ValueType::Ref,
+            None => return ValueType::Ref(None),
         },
     };
     // Primitive shapes Charon emits inline.  The literal-type schema
@@ -1709,7 +1714,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             return match lit_atom {
                 "Bool" => ValueType::Bool,
                 "Char" => ValueType::Int,
-                _ => ValueType::Ref,
+                _ => ValueType::Ref(None),
             };
         }
         if let Some(lit_obj) = lit.as_object() {
@@ -1728,7 +1733,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
-    ValueType::Ref
+    ValueType::Ref(None)
 }
 
 /// Stable short label for an [`Rvalue::Aggregate`]'s [`Field`]

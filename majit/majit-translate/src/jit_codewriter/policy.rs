@@ -39,7 +39,7 @@
 
 use std::collections::HashSet;
 
-use crate::front::ast::SemanticFunction;
+use crate::front::semantic::SemanticFunction;
 use crate::model::FunctionGraph;
 #[allow(unused_imports)]
 use majit_ir::value::Type;

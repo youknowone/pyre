@@ -12,7 +12,7 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
-use crate::front::ast::SemanticFunction;
+use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
