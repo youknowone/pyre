@@ -1365,20 +1365,51 @@ impl<'a> Lowering<'a> {
             CallKind::Fun(FunId::Other(v)) => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: CallKind::Fun(Other) not yet supported: {v}"
             ))),
-            // `CallKind::Trait([trait_ref, method_idx, ...])` — trait
-            // method call. Charon may emit this either when it
-            // could resolve the impl to a specific function (in which
-            // case it would have surfaced as `Fun(Regular)` instead)
-            // or when the call is generic and the impl is selected at
-            // runtime via type-flow. Synthesise a stable
-            // `__trait_method_<hash>` name; the codewriter sees a
-            // uniform `Call` shape and the downstream rtyper-equivalent
-            // layer can resolve the actual impl from `Variable.annotation`
-            // (matching the PRE-EXISTING-ADAPTATION pattern the AST
-            // driver follows for dyn Trait method calls).
+            // `CallKind::Trait([trait_ref, method_idx, fn_decl_id])` —
+            // generic-trait method call.  Charon's `arr[2]` is the
+            // `def_id` of the trait method declaration itself
+            // (e.g. `pyre_interpreter::shared_opcode::SharedOpcodeHandler::
+            // push_value`).
+            //
+            // The AST front-end's `extract_trait_impls` parses the
+            // trait declaration's default-body and registers it under
+            // BOTH `["<default methods of <Trait>>", <method>]` (the
+            // selfclassdef-bound `register_trait_method` path) and the
+            // direct path `[<Trait>, <method>]` (lib.rs:957-969 —
+            // `register_function_graph(direct_path, …)`).  The direct
+            // path is the call-site shape Rust code emits when calling
+            // `<Trait>::<method>(receiver, …)` and the BFS-driven
+            // `find_all_graphs` reaches it as a regular candidate.
+            //
+            // To stay PyPy-orthodox for generic-trait dispatch in MIR
+            // mode, route the call through that same `[<Trait>,
+            // <method>]` path so:
+            //   1. BFS discovers the trait default body as a
+            //      candidate, which transitively pulls in the helpers
+            //      it calls (e.g. `opcode_load_const`).
+            //   2. `flowspace_adapter` emits the same `simple_call(<
+            //      callable>, args…)` shape AST does (no `getattr`
+            //      surface) so the classdef-less receiver does not
+            //      surface as a panicking `SomeInstance.getattr`.
+            //
+            // Falls back to the legacy `["__trait_method", <label>]`
+            // synthetic path when the fn_decl cannot be resolved or
+            // does not have the trait-method shape (e.g. when arr[2]
+            // is missing or points at an `Impl` block).
             CallKind::Trait(v) => {
-                let label = trait_call_label(v);
-                Ok((vec!["__trait_method".to_string(), label], None))
+                let fn_id = v
+                    .as_array()
+                    .and_then(|a| a.get(2))
+                    .and_then(serde_json::Value::as_u64);
+                let direct = fn_id
+                    .and_then(|id| self.llbc.fn_by_id(id))
+                    .and_then(trait_method_owner);
+                if let Some((trait_leaf, method_leaf)) = direct {
+                    Ok((vec![trait_leaf, method_leaf], None))
+                } else {
+                    let label = trait_call_label(v);
+                    Ok((vec!["__trait_method".to_string(), label], None))
+                }
             }
             CallKind::Ptr(v) => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: CallKind::Ptr not yet supported: {v}"
@@ -1683,6 +1714,41 @@ fn field_label_from_payload(payload: &serde_json::Value) -> String {
         }
     }
     "field".into()
+}
+
+/// Return `(trait_leaf_ident, method_leaf_ident)` when the FunDecl's
+/// raw `NameSeg` vec ends in two consecutive `Ident` segments — the
+/// Charon shape for a trait method declaration (e.g.
+/// `pyre_interpreter::shared_opcode::SharedOpcodeHandler::push_value`).
+/// The penultimate Ident is the trait name, the leaf the method
+/// name.
+///
+/// Distinct from [`Lowering::impl_method_owner`], which looks for an
+/// `Impl` `NameSeg::Other` segment preceding the leaf — that arm
+/// fires for inherent / trait-impl methods Charon already resolved
+/// at extraction time.  Trait method declarations have no `Impl`
+/// segment because the body is the trait's default impl.
+///
+/// Used by the `CallKind::Trait` arm of
+/// [`Lowering::call_target_segments`] to emit
+/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf]
+/// }`, matching the direct-path key
+/// `register_function_graph(direct_path, …)` at `lib.rs:957-969`
+/// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
+fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
+    let segs = &fd.item_meta.name;
+    if segs.len() < 2 {
+        return None;
+    }
+    let leaf = match segs.last()? {
+        NameSeg::Ident { ident: (s, _) } => s.clone(),
+        _ => return None,
+    };
+    let parent = match &segs[segs.len() - 2] {
+        NameSeg::Ident { ident: (s, _) } => s.clone(),
+        _ => return None,
+    };
+    Some((parent, leaf))
 }
 
 /// Compact identifier for a `CallKind::Trait` payload — the triple
