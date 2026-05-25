@@ -4,6 +4,13 @@
 
 use crate::DictStorage;
 
+// `interp_signal.py:set_wakeup_fd` — stores the configured wakeup fd
+// for read-back via set_wakeup_fd(new) → previous_fd.  Real signal-to-fd
+// delivery is not wired up; this cell is the get/set contract only.
+thread_local! {
+    static WAKEUP_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
 /// _signal module — PyPy: pypy/module/signal/.
 ///
 /// signal() / getsignal() / set_wakeup_fd() remain stubs because the
@@ -28,19 +35,52 @@ pub fn register_module(ns: &mut DictStorage) {
         "getsignal",
         crate::make_builtin_function_with_arity("getsignal", |_| Ok(pyre_object::w_none()), 1),
     );
+    // `interp_signal.py:default_int_handler` — `raise KeyboardInterrupt`.
     crate::dict_storage_store(
         ns,
         "default_int_handler",
         crate::make_builtin_function_with_arity(
             "default_int_handler",
-            |_| Ok(pyre_object::w_none()),
+            |_| {
+                let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
+                    .expect("KeyboardInterrupt must be installed");
+                let exc = crate::builtins::exc_exception_new(&[cls])
+                    .expect("exc_exception_new is infallible for empty args");
+                Err(unsafe { crate::PyError::from_exc_object(exc) })
+            },
             2,
         ),
     );
+    // `interp_signal.py:set_wakeup_fd` — stores the fd in a
+    // process-wide cell and returns the previous value.  Real signal
+    // delivery on the fd needs interpreter-side trampolines (still
+    // unimplemented per the header comment); we still surface the
+    // get/set contract so callers like `signal.set_wakeup_fd(-1)` no
+    // longer silently report a stale −1.
     crate::dict_storage_store(
         ns,
         "set_wakeup_fd",
-        crate::make_builtin_function("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1))),
+        crate::make_builtin_function("set_wakeup_fd", |args| {
+            let fd = if let Some(&a) = args.first() {
+                if !unsafe { pyre_object::is_int(a) } {
+                    return Err(crate::PyError::type_error(
+                        "set_wakeup_fd() argument must be an int",
+                    ));
+                }
+                (unsafe { pyre_object::w_int_get_value(a) }) as i32
+            } else {
+                return Err(crate::PyError::type_error(
+                    "set_wakeup_fd() requires an argument",
+                ));
+            };
+            if fd < -1 {
+                return Err(crate::PyError::value_error(
+                    "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
+                ));
+            }
+            let prev = WAKEUP_FD.with(|c| c.replace(fd));
+            Ok(pyre_object::w_int_new(prev as i64))
+        }),
     );
     // ── real host_env-backed entry points ──
     crate::dict_storage_store(
