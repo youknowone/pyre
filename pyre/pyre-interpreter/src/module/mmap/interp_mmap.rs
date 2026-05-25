@@ -108,19 +108,24 @@ fn init_mmap_type(ns: &mut DictStorage) {
         ),
     );
 
-    // closed — bool property; CPython exposes it as a get-only attribute.
+    // `interp_mmap.py:391 closed = GetSetProperty(W_MMap.closed_get)` —
+    // bare attribute access (`m.closed`) returns the bool directly via
+    // descriptor lookup, not a bound method.
     crate::dict_storage_store(
         ns,
         "closed",
-        crate::make_builtin_function_with_arity(
+        crate::typedef::make_getset_descriptor_named(
+            crate::make_builtin_function_with_arity(
+                "closed",
+                |args| {
+                    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    Ok(pyre_object::w_bool_from(
+                        mmap_get_attr_i64(obj, "_ptr") == 0,
+                    ))
+                },
+                1,
+            ),
             "closed",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_bool_from(
-                    mmap_get_attr_i64(obj, "_ptr") == 0,
-                ))
-            },
-            1,
         ),
     );
 
