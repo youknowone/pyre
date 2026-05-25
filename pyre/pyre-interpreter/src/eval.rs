@@ -833,7 +833,7 @@ impl SharedOpcodeHandler for PyFrame {
     type Value = PyObjectRef;
 
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
-        PyFrame::push(self, value);
+        self.push(value);
         Ok(())
     }
 
@@ -841,7 +841,7 @@ impl SharedOpcodeHandler for PyFrame {
         if self.valuestackdepth <= self.nlocals() {
             return Err(stack_underflow_error("interpreter opcode"));
         }
-        Ok(PyFrame::pop(self))
+        Ok(self.pop())
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {

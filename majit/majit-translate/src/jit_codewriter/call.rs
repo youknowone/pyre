@@ -3066,6 +3066,50 @@ impl CallControl {
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
                     }
+                    // Suffix-match fallback for in-impl `self.method()` calls.
+                    //
+                    // When the parser walks `impl PyFrame { fn pop(&mut self) {
+                    // self.stack_base() } }`, the inner `self.stack_base()` is
+                    // recorded as `Method { receiver_root: Some("PyFrame") }`
+                    // — the syntactic spelling, not the canonical
+                    // `pyframe::PyFrame`.  `for_impl_method("PyFrame",
+                    // "stack_base")` produces the 2-segment
+                    // `["PyFrame", "stack_base"]`, but `function_graphs`
+                    // registers the impl method under the 3-segment
+                    // module-qualified key `["pyframe", "PyFrame",
+                    // "stack_base"]`.  The literal lookup above misses, and
+                    // without this fallback every in-impl `self.method()`
+                    // call falls through to residual_call — inflating IR
+                    // emission whenever the BFS would have inlined the
+                    // method body otherwise.
+                    //
+                    // Scan `function_graphs` for keys whose last 2 segments
+                    // match `[receiver, name]`.  Accept the match only if it
+                    // is unique: an ambiguous suffix (e.g. two crates both
+                    // exposing a `PyFrame::pop`) falls through to the trait
+                    // resolution path, which mirrors Rust's name-resolution
+                    // ambiguity error rather than silently picking one.
+                    let needle = (receiver, name.as_str());
+                    let mut matched: Option<&CallPath> = None;
+                    let mut multi = false;
+                    for key in self.function_graphs.keys() {
+                        let segs = &key.segments;
+                        if segs.len() >= 2
+                            && segs[segs.len() - 2] == needle.0
+                            && segs[segs.len() - 1] == needle.1
+                        {
+                            if matched.is_some() {
+                                multi = true;
+                                break;
+                            }
+                            matched = Some(key);
+                        }
+                    }
+                    if !multi {
+                        if let Some(path) = matched {
+                            return Some(path.clone());
+                        }
+                    }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
                 let impl_type =
