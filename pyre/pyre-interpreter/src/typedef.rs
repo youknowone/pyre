@@ -3690,7 +3690,7 @@ fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyOb
 /// descriptor's `name` (so `dict_descr.__name__` is `"__dict__"`,
 /// `weakref_descr.__name__` is `"__weakref__"`, etc.) — without this
 /// pyre's descriptors would all surface as `"<generic property>"`.
-fn make_getset_descriptor_named(
+pub(crate) fn make_getset_descriptor_named(
     getter: pyre_object::PyObjectRef,
     name: &str,
 ) -> pyre_object::PyObjectRef {

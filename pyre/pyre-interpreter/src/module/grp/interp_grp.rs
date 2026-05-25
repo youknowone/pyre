@@ -1,30 +1,52 @@
-//! grp implementation — derived from Modules/grpmodule.c (CPython).
+//! grp implementation — `lib_pypy/grp.py`.
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::DictStorage;
 
+#[cfg(unix)]
+thread_local! {
+    /// `lib_pypy/grp.py:14-20 class struct_group(metaclass=structseqtype)`
+    /// — process-wide cached subclass-of-tuple type so every getgrgid /
+    /// getgrnam / getgrall call materialises into the same structseq.
+    static STRUCT_GROUP_TYPE: std::cell::OnceCell<pyre_object::PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+#[cfg(unix)]
+fn struct_group_type() -> pyre_object::PyObjectRef {
+    STRUCT_GROUP_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            crate::structseq::make_struct_seq(
+                "grp.struct_group",
+                &["gr_name", "gr_passwd", "gr_gid", "gr_mem"],
+            )
+        })
+    })
+}
+
 /// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via
 /// `_pwdgrp_cffi`).  pyre takes CPython's `Modules/grpmodule.c`
 /// shape since pyre has no app-level stdlib.
 ///
-/// getgrgid / getgrnam / getgrall return 4-tuples `(gr_name,
-/// gr_passwd, gr_gid, gr_mem)` matching CPython.  `grp.struct_group`
-/// is exposed as a builtin type attribute; full structseq instance
-/// materialisation (so `entry.gr_name` works) is blocked on the
-/// structseq framework task.
+/// getgrgid / getgrnam / getgrall return a `grp.struct_group`
+/// structseq (subclass of tuple) with named fields `gr_name`,
+/// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py:14-20`.
 #[cfg(unix)]
 pub fn register_module(ns: &mut DictStorage) {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         let mem_items: Vec<pyre_object::PyObjectRef> =
             g.mem.iter().map(|s| pyre_object::w_str_new(s)).collect();
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&g.name),
-            pyre_object::w_str_new(&g.passwd),
-            pyre_object::w_int_new(g.gid as i64),
-            pyre_object::w_list_new(mem_items),
-        ])
+        crate::structseq::new_instance(
+            struct_group_type(),
+            vec![
+                pyre_object::w_str_new(&g.name),
+                pyre_object::w_str_new(&g.passwd),
+                pyre_object::w_int_new(g.gid as i64),
+                pyre_object::w_list_new(mem_items),
+            ],
+        )
     }
     // `lib_pypy/grp.py:21-34 _group_from_gstruct` libc backend, used when
     // the host_env abstraction layer is disabled.
@@ -45,18 +67,19 @@ pub fn register_module(ns: &mut DictStorage) {
                 p = p.add(1);
             }
         }
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&cstr((*g).gr_name)),
-            pyre_object::w_str_new(&cstr((*g).gr_passwd)),
-            pyre_object::w_int_new((*g).gr_gid as i64),
-            pyre_object::w_list_new(mem_items),
-        ])
+        crate::structseq::new_instance(
+            struct_group_type(),
+            vec![
+                pyre_object::w_str_new(&cstr((*g).gr_name)),
+                pyre_object::w_str_new(&cstr((*g).gr_passwd)),
+                pyre_object::w_int_new((*g).gr_gid as i64),
+                pyre_object::w_list_new(mem_items),
+            ],
+        )
     }
-    // `lib_pypy/grp.py:13-19 class struct_group` — exposed so
-    // `grp.struct_group` is observable on the module even though
-    // returned values are still raw tuples.
-    let struct_group_type = crate::typedef::make_builtin_type("grp.struct_group", |_| {});
-    crate::dict_storage_store(ns, "struct_group", struct_group_type);
+    // `lib_pypy/grp.py:14-20 class struct_group` — exposed as
+    // `grp.struct_group`; every result type uses this same class.
+    crate::dict_storage_store(ns, "struct_group", struct_group_type());
     crate::dict_storage_store(
         ns,
         "getgrgid",

@@ -168,6 +168,31 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // would fall through to the generic `<{name} object at ...>`
             // fallback — visible as `<tuple object at 0x...>` on
             // `print(e.args)` for two-arg exception constructors.
+            //
+            // structseq instances (`_structseq.py:43-87 structseqtype`)
+            // are tuple subclasses with `w_class` pointing at a custom
+            // type that installs its own `__repr__`.  Route them
+            // through the subclass dunder before the generic tuple
+            // formatting so `repr(pwd_entry)` prints
+            // `'pwd.struct_passwd(pw_name=..., ...)'` instead of the
+            // bare tuple form.  Plain `tuple()` keeps the fast path
+            // because its `w_class` is the canonical tuple type.
+            let w_class = (*obj).w_class;
+            let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
+            if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
+                // try_call_dunder gates on is_instance(obj); structseq
+                // instances are tuple subclasses with ob_type ==
+                // TUPLE_TYPE, so reach for the subclass __repr__
+                // directly via lookup(MRO).
+                if let Some(method) = crate::baseobjspace::lookup(obj, "__repr__") {
+                    if !method.is_null() {
+                        let r = crate::call_function(method, &[obj]);
+                        if !r.is_null() && pyre_object::is_str(r) {
+                            return pyre_object::w_str_get_value(r).to_string();
+                        }
+                    }
+                }
+            }
             let n = pyre_object::w_tuple_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
