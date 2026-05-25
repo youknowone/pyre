@@ -3573,12 +3573,11 @@ impl OptContext {
             // InputArg-target chain step (compile.py:478, unroll.py:497).
             op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Unbound non-const BoxRef target — remaining test fixtures
-            // that flow custom BoxRef constructions through
-            // `make_equal_to` without binding. Probe 2026-05-25 (post
-            // with_inputarg_types bind) counts 40 such tests across
-            // heap / pure / unroll / virtualize / jitdriver, migrated
-            // incrementally per [[box-pool-v2 C.6]].
+            // Probe 2026-05-25 (post lazy InputArg bind) counts 36 test
+            // fixtures still hitting this arm — predominantly ResOp
+            // BoxRef placeholders whose producer Op is never emitted in
+            // the test (forward-reference-only targets). Migrated
+            // incrementally per [[box-pool-v2 C.6]] in follow-up slices.
             op.set_forwarded_box(newop.clone());
         }
         // optimizer.py:395-396
@@ -3839,7 +3838,39 @@ impl OptContext {
         let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
         let placeholder = match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                crate::r#box::BoxRef::new_inputarg(placeholder_type, idx as u32)
+                let p = crate::r#box::BoxRef::new_inputarg(placeholder_type, idx as u32);
+                // Bind to the canonical `InputArgRc` for this slot. When
+                // `inputarg_refs[idx]` is already populated (e.g. by
+                // `with_inputarg_types`), use it; otherwise allocate a
+                // fresh `InputArgRc`, stash it in `inputarg_refs`, and
+                // bind. This keeps the `Forwarded::InputArg(_)` chain
+                // shape (`optimizer.py:394 op.set_forwarded(newop)`
+                // where `newop` is an `AbstractInputArg`) reachable for
+                // lazy-allocated InputArg placeholders too.
+                if idx >= self.inputarg_refs.len() {
+                    self.inputarg_refs.resize_with(idx + 1, || {
+                        std::rc::Rc::new(majit_ir::InputArg::new_int(0))
+                    });
+                    // Replace the placeholder filler at this exact slot
+                    // with one matching the OpRef's true type/index.
+                    self.inputarg_refs[idx] =
+                        std::rc::Rc::new(majit_ir::InputArg::from_type(
+                            placeholder_type,
+                            idx as u32,
+                        ));
+                } else if self.inputarg_refs[idx].tp != placeholder_type
+                    || self.inputarg_refs[idx].index != idx as u32
+                {
+                    // Replace a mismatched filler (e.g. `new_int(0)` set
+                    // by an earlier resize-fill on a different slot).
+                    self.inputarg_refs[idx] =
+                        std::rc::Rc::new(majit_ir::InputArg::from_type(
+                            placeholder_type,
+                            idx as u32,
+                        ));
+                }
+                p.bind_inputarg(&self.inputarg_refs[idx]);
+                p
             }
             _ => {
                 let p = crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32);
