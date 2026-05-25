@@ -23,19 +23,20 @@
 //!     `0..n-1`. Pyre's analog is the `enforce_input_args` free
 //!     function below (called by `GraphFlattener::enforce_input_args`
 //!     at `flatten.rs` to mirror `flatten.py:68 flattener.enforce_input_args()`,
-//!     and directly by the walker production path until the Phase 4
-//!     production flip retires walker-side SSARepr emission).
+//!     and directly by the walker production path until the walker
+//!     defers SSARepr emission to
+//!     `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`).
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
 //!     `num_regs[kind] = max(coloring)+1` per kind, packed into the
 //!     `JitCode`. Pyre's analog is `RegAllocator::find_num_colors`
 //!     plus the `AllocationResult.num_regs` field.
 //!
-//! ## Pyre-only deviation (Phase 4 retirement target, task #9)
+//! ## Pyre-only deviation (SSARepr-side companion allocator)
 //!
 //! Pyre's walker emits SSARepr inline rather than building a graph it
 //! later flattens.  Until the walker defers SSARepr emission to the
-//! canonical `flatten_graph(graph, regallocs, cpu)` driver, an
-//! SSARepr-side companion allocator is needed:
+//! canonical `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`
+//! driver, an SSARepr-side companion allocator is needed:
 //!
 //!   * `SSAReprRegAllocator` (declared further down) — same
 //!     `make_dependencies` / `coalesce_variables` /
@@ -134,9 +135,9 @@ impl<'a> RegAllocator<'a> {
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
-                        // Task #237 ADAPTATION: project each Variable ID
-                        // through `_unionfind.find_rep` so pre-merged
-                        // pairs (from `perform_register_allocation_with_pairs`'s
+                        // ADAPTATION: project each Variable ID through
+                        // `_unionfind.find_rep` so pre-merged pairs
+                        // (from `perform_register_allocation_with_pairs`'s
                         // `extra_coalesce_pairs`) share a single
                         // live-set identity.  Walker scratch variables
                         // pinned to a local-i inputarg slot otherwise
@@ -289,12 +290,13 @@ impl<'a> RegAllocator<'a> {
         self.try_coalesce_ids(v.id, w.id);
     }
 
-    /// Variable-id-keyed `try_coalesce` for Phase 4 endgame Task #228
-    /// external-pin pre-coalesce.  Skips the kind check that
-    /// [`try_coalesce`] performs; callers must ensure both IDs name
-    /// variables of `self.kind` (the Task #228 production pin path
-    /// only generates Ref-kind pairs, matching walker's
-    /// `walker_slot_for_variable` which only tracks Ref slots).
+    /// Variable-id-keyed `try_coalesce` for external-pin pre-coalesce
+    /// (called from `perform_register_allocation_with_pairs` to honour
+    /// the walker's scratch↔inputarg slot pinning).  Skips the kind
+    /// check that [`try_coalesce`] performs; callers must ensure both
+    /// IDs name variables of `self.kind` (the pin path only generates
+    /// Ref-kind pairs, matching walker's `walker_slot_for_variable`
+    /// which only tracks Ref slots).
     ///
     /// Calls `_depgraph.add_node` for both endpoints BEFORE the
     /// union/coalesce: walker scratch variables that don't appear as
@@ -384,10 +386,10 @@ pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> Grap
     perform_register_allocation_with_pairs(graph, kind, &[])
 }
 
-/// Phase 4 endgame Task #228 ADAPTATION variant: runs the same
-/// `RegAllocator` pipeline as [`perform_register_allocation`] but
-/// applies `extra_coalesce_pairs` between the upstream-orthodox
-/// `coalesce_variables` and `find_node_coloring` steps.
+/// ADAPTATION variant: runs the same `RegAllocator` pipeline as
+/// [`perform_register_allocation`] but applies `extra_coalesce_pairs`
+/// between the upstream-orthodox `coalesce_variables` and
+/// `find_node_coloring` steps.
 ///
 /// Each pair `(scratch_id, inputarg_id)` requests that
 /// `scratch_id`'s post-coloring color equal `inputarg_id`'s color.
@@ -404,8 +406,8 @@ pub(super) fn perform_register_allocation(graph: &FlowGraph, kind: Kind) -> Grap
 /// (`codewriter.rs::transform_graph_to_jitcode`) emits fresh
 /// scratch Variables for each `LOAD_FAST` / `STORE_FAST` and pins
 /// them to slot=i via `walker_slot_for_variable`; this helper lets
-/// the canonical graph regalloc honor that same pin so the
-/// production splice (Task #229) is byte-equivalent.
+/// the canonical graph regalloc honor that same pin so the bytes it
+/// emits match the walker's inline emission slot-for-slot.
 pub fn perform_register_allocation_with_pairs(
     graph: &FlowGraph,
     kind: Kind,
@@ -417,18 +419,17 @@ pub fn perform_register_allocation_with_pairs(
     //     regalloc.coalesce_variables()
     //     regalloc.find_node_coloring()
     let mut allocator = RegAllocator::new(graph, kind);
-    // Task #237 ADAPTATION: pre-merge external pairs into
-    // `_unionfind` BEFORE `make_dependencies` so the live-set
-    // tracking (which projects every Variable ID through
-    // `_unionfind.find_rep`) treats each pinned scratch↔inputarg
-    // pair as a single node.  Without the pre-merge, walker scratch
-    // and the corresponding canonical inputarg get separate live
-    // entries and `make_dependencies` records an interference edge
-    // between them; the post-coalesce `try_coalesce_ids` then
-    // early-returns at the `has_edge` check (regalloc.py:106) and
-    // the pin has no effect on coloring.  `find_rep` auto-creates a
-    // singleton partition for IDs not yet tracked, so unknown
-    // scratch IDs are handled safely.
+    // ADAPTATION: pre-merge external pairs into `_unionfind` BEFORE
+    // `make_dependencies` so the live-set tracking (which projects
+    // every Variable ID through `_unionfind.find_rep`) treats each
+    // pinned scratch↔inputarg pair as a single node.  Without the
+    // pre-merge, walker scratch and the corresponding canonical
+    // inputarg get separate live entries and `make_dependencies`
+    // records an interference edge between them; the post-coalesce
+    // `try_coalesce_ids` then early-returns at the `has_edge` check
+    // (regalloc.py:106) and the pin has no effect on coloring.
+    // `find_rep` auto-creates a singleton partition for IDs not yet
+    // tracked, so unknown scratch IDs are handled safely.
     for &(v_id, w_id) in extra_coalesce_pairs {
         let v0 = allocator._unionfind.find_rep(v_id);
         let w0 = allocator._unionfind.find_rep(w_id);
@@ -438,11 +439,11 @@ pub fn perform_register_allocation_with_pairs(
     }
     allocator.make_dependencies();
     allocator.coalesce_variables();
-    // Task #228 external pins — re-apply via `try_coalesce_ids` after
+    // External pins — re-apply via `try_coalesce_ids` after
     // `make_dependencies` so the surviving rep is explicitly added to
     // `_depgraph.all_nodes` even when neither endpoint appeared as an
-    // op result/arg in the canonical graph.  With the Task #237 pre-
-    // merge above these calls are no-ops on the union-find side
+    // op result/arg in the canonical graph.  With the union-find
+    // pre-merge above these calls are no-ops on the union-find side
     // (`find_rep` already returns a common rep), but `add_node` still
     // matters for `find_node_coloring`'s `getnodes` filter.
     for &(v_id, w_id) in extra_coalesce_pairs {
@@ -515,7 +516,7 @@ pub fn perform_register_allocation_all_kinds(graph: &FlowGraph) -> [GraphAllocat
     perform_register_allocation_all_kinds_with_pairs(graph, &[])
 }
 
-/// Phase 4 endgame Task #228 ADAPTATION variant: invokes the per-kind
+/// ADAPTATION variant: invokes the per-kind
 /// `perform_register_allocation_with_pairs` for `Kind::Ref` with
 /// `ref_coalesce_pairs`.  Int and Float kinds use the empty-pair
 /// path because walker's `walker_slot_for_variable` only tracks Ref
@@ -762,11 +763,12 @@ pub(super) fn allocate_registers(
 /// (frame, ec). Int and Float kinds have no inputargs — see
 /// `ExternalInputs` docstring.
 ///
-/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
-/// the SSARepr-side variant operates on `SSAReprRegAllocator` keyed by
-/// u16 register indices instead of Variable identities.  The
-/// PyPy-orthodox graph-side sibling lives at `enforce_input_args`
-/// (free function) above.
+/// PRE-EXISTING-ADAPTATION: the SSARepr-side variant operates on
+/// `SSAReprRegAllocator` keyed by u16 register indices instead of
+/// Variable identities.  The PyPy-orthodox graph-side sibling lives
+/// at `enforce_input_args` (free function) above and retires this
+/// variant when the walker defers SSARepr emission to
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`.
 fn enforce_ssarepr_input_args(
     allocators: &mut [SSAReprRegAllocator; 3],
     nlocals: usize,
@@ -811,11 +813,12 @@ fn enforce_ssarepr_input_args(
 /// + `rpython/tool/algo/regalloc.py:8-15`.  Builds an
 /// `SSAReprRegAllocator` and runs the three-stage pipeline.
 ///
-/// PRE-EXISTING-ADAPTATION (Phase 4 retirement target, task #9):
-/// pyre's walker emits SSARepr inline, so the consumer is
-/// `SSAReprRegAllocator`, not the orthodox `RegAllocator`.  The
-/// graph-side sibling (`perform_register_allocation`) is the
-/// PyPy-orthodox entry.
+/// PRE-EXISTING-ADAPTATION: pyre's walker emits SSARepr inline, so
+/// the consumer is `SSAReprRegAllocator`, not the orthodox
+/// `RegAllocator`.  The graph-side sibling (`perform_register_allocation`)
+/// is the PyPy-orthodox entry; this variant retires when the walker
+/// defers SSARepr emission to
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`.
 ///
 /// Dual coalesce source, ordered to give CFG link priority over the
 /// pyre-only SSARepr scanner when an interference edge forces a
@@ -871,9 +874,10 @@ fn perform_ssarepr_register_allocation(
 /// `RegAllocator`'s contract line-by-line (`make_dependencies`,
 /// `coalesce_variables`, `find_node_coloring`, `find_num_colors`,
 /// `getcolor`, `swapcolors`) so that — once the walker defers SSARepr
-/// emission to the canonical `flatten_graph` driver (Phase 4 endgame,
-/// task #9) — this whole struct retires and the sibling `RegAllocator`
-/// at the top of this module is the sole allocator, matching upstream
+/// emission to the canonical
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` driver —
+/// this whole struct retires and the sibling `RegAllocator` at the
+/// top of this module is the sole allocator, matching upstream
 /// exactly.
 ///
 /// The `SSARepr` prefix marks this as the deviation pending retirement.

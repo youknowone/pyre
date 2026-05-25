@@ -2542,19 +2542,18 @@ fn pair_walker_slot_if_absent(
 /// became production.  Body-defined Python locals `n_args..nlocals`
 /// have no canonical inputarg counterpart in pyre today; the
 /// architecturally-correct fix (PyPy parity) is to extend
-/// `graph_entry_inputargs` to seed all `nlocals` slots — see
-/// [[phase4-endgame-task229-blockers-2026-05-24]] path (a).
+/// `graph_entry_inputargs` to seed all `nlocals` slots.
 ///
-/// PRE-EXISTING-ADAPTATION (Phase 4 endgame Task #228): the upstream
-/// `flatten_graph(graph, regallocs, cpu)` signature has no extra
-/// pre-coalesce parameter because PyPy's flowgraph never produces
-/// scratch local-`i` Variables disjoint from the
+/// PRE-EXISTING-ADAPTATION: the upstream
+/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` signature
+/// has no extra pre-coalesce parameter because PyPy's flowgraph never
+/// produces scratch local-`i` Variables disjoint from the
 /// `startblock.inputargs[i]` Variable — every read/write of local `i`
 /// flows through the same Variable.  Pyre's walker creates fresh
 /// scratch Variables per emit, so the canonical regalloc needs this
 /// pre-coalesce hint to converge with walker's color assignments.
-/// Retired when the walker is replaced with a graph-only emit
-/// pipeline (Phase 4 endgame Task #230+).
+/// Retires when the walker is replaced with a graph-only emit
+/// pipeline.
 fn derive_walker_pin_coalesce_pairs(
     graph: &super::flow::FunctionGraph,
     walker_slot_for_variable: &[Option<u16>],
