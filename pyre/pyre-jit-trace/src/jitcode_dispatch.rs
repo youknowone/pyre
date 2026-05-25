@@ -2140,19 +2140,8 @@ fn setfield_gc_via_heapcache(
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
         // Write-through with alias-clearing semantics
-        // (`heapcache.py:90-94 do_write_with_aliasing`).  Box.value
-        // parity: `box_value` resolves Const pool /
-        // standard-virtualizable / `opref_concrete` stamp; `None`
-        // collapses to `Value::Void` so the downstream cache-hit
-        // sanity check skips for ops whose runtime result was not
-        // computed at trace time.  Mirrors PyPy's
-        // `upd.setfield(valuebox)` (heapcache.py:142) where
-        // `valuebox.getint()/getref_base()` payload travels with the
-        // Box.
-        let valuebox_payload = ctx
-            .trace_ctx
-            .box_value(valuebox)
-            .unwrap_or(majit_ir::Value::Void);
+        // (`heapcache.py:90-94 do_write_with_aliasing`).  Mirrors
+        // `upd.setfield(valuebox)` (heapcache.py:142).
         ctx.trace_ctx
             .heapcache_setfield_cached(obj, descr_index, valuebox);
     }

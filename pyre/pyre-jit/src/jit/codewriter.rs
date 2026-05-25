@@ -10430,7 +10430,7 @@ impl CodeWriter {
                 }
             }
             let ref_coloring = &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
-            let mut probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
+            let probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
                 if let Some(var_id) = slot_to_variable_id.get(pre_slot).copied().flatten() {
                     let v_id = super::flow::VariableId(var_id);
                     if let Some(&canonical_color) = ref_coloring.get(&v_id) {
