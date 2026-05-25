@@ -44,9 +44,7 @@ pub enum Kind {
 /// returns object identity; pyre's codewriter walker emits against
 /// pre-regalloc indices, so a u16 stands in for the identity. Wrapping
 /// it in `VariableId` keeps the index/color distinction visible in
-/// types — Phase 1 minimal slice (plan staged-sauteeing-koala). Until
-/// later phases can fold the index into the post-regalloc color
-/// derivation, callers extract the raw `u16` via `.0` at the consumer
+/// types. Callers extract the raw `u16` via `.0` at the consumer
 /// boundary (`Register::new(Kind, u16)`, `Operand::reg(Kind, u16)`,
 /// `JitCallArg::int/reference(u16)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,8 +117,7 @@ pub struct SSARepr {
     /// Sparse `Vec<(py_pc, first_insn_pos)>` keyed by py_pc per
     /// [[feedback-no-hashmap-ever]].
     pub pc_first_insn_pos: Vec<(i64, usize)>,
-    /// Phase 2.2a (plan staged-sauteeing-koala, Tasks #158/#159/#122
-    /// epic): per-kind fresh-Variable counter. RPython has no analog
+    /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
     /// implicit identity and `regalloc.py` numbers them densely after
     /// the FunctionGraph is final. Pyre's codewriter walks a CodeObject

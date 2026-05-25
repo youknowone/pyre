@@ -4187,8 +4187,7 @@ impl CodeWriter {
             max_stackdepth,
             stack_base,
         } = layout;
-        // Per-arm fresh int scratch slots — Phase 2 Commit 2.2b
-        // (Tasks #158/#159/#122 plan, plan staged-sauteeing-koala).
+        // Per-arm fresh int scratch slots.
         // Each opcode handler arm that needs a transient int-typed
         // register calls `ssarepr.fresh_var(Kind::Int, scratch_int_base)`
         // (flatten.rs:`SSARepr::fresh_var`) to claim a unique pre-regalloc
