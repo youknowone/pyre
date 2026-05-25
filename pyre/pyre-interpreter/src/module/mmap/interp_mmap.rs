@@ -344,8 +344,22 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 if pos >= len {
                     return Err(crate::PyError::value_error("write_byte out of range"));
                 }
-                let b = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u8;
-                unsafe { *p.add(pos) = b };
+                // `interp_mmap.py:114-121 write_byte(byte=int)` —
+                // `@unwrap_spec(byte=int)` rejects non-ints, then
+                // `chr(byte)` raises ValueError on values outside
+                // 0..256.
+                if !unsafe { pyre_object::is_int(args[1]) } {
+                    return Err(crate::PyError::type_error(
+                        "write_byte: byte must be an integer",
+                    ));
+                }
+                let raw = unsafe { pyre_object::w_int_get_value(args[1]) };
+                if !(0..=255).contains(&raw) {
+                    return Err(crate::PyError::value_error(
+                        "byte must be in range(0, 256)",
+                    ));
+                }
+                unsafe { *p.add(pos) = raw as u8 };
                 mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
                 Ok(pyre_object::w_none())
             },
@@ -355,6 +369,10 @@ fn init_mmap_type(ns: &mut DictStorage) {
 
     crate::dict_storage_store(
         ns,
+        // `interp_mmap.py:123-134 flush(offset=0, size=0)` —
+        // `@unwrap_spec(offset=int, size=int)` then `mmap.flush(offset,
+        // size)`.  rmmap.flush passes size==0 through as "whole map",
+        // which we mirror via `len - off`.
         "flush",
         crate::make_builtin_function("flush", |args| {
             if args.is_empty() {
@@ -362,16 +380,24 @@ fn init_mmap_type(ns: &mut DictStorage) {
             }
             let obj = args[0];
             let (p, len) = mmap_ptr(obj)?;
+            for (idx, label) in [(1usize, "offset"), (2, "size")] {
+                if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "flush: {label} must be an integer"
+                    )));
+                }
+            }
             let off = if args.len() >= 2 {
                 (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize
             } else {
                 0
             };
-            let n = if args.len() >= 3 {
+            let raw_size = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize
             } else {
-                len - off
+                0
             };
+            let n = if raw_size == 0 { len - off } else { raw_size };
             if off + n > len {
                 return Err(crate::PyError::value_error("flush range out of bounds"));
             }
@@ -714,10 +740,27 @@ fn init_mmap_type(ns: &mut DictStorage) {
                     ));
                 }
                 let obj = args[0];
+                // `interp_mmap.py:136-143 move(dest, src, count)` —
+                // `@unwrap_spec(dest=int, src=int, count=int)` plus
+                // `self.check_writeable()` upfront.  We require all
+                // three args to be ints and reject ACCESS_READ.
+                for (idx, label) in [(1, "dest"), (2, "src"), (3, "count")] {
+                    if !unsafe { pyre_object::is_int(args[idx]) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "move: {label} must be an integer"
+                        )));
+                    }
+                }
+                if mmap_get_attr_i64(obj, "_access") == MMAP_ACCESS_READ {
+                    return Err(crate::PyError::type_error("mmap is read-only"));
+                }
                 let dest = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
                 let src = (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize;
                 let count = (unsafe { pyre_object::w_int_get_value(args[3]) }) as usize;
                 let p = mmap_get_attr_i64(obj, "_ptr") as usize;
+                if p == 0 {
+                    return Err(crate::PyError::value_error("mmap closed or invalid"));
+                }
                 let total = mmap_get_attr_i64(obj, "_len") as usize;
                 if dest.saturating_add(count) > total || src.saturating_add(count) > total {
                     return Err(crate::PyError::value_error(
