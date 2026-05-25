@@ -469,34 +469,36 @@ pub struct JitDriverStaticData {
 /// Instead, callee graphs are collected from parsed Rust source files
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
-/// Resolution of a `(receiver, method)` last-two-segment suffix against the
-/// registered `function_graphs` keys: either a single unique key or an
-/// ambiguous suffix shared by more than one key.
-enum SuffixMatch {
-    Unique(CallPath),
-    Ambiguous,
-}
 
 pub struct CallControl {
     /// Free function graphs: CallPath → FunctionGraph.
     /// RPython: `funcptr._obj.graph` linkage.
     function_graphs: HashMap<CallPath, FunctionGraph>,
 
-    /// O(1) index over `function_graphs` keyed by their last two segments
-    /// `(receiver, method)`, mirroring the suffix-match in `target_to_path`'s
-    /// `self.method()` fallback. Maintained incrementally on registration so
-    /// the fallback is a single lookup instead of a linear scan over every
-    /// registered graph (the analysis runs that fallback tens of thousands of
-    /// times during effect inference). pyre-only resolution aid — RPython
-    /// carries the callee graph pointer on the call op, so there is no
-    /// suffix-scan upstream.
+    /// Leaf-name → free-function `CallPath`s with `owner_root.is_none()`.
     ///
-    /// Convergence path: retired together with `target_to_path` and the
-    /// whole name-resolution layer once the call op carries its resolved
-    /// graph directly (`call.py:98 funcobj = op.args[0].value._obj;
-    /// graph = funcobj.graph`) — i.e. when annotation/rtyper binds graph
-    /// identities onto call ops instead of leaving a `CallTarget` name.
-    method_suffix_index: HashMap<(String, String), SuffixMatch>,
+    /// Pyre-only acceleration for `target_to_path`'s cross-module
+    /// leaf-match fallback (line ~3086).  RPython resolves callees by
+    /// `funcptr` identity, so this fallback has no upstream analogue;
+    /// it exists because Rust's name resolution surfaces produce bare
+    /// or 2-segment callsites that need to find the unique
+    /// `function_graphs` registration whose path ends in the same
+    /// leaf.  Without an index, the resolver iterates the whole
+    /// `function_graphs` HashMap on every direct call (O(N_graphs)
+    /// per call op), which dominates `jtransform_transform` for
+    /// large opcode arms.  Maintained incrementally by the three
+    /// registration helpers below — keep in lockstep with
+    /// `function_graphs` so the lookup stays consistent.
+    free_fn_leaf_index: HashMap<String, Vec<CallPath>>,
+
+    /// Method-name leaf → impl-method `CallPath`s (graphs with
+    /// `owner_root.is_some()`).  Same rationale as
+    /// `free_fn_leaf_index`: pyre-only acceleration for
+    /// `target_to_path`'s `CallTarget::Method` receiver-leaf
+    /// fallback (line ~3273), which previously walked the whole
+    /// `function_graphs` HashMap looking for paths ending in
+    /// `[receiver_leaf, method_name]`.
+    impl_method_leaf_index: HashMap<String, Vec<CallPath>>,
 
     /// Per-graph hint set, mirroring RPython `func._jit_*_` / `_elidable_function_`.
     /// Populated by `register_function_graph_with_hints` and
@@ -1125,7 +1127,8 @@ impl CallControl {
     pub fn new() -> Self {
         Self {
             function_graphs: HashMap::new(),
-            method_suffix_index: HashMap::new(),
+            free_fn_leaf_index: HashMap::new(),
+            impl_method_leaf_index: HashMap::new(),
             function_hints: HashMap::new(),
             trait_method_impls: HashMap::new(),
             method_to_impl_types: HashMap::new(),
@@ -1901,35 +1904,28 @@ impl CallControl {
         Some(descr as majit_ir::descr::DescrRef)
     }
 
-    /// Maintain [`Self::method_suffix_index`] for a newly registered key.
-    /// Records the last two segments `(receiver, method)`; a second distinct
-    /// key with the same suffix marks the suffix `Ambiguous` (so the
-    /// `target_to_path` fallback declines to guess, matching the old scan).
-    fn index_method_suffix(&mut self, path: &CallPath) {
-        let segs = &path.segments;
-        if segs.len() < 2 {
-            return;
-        }
-        let key = (segs[segs.len() - 2].clone(), segs[segs.len() - 1].clone());
-        match self.method_suffix_index.entry(key) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(SuffixMatch::Unique(path.clone()));
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                if let SuffixMatch::Unique(existing) = o.get() {
-                    if existing != path {
-                        o.insert(SuffixMatch::Ambiguous);
-                    }
-                }
+    /// Insert into `function_graphs` and (if free function) the
+    /// `free_fn_leaf_index`.  The index is the only mutable side
+    /// channel that mirrors `function_graphs`, so all writes go
+    /// through this helper to keep them consistent.
+    fn insert_function_graph_indexed(&mut self, path: CallPath, graph: FunctionGraph) {
+        if let Some(leaf) = path.segments.last() {
+            let bucket = if graph.owner_root.is_none() {
+                self.free_fn_leaf_index.entry(leaf.clone()).or_default()
+            } else {
+                self.impl_method_leaf_index.entry(leaf.clone()).or_default()
+            };
+            if !bucket.contains(&path) {
+                bucket.push(path.clone());
             }
         }
+        self.function_graphs.insert(path, graph);
     }
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
     pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
-        self.index_method_suffix(&path);
-        self.function_graphs.insert(path, graph);
+        self.insert_function_graph_indexed(path, graph);
     }
 
     /// Register a free function graph together with its hints.
@@ -1942,8 +1938,7 @@ impl CallControl {
         graph: FunctionGraph,
         hints: Vec<String>,
     ) {
-        self.index_method_suffix(&path);
-        self.function_graphs.insert(path.clone(), graph);
+        self.insert_function_graph_indexed(path.clone(), graph);
         if !hints.is_empty() {
             self.function_hints.insert(path, hints);
         }
@@ -2086,9 +2081,12 @@ impl CallControl {
         // `for_impl_method` so PyFrame's `push_value` and MIFrame's
         // `push_value` stay separate.
         let qualified_path = CallPath::for_impl_method(impl_type, method_name);
+        // Impl-method graphs carry `owner_root = Some(impl_type)`, so they
+        // are excluded from `free_fn_leaf_index` by the helper's filter.
+        // Still route through it so a future `owner_root.is_none()` trait
+        // path stays indexed automatically.
         if !self.function_graphs.contains_key(&qualified_path) {
-            self.index_method_suffix(&qualified_path);
-            self.function_graphs.insert(qualified_path, graph);
+            self.insert_function_graph_indexed(qualified_path, graph);
         }
     }
 
@@ -3220,21 +3218,22 @@ impl CallControl {
                     // object identity (`annrpython.py:103-150 build_types`)
                     // which never crosses the module boundary on a
                     // syntactically-qualified callsite.
+                    //
+                    // `free_fn_leaf_index` pre-filters by `(leaf,
+                    // owner_root.is_none())` so this only walks paths
+                    // that already cleared two of the three gates;
+                    // the suffix check is the only per-candidate work.
                     let target_segs: &[String] = &segments[..];
                     let candidate_carries_target_as_suffix = |k: &CallPath| -> bool {
                         let cs = &k.segments;
                         cs.len() >= target_segs.len()
                             && cs[cs.len() - target_segs.len()..] == *target_segs
                     };
-                    let matches: Vec<&CallPath> = self
-                        .function_graphs
+                    let empty: Vec<CallPath> = Vec::new();
+                    let leaf_bucket = self.free_fn_leaf_index.get(leaf).unwrap_or(&empty);
+                    let matches: Vec<&CallPath> = leaf_bucket
                         .iter()
-                        .filter(|(k, g)| {
-                            g.owner_root.is_none()
-                                && k.segments.last().map(|s| s == leaf).unwrap_or(false)
-                                && candidate_carries_target_as_suffix(k)
-                        })
-                        .map(|(k, _)| k)
+                        .filter(|k| candidate_carries_target_as_suffix(k))
                         .collect();
                     if matches.len() == 1 {
                         return Some(matches[0].clone());
@@ -3317,7 +3316,7 @@ impl CallControl {
                     // method body otherwise.
                     //
                     // Look up `function_graphs` keys whose last 2 segments
-                    // match `[receiver, name]` via `method_suffix_index`.
+                    // match `[receiver, name]` via `impl_method_leaf_index`.
                     // Accept the match only if it is unique: an ambiguous
                     // suffix (e.g. two crates both exposing a `PyFrame::pop`)
                     // falls through to the trait resolution path, which mirrors
@@ -3329,12 +3328,36 @@ impl CallControl {
                     // branch above so audit sweeps observe both fallback
                     // surfaces consistently.
                     if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_none() {
-                        match self
-                            .method_suffix_index
-                            .get(&(receiver.to_string(), name.to_string()))
-                        {
-                            Some(SuffixMatch::Unique(path)) => return Some(path.clone()),
-                            Some(SuffixMatch::Ambiguous) | None => {}
+                        let need_tail = name.as_str().to_string();
+                        let receiver_leaf =
+                            receiver.rsplit("::").next().unwrap_or(receiver).to_string();
+                        // `impl_method_leaf_index` pre-filters by
+                        // method-name leaf so only same-leaf
+                        // candidates are scanned for the
+                        // `[..., receiver_leaf, need_tail]` tail.
+                        let empty: Vec<CallPath> = Vec::new();
+                        let leaf_bucket = self
+                            .impl_method_leaf_index
+                            .get(&need_tail)
+                            .unwrap_or(&empty);
+                        let mut matched: Option<&CallPath> = None;
+                        let mut multi = false;
+                        for key in leaf_bucket.iter() {
+                            let segs = &key.segments;
+                            if segs.len() >= 2
+                                && segs.get(segs.len() - 2).map(|s| s == &receiver_leaf).unwrap_or(false)
+                            {
+                                if matched.is_some() {
+                                    multi = true;
+                                    break;
+                                }
+                                matched = Some(key);
+                            }
+                        }
+                        if !multi {
+                            if let Some(path) = matched {
+                                return Some(path.clone());
+                            }
                         }
                     }
                 }

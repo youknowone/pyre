@@ -17,4 +17,5 @@ pub mod liveness;
 pub mod policy;
 pub mod regalloc;
 pub mod support;
+pub mod transform_profile;
 pub mod type_state;

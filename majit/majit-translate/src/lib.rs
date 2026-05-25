@@ -412,6 +412,25 @@ fn analyze_pipeline_from_parsed(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    let profile = std::env::var_os("PYRE_PROFILE_PIPELINE").is_some();
+    let phase_start = std::time::Instant::now();
+    let mut last = phase_start;
+    macro_rules! mark_phase {
+        ($name:literal) => {{
+            #[allow(unused_assignments)]
+            if profile {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[PYRE_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  {}",
+                    (now - phase_start).as_secs_f64(),
+                    (now - last).as_secs_f64(),
+                    $name,
+                );
+                last = now;
+            }
+        }};
+    }
+    mark_phase!("entry");
     // Use-import resolver: harvest `(bare_name → defining_module_path)`
     // from every `ParsedInterpreter.module_path` non-empty entry, then
     // publish into the `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` global
@@ -462,8 +481,10 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
+    mark_phase!("known_statics + struct_origins populated");
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
+    mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -1158,12 +1179,14 @@ fn analyze_pipeline_from_parsed(
         total_vable_rewrites: 0,
     };
 
+    mark_phase!("call_control + canonical_trait_impls + register graphs");
     let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
         parsed_files,
         &program.fn_return_types,
         &config.pipeline,
         &mut call_control,
     );
+    mark_phase!("build_canonical_opcode_dispatch");
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)

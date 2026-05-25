@@ -430,8 +430,10 @@ impl CodeWriter {
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
         // `FunctionGraph::concretetype_of(&v)` directly.
-        let real_value_to_var =
-            self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag);
+        let real_value_to_var = crate::jit_codewriter::transform_profile::time_phase(
+            "step0_dual_gate_publish_concretetypes",
+            || self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag),
+        );
 
         // Step 0b: rtyper-equivalent indirect_call lowering
         // (`translator/rtyper/rpbc.rs::lower_indirect_calls`).
@@ -440,7 +442,9 @@ impl CodeWriter {
         // jtransform sees `OpKind::IndirectCall` (with funcptr already
         // a regular Variable), never `CallTarget::Indirect`.
         let mut graph_owned = graph.clone();
-        crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
+        crate::jit_codewriter::transform_profile::time_phase("step0b_lower_indirect_calls", || {
+            crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol)
+        });
         #[cfg(debug_assertions)]
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         // Pre-jtransform rtyper fold of unit-variant ctors to singleton
@@ -465,7 +469,10 @@ impl CodeWriter {
         // classdef-keyed dispatch). Ops whose receiver carries no
         // SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var);
+            crate::jit_codewriter::transform_profile::time_phase(
+                "step0c_stamp_classdef_hints_on_graph",
+                || stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var),
+            );
         }
         let graph = &graph_owned;
 
@@ -489,12 +496,15 @@ impl CodeWriter {
         // `concretetype` cell, and `Variable::clone` Rc-shares that
         // cell so jtransform's internal `rewritten = graph.clone()`
         // carries it through.
-        let mut rewritten = {
-            let mut transformer = crate::jtransform::Transformer::new(config)
-                .with_callcontrol(callcontrol)
-                .with_portal_jd(portal_jd_index);
-            transformer.transform(graph)
-        };
+        let mut rewritten = crate::jit_codewriter::transform_profile::time_phase(
+            "step1_jtransform_transform",
+            || {
+                let mut transformer = crate::jtransform::Transformer::new(config)
+                    .with_callcontrol(callcontrol)
+                    .with_portal_jd(portal_jd_index);
+                transformer.transform(graph)
+            },
+        );
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
         // RPython stores `.concretetype` on each Variable. Pyre merges
@@ -529,8 +539,10 @@ impl CodeWriter {
         // `stamped > post_result > post_resolve > original` is
         // preserved; the graph IS the merge target, no intermediate
         // type side-table survives the call.
-        let post_result_types =
-            crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph);
+        let post_result_types = crate::jit_codewriter::transform_profile::time_phase(
+            "step1b_authoritative_result_types",
+            || crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph),
+        );
         // `post_resolve` is intentionally empty here: jtransform now
         // writes resolved kinds straight to each backing
         // `Variable.concretetype` (see `Transformer::transform` →
@@ -573,7 +585,10 @@ impl CodeWriter {
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
-        let mut regallocs = crate::regalloc::perform_all_register_allocations(&rewritten.graph);
+        let mut regallocs = crate::jit_codewriter::transform_profile::time_phase(
+            "step2_perform_all_register_allocations",
+            || crate::regalloc::perform_all_register_allocations(&rewritten.graph),
+        );
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
@@ -585,19 +600,25 @@ impl CodeWriter {
         // of each kind, and the rotation persists into the assembler
         // call below — matching upstream `flatten.py:63-66`
         // invocation order verbatim.
-        let mut ssarepr = crate::flatten::flatten_graph(&rewritten.graph, &mut regallocs);
+        let mut ssarepr =
+            crate::jit_codewriter::transform_profile::time_phase("step3_flatten_graph", || {
+                crate::flatten::flatten_graph(&rewritten.graph, &mut regallocs)
+            });
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before
         // committing the shell via `set_body`.
-        let mut body = self.assembler.assemble_with_callcontrol_and_graph(
-            &mut ssarepr,
-            &regallocs,
-            Some(callcontrol),
-            &rewritten.graph,
-        );
+        let mut body =
+            crate::jit_codewriter::transform_profile::time_phase("step4_assemble", || {
+                self.assembler.assemble_with_callcontrol_and_graph(
+                    &mut ssarepr,
+                    &regallocs,
+                    Some(callcontrol),
+                    &rewritten.graph,
+                )
+            });
 
         // call.py:174-187 get_jitcode_calldescr:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -745,10 +766,14 @@ impl CodeWriter {
         // RPython's enum_pending_graphs() pops from unfinished_graphs (LIFO).
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
+        let profile = std::env::var_os("PYRE_PROFILE_DRAIN").is_some();
+        let mut drain_count = 0usize;
+        let drain_start = std::time::Instant::now();
         loop {
             let Some((path, jitcode)) = callcontrol.enum_pending_graphs() else {
                 break;
             };
+            let iter_start = std::time::Instant::now();
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
                 // RPython `enum_pending_graphs` (codewriter.py:79-84)
                 // never yields a jitcode whose graph is missing —
@@ -795,6 +820,24 @@ impl CodeWriter {
                     jitcode.set_jitdriver_sd(jd.index);
                 }
             }
+            if profile {
+                drain_count += 1;
+                let elapsed = iter_start.elapsed().as_secs_f64();
+                if elapsed >= 0.5 {
+                    eprintln!(
+                        "[PYRE_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
+                        drain_count, elapsed, jitcode.name,
+                    );
+                }
+            }
+        }
+        if profile {
+            eprintln!(
+                "[PYRE_PROFILE_DRAIN] DRAIN TOTAL {:>7.3}s  {} graphs",
+                drain_start.elapsed().as_secs_f64(),
+                drain_count,
+            );
+            crate::jit_codewriter::transform_profile::dump_transform_phase_totals();
         }
     }
 
