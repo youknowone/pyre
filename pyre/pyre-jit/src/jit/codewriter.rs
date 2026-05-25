@@ -4210,6 +4210,17 @@ impl CodeWriter {
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
         let mut current_depth: u16 = 0;
+        // Per-position symbolic FlowValue for each active stack slot.
+        // `stack_values[i]` is the Variable / Constant currently
+        // occupying stack slot `i`; `stack_values.len()` matches
+        // `current_depth` when caller and macro maintenance are in
+        // sync.  Mirrors `current_state.stack` but is owned by the
+        // walker, so consumers that resolve a stack-TOS operand to a
+        // Variable can read it without threading the full FrameState.
+        // pyframe.py `valuestack_w` is the runtime counterpart;
+        // jtransform.py lowers `pushvalue`/`popvalue` to
+        // `setarrayitem_vable_r` against the same indices.
+        let mut stack_values: Vec<super::flow::FlowValue> = Vec::new();
 
         // RPython: self.assembler = Assembler() + JitCode(graph.name, ...)
         // (rpython/jit/codewriter/jitcode.py:14-15 takes name as the first
@@ -5894,6 +5905,11 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
+                // Mirror pyframe.py `pushvalue(w_object)`: record the
+                // symbolic value at the new TOS so consumers can
+                // recover the Variable for an operand they would
+                // otherwise read out of `stack_base + depth`.
+                stack_values.push(src_value.clone());
                 emit_ref_copy!(stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
@@ -5957,6 +5973,13 @@ impl CodeWriter {
                     "emit_pushvalue_ref_const: only PY_NULL is supported today; \
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
+                // Mirror pyframe.py `pushvalue(None)` for PUSH_NULL /
+                // LOAD_GLOBAL(push_null): the symbolic TOS becomes the
+                // `null_stack_sentinel()` (`Constant::none()`) so a
+                // subsequent CALL that observes the NULL slot lowers
+                // through `flatten_constant_operand` -> `ConstRef(0)`
+                // without an Opaque detour.
+                stack_values.push(null_stack_sentinel());
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
@@ -6014,6 +6037,12 @@ impl CodeWriter {
                 // cranelift (`python3 pyre/check.py --synthetic-only
                 // --synthetic-pattern comprehensions.py`).
                 let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
+                // pyframe.py `popvalue_maybe_none`: drop the TOS
+                // symbolic value alongside the runtime stack write.
+                // saturating semantics match the `$depth.saturating_sub`
+                // below so an underflow (legal during exception unwind
+                // before the entry frame is rebuilt) is tolerated.
+                let _ = stack_values.pop();
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
                 if is_portal {
@@ -6209,6 +6238,10 @@ impl CodeWriter {
                 current_block = pending_block;
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
+                // Block-entry hand-off: adopt the predecessor's
+                // symbolic stack snapshot, mirroring
+                // `flowcontext.py:404 record_block`.
+                stack_values = current_state.stack.clone();
                 needs_fallthrough = true;
                 // Task #227.5 per-block walker: reset switch flag at the
                 // start of every new block iteration so a previous
@@ -6262,11 +6295,24 @@ impl CodeWriter {
                         ) {
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
+                            // Catch-edge hand-off: adopt the handler's
+                            // recorded stack snapshot (pyopcode.py
+                            // PUSH_EXC_INFO / RERAISE rebuild the
+                            // symbolic stack at the handler entry).
+                            stack_values = current_state.stack.clone();
                             needs_fallthrough = false;
                         } else if let Some(handler_depth) =
                             handler_depth_at.get(py_pc).copied().flatten()
                         {
                             current_depth = handler_depth;
+                            // Bare handler entry without a recorded
+                            // FrameState: only the depth is known, so
+                            // fill the symbolic stack with null
+                            // sentinels.  A consumer that resolves
+                            // such a slot must fall back to the raw
+                            // `stack_base + depth` register because
+                            // the Variable identity isn't recoverable.
+                            stack_values.resize(handler_depth as usize, null_stack_sentinel());
                         }
                     }
                     // RPython flatten.py: Label(block) at block entry
@@ -9631,28 +9677,24 @@ impl CodeWriter {
             std::env::var("PYRE_PHASE4_BUILD_CANONICAL").ok().as_deref() == Some("1");
         let phase4_diff_canonical =
             std::env::var("PYRE_PHASE4_DIFF_CANONICAL").ok().as_deref() == Some("1");
-        // Task #229 splice-1: per-graph byte_equivalent audit.  Reports
-        // which graphs are READY for canonical SSARepr swap (production
-        // splice) — when walker and canonical Insn sequences match
-        // modulo pyre-only walker emits and canonical-only trampolines,
-        // the graph is a splice candidate.  No production behavior
-        // change — just `[phase4-splice-audit]` stderr report.  The
-        // actual swap lands in a follow-up slice once audit data shows
-        // a stable byte_equivalent ratio across benches.
+        // Per-graph audit: when walker and canonical Insn sequences
+        // are byte-equivalent (after filtering pyre-only walker
+        // emits and canonical-only trampolines) the graph can be
+        // safely served from `canonical_ssarepr.insns` per
+        // `codewriter.py:53 ssarepr = flatten_graph(graph, regallocs,
+        // cpu)`.  This emits a `[phase4-splice-audit]` report only;
+        // no production behavior change.
         let phase4_splice_audit =
             std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
-        // Task #229 splice-5 (experimental, default-off): force-splice
-        // `ssarepr.insns` with `canonical_ssarepr.insns` for graphs whose
-        // name appears in the comma-separated `PYRE_PHASE4_SPLICE_ENABLE`
-        // list, regardless of byte_equivalent eligibility.  Surveys
-        // which graphs are *runtime-equivalent* even when not
-        // byte-equivalent — the splice-3a investigation showed
-        // walker-vs-canonical Register indices diverge by +nlocals due
-        // to walker stack-slot mediation, but the `ref_copy`-mirrored
-        // values are runtime-identical, so canonical's lower-indexed
-        // reads should still see the same values.  Confirming this
-        // per-graph would unblock the Task #229 splice without waiting
-        // for Path 4's multi-month walker_slot_for_variable retirement.
+        // Default-off experimental knob: replace walker's
+        // inline-emitted `ssarepr.insns` with `canonical_ssarepr.insns`
+        // for graphs whose name appears in the comma-separated
+        // `PYRE_PHASE4_SPLICE_ENABLE` list, regardless of
+        // byte-equivalent eligibility.  Used to characterise which
+        // graphs are runtime-equivalent under the swap even when the
+        // two byte streams diverge — diagnostic only; failures (e.g.
+        // `enforce_ssarepr_input_args` color-budget panic) are the
+        // informative signal.
         let phase4_splice_enable_names: Vec<String> = std::env::var("PYRE_PHASE4_SPLICE_ENABLE")
             .ok()
             .as_deref()
@@ -10217,17 +10259,16 @@ impl CodeWriter {
                     );
                 }
             }
-            // Task #229 splice-1: per-graph byte_equivalent audit.
             // `phase4_byte_equivalent` filters pyre-only walker emits
             // (`-live-` / `ref_copy`) and canonical-only trampoline
             // Labels, then performs structural equality on the
             // resulting Insn sequence (Register kind+index, Const
-            // literal values, opname).  PyPy parity: an `eligible=true`
-            // graph emits the same Insn sequence
+            // literal values, opname).  An `eligible=true` graph
+            // emits the same Insn sequence
             // `flatten.py:63-70 flatten_graph` would emit, modulo the
-            // documented walker deviations — a follow-up slice can
-            // replace `ssarepr.insns` with `canonical_ssarepr.insns`
-            // on these graphs without runtime behavior change.
+            // documented walker deviations — `ssarepr.insns` could be
+            // replaced with `canonical_ssarepr.insns` on these graphs
+            // without runtime behavior change.
             if phase4_splice_audit || phase4_diff_canonical {
                 let eligible_strict =
                     phase4_byte_equivalent(&ssarepr.insns, &canonical_ssarepr.insns, false);
