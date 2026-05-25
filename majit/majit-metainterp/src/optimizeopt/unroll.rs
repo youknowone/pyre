@@ -522,7 +522,14 @@ impl UnrollOptimizer {
                         // so the backend can see the reduced LABEL's declared
                         // types. Clone only the field we need to avoid keeping
                         // Phase 1 short preamble data alive longer than before.
-                        self.final_exported_state = Some(ExportedState {
+                        // GC parity (gcreftracer.py): `virtual_state` and
+                        // `box_pool` both carry GcRefs that the shadow stack
+                        // must pin between this store and any later read.
+                        // Match the rooting pattern at
+                        // `imported_loop_state = ...` / `phase1_out = ...`
+                        // (this file, ~line 666) — root after construction,
+                        // before placing into long-lived storage.
+                        let mut final_exported_state = ExportedState {
                             end_args: Vec::new(),
                             next_iteration_args: Vec::new(),
                             end_arg_types: Vec::new(),
@@ -538,9 +545,12 @@ impl UnrollOptimizer {
                             runtime_boxes: Vec::new(),
                             patchguardop: None,
                             box_pool: state.box_pool.clone(),
+                            phase1_emit_high_water: self.next_global_opref,
                             rooted_refs: Vec::new(),
                             shadow_stack_base: 0,
-                        });
+                        };
+                        final_exported_state.root_all_gcrefs();
+                        self.final_exported_state = Some(final_exported_state);
                         // Codex plan step 3: snapshot Phase 1 emit-op slice as
                         // Rc::clone vector. Phase 2's TraceIterator embeds these
                         // BoxRefs at its placeholder prefix `[num_inputs..end)`
@@ -1742,13 +1752,21 @@ pub struct ExportedState {
     /// populated by `export_state_with_bounds` at the canonical Phase 1
     /// export site.  PyPy has no analog because Box references pass by
     /// Python identity end-to-end; pyre's numeric `OpRef` indirection
-    /// makes this table the explicit lookup.  Doubles as the
-    /// `opref_high_water` ceiling (`box_pool.len()` covers every
-    /// Phase 1 emit position, including intermediates that were
-    /// forwarded/folded and never survive as an end_arg / short_op
-    /// source — `reserve_pos` extends `box_pool` even when the resulting
-    /// op is later dropped).
+    /// makes this table the explicit lookup.
     pub(crate) box_pool: crate::r#box::BoxPool,
+    /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
+    /// every OpRef Phase 1 allocated, including intermediates folded /
+    /// forwarded away before any structure-stored field could observe
+    /// them.  `box_pool.len()` is *almost* the same value, but
+    /// `reserve_pos_typed` skips `ensure_box` when `box_pool` is empty
+    /// (zero-inputarg / retrace baselines, `optimizeopt/mod.rs:2026`),
+    /// so the pool length under-reports the emit allocations in that
+    /// case.  Phase 2 / retrace seed their TraceIterator namespace
+    /// strictly above this watermark via `opref_high_water()` to keep
+    /// the OpRef set disjoint — RPython's object-identity Boxes get
+    /// disjointness from Python identity for free; pyre's numeric
+    /// OpRefs need an explicit position floor.
+    pub phase1_emit_high_water: u32,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1840,6 +1858,7 @@ impl ExportedState {
             runtime_boxes: Vec::new(),
             patchguardop: None,
             box_pool,
+            phase1_emit_high_water: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1934,18 +1953,25 @@ impl ExportedState {
         }
 
         // `box_pool.len()` covers every Phase 1 BoxRef the failed
-        // attempt allocated — inputargs, emitted ops, and intermediates
-        // that were forwarded/folded and never survive as an end_arg /
-        // short_op source.  `OptContext::reserve_pos` extends `box_pool`
-        // even when the resulting op is later dropped, so this is the
-        // raw position ceiling Phase 2's namespace must clear.  When
-        // retrace's Phase 2 `start_fresh` is below that ceiling, the
+        // attempt materialized — inputargs and emit ops the recorder /
+        // optimizer extended the pool for.  When retrace's Phase 2
+        // `start_fresh` is below that ceiling, the
         // `TraceIterator::new` `p1_prefix.len().min(start_fresh)`
         // truncation would drop the tail of the pool and re-issue the
         // same raw positions for Phase 2 input/result OpRefs — a numeric
         // collision PyPy's object-identity Boxes structurally cannot
         // have.
         high = high.max(self.box_pool.len() as u32);
+
+        // `phase1_emit_high_water` covers Phase 1 emit positions when
+        // `box_pool` was not extended (zero-inputarg / retrace baselines
+        // where `reserve_pos_typed` skips `ensure_box` — see
+        // `optimizeopt/mod.rs:2026`).  Intermediate OpRefs that were
+        // allocated then forwarded/folded never make it into any
+        // structure-stored field above, so the explicit watermark from
+        // Phase 1's `OptContext::next_pos` is the only signal that keeps
+        // Phase 2's namespace disjoint from those positions.
+        high = high.max(self.phase1_emit_high_water);
 
         high
     }
@@ -2329,6 +2355,7 @@ impl Clone for ExportedState {
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
             box_pool: self.box_pool.clone(),
+            phase1_emit_high_water: self.phase1_emit_high_water,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2749,6 +2776,12 @@ impl OptUnroll {
             short_args,
             ctx.box_pool.clone(),
         );
+        // `OptContext::next_pos` is the strict upper bound on raw OpRefs
+        // Phase 1 allocated.  Captured here so `opref_high_water()` can
+        // floor Phase 2 / retrace's `start_fresh` above every Phase 1
+        // emit position even when `box_pool` was not extended (zero-
+        // inputarg / retrace baselines — `optimizeopt/mod.rs:2026`).
+        state.phase1_emit_high_water = ctx.next_pos;
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the

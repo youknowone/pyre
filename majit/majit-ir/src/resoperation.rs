@@ -292,7 +292,19 @@ impl OpRef {
     /// the type test by coincidence but trips any identity-based
     /// dispatch (resoperation.py:699 `AbstractInputArg` vs :250
     /// `AbstractResOp`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `types` contains `Type::Void`. RPython has no
+    /// `InputArgVoid` class — only `InputArgInt`/`InputArgFloat`/`InputArgRef`
+    /// exist (resoperation.py:719/727/739) — so a Void slot here is a
+    /// structural bookkeeping error in the caller.
     pub fn inputarg_refs(types: &[Type]) -> Vec<OpRef> {
+        debug_assert!(
+            types.iter().all(|t| *t != Type::Void),
+            "inputarg_refs: Type::Void is not a valid InputArg type \
+             (resoperation.py:719/727/739 has no InputArgVoid)"
+        );
         types
             .iter()
             .enumerate()
