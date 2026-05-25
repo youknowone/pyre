@@ -1224,8 +1224,10 @@ fn collect_cfg_coalesce_pairs(
                 {
                     continue;
                 }
-                let kind = dst_variable.kind.unwrap_or(Kind::Ref);
-                if kind != Kind::Ref {
+                // `regalloc.py:99-100 _try_coalesce` predicates on
+                // `consider_var(v) and consider_var(w)`; the Ref-kind
+                // pass requires both endpoints to be Ref.
+                if src_variable.kind != Some(Kind::Ref) || dst_variable.kind != Some(Kind::Ref) {
                     continue;
                 }
                 pairs.push((src_variable.id, dst_variable.id));
@@ -4209,18 +4211,13 @@ impl CodeWriter {
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
+        // `current_depth` is kept synchronised with
+        // `current_state.stack.len()` (pyframe.py `valuestack_w`):
+        // every emit_pushvalue_ref! / popvalue_ref! callsite and every
+        // direct +=/-= maintains `current_state.stack` alongside the
+        // depth bump, so a consumer that needs the FlowValue at
+        // `stack_base + depth - 1` reads `current_state.stack.last()`.
         let mut current_depth: u16 = 0;
-        // Per-position symbolic FlowValue for each active stack slot.
-        // `stack_values[i]` is the Variable / Constant currently
-        // occupying stack slot `i`; `stack_values.len()` matches
-        // `current_depth` when caller and macro maintenance are in
-        // sync.  Mirrors `current_state.stack` but is owned by the
-        // walker, so consumers that resolve a stack-TOS operand to a
-        // Variable can read it without threading the full FrameState.
-        // pyframe.py `valuestack_w` is the runtime counterpart;
-        // jtransform.py lowers `pushvalue`/`popvalue` to
-        // `setarrayitem_vable_r` against the same indices.
-        let mut stack_values: Vec<super::flow::FlowValue> = Vec::new();
 
         // RPython: self.assembler = Assembler() + JitCode(graph.name, ...)
         // (rpython/jit/codewriter/jitcode.py:14-15 takes name as the first
@@ -5905,11 +5902,6 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
-                // Mirror pyframe.py `pushvalue(w_object)`: record the
-                // symbolic value at the new TOS so consumers can
-                // recover the Variable for an operand they would
-                // otherwise read out of `stack_base + depth`.
-                stack_values.push(src_value.clone());
                 emit_ref_copy!(stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
@@ -5973,13 +5965,6 @@ impl CodeWriter {
                     "emit_pushvalue_ref_const: only PY_NULL is supported today; \
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
-                // Mirror pyframe.py `pushvalue(None)` for PUSH_NULL /
-                // LOAD_GLOBAL(push_null): the symbolic TOS becomes the
-                // `null_stack_sentinel()` (`Constant::none()`) so a
-                // subsequent CALL that observes the NULL slot lowers
-                // through `flatten_constant_operand` -> `ConstRef(0)`
-                // without an Opaque detour.
-                stack_values.push(null_stack_sentinel());
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
@@ -6037,12 +6022,6 @@ impl CodeWriter {
                 // cranelift (`python3 pyre/check.py --synthetic-only
                 // --synthetic-pattern comprehensions.py`).
                 let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
-                // pyframe.py `popvalue_maybe_none`: drop the TOS
-                // symbolic value alongside the runtime stack write.
-                // saturating semantics match the `$depth.saturating_sub`
-                // below so an underflow (legal during exception unwind
-                // before the entry frame is rebuilt) is tolerated.
-                let _ = stack_values.pop();
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
                 if is_portal {
@@ -6238,10 +6217,6 @@ impl CodeWriter {
                 current_block = pending_block;
                 current_state = pending_state;
                 current_depth = current_state.stack.len() as u16;
-                // Block-entry hand-off: adopt the predecessor's
-                // symbolic stack snapshot, mirroring
-                // `flowcontext.py:404 record_block`.
-                stack_values = current_state.stack.clone();
                 needs_fallthrough = true;
                 // Task #227.5 per-block walker: reset switch flag at the
                 // start of every new block iteration so a previous
@@ -6295,11 +6270,6 @@ impl CodeWriter {
                         ) {
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
-                            // Catch-edge hand-off: adopt the handler's
-                            // recorded stack snapshot (pyopcode.py
-                            // PUSH_EXC_INFO / RERAISE rebuild the
-                            // symbolic stack at the handler entry).
-                            stack_values = current_state.stack.clone();
                             needs_fallthrough = false;
                         } else if let Some(handler_depth) =
                             handler_depth_at.get(py_pc).copied().flatten()
@@ -6308,11 +6278,13 @@ impl CodeWriter {
                             // Bare handler entry without a recorded
                             // FrameState: only the depth is known, so
                             // fill the symbolic stack with null
-                            // sentinels.  A consumer that resolves
-                            // such a slot must fall back to the raw
-                            // `stack_base + depth` register because
-                            // the Variable identity isn't recoverable.
-                            stack_values.resize(handler_depth as usize, null_stack_sentinel());
+                            // sentinels.  A consumer reading
+                            // `current_state.stack[i]` here sees the
+                            // sentinel and falls back to the raw
+                            // `stack_base + i` register.
+                            current_state
+                                .stack
+                                .resize(handler_depth as usize, null_stack_sentinel());
                         }
                     }
                     // RPython flatten.py: Label(block) at block entry
@@ -9470,14 +9442,18 @@ impl CodeWriter {
         // chordal coloring assign them the same color so
         // `enforce_input_args`'s rotation lands the scratch on its
         // semantic local-i slot — matching walker's
-        // `walker_slot_for_variable` pinning regime exactly.
+        // `walker_slot_for_variable` pinning regime exactly.  Walker
+        // pin pairs are pyre-only (scratch and inputarg may never
+        // appear in the canonical graph) and bypass the normal
+        // `coalesce_variables` interference check by design.
         //
-        // Also thread CFG `link.args ↔ target.inputargs` Variable
-        // pairs from `collect_cfg_coalesce_pairs` (`regalloc.py:79-96
-        // coalesce_variables`).  The CFG sweep already feeds the
-        // SSARepr-side regalloc below; routing the same Variable-keyed
-        // pairs here puts the canonical Ref regalloc on the same
-        // pre-coalesce surface PyPy uses.
+        // CFG `link.args ↔ target.inputargs` pairs are NOT routed
+        // through the pre-merge: `RegAllocator::coalesce_variables`
+        // (`regalloc.py:79-96`) already walks every block's exits
+        // post-`make_dependencies`, calling `_try_coalesce` which
+        // honours the interference check.  Pre-merging CFG pairs
+        // here would silently merge variables that `_try_coalesce`
+        // would reject.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
@@ -9485,21 +9461,13 @@ impl CodeWriter {
         );
         // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
         // `flatten.py:154 insert_renamings` mutates the graph.
-        // Collect once here so both the canonical (above) and
-        // SSARepr-side (below at `allocate_registers`) consumers
-        // share the same pre-renaming pair set, matching upstream
-        // sequence and avoiding sensitivity to any
-        // `walker_post_walk_insert_renamings` graph mutation.
+        // Collect once here so the SSARepr-side regalloc below
+        // (which receives slot-projected pairs) sees the same
+        // pre-renaming pair set as the canonical pass above.
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
-        let canonical_ref_coalesce_pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> =
-            walker_pin_pairs
-                .iter()
-                .copied()
-                .chain(cfg_variable_pairs.iter().copied())
-                .collect();
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
-            &canonical_ref_coalesce_pairs,
+            &walker_pin_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Walker-tracked per-PC `-live-` marker positions exposed to
