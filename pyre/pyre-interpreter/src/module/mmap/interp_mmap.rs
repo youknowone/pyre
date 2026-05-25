@@ -429,16 +429,28 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 }
                 pyre_object::bytesobject::bytes_like_data(args[1])
             };
+            // `interp_mmap.py:56-69 find(w_tofind, w_start=None,
+            // w_end=None)` defaults w_start to `self.mmap.pos` then
+            // routes through rmmap.find which handles negative start /
+            // end by adding `size` and clamping to 0.
             let cur = mmap_get_attr_i64(obj, "_pos") as usize;
             let start = if args.len() >= 3 {
                 let s = unsafe { pyre_object::w_int_get_value(args[2]) };
-                if s < 0 { cur } else { s as usize }
+                if s < 0 {
+                    ((s + len as i64).max(0)) as usize
+                } else {
+                    (s as usize).min(len)
+                }
             } else {
                 cur
             };
             let end = if args.len() >= 4 {
                 let e = unsafe { pyre_object::w_int_get_value(args[3]) };
-                if e < 0 { len } else { (e as usize).min(len) }
+                if e < 0 {
+                    ((e + len as i64).max(0)) as usize
+                } else {
+                    (e as usize).min(len)
+                }
             } else {
                 len
             };
@@ -471,15 +483,28 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 }
                 pyre_object::bytesobject::bytes_like_data(args[1])
             };
+            // `interp_mmap.py:71-84 rfind(w_tofind, w_start=None,
+            // w_end=None)` defaults w_start to `self.mmap.pos`, not 0.
+            // Negative args run through rmmap.find which adds `size`
+            // and clamps to 0.
+            let cur = mmap_get_attr_i64(obj, "_pos") as usize;
             let start = if args.len() >= 3 {
                 let s = unsafe { pyre_object::w_int_get_value(args[2]) };
-                if s < 0 { 0 } else { s as usize }
+                if s < 0 {
+                    ((s + len as i64).max(0)) as usize
+                } else {
+                    (s as usize).min(len)
+                }
             } else {
-                0
+                cur
             };
             let end = if args.len() >= 4 {
                 let e = unsafe { pyre_object::w_int_get_value(args[3]) };
-                if e < 0 { len } else { (e as usize).min(len) }
+                if e < 0 {
+                    ((e + len as i64).max(0)) as usize
+                } else {
+                    (e as usize).min(len)
+                }
             } else {
                 len
             };
