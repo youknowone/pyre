@@ -1904,6 +1904,7 @@ mod execute_pure_call_tests {
         assert_eq!(result, 0, "void execute_pure_call returns the 0 sentinel");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
     fn non_elidable_ei_panics_debug_assertion() {
@@ -1913,6 +1914,7 @@ mod execute_pure_call_tests {
         let _ = execute_pure_call(&descr, double_i64 as *const () as i64, &[1]);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI")]
     fn elidable_can_raise_panics_debug_assertion() {

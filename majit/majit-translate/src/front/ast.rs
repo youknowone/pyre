@@ -15200,6 +15200,7 @@ mod tests {
         ctx.assert_stack_empty_at_stmt_boundary("z4b0_test");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stmt-boundary stack imbalance")]
     fn z4b0_assert_stack_empty_at_stmt_boundary_panics_when_value_stack_carries_residue() {
