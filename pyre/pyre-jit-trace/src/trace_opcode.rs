@@ -7548,6 +7548,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Cache
             | Instruction::NotTaken
             | Instruction::ExitInitCheck
+            | Instruction::EndFor
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
             | Instruction::GetIter
@@ -7595,7 +7596,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::Resume { .. }
         | Instruction::Cache
         | Instruction::NotTaken
-        | Instruction::ExitInitCheck => {
+        | Instruction::ExitInitCheck
+        | Instruction::EndFor => {
             // delta = 0, no shadow mutation.
         }
         Instruction::UnaryNot
