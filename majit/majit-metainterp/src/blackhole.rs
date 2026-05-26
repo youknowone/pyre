@@ -5043,6 +5043,28 @@ fn bhimpl_int_signext(a: i64, numbytes: i64) -> i64 {
     }
 }
 
+/// blackhole.py:1044 `bhimpl_int_isconstant(x): return False`.
+fn bhimpl_int_isconstant(_a: i64) -> i64 {
+    0
+}
+
+/// blackhole.py:1048 `bhimpl_float_isconstant(x): return False`.
+fn bhimpl_float_isconstant(_a: f64) -> i64 {
+    0
+}
+
+/// blackhole.py:828-830 `bhimpl_convert_float_bytes_to_longlong(a): return
+/// float2longlong(a)`.
+fn bhimpl_convert_float_bytes_to_longlong(a: f64) -> i64 {
+    a.to_bits() as i64
+}
+
+/// blackhole.py:833-835 `bhimpl_convert_longlong_bytes_to_float(a): return
+/// longlong2float(a)`.
+fn bhimpl_convert_longlong_bytes_to_float(a: i64) -> f64 {
+    f64::from_bits(a as u64)
+}
+
 // Generate handler fns from bhimpl methods via macros.
 // @arguments("i", returns="i") → argcodes "i>i" → 1 src reg + 1 dst reg = 2 bytes
 bhhandler_i_i!(handler_int_same_as, bhimpl_int_same_as);
@@ -5367,6 +5389,36 @@ macro_rules! bhhandler_ff_i {
             let b = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
             bh.registers_i[code[position + 2] as usize] = $cmp(a, b) as i64;
             Ok(position + 3)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("f", returns="i")` — argcodes `"f>i"`.
+macro_rules! bhhandler_f_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            bh.registers_i[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("i", returns="f")` — argcodes `"i>f"`.
+macro_rules! bhhandler_i_f {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            bh.registers_f[code[position + 1] as usize] = $bhimpl(a).to_bits() as i64;
+            Ok(position + 2)
         }
     };
 }
@@ -7933,22 +7985,8 @@ fn handler_float_assert_green(
 ) -> Result<usize, DispatchError> {
     Ok(p + 1)
 }
-fn handler_int_isconstant(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
-    Ok(p + 2)
-}
-fn handler_float_isconstant(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
-    Ok(p + 2)
-}
+bhhandler_i_i!(handler_int_isconstant, bhimpl_int_isconstant);
+bhhandler_f_i!(handler_float_isconstant, bhimpl_float_isconstant);
 
 // misc
 bhhandler_ii_i!(handler_uint_mul_high, bhimpl_uint_mul_high);
@@ -7969,22 +8007,14 @@ fn handler_unicodehash(
     bh.registers_i[code[p + 1] as usize] = 0;
     Ok(p + 2)
 }
-fn handler_convert_float_bytes_to_longlong(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = bh.registers_f[code[p] as usize];
-    Ok(p + 2)
-}
-fn handler_convert_longlong_bytes_to_float(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_f[code[p + 1] as usize] = bh.registers_i[code[p] as usize];
-    Ok(p + 2)
-}
+bhhandler_f_i!(
+    handler_convert_float_bytes_to_longlong,
+    bhimpl_convert_float_bytes_to_longlong
+);
+bhhandler_i_f!(
+    handler_convert_longlong_bytes_to_float,
+    bhimpl_convert_longlong_bytes_to_float
+);
 fn handler_cast_float_to_singlefloat(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
