@@ -863,53 +863,26 @@ thread_local! {
         );
         // W_PropertyObject (3 PyObjectRef fields: fget/fset/fdel),
         // W_StaticMethodObject and W_ClassMethodObject (1 PyObjectRef
-        // field each: w_function). Pre-registered ahead of the
-        // foreign-pytype loop so the GC walker reaches the inline
-        // descriptor refs.
-        let w_property_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::propertyobject::W_PropertyObject>(),
-            object_tid,
-            pyre_object::propertyobject::W_PROPERTY_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_property_tid, W_PROPERTY_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // field each: w_function) — typed payload via `#[pyre_class]`.
+        // Pre-registered ahead of the foreign-pytype loop so the GC
+        // walker reaches the inline descriptor refs.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::propertyobject::PROPERTY_TYPE as *const _ as usize,
-            w_property_tid,
+            &mut pytype_to_tid,
+            <pyre_object::propertyobject::W_PropertyObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::propertyobject::PROPERTY_TYPE as *const _ as usize,
-            w_property_tid,
-        );
-        let w_staticmethod_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::propertyobject::W_StaticMethodObject>(),
-            object_tid,
-            pyre_object::propertyobject::W_STATICMETHOD_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_staticmethod_tid, W_STATICMETHOD_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::propertyobject::STATICMETHOD_TYPE as *const _ as usize,
-            w_staticmethod_tid,
+            &mut pytype_to_tid,
+            <pyre_object::propertyobject::W_StaticMethodObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::propertyobject::STATICMETHOD_TYPE as *const _ as usize,
-            w_staticmethod_tid,
-        );
-        let w_classmethod_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::propertyobject::W_ClassMethodObject>(),
-            object_tid,
-            pyre_object::propertyobject::W_CLASSMETHOD_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_classmethod_tid, W_CLASSMETHOD_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const _ as usize,
-            w_classmethod_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const _ as usize,
-            w_classmethod_tid,
+            &mut pytype_to_tid,
+            <pyre_object::propertyobject::W_ClassMethodObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_UnionType (PEP 604 `X | Y`) carries one inline `PyObjectRef`
         // field (`args` — tuple of union members). Pre-registered ahead
