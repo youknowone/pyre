@@ -7561,6 +7561,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::GetYieldFromIter
             | Instruction::PopIter
             | Instruction::EndSend
+            | Instruction::DeleteSubscr
     )
 }
 
@@ -7644,7 +7645,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
             // operand in-place; `sym.valuestackdepth` is invariant.
         }
         Instruction::PopIter
-        | Instruction::EndSend => {
+        | Instruction::EndSend
+        | Instruction::DeleteSubscr => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
