@@ -389,16 +389,33 @@ impl PyreCallRegistry {
         found
     }
 
-    /// Same as [`Self::lookup`] with an additional cross-module leaf-
-    /// match fallback for callsites whose verbatim path missed.
+    /// Same as [`Self::lookup`] with an additional caller-scoped
+    /// `use_imports` consultation, then a narrowly-scoped cross-module
+    /// leaf-match fallback for callsites whose verbatim path missed.
     ///
-    /// Mirrors `jit_codewriter::call::CallControl::target_to_path`'s
-    /// `FunctionPath` leaf-match heuristic (`call.rs:3043-3104`) but
-    /// applied at the registry-build stage so
-    /// `flowspace_adapter::translate_op`'s `Call` arm can resolve a
-    /// caller-qualified bare-call (`["baseobjspace", "is_int_or_long"]`)
-    /// to a registered alias (`["pyre_object", "is_int_or_long"]`)
-    /// originating from a glob-import (`use pyre_object::*;`).
+    /// Resolution order, in priority:
+    ///
+    /// 1. Verbatim literal lookup ([`Self::lookup`]) — the registered
+    ///    `FunctionPathKey` hits this whenever the caller spelled the
+    ///    callee under one of its registered aliases.
+    /// 2. Caller-relative globals via [`Self::lookup_use_import`] —
+    ///    when the query is `[caller_module, leaf]`, ask the
+    ///    `use_imports` table whether `leaf` was imported into
+    ///    `caller_module`'s lexical scope.  Mirrors
+    ///    `flowcontext.py:845-866 LOAD_GLOBAL` consulting
+    ///    `frame.globals[name]` before the builtins fallback.
+    /// 3. Cross-module leaf-match safety net — scan the registry for
+    ///    free-function entries whose last segment equals the query
+    ///    leaf.  A single match resolves; multiple matches resolve only
+    ///    when they all point at the same `host_object` (alias cluster
+    ///    of one source function).  PyPy has no equivalent of this
+    ///    global scan — it is a PRE-EXISTING-ADAPTATION covering the
+    ///    code paths where the caller's `use_imports` aggregation has
+    ///    not yet captured the import that bound the alias (e.g.
+    ///    crate-level re-exports threaded through `pub use`).  The
+    ///    convergence check keeps the resolution unambiguous; the
+    ///    `query_is_free_fn` filter keeps it from picking up
+    ///    impl-method candidates that share the leaf.
     ///
     /// Restrictions match the codewriter-side leaf-match:
     ///
@@ -414,10 +431,10 @@ impl PyreCallRegistry {
     /// - Multi-match aliases of the same source (identical
     ///   `host_object` Arc identity) converge on a single resolution.
     ///
-    /// `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables the leaf-
-    /// match here as well, keeping the strict-mode envelope
-    /// consistent across registry-build and codewriter call
-    /// resolution.
+    /// `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables the
+    /// `use_imports` consultation and the cross-module safety net,
+    /// keeping the strict-mode envelope consistent across
+    /// registry-build and codewriter call resolution.
     pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
         if let Some(entry) = self.lookup(key) {
             return Some(entry);
@@ -430,6 +447,23 @@ impl PyreCallRegistry {
             return None;
         }
         let leaf = segments.last()?;
+        // PyPy `flowcontext.py:845-866 LOAD_GLOBAL`-orthodox priority:
+        // when the query is a two-segment `[caller_module, leaf]` path,
+        // consult the caller's `use_imports` (lexical globals) FIRST.
+        // The caller-relative resolution captures `use foo::bar` aliases
+        // and the typical `use ...::*` glob-import path, mirroring
+        // upstream's `frame.globals[name]` consultation before the
+        // cross-module fallback below.
+        if segments.len() == 2 {
+            let caller_module = &segments[0];
+            if let Some(resolved) = self.lookup_use_import(caller_module, leaf) {
+                let resolved_segs: Vec<String> = resolved.split("::").map(str::to_string).collect();
+                let resolved_key = FunctionPathKey::from_segments(resolved_segs.iter().cloned());
+                if let Some(entry) = self.lookup(&resolved_key) {
+                    return Some(entry);
+                }
+            }
+        }
         // Free-fn vs impl-method shape disambiguator.  A free-fn query
         // path spells `[module_or_crate, fn_name]` where every pre-leaf
         // segment is snake_case (module conv); an impl-method path
@@ -1016,6 +1050,40 @@ mod tests {
             resolved.is_none(),
             "free-fn-shape query must NOT silently latch onto an impl-method \
              candidate sharing the leaf identifier"
+        );
+    }
+
+    #[test]
+    fn lookup_with_leaf_match_uses_caller_use_imports_before_global_scan() {
+        // PyPy `flowcontext.py:845-866 LOAD_GLOBAL` parity — given two
+        // free functions named `helper` (one in `mod_a`, one in
+        // `mod_b`), a `[caller, helper]` query must resolve to whatever
+        // `caller`'s `use_imports` declares the alias to, not whichever
+        // global-leaf-scan match the registry iteration order yields.
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = PyreCallRegistry::new(bk);
+        let _a = registry.get_or_register(
+            FunctionPathKey::from_segments(["mod_a", "helper"]),
+            signature(&["x"]),
+        );
+        let b = registry.get_or_register(
+            FunctionPathKey::from_segments(["mod_b", "helper"]),
+            signature(&["x"]),
+        );
+        let mut imports = std::collections::HashMap::new();
+        imports.insert(
+            ("caller".to_string(), "helper".to_string()),
+            "mod_b::helper".to_string(),
+        );
+        registry.set_use_imports(imports);
+        let resolved = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["caller", "helper"]))
+            .expect("caller's use_imports must steer the leaf-match resolution");
+        assert!(
+            Rc::ptr_eq(&resolved, &b),
+            "use_imports[caller, helper] = mod_b::helper must select the mod_b entry, \
+             not whichever same-leaf global-scan match the iteration happens to produce \
+             first"
         );
     }
 }
