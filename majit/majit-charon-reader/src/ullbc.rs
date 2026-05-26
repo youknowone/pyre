@@ -28,6 +28,16 @@ pub struct FunDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub signature: Signature,
+    /// Charon stamps this with the `GlobalDecl` id when the function
+    /// is a compiler-synthesised static / const initialiser body
+    /// (e.g. the body that constructs `static NONE_SINGLETON`'s
+    /// value).  Production lowering treats these as values rather
+    /// than call targets — they have no call sites in user code, and
+    /// their unwind paths use orphan exception slots that the
+    /// flowspace adapter cannot lift.  `None` for ordinary function
+    /// bodies.
+    #[serde(default)]
+    pub is_global_initializer: Option<u64>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
     /// `{"Error": {...}}` otherwise. Kept as raw `Value` so a schema
