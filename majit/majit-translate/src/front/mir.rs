@@ -234,6 +234,22 @@ pub fn build_semantic_program_from_llbc(
         if fd.unstructured().is_none() {
             continue;
         }
+        // Charon emits static / const initialiser bodies (e.g. the
+        // body that builds `static NONE_SINGLETON`) as ordinary
+        // `FunDecl` entries with `is_global_initializer` set to the
+        // backing `GlobalDecl` id.  These bodies are not call targets
+        // at the JIT level, and their unwind paths use `set_raise`
+        // (`model.rs:3873`) — which mints orphan etype/evalue slots
+        // the flowspace adapter then rejects with the "undefined
+        // operand slot N as Link.args[0]" invariant break.  The AST
+        // front-end never registered them as call graphs either
+        // (it routes static initialiser values through
+        // `collect_module_statics` instead); preserve that policy
+        // here so the MIR cutover does not surface call-registry
+        // entries the rest of the pipeline never modelled.
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
         // Step 4.5 naming alignment: AST front-end keys SemanticFunction
         // by bare leaf name plus a separate `module_path`.  Mirror the
         // shape so `register_function_graph_alias` (lib.rs:444) walks
@@ -920,22 +936,94 @@ impl<'a> Lowering<'a> {
             // construction).  Operands flow as call arguments; the
             // synthetic name is best-effort from the AggregateKind tag.
             Rvalue::Aggregate(kind, operands) => {
-                let mut args: Vec<Variable> = Vec::with_capacity(operands.len());
+                // Resolve operand Variables up front; they flow into the
+                // synthesised FieldWrite chain rather than the ctor's
+                // arg list.
+                let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
                 for op in operands {
-                    args.push(self.resolve_operand(mir_bb, op)?);
+                    arg_vars.push(self.resolve_operand(mir_bb, op)?);
                 }
-                let ctor_name = aggregate_ctor_name(&kind);
+                // Resolve the user-defined owner + field names from the
+                // Adt kind's `type_id` when possible.  Charon encodes
+                // `AggregateKind::Adt(type_id, variant_idx, ..)` as
+                // `{"Adt": [type_id, variant_idx, ..]}`; struct variants
+                // use `variant_idx = null`, enum variants index into the
+                // `TypeDeclKind::Enum` variant list.
+                let resolved = self.resolve_aggregate_adt(&kind);
+                let (owner_path, ctor_name, field_names) = match resolved {
+                    Some((owner_path, ctor_name, field_names)) => {
+                        (owner_path, ctor_name, field_names)
+                    }
+                    None => {
+                        let leaf = aggregate_ctor_name(&kind);
+                        // Synthetic placeholders for non-Adt aggregates
+                        // (`Tuple`, `Array`, `Closure`) — they have no
+                        // user-defined class to resolve into.
+                        let positional = (0..arg_vars.len())
+                            .map(|i| format!("__pos_{i}"))
+                            .collect();
+                        (Vec::new(), leaf, positional)
+                    }
+                };
+                let result_ty_owner = if owner_path.is_empty() {
+                    ctor_name.clone()
+                } else {
+                    format!("{}::{}", owner_path.join("::"), ctor_name)
+                };
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                Ok((
-                    Some(OpKind::Call {
-                        target: CallTarget::synthetic_transparent_ctor(ctor_name),
-                        args,
-                        result_ty: ValueType::Int,
-                    }),
-                    res,
-                ))
+                // Emit the transparent ctor with empty args so the
+                // annotator's `ClassDesc::pycall` `args.fixedunpack(0)`
+                // check (`classdesc.rs:1247`, mirroring upstream
+                // `classdesc.py:705`) succeeds for classes whose
+                // `__init__` is not registered with the bookkeeper —
+                // the operand values flow through the FieldWrite chain
+                // below instead.  `SyntheticTransparentCtor` survives
+                // as the marker that downstream jtransform unwraps to
+                // the underlying `SomeInstance(classdef)`.
+                let ctor_target = if owner_path.is_empty() {
+                    CallTarget::synthetic_transparent_ctor(ctor_name.clone())
+                } else {
+                    CallTarget::synthetic_transparent_ctor_with_owner(
+                        owner_path.clone(),
+                        ctor_name.clone(),
+                    )
+                };
+                let bb_id = self.block_id[mir_bb];
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind: OpKind::Call {
+                        target: ctor_target,
+                        args: Vec::new(),
+                        result_ty: ValueType::Ref(Some(result_ty_owner.clone())),
+                    },
+                });
+                // Surface every operand through a separate FieldWrite so
+                // the field-to-value binding survives into the
+                // codewriter / annotator.  Field names default to
+                // `__pos_<i>` when the resolver could not project a real
+                // schema entry (tuple aggregates, deduplicated types
+                // not in the LLBC's local table).
+                for (i, value) in arg_vars.into_iter().enumerate() {
+                    let name = field_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("__pos_{i}"));
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: res.clone(),
+                            field: crate::model::FieldDescriptor {
+                                name,
+                                owner_root: Some(result_ty_owner.clone()),
+                            },
+                            value,
+                            ty: ValueType::Ref(None),
+                        },
+                    });
+                }
+                Ok((None, res))
             }
             // `Discriminant(place)` — read the integer tag of an enum
             // value. Modeled as a synthetic `FieldRead` of an
@@ -1120,6 +1208,59 @@ impl<'a> Lowering<'a> {
     /// - the resolved TypeDecl is not `Struct(_)` / `Enum(_)`;
     /// - the field index is out of range for the resolved variant.
     ///
+    /// Resolve a Charon `AggregateKind::Adt` payload to the
+    /// `(owner_path, ctor_leaf, field_names)` triple suitable for a
+    /// transparent-ctor + FieldWrite chain emission.
+    ///
+    /// Charon encodes `Aggregate(AggregateKind::Adt(type_id,
+    /// variant_idx, ..), operands)` as `{"Adt": [type_id, variant_idx,
+    /// ..]}`.  Struct aggregates use `variant_idx = null` and pull
+    /// field names straight from the `TypeDeclKind::Struct(fields)`
+    /// list; enum aggregates use a non-null `variant_idx` to select
+    /// the right `VariantDecl` and emit the qualified ctor leaf
+    /// (`Variant`) under the enum's `owner_path` (everything up to but
+    /// not including the leaf in the resolved `name_path()`).
+    ///
+    /// Returns `None` when the kind is not Adt or the LLBC has no
+    /// `TypeDecl` for `type_id`; the caller then falls back to the
+    /// generic-tag ctor name with positional `__pos_<i>` fields.
+    fn resolve_aggregate_adt(
+        &self,
+        kind: &serde_json::Value,
+    ) -> Option<(Vec<String>, String, Vec<String>)> {
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let type_id = adt.first()?.as_u64()?;
+        let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
+        let td = self.llbc.type_by_id(type_id)?;
+        let name_path = td.item_meta.name_path();
+        let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
+        let type_leaf = segments.pop().unwrap_or_default();
+        let owner_path = segments;
+        match (&td.kind, variant_idx) {
+            (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
+                let field_names: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
+                    .collect();
+                Some((owner_path, type_leaf, field_names))
+            }
+            (TypeDeclKind::Enum(variants), Some(idx)) => {
+                let v = variants.get(idx as usize)?;
+                let mut variant_owner = owner_path;
+                variant_owner.push(type_leaf);
+                let field_names: Vec<String> = v
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
+                    .collect();
+                Some((variant_owner, v.name.clone(), field_names))
+            }
+            _ => None,
+        }
+    }
+
     /// The owner_root is the LLBC TypeDecl's leaf name
     /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
     /// downstream `struct_fields` registry — populated in
@@ -1305,10 +1446,22 @@ impl<'a> Lowering<'a> {
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) =
                     self.call_target_segments(mir_bb, &reg.kind)?;
-                let target = if let Some((owner_root, leaf)) = method_hint {
-                    CallTarget::method(leaf, Some(owner_root))
-                } else {
-                    CallTarget::FunctionPath { segments }
+                // `CallTarget::Method` requires a receiver in `args[0]`
+                // (the flowspace adapter lowers it to `getattr(recv,
+                // method_leaf) → simple_call(bound_method, …)`).
+                // Charon's `impl_method_owner` matches both inherent
+                // methods (which carry `&self`) *and* associated
+                // functions (e.g. `RootScope::new()` — no `self` arg).
+                // Only the former actually has a receiver in `args[0]`;
+                // routing a 0-arg associated function through `Method`
+                // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                // has empty args").  Fall back to the `FunctionPath`
+                // segments when there is no receiver to thread.
+                let target = match method_hint {
+                    Some((owner_root, leaf)) if !args.is_empty() => {
+                        CallTarget::method(leaf, Some(owner_root))
+                    }
+                    _ => CallTarget::FunctionPath { segments },
                 };
                 OpKind::Call {
                     target,
