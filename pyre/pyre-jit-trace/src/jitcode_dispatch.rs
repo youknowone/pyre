@@ -3478,7 +3478,7 @@ fn write_residual_call_result_to_dst(
 /// the downstream optimizer surfaces the empty snapshot as a no-op.
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
-    trace_ctx: &majit_metainterp::TraceCtx,
+    trace_ctx: &TraceCtx,
     outer_jitcode_index: u32,
     entry_py_pc: u32,
 ) -> Vec<OpRef> {
@@ -3487,41 +3487,68 @@ fn collect_outer_active_boxes(
         entry_py_pc as i32,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
-    // Portal-frame ref bank read parity: when the outer frame owns the
-    // virtualizable shadow (`pyjitpl.py:1242 _opimpl_setarrayitem_vable`),
-    // trait dispatch's `store_local_value` (trace_opcode.rs:2174-2177)
-    // and `write_stack_slot` (trace_opcode.rs:590-595) write the symbolic
-    // value into `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]`
-    // and SKIP writing `registers_r[semantic_idx]` because the latter
-    // would shadow the authoritative vable view.  Walker-emitted snapshot
-    // active boxes still index by register, so for portal frames read
-    // the ref bank through the vable shadow first and fall back to
-    // `registers_r[idx]` only if the vable lookup misses (e.g. for
-    // bridge-local or non-vable scratch slots).  Mirrors `read_stack_slot`
-    // / `load_local_value`'s vable-first read path.
-    //
-    // `reg_idx == semantic_idx` for ref bank registers because
-    // `stack_slot_reg_idx(sym, stack_idx) = nlocals + stack_idx`
-    // (trace_opcode.rs:543) and locals occupy `[0..nlocals)` directly.
-    let portal_vable_owner = sym.owns_virtualizable_shadow();
-    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     // RPython `pyjitpl.py:216-233 _get_list_of_active_boxes` reads
-    // `self.registers_X[index]` directly per liveness index — an
-    // out-of-bounds index is an IndexError, not a silent NONE.  Pyre's
-    // banks are sized to the jitcode's `num_regs_X`, which the codewriter
-    // co-publishes with the liveness side-table, so every liveness
-    // index is in range by construction.  A miss here is a tracer-side
-    // invariant violation (size mismatch) — panic loudly so the bug
-    // surfaces at the encode site instead of bleeding NONE values into
-    // `encode_snapshot_boxes` where `get_opref_type(NONE)` panics with
-    // no breadcrumb pointing at the source.
+    // `self.registers_X[index]` directly per liveness index.  Pyre
+    // diverges on the Ref bank for portal-owner frames: Path 3 (task
+    // #219) retired the `registers_r` semantic-mirror write in
+    // `write_stack_slot` (trace_opcode.rs:581/605) so stack-slot colors
+    // sit at `OpRef::NONE` in `sym.registers_r`; the authoritative
+    // shadow lives in `trace_ctx.virtualizable_boxes`.  Codewriter
+    // liveness also force-alives `portal_frame_reg` / `portal_ec_reg`
+    // (codewriter.rs:3419-3424 `filter_liveness_in_place`) — these are
+    // scratch colors past `nlocals + max_stackdepth` that have no
+    // semantic frame slot, sourced instead from `sym.frame` /
+    // `sym.execution_context` (`interp_jit.py:67 reds = ['frame', 'ec']`).
     //
-    // Per-bank NONE check: if the trait dispatcher (or any path that
-    // writes to `sym.registers_X`) leaves a liveness-active slot
-    // unfilled, the snapshot encoder downstream would panic with a
-    // generic "active OpRef missing Box.type" message that obscures
-    // which bank/index was bad.  Catch it here at the source so the
-    // diagnostic points at the actual register-fill gap.
+    // Mirror the trait-side snapshot materializer
+    // (trace_opcode.rs:1340-1395 `get_list_of_active_boxes`): map each
+    // live Ref color to its semantic index via
+    // `semantic_ref_slot_for_reg_color`, read the vable shadow for
+    // portal-owner frames, and route the two portal red regs through
+    // `sym.frame` / `sym.execution_context` directly.
+    let (
+        nlocals,
+        valid_stack_only,
+        owns_vable,
+        local_color_map,
+        stack_color_map,
+        live_locals,
+        portal_frame_reg,
+        portal_ec_reg,
+    ) = if sym.jitcode.is_null() {
+        (0usize, 0usize, false, Vec::new(), Vec::new(), Vec::new(), u16::MAX, u16::MAX)
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            let payload = &jc.payload;
+            let live_locals = if payload.code_ptr.is_null() {
+                Vec::new()
+            } else {
+                let live_vars = crate::liveness::liveness_for(payload.code_ptr);
+                (0..sym.nlocals)
+                    .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
+                    .collect::<Vec<usize>>()
+            };
+            (
+                sym.nlocals,
+                sym.valuestackdepth.saturating_sub(sym.nlocals),
+                sym.owns_virtualizable_shadow(),
+                payload.metadata.pyre_color_for_semantic_local.clone(),
+                payload.metadata.stack_slot_color_map.clone(),
+                live_locals,
+                payload.metadata.portal_frame_reg,
+                payload.metadata.portal_ec_reg,
+            )
+        }
+    };
+    // Int / Float bank diagnostic panic: pyre's banks are sized to the
+    // jitcode's `num_regs_X`, which the codewriter co-publishes with the
+    // liveness side-table, so every liveness index is in range by
+    // construction.  A miss here is a tracer-side invariant violation
+    // (size mismatch) — panic loudly so the bug surfaces at the encode
+    // site instead of bleeding NONE values into `encode_snapshot_boxes`
+    // where `get_opref_type(NONE)` panics with no breadcrumb pointing at
+    // the source.
     let live_i = banks.int.clone();
     let live_r = banks.ref_.clone();
     let live_f = banks.float.clone();
@@ -3530,7 +3557,6 @@ fn collect_outer_active_boxes(
         sym.registers_r.len(),
         sym.registers_f.len(),
     );
-    let nlocals = sym.nlocals;
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
     // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
@@ -3540,12 +3566,6 @@ fn collect_outer_active_boxes(
     let vable_vsd = sym.vable_valuestackdepth;
     let vable_last_instr = sym.vable_last_instr;
     let dump_ctx = |bank: &'static str, reg_idx: u32| -> String {
-        let vable_idx = nvs + reg_idx as usize;
-        let vable_val = if portal_vable_owner {
-            format!("{:?}", trace_ctx.virtualizable_box_at(vable_idx))
-        } else {
-            "n/a (non-portal)".to_string()
-        };
         let int_hint = if bank == "int" {
             format!(
                 ", sym.vable_valuestackdepth={vable_vsd:?}, sym.vable_last_instr={vable_last_instr:?}"
@@ -3557,8 +3577,8 @@ fn collect_outer_active_boxes(
             "collect_outer_active_boxes: liveness-active {bank} \
              register {reg_idx} holds OpRef::NONE \
              (outer_jitcode_index={outer_jitcode_index}, entry_py_pc={entry_py_pc}, \
-              nlocals={nlocals}, portal_vable_owner={portal_vable_owner}, \
-              vable_len={vable_len}, vable[{vable_idx}]={vable_val}, \
+              nlocals={nlocals}, owns_vable={owns_vable}, \
+              vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
               live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
               {int_hint})",
@@ -3576,33 +3596,33 @@ fn collect_outer_active_boxes(
         active.push(v);
     }
     for &idx in &banks.ref_ {
-        let reg_idx = idx as usize;
-        // Vable-first read for portal frames.  The trait dispatch path
-        // intentionally stops mutating `registers_r` once the portal owns
-        // the vable shadow, so a non-`NONE` slot there can be stale.
-        // Reading `virtualizable_box_at(nvs + reg_idx)` first keeps the
-        // outer snapshot in lockstep with the live shadow; fall back to
-        // `registers_r` only when the vable lookup misses (non-portal
-        // sub-frames, or out-of-range indices the vable info doesn't
-        // cover).
-        let registers_r_slot = || {
-            sym.registers_r
-                .get(reg_idx)
-                .copied()
-                .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
-        };
-        let v = if portal_vable_owner {
-            match trace_ctx.virtualizable_box_at(nvs + reg_idx) {
-                Some(vable_box) if vable_box != OpRef::NONE => vable_box,
-                _ => registers_r_slot(),
+        let color = idx as usize;
+        let value = if color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX {
+            sym.frame
+        } else if color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX {
+            sym.execution_context
+        } else if owns_vable {
+            let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                &local_color_map,
+                &stack_color_map,
+                &live_locals,
+                color,
+            );
+            match semantic_idx {
+                Some(s_idx) if s_idx < nlocals + valid_stack_only => {
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    trace_ctx
+                        .virtualizable_box_at(nvs + s_idx)
+                        .unwrap_or(sym.registers_r[color])
+                }
+                _ => sym.registers_r[color],
             }
         } else {
-            registers_r_slot()
+            sym.registers_r[color]
         };
-        if v == OpRef::NONE {
-            panic!("{}", dump_ctx("ref", idx));
-        }
-        active.push(v);
+        active.push(value);
     }
     for &idx in &banks.float {
         let v = sym
