@@ -2640,6 +2640,15 @@ impl OptHeap {
                     }
                 });
             }
+            // heap.py:703 `make_nonnull(op.getarg(0))` runs in the
+            // fallthrough default of `optimize_GETARRAYITEM_GC_I`. PyPy's
+            // constant-index branch only short-circuits on a cache hit;
+            // when it falls through to record the new value (matching
+            // pyre's `arrayinfo_setitem` below), `make_nonnull` still
+            // fires.
+            if let Some(array_box) = ctx.ensure_box(array_ref) {
+                ctx.make_nonnull(&array_box);
+            }
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
