@@ -36,6 +36,13 @@ use std::sync::Arc;
 
 #[test]
 fn test_make_jitcodes_produces_graph_keyed_output() {
+    if !ensure_workspace_llbc_env() {
+        eprintln!(
+            "skipping: build/llbc/{{pyre-object,pyre-interpreter}}.ullbc missing — \
+             run `scripts/extract-llbc.sh` to enable this test"
+        );
+        return;
+    }
     // Phase E contract: `AllJitCodes::by_path` is keyed by `CallPath`
     // (graph identity), matching upstream `call.py:87 self.jitcodes`.
     // The `by_path` field's type ensures at compile time that no
@@ -139,6 +146,36 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
          is graph-keyed only:\n{}",
         offenders.join("\n")
     );
+}
+
+/// Resolve workspace LLBC artefacts and export `PYRE_MIR_FRONTEND_LLBC`
+/// when they exist. The 5-source `PYRE_JIT_GRAPH_SOURCES` fixture used
+/// by `generated::with_all_jitcodes` falls below the production
+/// auto-discovery floor (>=50 parsed_files), so test invocations must
+/// opt in explicitly. Returns `false` when the artefacts are absent so
+/// the caller can skip cleanly.
+fn ensure_workspace_llbc_env() -> bool {
+    if std::env::var_os("PYRE_MIR_FRONTEND_LLBC").is_some() {
+        return true;
+    }
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let llbc_dir = workspace_root.join("build").join("llbc");
+    let required = ["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    let mut paths = Vec::with_capacity(required.len());
+    for name in required {
+        let p = llbc_dir.join(name);
+        if !p.exists() {
+            return false;
+        }
+        paths.push(p.to_string_lossy().into_owned());
+    }
+    // SAFETY: set_var is unsafe in Rust 2024 because multi-threaded
+    // env mutation races; this test binary runs single-threaded before
+    // `with_all_jitcodes` spawns any worker, so the call is sound.
+    unsafe { std::env::set_var("PYRE_MIR_FRONTEND_LLBC", paths.join(":")) };
+    true
 }
 
 fn walk_rs_files<F: FnMut(&std::path::Path, &str)>(dir: &std::path::Path, f: &mut F) {
