@@ -7589,6 +7589,39 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::SetFunctionAttribute { .. }
             | Instruction::UnpackSequence { .. }
             | Instruction::UnpackEx { .. }
+            | Instruction::LoadName { .. }
+            | Instruction::StoreName { .. }
+            | Instruction::StoreGlobal { .. }
+            | Instruction::DeleteAttr { .. }
+            | Instruction::ImportName { .. }
+            | Instruction::ImportFrom { .. }
+            | Instruction::LoadSuperAttr { .. }
+            | Instruction::BuildInterpolation { .. }
+            | Instruction::CallIntrinsic1 { .. }
+            | Instruction::CallIntrinsic2 { .. }
+            | Instruction::GetLen
+            | Instruction::LoadSpecial { .. }
+            | Instruction::LoadFromDictOrGlobals { .. }
+            | Instruction::LoadFromDictOrDeref { .. }
+            | Instruction::LoadDeref { .. }
+            | Instruction::LoadFastCheck { .. }
+            | Instruction::LoadCommonConstant { .. }
+            | Instruction::GetAiter
+            | Instruction::GetAwaitable { .. }
+            | Instruction::StoreDeref { .. }
+            | Instruction::YieldValue { .. }
+            | Instruction::ReturnGenerator
+            | Instruction::Send { .. }
+            | Instruction::GetAnext
+            | Instruction::EndAsyncFor
+            | Instruction::CleanupThrow
+            | Instruction::WithExceptStart
+            | Instruction::DeleteFast { .. }
+            | Instruction::DeleteDeref { .. }
+            | Instruction::DeleteGlobal { .. }
+            | Instruction::DeleteName { .. }
+            | Instruction::CopyFreeVars { .. }
+            | Instruction::MakeCell { .. }
     )
 }
 
@@ -7700,7 +7733,40 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::DictMerge { .. }
         | Instruction::SetFunctionAttribute { .. }
         | Instruction::UnpackSequence { .. }
-        | Instruction::UnpackEx { .. } => {
+        | Instruction::UnpackEx { .. }
+        | Instruction::LoadName { .. }
+        | Instruction::StoreName { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::DeleteAttr { .. }
+        | Instruction::ImportName { .. }
+        | Instruction::ImportFrom { .. }
+        | Instruction::LoadSuperAttr { .. }
+        | Instruction::BuildInterpolation { .. }
+        | Instruction::CallIntrinsic1 { .. }
+        | Instruction::CallIntrinsic2 { .. }
+        | Instruction::GetLen
+        | Instruction::LoadSpecial { .. }
+        | Instruction::LoadFromDictOrGlobals { .. }
+        | Instruction::LoadFromDictOrDeref { .. }
+        | Instruction::LoadDeref { .. }
+        | Instruction::LoadFastCheck { .. }
+        | Instruction::LoadCommonConstant { .. }
+        | Instruction::GetAiter
+        | Instruction::GetAwaitable { .. }
+        | Instruction::StoreDeref { .. }
+        | Instruction::YieldValue { .. }
+        | Instruction::ReturnGenerator
+        | Instruction::Send { .. }
+        | Instruction::GetAnext
+        | Instruction::EndAsyncFor
+        | Instruction::CleanupThrow
+        | Instruction::WithExceptStart
+        | Instruction::DeleteFast { .. }
+        | Instruction::DeleteDeref { .. }
+        | Instruction::DeleteGlobal { .. }
+        | Instruction::DeleteName { .. }
+        | Instruction::CopyFreeVars { .. }
+        | Instruction::MakeCell { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
