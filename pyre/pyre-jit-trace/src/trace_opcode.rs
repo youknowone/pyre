@@ -7567,6 +7567,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::BuildTemplate
             | Instruction::PushNull
             | Instruction::Copy { .. }
+            | Instruction::BinarySlice
     )
 }
 
@@ -7656,7 +7657,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadBuildClass
         | Instruction::BuildTemplate
         | Instruction::PushNull
-        | Instruction::Copy { .. } => {
+        | Instruction::Copy { .. }
+        | Instruction::BinarySlice => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
