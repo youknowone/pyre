@@ -5274,6 +5274,32 @@ fn bhimpl_ref_isvirtual(_a: i64) -> i64 {
     0
 }
 
+/// blackhole.py:613-614 `bhimpl_assert_not_none(a): assert a`.
+fn bhimpl_assert_not_none(a: i64) {
+    assert!(a != 0, "bhimpl_assert_not_none: ref register is null");
+}
+
+/// blackhole.py:616-618 `bhimpl_record_exact_class(a, b): pass`.
+fn bhimpl_record_exact_class(_a: i64, _b: i64) {}
+
+/// blackhole.py:631-632 `bhimpl_record_exact_value_r(a, b): pass`.
+fn bhimpl_record_exact_value_r(_a: i64, _b: i64) {}
+
+/// blackhole.py:635-636 `bhimpl_record_exact_value_i(a, b): pass`.
+fn bhimpl_record_exact_value_i(_a: i64, _b: i64) {}
+
+/// blackhole.py:1062-1064 `bhimpl_loop_header(jdindex): pass`.
+fn bhimpl_loop_header(_jdindex: i64) {}
+
+/// blackhole.py:1029-1030 `bhimpl_int_assert_green(x): pass`.
+fn bhimpl_int_assert_green(_a: i64) {}
+
+/// `bhimpl_ref_assert_green(x): pass`.
+fn bhimpl_ref_assert_green(_a: i64) {}
+
+/// `bhimpl_float_assert_green(x): pass`.
+fn bhimpl_float_assert_green(_a: f64) {}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5476,6 +5502,99 @@ macro_rules! bhhandler_r_r {
             let a = bh.registers_r[code[position] as usize];
             bh.registers_r[code[position + 1] as usize] = $bhimpl(a);
             Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("r", "i")` (no return) — argcodes `"ri"`.
+macro_rules! bhhandler_ri_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            $bhimpl(a, b);
+            Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("r", "r")` (no return) — argcodes `"rr"`.
+macro_rules! bhhandler_rr_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let b = bh.registers_r[code[position + 1] as usize];
+            $bhimpl(a, b);
+            Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("i", "i")` (no return) — argcodes `"ii"`.
+macro_rules! bhhandler_ii_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            $bhimpl(a, b);
+            Ok(position + 2)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("r")` (no return) — argcodes `"r"`.
+macro_rules! bhhandler_r_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            $bhimpl(a);
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("i")` (no return) — argcodes `"i"`.
+macro_rules! bhhandler_i_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            $bhimpl(a);
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("f")` (no return) — argcodes `"f"`.
+macro_rules! bhhandler_f_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            $bhimpl(a);
+            Ok(position + 1)
         }
     };
 }
@@ -5693,27 +5812,9 @@ fn handler_float_pop(
 }
 
 // ── record_exact_class/value — no-op (blackhole.py:616-636) ─────────
-fn handler_record_exact_class(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 2)
-}
-fn handler_record_exact_value_r(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 2)
-}
-fn handler_record_exact_value_i(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 2)
-}
+bhhandler_ri_v!(handler_record_exact_class, bhimpl_record_exact_class);
+bhhandler_rr_v!(handler_record_exact_value_r, bhimpl_record_exact_value_r);
+bhhandler_ii_v!(handler_record_exact_value_i, bhimpl_record_exact_value_i);
 
 // ── cast operations (blackhole.py:800-831) ──────────────────────────
 bhhandler_f_i!(handler_cast_float_to_int, bhimpl_cast_float_to_int);
@@ -5778,20 +5879,7 @@ fn handler_int_mul_jump_if_ovf(
 
 // ── misc simple ops ─────────────────────────────────────────────────
 
-fn handler_assert_not_none(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    // blackhole.py:613 `bhimpl_assert_not_none(a): assert a`.
-    let reg = code[position] as usize;
-    let a = bh.registers_r[reg];
-    assert!(
-        a != 0,
-        "bhimpl_assert_not_none: ref register r{reg} is null"
-    );
-    Ok(position + 1)
-}
+bhhandler_r_v!(handler_assert_not_none, bhimpl_assert_not_none);
 
 fn handler_virtual_ref(
     bh: &mut BlackholeInterpreter,
@@ -5808,15 +5896,7 @@ fn handler_virtual_ref_finish(
 ) -> Result<usize, DispatchError> {
     Ok(position + 1)
 }
-fn handler_loop_header(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
-    // Advance past the 1-byte jdindex operand.
-    Ok(position + 1)
-}
+bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
 fn handler_goto_if_not_int_is_zero(
@@ -7977,27 +8057,9 @@ fn handler_goto_if_not_ptr_ne(
 }
 
 // assert_green / isconstant — no-ops
-fn handler_int_assert_green(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    Ok(p + 1)
-}
-fn handler_ref_assert_green(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    Ok(p + 1)
-}
-fn handler_float_assert_green(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    Ok(p + 1)
-}
+bhhandler_i_v!(handler_int_assert_green, bhimpl_int_assert_green);
+bhhandler_r_v!(handler_ref_assert_green, bhimpl_ref_assert_green);
+bhhandler_f_v!(handler_float_assert_green, bhimpl_float_assert_green);
 bhhandler_i_i!(handler_int_isconstant, bhimpl_int_isconstant);
 bhhandler_f_i!(handler_float_isconstant, bhimpl_float_isconstant);
 
