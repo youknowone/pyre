@@ -130,16 +130,28 @@
 //!     LLBC fixture:
 //!       - trait covered 150 → 242 / 275 (55% → 88%)
 //!       - inherent covered 102 → 114 / 125 (82% → 91%)
-//!   - **3.E (pending)** — close the residual ≈44 MIR-uncovered
-//!     entries.  Pattern groups: `XXX::drop` (Drop trait glue Charon
-//!     emits with a synthetic NameSeg shape MIR's
-//!     `impl_method_owner_for_fundecl` does not classify),
-//!     `PyPyJitDriver::{can_enter_jit,jit_merge_point}` (macro-
-//!     generated entries), `pyopcode::__extend__::*` (PyPy class-
-//!     extension methods AST treats as inherent under their owner type
-//!     but Charon files under a synthetic module).  Each subgroup
-//!     wants its own diagnostic dive; AST fallback covers them today
-//!     so the registration loop stays correct in the meantime.
+//!   - **3.E (in progress)** — close the residual MIR-uncovered
+//!     entries.  Latest audit (29 trait_missing / 0 inherent_missing
+//!     after extract_inherent_impl_methods reached full coverage) on
+//!     the `test_make_jitcodes_produces_graph_keyed_output` fixture:
+//!       - **26 entries**: `PyreBlackholeAllocator::bh_*` /
+//!         `os_str_concat` / `os_str_slice` / `os_uni_concat` /
+//!         `os_uni_slice` / `allocate_*` / `box_int` / `box_float`
+//!         (the `impl BlackholeAllocator for PyreBlackholeAllocator`
+//!         block in `pyre/pyre-jit/src/eval.rs:6537`).
+//!       - **3 entries**: `JitSuppressionGuard::drop`,
+//!         `GuardCompilingScope::drop`,
+//!         `eval::tests::TestJitParamsGuard::drop` (Drop impls in
+//!         `pyre/pyre-jit/src/eval.rs`).
+//!     All 29 live in the `pyre-jit` crate, which the auto-discover
+//!     LLBC set did not include.  Adding `pyre-jit` to
+//!     `scripts/extract-llbc.sh` and treating `pyre-jit.ullbc` as an
+//!     OPTIONAL artefact in `auto_discover_workspace_llbc_paths`
+//!     closes the gap once contributors re-run extraction; the
+//!     canonical pair (`pyre-object.ullbc`, `pyre-interpreter.ullbc`)
+//!     remains REQUIRED.  AST fallback covers the entries today via
+//!     the `extract_*` `graph: None` placeholder path, so production
+//!     stays green between extraction and consumption.
 //!   - **3.F** — `extract_trait_impls` /
 //!     `extract_inherent_impl_methods` no longer call
 //!     `build_function_graph_with_self_ty_pub` when the caller

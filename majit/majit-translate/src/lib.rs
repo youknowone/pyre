@@ -351,13 +351,25 @@ fn auto_discover_workspace_llbc_paths(
     // omitted — it is empty in current builds and adds nothing.
     // `corpus.ullbc` is the charon-spike fixture, not production.
     const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
-    let mut paths = Vec::with_capacity(REQUIRED.len());
+    // `pyre-jit.ullbc` carries `PyreBlackholeAllocator::bh_*` and the
+    // three `Drop::drop` guards the Step 6.E audit flagged as MIR-
+    // uncovered.  Optional — contributors without a fresh extraction
+    // still build with the canonical pair, with the missing entries
+    // covered by the `extract_*` `graph: None` placeholder path.
+    const OPTIONAL: &[&str] = &["pyre-jit.ullbc"];
+    let mut paths = Vec::with_capacity(REQUIRED.len() + OPTIONAL.len());
     for name in REQUIRED {
         let p = llbc_dir.join(name);
         if !p.exists() {
             return None;
         }
         paths.push(p.to_string_lossy().into_owned());
+    }
+    for name in OPTIONAL {
+        let p = llbc_dir.join(name);
+        if p.exists() {
+            paths.push(p.to_string_lossy().into_owned());
+        }
     }
     Some(paths)
 }

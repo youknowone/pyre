@@ -54,13 +54,22 @@ crate_info() {
         pyre-interpreter)
             echo "$repo_root/pyre/pyre-interpreter|--features ${CARGO_FEATURES:-cranelift}"
             ;;
+        pyre-jit)
+            # pyre-jit hosts PyreBlackholeAllocator + the Drop-impl
+            # guards (JitSuppressionGuard / GuardCompilingScope /
+            # TestJitParamsGuard) the AST extract audit lists as
+            # uncovered.  Extracting it closes the residual gap so
+            # extract_trait_impls / extract_inherent_impl_methods stop
+            # emitting `graph: None` placeholders for those entries.
+            echo "$repo_root/pyre/pyre-jit|--features ${CARGO_FEATURES:-cranelift}"
+            ;;
         *)
             echo ""
             ;;
     esac
 }
 
-ALL_CRATES="corpus pyre-object pyre-module pyre-interpreter"
+ALL_CRATES="corpus pyre-object pyre-module pyre-interpreter pyre-jit"
 
 if [[ "$#" -eq 0 ]]; then
     targets="$ALL_CRATES"
