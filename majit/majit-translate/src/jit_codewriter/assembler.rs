@@ -3964,6 +3964,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -3986,6 +3987,7 @@ mod tests {
                 OpKind::Input {
                     name: "r".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4038,6 +4040,7 @@ mod tests {
                 OpKind::Input {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4125,6 +4128,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4135,6 +4139,7 @@ mod tests {
                 OpKind::Input {
                     name: "i".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4145,6 +4150,7 @@ mod tests {
                 OpKind::Input {
                     name: "v".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4248,6 +4254,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4258,6 +4265,7 @@ mod tests {
                 OpKind::Input {
                     name: "i".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4367,6 +4375,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4377,6 +4386,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4436,6 +4446,7 @@ mod tests {
                 kind: crate::model::OpKind::Input {
                     name: "x".into(),
                     ty: crate::model::ValueType::Int,
+                    class_root: None,
                 },
             })],
             num_blocks: 1,

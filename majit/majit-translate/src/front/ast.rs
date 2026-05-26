@@ -1768,11 +1768,16 @@ pub fn lower_expr_into_graph_with_signature(
                     let self_ty = classify_fn_arg_ty(&recv.ty);
                     ctx.local_value_types
                         .insert("self".to_string(), self_ty.clone());
+                    let self_class_root = match &self_ty {
+                        ValueType::Ref(Some(root)) => Some(root.clone()),
+                        _ => None,
+                    };
                     if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: "self".to_string(),
                             ty: self_ty,
+                            class_root: self_class_root,
                         },
                         true,
                     ) {
@@ -1788,11 +1793,16 @@ pub fn lower_expr_into_graph_with_signature(
                     }
                     let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                     ctx.local_value_types.insert(name.clone(), arg_ty.clone());
+                    let arg_class_root = match &arg_ty {
+                        ValueType::Ref(Some(root)) => Some(root.clone()),
+                        _ => None,
+                    };
                     if let Some(var) = graph.push_op_var(
                         block,
                         OpKind::Input {
                             name: name.clone(),
                             ty: arg_ty,
+                            class_root: arg_class_root,
                         },
                         true,
                     ) {
@@ -2554,12 +2564,17 @@ fn allocate_loop_header_phis(
         // upstream `Variable.concretetype` access pattern post-rtyper).
         let value_type = graph_value_type_var(graph, &entry_var).unwrap_or(ValueType::Unknown);
         let name = name.clone();
+        let phi_class_root = match &value_type {
+            ValueType::Ref(Some(root)) => Some(root.clone()),
+            _ => None,
+        };
         let phi_var = graph
             .push_op_var(
                 header_entry,
                 OpKind::Input {
                     name: name.clone(),
                     ty: value_type.clone(),
+                    class_root: phi_class_root,
                 },
                 true,
             )
@@ -3768,12 +3783,17 @@ fn lazy_install_local_at_current_block_var(
     // header).
     let prior_ctx_lvi = ctx.local_var_of(name, graph);
     let prior_ctx_lvt = ctx.local_value_types.get(name).cloned();
+    let class_root = match &value_type {
+        ValueType::Ref(Some(root)) => Some(root.clone()),
+        _ => None,
+    };
     let new_var = if let Some(var) = pre_allocated_var {
         graph.push_op_with_result_var(
             current_block,
             OpKind::Input {
                 name: name.to_string(),
                 ty: value_type.clone(),
+                class_root: class_root.clone(),
             },
             var.clone(),
         );
@@ -3784,6 +3804,7 @@ fn lazy_install_local_at_current_block_var(
             OpKind::Input {
                 name: name.to_string(),
                 ty: value_type.clone(),
+                class_root,
             },
             true,
         )?
@@ -4123,11 +4144,16 @@ fn build_function_graph(
                 let self_ty = classify_fn_arg_ty(&recv.ty);
                 ctx.local_value_types
                     .insert("self".to_string(), self_ty.clone());
+                let self_class_root = match &self_ty {
+                    ValueType::Ref(Some(root)) => Some(root.clone()),
+                    _ => None,
+                };
                 if let Some(var) = graph.push_op_var(
                     entry,
                     OpKind::Input {
                         name: "self".to_string(),
                         ty: self_ty,
+                        class_root: self_class_root,
                     },
                     true,
                 ) {
@@ -4189,11 +4215,16 @@ fn build_function_graph(
                 // `getfield_gc_*/id>*` `_intbase` aliases.
                 let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                 ctx.local_value_types.insert(name.clone(), arg_ty.clone());
+                let arg_class_root = match &arg_ty {
+                    ValueType::Ref(Some(root)) => Some(root.clone()),
+                    _ => None,
+                };
                 if let Some(var) = graph.push_op_var(
                     entry,
                     OpKind::Input {
                         name: name.clone(),
                         ty: arg_ty.clone(),
+                        class_root: arg_class_root,
                     },
                     true,
                 ) {
@@ -5151,11 +5182,16 @@ fn lower_if_expr(
         };
         for (slot_idx, phi_var, ty) in phi_info {
             let name = ctx.local_first_bind_order[slot_idx].clone();
+            let class_root = match &ty {
+                ValueType::Ref(Some(root)) => Some(root.clone()),
+                _ => None,
+            };
             graph.push_op_with_result_var(
                 merge_block,
                 OpKind::Input {
                     name: name.clone(),
                     ty: ty.clone(),
+                    class_root,
                 },
                 phi_var.clone(),
             );
@@ -6165,11 +6201,16 @@ fn lower_expr(
                 .get(&name)
                 .cloned()
                 .unwrap_or(ValueType::Unknown);
+            let class_root = match &ty {
+                ValueType::Ref(Some(root)) => Some(root.clone()),
+                _ => None,
+            };
             let value_var = graph.push_op_var(
                 *block,
                 OpKind::Input {
                     name: name.clone(),
                     ty: ty.clone(),
+                    class_root,
                 },
                 true,
             );
@@ -12346,7 +12387,7 @@ mod tests {
                 .graph;
             graph.blocks.iter().find_map(|block| {
                 block.operations.iter().find_map(|op| match &op.kind {
-                    OpKind::Input { name, ty } if name == "x" => Some(ty.clone()),
+                    OpKind::Input { name, ty, .. } if name == "x" => Some(ty.clone()),
                     _ => None,
                 })
             })
@@ -12491,7 +12532,7 @@ mod tests {
                 block.operations.iter().any(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Input { name, ty }
+                        OpKind::Input { name, ty, .. }
                             if name == "depth" && *ty == ValueType::Int
                     )
                 })
@@ -12776,7 +12817,7 @@ mod tests {
                 block.operations.iter().any(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Input { name, ty }
+                        OpKind::Input { name, ty, .. }
                             if name == "err" && *ty == ValueType::Float
                     )
                 })
@@ -14808,6 +14849,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -14818,6 +14860,7 @@ mod tests {
                 OpKind::Input {
                     name: "y".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -14879,7 +14922,7 @@ mod tests {
         assert_eq!(header.operations.len(), 1);
         let phi_op = &header.operations[0];
         match &phi_op.kind {
-            OpKind::Input { name, ty } => {
+            OpKind::Input { name, ty, .. } => {
                 assert_eq!(name, "x");
                 assert_eq!(*ty, ValueType::Int);
             }

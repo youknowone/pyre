@@ -489,6 +489,7 @@ mod tests {
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
+                        class_root: None,
                     },
                 }),
                 FlatOp::Op(SpaceOperation {

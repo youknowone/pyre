@@ -4528,6 +4528,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4570,6 +4571,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4624,6 +4626,7 @@ mod tests {
                 OpKind::Input {
                     name: "receiver".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4681,6 +4684,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4691,6 +4695,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -4755,6 +4760,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -4765,6 +4771,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4829,6 +4836,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4839,6 +4847,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -5251,6 +5260,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -5261,6 +5271,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -5331,6 +5342,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5341,6 +5353,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5411,6 +5424,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5421,6 +5435,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5488,6 +5503,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5498,6 +5514,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -5561,6 +5578,7 @@ mod tests {
                 OpKind::Input {
                     name: "arg".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -5903,6 +5921,7 @@ mod tests {
                 OpKind::Input {
                     name: "cell".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -5973,6 +5992,7 @@ mod tests {
                 OpKind::Input {
                     name: "p".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6488,6 +6508,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6532,6 +6553,7 @@ mod tests {
                 OpKind::Input {
                     name: "handler".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -6625,6 +6647,7 @@ mod tests {
                 OpKind::Input {
                     name: "handler".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -6710,6 +6733,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6720,6 +6744,7 @@ mod tests {
                     OpKind::Input {
                         name: format!("a{i}"),
                         ty: ty.clone(),
+                        class_root: None,
                     },
                     true,
                 )
@@ -6764,6 +6789,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6777,6 +6803,7 @@ mod tests {
                         OpKind::Input {
                             name: format!("a{i}"),
                             ty: ty.clone(),
+                            class_root: None,
                         },
                         true,
                     )
@@ -6963,6 +6990,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -6973,6 +7001,7 @@ mod tests {
                     OpKind::Input {
                         name: format!("a{i}"),
                         ty: ty.clone(),
+                        class_root: None,
                     },
                     true,
                 )
@@ -7015,6 +7044,7 @@ mod tests {
                 OpKind::Input {
                     name: "self".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -7028,6 +7058,7 @@ mod tests {
                         OpKind::Input {
                             name: format!("a{i}"),
                             ty: ty.clone(),
+                            class_root: None,
                         },
                         true,
                     )

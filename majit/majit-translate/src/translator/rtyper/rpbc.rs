@@ -752,6 +752,7 @@ pub(crate) mod tests {
                 OpKind::Input {
                     name: "h".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -865,6 +866,7 @@ pub(crate) mod tests {
                 OpKind::Input {
                     name: "f".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )

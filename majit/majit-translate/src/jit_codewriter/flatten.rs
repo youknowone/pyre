@@ -1855,6 +1855,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: crate::model::ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )

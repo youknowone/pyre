@@ -733,6 +733,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -743,6 +744,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -787,6 +789,7 @@ mod tests {
                 OpKind::Input {
                     name: "lhs".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -797,6 +800,7 @@ mod tests {
                 OpKind::Input {
                     name: "rhs".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -841,6 +845,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -910,6 +915,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -958,6 +964,7 @@ mod tests {
                 OpKind::Input {
                     name: "obj".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )

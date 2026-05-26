@@ -409,9 +409,14 @@ fn remap_op_kind(
     remap_var: &impl Fn(&crate::flowspace::model::Variable) -> crate::flowspace::model::Variable,
 ) -> OpKind {
     match kind {
-        OpKind::Input { name, ty } => OpKind::Input {
+        OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } => OpKind::Input {
             name: name.clone(),
             ty: ty.clone(),
+            class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
@@ -1382,6 +1387,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1413,6 +1419,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1499,6 +1506,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1523,6 +1531,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -1577,6 +1586,7 @@ mod tests {
                 OpKind::Input {
                     name: "base".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )

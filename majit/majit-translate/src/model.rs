@@ -431,6 +431,18 @@ pub enum OpKind {
     Input {
         name: String,
         ty: ValueType,
+        /// Optional class identity for `Ref`-typed parameters carried
+        /// from the front-end's `syn::Type` projection.  Mirrors how
+        /// PyPy's annotator routes typed `&Foo` through
+        /// `bookkeeper.getuniqueclassdef` (`description.py:283-305
+        /// FunctionDesc.pycall`) so the rtyper's `find_attribute`
+        /// (`rclass.py:556`) lands on the actual `ClassDef`.  Populated
+        /// from the leaf segment of `type_root_ident` at
+        /// `build_function_graph` (front/ast.rs:2107-2184) when the
+        /// param's `ValueType` is `Ref(_)` and the leaf matches a known
+        /// struct in `program.struct_fields`; otherwise `None`.  Non-
+        /// `Ref` params (Int, Float, Bool, Void) always have `None`.
+        class_root: Option<String>,
     },
     ConstInt(i64),
     /// RPython `flowmodel.py:Constant(bool_value)` — a bool constant
@@ -3701,6 +3713,7 @@ impl FunctionGraph {
                 OpKind::Input {
                     name,
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 var.clone(),
             );
@@ -4113,6 +4126,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4153,6 +4167,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4179,6 +4194,7 @@ mod tests {
                 OpKind::Input {
                     name: "cond".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4276,6 +4292,7 @@ mod tests {
                 OpKind::Input {
                     name: name.to_string(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4466,6 +4483,7 @@ mod tests {
                 OpKind::Input {
                     name: "param".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -4580,6 +4598,7 @@ mod tests {
                 OpKind::Input {
                     name: "captured".into(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -4978,6 +4997,7 @@ mod tests {
             OpKind::Input {
                 name: "x".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -5034,6 +5054,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -5078,6 +5099,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );
@@ -5124,6 +5146,7 @@ mod tests {
             OpKind::Input {
                 name: "p".to_string(),
                 ty: ValueType::Unknown,
+                class_root: None,
             },
             true,
         );

@@ -602,6 +602,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -639,6 +640,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -649,6 +651,7 @@ mod tests {
                 OpKind::Input {
                     name: "b".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -690,6 +693,7 @@ mod tests {
                 OpKind::Input {
                     name: "a".into(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )

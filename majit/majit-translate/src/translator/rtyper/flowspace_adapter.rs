@@ -1742,11 +1742,22 @@ pub(crate) fn derive_subject_inputcells(
     let startblock = &legacy.blocks[legacy.startblock.0];
     let mut input_by_result: HashMap<
         crate::flowspace::model::Variable,
-        (&crate::model::ValueType, &str),
+        (&crate::model::ValueType, &str, Option<&str>),
     > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, name }) = (op.result.as_ref(), &op.kind) {
-            input_by_result.insert(result.clone(), (ty, name.as_str()));
+        if let (
+            Some(result),
+            OpKind::Input {
+                ty,
+                name,
+                class_root,
+            },
+        ) = (op.result.as_ref(), &op.kind)
+        {
+            input_by_result.insert(
+                result.clone(),
+                (ty, name.as_str(), class_root.as_deref()),
+            );
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1760,7 +1771,7 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(&(ty, name)) = input_by_result.get(var) {
+        if let Some(&(ty, name, class_root)) = input_by_result.get(var) {
             let mut shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -1769,28 +1780,40 @@ pub(crate) fn derive_subject_inputcells(
                      only `ValueType::Unknown` lacks a SomeValue shell)"
                 ))
             })?;
-            // RPython parity: when the legacy graph carries an impl-block
-            // self-type root (`graph.owner_root`) and the receiver inputarg
-            // is `name == "self"` with `ty == Ref`, project the receiver as
-            // `SomeInstance(Some(getuniqueclassdef(im_class)))` instead of
-            // the abstract `SomeInstance(None)` that `valuetype_to_someshell`
-            // yields for un-narrowed Ref.  Mirrors
-            // `description.py:283-305 FunctionDesc.pycall` lifting `self`
-            // through `bookkeeper.getuniqueclassdef(im_class)` so the
-            // rtyper's `find_attribute` (`rclass.py:556`) can route
-            // `self.<field>` against the actual ClassDef.
+            // RPython parity (M2.5g.2 — class_root structural carry):
+            // when the front-end populated `OpKind::Input.class_root` from
+            // `syn::Type`'s leaf ident, project the inputarg as
+            // `SomeInstance(Some(getuniqueclassdef(class_root)))` instead
+            // of the abstract `SomeInstance(None)` that
+            // `valuetype_to_someshell` yields for un-narrowed Ref.
+            // Mirrors `description.py:283-305 FunctionDesc.pycall` lifting
+            // each typed pointer through `bookkeeper.getuniqueclassdef`
+            // so the rtyper's `find_attribute` (`rclass.py:556`) can
+            // route attribute reads against the actual ClassDef.
             //
             // Gate: only activate the narrowing when the resulting
-            // ClassDef has non-empty `attrs` — naive activation against
-            // an empty-attrs ClassDef caused a `fib_recursive` timeout
-            // because the rtyper walks longer paths per failing-attribute
-            // lookup before Skip-classifying.  See [[z25-skip-profile-2026-05-20]].
-            if name == "self"
+            // ClassDef has non-empty `attrs` — an empty-attrs ClassDef
+            // would slow the rtyper's find_attribute walk before any
+            // Skip-classification (`fib_recursive` regression precedent
+            // — see [[z25-skip-profile-2026-05-20]]).
+            //
+            // Fallback path: when the front-end did not populate
+            // `class_root` (e.g. legacy/test fixtures pre-dating
+            // M2.5g.2.a), fall back to the impl-block self-type root
+            // carried on the legacy graph for the receiver inputarg.
+            if let Some(bk) = bookkeeper
                 && matches!(ty, crate::model::ValueType::Ref(_))
-                && let Some(bk) = bookkeeper
-                && let Some(owner_root) = legacy.owner_root.as_deref()
             {
-                if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(owner_root) {
+                let resolved_root: Option<&str> = class_root.or_else(|| {
+                    if name == "self" {
+                        legacy.owner_root.as_deref()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(root) = resolved_root
+                    && let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(root)
+                {
                     let attrs_populated = !classdef.borrow().attrs.is_empty();
                     if attrs_populated {
                         shell = crate::annotator::model::SomeValue::Instance(
@@ -2031,7 +2054,14 @@ pub fn function_graph_to_flowspace(
             }
         }
         for legacy_op in &legacy_block.operations {
-            if let (Some(result), OpKind::Input { name, ty: _ }) = (
+            if let (
+                Some(result),
+                OpKind::Input {
+                    name,
+                    ty: _,
+                    class_root: _,
+                },
+            ) = (
                 legacy_op.result.as_ref().and_then(|v| legacy.slot_of(v)),
                 &legacy_op.kind,
             ) {
@@ -2056,7 +2086,14 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
 
-            if let (Some(result), OpKind::Input { name, ty: _ }) = (
+            if let (
+                Some(result),
+                OpKind::Input {
+                    name,
+                    ty: _,
+                    class_root: _,
+                },
+            ) = (
                 legacy_op.result.as_ref().and_then(|v| legacy.slot_of(v)),
                 &legacy_op.kind,
             ) {
@@ -2558,6 +2595,7 @@ mod tests {
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
+                        class_root: None,
                     },
                 },
                 // Rebind: result is fresh; same name → alias to slot 1's Variable.
@@ -2566,6 +2604,7 @@ mod tests {
                     kind: OpKind::Input {
                         name: "x".to_string(),
                         ty: ValueType::Int,
+                        class_root: None,
                     },
                 },
             ],
@@ -2655,6 +2694,7 @@ mod tests {
             kind: OpKind::Input {
                 name: "x".to_string(),
                 ty: ValueType::Int,
+                class_root: None,
             },
         };
         let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
@@ -2676,6 +2716,7 @@ mod tests {
                 OpKind::Input {
                     name: "x".to_string(),
                     ty: ValueType::Int,
+                    class_root: None,
                 },
                 true,
             )
@@ -2686,6 +2727,7 @@ mod tests {
                 OpKind::Input {
                     name: "y".to_string(),
                     ty: ValueType::Float,
+                    class_root: None,
                 },
                 true,
             )
@@ -2696,6 +2738,7 @@ mod tests {
                 OpKind::Input {
                     name: "z".to_string(),
                     ty: ValueType::Ref(None),
+                    class_root: None,
                 },
                 true,
             )
@@ -2749,6 +2792,7 @@ mod tests {
                 OpKind::Input {
                     name: "u".to_string(),
                     ty: ValueType::Unknown,
+                    class_root: None,
                 },
                 true,
             )
@@ -3736,7 +3780,8 @@ mod tests {
         assert_eq!(
             opkind_variant_name(&OpKind::Input {
                 name: "x".into(),
-                ty: ValueType::Int
+                ty: ValueType::Int,
+                class_root: None,
             }),
             "Input"
         );
