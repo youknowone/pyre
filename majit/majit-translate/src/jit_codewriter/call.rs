@@ -3345,7 +3345,10 @@ impl CallControl {
                         for key in leaf_bucket.iter() {
                             let segs = &key.segments;
                             if segs.len() >= 2
-                                && segs.get(segs.len() - 2).map(|s| s == &receiver_leaf).unwrap_or(false)
+                                && segs
+                                    .get(segs.len() - 2)
+                                    .map(|s| s == &receiver_leaf)
+                                    .unwrap_or(false)
                             {
                                 if matched.is_some() {
                                     multi = true;

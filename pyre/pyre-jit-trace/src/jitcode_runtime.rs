@@ -1443,8 +1443,10 @@ mod tests {
             "same_as/>i",
             "same_as/>r",
         ];
-        let unexpected: Vec<&String> =
-            unwired.iter().filter(|n| !allowed.contains(&n.as_str())).collect();
+        let unexpected: Vec<&String> = unwired
+            .iter()
+            .filter(|n| !allowed.contains(&n.as_str()))
+            .collect();
         assert!(
             unexpected.is_empty(),
             "Task #85 unwired-opname snapshot drifted. New entries: {unexpected:?}. \

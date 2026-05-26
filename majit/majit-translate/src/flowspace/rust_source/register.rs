@@ -4099,8 +4099,15 @@ fn extract_argnames_from_sig(sig: &syn::Signature) -> Result<Vec<String>, Adapte
 /// free-fn key becomes `[prefix, ident]` (or `[ident]` when prefix is
 /// empty, matching the bare-name registration path in
 /// `front/ast.rs::collect_fn_returns`).  Impl-methods key as
-/// `[ImplTy, method]` regardless of prefix, mirroring how
-/// `lib.rs::register_function_graph` keys impl methods today.
+/// `[prefix-segments..., ImplTy-segments..., method]` — the file's
+/// module prefix is prepended only when the impl target was written as
+/// a bare ident (`impl PyFrame { ... }` in `pyframe.rs` → `["pyframe",
+/// "PyFrame", method]`).  When the impl target carries its own
+/// qualifier (`impl pyframe::PyFrame { ... }` from a different file)
+/// the syntactic spelling is used verbatim.  This matches the
+/// module-qualified `CallPath::for_impl_method(impl_type_root, name)`
+/// shape that `lib.rs::register_function_graph` registers (`impl_type`
+/// is derived from `method_info.self_ty_root`, the qualified path).
 ///
 /// Pure-extract — no registration, no side effects.  The slice 3
 /// consumer (`cutover.rs::populate_call_registry_from_call_graphs`)
@@ -4131,8 +4138,23 @@ pub fn extract_unsafe_fn_signatures(
                 let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
                     continue;
                 };
-                let Some(target_ident) = target_path.last().cloned() else {
-                    continue;
+                // Module-qualify the impl-method key so it matches the
+                // runtime `register_function_graph` shape
+                // (`["pyframe", "PyFrame", method]`) rather than the
+                // 2-segment leaf-only shape (`["PyFrame", method]`).
+                // When the impl target was written bare (`impl PyFrame
+                // {...}`), prepend the file's module prefix; when the
+                // impl target was written with its own qualifier (`impl
+                // pyframe::PyFrame {...}`), use that path verbatim —
+                // the syntactic spelling already disambiguates.
+                let impl_ty_segments: Vec<String> = if target_path.len() > 1 {
+                    target_path.clone()
+                } else if prefix.is_empty() {
+                    target_path.clone()
+                } else {
+                    let mut segs: Vec<String> = prefix.split("::").map(String::from).collect();
+                    segs.extend(target_path.iter().cloned());
+                    segs
                 };
                 for sub in &impl_block.items {
                     let syn::ImplItem::Fn(method) = sub else {
@@ -4144,10 +4166,9 @@ pub fn extract_unsafe_fn_signatures(
                     let Ok(argnames) = extract_argnames_from_sig(&method.sig) else {
                         continue;
                     };
-                    out.push((
-                        vec![target_ident.clone(), method.sig.ident.to_string()],
-                        Signature::new(argnames, None, None),
-                    ));
+                    let mut path = impl_ty_segments.clone();
+                    path.push(method.sig.ident.to_string());
+                    out.push((path, Signature::new(argnames, None, None)));
                 }
             }
             _ => {}
@@ -4401,9 +4422,9 @@ pub fn extract_unsafe_fn_stubs(
 
 /// Find the `syn::ReturnType` for a registered `(segments, signature)`
 /// pair by re-walking the file.  Each `extract_unsafe_fn_signatures`
-/// entry corresponds to exactly one `Item::Fn` (when `segments`
-/// matches `[prefix?, ident]`) or one `Item::Impl::ImplItem::Fn`
-/// (when `segments` matches `[ImplTy, method]`).
+/// entry corresponds to exactly one `Item::Fn` (free-fn shape
+/// `[prefix?, ident]`) or one `Item::Impl::ImplItem::Fn` (impl-method
+/// shape `[prefix-segments?..., ImplTy-segments..., method]`).
 fn lookup_return_type_for_signature(
     file: &File,
     prefix: &str,
@@ -4413,10 +4434,6 @@ fn lookup_return_type_for_signature(
         return None;
     }
     let method_or_fn_ident = segments.last()?.as_str();
-    // Two cases: `[prefix, ident]` / `[ident]` for free fn, OR
-    // `[ImplTy, method]` for impl methods.  Free-fn case: segments
-    // start with `prefix` (or is single-segment when prefix empty);
-    // impl case: segments[0] is the impl target's last ident.
     let is_free_fn_segments = if prefix.is_empty() {
         segments.len() == 1
     } else {
@@ -4429,14 +4446,25 @@ fn lookup_return_type_for_signature(
                     return Some(func.sig.output.clone());
                 }
             }
-            Item::Impl(impl_block) if !is_free_fn_segments && segments.len() == 2 => {
+            Item::Impl(impl_block) if !is_free_fn_segments => {
                 let Some(target_path) = extract_impl_target_path(&impl_block.self_ty) else {
                     continue;
                 };
-                let Some(target_ident) = target_path.last() else {
-                    continue;
+                // Reproduce the prefix-prepend logic of
+                // `extract_unsafe_fn_signatures` so the lookup key
+                // matches when the impl was written bare under a
+                // non-empty prefix.
+                let expected_impl_ty: Vec<String> = if target_path.len() > 1 {
+                    target_path.clone()
+                } else if prefix.is_empty() {
+                    target_path.clone()
+                } else {
+                    let mut segs: Vec<String> = prefix.split("::").map(String::from).collect();
+                    segs.extend(target_path.iter().cloned());
+                    segs
                 };
-                if target_ident != &segments[0] {
+                let segs_lead = &segments[..segments.len() - 1];
+                if segs_lead != expected_impl_ty.as_slice() {
                     continue;
                 }
                 for sub in &impl_block.items {
@@ -4507,13 +4535,42 @@ mod tests {
         let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
         assert_eq!(pairs.len(), 1, "safe method must be filtered out");
         let (segments, sig) = &pairs[0];
-        assert_eq!(segments, &vec!["Foo".to_string(), "method_a".to_string()]);
+        // Module-qualified: bare `impl Foo {...}` in prefix `pyobject`
+        // → `["pyobject", "Foo", "method_a"]`.
+        assert_eq!(
+            segments,
+            &vec![
+                "pyobject".to_string(),
+                "Foo".to_string(),
+                "method_a".to_string()
+            ],
+        );
         assert_eq!(sig.argnames, vec!["self".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn extract_unsafe_fn_signatures_impl_unsafe_method_keeps_qualifier_when_written() {
+        let file = parse_file("impl other_mod::Foo { pub unsafe fn method_q(&self) {} }");
+        let pairs = extract_unsafe_fn_signatures(&file, "pyobject");
+        assert_eq!(pairs.len(), 1);
+        let (segments, _) = &pairs[0];
+        // Qualified `impl other_mod::Foo {...}` keeps its syntactic
+        // path verbatim regardless of the file's prefix.
+        assert_eq!(
+            segments,
+            &vec![
+                "other_mod".to_string(),
+                "Foo".to_string(),
+                "method_q".to_string()
+            ],
+        );
     }
 
     #[test]
     fn extract_unsafe_fn_signatures_trait_impl_unsafe_method_keys_by_self_type() {
         let file = parse_file("impl SomeTrait for Bar { unsafe fn op(&self) -> i64 { 0 } }");
+        // Empty prefix: bare `impl ... for Bar` stays at `["Bar", "op"]`
+        // because there is no module-stem to prepend.
         let pairs = extract_unsafe_fn_signatures(&file, "");
         assert_eq!(pairs.len(), 1);
         let (segments, _) = &pairs[0];
@@ -4530,7 +4587,13 @@ mod tests {
         let segments_set: std::collections::HashSet<Vec<String>> =
             pairs.iter().map(|(s, _)| s.clone()).collect();
         assert!(segments_set.contains(&vec!["modx".to_string(), "unsafe_a".to_string()]));
-        assert!(segments_set.contains(&vec!["Cls".to_string(), "m".to_string()]));
+        // Impl method picks up the file prefix (`modx`) on top of the
+        // bare impl target ident.
+        assert!(segments_set.contains(&vec![
+            "modx".to_string(),
+            "Cls".to_string(),
+            "m".to_string()
+        ]));
     }
 
     // ─── Z2.5 Path C slice 3a/3b ───
@@ -4619,7 +4682,16 @@ mod tests {
         let stubs = extract_unsafe_fn_stubs(&file, "pyobject");
         assert_eq!(stubs.len(), 1);
         let (segments, _, lltype) = &stubs[0];
-        assert_eq!(segments, &vec!["Foo".to_string(), "method_b".to_string()]);
+        // Module-qualified key matches `register_function_graph`'s
+        // `["pyobject", "Foo", "method_b"]` shape.
+        assert_eq!(
+            segments,
+            &vec![
+                "pyobject".to_string(),
+                "Foo".to_string(),
+                "method_b".to_string()
+            ],
+        );
         assert!(matches!(
             lltype,
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool
