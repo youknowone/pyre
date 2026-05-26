@@ -52,15 +52,27 @@ fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
         }
         'h' | 'H' => {
             let v = unsafe { w_int_get_value(arg) } as i16;
-            out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            out.extend_from_slice(&if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            });
         }
         'i' | 'I' | 'l' | 'L' => {
             let v = unsafe { w_int_get_value(arg) } as i32;
-            out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            out.extend_from_slice(&if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            });
         }
         'q' | 'Q' | 'n' | 'N' => {
             let v = unsafe { w_int_get_value(arg) };
-            out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            out.extend_from_slice(&if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            });
         }
         'f' => {
             let v = unsafe {
@@ -70,7 +82,11 @@ fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
                     w_int_get_value(arg) as f32
                 }
             };
-            out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            out.extend_from_slice(&if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            });
         }
         'd' => {
             let v = unsafe {
@@ -80,7 +96,11 @@ fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
                     w_int_get_value(arg) as f64
                 }
             };
-            out.extend_from_slice(&if little { v.to_le_bytes() } else { v.to_be_bytes() });
+            out.extend_from_slice(&if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            });
         }
         _ => {}
     }
@@ -105,27 +125,47 @@ fn unpack_one(buf: &[u8], pos: &mut usize, code: char, little: bool) -> Option<P
         }
         'h' | 'H' => {
             let b: [u8; 2] = take!(2).try_into().unwrap();
-            let v = if little { i16::from_le_bytes(b) } else { i16::from_be_bytes(b) };
+            let v = if little {
+                i16::from_le_bytes(b)
+            } else {
+                i16::from_be_bytes(b)
+            };
             Some(w_int_new(v as i64))
         }
         'i' | 'I' | 'l' | 'L' => {
             let b: [u8; 4] = take!(4).try_into().unwrap();
-            let v = if little { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) };
+            let v = if little {
+                i32::from_le_bytes(b)
+            } else {
+                i32::from_be_bytes(b)
+            };
             Some(w_int_new(v as i64))
         }
         'q' | 'Q' | 'n' | 'N' => {
             let b: [u8; 8] = take!(8).try_into().unwrap();
-            let v = if little { i64::from_le_bytes(b) } else { i64::from_be_bytes(b) };
+            let v = if little {
+                i64::from_le_bytes(b)
+            } else {
+                i64::from_be_bytes(b)
+            };
             Some(w_int_new(v))
         }
         'f' => {
             let b: [u8; 4] = take!(4).try_into().unwrap();
-            let v = if little { f32::from_le_bytes(b) } else { f32::from_be_bytes(b) };
+            let v = if little {
+                f32::from_le_bytes(b)
+            } else {
+                f32::from_be_bytes(b)
+            };
             Some(w_float_new(v as f64))
         }
         'd' => {
             let b: [u8; 8] = take!(8).try_into().unwrap();
-            let v = if little { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) };
+            let v = if little {
+                f64::from_le_bytes(b)
+            } else {
+                f64::from_be_bytes(b)
+            };
             Some(w_float_new(v))
         }
         _ => None,

@@ -157,7 +157,10 @@ fn get_native_id() -> i64 {
         }
         return unsafe { libc::pthread_self() } as i64;
     }
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    ))]
     {
         return unsafe { libc::pthread_self() } as i64;
     }
