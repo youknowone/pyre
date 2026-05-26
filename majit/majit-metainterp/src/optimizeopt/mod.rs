@@ -6068,21 +6068,6 @@ impl OptContext {
     ///     return None
     /// ```
     ///
-    /// The `IntBound` branch maps onto `peek_ptr_info` returning `None`
-    /// when the forwarded slot is `Forwarded::IntBound` (rather than
-    /// `Forwarded::Info(PtrInfo)`), which already corresponds to
-    /// upstream's `isinstance(fw, IntBound): return None` early-out.
-    ///
-    /// The two `assert op.type == 'i'` are kept as `debug_assert_eq!`s
-    /// against `BoxRef::type_()` — strict `Type::Int` only, matching
-    /// upstream. Callers that materialize boxes via `ensure_box`
-    /// (which defaults to `Type::Void` for un-typed OpRef variants)
-    /// must thread the correct `Type::Int` at the fixture boundary
-    /// instead of relaxing this helper.
-    pub fn getrawptrinfo(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfo> {
-        self.getrawptrinfo_handle(op).map(|h| h.snapshot())
-    }
-
     /// info.py:865-878 `getrawptrinfo(op)` parity — orthodox return
     /// shape that preserves RPython `_forwarded` object identity.
     /// `PtrInfoHandle::Const(_)` for the `isinstance(op, ConstInt)`
