@@ -5870,6 +5870,24 @@ macro_rules! bhhandler_goto_if_not_r {
     };
 }
 
+/// Decode pattern `@arguments("r", "r", "L", "pc", returns="L")` — 2 ref reads +
+/// 2-byte label target; bhimpl chooses target or fall-through pc.
+macro_rules! bhhandler_goto_if_not_rr {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let b = bh.registers_r[code[position + 1] as usize];
+            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
+            let pc = position + 4;
+            Ok($bhimpl(a, b, target, pc))
+        }
+    };
+}
+
 /// blackhole.py:915-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`.
 fn bhimpl_goto_if_not_int_is_zero(a: i64, target: usize, pc: usize) -> usize {
     if a == 0 { pc } else { target }
@@ -5883,6 +5901,16 @@ fn bhimpl_goto_if_not_ptr_iszero(a: i64, target: usize, pc: usize) -> usize {
 /// blackhole.py:943-948 `bhimpl_goto_if_not_ptr_nonzero(a, target, pc)`.
 fn bhimpl_goto_if_not_ptr_nonzero(a: i64, target: usize, pc: usize) -> usize {
     if a != 0 { pc } else { target }
+}
+
+/// blackhole.py:922-927 `bhimpl_goto_if_not_ptr_eq(a, b, target, pc)`.
+fn bhimpl_goto_if_not_ptr_eq(a: i64, b: i64, target: usize, pc: usize) -> usize {
+    if a == b { pc } else { target }
+}
+
+/// blackhole.py:929-934 `bhimpl_goto_if_not_ptr_ne(a, b, target, pc)`.
+fn bhimpl_goto_if_not_ptr_ne(a: i64, b: i64, target: usize, pc: usize) -> usize {
+    if a != b { pc } else { target }
 }
 
 // ── ref operations (RPython blackhole.py:584-610) ───────────────────
@@ -8152,27 +8180,8 @@ bhhandler_goto_if_not_ff!(handler_goto_if_not_float_ne, |a: f64, b: f64| a != b)
 bhhandler_goto_if_not_ff!(handler_goto_if_not_float_gt, |a: f64, b: f64| a > b);
 bhhandler_goto_if_not_ff!(handler_goto_if_not_float_ge, |a: f64, b: f64| a >= b);
 
-// goto_if_not_ptr_eq/ne (reuse ii macro with ref registers)
-fn handler_goto_if_not_ptr_eq(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_r[code[position] as usize];
-    let b = bh.registers_r[code[position + 1] as usize];
-    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-    if a == b { Ok(position + 4) } else { Ok(target) }
-}
-fn handler_goto_if_not_ptr_ne(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_r[code[position] as usize];
-    let b = bh.registers_r[code[position + 1] as usize];
-    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-    if a != b { Ok(position + 4) } else { Ok(target) }
-}
+bhhandler_goto_if_not_rr!(handler_goto_if_not_ptr_eq, bhimpl_goto_if_not_ptr_eq);
+bhhandler_goto_if_not_rr!(handler_goto_if_not_ptr_ne, bhimpl_goto_if_not_ptr_ne);
 
 // assert_green / isconstant — no-ops
 bhhandler_i_v!(handler_int_assert_green, bhimpl_int_assert_green);
