@@ -1020,6 +1020,57 @@ impl<'a> Transformer<'a> {
             // for the missing rtyper cast remains the canonical
             // convergence path; this jtransform recovery is the
             // bridge until that lands.
+            // eq/ne with BOTH operands ref-kind → emit ptr_eq / ptr_ne
+            // directly.  PyPy `rpython/rtyper/rptr.py:167-184
+            // pairtype(PtrRepr, Repr).rtype_eq/ne` calls
+            // `hop.inputargs(r_ptr, r_ptr)` (both already ptr-typed in
+            // this branch — no cast) and emits `ptr_eq` / `ptr_ne`.
+            // Pyre's blackhole has `bhimpl_ptr_eq` / `bhimpl_ptr_ne`
+            // wired at `bh_binop_r_to_i`, so the resulting
+            // `ptr_eq/rr>i` opname dispatches without going through
+            // `cast_ptr_to_int`.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "eq" | "ne")
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r' =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let ptr_op = if binop_name == "eq" {
+                    "ptr_eq"
+                } else {
+                    "ptr_ne"
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: ptr_op.into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
+            // Mixed-kind eq/ne (one ref + one int) or any ordered
+            // ref-cmp (lt/le/gt/ge with a ref operand) — PRE-EXISTING
+            // ADAPTATION: pyre's frontend admits source patterns
+            // RPython does not (PyPy `rptr.py` only registers eq/ne for
+            // PtrRepr pairtype, never `<`/`<=`/`>`/`>=`; mixed
+            // ref+int eq/ne would surface as a TyperError at PyPy's
+            // `inputargs(r_ptr, r_ptr)` convertfromrepr step).  Pyre
+            // bridges by coercing every ref operand through
+            // `cast_ptr_to_int` and emitting `int_<op>`.  The canonical
+            // PyPy-orthodox close is fixing the source patterns
+            // upstream (use `is_null()` / explicit `as` cast) or
+            // moving the cast emission into pyre's rtyper rint
+            // compare-template — Task #146 deferred multi-session.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
