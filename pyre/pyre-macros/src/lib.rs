@@ -124,10 +124,30 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
 fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     let ty = unwrap_type_group(ty);
     // `&[PyObjectRef]` — pass the whole slice (varargs).
+    // `&[u8]`        — bytes-like (bytes + bytearray) → `bytes_like_data`,
+    //                  with a runtime type check that returns a TypeError
+    //                  on non-bytes-like input.
     if let Type::Reference(r) = ty {
         if let Type::Slice(s) = &*r.elem {
-            if type_is_py_object_ref(&s.elem) {
+            let elem = unwrap_type_group(&s.elem);
+            if type_is_py_object_ref(elem) {
                 return Ok(quote! { args });
+            }
+            if let Type::Path(p) = elem {
+                if path_is_ident(&p.path, "u8") {
+                    return Ok(quote! {
+                        {
+                            if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
+                                return ::std::result::Result::Err(
+                                    crate::PyError::type_error(
+                                        format!("argument {} must be bytes-like", #idx)
+                                    )
+                                );
+                            }
+                            unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) }
+                        }
+                    });
+                }
             }
         }
         // `&str` — borrow from `w_str_get_value`.
@@ -246,6 +266,21 @@ fn wrap_value_expr(
                 "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
                 "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
                 _ => {}
+            }
+            // `Vec<u8>` — bytes.  Borrow then wrap via `w_bytes_from_bytes`.
+            if seg.ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        let inner = unwrap_type_group(inner);
+                        if let Type::Path(ip) = inner {
+                            if path_is_ident(&ip.path, "u8") {
+                                return Ok(quote! {
+                                    ::pyre_object::bytesobject::w_bytes_from_bytes(&#value)
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
