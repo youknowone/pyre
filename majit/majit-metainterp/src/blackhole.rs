@@ -4721,6 +4721,23 @@ macro_rules! bhhandler_i_i {
     };
 }
 
+/// Decode pattern `@arguments("i", "i", "i", returns="i")` — argcodes `"iii>i"`.
+macro_rules! bhhandler_iii_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            let c = bh.registers_i[code[position + 2] as usize];
+            bh.registers_i[code[position + 3] as usize] = $bhimpl(a, b, c);
+            Ok(position + 4)
+        }
+    };
+}
+
 // ── bhimpl methods (line-by-line from RPython blackhole.py) ─────────
 
 /// blackhole.py:454-456 `bhimpl_int_same_as`.
@@ -5009,6 +5026,21 @@ fn bhimpl_int_is_zero(a: i64) -> i64 {
 /// blackhole.py:567 `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
 fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
     if a < 0 { 0 } else { a }
+}
+
+/// blackhole.py:560 `bhimpl_int_between(a, b, c): return a <= b < c`.
+fn bhimpl_int_between(a: i64, b: i64, c: i64) -> i64 {
+    (a <= b && b < c) as i64
+}
+
+/// blackhole.py:568 `bhimpl_int_signext(a, b): return int_signext(a, b)`.
+fn bhimpl_int_signext(a: i64, numbytes: i64) -> i64 {
+    match numbytes {
+        1 => (a as i8) as i64,
+        2 => (a as i16) as i64,
+        4 => (a as i32) as i64,
+        _ => a,
+    }
 }
 
 // Generate handler fns from bhimpl methods via macros.
@@ -5609,22 +5641,7 @@ fn handler_cast_int_to_float(
 }
 
 // ── int_signext (blackhole.py:566-569) ──────────────────────────────
-fn handler_int_signext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[position] as usize];
-    let numbytes = bh.registers_i[code[position + 1] as usize];
-    let result = match numbytes {
-        1 => (a as i8) as i64,
-        2 => (a as i16) as i64,
-        4 => (a as i32) as i64,
-        _ => a,
-    };
-    bh.registers_i[code[position + 2] as usize] = result;
-    Ok(position + 3)
-}
+bhhandler_ii_i!(handler_int_signext, bhimpl_int_signext);
 
 // ── overflow ops (blackhole.py:478-497) ─────────────────────────────
 
@@ -7934,27 +7951,8 @@ fn handler_float_isconstant(
 }
 
 // misc
-fn handler_uint_mul_high(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[p] as usize] as u64;
-    let b = bh.registers_i[code[p + 1] as usize] as u64;
-    bh.registers_i[code[p + 2] as usize] = ((a as u128 * b as u128) >> 64) as i64;
-    Ok(p + 3)
-}
-fn handler_int_between(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[p] as usize];
-    let b = bh.registers_i[code[p + 1] as usize];
-    let c = bh.registers_i[code[p + 2] as usize];
-    bh.registers_i[code[p + 3] as usize] = (a <= b && b < c) as i64;
-    Ok(p + 4)
-}
+bhhandler_ii_i!(handler_uint_mul_high, bhimpl_uint_mul_high);
+bhhandler_iii_i!(handler_int_between, bhimpl_int_between);
 fn handler_strhash(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
