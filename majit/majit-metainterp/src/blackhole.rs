@@ -5300,6 +5300,14 @@ fn bhimpl_ref_assert_green(_a: i64) {}
 /// `bhimpl_float_assert_green(x): pass`.
 fn bhimpl_float_assert_green(_a: f64) {}
 
+/// blackhole.py:1138-1139 `bhimpl_virtual_ref(a): return a`.
+fn bhimpl_virtual_ref(a: i64) -> i64 {
+    a
+}
+
+/// blackhole.py:1142-1143 `bhimpl_virtual_ref_finish(a): pass`.
+fn bhimpl_virtual_ref_finish(_a: i64) {}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5881,21 +5889,8 @@ fn handler_int_mul_jump_if_ovf(
 
 bhhandler_r_v!(handler_assert_not_none, bhimpl_assert_not_none);
 
-fn handler_virtual_ref(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_r[code[position + 1] as usize] = bh.registers_r[code[position] as usize];
-    Ok(position + 2)
-}
-fn handler_virtual_ref_finish(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 1)
-}
+bhhandler_r_r!(handler_virtual_ref, bhimpl_virtual_ref);
+bhhandler_r_v!(handler_virtual_ref_finish, bhimpl_virtual_ref_finish);
 bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
