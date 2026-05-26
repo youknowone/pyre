@@ -2407,15 +2407,38 @@ impl Optimizer {
         //
         // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
         // pushes a fresh `BoxRef::new_resop` slot for every visited op
-        // BEFORE the optimizer pipeline decides whether to emit. When
-        // the pipeline drops the op no `ctx.emit` is called and the
-        // slot stays unbound; the BoxRef is then an orphan with no
-        // producer `OpRc`. Seal each orphan now by synthesising a
-        // SameAs stand-in OpRc, binding the slot, and appending the
-        // stand-in to the emit-op carry list so the retrace
-        // `ensure_box` existing-pool-slot late-bind reaches it.
+        // BEFORE the optimizer pipeline decides whether to emit. Two
+        // categories of slot escape the `new_operations` carry above
+        // and need explicit handling so `Forwarded::Op(Weak<Op>)`
+        // upgrades stay live after Phase 1 context drop:
+        //
+        //   - Unbound orphan: the pipeline folded/dropped the op so
+        //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
+        //     and bind the slot.
+        //   - Synthetic-bound: a forward reference reached `ensure_box`
+        //     first; `ensure_box` minted a `SameAs` stand-in into
+        //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
+        //     never arrived to upgrade the binding to a real producer,
+        //     the stand-in itself is the chain target carrier.
+        //
+        // In both cases the stand-in OpRc must travel into
+        // `phase1_emit_ops` (and from there into
+        // `ExportedState.partial_trace_operations`) so retrace's
+        // `Weak<Op>` upgrade succeeds.
         for (idx, b) in ctx.box_pool.iter_indexed() {
-            if !b.is_resop() || b.bound_op().is_some() {
+            if !b.is_resop() {
+                continue;
+            }
+            let synth_stand_in = ctx.resop_refs.get(idx).and_then(|slot| slot.as_ref());
+            let bound = b.bound_op();
+            let bound_is_synthetic = match (&bound, synth_stand_in) {
+                (Some(boxed), Some(synth)) => std::rc::Rc::ptr_eq(boxed, synth),
+                _ => false,
+            };
+            if let Some(bound_rc) = bound {
+                if bound_is_synthetic {
+                    self.phase1_emit_ops.push(bound_rc);
+                }
                 continue;
             }
             use majit_ir::resoperation::Op;
