@@ -283,38 +283,55 @@ impl<'a> RegAllocator<'a> {
         }
     }
 
+    /// `rpython/tool/algo/regalloc.py:98-112 _try_coalesce` — kind
+    /// check + identity short-circuit + interference check + union.
+    /// Both endpoints are assumed to be in `_depgraph` already because
+    /// `make_dependencies` registered every op result, inputarg, and
+    /// link-arg-derived Variable; upstream does no `add_node` here.
     fn try_coalesce(&mut self, v: Variable, w: Variable) {
         if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
         }
-        self.try_coalesce_ids(v.id, w.id);
+        if v.id == w.id {
+            return;
+        }
+        let v0 = self._unionfind.find_rep(v.id);
+        let w0 = self._unionfind.find_rep(w.id);
+        if v0 == w0 {
+            return;
+        }
+        if self._depgraph.has_edge(&v0, &w0) {
+            return;
+        }
+        let (_, rep) = self._unionfind.union(v0, w0);
+        debug_assert_eq!(self._unionfind.find_rep(v0), rep);
+        debug_assert_eq!(self._unionfind.find_rep(w0), rep);
+        if rep == v0 {
+            self._depgraph.coalesce(w0, v0);
+        } else {
+            debug_assert_eq!(rep, w0);
+            self._depgraph.coalesce(v0, w0);
+        }
     }
 
-    /// Variable-id-keyed `try_coalesce` for external-pin pre-coalesce
-    /// (called from `perform_register_allocation_with_pairs` to honour
-    /// the walker's scratch↔inputarg slot pinning).  Skips the kind
-    /// check that [`try_coalesce`] performs; callers must ensure both
-    /// IDs name variables of `self.kind` (the pin path only generates
-    /// Ref-kind pairs, matching walker's `walker_slot_for_variable`
-    /// which only tracks Ref slots).
-    ///
-    /// Calls `_depgraph.add_node` for both endpoints BEFORE the
-    /// union/coalesce: walker scratch variables that don't appear as
-    /// op operands/results in the canonical graph aren't registered
-    /// via `make_dependencies`, so they're absent from `_depgraph.all_nodes`.
-    /// `DependencyGraph::coalesce` only modifies `neighbours` (not
-    /// `all_nodes`), so `find_node_coloring`'s `getnodes` filter would
-    /// skip a coalesced surviving node that was never explicitly
-    /// added — yielding `None` for `getcolor` and dropping the chain's
-    /// inputarg from the final coloring map.
-    fn try_coalesce_ids(&mut self, v_id: super::flow::VariableId, w_id: super::flow::VariableId) {
-        // `regalloc.py:98-99 _try_coalesce` short-circuits `if v is w:
-        // return` before touching the depgraph or union-find — a
-        // `link.arg is target.inputarg` self-edge from
-        // `coalesce_variables` has nothing to do.  The `v0 == w0` check
-        // below catches it after `find_rep`, but the identity guard
-        // avoids two `add_node` calls plus two `find_rep` lookups in
-        // the same case.
+    /// Variable-id-keyed pin coalesce for `walker_pin_pairs` —
+    /// pyre-only ADAPTATION called from
+    /// `perform_register_allocation_with_pairs` to honour the walker's
+    /// scratch↔inputarg slot pinning.  Walker scratch variables that
+    /// don't appear as op operands/results in the canonical graph
+    /// aren't registered via `make_dependencies`, so they're absent
+    /// from `_depgraph.all_nodes`.  `DependencyGraph::coalesce` only
+    /// modifies `neighbours` (not `all_nodes`), so
+    /// `find_node_coloring`'s `getnodes` filter would skip a coalesced
+    /// surviving node that was never explicitly added — yielding
+    /// `None` for `getcolor` and dropping the chain's inputarg from
+    /// the final coloring map.  Pyre's [[always-true-orthodox]]
+    /// endgame retires this adaptation as part of Path 4 (#238).
+    fn try_coalesce_pin_ids(
+        &mut self,
+        v_id: super::flow::VariableId,
+        w_id: super::flow::VariableId,
+    ) {
         if v_id == w_id {
             return;
         }
@@ -329,14 +346,11 @@ impl<'a> RegAllocator<'a> {
             return;
         }
         let (_, rep) = self._unionfind.union(v0, w0);
-        // upstream (`regalloc.py:108`): `assert uf.find_rep(v0) is
-        // uf.find_rep(w0) is rep`.
         debug_assert_eq!(self._unionfind.find_rep(v0), rep);
         debug_assert_eq!(self._unionfind.find_rep(w0), rep);
         if rep == v0 {
             self._depgraph.coalesce(w0, v0);
         } else {
-            // upstream (`regalloc.py:112`): `assert rep is w0`.
             debug_assert_eq!(rep, w0);
             self._depgraph.coalesce(v0, w0);
         }
@@ -449,7 +463,7 @@ pub fn perform_register_allocation_with_pairs(
     }
     allocator.make_dependencies();
     allocator.coalesce_variables();
-    // External pins — re-apply via `try_coalesce_ids` after
+    // External pins — re-apply via `try_coalesce_pin_ids` after
     // `make_dependencies` so the surviving rep is explicitly added to
     // `_depgraph.all_nodes` even when neither endpoint appeared as an
     // op result/arg in the canonical graph.  With the union-find
@@ -457,7 +471,7 @@ pub fn perform_register_allocation_with_pairs(
     // (`find_rep` already returns a common rep), but `add_node` still
     // matters for `find_node_coloring`'s `getnodes` filter.
     for &(v_id, w_id) in extra_coalesce_pairs {
-        allocator.try_coalesce_ids(v_id, w_id);
+        allocator.try_coalesce_pin_ids(v_id, w_id);
     }
     allocator.find_node_coloring();
 

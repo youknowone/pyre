@@ -9521,22 +9521,22 @@ impl CodeWriter {
         // semantic local-i slot — matching walker's
         // `walker_slot_for_variable` pinning regime exactly.
         //
-        // TODO (parity regression vs PyPy): CFG
-        // `link.args ↔ target.inputargs` pairs are also threaded
-        // through the pre-merge.  In PyPy
-        // (`regalloc.py:79-96 coalesce_variables` + `:98-112
-        // _try_coalesce`), CFG pairs are coalesced post-
-        // `make_dependencies` with an interference check;
-        // pre-merging here bypasses that check and silently merges
-        // pairs PyPy would reject.  The walker downstream path
-        // `walker_post_walk_insert_renamings` currently depends on
-        // these pairs sharing colors to keep the emitted `ref_copy`
-        // count bounded — honouring PyPy's interference check
-        // surfaces multi-bench timeouts (fib_recursive, fannkuch,
-        // synth/comprehensions).  The interference-aware path needs
-        // `walker_post_walk_insert_renamings` to absorb the extra
-        // copies efficiently before this can flip — separate
-        // restructure.
+        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): CFG
+        // `link.args ↔ target.inputargs` pairs are pre-merged
+        // alongside `walker_pin_pairs`.  PyPy `regalloc.py:79-96
+        // coalesce_variables` + `:98-112 _try_coalesce` coalesces CFG
+        // pairs post-`make_dependencies` with the
+        // `v0 not in dg.neighbours[w0]` interference check; this
+        // pre-merge bypasses that check and silently merges pairs
+        // PyPy would reject.  Honouring the interference check
+        // measurably regresses cranelift (fib_recursive/raise_catch/
+        // fannkuch TIMEOUT, measured 2026-05-26) because the walker's
+        // color-aggressive emit diverges from canonical's
+        // interference-respecting coloring, and
+        // `walker_post_walk_insert_renamings` emits unbounded
+        // ref_copy ops to bridge — gated on Path 4 (#238) retirement
+        // of `walker_slot_for_variable` so canonical colors become
+        // authoritative.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
