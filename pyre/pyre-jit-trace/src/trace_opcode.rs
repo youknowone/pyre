@@ -7624,6 +7624,8 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
             | Instruction::Reraise { .. }
+            | Instruction::PopJumpIfNone { .. }
+            | Instruction::PopJumpIfNotNone { .. }
     )
 }
 
@@ -7770,7 +7772,9 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::CopyFreeVars { .. }
         | Instruction::MakeCell { .. }
         | Instruction::ConvertValue { .. }
-        | Instruction::Reraise { .. } => {
+        | Instruction::Reraise { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
