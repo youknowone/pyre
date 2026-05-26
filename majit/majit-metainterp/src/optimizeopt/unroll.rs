@@ -2933,24 +2933,39 @@ impl OptUnroll {
         // the PyPy-orthodox identity carry.
         //
         // Walk `ctx.inputargs` (the canonical inputarg-order OpRef list)
-        // and pick up the `InputArgRc` at each inputarg's raw OpRef
-        // position out of `ctx.inputarg_refs`. The raw-position table
-        // can carry placeholder fillers for slots outside the active
-        // inputarg range (bridges open at `inputarg_base > 0`, so
-        // positions `[0, inputarg_base)` are unused); the indexed copy
-        // here yields exactly the partial trace's inputargs in PyPy
-        // `partial_trace.inputargs` order.
+        // and pick up the `InputArgRc` for each inputarg's raw OpRef
+        // position. The bound `InputArgRc` lives on the `box_pool` slot
+        // already, populated by either `with_inputarg_types`,
+        // `ensure_inputarg_bindings`, or retrace prefix import; reading
+        // it directly preserves any `_forwarded` state the Phase 1
+        // passes wrote on the original `InputArg` object
+        // (resoperation.py:700 `_forwarded` host). `inputarg_refs[idx]`
+        // is the strong-owner mirror — read it first, but only when
+        // it actually matches the inputarg's type and index (the
+        // `ensure_inputarg_bindings` resize fills gaps with
+        // `new_int(0)` placeholders that would otherwise leak in here);
+        // fall back to the bound BoxRef in `box_pool` for retrace paths
+        // where the prefix slot was bound before this OptContext was
+        // built, so `inputarg_refs` has no entry. Last-resort fresh
+        // allocation only when neither carries an Rc (test fixtures
+        // with empty box_pool).
         state.partial_trace_inputargs = ctx
             .inputargs
             .iter()
             .map(|ia_opref| {
                 let idx = ia_opref.raw() as usize;
-                ctx.inputarg_refs.get(idx).cloned().unwrap_or_else(|| {
-                    std::rc::Rc::new(majit_ir::InputArg::from_type(
-                        ia_opref.ty().unwrap_or(majit_ir::Type::Void),
-                        idx as u32,
-                    ))
-                })
+                let want_ty = ia_opref.ty().unwrap_or(majit_ir::Type::Void);
+                if let Some(rc) = ctx.inputarg_refs.get(idx).cloned() {
+                    if rc.tp == want_ty && rc.index == idx as u32 {
+                        return rc;
+                    }
+                }
+                if let Some(b) = ctx.box_pool.get(*ia_opref) {
+                    if let Some(ia_rc) = b.bound_inputarg() {
+                        return ia_rc;
+                    }
+                }
+                std::rc::Rc::new(majit_ir::InputArg::from_type(want_ty, idx as u32))
             })
             .collect();
         state.partial_trace_operations = optimizer.phase1_emit_ops.clone();

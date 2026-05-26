@@ -3654,9 +3654,33 @@ impl OptContext {
             // resoperation.py:240 set_forwarded(forwarded_to) where
             // forwarded_to is an AbstractResOp), retiring the
             // BoxKind::ResOp-as-chain-target carrier.
+            //
+            // `optimizer.py:392 if op is newop: return` — PyPy's
+            // identity check uses Python `is`; after `bind_op`, two
+            // separate `Rc<Box>` wrappers can share the same canonical
+            // `OpRc`, so `&op == newop` (which compares the `Rc<Box>`)
+            // misses that case and falls through to `set_forwarded_op`,
+            // tripping `set_forwarded_op`'s self-cycle assert. Honour
+            // the upstream `is` semantics by comparing the bound `Op`
+            // identities first.
+            if op
+                .bound_op()
+                .is_some_and(|o| std::rc::Rc::ptr_eq(&o, &target_op))
+            {
+                return;
+            }
             op.set_forwarded_op(&target_op);
         } else if let Some(target_ia) = newop.bound_inputarg() {
             // InputArg-target chain step (compile.py:478, unroll.py:497).
+            // Same `optimizer.py:392` idempotent gate as the
+            // `bound_op` arm above, against the bound `InputArg`
+            // identities.
+            if op
+                .bound_inputarg()
+                .is_some_and(|i| std::rc::Rc::ptr_eq(&i, &target_ia))
+            {
+                return;
+            }
             op.set_forwarded_inputarg(&target_ia);
         } else {
             // Orphan unbound non-Const BoxRef target. Phase 1's per-iter
