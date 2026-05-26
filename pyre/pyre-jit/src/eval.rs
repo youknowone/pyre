@@ -791,65 +791,28 @@ thread_local! {
             &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
             function_tid,
         );
-        // W_CellObject (closure cell) is pre-registered with its real
-        // payload size and `gc_ptr_offsets = [contents]`, mirroring the
-        // BuiltinCode/Function pattern. The foreign-pytype loop hard-codes
-        // `size_of::<PyObject>()`, missing the `contents` slot — so any
-        // cell live across a minor collection would lose the value if it
-        // went through the loop.
-        let w_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::cellobject::W_CellObject>(),
-            object_tid,
-            pyre_object::cellobject::W_CELL_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_cell_tid, W_CELL_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // W_CellObject / W_MethodObject / W_SliceObject — typed payload
+        // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
+        // pytype loop because that loop's `size_of::<PyObject>()`
+        // approximation drops the GC ptr offsets, leaving cells / bound
+        // methods / slices unscanned across a minor collection.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::cellobject::CELL_TYPE as *const _ as usize,
-            w_cell_tid,
+            &mut pytype_to_tid,
+            <pyre_object::cellobject::W_CellObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::cellobject::CELL_TYPE as *const _ as usize,
-            w_cell_tid,
-        );
-        // W_MethodObject (bound method) carries 3 inline `PyObjectRef`
-        // fields (w_function / w_self / w_class). Pre-registered ahead
-        // of the foreign-pytype loop for the same reason as W_Cell:
-        // the loop's `size_of::<PyObject>()` approximation drops the
-        // gc_ptr_offsets, leaving live methods unscanned across a
-        // minor collection.
-        let w_method_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::methodobject::W_MethodObject>(),
-            object_tid,
-            pyre_object::methodobject::W_METHOD_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_method_tid, W_METHOD_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
-            w_method_tid,
+            &mut pytype_to_tid,
+            <pyre_object::methodobject::W_MethodObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
-            w_method_tid,
-        );
-        // W_SliceObject (Python slice) carries 3 inline `PyObjectRef`
-        // fields (start / stop / step). Pre-registered ahead of the
-        // foreign-pytype loop for the same reason as W_Cell/W_Method.
-        let w_slice_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::sliceobject::W_SliceObject>(),
-            object_tid,
-            pyre_object::sliceobject::W_SLICE_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_slice_tid, W_SLICE_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
-            w_slice_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
-            w_slice_tid,
+            &mut pytype_to_tid,
+            <pyre_object::sliceobject::W_SliceObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_SuperObject (super proxy) — typed payload via `#[pyre_class]`;
         // GC descriptor carries the 2 inline `PyObjectRef` fields
@@ -921,24 +884,14 @@ thread_local! {
         );
         // W_MemberDescr (`__slots__` member descriptor) carries one
         // inline `PyObjectRef` field (`w_cls`) plus a `*const String`
-        // (`name`) and a `u32` index. Pre-registered ahead of the
-        // foreign-pytype loop so the GC walker reaches `w_cls`. The
-        // `name` pointer is intentionally outside `gc_ptr_offsets`
-        // because it points into a non-PyObject heap allocation.
-        let w_member_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::memberobject::W_MemberDescr>(),
-            object_tid,
-            pyre_object::memberobject::W_MEMBER_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_member_tid, W_MEMBER_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // (`name`) and a `u32` index. The `#[pyre_class]` macro's
+        // auto-detection skips both non-PyObjectRef fields, so the
+        // descriptor's ptr_offsets only includes `w_cls`.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::memberobject::MEMBER_TYPE as *const _ as usize,
-            w_member_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::memberobject::MEMBER_TYPE as *const _ as usize,
-            w_member_tid,
+            &mut pytype_to_tid,
+            <pyre_object::memberobject::W_MemberDescr
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_BytesObject (immutable byte sequence) carries a raw
         // `*const Vec<u8>` (`data`) and a `usize` length, neither a
