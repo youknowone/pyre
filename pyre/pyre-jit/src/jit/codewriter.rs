@@ -9556,13 +9556,17 @@ impl CodeWriter {
         // pre-merge bypasses that check and silently merges pairs
         // PyPy would reject.  Honouring the interference check
         // measurably regresses cranelift (fib_recursive/raise_catch/
-        // fannkuch TIMEOUT, measured 2026-05-26) because the walker's
-        // color-aggressive emit diverges from canonical's
-        // interference-respecting coloring, and
-        // `walker_post_walk_insert_renamings` emits unbounded
-        // ref_copy ops to bridge — gated on Path 4 (#238) retirement
-        // of `walker_slot_for_variable` so canonical colors become
-        // authoritative.
+        // fannkuch TIMEOUT, measured 2026-05-26).  Re-measured
+        // 2026-05-26 cycle-10 on top of LoadName/LoadConst
+        // orphan-Variable closures (commits `ba48e1ab61`, `1606e187de`):
+        // dynasm fib_recursive 2.44s vs cpython 1.62s = 1.5x FAIL.
+        // The orphan-Variable closures did not remove the bridge
+        // ref_copy cost.  Root cause is walker's color-aggressive
+        // emit diverging from canonical's interference-respecting
+        // coloring; `walker_post_walk_insert_renamings` emits
+        // unbounded ref_copy ops to bridge — gated on Path 4 (#238)
+        // retirement of `walker_slot_for_variable` so canonical
+        // colors become authoritative.
         let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
             &graph,
             &walker_slot_for_variable,
