@@ -5254,6 +5254,16 @@ bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
 // Wire as alias.
 bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
 
+/// blackhole.py:643 `bhimpl_ref_copy(a): return a` — @arguments("r", returns="r").
+fn bhimpl_ref_copy(a: i64) -> i64 {
+    a
+}
+
+/// blackhole.py:646 `bhimpl_float_copy(a): return a` — @arguments("f", returns="f").
+fn bhimpl_float_copy(a: f64) -> f64 {
+    a
+}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5445,6 +5455,21 @@ macro_rules! bhhandler_i_f {
     };
 }
 
+/// Decode pattern `@arguments("r", returns="r")` — argcodes `"r>r"`.
+macro_rules! bhhandler_r_r {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            bh.registers_r[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
 bhhandler_ff_f!(handler_float_add, bhimpl_float_add);
 bhhandler_ff_f!(handler_float_sub, bhimpl_float_sub);
 bhhandler_ff_f!(handler_float_mul, bhimpl_float_mul);
@@ -5569,22 +5594,8 @@ bhhandler_r_i!(handler_ptr_iszero, bhimpl_ptr_iszero);
 bhhandler_r_i!(handler_ptr_nonzero, bhimpl_ptr_nonzero);
 
 // ref/float copy (blackhole.py:641-645)
-fn handler_ref_copy(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_r[code[position + 1] as usize] = bh.registers_r[code[position] as usize];
-    Ok(position + 2)
-}
-fn handler_float_copy(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_f[code[position + 1] as usize] = bh.registers_f[code[position] as usize];
-    Ok(position + 2)
-}
+bhhandler_r_r!(handler_ref_copy, bhimpl_ref_copy);
+bhhandler_f_f!(handler_float_copy, bhimpl_float_copy);
 
 // float_return (blackhole.py:853-857)
 fn handler_float_return(
