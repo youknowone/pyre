@@ -458,7 +458,25 @@ impl BoxRef {
         // `assert forwarded_to is not self` (resoperation.py:241).
         // Always-on assert so a release build can't accept a one-node
         // forwarding cycle that would make `get_box_replacement()` spin.
+        // After `bind_op` / `bind_inputarg` two distinct `Rc<Box>`
+        // wrappers can share the same canonical bound `OpRc`/`InputArgRc`;
+        // the `Rc::ptr_eq` on `self.0` alone misses that case, so also
+        // compare the bound handles when both sides carry one.
         assert!(!Rc::ptr_eq(&self.0, &target.0));
+        if let (Some(self_op), Some(target_op)) = (self.bound_op(), target.bound_op()) {
+            assert!(
+                !Rc::ptr_eq(&self_op, &target_op),
+                "set_forwarded_box on a BoxRef that wraps the same bound \
+                 Op as the target creates a one-node chain cycle"
+            );
+        }
+        if let (Some(self_ia), Some(target_ia)) = (self.bound_inputarg(), target.bound_inputarg()) {
+            assert!(
+                !Rc::ptr_eq(&self_ia, &target_ia),
+                "set_forwarded_box on a BoxRef that wraps the same bound \
+                 InputArg as the target creates a one-node chain cycle"
+            );
+        }
         // RPython AbstractValue invariant: `Const` is not a subclass of
         // `AbstractResOpOrInputArg` (history.py:182), so `set_forwarded`
         // is undefined on Const objects (resoperation.py:50 default
@@ -479,6 +497,17 @@ impl BoxRef {
     /// `Weak<InputArg>`. Mirror of `set_forwarded_op` for the InputArg
     /// chain-step case (compile.py:478, unroll.py:497).
     pub fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
+        // `resoperation.py:241 assert forwarded_to is not self` —
+        // compare against this BoxRef's bound InputArg so a chain step
+        // targeting the box's own identity panics instead of spinning
+        // the walker.
+        if let Some(self_ia) = self.bound_inputarg() {
+            assert!(
+                !Rc::ptr_eq(&self_ia, target),
+                "set_forwarded_inputarg on the same InputArg creates a \
+                 one-node chain cycle"
+            );
+        }
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
             "set_forwarded_inputarg on Const violates RPython AbstractValue \
@@ -494,6 +523,17 @@ impl BoxRef {
     /// entry) — chain walkers upgrade the `Weak` and continue from
     /// there.
     pub fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
+        // `resoperation.py:241 assert forwarded_to is not self` —
+        // compare against this BoxRef's bound Op so a chain step
+        // targeting the box's own identity panics instead of spinning
+        // the walker.
+        if let Some(self_op) = self.bound_op() {
+            assert!(
+                !Rc::ptr_eq(&self_op, target),
+                "set_forwarded_op on the same Op creates a one-node chain \
+                 cycle"
+            );
+        }
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
             "set_forwarded_op on Const violates RPython AbstractValue \
