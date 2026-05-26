@@ -3516,7 +3516,16 @@ fn collect_outer_active_boxes(
         portal_frame_reg,
         portal_ec_reg,
     ) = if sym.jitcode.is_null() {
-        (0usize, 0usize, false, Vec::new(), Vec::new(), Vec::new(), u16::MAX, u16::MAX)
+        (
+            0usize,
+            0usize,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            u16::MAX,
+            u16::MAX,
+        )
     } else {
         unsafe {
             let jc = &*sym.jitcode;
@@ -8690,16 +8699,14 @@ mod tests {
         // Sort by total IR-cost ascending — lowest-cost arms first
         // are the first candidates for production_walker_handles
         // expansion.
-        stats.sort_by_key(|s| {
-            s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops
-        });
+        stats
+            .sort_by_key(|s| s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops);
         eprintln!(
             "{:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>6}  {}",
             "code", "ops", "resid", "inline", "vable_w", "gc_emit", "total", "name"
         );
         for s in &stats {
-            let total_emit =
-                s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops;
+            let total_emit = s.residual_calls + s.inline_calls + s.vable_writes + s.other_emit_ops;
             eprintln!(
                 "{:>5} {:>6} {:>8} {:>8} {:>8} {:>8} {:>6}  {}",
                 s.code_len,

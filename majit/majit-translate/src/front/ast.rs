@@ -9041,11 +9041,14 @@ fn lookup_module_static_literal(
 }
 
 /// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
-/// as bare path-expression values; `flowspace_adapter` builds a
-/// 0-arg `HostObject::new_class(name, [])` for them and the result
-/// lands as a `SomeInstance(classdef)`.  jtransform does not elide
-/// them.
-fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
+/// as bare path-expression values; `flowspace_adapter` pre-folds them
+/// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
+/// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
+/// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
+/// before `jtransform`).  Exposed `pub(crate)` so
+/// `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
+/// reads the same allowlist.
+pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();
     matches!(
         path.as_slice(),

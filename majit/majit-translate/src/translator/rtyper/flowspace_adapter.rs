@@ -593,6 +593,27 @@ pub fn translate_op(
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
     graph: &crate::model::FunctionGraph,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
+    // RPython parity: unit-variant ctors (`StepResult::Continue`,
+    // `LoopResult::Done`, …) pre-fold to `Hlvalue::Constant(
+    // HostObject(prebuilt_instance))` in the pre-pass (see
+    // `legacy_const_define_hlvalue`).  Skip translation here so they
+    // do not double-emit as `simple_call(HostClass(qualname))` —
+    // matches the `ConstInt`/`ConstBool`/`ConstFloat` pattern below
+    // (the pre-pass owns the slot's `Hlvalue::Constant`, translate_op
+    // emits no FlowspaceOp).
+    if let OpKind::Call {
+        target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
+        args,
+        ..
+    } = &op.kind
+        && args.is_empty()
+    {
+        let mut segments = owner_path.clone();
+        segments.push(name.clone());
+        if crate::front::ast::is_synthetic_unit_variant_path(&segments) {
+            return Ok(Vec::new());
+        }
+    }
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
@@ -1352,6 +1373,63 @@ fn legacy_const_define_hlvalue(
                 LowLevelType::Float,
             )),
         )),
+        // RPython parity: unit-variant ctors (`StepResult::Continue`,
+        // `LoopResult::Done`, …) are pre-built singleton instances at
+        // the rtyper layer (`rclass.InstanceRepr.
+        // get_reusable_prebuilt_instance`), so the codewriter never
+        // sees a call op for them — the rtyper folds them to
+        // `Constant(prebuilt_ptr)` before `jtransform` runs.
+        //
+        // Pyre's frontend (`front/ast.rs:5642`) lowers a unit-variant
+        // path expression to `OpKind::Call { target:
+        // SyntheticTransparentCtor, args: [], result_ty: Unknown }`;
+        // without this pre-fold the args=[] call falls through to
+        // `handle_residual_call` and leaves a `residual_call_r/d>r`
+        // op in the walker arm body that breaks
+        // `production_walker_handles` activation (Task #333).
+        //
+        // The frontend's `is_synthetic_unit_variant_path` allowlist
+        // (StepResult, LoopResult, JitAction, CompareOp variants) is
+        // the same set consulted here — both layers agree on which
+        // paths are unit-variant singletons.
+        OpKind::Call {
+            target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
+            args,
+            ..
+        } if args.is_empty() => {
+            let mut segments = owner_path.clone();
+            segments.push(name.clone());
+            if !crate::front::ast::is_synthetic_unit_variant_path(&segments) {
+                return None;
+            }
+            // PyPy rtyper folds unit-variant PBC constructors into a
+            // singleton instance pointer before jtransform sees them
+            // (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  The
+            // pre-fold here materialises the same shape inside the
+            // flowspace graph so the per-graph annotator surfaces a
+            // `Hlvalue::Constant(HostObject(prebuilt_instance))` to
+            // downstream rtyper passes.  NOTE (2026-05-26): this only
+            // affects graphs that go through the rtyper Match arm
+            // (`dual_gate_publish_concretetypes`).  Per-opcode arm
+            // body graphs registered via `register_function_graph`
+            // typically take the Skip arm and bypass this pre-fold;
+            // the residual `OpKind::Call` survives into jtransform
+            // and is emitted as a `residual_call_r_r` wrapper there.
+            // Closing that gap requires either an early-pass on
+            // `FunctionGraph` ahead of jtransform or extending
+            // `is_synthetic_result_option_ctor` to handle the args=0
+            // case — tracked under M4 walker re-enable.
+            let qualname = segments.join(".");
+            let class_obj = HostObject::new_class(qualname, Vec::new());
+            let instance = class_obj.reusable_prebuilt_instance()?;
+            Some((
+                result,
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::HostObject(instance),
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                )),
+            ))
+        }
         _ => None,
     }
 }
