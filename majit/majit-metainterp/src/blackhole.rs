@@ -5300,6 +5300,15 @@ fn bhimpl_ref_assert_green(_a: i64) {}
 /// `bhimpl_float_assert_green(x): pass`.
 fn bhimpl_float_assert_green(_a: f64) {}
 
+/// blackhole.py:648-650 `bhimpl_int_guard_value(a): pass`.
+fn bhimpl_int_guard_value(_a: i64) {}
+
+/// blackhole.py:651-653 `bhimpl_ref_guard_value(a): pass`.
+fn bhimpl_ref_guard_value(_a: i64) {}
+
+/// blackhole.py:654-656 `bhimpl_float_guard_value(a): pass`.
+fn bhimpl_float_guard_value(_a: f64) {}
+
 /// blackhole.py:1138-1139 `bhimpl_virtual_ref(a): return a`.
 fn bhimpl_virtual_ref(a: i64) -> i64 {
     a
@@ -5775,27 +5784,9 @@ fn handler_float_return(
 }
 
 // ── guard_value — no-op in blackhole (blackhole.py:648-656) ─────────
-fn handler_int_guard_value(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 1)
-}
-fn handler_ref_guard_value(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 1)
-}
-fn handler_float_guard_value(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position + 1)
-}
+bhhandler_i_v!(handler_int_guard_value, bhimpl_int_guard_value);
+bhhandler_r_v!(handler_ref_guard_value, bhimpl_ref_guard_value);
+bhhandler_f_v!(handler_float_guard_value, bhimpl_float_guard_value);
 
 // ── push/pop (blackhole.py:661-679) ─────────────────────────────────
 fn handler_int_push(
