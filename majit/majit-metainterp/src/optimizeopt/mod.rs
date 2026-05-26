@@ -4161,45 +4161,6 @@ impl OptContext {
         op.get_box_replacement(false).ptr_info_handle()
     }
 
-    /// `optimizer.py:99-113 getintbound(op)` orthodox identity reader.
-    ///
-    /// Returns `IntBoundHandle::Const(from_constant(v))` for a
-    /// `ConstInt` terminal (line 102-103) and
-    /// `IntBoundHandle::Live(rc)` when the terminal's `_forwarded`
-    /// slot already holds an `OpInfo::IntBound(rc)` (line 105-108
-    /// `if cur is not None and isinstance(cur, IntBound): return cur`).
-    /// Returns `None` when the slot carries any other `Forwarded`
-    /// variant — caller decides whether to lazy-install via
-    /// [`Self::getintbound`].
-    ///
-    /// This is the IntBound counterpart of `peek_ptr_info_handle`;
-    /// two handles cloned from the same `Live` cell observe each
-    /// other's `.intersect(...)` / `.make_ge(...)` mutations
-    /// (`Rc::ptr_eq` ≡ `is`).
-    pub fn peek_intbound_handle(&self, op: &crate::r#box::BoxRef) -> Option<IntBoundHandle> {
-        // optimizer.py:100 `assert op.type == 'i'`. Void admitted as the
-        // pyre placeholder-box tolerance noted in `setintbound`'s comment
-        // (convergence path: D-3 box_pool retirement).
-        assert!(
-            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "peek_intbound_handle: expected 'i'-typed BoxRef, got {:?}",
-            op.type_()
-        );
-        let resolved = op.get_box_replacement(false);
-        // optimizer.py:107 `assert op.type == 'i'` — re-check post-walker.
-        assert!(
-            matches!(resolved.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "peek_intbound_handle: chain terminal lost 'i' type, got {:?}",
-            resolved.type_()
-        );
-        if let Some(Value::Int(v)) = resolved.const_value() {
-            return Some(IntBoundHandle::const_(
-                crate::optimizeopt::intutils::IntBound::from_constant(v as i64),
-            ));
-        }
-        resolved.int_bound_handle().map(IntBoundHandle::live)
-    }
-
     /// info.py: getptrinfo(op) — mutable variant. Walks the chain on `op`
     /// and runs the closure against the terminal BoxRef's `_forwarded`
     /// PtrInfo via `ptr_info_mut()`. The BoxRef slot is the authoritative
