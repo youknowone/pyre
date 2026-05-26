@@ -5997,57 +5997,59 @@ bhhandler_ii_i!(handler_int_signext, bhimpl_int_signext);
 
 // ── overflow ops (blackhole.py:478-497) ─────────────────────────────
 
-fn handler_int_add_jump_if_ovf(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let a = bh.registers_i[code[position + 2] as usize];
-    let b = bh.registers_i[code[position + 3] as usize];
-    let pc = position + 5;
+/// blackhole.py:478-483 `bhimpl_int_add_jump_if_ovf(label, a, b)`.
+/// On overflow: returns `(None, target)` so the handler jumps to label.
+/// On success: returns `(Some(sum), pc)` so the handler stores sum at the
+/// result register and falls through to pc.
+fn bhimpl_int_add_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Option<i64>, usize) {
     match a.checked_add(b) {
-        Some(result) => {
-            bh.registers_i[code[position + 4] as usize] = result;
-            Ok(pc)
-        }
-        None => Ok(target),
+        Some(r) => (Some(r), pc),
+        None => (None, target),
     }
 }
-fn handler_int_sub_jump_if_ovf(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let a = bh.registers_i[code[position + 2] as usize];
-    let b = bh.registers_i[code[position + 3] as usize];
-    let pc = position + 5;
+
+/// blackhole.py:485-490 `bhimpl_int_sub_jump_if_ovf(label, a, b)`.
+fn bhimpl_int_sub_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Option<i64>, usize) {
     match a.checked_sub(b) {
-        Some(result) => {
-            bh.registers_i[code[position + 4] as usize] = result;
-            Ok(pc)
-        }
-        None => Ok(target),
+        Some(r) => (Some(r), pc),
+        None => (None, target),
     }
 }
-fn handler_int_mul_jump_if_ovf(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let a = bh.registers_i[code[position + 2] as usize];
-    let b = bh.registers_i[code[position + 3] as usize];
-    let pc = position + 5;
+
+/// blackhole.py:492-497 `bhimpl_int_mul_jump_if_ovf(label, a, b)`.
+fn bhimpl_int_mul_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Option<i64>, usize) {
     match a.checked_mul(b) {
-        Some(result) => {
-            bh.registers_i[code[position + 4] as usize] = result;
-            Ok(pc)
-        }
-        None => Ok(target),
+        Some(r) => (Some(r), pc),
+        None => (None, target),
     }
 }
+
+/// Decode pattern `@arguments("L", "i", "i", returns="iL")` — 2-byte label +
+/// 2 int reads + 1 int write (only on no-overflow path). Total 5 bytes.
+macro_rules! bhhandler_ovf_jump_ii {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+            let a = bh.registers_i[code[position + 2] as usize];
+            let b = bh.registers_i[code[position + 3] as usize];
+            let result_reg = code[position + 4] as usize;
+            let pc = position + 5;
+            let (maybe_result, new_pos) = $bhimpl(a, b, target, pc);
+            if let Some(r) = maybe_result {
+                bh.registers_i[result_reg] = r;
+            }
+            Ok(new_pos)
+        }
+    };
+}
+
+bhhandler_ovf_jump_ii!(handler_int_add_jump_if_ovf, bhimpl_int_add_jump_if_ovf);
+bhhandler_ovf_jump_ii!(handler_int_sub_jump_if_ovf, bhimpl_int_sub_jump_if_ovf);
+bhhandler_ovf_jump_ii!(handler_int_mul_jump_if_ovf, bhimpl_int_mul_jump_if_ovf);
 
 // ── misc simple ops ─────────────────────────────────────────────────
 
