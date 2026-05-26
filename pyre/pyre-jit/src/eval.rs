@@ -1242,23 +1242,11 @@ thread_local! {
         // survive minor collection.  Registered after the dict-view
         // tid so `W_GETSET_PROPERTY_GC_TYPE_ID = 40` lines up with
         // the post-`W_DICT_VIEW_GC_TYPE_ID = 39` slot.
-        let w_getset_property_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::getsetproperty::W_GetSetProperty>(),
-            object_tid,
-            pyre_object::getsetproperty::W_GETSET_PROPERTY_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(
-            w_getset_property_tid,
-            pyre_object::getsetproperty::W_GETSET_PROPERTY_GC_TYPE_ID
-        );
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const _ as usize,
-            w_getset_property_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const _ as usize,
-            w_getset_property_tid,
+            &mut pytype_to_tid,
+            <pyre_object::getsetproperty::W_GetSetProperty
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
         // delegates to cpu.bh_new_array(), which in turn requires the

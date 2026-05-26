@@ -461,6 +461,14 @@ struct PyreClassAttrs {
     /// historically shipped as `SUPER_TYPE` and `W_SUPER_GC_TYPE_ID`,
     /// not `SUPEROBJECT_TYPE`) need to opt into the shorter form.
     static_name: Option<syn::LitStr>,
+    /// Optional override for *just* the PyType static identifier.  Most
+    /// classes accept the `{static_name}_TYPE` default
+    /// (`SUPER_TYPE`, `RANDOM_TYPE`); a few legacy classes ship the
+    /// PyType under a name unrelated to the GC consts (e.g.
+    /// `GETSET_DESCRIPTOR_TYPE` vs `W_GETSET_PROPERTY_GC_TYPE_ID`).
+    /// Specifying this lets the GC consts retain one prefix while the
+    /// PyType keeps its historical name.
+    pytype_static: Option<syn::LitStr>,
 }
 
 impl syn::parse::Parse for PyreClassAttrs {
@@ -470,16 +478,21 @@ impl syn::parse::Parse for PyreClassAttrs {
         input.parse::<syn::Token![,]>()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
+        let mut pytype_static: Option<syn::LitStr> = None;
         loop {
             let key: syn::Ident = input.parse()?;
             input.parse::<syn::Token![=]>()?;
             match key.to_string().as_str() {
                 "type_id" => type_id = Some(input.parse()?),
                 "static_name" => static_name = Some(input.parse()?),
+                "pytype_static" => pytype_static = Some(input.parse()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("unknown `#[pyre_class]` key `{other}` — expected `type_id` or `static_name`"),
+                        format!(
+                            "unknown `#[pyre_class]` key `{other}` — \
+                             expected `type_id` / `static_name` / `pytype_static`",
+                        ),
                     ));
                 }
             }
@@ -494,7 +507,12 @@ impl syn::parse::Parse for PyreClassAttrs {
         let type_id = type_id.ok_or_else(|| {
             syn::Error::new(name.span(), "`#[pyre_class]` requires `type_id = N`")
         })?;
-        Ok(Self { name, type_id, static_name })
+        Ok(Self {
+            name,
+            type_id,
+            static_name,
+            pytype_static,
+        })
     }
 }
 
@@ -517,7 +535,10 @@ fn expand_pyre_class(
         .as_ref()
         .map(|s| s.value())
         .unwrap_or_else(|| st_str.strip_prefix("W_").unwrap_or(&st_str).to_uppercase());
-    let pytype_static = format_ident!("{}_TYPE", suffix);
+    let pytype_static = match attrs.pytype_static.as_ref() {
+        Some(s) => format_ident!("{}", s.value()),
+        None => format_ident!("{}_TYPE", suffix),
+    };
     let gc_type_id_const = format_ident!("W_{}_GC_TYPE_ID", suffix);
     let object_size_const = format_ident!("W_{}_OBJECT_SIZE", suffix);
     let ptr_offsets_const = format_ident!("W_{}_GC_PTR_OFFSETS", suffix);

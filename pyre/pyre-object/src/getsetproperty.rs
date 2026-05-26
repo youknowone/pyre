@@ -16,23 +16,25 @@
 //! state to fall out of sync with the descriptor's actual lifetime.
 
 use crate::pyobject::*;
-
-/// `pypy/interpreter/typedef.py:444 GetSetProperty.typedef = TypeDef(
-/// "getset_descriptor", ...)`.  Pyre needs a static PyType here so the
-/// W_GetSetProperty allocation can name an `ob_type` that's distinct
-/// from `INSTANCE_TYPE` — the GC then routes `[malloc_typed,
-/// register_vtable_for_type]` through this PyType pointer to find the
-/// matching tid + offsets.
-pub static GETSET_DESCRIPTOR_TYPE: PyType = crate::pyobject::new_pytype("getset_descriptor");
+use pyre_macros::pyre_class;
 
 /// `pypy/interpreter/typedef.py:312-346 class GetSetProperty(W_Root)`.
 ///
 /// All `PyObjectRef`-shaped slots default to `PY_NULL` to mark
 /// "absent" (PyPy uses `None`); `use_closure` is a `bool` mirroring
 /// the eponymous PyPy field.
-#[repr(C)]
+///
+/// `pytype_static = "GETSET_DESCRIPTOR_TYPE"` keeps the PyType under
+/// its existing public name (`typedef.py:444 GetSetProperty.typedef =
+/// TypeDef("getset_descriptor", ...)`) while the GC consts stay on
+/// the `W_GETSET_PROPERTY_*` convention.
+#[pyre_class(
+    "getset_descriptor",
+    type_id = 40,
+    static_name = "GETSET_PROPERTY",
+    pytype_static = "GETSET_DESCRIPTOR_TYPE"
+)]
 pub struct W_GetSetProperty {
-    pub ob_header: PyObject,
     /// `typedef.py:339 self.fget` — getter callable.
     pub fget: PyObjectRef,
     /// `typedef.py:340 self.fset` — setter callable.
@@ -61,41 +63,6 @@ pub struct W_GetSetProperty {
     pub use_closure: bool,
 }
 
-pub const GETSET_FGET_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, fget);
-pub const GETSET_FSET_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, fset);
-pub const GETSET_FDEL_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, fdel);
-pub const GETSET_DOC_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, doc);
-pub const GETSET_REQCLS_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, reqcls);
-pub const GETSET_NAME_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, name);
-pub const GETSET_W_OBJCLASS_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, w_objclass);
-pub const GETSET_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(W_GetSetProperty, w_qualname);
-
-/// GC type id assigned to `W_GetSetProperty`.
-/// 1-39 are taken; 40 is the next free slot.
-pub const W_GETSET_PROPERTY_GC_TYPE_ID: u32 = 40;
-
-pub const W_GETSET_PROPERTY_OBJECT_SIZE: usize = std::mem::size_of::<W_GetSetProperty>();
-
-/// Eight PyObjectRef-shaped fields are GC roots — a GetSetProperty
-/// can reference both interp-level callables (built-in functions) and
-/// user-level ones, plus an optional `reqcls` / `w_objclass`
-/// W_TypeObject and a lazily-cached `w_qualname` text object.
-pub const W_GETSET_PROPERTY_GC_PTR_OFFSETS: [usize; 8] = [
-    GETSET_FGET_OFFSET,
-    GETSET_FSET_OFFSET,
-    GETSET_FDEL_OFFSET,
-    GETSET_DOC_OFFSET,
-    GETSET_REQCLS_OFFSET,
-    GETSET_NAME_OFFSET,
-    GETSET_W_OBJCLASS_OFFSET,
-    GETSET_W_QUALNAME_OFFSET,
-];
-
-impl crate::lltype::GcType for W_GetSetProperty {
-    const TYPE_ID: u32 = W_GETSET_PROPERTY_GC_TYPE_ID;
-    const SIZE: usize = W_GETSET_PROPERTY_OBJECT_SIZE;
-}
-
 /// Allocate a `W_GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.
 /// Mirrors `typedef.py:327-336 _init` — every slot is set in one shot
 /// so the descriptor is fully initialised before the first reader.
@@ -114,10 +81,10 @@ pub fn w_getset_property_new(
     use_closure: bool,
     name: PyObjectRef,
 ) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_GetSetProperty {
-        ob_header: PyObject {
-            ob_type: &GETSET_DESCRIPTOR_TYPE as *const PyType,
-            w_class: get_instantiate(&GETSET_DESCRIPTOR_TYPE),
+    W_GetSetProperty::allocate(W_GetSetProperty {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         fget,
         fset,
@@ -128,7 +95,7 @@ pub fn w_getset_property_new(
         w_objclass: PY_NULL,
         w_qualname: PY_NULL,
         use_closure,
-    }) as PyObjectRef
+    })
 }
 
 /// Test whether `obj` is a `W_GetSetProperty`.
