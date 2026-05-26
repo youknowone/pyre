@@ -7548,6 +7548,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::Cache
             | Instruction::NotTaken
             | Instruction::ExitInitCheck
+            | Instruction::UnaryNot
     )
 }
 
@@ -7588,6 +7589,12 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::NotTaken
         | Instruction::ExitInitCheck => {
             // delta = 0, no shadow mutation.
+        }
+        Instruction::UnaryNot => {
+            // 1-in-1-out at the TOS slot. The walker arm emits
+            // `inline_call_r_r/dR>r` whose dst writeback to
+            // `concrete_registers_r[dst]` replaces the TOS register
+            // operand in-place; `sym.valuestackdepth` is invariant.
         }
         other => panic!(
             "apply_walker_stack_effect: missing handler for {:?}; every entry \
