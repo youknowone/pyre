@@ -851,24 +851,15 @@ thread_local! {
             &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
             w_slice_tid,
         );
-        // W_SuperObject (super proxy) carries 2 inline `PyObjectRef`
-        // fields (super_type / obj). Pre-registered ahead of the
-        // foreign-pytype loop for the same reason as W_Cell/W_Method/
-        // W_Slice.
-        let w_super_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::superobject::W_SuperObject>(),
-            object_tid,
-            pyre_object::superobject::W_SUPER_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_super_tid, W_SUPER_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // W_SuperObject (super proxy) — typed payload via `#[pyre_class]`;
+        // GC descriptor carries the 2 inline `PyObjectRef` fields
+        // (super_type / obj).  Pre-registered ahead of the foreign-pytype
+        // loop for the same reason as W_Cell/W_Method/W_Slice.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::superobject::SUPER_TYPE as *const _ as usize,
-            w_super_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::superobject::SUPER_TYPE as *const _ as usize,
-            w_super_tid,
+            &mut pytype_to_tid,
+            <pyre_object::superobject::W_SuperObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_PropertyObject (3 PyObjectRef fields: fget/fset/fdel),
         // W_StaticMethodObject and W_ClassMethodObject (1 PyObjectRef

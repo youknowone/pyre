@@ -6,35 +6,15 @@
 //! starting from the next class after super_type in obj's MRO.
 
 use crate::pyobject::*;
-
-pub static SUPER_TYPE: PyType = crate::pyobject::new_pytype("super");
+use pyre_macros::pyre_class;
 
 /// super proxy: [ob_type | super_type (cls) | obj (self)]
-#[repr(C)]
+#[pyre_class("super", type_id = 18, static_name = "SUPER")]
 pub struct W_SuperObject {
-    pub ob: PyObject,
     /// The class passed to super() — lookup starts after this in MRO.
     pub super_type: PyObjectRef,
     /// The instance (self) or class for classmethod.
     pub obj: PyObjectRef,
-}
-
-/// Field offsets of inline `PyObjectRef` slots.
-pub const SUPER_SUPER_TYPE_OFFSET: usize = std::mem::offset_of!(W_SuperObject, super_type);
-pub const SUPER_OBJ_OFFSET: usize = std::mem::offset_of!(W_SuperObject, obj);
-
-/// GC type id assigned to `W_SuperObject` at JitDriver init time.
-pub const W_SUPER_GC_TYPE_ID: u32 = 18;
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_SUPER_OBJECT_SIZE: usize = std::mem::size_of::<W_SuperObject>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-pub const W_SUPER_GC_PTR_OFFSETS: [usize; 2] = [SUPER_SUPER_TYPE_OFFSET, SUPER_OBJ_OFFSET];
-
-impl crate::lltype::GcType for W_SuperObject {
-    const TYPE_ID: u32 = W_SUPER_GC_TYPE_ID;
-    const SIZE: usize = W_SUPER_OBJECT_SIZE;
 }
 
 /// Create a new super proxy.
@@ -43,15 +23,14 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(super_type);
     crate::gc_roots::pin_root(obj);
-
-    crate::lltype::malloc_typed(W_SuperObject {
+    W_SuperObject::allocate(W_SuperObject {
         ob: PyObject {
-            ob_type: &SUPER_TYPE as *const PyType,
-            w_class: get_instantiate(&SUPER_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         super_type,
         obj,
-    }) as PyObjectRef
+    })
 }
 
 #[inline]

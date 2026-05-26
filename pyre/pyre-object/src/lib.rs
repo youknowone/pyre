@@ -1,3 +1,13 @@
+// `extern crate self as pyre_object;` lets `#[pyre_class]`'s emitted
+// `::pyre_object::lltype::*` / `::pyre_object::PyObject` paths resolve
+// to *this* crate when the macro is consumed from inside pyre-object
+// itself (e.g. `superobject.rs`, `propertyobject.rs`, …) instead of
+// erroring with `unresolved module pyre_object`.
+extern crate self as pyre_object;
+
+/// Typed-payload binding macro: see `pyre/pyre-macros/src/lib.rs`.
+pub use pyre_macros::pyre_class;
+
 pub mod boolobject;
 pub mod bytearrayobject;
 pub mod bytesobject;
