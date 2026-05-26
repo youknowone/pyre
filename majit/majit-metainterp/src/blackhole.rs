@@ -5264,6 +5264,16 @@ fn bhimpl_float_copy(a: f64) -> f64 {
     a
 }
 
+/// blackhole.py:1052 `bhimpl_ref_isconstant(x): return False`.
+fn bhimpl_ref_isconstant(_a: i64) -> i64 {
+    0
+}
+
+/// blackhole.py:1056 `bhimpl_ref_isvirtual(x): return False`.
+fn bhimpl_ref_isvirtual(_a: i64) -> i64 {
+    0
+}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5807,22 +5817,8 @@ fn handler_loop_header(
     // Advance past the 1-byte jdindex operand.
     Ok(position + 1)
 }
-fn handler_ref_isconstant(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[position + 1] as usize] = 0;
-    Ok(position + 2)
-}
-fn handler_ref_isvirtual(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[position + 1] as usize] = 0;
-    Ok(position + 2)
-}
+bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
+bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
 fn handler_goto_if_not_int_is_zero(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
