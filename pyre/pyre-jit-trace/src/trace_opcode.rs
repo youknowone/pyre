@@ -7622,6 +7622,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DeleteName { .. }
             | Instruction::CopyFreeVars { .. }
             | Instruction::MakeCell { .. }
+            | Instruction::ConvertValue { .. }
     )
 }
 
@@ -7766,7 +7767,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::DeleteGlobal { .. }
         | Instruction::DeleteName { .. }
         | Instruction::CopyFreeVars { .. }
-        | Instruction::MakeCell { .. } => {
+        | Instruction::MakeCell { .. }
+        | Instruction::ConvertValue { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
