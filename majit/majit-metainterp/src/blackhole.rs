@@ -5377,39 +5377,17 @@ fn handler_live(
 
 /// Handler for `goto/L` — unconditional jump. Argcodes: `L` (2-byte label).
 /// RPython blackhole.py:950-952: `def bhimpl_goto(target): return target`.
-/// Returns="L" means the handler returns the label value as new position.
 fn handler_goto(
     _bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    Ok(target)
+    Ok(bhimpl_goto(target))
 }
 
-/// Handler for `goto_if_not/iL` — conditional jump.
-/// RPython blackhole.py:864-869:
-/// ```python
-/// @arguments("i", "L", "pc", returns="L")
-/// def bhimpl_goto_if_not(a, target, pc):
-///     if a: return pc
-///     else: return target
-/// ```
-/// "pc" means the current position AFTER decoding all operands.
-fn handler_goto_if_not(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[position] as usize];
-    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-    let pc = position + 3; // position after all operands
-    if a != 0 {
-        Ok(pc) // condition true: fall through
-    } else {
-        Ok(target) // condition false: jump to target
-    }
-}
+// `handler_goto_if_not` extracted via `bhhandler_goto_if_not_i!` macro below
+// after the macro definition site so the macro is in scope.
 
 /// Handler for `int_return/i` — RPython blackhole.py:841-845.
 /// @arguments("self", "i"): read one int register, store in tmpreg_i,
@@ -5913,6 +5891,16 @@ fn bhimpl_goto_if_not_ptr_ne(a: i64, b: i64, target: usize, pc: usize) -> usize 
     if a != b { pc } else { target }
 }
 
+/// blackhole.py:864-869 `bhimpl_goto_if_not(a, target, pc)`.
+fn bhimpl_goto_if_not(a: i64, target: usize, pc: usize) -> usize {
+    if a != 0 { pc } else { target }
+}
+
+/// blackhole.py:950-952 `bhimpl_goto(target): return target`.
+fn bhimpl_goto(target: usize) -> usize {
+    target
+}
+
 // ── ref operations (RPython blackhole.py:584-610) ───────────────────
 
 fn bhimpl_ptr_eq(a: i64, b: i64) -> i64 {
@@ -6070,6 +6058,7 @@ bhhandler_r_v!(handler_virtual_ref_finish, bhimpl_virtual_ref_finish);
 bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
+bhhandler_goto_if_not_i!(handler_goto_if_not, bhimpl_goto_if_not);
 bhhandler_goto_if_not_i!(
     handler_goto_if_not_int_is_zero,
     bhimpl_goto_if_not_int_is_zero
