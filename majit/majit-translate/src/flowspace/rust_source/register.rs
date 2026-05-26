@@ -4736,8 +4736,8 @@ mod tests {
         );
         assert_eq!(
             snap.get("name"),
-            Some(&crate::model::ValueType::Ref),
-            "user-typed (String) field must project to ValueType::Ref"
+            Some(&crate::model::ValueType::Ref(Some("String".to_string()))),
+            "user-typed (String) field must project to ValueType::Ref carrying the type root"
         );
         assert_eq!(
             snap.get("flag"),
@@ -4788,7 +4788,10 @@ mod tests {
             .expect("qualified lookup matches the registered key");
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get("count"), Some(&crate::model::ValueType::Int));
-        assert_eq!(snap.get("name"), Some(&crate::model::ValueType::Ref));
+        assert_eq!(
+            snap.get("name"),
+            Some(&crate::model::ValueType::Ref(Some("String".to_string())))
+        );
     }
 
     /// Nested-mod prefix composition: a struct inside `mod outer { mod
@@ -9425,10 +9428,10 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         assert_eq!(decls.len(), 2);
         // `PyType` is a bare path leaf; `classify_fn_arg_ty` falls through
         // to the compound-type `Ref` branch.
-        assert_eq!(decls[0].1, ValueType::Ref);
+        assert_eq!(decls[0].1, ValueType::Ref(Some("PyType".to_string())));
         // `LazyLock<...>` is not in the `Box | Rc | Arc` unwrap list;
-        // also falls through to Ref.
-        assert_eq!(decls[1].1, ValueType::Ref);
+        // also falls through to Ref carrying the wrapper's leaf ident.
+        assert_eq!(decls[1].1, ValueType::Ref(Some("LazyLock".to_string())));
         // Non-literal RHS: `ConstValue` resolution falls back to `None`,
         // adapter retains the `UniStr(joined)` sentinel.
         assert!(decls[0].2.is_none());
@@ -9500,7 +9503,7 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         assert!(names.contains(&"SHADOW_STACK".to_string()));
         // Compound types fall through to `ValueType::Ref` per the
         // `compound_type_classifies_as_ref` invariant.
-        assert!(decls.iter().all(|(_, ty, _)| matches!(ty, ValueType::Ref)));
+        assert!(decls.iter().all(|(_, ty, _)| matches!(ty, ValueType::Ref(_))));
     }
 
     #[test]
