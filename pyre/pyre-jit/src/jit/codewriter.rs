@@ -8455,6 +8455,17 @@ impl CodeWriter {
                             // RPython resolves the name to a Constant during flow
                             // analysis; pyre cannot fold module namespace lookups at
                             // codewriter time, so do not invent a graph op here.
+                            // The abort_permanent above means the loaded value is
+                            // never observed at runtime, but downstream ops in the
+                            // same block (e.g. the bool() arg of POP_JUMP_IF_FALSE)
+                            // pop from current_state.stack and would otherwise
+                            // hit `fresh_ref_value` — producing an orphan Variable
+                            // with no graph SpaceOp producer that breaks canonical
+                            // SSARepr build's make_dependencies (regalloc.py:26-77
+                            // adds depgraph nodes only for op.result + inputargs).
+                            // Push `Constant::none()` so downstream pops resolve
+                            // to a constant, not a fresh Variable.
+                            current_state.stack.push(super::flow::Constant::none().into());
                             emit_abort_permanent!();
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
