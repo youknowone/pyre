@@ -4150,17 +4150,6 @@ impl OptContext {
         op.get_box_replacement(false).ptr_info().map(|p| p.clone())
     }
 
-    /// Live `Rc<RefCell<PtrInfo>>` handle for `info.py:865-894
-    /// getrawptrinfo`/`getptrinfo` semantics — RPython `return fw`
-    /// object identity.  Returns `None` if the chain terminal does
-    /// not currently carry `Forwarded::Info(OpInfo::Ptr(_))`.
-    pub fn peek_ptr_info_handle(
-        &self,
-        op: &crate::r#box::BoxRef,
-    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>> {
-        op.get_box_replacement(false).ptr_info_handle()
-    }
-
     /// info.py: getptrinfo(op) — mutable variant. Walks the chain on `op`
     /// and runs the closure against the terminal BoxRef's `_forwarded`
     /// PtrInfo via `ptr_info_mut()`. The BoxRef slot is the authoritative
