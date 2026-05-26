@@ -7550,6 +7550,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ExitInitCheck
             | Instruction::UnaryNot
             | Instruction::UnaryInvert
+            | Instruction::GetIter
     )
 }
 
@@ -7591,7 +7592,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::ExitInitCheck => {
             // delta = 0, no shadow mutation.
         }
-        Instruction::UnaryNot | Instruction::UnaryInvert => {
+        Instruction::UnaryNot | Instruction::UnaryInvert | Instruction::GetIter => {
             // 1-in-1-out at the TOS slot. The walker arm emits
             // `inline_call_r_r/dR>r` whose dst writeback to
             // `concrete_registers_r[dst]` replaces the TOS register
