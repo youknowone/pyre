@@ -7560,6 +7560,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::MakeFunction
             | Instruction::GetYieldFromIter
             | Instruction::PopIter
+            | Instruction::EndSend
     )
 }
 
@@ -7642,8 +7643,7 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
             // `concrete_registers_r[dst]` replaces the TOS register
             // operand in-place; `sym.valuestackdepth` is invariant.
         }
-        Instruction::PushNull
-        | Instruction::PopIter
+        Instruction::PopIter
         | Instruction::EndSend => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
