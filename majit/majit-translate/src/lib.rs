@@ -438,7 +438,7 @@ fn collect_hints_walk(
     for item in items {
         match item {
             syn::Item::Fn(item_fn) => {
-                let hints = front::ast::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
+                let hints = front::syn_metadata::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
                 if !hints.is_empty() {
                     out.insert(item_fn.sig.ident.to_string(), hints);
                 }
@@ -446,7 +446,7 @@ fn collect_hints_walk(
             syn::Item::Impl(item_impl) => {
                 for sub in &item_impl.items {
                     if let syn::ImplItem::Fn(impl_fn) = sub {
-                        let hints = front::ast::collect_jit_hints_with_sig(
+                        let hints = front::syn_metadata::collect_jit_hints_with_sig(
                             &impl_fn.attrs,
                             &impl_fn.sig,
                         );
@@ -1464,7 +1464,7 @@ fn analyze_pipeline_from_parsed(
                     continue;
                 }
                 // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
-                // — companion hint emitted by `front::ast::collect_jit_hints`
+                // — companion hint emitted by `front::syn_metadata::collect_jit_hints`
                 // when `#[oopspec(...)]` is paired with a function signature.
                 // Threads the declaration-order parameter names into
                 // `CallControl::oopspec_argnames` so `parse_oopspec`

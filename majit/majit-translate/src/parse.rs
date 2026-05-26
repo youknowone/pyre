@@ -1092,7 +1092,7 @@ fn collect_trait_impls_from_items(
                                         .as_deref()
                                         .and_then(|owner| m.lookup_impl_method(owner, &method_name))
                                 });
-                                let hints = crate::front::ast::collect_jit_hints_with_sig(
+                                let hints = crate::front::syn_metadata::collect_jit_hints_with_sig(
                                     &synth.attrs,
                                     &synth.sig,
                                 );
@@ -1159,7 +1159,7 @@ fn collect_trait_impls_from_items(
                                 // AST graph builder fallback is retired.
                                 let mir_hit = mir_graphs
                                     .and_then(|m| m.lookup_trait_default(&trait_name, &method_name));
-                                let hints = crate::front::ast::collect_jit_hints_with_sig(
+                                let hints = crate::front::syn_metadata::collect_jit_hints_with_sig(
                                     &synth.attrs,
                                     &synth.sig,
                                 );
@@ -1358,7 +1358,7 @@ fn collect_inherent_methods_from_items(
                                 Some(g) => g.clone(),
                                 None => continue,
                             };
-                            let hints = crate::front::ast::collect_jit_hints_with_sig(
+                            let hints = crate::front::syn_metadata::collect_jit_hints_with_sig(
                                 &synth.attrs,
                                 &synth.sig,
                             );

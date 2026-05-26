@@ -738,7 +738,7 @@ pub struct CallControl {
     /// `Index(n)` placeholders.  Pyre cannot introspect a function
     /// pointer for argnames; populated by the walker through
     /// `mark_oopspec_argnames` whenever `#[oopspec(...)]` is paired
-    /// with a function signature (`front::ast::collect_jit_hints`
+    /// with a function signature (`front::syn_metadata::collect_jit_hints`
     /// emits a companion `"oopspec_argnames:..."` hint that
     /// `lib.rs:600` consumes alongside `"oopspec:..."`).
     ///
@@ -3984,7 +3984,7 @@ impl CallControl {
     /// match the function's actual parameter declaration order.
     ///
     /// Populated by the walker (`lib.rs:600`) whenever
-    /// `front::ast::collect_jit_hints` emits the
+    /// `front::syn_metadata::collect_jit_hints` emits the
     /// `"oopspec_argnames:..."` companion hint — i.e. when a function
     /// carries `#[oopspec(...)]` AND its signature is available at
     /// hint-collection time.  Programmatic `mark_oopspec` callers
