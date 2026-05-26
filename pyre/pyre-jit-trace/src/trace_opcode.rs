@@ -7572,6 +7572,23 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ContainsOp { .. }
             | Instruction::IsOp { .. }
             | Instruction::Swap { .. }
+            | Instruction::BuildTuple { .. }
+            | Instruction::BuildList { .. }
+            | Instruction::BuildSet { .. }
+            | Instruction::BuildString { .. }
+            | Instruction::BuildMap { .. }
+            | Instruction::BuildSlice { .. }
+            | Instruction::LoadFastAndClear { .. }
+            | Instruction::ListAppend { .. }
+            | Instruction::ListExtend { .. }
+            | Instruction::SetAdd { .. }
+            | Instruction::SetUpdate { .. }
+            | Instruction::MapAdd { .. }
+            | Instruction::DictUpdate { .. }
+            | Instruction::DictMerge { .. }
+            | Instruction::SetFunctionAttribute { .. }
+            | Instruction::UnpackSequence { .. }
+            | Instruction::UnpackEx { .. }
     )
 }
 
@@ -7666,7 +7683,24 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::StoreSlice
         | Instruction::ContainsOp { .. }
         | Instruction::IsOp { .. }
-        | Instruction::Swap { .. } => {
+        | Instruction::Swap { .. }
+        | Instruction::BuildTuple { .. }
+        | Instruction::BuildList { .. }
+        | Instruction::BuildSet { .. }
+        | Instruction::BuildString { .. }
+        | Instruction::BuildMap { .. }
+        | Instruction::BuildSlice { .. }
+        | Instruction::LoadFastAndClear { .. }
+        | Instruction::ListAppend { .. }
+        | Instruction::ListExtend { .. }
+        | Instruction::SetAdd { .. }
+        | Instruction::SetUpdate { .. }
+        | Instruction::MapAdd { .. }
+        | Instruction::DictUpdate { .. }
+        | Instruction::DictMerge { .. }
+        | Instruction::SetFunctionAttribute { .. }
+        | Instruction::UnpackSequence { .. }
+        | Instruction::UnpackEx { .. } => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
