@@ -5313,6 +5313,15 @@ fn bhimpl_unreachable() -> ! {
     panic!("bhimpl_unreachable reached")
 }
 
+/// blackhole.py:1021-1023 `bhimpl_jit_enter_portal_frame(x): pass`.
+fn bhimpl_jit_enter_portal_frame(_x: i64) {}
+
+/// blackhole.py:1025-1027 `bhimpl_jit_leave_portal_frame(): pass`.
+fn bhimpl_jit_leave_portal_frame() {}
+
+/// blackhole.py:1547-1548 `bhimpl_hint_force_virtualizable(r): pass`.
+fn bhimpl_hint_force_virtualizable(_r: i64) {}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5608,6 +5617,20 @@ macro_rules! bhhandler_f_v {
             let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
             $bhimpl(a);
             Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments()` (no operands, no return) — empty argcodes.
+macro_rules! bhhandler_v_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            _bh: &mut BlackholeInterpreter,
+            _code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            $bhimpl();
+            Ok(position)
         }
     };
 }
@@ -6544,21 +6567,14 @@ fn handler_jit_debug(
     // @arguments("r", "i", "i", "i", "i") = 1 ref + 4 int = 5 regs
     Ok(position + 5)
 }
-fn handler_jit_enter_portal_frame(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    // @arguments("i") = 1 int
-    Ok(position + 1)
-}
-fn handler_jit_leave_portal_frame(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    Ok(position)
-}
+bhhandler_i_v!(
+    handler_jit_enter_portal_frame,
+    bhimpl_jit_enter_portal_frame
+);
+bhhandler_v_v!(
+    handler_jit_leave_portal_frame,
+    bhimpl_jit_leave_portal_frame
+);
 
 // ── interiorfield_gc (blackhole.py:1411-1429) ───────────────────────
 // @arguments("cpu", "r", "i", "d", returns="X")
@@ -8098,17 +8114,10 @@ bhhandler_i_f!(
     handler_cast_singlefloat_to_float,
     bhimpl_cast_singlefloat_to_float
 );
-fn handler_hint_force_virtualizable(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    // RPython `blackhole.py:1547` `bhimpl_hint_force_virtualizable(r): pass`
-    // — body is a pure no-op. With canonical argcode `r` (one 1-byte
-    // register index in RPython assembler.py's `chr(...)` packing) the
-    // handler advances past that single operand byte.
-    Ok(p + 1)
-}
+bhhandler_r_v!(
+    handler_hint_force_virtualizable,
+    bhimpl_hint_force_virtualizable
+);
 fn handler_guard_class(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
