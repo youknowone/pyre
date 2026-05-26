@@ -5322,6 +5322,38 @@ fn bhimpl_unreachable() -> ! {
     panic!("bhimpl_unreachable reached")
 }
 
+/// blackhole.py:661-663 `bhimpl_int_push(self, a): self.tmpreg_i = a`.
+fn bhimpl_int_push(bh: &mut BlackholeInterpreter, a: i64) {
+    bh.tmpreg_i = a;
+}
+
+/// blackhole.py:664-666 `bhimpl_ref_push(self, a): self.tmpreg_r = a`.
+fn bhimpl_ref_push(bh: &mut BlackholeInterpreter, a: i64) {
+    bh.tmpreg_r = a;
+}
+
+/// blackhole.py:667-669 `bhimpl_float_push(self, a): self.tmpreg_f = a`.
+/// `tmpreg_f` stores floatstorage bits; convert real f64 → bits.
+fn bhimpl_float_push(bh: &mut BlackholeInterpreter, a: f64) {
+    bh.tmpreg_f = a.to_bits() as i64;
+}
+
+/// blackhole.py:671-673 `bhimpl_int_pop(self): return self.get_tmpreg_i()`.
+fn bhimpl_int_pop(bh: &mut BlackholeInterpreter) -> i64 {
+    bh.tmpreg_i
+}
+
+/// blackhole.py:674-676 `bhimpl_ref_pop(self): return self.get_tmpreg_r()`.
+fn bhimpl_ref_pop(bh: &mut BlackholeInterpreter) -> i64 {
+    bh.tmpreg_r
+}
+
+/// blackhole.py:677-679 `bhimpl_float_pop(self): return self.get_tmpreg_f()`.
+/// `tmpreg_f` stores floatstorage bits; convert bits → real f64.
+fn bhimpl_float_pop(bh: &mut BlackholeInterpreter) -> f64 {
+    f64::from_bits(bh.tmpreg_f as u64)
+}
+
 /// blackhole.py:1021-1023 `bhimpl_jit_enter_portal_frame(x): pass`.
 fn bhimpl_jit_enter_portal_frame(_x: i64) {}
 
@@ -5644,6 +5676,96 @@ macro_rules! bhhandler_v_v {
     };
 }
 
+/// Decode pattern `@arguments("self", "i")` — 1 int read, no return, takes bh.
+macro_rules! bhhandler_self_i_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            $bhimpl(bh, a);
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("self", "r")` — 1 ref read, no return, takes bh.
+macro_rules! bhhandler_self_r_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            $bhimpl(bh, a);
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("self", "f")` — 1 float read, no return, takes bh.
+macro_rules! bhhandler_self_f_v {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
+            $bhimpl(bh, a);
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("self", returns="i")` — no read, 1 int write, takes bh.
+macro_rules! bhhandler_self_v_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let result = $bhimpl(bh);
+            bh.registers_i[code[position] as usize] = result;
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("self", returns="r")` — no read, 1 ref write, takes bh.
+macro_rules! bhhandler_self_v_r {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let result = $bhimpl(bh);
+            bh.registers_r[code[position] as usize] = result;
+            Ok(position + 1)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("self", returns="f")` — no read, 1 float write, takes bh.
+macro_rules! bhhandler_self_v_f {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let result: f64 = $bhimpl(bh);
+            bh.registers_f[code[position] as usize] = result.to_bits() as i64;
+            Ok(position + 1)
+        }
+    };
+}
+
 bhhandler_ff_f!(handler_float_add, bhimpl_float_add);
 bhhandler_ff_f!(handler_float_sub, bhimpl_float_sub);
 bhhandler_ff_f!(handler_float_mul, bhimpl_float_mul);
@@ -5789,54 +5911,12 @@ bhhandler_r_v!(handler_ref_guard_value, bhimpl_ref_guard_value);
 bhhandler_f_v!(handler_float_guard_value, bhimpl_float_guard_value);
 
 // ── push/pop (blackhole.py:661-679) ─────────────────────────────────
-fn handler_int_push(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.tmpreg_i = bh.registers_i[code[position] as usize];
-    Ok(position + 1)
-}
-fn handler_ref_push(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.tmpreg_r = bh.registers_r[code[position] as usize];
-    Ok(position + 1)
-}
-fn handler_float_push(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.tmpreg_f = bh.registers_f[code[position] as usize];
-    Ok(position + 1)
-}
-fn handler_int_pop(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[position] as usize] = bh.tmpreg_i;
-    Ok(position + 1)
-}
-fn handler_ref_pop(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_r[code[position] as usize] = bh.tmpreg_r;
-    Ok(position + 1)
-}
-fn handler_float_pop(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_f[code[position] as usize] = bh.tmpreg_f;
-    Ok(position + 1)
-}
+bhhandler_self_i_v!(handler_int_push, bhimpl_int_push);
+bhhandler_self_r_v!(handler_ref_push, bhimpl_ref_push);
+bhhandler_self_f_v!(handler_float_push, bhimpl_float_push);
+bhhandler_self_v_i!(handler_int_pop, bhimpl_int_pop);
+bhhandler_self_v_r!(handler_ref_pop, bhimpl_ref_pop);
+bhhandler_self_v_f!(handler_float_pop, bhimpl_float_pop);
 
 // ── record_exact_class/value — no-op (blackhole.py:616-636) ─────────
 bhhandler_ri_v!(handler_record_exact_class, bhimpl_record_exact_class);
