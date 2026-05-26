@@ -6755,21 +6755,36 @@ impl CodeWriter {
                                 // is_portal=false: pycode_var is None per
                                 // `emit_vable_getfield_ref!` gate above.
                                 // Non-portal graphs lack a `pycode_var`
-                                // inputarg — fall back to a fresh placeholder.
-                                // NOTE: this diverges from the walker path
-                                // (which correctly emits ConstRef pycode via
-                                // `_with_const_pycode`); when `flatten_graph`
-                                // canonical path is implemented, the graph
-                                // side must emit a matching ConstRef op.
-                                let placeholder = fresh_ref_value(&mut graph);
-                                if let super::flow::FlowValue::Variable(v) = &placeholder {
-                                    pair_walker_slot(
-                                        &mut walker_slot_for_variable,
-                                        Some(*v),
-                                        dst_slot,
-                                    );
-                                }
-                                placeholder
+                                // inputarg.  Emit the graph SpaceOp with the
+                                // helper's real ABI shape (pycode:Ref,
+                                // idx:Int) → Ref using `Constant::none()` as
+                                // the absent pycode Variable.  This binds
+                                // the result Variable as op.result so
+                                // canonical SSARepr build's
+                                // `make_dependencies` (regalloc.py:38-77)
+                                // sees a producer rather than an unbound
+                                // Variable downstream (e.g. as a CALL arg).
+                                // Mirrors the analogous LoadGlobal non-portal
+                                // arm at codewriter.rs:7474-7503.
+                                let loaded = record_residual_call_graph_op(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    load_const_fn_idx,
+                                    CallFlavor::Plain,
+                                    vec![super::flow::Constant::signed(idx as i64).into()],
+                                    vec![super::flow::Constant::none().into()],
+                                    vec![],
+                                    vec![Kind::Ref, Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                )
+                                .expect("load_const_fn returns Ref result");
+                                pair_walker_slot(
+                                    &mut walker_slot_for_variable,
+                                    Some(loaded),
+                                    dst_slot,
+                                );
+                                loaded.into()
                             };
                             current_state.stack.push(value);
                             current_depth += 1;
