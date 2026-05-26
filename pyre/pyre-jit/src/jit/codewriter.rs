@@ -7464,24 +7464,38 @@ impl CodeWriter {
                             } else {
                                 // Non-portal helpers: emit_vable_getfield_ref!
                                 // returned None (frame_var is not a startblock
-                                // inputarg here), so no ns/code Ref Variables
-                                // exist.  Still record a graph SpaceOp with
-                                // `loaded` as op.result and just `namei` as the
-                                // Int arg, so canonical SSARepr build's
-                                // `make_dependencies` (regalloc.py:38-77) sees
-                                // `loaded` as an op.result rather than an
-                                // unbound Variable; without this the downstream
-                                // simple_call HLOp panics in `regalloc_color`
-                                // with "missing color for Variable".
+                                // inputarg here and `frame_var.id` aliases
+                                // `return_var.id` in non-portal graphs — see
+                                // LoweringContext.portal_frame_var gate at
+                                // codewriter.rs:4467-4478), so no ns/code/frame
+                                // Ref Variables are available to thread as args.
+                                // Emit the graph SpaceOp with the helper's real
+                                // ABI shape (ns:Ref, code:Ref, frame:Ref,
+                                // namei:Int) → Ref using `Constant::none()` Ref
+                                // placeholders for the absent Variables.  This:
+                                // (1) binds `loaded` as op.result so canonical
+                                // SSARepr build's `make_dependencies`
+                                // (regalloc.py:38-77) sees a producer rather
+                                // than an unbound Variable; (2) records the
+                                // intern_call_descr_stub with the actual helper
+                                // arg_kinds so descr-side parity matches the
+                                // SSARepr-emitted residual_call_ir_r helper.
+                                // Constants have no producer requirement so
+                                // make_dependencies does not need synthetic
+                                // startblock inputargs.
                                 record_residual_call_graph_op(
                                     &mut graph,
                                     &current_block.block(),
                                     load_global_fn_idx,
                                     CallFlavor::Plain,
                                     vec![super::flow::Constant::signed(raw_namei).into()],
+                                    vec![
+                                        super::flow::Constant::none().into(),
+                                        super::flow::Constant::none().into(),
+                                        super::flow::Constant::none().into(),
+                                    ],
                                     vec![],
-                                    vec![],
-                                    vec![Kind::Int],
+                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
                                     ResKind::Ref,
                                     py_pc as i64,
                                 )
