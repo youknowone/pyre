@@ -7,52 +7,37 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-/// Type descriptor for range iterators.
-pub static RANGE_ITER_TYPE: PyType = crate::pyobject::new_pytype("range_iterator");
-
 /// Range iterator object.
 ///
 /// Layout: `[ob_type | current: i64 | stop: i64 | step: i64]`
 /// The JIT reads `current` and `stop` via `GetfieldGcI` and writes
 /// `current` via `SetfieldGcI` to advance the loop counter in registers.
-#[repr(C)]
+#[pyre_class("range_iterator", type_id = 6, static_name = "RANGE_ITER")]
 pub struct W_RangeIterator {
-    pub ob: PyObject,
     pub current: i64,
     pub stop: i64,
     pub step: i64,
 }
 
-/// Field offset of `current` within `W_RangeIterator`.
+/// Field offsets of inline scalar slots — consumed by JIT field-access
+/// IR (`pyre-jit/src/jit/codewriter.rs` GetfieldGcI / SetfieldGcI).
+/// The macro's auto-generated `W_RANGE_ITER_GC_PTR_OFFSETS` is empty
+/// here (no PyObjectRef fields) and does not depend on these.
 pub const RANGE_ITER_CURRENT_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, current);
-
-/// Field offset of `stop` within `W_RangeIterator`.
 pub const RANGE_ITER_STOP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, stop);
-
-/// Field offset of `step` within `W_RangeIterator`.
 pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, step);
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_RANGE_ITER_OBJECT_SIZE: usize = std::mem::size_of::<W_RangeIterator>();
-
-impl crate::lltype::GcType for W_RangeIterator {
-    /// Mirrors `pyre_jit_trace::descr::RANGE_ITER_GC_TYPE_ID`. The JIT
-    /// init's `debug_assert_eq!` cross-checks any drift.
-    const TYPE_ID: u32 = 6;
-    const SIZE: usize = W_RANGE_ITER_OBJECT_SIZE;
-}
 
 /// Allocate a new `W_RangeIterator` on the heap.
 pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_RangeIterator {
+    W_RangeIterator::allocate(W_RangeIterator {
         ob: PyObject {
-            ob_type: &RANGE_ITER_TYPE as *const PyType,
-            w_class: get_instantiate(&RANGE_ITER_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         current: start,
         stop,
         step,
-    }) as PyObjectRef
+    })
 }
 
 #[majit_macros::dont_look_inside]

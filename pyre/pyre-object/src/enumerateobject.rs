@@ -20,12 +20,10 @@
 //! `space.add(w_index, space.newint(1))` after `rarithmetic.ovfcheck`).
 
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
 
-pub static ENUMERATE_TYPE: PyType = crate::pyobject::new_pytype("enumerate");
-
-#[repr(C)]
+#[pyre_class("enumerate", type_id = 41, static_name = "ENUMERATE")]
 pub struct W_Enumerate {
-    pub ob: PyObject,
     /// `functional.py:225 self.w_iter_or_list` — either the source
     /// iterator (general case) or the source list itself
     /// (start == 0 + exact-list source).  When the iterator is
@@ -40,26 +38,6 @@ pub struct W_Enumerate {
     pub w_index: PyObjectRef,
 }
 
-pub const ENUMERATE_W_ITER_OR_LIST_OFFSET: usize =
-    std::mem::offset_of!(W_Enumerate, w_iter_or_list);
-pub const ENUMERATE_W_INDEX_OFFSET: usize = std::mem::offset_of!(W_Enumerate, w_index);
-
-/// GC type id assigned to `W_Enumerate`.
-/// 1-40 are taken; 41 is the next free slot.
-pub const W_ENUMERATE_GC_TYPE_ID: u32 = 41;
-
-pub const W_ENUMERATE_OBJECT_SIZE: usize = std::mem::size_of::<W_Enumerate>();
-
-/// Two `PyObjectRef`-shaped slots are GC roots — the wrapped
-/// iterator (or source list) and the optional bigint index.
-pub const W_ENUMERATE_GC_PTR_OFFSETS: [usize; 2] =
-    [ENUMERATE_W_ITER_OR_LIST_OFFSET, ENUMERATE_W_INDEX_OFFSET];
-
-impl crate::lltype::GcType for W_Enumerate {
-    const TYPE_ID: u32 = W_ENUMERATE_GC_TYPE_ID;
-    const SIZE: usize = W_ENUMERATE_OBJECT_SIZE;
-}
-
 /// Allocate a `W_Enumerate`.  Mirrors `functional.py:222-227 __init__`.
 /// `w_index` may be `PY_NULL` (i64 fast-path) or a bigint
 /// `PyObjectRef` (overflow path).
@@ -71,16 +49,15 @@ pub fn w_enumerate_new(
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iter_or_list);
     crate::gc_roots::pin_root(w_index);
-
-    crate::lltype::malloc_typed(W_Enumerate {
+    W_Enumerate::allocate(W_Enumerate {
         ob: PyObject {
-            ob_type: &ENUMERATE_TYPE as *const PyType,
-            w_class: get_instantiate(&ENUMERATE_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         w_iter_or_list,
         index: start,
         w_index,
-    }) as PyObjectRef
+    })
 }
 
 /// # Safety
