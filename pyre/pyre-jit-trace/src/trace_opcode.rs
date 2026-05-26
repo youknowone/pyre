@@ -7540,36 +7540,114 @@ unsafe fn trace_check_exc_match_against(
 /// PopTop walker activation is structurally blocked.  Documented in
 /// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    // Disabled post-rebase 2026-05-26 onto origin/main.  Upstream
-    // `a414b6e216` ("codewriter: build canonical SSARepr alongside
-    // walker") changed the walker arm shape so every previously
-    // 2-byte arm body now decodes as a 14-byte sequence
-    // `int_copy/i>i ; residual_call_r_r/iRd>r ; live/ ; ref_return/r`.
-    // The residual_call_r_r wrapper is the inner unit-variant
-    // SyntheticTransparentCtor (`StepResult::Continue`,
-    // `LoopResult::Done`, …).  Executing the wrapper through the
-    // walker activation path hits a synthetic function pointer that
-    // was never published as a real callable, so the activation
-    // crashes seven benches (`fib_recursive`, `synth/function_calls`,
-    // `synth/default_keyword_args`, `synth/exceptions`,
-    // `synth/inheritance_dispatch`, `synth/iteration_protocol`,
-    // `synth/recursion`).
-    //
-    // The orthodox elision (PyPy `rtyper/rpbc.py::SingleFrozenPBCRepr`)
-    // folds unit-variant PBC constructors to a singleton instance
-    // constant before jtransform sees them.  Pyre's
-    // `flowspace_adapter::legacy_const_define_hlvalue` now performs
-    // that fold for graphs that take the rtyper Match arm, but the
-    // per-opcode arm body graphs (`__opcode_dispatch__/...`) take the
-    // Skip arm and bypass the fold.  Closing that gap requires either
-    // a pre-jtransform pass on `model::FunctionGraph` or extending
-    // `is_synthetic_result_option_ctor` to handle the args=0 case
-    // (Path A in project memory `project_m4_rebase_walker_wrapper_2026_05_26`).
-    //
-    // Re-enable here only after `dump_nop_arm_bytes` decodes back to
-    // a 2-byte `ref_return/r` shape.
-    let _ = instruction;
-    false
+    // Re-enabled 2026-05-27.  The pre-jtransform unit-variant fold
+    // (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
+    // rewrites zero-arg `SyntheticTransparentCtor` calls
+    // (`StepResult::Continue`, `LoopResult::Done`, …) to
+    // `OpKind::ConstRef(prebuilt_instance)` on `model::FunctionGraph`
+    // before `Transformer::transform` runs.  The assembler lowers
+    // `ConstRef` through the existing `ref_copy/r>r` path
+    // (`assembler.rs::emit_const_r`), so arm bytes decode to the real
+    // no-op shape and walker activation no longer encounters
+    // residual-call wrappers around unit variants.
+    matches!(
+        instruction,
+        Instruction::Nop
+            | Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Cache
+            | Instruction::NotTaken
+            | Instruction::ExitInitCheck
+            | Instruction::EndFor
+            | Instruction::UnaryNot
+            | Instruction::UnaryInvert
+            | Instruction::GetIter
+            | Instruction::MatchMapping
+            | Instruction::MatchSequence
+            | Instruction::SetupAnnotations
+            | Instruction::FormatSimple
+            | Instruction::FormatWithSpec
+            | Instruction::MakeFunction
+            | Instruction::GetYieldFromIter
+            | Instruction::PopIter
+            | Instruction::EndSend
+            | Instruction::DeleteSubscr
+            | Instruction::LoadLocals
+            | Instruction::LoadBuildClass
+            | Instruction::BuildTemplate
+            | Instruction::PushNull
+            | Instruction::Copy { .. }
+            | Instruction::BinarySlice
+            | Instruction::StoreSlice
+            | Instruction::ContainsOp { .. }
+            | Instruction::IsOp { .. }
+            | Instruction::Swap { .. }
+            | Instruction::BuildTuple { .. }
+            | Instruction::BuildList { .. }
+            | Instruction::BuildSet { .. }
+            | Instruction::BuildString { .. }
+            | Instruction::BuildMap { .. }
+            | Instruction::BuildSlice { .. }
+            | Instruction::LoadFastAndClear { .. }
+            | Instruction::ListAppend { .. }
+            | Instruction::ListExtend { .. }
+            | Instruction::SetAdd { .. }
+            | Instruction::SetUpdate { .. }
+            | Instruction::MapAdd { .. }
+            | Instruction::DictUpdate { .. }
+            | Instruction::DictMerge { .. }
+            | Instruction::SetFunctionAttribute { .. }
+            | Instruction::UnpackSequence { .. }
+            | Instruction::UnpackEx { .. }
+            | Instruction::LoadName { .. }
+            | Instruction::StoreName { .. }
+            | Instruction::StoreGlobal { .. }
+            | Instruction::DeleteAttr { .. }
+            | Instruction::ImportName { .. }
+            | Instruction::ImportFrom { .. }
+            | Instruction::LoadSuperAttr { .. }
+            | Instruction::BuildInterpolation { .. }
+            | Instruction::CallIntrinsic1 { .. }
+            | Instruction::CallIntrinsic2 { .. }
+            | Instruction::GetLen
+            | Instruction::LoadSpecial { .. }
+            | Instruction::LoadFromDictOrGlobals { .. }
+            | Instruction::LoadFromDictOrDeref { .. }
+            | Instruction::LoadDeref { .. }
+            | Instruction::LoadFastCheck { .. }
+            | Instruction::LoadCommonConstant { .. }
+            | Instruction::GetAiter
+            | Instruction::GetAwaitable { .. }
+            | Instruction::StoreDeref { .. }
+            | Instruction::YieldValue { .. }
+            | Instruction::ReturnGenerator
+            | Instruction::Send { .. }
+            | Instruction::GetAnext
+            | Instruction::EndAsyncFor
+            | Instruction::CleanupThrow
+            | Instruction::WithExceptStart
+            | Instruction::DeleteFast { .. }
+            | Instruction::DeleteDeref { .. }
+            | Instruction::DeleteGlobal { .. }
+            | Instruction::DeleteName { .. }
+            | Instruction::CopyFreeVars { .. }
+            | Instruction::MakeCell { .. }
+            | Instruction::ConvertValue { .. }
+            | Instruction::Reraise { .. }
+            | Instruction::PopJumpIfNone { .. }
+            | Instruction::PopJumpIfNotNone { .. }
+            | Instruction::ForIter { .. }
+            | Instruction::CallKw { .. }
+            | Instruction::CallFunctionEx
+            | Instruction::LoadAttr { .. }
+            // StoreAttr 비활성: 2026-05-27 walker 재활성 회귀.
+            // synth/iteration_protocol 가 `self.n = self.n - 1` 경로에서
+            // SIGSEGV.  unit-variant wrapper 와 별개의 활성 회귀이며,
+            // 별도 slice (issue M4 StoreAttr) 에서 진단해야 함.
+            //
+            // | Instruction::StoreAttr { .. }
+            | Instruction::StoreFastStoreFast { .. }
+    )
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.

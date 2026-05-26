@@ -1238,6 +1238,32 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
+            // Ref-constant materialization mirrors `ConstInt`: the
+            // `HostObject`'s `identity_id()` goes through
+            // `emit_const_r` (the shared `'r'` constant pool) and the
+            // pool-region register index is moved into the SSA
+            // destination via `ref_copy`.  Emitted only for
+            // unit-variant `SyntheticTransparentCtor` results that the
+            // pre-jtransform fold (`translator/rtyper/unit_variant_fold.rs`)
+            // rewrote from `OpKind::Call { args: [] }` (PyPy
+            // `rtyper/rpbc.py::SingleFrozenPBCRepr` parity).
+            OpKind::ConstRef(obj) => {
+                let const_value =
+                    crate::flowspace::model::ConstValue::HostObject(obj.clone());
+                let idx = self.emit_const_r(&const_value, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
             // Float-constant materialization mirrors `ConstInt`: the
             // bit pattern goes through `emit_const_f` (the same pool
             // every `'f'` constant uses) and the resulting pool-region
@@ -2063,6 +2089,7 @@ impl Assembler {
                 OpKind::ConstInt(_) => "ConstInt",
                 OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstFloat(_) => "ConstFloat",
+                OpKind::ConstRef(_) => "ConstRef",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
                 OpKind::ArrayRead { .. } => "ArrayRead",
@@ -3072,6 +3099,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
         OpKind::ConstFloat(_) => "float_copy".into(),
+        // Ref-bank analog of `ConstInt`. The singleton HostObject's
+        // `identity_id()` enters the shared `constants_r` pool via
+        // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
+        // SSA destination register.
+        OpKind::ConstRef(_) => "ref_copy".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {

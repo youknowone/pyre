@@ -447,6 +447,16 @@ impl<'a> Transformer<'a> {
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
 
+        // RPython `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves
+        // zero-arg unit-variant PBC ctors to a singleton
+        // `Constant(prebuilt_instance_ptr)` before jtransform runs.
+        // `transform_graph_to_jitcode` runs this fold on `graph_owned`
+        // already; running it again here is idempotent (no-op after
+        // the first pass) and ensures `rewrite_graph` /
+        // `rewrite_graph_with_callcontrol` entry points (test
+        // fixtures, etc.) are also covered.
+        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten);
+
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
         for block_idx in 0..rewritten.blocks.len() {
@@ -3856,6 +3866,7 @@ fn remap_op(
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
+        | OpKind::ConstRef(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }

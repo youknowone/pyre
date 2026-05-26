@@ -480,6 +480,19 @@ pub enum OpKind {
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
+    /// RPython `flowmodel.py:Constant(host_object)` resolved by the
+    /// rtyper to a singleton instance pointer
+    /// (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  Stored as a thin
+    /// `HostObject` handle so the assembler can stash
+    /// `obj.identity_id()` in the ref-kind constant pool
+    /// (`assembler.rs::emit_const_r`) and emit `ref_copy/r>r` —
+    /// mirroring the `ConstInt` → `int_copy` lowering for the
+    /// ref bank.  Producers: the pre-jtransform unit-variant
+    /// rewrite pass (`translator/rtyper/unit_variant_fold.rs`)
+    /// folds `OpKind::Call { target: SyntheticTransparentCtor,
+    /// args: [] }` matching `is_synthetic_unit_variant_path`
+    /// into this variant.
+    ConstRef(crate::flowspace::model::HostObject),
     FieldRead {
         base: crate::flowspace::model::Variable,
         field: FieldDescriptor,

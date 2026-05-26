@@ -263,6 +263,10 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::ConstInt(_) => ValueType::Int,
         OpKind::ConstBool(_) => ValueType::Bool,
         OpKind::ConstFloat(_) => ValueType::Float,
+        // Singleton instance pointer (unit-variant PBC).  The legacy
+        // annotator sees this as a plain ref-typed value; concrete
+        // class identity stays in the `HostObject` carrier itself.
+        OpKind::ConstRef(_) => ValueType::Ref(None),
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),

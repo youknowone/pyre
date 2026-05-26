@@ -35,3 +35,4 @@ pub mod rpbc;
 pub mod rstr;
 pub mod rtuple;
 pub mod rtyper;
+pub mod unit_variant_fold;
