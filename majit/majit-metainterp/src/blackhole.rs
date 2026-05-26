@@ -8418,20 +8418,18 @@ fn handler_last_exception(
 /// def bhimpl_last_exc_value(self):
 ///     return cast_opaque_ptr(GCREF, self.exception_last_value)
 /// ```
-fn handler_last_exc_value(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    // blackhole.py:996 `assert real_instance` — last_exc_value must
-    // only fire while an active caught exception is in scope.
+/// blackhole.py:991-997 `bhimpl_last_exc_value(self): return self.exception_last_value`.
+/// `assert real_instance` ensures last_exc_value fires only while an active
+/// caught exception is in scope.
+fn bhimpl_last_exc_value(bh: &mut BlackholeInterpreter) -> i64 {
     assert!(
         bh.exception_last_value != 0,
         "blackhole.py:996 last_exc_value: exception_last_value must be non-null"
     );
-    bh.registers_r[code[p] as usize] = bh.exception_last_value;
-    Ok(p + 1)
+    bh.exception_last_value
 }
+
+bhhandler_self_v_r!(handler_last_exc_value, bhimpl_last_exc_value);
 /// RPython `blackhole.py:976-985`:
 /// ```python
 /// @arguments("self", "i", "L", "pc", returns="L")
