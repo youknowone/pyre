@@ -7540,99 +7540,26 @@ unsafe fn trace_check_exc_match_against(
 /// PopTop walker activation is structurally blocked.  Documented in
 /// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
-    matches!(
-        instruction,
-        Instruction::Nop
-            | Instruction::ExtendedArg
-            | Instruction::Resume { .. }
-            | Instruction::Cache
-            | Instruction::NotTaken
-            | Instruction::ExitInitCheck
-            | Instruction::EndFor
-            | Instruction::UnaryNot
-            | Instruction::UnaryInvert
-            | Instruction::GetIter
-            | Instruction::MatchMapping
-            | Instruction::MatchSequence
-            | Instruction::SetupAnnotations
-            | Instruction::FormatSimple
-            | Instruction::FormatWithSpec
-            | Instruction::MakeFunction
-            | Instruction::GetYieldFromIter
-            | Instruction::PopIter
-            | Instruction::EndSend
-            | Instruction::DeleteSubscr
-            | Instruction::LoadLocals
-            | Instruction::LoadBuildClass
-            | Instruction::BuildTemplate
-            | Instruction::PushNull
-            | Instruction::Copy { .. }
-            | Instruction::BinarySlice
-            | Instruction::StoreSlice
-            | Instruction::ContainsOp { .. }
-            | Instruction::IsOp { .. }
-            | Instruction::Swap { .. }
-            | Instruction::BuildTuple { .. }
-            | Instruction::BuildList { .. }
-            | Instruction::BuildSet { .. }
-            | Instruction::BuildString { .. }
-            | Instruction::BuildMap { .. }
-            | Instruction::BuildSlice { .. }
-            | Instruction::LoadFastAndClear { .. }
-            | Instruction::ListAppend { .. }
-            | Instruction::ListExtend { .. }
-            | Instruction::SetAdd { .. }
-            | Instruction::SetUpdate { .. }
-            | Instruction::MapAdd { .. }
-            | Instruction::DictUpdate { .. }
-            | Instruction::DictMerge { .. }
-            | Instruction::SetFunctionAttribute { .. }
-            | Instruction::UnpackSequence { .. }
-            | Instruction::UnpackEx { .. }
-            | Instruction::LoadName { .. }
-            | Instruction::StoreName { .. }
-            | Instruction::StoreGlobal { .. }
-            | Instruction::DeleteAttr { .. }
-            | Instruction::ImportName { .. }
-            | Instruction::ImportFrom { .. }
-            | Instruction::LoadSuperAttr { .. }
-            | Instruction::BuildInterpolation { .. }
-            | Instruction::CallIntrinsic1 { .. }
-            | Instruction::CallIntrinsic2 { .. }
-            | Instruction::GetLen
-            | Instruction::LoadSpecial { .. }
-            | Instruction::LoadFromDictOrGlobals { .. }
-            | Instruction::LoadFromDictOrDeref { .. }
-            | Instruction::LoadDeref { .. }
-            | Instruction::LoadFastCheck { .. }
-            | Instruction::LoadCommonConstant { .. }
-            | Instruction::GetAiter
-            | Instruction::GetAwaitable { .. }
-            | Instruction::StoreDeref { .. }
-            | Instruction::YieldValue { .. }
-            | Instruction::ReturnGenerator
-            | Instruction::Send { .. }
-            | Instruction::GetAnext
-            | Instruction::EndAsyncFor
-            | Instruction::CleanupThrow
-            | Instruction::WithExceptStart
-            | Instruction::DeleteFast { .. }
-            | Instruction::DeleteDeref { .. }
-            | Instruction::DeleteGlobal { .. }
-            | Instruction::DeleteName { .. }
-            | Instruction::CopyFreeVars { .. }
-            | Instruction::MakeCell { .. }
-            | Instruction::ConvertValue { .. }
-            | Instruction::Reraise { .. }
-            | Instruction::PopJumpIfNone { .. }
-            | Instruction::PopJumpIfNotNone { .. }
-            | Instruction::ForIter { .. }
-            | Instruction::CallKw { .. }
-            | Instruction::CallFunctionEx
-            | Instruction::LoadAttr { .. }
-            | Instruction::StoreAttr { .. }
-            | Instruction::StoreFastStoreFast { .. }
-    )
+    // Post-rebase 2026-05-26 onto origin/main: upstream `a414b6e216`
+    // ("codewriter: build canonical SSARepr alongside walker; threaded
+    // splice gate and color-budget probes") changed the walker arm shape
+    // so that even the zero-op Nop family now decodes as
+    // `int_copy/i>i ; residual_call_r_r/iRd>r ; live/ ; ref_return/r`
+    // (14 bytes, was 2 bytes pre-rebase).  The synthetic
+    // `residual_call_r_r/iRd>r` wrapper with a symbolic function
+    // address invalidates production walker activation: emitting it
+    // through the dispatch path produces an invalid `CallR` before any
+    // optimizer/backend choice is involved.  Upstream `61e55b5133`
+    // disabled this set for exactly that reason; the disable now applies
+    // to the ec-wiring branch as well.
+    //
+    // Re-enable an opcode here only after the arm bytes decode to a
+    // shape free of `residual_call_r_r/iRd>r` wrappers.  The 49 prior
+    // walker activation commits remain in history as the matches! list
+    // expansion staging; activation is re-armed once the wrapper is
+    // stripped at the SSARepr-walker boundary.
+    let _ = instruction;
+    false
 }
 
 /// Apply the symbolic-tracker side effects of a walker-handled opcode.
