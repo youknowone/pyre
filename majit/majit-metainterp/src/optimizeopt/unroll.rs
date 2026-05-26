@@ -2931,7 +2931,28 @@ impl OptUnroll {
         // `compile_retrace` reads `Op.forwarded` / `InputArg.forwarded`
         // directly off the same objects (resoperation.py:233-242 / :700),
         // the PyPy-orthodox identity carry.
-        state.partial_trace_inputargs = ctx.inputarg_refs.clone();
+        //
+        // Walk `ctx.inputargs` (the canonical inputarg-order OpRef list)
+        // and pick up the `InputArgRc` at each inputarg's raw OpRef
+        // position out of `ctx.inputarg_refs`. The raw-position table
+        // can carry placeholder fillers for slots outside the active
+        // inputarg range (bridges open at `inputarg_base > 0`, so
+        // positions `[0, inputarg_base)` are unused); the indexed copy
+        // here yields exactly the partial trace's inputargs in PyPy
+        // `partial_trace.inputargs` order.
+        state.partial_trace_inputargs = ctx
+            .inputargs
+            .iter()
+            .map(|ia_opref| {
+                let idx = ia_opref.raw() as usize;
+                ctx.inputarg_refs.get(idx).cloned().unwrap_or_else(|| {
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(
+                        ia_opref.ty().unwrap_or(majit_ir::Type::Void),
+                        idx as u32,
+                    ))
+                })
+            })
+            .collect();
         state.partial_trace_operations = optimizer.phase1_emit_ops.clone();
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.

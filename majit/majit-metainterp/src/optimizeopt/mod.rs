@@ -1756,7 +1756,16 @@ impl OptContext {
             if let Some(b) = self.box_pool.get_at_position(pos) {
                 b.bind_inputarg(&ia);
             }
-            self.inputarg_refs.push(ia);
+            // `inputarg_refs` is keyed by raw OpRef position so
+            // `ensure_box(InputArg{Int,Ref,Float}(idx))` finds the
+            // canonical `InputArgRc` at `inputarg_refs[idx]`. Pushing
+            // would scramble the position→Rc mapping (bridges/Phase 2
+            // see scattered inputarg positions, not a dense 0..N range).
+            if pos >= self.inputarg_refs.len() {
+                self.inputarg_refs
+                    .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+            }
+            self.inputarg_refs[pos] = ia;
         }
     }
 
