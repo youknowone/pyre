@@ -5308,6 +5308,11 @@ fn bhimpl_virtual_ref(a: i64) -> i64 {
 /// blackhole.py:1142-1143 `bhimpl_virtual_ref_finish(a): pass`.
 fn bhimpl_virtual_ref_finish(_a: i64) {}
 
+/// blackhole.py:963-964 `bhimpl_unreachable(): raise AssertionError("unreachable")`.
+fn bhimpl_unreachable() -> ! {
+    panic!("bhimpl_unreachable reached")
+}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
@@ -5929,7 +5934,7 @@ fn handler_unreachable(
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
-    panic!("bhimpl_unreachable reached");
+    bhimpl_unreachable()
 }
 
 // ── cpu-dependent field/array operations ─────────────────────────────
