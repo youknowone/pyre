@@ -5947,6 +5947,21 @@ macro_rules! bhhandler_r_i {
     };
 }
 
+/// `@arguments("i", returns="r")` — i>r: read 1 int reg, result ref.
+macro_rules! bhhandler_i_r {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            bh.registers_r[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
 bhhandler_rr_i!(handler_ptr_eq, bhimpl_ptr_eq);
 bhhandler_rr_i!(handler_ptr_ne, bhimpl_ptr_ne);
 bhhandler_rr_i!(handler_instance_ptr_eq, bhimpl_ptr_eq);
@@ -8472,22 +8487,20 @@ fn handler_debug_fatalerror(
 ) -> Result<usize, DispatchError> {
     panic!("bhimpl_debug_fatalerror");
 }
-fn handler_cast_ptr_to_int(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = bh.registers_r[code[p] as usize];
-    Ok(p + 2)
+/// blackhole.py:602-606 `bhimpl_cast_ptr_to_int(a)`. Pyre uses identity cast
+/// pending Phase F tagged-int representation (`(i & 1) == 1` invariant).
+fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
+    a
 }
-fn handler_cast_int_to_ptr(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    bh.registers_r[code[p + 1] as usize] = bh.registers_i[code[p] as usize];
-    Ok(p + 2)
+
+/// blackhole.py:607-610 `bhimpl_cast_int_to_ptr(i)`. Pyre uses identity cast
+/// pending Phase F tagged-int representation.
+fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
+    i
 }
+
+bhhandler_r_i!(handler_cast_ptr_to_int, bhimpl_cast_ptr_to_int);
+bhhandler_i_r!(handler_cast_int_to_ptr, bhimpl_cast_int_to_ptr);
 fn handler_current_trace_length(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
