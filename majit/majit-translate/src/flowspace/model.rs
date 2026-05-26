@@ -2117,6 +2117,22 @@ impl HostEnv {
             HostObject::new_builtin_callable("IntArray.from_vec"),
         );
 
+        // `core::ptr` / `std::ptr` — Rust standard pointer utilities
+        // surfaced by Charon as `core::ptr::*` dotted paths.  Pyre
+        // source uses `std::ptr::null_mut()` for `pub const PY_NULL`-
+        // style declarations (`parse.rs:1407`); MIR lowering normalises
+        // the `std::` re-export to its canonical `core::` form, so the
+        // FunctionPath that reaches the flowspace adapter is
+        // `["core", "ptr", "null_mut"]`.  Registering both modules
+        // keeps either spelling resolvable when the front-end emits
+        // the bare-namespace form.
+        let core_ptr = HostObject::new_module("core.ptr");
+        core_ptr.module_set("null_mut", HostObject::new_builtin_callable("core.ptr.null_mut"));
+        core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
+        let std_ptr = HostObject::new_module("std.ptr");
+        std_ptr.module_set("null_mut", HostObject::new_builtin_callable("core.ptr.null_mut"));
+        std_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2128,6 +2144,7 @@ impl HostEnv {
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("weakref".into(), weakref_mod);
+        mods.insert("core.ptr".into(), core_ptr);
         mods.insert("std.ptr".into(), std_ptr);
         mods.insert("std.mem".into(), std_mem);
         mods.insert("std.alloc".into(), std_alloc);
