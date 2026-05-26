@@ -5065,6 +5065,28 @@ fn bhimpl_convert_longlong_bytes_to_float(a: i64) -> f64 {
     f64::from_bits(a as u64)
 }
 
+/// blackhole.py:801-810 `bhimpl_cast_float_to_int(a): return int(int(a))`.
+fn bhimpl_cast_float_to_int(a: f64) -> i64 {
+    a as i64
+}
+
+/// blackhole.py:811-813 `bhimpl_cast_int_to_float(a): return float(a)`.
+fn bhimpl_cast_int_to_float(a: i64) -> f64 {
+    a as f64
+}
+
+/// blackhole.py:815-820 `bhimpl_cast_float_to_singlefloat(a): return
+/// singlefloat2int(r_singlefloat(a))`.
+fn bhimpl_cast_float_to_singlefloat(a: f64) -> i64 {
+    (a as f32).to_bits() as i64
+}
+
+/// blackhole.py:822-826 `bhimpl_cast_singlefloat_to_float(a): return
+/// getfloatstorage(float(int2singlefloat(a)))`.
+fn bhimpl_cast_singlefloat_to_float(a: i64) -> f64 {
+    f32::from_bits(a as u32) as f64
+}
+
 // Generate handler fns from bhimpl methods via macros.
 // @arguments("i", returns="i") → argcodes "i>i" → 1 src reg + 1 dst reg = 2 bytes
 bhhandler_i_i!(handler_int_same_as, bhimpl_int_same_as);
@@ -5673,24 +5695,8 @@ fn handler_record_exact_value_i(
 }
 
 // ── cast operations (blackhole.py:800-831) ──────────────────────────
-fn handler_cast_float_to_int(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
-    bh.registers_i[code[position + 1] as usize] = a as i64;
-    Ok(position + 2)
-}
-fn handler_cast_int_to_float(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[position] as usize];
-    bh.registers_f[code[position + 1] as usize] = (a as f64).to_bits() as i64;
-    Ok(position + 2)
-}
+bhhandler_f_i!(handler_cast_float_to_int, bhimpl_cast_float_to_int);
+bhhandler_i_f!(handler_cast_int_to_float, bhimpl_cast_int_to_float);
 
 // ── int_signext (blackhole.py:566-569) ──────────────────────────────
 bhhandler_ii_i!(handler_int_signext, bhimpl_int_signext);
@@ -8015,24 +8021,14 @@ bhhandler_i_f!(
     handler_convert_longlong_bytes_to_float,
     bhimpl_convert_longlong_bytes_to_float
 );
-fn handler_cast_float_to_singlefloat(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let f = f64::from_bits(bh.registers_f[code[p] as usize] as u64);
-    bh.registers_i[code[p + 1] as usize] = (f as f32).to_bits() as i64;
-    Ok(p + 2)
-}
-fn handler_cast_singlefloat_to_float(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let f = f32::from_bits(bh.registers_i[code[p] as usize] as u32) as f64;
-    bh.registers_f[code[p + 1] as usize] = f.to_bits() as i64;
-    Ok(p + 2)
-}
+bhhandler_f_i!(
+    handler_cast_float_to_singlefloat,
+    bhimpl_cast_float_to_singlefloat
+);
+bhhandler_i_f!(
+    handler_cast_singlefloat_to_float,
+    bhimpl_cast_singlefloat_to_float
+);
 fn handler_hint_force_virtualizable(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
