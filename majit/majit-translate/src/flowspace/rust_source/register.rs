@@ -3190,8 +3190,8 @@ thread_local! {
     /// catalog layer: `type PyObjectRef = *mut PyObject;` lets a
     /// struct field declared as `PyObjectRef` resolve through the
     /// catalog the same way `*mut PyObject` already does.
-    static WALKER_TYPE_ALIASES: RefCell<StdHashMap<String, syn::Type>> =
-        RefCell::new(StdHashMap::new());
+    static WALKER_TYPE_ALIASES: RefCell<indexmap::IndexMap<String, syn::Type>> =
+        RefCell::new(indexmap::IndexMap::new());
 }
 
 /// RAII guard that swaps the walker's thread-local type-alias map
@@ -3202,11 +3202,11 @@ thread_local! {
 /// see their own alias scope; outer scope aliases are NOT visible
 /// inside).
 struct WalkerTypeAliasGuard {
-    prev: StdHashMap<String, syn::Type>,
+    prev: indexmap::IndexMap<String, syn::Type>,
 }
 
 impl WalkerTypeAliasGuard {
-    fn enter(aliases: StdHashMap<String, syn::Type>) -> Self {
+    fn enter(aliases: indexmap::IndexMap<String, syn::Type>) -> Self {
         // Mirror each entering alias into the process-wide registry so
         // a `type PyObjectRef = *mut PyObject;` declared in
         // `pyre-object/src/pyobject.rs` stays addressable when a later
@@ -3267,23 +3267,31 @@ fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
     if local.is_some() {
         return local;
     }
-    // Per-thread cache of previously-parsed global entries (`None`
-    // entries cache misses too).  The lookup is on the hot path
-    // through [`syn_primitive_to_lltype`] for every single-segment
-    // ident encountered during the walker pass; without this cache
-    // each call re-parses the token spelling via [`syn::parse_str`],
-    // which compounds into hundreds of seconds of overhead on the
-    // full pyre source set.
+    // Per-thread positive cache of previously-parsed global entries.
+    // The lookup is on the hot path through
+    // [`syn_primitive_to_lltype`] for every single-segment ident
+    // encountered during the walker pass; without this cache each
+    // call re-parses the token spelling via [`syn::parse_str`], which
+    // compounds into hundreds of seconds of overhead on the full
+    // pyre source set.
+    //
+    // Misses are not cached.  The global table grows monotonically as
+    // later files register their aliases; a name that misses now may
+    // be registered shortly after by the next file's
+    // `WalkerTypeAliasGuard::enter`, and caching the miss would make
+    // that later alias permanently invisible to this thread.
     if let Some(cached) =
         PROCESS_WIDE_ALIAS_PARSED_CACHE.with(|cell| cell.borrow().get(name).cloned())
     {
-        return cached;
+        return Some(cached);
     }
     let serialized = PROCESS_WIDE_TYPE_ALIASES.lock().ok()?.get(name).cloned();
     let parsed = serialized.and_then(|s| syn::parse_str::<syn::Type>(&s).ok());
-    PROCESS_WIDE_ALIAS_PARSED_CACHE.with(|cell| {
-        cell.borrow_mut().insert(name.to_string(), parsed.clone());
-    });
+    if let Some(ref ty) = parsed {
+        PROCESS_WIDE_ALIAS_PARSED_CACHE.with(|cell| {
+            cell.borrow_mut().insert(name.to_string(), ty.clone());
+        });
+    }
     parsed
 }
 
@@ -3301,22 +3309,23 @@ fn walker_type_alias_lookup(name: &str) -> Option<syn::Type> {
 /// [`PROCESS_WIDE_ALIAS_PARSED_CACHE`] so the round-trip via
 /// [`syn::parse_str`] runs at most once per (thread, alias) pair.
 static PROCESS_WIDE_TYPE_ALIASES: std::sync::LazyLock<
-    std::sync::Mutex<StdHashMap<String, String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
+    std::sync::Mutex<indexmap::IndexMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(indexmap::IndexMap::new()));
 
 thread_local! {
-    /// Per-thread cache of `walker_type_alias_lookup` results for the
-    /// process-wide fallback path.  Each thread re-parses each global
-    /// alias spelling at most once; subsequent lookups read from this
-    /// `RefCell` directly.  Caches `None` for misses too — the global
-    /// table grows monotonically and a name that was missing at the
-    /// time of cache write may be registered by a later
-    /// `WalkerTypeAliasGuard::enter`, so a negative entry CAN go
-    /// stale.  In practice pyre source orders declarations before
-    /// consumers (alphabetical / dependency walks), so the negative
-    /// cache holds in the analyze path.
-    static PROCESS_WIDE_ALIAS_PARSED_CACHE: RefCell<StdHashMap<String, Option<syn::Type>>> =
-        RefCell::new(StdHashMap::new());
+    /// Per-thread positive cache of `walker_type_alias_lookup` results
+    /// for the process-wide fallback path.  Each thread re-parses each
+    /// global alias spelling at most once; subsequent lookups read
+    /// from this `RefCell` directly.
+    ///
+    /// Misses are NOT cached.  The global table grows monotonically
+    /// as later files register their aliases; caching a miss would
+    /// make any alias registered *after* the cache write
+    /// permanently invisible to this thread.  Recomputing on each
+    /// miss is cheap (one `IndexMap` lookup); the expensive
+    /// `syn::parse_str` call is reserved for genuine positive entries.
+    static PROCESS_WIDE_ALIAS_PARSED_CACHE: RefCell<indexmap::IndexMap<String, syn::Type>> =
+        RefCell::new(indexmap::IndexMap::new());
 }
 
 thread_local! {
@@ -3468,13 +3477,22 @@ fn qualify_under_walker_prefix(bare_name: &str) -> String {
 }
 
 /// Pre-collect `Item::Type T = U;` definitions from a flat list of
-/// items into a `StdHashMap<String, syn::Type>`. Skips items with
-/// generic parameters (`type T<U> = Vec<U>;`) — those would require
+/// items into an [`indexmap::IndexMap`]. Skips items with generic
+/// parameters (`type T<U> = Vec<U>;`) — those would require
 /// substitution semantics the catalog does not implement yet.
+///
+/// Insertion-order preservation is load-bearing: downstream
+/// [`WalkerTypeAliasGuard::enter`] mirrors each alias into the
+/// process-wide registry via `first-writer-wins` semantics.  A
+/// non-deterministic hash-table iteration order would make the first
+/// writer platform-dependent (random hasher seeds on Linux vs macOS
+/// vs Windows), turning what looks like a stable registry into
+/// platform-divergent analyzer state.  Source-order keeps the floor
+/// reproducible across hosts and across cargo-test runs.
 fn collect_type_aliases<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
-) -> StdHashMap<String, syn::Type> {
-    let mut map = StdHashMap::new();
+) -> indexmap::IndexMap<String, syn::Type> {
+    let mut map = indexmap::IndexMap::new();
     for item in items {
         if let syn::Item::Type(item_type) = item
             && item_type.generics.params.is_empty()
