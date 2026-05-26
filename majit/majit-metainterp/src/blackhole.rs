@@ -5836,6 +5836,55 @@ bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ne, |a: i64, b: i64| a != b);
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_gt, |a: i64, b: i64| a > b);
 bhhandler_goto_if_not_ii!(handler_goto_if_not_int_ge, |a: i64, b: i64| a >= b);
 
+/// Decode pattern `@arguments("i", "L", "pc", returns="L")` — 1 int read +
+/// 2-byte label target; bhimpl chooses target or fall-through pc.
+macro_rules! bhhandler_goto_if_not_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+            let pc = position + 3;
+            Ok($bhimpl(a, target, pc))
+        }
+    };
+}
+
+/// Decode pattern `@arguments("r", "L", "pc", returns="L")` — 1 ref read +
+/// 2-byte label target; bhimpl chooses target or fall-through pc.
+macro_rules! bhhandler_goto_if_not_r {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
+            let pc = position + 3;
+            Ok($bhimpl(a, target, pc))
+        }
+    };
+}
+
+/// blackhole.py:915-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`.
+fn bhimpl_goto_if_not_int_is_zero(a: i64, target: usize, pc: usize) -> usize {
+    if a == 0 { pc } else { target }
+}
+
+/// blackhole.py:936-941 `bhimpl_goto_if_not_ptr_iszero(a, target, pc)`.
+fn bhimpl_goto_if_not_ptr_iszero(a: i64, target: usize, pc: usize) -> usize {
+    if a == 0 { pc } else { target }
+}
+
+/// blackhole.py:943-948 `bhimpl_goto_if_not_ptr_nonzero(a, target, pc)`.
+fn bhimpl_goto_if_not_ptr_nonzero(a: i64, target: usize, pc: usize) -> usize {
+    if a != 0 { pc } else { target }
+}
+
 // ── ref operations (RPython blackhole.py:584-610) ───────────────────
 
 fn bhimpl_ptr_eq(a: i64, b: i64) -> i64 {
@@ -5993,36 +6042,18 @@ bhhandler_r_v!(handler_virtual_ref_finish, bhimpl_virtual_ref_finish);
 bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
-fn handler_goto_if_not_int_is_zero(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_i[code[position] as usize];
-    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-    let pc = position + 3;
-    if a == 0 { Ok(pc) } else { Ok(target) }
-}
-fn handler_goto_if_not_ptr_iszero(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_r[code[position] as usize];
-    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-    let pc = position + 3;
-    if a == 0 { Ok(pc) } else { Ok(target) }
-}
-fn handler_goto_if_not_ptr_nonzero(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let a = bh.registers_r[code[position] as usize];
-    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-    let pc = position + 3;
-    if a != 0 { Ok(pc) } else { Ok(target) }
-}
+bhhandler_goto_if_not_i!(
+    handler_goto_if_not_int_is_zero,
+    bhimpl_goto_if_not_int_is_zero
+);
+bhhandler_goto_if_not_r!(
+    handler_goto_if_not_ptr_iszero,
+    bhimpl_goto_if_not_ptr_iszero
+);
+bhhandler_goto_if_not_r!(
+    handler_goto_if_not_ptr_nonzero,
+    bhimpl_goto_if_not_ptr_nonzero
+);
 fn handler_unreachable(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
