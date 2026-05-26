@@ -8,6 +8,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
 
 /// Python union type object (PEP 604).
 ///
@@ -16,30 +17,10 @@ use crate::pyobject::*;
 /// - `args`: tuple of the union members (deduplicated, flattened)
 ///
 /// PyPy equivalent: UnionType in _pypy_generic_alias.py
-#[repr(C)]
+#[pyre_class("types.UnionType", type_id = 22, static_name = "UNION")]
 pub struct W_UnionType {
-    pub ob_header: PyObject,
     /// Tuple of union member types — PyPy: UnionType._args
     pub args: PyObjectRef,
-}
-
-pub static UNION_TYPE: PyType = crate::pyobject::new_pytype("types.UnionType");
-
-/// Field offset of `args` within `W_UnionType`.
-pub const UNION_ARGS_OFFSET: usize = std::mem::offset_of!(W_UnionType, args);
-
-/// GC type id assigned to `W_UnionType` at JitDriver init time.
-pub const W_UNION_GC_TYPE_ID: u32 = 22;
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_UNION_OBJECT_SIZE: usize = std::mem::size_of::<W_UnionType>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-pub const W_UNION_GC_PTR_OFFSETS: [usize; 1] = [UNION_ARGS_OFFSET];
-
-impl crate::lltype::GcType for W_UnionType {
-    const TYPE_ID: u32 = W_UNION_GC_TYPE_ID;
-    const SIZE: usize = W_UNION_OBJECT_SIZE;
 }
 
 /// Check if an object is a UnionType.
@@ -63,14 +44,13 @@ pub fn w_union_new(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(args);
-
-    crate::lltype::malloc_typed(W_UnionType {
-        ob_header: PyObject {
-            ob_type: &UNION_TYPE as *const PyType,
-            w_class: get_instantiate(&UNION_TYPE),
+    W_UnionType::allocate(W_UnionType {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         args,
-    }) as PyObjectRef
+    })
 }
 
 /// Flatten nested UnionType args, or add a single type.

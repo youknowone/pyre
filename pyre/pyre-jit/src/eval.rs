@@ -884,84 +884,40 @@ thread_local! {
             <pyre_object::propertyobject::W_ClassMethodObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_UnionType (PEP 604 `X | Y`) carries one inline `PyObjectRef`
-        // field (`args` — tuple of union members). Pre-registered ahead
-        // of the foreign-pytype loop for the same reason as W_Cell:
-        // the loop's `size_of::<PyObject>()` approximation drops the
-        // gc_ptr_offsets, leaving live unions unscanned across a
-        // minor collection.
-        let w_union_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::unionobject::W_UnionType>(),
-            object_tid,
-            pyre_object::unionobject::W_UNION_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_union_tid, W_UNION_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // W_UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
+        // Pre-registered ahead of the foreign-pytype loop because that
+        // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,
+        // leaving live unions unscanned across a minor collection.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::unionobject::UNION_TYPE as *const _ as usize,
-            w_union_tid,
+            &mut pytype_to_tid,
+            <pyre_object::unionobject::W_UnionType
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::unionobject::UNION_TYPE as *const _ as usize,
-            w_union_tid,
-        );
-        // W_SeqIterator (list/tuple iterator) carries one inline
-        // `PyObjectRef` field (`seq`) plus two i64 scalars
-        // (`index`/`length`). Pre-registered ahead of the foreign-pytype
-        // loop so the GC walker reaches `seq`.
-        let w_seq_iter_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::rangeobject::W_SeqIterator>(),
-            object_tid,
-            pyre_object::rangeobject::W_SEQ_ITER_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_seq_iter_tid, W_SEQ_ITER_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // W_SeqIterator (list/tuple iterator) — typed payload via
+        // `#[pyre_class]`.  Pre-registered ahead of the foreign-pytype
+        // loop so the GC walker reaches the inline `seq` field.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::rangeobject::SEQ_ITER_TYPE as *const _ as usize,
-            w_seq_iter_tid,
+            &mut pytype_to_tid,
+            <pyre_object::rangeobject::W_SeqIterator
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::rangeobject::SEQ_ITER_TYPE as *const _ as usize,
-            w_seq_iter_tid,
-        );
-        // W_Count (`itertools.count`) carries two inline `PyObjectRef`
-        // fields (`w_c` / `w_step`) so the iterator state survives a
-        // minor collection. `COUNT_TYPE` is not in
-        // `all_foreign_pytypes()`, so the foreign-pytype loop never
-        // visits it; pre-registration is the only path through which
-        // its instances become GC-managed.
-        let w_count_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::itertoolsmodule::W_Count>(),
-            object_tid,
-            pyre_object::itertoolsmodule::W_COUNT_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_count_tid, W_COUNT_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —
+        // typed payload via `#[pyre_class]`.  Neither PyType is in
+        // `all_foreign_pytypes()`, so pre-registration here is the only
+        // path through which their instances become GC-managed.
+        register_pyre_class(
             &mut gc,
-            &pyre_object::itertoolsmodule::COUNT_TYPE as *const _ as usize,
-            w_count_tid,
+            &mut pytype_to_tid,
+            <pyre_object::itertoolsmodule::W_Count
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        pytype_to_tid.insert(
-            &pyre_object::itertoolsmodule::COUNT_TYPE as *const _ as usize,
-            w_count_tid,
-        );
-        // W_Repeat (`itertools.repeat`) carries one inline
-        // `PyObjectRef` field (`w_obj`) plus a bool/i64 pair. Same
-        // foreign-pytype caveat as W_Count.
-        let w_repeat_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::itertoolsmodule::W_Repeat>(),
-            object_tid,
-            pyre_object::itertoolsmodule::W_REPEAT_GC_PTR_OFFSETS.to_vec(),
-        ));
-        debug_assert_eq!(w_repeat_tid, W_REPEAT_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
+        register_pyre_class(
             &mut gc,
-            &pyre_object::itertoolsmodule::REPEAT_TYPE as *const _ as usize,
-            w_repeat_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::itertoolsmodule::REPEAT_TYPE as *const _ as usize,
-            w_repeat_tid,
+            &mut pytype_to_tid,
+            <pyre_object::itertoolsmodule::W_Repeat
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_MemberDescr (`__slots__` member descriptor) carries one
         // inline `PyObjectRef` field (`w_cls`) plus a `*const String`

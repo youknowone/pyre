@@ -6,6 +6,7 @@
 //! classes. Each class becomes a `#[repr(C)]` struct with a static PyType.
 
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
 
 // ── W_Count — pypy/module/itertools/interp_itertools.py:class W_Count ──
 //
@@ -28,31 +29,10 @@ use crate::pyobject::*;
 // The receiver stores `w_c` (current value) and `w_step` which are both
 // PyObjectRef so that count(1.5, 0.5) works for float too.
 
-pub static COUNT_TYPE: PyType = new_pytype("itertools.count");
-
-#[repr(C)]
+#[pyre_class("itertools.count", type_id = 24, static_name = "COUNT")]
 pub struct W_Count {
-    pub ob: PyObject,
     pub w_c: PyObjectRef,
     pub w_step: PyObjectRef,
-}
-
-/// Field offsets of inline `PyObjectRef` slots within `W_Count`.
-pub const COUNT_W_C_OFFSET: usize = std::mem::offset_of!(W_Count, w_c);
-pub const COUNT_W_STEP_OFFSET: usize = std::mem::offset_of!(W_Count, w_step);
-
-/// GC type id assigned to `W_Count` at JitDriver init time.
-pub const W_COUNT_GC_TYPE_ID: u32 = 24;
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_COUNT_OBJECT_SIZE: usize = std::mem::size_of::<W_Count>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-pub const W_COUNT_GC_PTR_OFFSETS: [usize; 2] = [COUNT_W_C_OFFSET, COUNT_W_STEP_OFFSET];
-
-impl crate::lltype::GcType for W_Count {
-    const TYPE_ID: u32 = W_COUNT_GC_TYPE_ID;
-    const SIZE: usize = W_COUNT_OBJECT_SIZE;
 }
 
 pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef {
@@ -60,15 +40,14 @@ pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef 
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_firstval);
     crate::gc_roots::pin_root(w_step);
-
-    crate::lltype::malloc_typed(W_Count {
+    W_Count::allocate(W_Count {
         ob: PyObject {
-            ob_type: &COUNT_TYPE as *const PyType,
-            w_class: get_instantiate(&COUNT_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         w_c: w_firstval,
         w_step,
-    }) as PyObjectRef
+    })
 }
 
 /// Check if an object is a `W_Count`.
@@ -128,31 +107,11 @@ pub unsafe fn w_count_get_step(obj: PyObjectRef) -> PyObjectRef {
 //         return self.w_obj
 // ```
 
-pub static REPEAT_TYPE: PyType = new_pytype("itertools.repeat");
-
-#[repr(C)]
+#[pyre_class("itertools.repeat", type_id = 25, static_name = "REPEAT")]
 pub struct W_Repeat {
-    pub ob: PyObject,
     pub w_obj: PyObjectRef,
     pub counting: bool,
     pub count: i64,
-}
-
-/// Field offset of `w_obj` within `W_Repeat`.
-pub const REPEAT_W_OBJ_OFFSET: usize = std::mem::offset_of!(W_Repeat, w_obj);
-
-/// GC type id assigned to `W_Repeat` at JitDriver init time.
-pub const W_REPEAT_GC_TYPE_ID: u32 = 25;
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_REPEAT_OBJECT_SIZE: usize = std::mem::size_of::<W_Repeat>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-pub const W_REPEAT_GC_PTR_OFFSETS: [usize; 1] = [REPEAT_W_OBJ_OFFSET];
-
-impl crate::lltype::GcType for W_Repeat {
-    const TYPE_ID: u32 = W_REPEAT_GC_TYPE_ID;
-    const SIZE: usize = W_REPEAT_OBJECT_SIZE;
 }
 
 pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
@@ -163,16 +122,15 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_obj);
-
-    crate::lltype::malloc_typed(W_Repeat {
+    W_Repeat::allocate(W_Repeat {
         ob: PyObject {
-            ob_type: &REPEAT_TYPE as *const PyType,
-            w_class: get_instantiate(&REPEAT_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         w_obj,
         counting,
         count,
-    }) as PyObjectRef
+    })
 }
 
 /// Check if an object is a `W_Repeat`.

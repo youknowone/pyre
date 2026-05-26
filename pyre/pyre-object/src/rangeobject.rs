@@ -5,6 +5,7 @@
 //! by reading/writing `current`, `stop`, `step` via field descriptors.
 
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
 
 /// Type descriptor for range iterators.
 pub static RANGE_ITER_TYPE: PyType = crate::pyobject::new_pytype("range_iterator");
@@ -193,47 +194,26 @@ mod tests {
 
 // ── Sequence iterator (list/tuple) ──
 
-pub static SEQ_ITER_TYPE: PyType = crate::pyobject::new_pytype("list_iterator");
-
-#[repr(C)]
+#[pyre_class("list_iterator", type_id = 23, static_name = "SEQ_ITER")]
 pub struct W_SeqIterator {
-    pub ob: PyObject,
     pub seq: PyObjectRef,
     pub index: i64,
     pub length: i64,
-}
-
-/// Field offset of `seq` within `W_SeqIterator`.
-pub const SEQ_ITER_SEQ_OFFSET: usize = std::mem::offset_of!(W_SeqIterator, seq);
-
-/// GC type id assigned to `W_SeqIterator` at JitDriver init time.
-pub const W_SEQ_ITER_GC_TYPE_ID: u32 = 23;
-
-/// Fixed payload size (`framework.py:811`).
-pub const W_SEQ_ITER_OBJECT_SIZE: usize = std::mem::size_of::<W_SeqIterator>();
-
-/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
-pub const W_SEQ_ITER_GC_PTR_OFFSETS: [usize; 1] = [SEQ_ITER_SEQ_OFFSET];
-
-impl crate::lltype::GcType for W_SeqIterator {
-    const TYPE_ID: u32 = W_SEQ_ITER_GC_TYPE_ID;
-    const SIZE: usize = W_SEQ_ITER_OBJECT_SIZE;
 }
 
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(seq);
-
-    crate::lltype::malloc_typed(W_SeqIterator {
+    W_SeqIterator::allocate(W_SeqIterator {
         ob: PyObject {
-            ob_type: &SEQ_ITER_TYPE as *const PyType,
-            w_class: get_instantiate(&SEQ_ITER_TYPE),
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
         },
         seq,
         index: 0,
         length: length as i64,
-    }) as PyObjectRef
+    })
 }
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
