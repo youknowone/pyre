@@ -299,6 +299,104 @@ macro_rules! py_class {
     };
 }
 
+/// Typed-payload variant of [`py_class!`] — binds the Python-level
+/// `W_TypeObject` to a Rust `#[pyre_class]` struct so instances
+/// allocate the typed payload (`<W_X>::allocate(payload)`) and carry
+/// the class's own static `PyType` in `ob_header.ob_type` instead of
+/// piggy-backing on `INSTANCE_TYPE`.
+///
+/// The first argument names a `#[pyre_class]`-attributed struct that
+/// owns the layout; the second is the Python-visible type name; the
+/// `methods:` / `properties:` arms mirror [`py_class!`].
+///
+/// ```ignore
+/// #[crate::pyre_class("_random.Random", type_id = 53)]
+/// pub struct W_Random {
+///     pub state: u64,
+/// }
+///
+/// crate::py_class_typed! {
+///     W_Random as "_random.Random",
+///     methods: {
+///         fn random(self_obj: PyObjectRef) -> f64 {
+///             let w = W_Random::from_obj(self_obj).unwrap();
+///             w.state = w.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+///             (w.state as f64) / (u64::MAX as f64)
+///         }
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! py_class_typed {
+    (
+        $struct:ident as $name:literal
+        $(, methods: {
+            $(
+                fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
+            )*
+        })?
+        $(, properties: {
+            $(
+                fn $pname:ident ( $($pargs:tt)* ) $(-> $pret:ty)? $pbody:block
+            )*
+        })?
+        $(,)?
+    ) => {
+        pub fn type_object() -> ::pyre_object::PyObjectRef {
+            thread_local! {
+                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
+                    = const { ::std::cell::OnceCell::new() };
+            }
+            CELL.with(|c| {
+                *c.get_or_init(|| {
+                    let tp = $crate::typedef::make_builtin_type_with_layout(
+                        $name,
+                        |ns| {
+                            $($(
+                                {
+                                    #[$crate::pyre_function]
+                                    fn $mname ( $($margs)* ) $(-> $mret)? $mbody
+                                    $crate::dict_storage_store(
+                                        ns,
+                                        stringify!($mname),
+                                        $crate::make_builtin_function(stringify!($mname), $mname),
+                                    );
+                                }
+                            )*)?
+                            $($(
+                                {
+                                    #[$crate::pyre_function]
+                                    fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
+                                    $crate::dict_storage_store(
+                                        ns,
+                                        stringify!($pname),
+                                        $crate::typedef::make_getset_descriptor_named(
+                                            $crate::make_builtin_function(stringify!($pname), $pname),
+                                            stringify!($pname),
+                                        ),
+                                    );
+                                }
+                            )*)?
+                        },
+                        $crate::typedef::w_object(),
+                        <$struct as $crate::PyreClassPyTypeOf>::PYTYPE,
+                    );
+                    // Eagerly bind the W_TypeObject to the static
+                    // `PyType` so `<$struct>::allocate(...)` can stamp
+                    // `ob_header.w_class` at construction without racing
+                    // the post-init typedef pass (matches
+                    // `getset_descriptor_type()`'s eager `set_instantiate`).
+                    ::pyre_object::pyobject::set_instantiate(
+                        unsafe { &*<$struct as $crate::PyreClassPyTypeOf>::PYTYPE },
+                        tp,
+                    );
+                    tp
+                })
+            })
+        }
+    };
+}
+
 /// Helper for `py_module!`'s `functions:` arm.  `*` → varargs
 /// (`make_builtin_function`); numeric arity → `make_builtin_function_with_arity`.
 #[macro_export]
@@ -374,6 +472,26 @@ pub use shared_opcode::*;
 
 /// PyPy `@unwrap_spec(...)` equivalent.  See `pyre-macros/src/lib.rs`.
 pub use pyre_macros::pyre_function;
+
+/// PyPy `class W_X(W_Root)` + `TypeDef(...)` equivalent: derives the
+/// PyType static, GC type-id constants, GC pointer-offsets table, and
+/// `from_obj` / `allocate` helpers from a `#[repr(C)]` struct with a
+/// `pub ob: PyObject` header (auto-prepended if absent).
+pub use pyre_macros::pyre_class;
+
+/// PyPy `interp2app(W_X.method)` equivalent attached to an `impl
+/// W_X { ... }` block: every typed method gains an `args: &[PyObjectRef]`
+/// wrapper that downcasts `args[0]` to `&mut Self` via `from_obj`,
+/// unwraps the remaining args (same engine as [`pyre_function`]), calls
+/// the typed body, and re-wraps the return value.  A `pub fn
+/// type_object()` accessor is generated alongside, ready to drop into
+/// `py_module! { interpleveldefs: { "X" => type_object() } }`.
+pub use pyre_macros::pyre_methods;
+
+/// Re-export of [`pyre_object::lltype::PyreClassPyTypeOf`] so
+/// `py_class_typed!` can name it via `$crate::PyreClassPyTypeOf` from
+/// downstream module crates.
+pub use pyre_object::lltype::PyreClassPyTypeOf;
 
 /// Every interpreter-level `PyType` static that represents a
 /// `PyObject`-layout type (instances carry `ob_type` at offset 0,

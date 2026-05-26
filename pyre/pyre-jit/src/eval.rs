@@ -645,6 +645,30 @@ thread_local! {
         // INT/FLOAT are wired up first so subsequent foreign-pytype
         // entries can resolve their parents through the same map.
         let mut pytype_to_tid: HashMap<usize, u32> = HashMap::new();
+        // Helper for `#[pyre_class]`-emitted types: register the GC
+        // payload + vtable + `pytype_to_tid` entry in one call.  Asserts
+        // that the descriptor's `gc_type_id` matches the id `gc.register_type`
+        // returns — drift indicates the manual constant in the
+        // `#[pyre_class(... type_id = N)]` attribute is out of step
+        // with the registration order here.
+        let register_pyre_class = |gc: &mut MiniMarkGC,
+                                       pytype_to_tid: &mut HashMap<usize, u32>,
+                                       descr: &'static pyre_object::lltype::PyreClassDescriptor|
+         -> u32 {
+            let tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+                descr.object_size,
+                object_tid,
+                descr.ptr_offsets.to_vec(),
+            ));
+            debug_assert_eq!(
+                tid, descr.gc_type_id,
+                "PyreClassDescriptor::gc_type_id mismatch — adjust `#[pyre_class(type_id = N)]`",
+            );
+            let pytype_ptr = descr.pytype_ptr as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
+            pytype_to_tid.insert(pytype_ptr, tid);
+            tid
+        };
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
             &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
@@ -1554,6 +1578,18 @@ thread_local! {
         pytype_to_tid.insert(
             &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
             w_gc_weakref_tid,
+        );
+        // `#[pyre_class]`-emitted typed-payload registrations.  Each
+        // entry is one line consuming the macro-generated
+        // `PyreClassDescriptor` static; `register_pyre_class` asserts
+        // the descriptor's `gc_type_id` matches the order here so the
+        // hardcoded `type_id` constants on the `#[pyre_class]`
+        // attribute cannot silently drift.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_random::W_Random
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // Per-`ExcKind` GC type ids.  The pre-registration loop at the
         // top of this function mapped every exception PyType to a

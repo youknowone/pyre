@@ -61,6 +61,51 @@ pub trait GcType {
     const SIZE: usize;
 }
 
+/// Compile-time descriptor every `#[pyre_class]` type emits, consumed
+/// by the JIT driver's GC registration loop in
+/// `pyre/pyre-jit/src/eval.rs`.  Mirrors the per-type tuple PyPy's
+/// `framework.py:807-811` materializes (TYPE_ID + fixed size + GC
+/// pointer offsets) plus the static `PyType` the dispatcher uses to
+/// recognise the layout at runtime.
+pub struct PyreClassDescriptor {
+    /// Static `PyType` pointer used by `py_type_check` and stamped
+    /// into `ob_header.ob_type`.
+    pub pytype_ptr: *const crate::pyobject::PyType,
+    /// `GcType::TYPE_ID` for this payload.  Asserted equal to the id
+    /// returned by `gc.register_type(...)` in the JIT driver.
+    pub gc_type_id: u32,
+    /// `GcType::SIZE` for this payload (in bytes).
+    pub object_size: usize,
+    /// Byte offsets of inline `PyObjectRef` fields the GC must trace.
+    pub ptr_offsets: &'static [usize],
+}
+
+// Safety: every field is either a static-`'static` reference (PyType,
+// ptr_offsets), a primitive, or a raw pointer to read-only static
+// storage; sharing across threads is sound.
+unsafe impl Sync for PyreClassDescriptor {}
+
+/// Compile-time bridge between a `#[pyre_class]` struct and its
+/// per-type static `PyType` / `PyreClassDescriptor`.  Implemented
+/// automatically by `#[pyre_class]`; consumed by `py_class_typed!`
+/// to thread the static `PyType` pointer through
+/// `make_builtin_type_with_layout` without naming the macro-generated
+/// suffixed identifier (`RANDOM_TYPE`, `RANDOM_PYRE_CLASS_DESCRIPTOR`,
+/// …) at the call site.
+pub trait PyreClassPyTypeOf {
+    /// Static `PyType` pointer (`*const pyre_object::PyType`).  Read
+    /// by `py_class_typed!` and `<W_X>::allocate` to stamp
+    /// `ob_header.ob_type`.
+    const PYTYPE: *const crate::pyobject::PyType;
+    /// Compile-time descriptor consumed by the JIT driver's
+    /// `register_pyre_class` helper in `pyre-jit/src/eval.rs`.
+    const DESCRIPTOR: &'static PyreClassDescriptor;
+    /// Python-visible dotted name (e.g. `"_random.Random"`) carried
+    /// verbatim from `#[pyre_class("…", type_id = N)]`.  Consumed by
+    /// `#[pyre_methods]` so the impl block doesn't restate it.
+    const PYNAME: &'static str;
+}
+
 /// `lltype.malloc(T, flavor='gc')` parity, *untyped* (no `GcType` impl
 /// required). Allocates a fixed-size GC-managed object on the heap and
 /// returns a raw pointer the caller owns until the GC takes over.

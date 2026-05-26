@@ -44,7 +44,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, ItemFn, Pat, PatType, ReturnType, Type, parse_macro_input, parse_quote, spanned::Spanned,
+    Fields, FnArg, ImplItem, ItemFn, ItemImpl, ItemStruct, Pat, PatType, ReturnType, Type,
+    parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 #[proc_macro_attribute]
@@ -380,4 +381,425 @@ fn type_is_pyerror(ty: &Type) -> bool {
 #[allow(dead_code)]
 fn _unused() {
     let _: syn::Type = parse_quote!(i64);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `#[pyre_class("python.name", type_id = N)]` — PyPy `class W_X(W_Root)`
+// equivalent.
+//
+// Generates the typed-payload boilerplate every existing `W_X` struct
+// writes by hand (see `pyre/pyre-object/src/superobject.rs`):
+// ──────────────────────────────────────────────────────────────────────
+//
+// User source:
+//   #[pyre_class("_random.Random", type_id = 53)]
+//   pub struct W_Random {
+//       state: u64,
+//   }
+//
+// Emitted:
+//   pub static RANDOM_TYPE: ::pyre_object::PyType =
+//       ::pyre_object::pyobject::new_pytype("_random.Random");
+//
+//   #[repr(C)]
+//   pub struct W_Random {
+//       pub ob: ::pyre_object::PyObject,   // <- macro-prepended header
+//       pub state: u64,
+//   }
+//
+//   pub const W_RANDOM_GC_TYPE_ID: u32 = 53;
+//   pub const W_RANDOM_OBJECT_SIZE: usize = ::std::mem::size_of::<W_Random>();
+//   pub const W_RANDOM_GC_PTR_OFFSETS: [usize; 0] = [];
+//
+//   impl ::pyre_object::lltype::GcType for W_Random {
+//       const TYPE_ID: u32 = W_RANDOM_GC_TYPE_ID;
+//       const SIZE: usize = W_RANDOM_OBJECT_SIZE;
+//   }
+//
+//   impl W_Random {
+//       pub unsafe fn from_obj(obj: ::pyre_object::PyObjectRef)
+//           -> ::std::option::Option<&'static mut Self>
+//       {
+//           if unsafe { ::pyre_object::py_type_check(obj, &RANDOM_TYPE) } {
+//               Some(unsafe { &mut *(obj as *mut Self) })
+//           } else { None }
+//       }
+//   }
+//
+// `PTR_OFFSETS` auto-derived from the user's struct: every field whose
+// type is `PyObjectRef` becomes one entry via `std::mem::offset_of!`.
+// Primitive fields (`u64` / `i32` / etc.) are skipped because the GC
+// doesn't need to trace them.
+//
+// `type_id = N` is required (manual): the GC's `pytype_to_tid` table
+// asserts a contiguous monotonic sequence at JIT-init in
+// `pyre/pyre-jit/src/eval.rs:1335-1352`.  Reserve a slot, register
+// it in eval.rs, and pass the same number here.
+//
+// The PyType static name is derived from the struct name (snake-case
+// uppercased + `_TYPE` suffix): `W_Random` → `RANDOM_TYPE`.
+// `W_GetSetProperty` → `GETSETPROPERTY_TYPE`.  Override the suffix
+// path is not yet supported — pick struct names whose derived static
+// matches the import path callers expect.
+
+#[proc_macro_attribute]
+pub fn pyre_class(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = parse_macro_input!(attr as PyreClassAttrs);
+    let st = parse_macro_input!(item as ItemStruct);
+    match expand_pyre_class(attrs, st) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+struct PyreClassAttrs {
+    name: syn::LitStr,
+    type_id: syn::LitInt,
+}
+
+impl syn::parse::Parse for PyreClassAttrs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        // `"name.path", type_id = N`
+        let name: syn::LitStr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let key: syn::Ident = input.parse()?;
+        if key != "type_id" {
+            return Err(syn::Error::new(key.span(), "expected `type_id`"));
+        }
+        input.parse::<syn::Token![=]>()?;
+        let type_id: syn::LitInt = input.parse()?;
+        Ok(Self { name, type_id })
+    }
+}
+
+fn expand_pyre_class(
+    attrs: PyreClassAttrs,
+    mut st: ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let st_name = st.ident.clone();
+    let st_vis = st.vis.clone();
+    let name_lit = attrs.name;
+    let type_id_lit = attrs.type_id;
+
+    // Derive static names from the struct name.
+    //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
+    //                       W_RANDOM_OBJECT_SIZE, W_RANDOM_GC_PTR_OFFSETS
+    //   W_GetSetProperty  -> GETSETPROPERTY_TYPE, W_GETSETPROPERTY_GC_TYPE_ID, …
+    let st_str = st_name.to_string();
+    let suffix = st_str.strip_prefix("W_").unwrap_or(&st_str).to_uppercase();
+    let pytype_static = format_ident!("{}_TYPE", suffix);
+    let gc_type_id_const = format_ident!("W_{}_GC_TYPE_ID", suffix);
+    let object_size_const = format_ident!("W_{}_OBJECT_SIZE", suffix);
+    let ptr_offsets_const = format_ident!("W_{}_GC_PTR_OFFSETS", suffix);
+    let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
+
+    // Enforce `#[repr(C)]` and prepend the PyObject header.
+    let already_repr_c = st.attrs.iter().any(|a| {
+        a.path().is_ident("repr")
+            && a.parse_args::<syn::Ident>()
+                .map(|i| i == "C")
+                .unwrap_or(false)
+    });
+    if !already_repr_c {
+        st.attrs.push(parse_quote!(#[repr(C)]));
+    }
+
+    // Prepend `pub ob: PyObject` if not already present.
+    let Fields::Named(ref mut named) = st.fields else {
+        return Err(syn::Error::new(
+            st.span(),
+            "#[pyre_class] requires a struct with named fields",
+        ));
+    };
+    let has_ob = named
+        .named
+        .iter()
+        .any(|f| f.ident.as_ref().map(|i| i == "ob").unwrap_or(false));
+    if !has_ob {
+        use syn::parse::Parser;
+        let ob_field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { pub ob: ::pyre_object::PyObject })
+            .expect("parse ob field");
+        named.named.insert(0, ob_field);
+    }
+
+    // Collect `PyObjectRef` fields' offsets for GC tracing.  Skip `ob`
+    // because the GC walks the header through the parent (object) tid.
+    let mut ptr_field_idents: Vec<syn::Ident> = Vec::new();
+    for f in named.named.iter() {
+        let Some(ident) = f.ident.clone() else {
+            continue;
+        };
+        if ident == "ob" {
+            continue;
+        }
+        if type_is_py_object_ref(&f.ty) {
+            ptr_field_idents.push(ident);
+        }
+    }
+    let ptr_offsets_len = ptr_field_idents.len();
+    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> = ptr_field_idents
+        .iter()
+        .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) })
+        .collect();
+
+    Ok(quote! {
+        #st
+
+        #st_vis static #pytype_static: ::pyre_object::PyType =
+            ::pyre_object::pyobject::new_pytype(#name_lit);
+
+        #st_vis const #gc_type_id_const: u32 = #type_id_lit;
+        #st_vis const #object_size_const: usize = ::std::mem::size_of::<#st_name>();
+        #st_vis const #ptr_offsets_const: [usize; #ptr_offsets_len] = [
+            #(#ptr_offsets_inits),*
+        ];
+
+        impl ::pyre_object::lltype::GcType for #st_name {
+            const TYPE_ID: u32 = #gc_type_id_const;
+            const SIZE: usize = #object_size_const;
+        }
+
+        /// Compile-time descriptor consumed by `pyre/pyre-jit/src/eval.rs`'s
+        /// GC registration loop.  Aggregates the four constants above into
+        /// a single `Sync` static the JIT driver iterates over without
+        /// per-type knowledge.
+        #st_vis static #descriptor_static: ::pyre_object::lltype::PyreClassDescriptor =
+            ::pyre_object::lltype::PyreClassDescriptor {
+                pytype_ptr: &#pytype_static as *const ::pyre_object::PyType,
+                gc_type_id: #gc_type_id_const,
+                object_size: #object_size_const,
+                ptr_offsets: &#ptr_offsets_const,
+            };
+
+        impl ::pyre_object::lltype::PyreClassPyTypeOf for #st_name {
+            const PYTYPE: *const ::pyre_object::PyType =
+                &#pytype_static as *const ::pyre_object::PyType;
+            const DESCRIPTOR: &'static ::pyre_object::lltype::PyreClassDescriptor =
+                &#descriptor_static;
+            const PYNAME: &'static str = #name_lit;
+        }
+
+        impl #st_name {
+            /// Borrow `obj` as `&mut Self` after verifying its
+            /// `ob_type` matches this class's static `PyType`.
+            /// Returns `None` if `obj` is the wrong type — callers
+            /// must convert that to a Python `TypeError`.
+            #[allow(dead_code)]
+            #[inline]
+            pub fn from_obj(obj: ::pyre_object::PyObjectRef)
+                -> ::std::option::Option<&'static mut Self>
+            {
+                if unsafe { ::pyre_object::py_type_check(obj, &#pytype_static) } {
+                    ::std::option::Option::Some(unsafe { &mut *(obj as *mut Self) })
+                } else {
+                    ::std::option::Option::None
+                }
+            }
+
+            /// Allocate a fresh instance via `lltype::malloc_typed`,
+            /// stamping the PyObject header so the GC and dispatcher
+            /// can identify it.  `payload` carries the user-defined
+            /// fields; the `ob` header is filled in by this fn.
+            #[allow(dead_code)]
+            pub fn allocate(payload: Self) -> ::pyre_object::PyObjectRef {
+                let _roots = ::pyre_object::gc_roots::push_roots();
+                let full = Self {
+                    ob: ::pyre_object::PyObject {
+                        ob_type: &#pytype_static as *const ::pyre_object::PyType,
+                        w_class: ::pyre_object::pyobject::get_instantiate(&#pytype_static),
+                    },
+                    ..payload
+                };
+                ::pyre_object::lltype::malloc_typed(full) as ::pyre_object::PyObjectRef
+            }
+        }
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `#[pyre_methods]` — PyPy `TypeDef("...", method=interp2app(W_X.m))`
+// equivalent attached to an `impl W_X { ... }` block.
+//
+// User source:
+//   #[pyre_methods]
+//   impl W_Random {
+//       fn __init__(&mut self, seed: Option<i64>) {
+//           self.state = seed.unwrap_or(DEFAULT) as u64;
+//       }
+//       fn random(&mut self) -> f64 { ... }
+//   }
+//
+// Emitted: one `args: &[PyObjectRef]` wrapper per method (downcasts
+// `args[0]` to `&mut Self` via `from_obj`, unwraps the rest through
+// the same `unwrap_expr` machinery `#[pyre_function]` uses, calls the
+// typed method, wraps the return through `wrap_return`) plus
+// `pub fn type_object()` that consumes `<Self as PyreClassPyTypeOf>::
+// {PYNAME, PYTYPE}` to drive `make_builtin_type_with_layout` and
+// `set_instantiate` exactly like `py_class_typed!` does.
+// ──────────────────────────────────────────────────────────────────────
+
+#[proc_macro_attribute]
+pub fn pyre_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let imp = parse_macro_input!(item as ItemImpl);
+    match expand_pyre_methods(imp) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some((_, path, _)) = &imp.trait_ {
+        return Err(syn::Error::new(
+            path.span(),
+            "#[pyre_methods] must annotate an inherent impl, not a trait impl",
+        ));
+    }
+    let self_ty = (*imp.self_ty).clone();
+
+    // Collect (python_name, wrapper_ident) per method as we rewrite the
+    // impl block in-place: every `fn name(&self|&mut self, …)` keeps
+    // its typed body untouched so users can call it directly from Rust,
+    // and we synthesise a sibling `pub fn name__pyre_wrapper(args)` as
+    // a free-fn inside an attached `mod _pyre_wrappers_<Self>` module.
+    let mut wrappers = Vec::<proc_macro2::TokenStream>::new();
+    let mut registrations = Vec::<proc_macro2::TokenStream>::new();
+
+    for item in imp.items.iter() {
+        let ImplItem::Fn(m) = item else { continue };
+        if m.sig.asyncness.is_some()
+            || m.sig.constness.is_some()
+            || m.sig.unsafety.is_some()
+            || !m.sig.generics.params.is_empty()
+        {
+            return Err(syn::Error::new(
+                m.sig.span(),
+                "#[pyre_methods]: async/const/unsafe/generic methods not supported",
+            ));
+        }
+        let mname = &m.sig.ident;
+        let wrapper_name = format_ident!("__pyre_wrap_{}", mname);
+
+        // Split first arg (must be `&mut self` / `&self`) from the rest.
+        let mut inputs = m.sig.inputs.iter();
+        let recv = match inputs.next() {
+            Some(FnArg::Receiver(r)) => r,
+            _ => {
+                return Err(syn::Error::new(
+                    m.sig.span(),
+                    "#[pyre_methods]: every method must take `&self` or `&mut self` \
+                     as its first arg — static/class methods are not supported yet",
+                ));
+            }
+        };
+        let recv_is_mut = recv.mutability.is_some();
+        let from_obj_call = if recv_is_mut {
+            quote! { <#self_ty>::from_obj(args[0]) }
+        } else {
+            // `from_obj` returns `Option<&mut Self>` even for `&self`
+            // callers — re-borrow as `&Self` to match the method's
+            // receiver kind without forcing a separate `from_obj_ref`.
+            quote! { <#self_ty>::from_obj(args[0]).map(|m| &*m) }
+        };
+
+        // Unwrap remaining args.  `args[0]` is `self`, so user-arg
+        // indices are `1`, `2`, ….
+        let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
+        let mut call_args = Vec::<proc_macro2::TokenStream>::new();
+        for (offset, arg) in inputs.enumerate() {
+            let FnArg::Typed(pt) = arg else {
+                return Err(syn::Error::new(
+                    arg.span(),
+                    "#[pyre_methods]: unexpected receiver mid-signature",
+                ));
+            };
+            let arg_idx = offset + 1;
+            let (stmt, ident) = unwrap_arg(arg_idx, pt)?;
+            unwrap_stmts.push(stmt);
+            call_args.push(quote! { #ident });
+        }
+
+        let call_inner = quote! { __pyre_self.#mname( #(#call_args),* ) };
+        let body = wrap_return(&m.sig.output, call_inner)?;
+
+        let py_name = mname.to_string();
+        wrappers.push(quote! {
+            #[allow(non_snake_case)]
+            pub fn #wrapper_name(
+                args: &[::pyre_object::PyObjectRef],
+            ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+                if args.is_empty() {
+                    return ::std::result::Result::Err(
+                        crate::PyError::type_error(
+                            concat!("descriptor '", #py_name, "' requires self argument"),
+                        ),
+                    );
+                }
+                let __pyre_self = match #from_obj_call {
+                    ::std::option::Option::Some(s) => s,
+                    ::std::option::Option::None => {
+                        return ::std::result::Result::Err(
+                            crate::PyError::type_error(
+                                concat!("descriptor '", #py_name, "' got wrong receiver type"),
+                            ),
+                        );
+                    }
+                };
+                #(#unwrap_stmts)*
+                #body
+            }
+        });
+        registrations.push(quote! {
+            crate::dict_storage_store(
+                ns,
+                #py_name,
+                crate::make_builtin_function(#py_name, #wrapper_name),
+            );
+        });
+    }
+
+    // Strip `#[pyre_method]` / `#[pyre_property]` marker attrs the user
+    // may have placed (future-compat; ignored today).  Other attrs
+    // pass through.
+    for item in imp.items.iter_mut() {
+        if let ImplItem::Fn(m) = item {
+            m.attrs.retain(|a| {
+                !(a.path().is_ident("pyre_method") || a.path().is_ident("pyre_property"))
+            });
+        }
+    }
+
+    let type_object_fn = quote! {
+        pub fn type_object() -> ::pyre_object::PyObjectRef {
+            thread_local! {
+                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
+                    = const { ::std::cell::OnceCell::new() };
+            }
+            CELL.with(|c| {
+                *c.get_or_init(|| {
+                    let tp = crate::typedef::make_builtin_type_with_layout(
+                        <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
+                        |ns| { #(#registrations)* },
+                        crate::typedef::w_object(),
+                        <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+                    );
+                    ::pyre_object::pyobject::set_instantiate(
+                        unsafe {
+                            &*<#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
+                        },
+                        tp,
+                    );
+                    tp
+                })
+            })
+        }
+    };
+
+    Ok(quote! {
+        #imp
+
+        #(#wrappers)*
+
+        #type_object_fn
+    })
 }
