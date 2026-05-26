@@ -202,31 +202,27 @@
 //!
 //! ### Remaining AST-side CFG shims (Step 6.E)
 //!
-//! Four AST-side CFG-reconstruction shims remain reachable through
-//! the AST front-end:
+//! Three AST-side CFG-reconstruction shims remain reachable through
+//! the surviving walker (`lower_expr_into_graph_with_signature`):
 //!
 //! - `front::ast::lazy_install_local_at_current_block_var`
-//! - `front::ast::can_thread_variable_to_block`
 //! - `front::ast::lower_if_expr`'s fallback branch
 //! - `front::ast::GraphBuildContext` per-scope binding tracking
 //!
-//! These are AST builder internals compensating for the recursive
-//! walker's CFG-blindness.  MIR has CFG explicit and never needs
-//! them.  Removing them requires either:
+//! (`can_thread_variable_to_block` was retired during the Slice 5
+//! deletions — it had no remaining callers.)
 //!
-//! - Integrating Charon into the cargo build (separate
-//!   infrastructure project), or
-//! - Shipping pre-extracted `.ullbc` artefacts in the source tree
-//!   (CI-scoped), or
-//! - Rewriting the AST builder to not need CFG-blindness
-//!   compensation (broad refactor of the recursive walker).
-//!
-//! Each path is its own multi-session epic outside the Charon
-//! mission's stable-Rust acceptance criterion.  The mission ships
-//! with the AST fallback intact — issue #97 acceptance criterion
-//! "removed only if production lowering no longer depends on it"
-//! is honoured because the AST builder is reachable only when no
-//! LLBC source resolves.
+//! These compensate for the recursive walker's CFG-blindness.  Every
+//! survivor is instantiated directly by
+//! `lower_expr_into_graph_with_signature`
+//! (`front/ast.rs:1055`), which is still production-essential for
+//! `parse::extract_opcode_dispatch_arms::extract_match_arms` per-arm
+//! body lowering.  Retiring the shims therefore requires retiring
+//! that walker first — its own multi-session project (see Slice 5's
+//! "remaining" note above).  The Charon mission's acceptance
+//! criterion is honoured because the AST graph builder is unreachable
+//! in production; only the per-arm body lowerer survives, and only
+//! for the dispatch table.
 //!
 
 pub mod ast;
