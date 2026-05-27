@@ -23,12 +23,14 @@ pub use crate::front::syn_metadata::{
 };
 pub(crate) use crate::front::syn_metadata::is_synthetic_unit_variant_path;
 use crate::front::syn_metadata::{
-    array_item_value_type_from_array_type_id, bare_type_root_from_type_str, cast_builtin_name,
+    UnaryNotOperandKind, array_item_value_type_from_array_type_id, bare_type_root_from_type_str,
+    binary_result_value_type_inner, cast_builtin_name, const_value_value_type,
     dyn_trait_root_from_type_str, extract_element_type_from_str, intrinsic_call_result_type,
     is_synthetic_ctor_path, is_synthetic_result_option_wrapper_path, kind_char_to_value_type,
-    method_as_ref_return_type, outer_generic_inner_type, path_as_value_float_constant,
-    split_tuple_type_elements, transparent_option_inner_type, transparent_result_err_type,
-    type_root_from_type_string, type_string_to_value_type,
+    method_as_ref_return_type, op_result_value_type, outer_generic_inner_type,
+    path_as_value_float_constant, split_tuple_type_elements, transparent_option_inner_type,
+    transparent_result_err_type, type_root_from_type_string, type_string_to_unary_not_kind,
+    type_string_to_value_type, unwrap_result_or_option, value_type_to_unary_not_kind,
 };
 
 /// Result of lowering one expression or statement-list tail.
@@ -6272,13 +6274,6 @@ fn lower_expr(
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnaryNotOperandKind {
-    Bool,
-    Int,
-    Unknown,
-}
-
 /// Classify Rust's overloaded `!` operand into the RPython opcode it
 /// can be lowered to. RPython/PyPy has distinct bytecode shapes:
 /// `UNARY_NOT` lowers through `op.bool` plus a branch, while
@@ -6922,66 +6917,6 @@ fn expr_binary_unary_not_operand_kind(
     }
 }
 
-fn value_type_to_unary_not_kind(ty: &ValueType) -> UnaryNotOperandKind {
-    match ty {
-        ValueType::Bool => UnaryNotOperandKind::Bool,
-        // `lltype.Unsigned`'s `UNARY_INVERT` dispatch routes through
-        // the same `int_invert` opname as `lltype.Signed` — see
-        // `flowspace/operation.py:521 invert.dispatch_to_register
-        // _class('int')` and `rint.py:rtype_int__invert` which both
-        // Signed and Unsigned IntegerRepr inherit.  `UnaryNotOperand
-        // Kind::Int` here drives the bytecode dispatch decision; the
-        // result-type carrier is computed from the operand's actual
-        // lowered type at the emit site, so Unsigned operands stay
-        // Unsigned through the rtyper.
-        ValueType::Int | ValueType::Unsigned => UnaryNotOperandKind::Int,
-        _ => UnaryNotOperandKind::Unknown,
-    }
-}
-
-fn type_string_to_unary_not_kind(type_str: &str) -> UnaryNotOperandKind {
-    let trimmed = type_str.trim();
-    // Arbitrary-precision integer types — `BigInt` / `BigUint`. Routed
-    // through `UNARY_INVERT` (bitwise NOT) like primitive integers,
-    // even though their lattice lowering is `ValueType::Ref`. RPython
-    // peer: `LongRepr.rtype_invert` (`rtyper/rlong.py:..`) dispatches
-    // bigint invert at the rtyper layer; pyre's `OpKind::UnaryOp.
-    // result_ty` is computed from the operand's actual lowered type
-    // at the emit site (`front/ast.rs:3667 UnaryNotOperandKind::Int`
-    // arm), so this kind only drives the bytecode dispatch decision,
-    // not the result-type carrier.
-    if matches!(trimmed, "BigInt" | "BigUint") {
-        return UnaryNotOperandKind::Int;
-    }
-    value_type_to_unary_not_kind(&type_string_to_value_type(type_str))
-}
-
-/// Strip the outer `Result<_, _>` or `Option<_>` wrapper from a type
-/// string and return the inner ok / some payload type.  Used by the
-/// `.unwrap()` / `.expect()` projection in `expr_unary_not_operand_kind`
-/// so a `let x = foo().unwrap()` whose `foo() -> Result<bool, _>`
-/// classifies `x` as `Bool`, not `Unknown`.
-fn unwrap_result_or_option(type_str: &str) -> Option<&str> {
-    let trimmed = type_str.trim();
-    let inner = trimmed
-        .strip_prefix("Result<")
-        .or_else(|| trimmed.strip_prefix("Option<"))?
-        .strip_suffix('>')?;
-    // For `Result<T, E>` keep `T` (split on the top-level comma).  Track
-    // angle-bracket depth so nested generics like `Result<Vec<T>, E>` /
-    // `Option<Result<bool, _>>` survive the split.
-    let mut depth = 0_i32;
-    for (i, ch) in inner.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            ',' if depth == 0 => return Some(inner[..i].trim()),
-            _ => {}
-        }
-    }
-    Some(inner.trim())
-}
-
 fn expr_is_statically_bool(expr: &syn::Expr, ctx: &GraphBuildContext) -> bool {
     expr_unary_not_operand_kind(expr, ctx) == UnaryNotOperandKind::Bool
 }
@@ -7011,62 +6946,6 @@ fn binary_result_value_type_var(
     let lhs_ty = graph_value_type_var(graph, lhs);
     let rhs_ty = graph_value_type_var(graph, rhs);
     binary_result_value_type_inner(lhs_ty, rhs_ty, op)
-}
-
-fn binary_result_value_type_inner(
-    lhs_ty: Option<ValueType>,
-    rhs_ty: Option<ValueType>,
-    op: &str,
-) -> ValueType {
-    match (lhs_ty, rhs_ty) {
-        (Some(ValueType::Float), Some(ValueType::Float))
-        | (Some(ValueType::Float), Some(ValueType::Int))
-        | (Some(ValueType::Int), Some(ValueType::Float))
-            if matches!(
-                op,
-                "add"
-                    | "sub"
-                    | "mul"
-                    | "div"
-                    | "mod"
-                    | "add_assign"
-                    | "sub_assign"
-                    | "mul_assign"
-                    | "div_assign"
-                    | "mod_assign"
-            ) =>
-        {
-            ValueType::Float
-        }
-        (Some(ValueType::Int), Some(ValueType::Int))
-            if matches!(
-                op,
-                "add"
-                    | "sub"
-                    | "mul"
-                    | "div"
-                    | "mod"
-                    | "bitand"
-                    | "bitor"
-                    | "bitxor"
-                    | "lshift"
-                    | "rshift"
-                    | "add_assign"
-                    | "sub_assign"
-                    | "mul_assign"
-                    | "div_assign"
-                    | "mod_assign"
-                    | "bitand_assign"
-                    | "bitor_assign"
-                    | "bitxor_assign"
-                    | "lshift_assign"
-                    | "rshift_assign"
-            ) =>
-        {
-            ValueType::Int
-        }
-        _ => ValueType::Unknown,
-    }
 }
 
 /// RPython: direct_call carries the exact callee graph identity.
@@ -7392,46 +7271,6 @@ fn graph_link_input_value_type_var(
 /// `graph_link_input_value_type` to infer phi-input concretetype from
 /// constant link args.  `Placeholder` is unmaterialised by definition
 /// and never appears in production link args.
-fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
-    match c {
-        ConstValue::Int(_) | ConstValue::AddressOffset(_) => Some(ValueType::Int),
-        // RPython annotates `Constant(True)`/`Constant(False)` with
-        // `SomeBool(SomeInteger)` (`annotator/model.py:185-227`); the
-        // rtyper picks `BoolRepr` and `getkind(lltype.Bool) == 'int'`
-        // so the register class merges with Int downstream.  The
-        // annotation-stage type is Bool — not Int — so propagate Bool
-        // here to keep the lattice node distinct.
-        ConstValue::Bool(_) => Some(ValueType::Bool),
-        ConstValue::Float(_) => Some(ValueType::Float),
-        // GC-managed Python objects → `lltype.Ptr(GcStruct)` (Ref bank).
-        ConstValue::ByteStr(_)
-        | ConstValue::UniStr(_)
-        | ConstValue::None
-        | ConstValue::Tuple(_)
-        | ConstValue::List(_)
-        | ConstValue::Dict(_)
-        | ConstValue::Code(_)
-        | ConstValue::Function(_)
-        | ConstValue::Graphs(_)
-        | ConstValue::Atom(_)
-        | ConstValue::LLPtr(_)
-        | ConstValue::HostObject(_) => Some(ValueType::Ref(None)),
-        // `LowLevelType` constants are `lltype.Void` carriers (the
-        // value IS a TYPE object); RPython flow `Constant(TYPE,
-        // lltype.Void)` — Void register class.
-        ConstValue::LowLevelType(_) => Some(ValueType::Void),
-        // `_address` is RPython's `Address` lowleveltype — distinct
-        // from GcRef and Signed.  Pyre has no Address bank, but the
-        // value is a raw pointer-sized integer in practice; conservative
-        // None lets the rtyper Unknown→GcRef fallback handle it as it
-        // does today.
-        ConstValue::LLAddress(_) => None,
-        // SpecTag identity carrier — never feeds an int/float/ref op.
-        ConstValue::SpecTag(_) => None,
-        ConstValue::Placeholder => None,
-    }
-}
-
 /// Op-result scan driven by Variable identity (`op.result == Some(var)`
 /// across every block's operations).  Returns the producing op's
 /// declared `ValueType` via [`op_result_value_type`].
@@ -7450,48 +7289,6 @@ fn graph_result_value_type_var(
                 None
             }
         })
-}
-
-fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
-    match kind {
-        OpKind::Input { ty, .. }
-        | OpKind::FieldRead { ty, .. }
-        | OpKind::VableFieldRead { ty, .. }
-        | OpKind::BinOp { result_ty: ty, .. }
-        | OpKind::UnaryOp { result_ty: ty, .. }
-        | OpKind::Call { result_ty: ty, .. }
-        | OpKind::IndirectCall { result_ty: ty, .. } => {
-            if *ty == ValueType::Unknown {
-                None
-            } else {
-                Some(ty.clone())
-            }
-        }
-        OpKind::ConstInt(_) | OpKind::VtableMethodPtr { .. } | OpKind::CurrentTraceLength => {
-            Some(ValueType::Int)
-        }
-        OpKind::ConstFloat(_) => Some(ValueType::Float),
-        OpKind::ConstBool(_) => Some(ValueType::Bool),
-        OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => {
-            Some(ValueType::Ref(None))
-        }
-        OpKind::ArrayRead { item_ty, .. }
-        | OpKind::InteriorFieldRead { item_ty, .. }
-        | OpKind::VableArrayRead { item_ty, .. } => {
-            if *item_ty == ValueType::Unknown {
-                None
-            } else {
-                Some(item_ty.clone())
-            }
-        }
-        OpKind::CallElidable { result_kind, .. }
-        | OpKind::CallResidual { result_kind, .. }
-        | OpKind::CallMayForce { result_kind, .. }
-        | OpKind::InlineCall { result_kind, .. }
-        | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_value_type(*result_kind),
-        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => Some(ValueType::Int),
-        _ => None,
-    }
 }
 
 fn transparent_option_method_result_type(

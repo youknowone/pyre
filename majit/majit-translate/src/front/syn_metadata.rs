@@ -1999,6 +1999,186 @@ pub(crate) fn kind_char_to_value_type(kind: char) -> Option<crate::model::ValueT
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnaryNotOperandKind {
+    Bool,
+    Int,
+    Unknown,
+}
+
+pub(crate) fn value_type_to_unary_not_kind(ty: &crate::model::ValueType) -> UnaryNotOperandKind {
+    use crate::model::ValueType;
+    match ty {
+        ValueType::Bool => UnaryNotOperandKind::Bool,
+        ValueType::Int | ValueType::Unsigned => UnaryNotOperandKind::Int,
+        _ => UnaryNotOperandKind::Unknown,
+    }
+}
+
+pub(crate) fn type_string_to_unary_not_kind(type_str: &str) -> UnaryNotOperandKind {
+    let trimmed = type_str.trim();
+    // Arbitrary-precision integer types — `BigInt` / `BigUint` — route
+    // through `UNARY_INVERT` (bitwise NOT) like primitive integers,
+    // even though their lattice lowering is `ValueType::Ref`.  Pyre's
+    // `OpKind::UnaryOp.result_ty` is computed from the operand's actual
+    // lowered type at the emit site, so this kind only drives the
+    // bytecode dispatch decision, not the result-type carrier.
+    if matches!(trimmed, "BigInt" | "BigUint") {
+        return UnaryNotOperandKind::Int;
+    }
+    value_type_to_unary_not_kind(&type_string_to_value_type(type_str))
+}
+
+/// Strip the outer `Result<_, _>` or `Option<_>` wrapper from a type
+/// string and return the inner ok / some payload type.
+pub(crate) fn unwrap_result_or_option(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    let inner = trimmed
+        .strip_prefix("Result<")
+        .or_else(|| trimmed.strip_prefix("Option<"))?
+        .strip_suffix('>')?;
+    let mut depth = 0_i32;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some(inner[..i].trim()),
+            _ => {}
+        }
+    }
+    Some(inner.trim())
+}
+
+pub(crate) fn binary_result_value_type_inner(
+    lhs_ty: Option<crate::model::ValueType>,
+    rhs_ty: Option<crate::model::ValueType>,
+    op: &str,
+) -> crate::model::ValueType {
+    use crate::model::ValueType;
+    match (lhs_ty, rhs_ty) {
+        (Some(ValueType::Float), Some(ValueType::Float))
+        | (Some(ValueType::Float), Some(ValueType::Int))
+        | (Some(ValueType::Int), Some(ValueType::Float))
+            if matches!(
+                op,
+                "add"
+                    | "sub"
+                    | "mul"
+                    | "div"
+                    | "mod"
+                    | "add_assign"
+                    | "sub_assign"
+                    | "mul_assign"
+                    | "div_assign"
+                    | "mod_assign"
+            ) =>
+        {
+            ValueType::Float
+        }
+        (Some(ValueType::Int), Some(ValueType::Int))
+            if matches!(
+                op,
+                "add"
+                    | "sub"
+                    | "mul"
+                    | "div"
+                    | "mod"
+                    | "bitand"
+                    | "bitor"
+                    | "bitxor"
+                    | "lshift"
+                    | "rshift"
+                    | "add_assign"
+                    | "sub_assign"
+                    | "mul_assign"
+                    | "div_assign"
+                    | "mod_assign"
+                    | "bitand_assign"
+                    | "bitor_assign"
+                    | "bitxor_assign"
+                    | "lshift_assign"
+                    | "rshift_assign"
+            ) =>
+        {
+            ValueType::Int
+        }
+        _ => ValueType::Unknown,
+    }
+}
+
+pub(crate) fn const_value_value_type(
+    c: &crate::flowspace::model::ConstValue,
+) -> Option<crate::model::ValueType> {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::ValueType;
+    match c {
+        ConstValue::Int(_) | ConstValue::AddressOffset(_) => Some(ValueType::Int),
+        ConstValue::Bool(_) => Some(ValueType::Bool),
+        ConstValue::Float(_) => Some(ValueType::Float),
+        ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
+        | ConstValue::None
+        | ConstValue::Tuple(_)
+        | ConstValue::List(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Code(_)
+        | ConstValue::Function(_)
+        | ConstValue::Graphs(_)
+        | ConstValue::Atom(_)
+        | ConstValue::LLPtr(_)
+        | ConstValue::HostObject(_) => Some(ValueType::Ref(None)),
+        ConstValue::LowLevelType(_) => Some(ValueType::Void),
+        ConstValue::LLAddress(_) => None,
+        ConstValue::SpecTag(_) => None,
+        ConstValue::Placeholder => None,
+    }
+}
+
+pub(crate) fn op_result_value_type(
+    kind: &crate::model::OpKind,
+) -> Option<crate::model::ValueType> {
+    use crate::model::{OpKind, ValueType};
+    match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. }
+        | OpKind::IndirectCall { result_ty: ty, .. } => {
+            if *ty == ValueType::Unknown {
+                None
+            } else {
+                Some(ty.clone())
+            }
+        }
+        OpKind::ConstInt(_) | OpKind::VtableMethodPtr { .. } | OpKind::CurrentTraceLength => {
+            Some(ValueType::Int)
+        }
+        OpKind::ConstFloat(_) => Some(ValueType::Float),
+        OpKind::ConstBool(_) => Some(ValueType::Bool),
+        OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => {
+            Some(ValueType::Ref(None))
+        }
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => {
+            if *item_ty == ValueType::Unknown {
+                None
+            } else {
+                Some(item_ty.clone())
+            }
+        }
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_value_type(*result_kind),
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => Some(ValueType::Int),
+        _ => None,
+    }
+}
+
 /// RPython equivalent of Rust's `expr as T` for numeric / Bool /
 /// pointer casts.  Maps each `(source, target)` pair to the matching
 /// callable path — a single `__builtin__` name (one segment) for
