@@ -359,6 +359,10 @@ impl FrameState {
             .and_then(|idx| self.mergeable_index_to_slot(idx))
     }
 
+    fn local_value_at(&self, reg: usize) -> Option<super::flow::FlowValue> {
+        self.locals_w.get(reg).and_then(|v| v.clone())
+    }
+
     fn copy<F>(&self, fresh_variable: &mut F) -> Self
     where
         F: FnMut(Option<Kind>) -> super::flow::Variable,
@@ -6171,9 +6175,7 @@ impl CodeWriter {
                     emit_vsd!($depth, load_fast_py_pc);
                 } else {
                     let loaded = current_state
-                        .locals_w
-                        .get(reg as usize)
-                        .and_then(|value| value.clone())
+                        .local_value_at(reg as usize)
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded.clone());
                     emit_pushvalue_ref!($depth, reg, loaded, load_fast_py_pc);
@@ -6943,9 +6945,7 @@ impl CodeWriter {
                                     *slot = Some(stored);
                                 }
                                 let loaded = current_state
-                                    .locals_w
-                                    .get(load_reg as usize)
-                                    .and_then(|value| value.clone())
+                                    .local_value_at(load_reg as usize)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 current_state.stack.push(loaded.clone());
                                 emit_pushvalue_ref!(current_depth, load_reg, loaded, py_pc);
@@ -8480,7 +8480,9 @@ impl CodeWriter {
                             // adds depgraph nodes only for op.result + inputargs).
                             // Push `Constant::none()` so downstream pops resolve
                             // to a constant, not a fresh Variable.
-                            current_state.stack.push(super::flow::Constant::none().into());
+                            current_state
+                                .stack
+                                .push(super::flow::Constant::none().into());
                             emit_abort_permanent!();
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
@@ -8700,13 +8702,9 @@ impl CodeWriter {
                         // pyopcode.py LOAD_FAST_AND_CLEAR / eval.rs:2052-2058.
                         Instruction::LoadFastAndClear { var_num } => {
                             let idx = var_num.get(op_arg).as_usize();
-                            let value = if idx < current_state.locals_w.len() {
-                                current_state.locals_w[idx]
-                                    .clone()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph))
-                            } else {
-                                fresh_ref_value(&mut graph)
-                            };
+                            let value = current_state
+                                .local_value_at(idx)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             if idx < current_state.locals_w.len() {
                                 current_state.locals_w[idx] = None;
                             }
