@@ -959,265 +959,8 @@ struct LoopFrame {
 /// The None-kill at `framestate.py:110-111` is realised by
 /// intersecting the pre-scan names with the pre-loop framestate inside
 /// the allocator — body-only locals never enter the header phi list.
-#[derive(Debug, Default, Clone)]
-struct LoopBodyLocals {
-    read_names: std::collections::HashSet<String>,
-    rebound_names: std::collections::HashSet<String>,
-}
-
-/// Statically scan `body` and partition every locally-referenced name
-/// into `read_names` and `rebound_names` for the eager loop-header
-/// phi allocator.  See `LoopBodyLocals` for the exact contract.
-fn loop_body_locals(body: &syn::Block) -> LoopBodyLocals {
-    let mut state = LoopBodyLocals::default();
-    visit_block_for_loop_locals(body, &mut state);
-    state
-}
-
-fn visit_block_for_loop_locals(block: &syn::Block, state: &mut LoopBodyLocals) {
-    for stmt in &block.stmts {
-        visit_stmt_for_loop_locals(stmt, state);
-    }
-}
-
-fn visit_stmt_for_loop_locals(stmt: &syn::Stmt, state: &mut LoopBodyLocals) {
-    match stmt {
-        syn::Stmt::Local(local) => {
-            // `let pat [: ty] [= init];` — pattern bindings are
-            // rebinds.  Inner-scope-only bindings (a `let` inside a
-            // nested block whose name shadows nothing in the
-            // pre-loop snapshot) are filtered by the allocator: a
-            // name not present in the pre-loop framestate is not a
-            // header phi candidate.
-            collect_pat_idents(&local.pat, &mut state.rebound_names);
-            if let Some(init) = &local.init {
-                visit_expr_for_loop_locals(&init.expr, state);
-                if let Some((_, diverge)) = &init.diverge {
-                    visit_expr_for_loop_locals(diverge, state);
-                }
-            }
-        }
-        syn::Stmt::Expr(expr, _semi) => visit_expr_for_loop_locals(expr, state),
-        syn::Stmt::Item(_) => {
-            // `fn`, `struct`, `use`, etc. — item definitions live in
-            // their own scope and do not refer to enclosing locals.
-            // Skip — items live in their own scope.
-        }
-        syn::Stmt::Macro(_) => {
-            // Macro invocations cannot be statically introspected
-            // for local references.  Conservatively skip; if a macro
-            // mutates a local that later participates in the
-            // back-edge, the `Link.__init__` arity check at build
-            // time fails loud.
-        }
-    }
-}
-
-fn visit_expr_for_loop_locals(expr: &syn::Expr, state: &mut LoopBodyLocals) {
-    match expr {
-        syn::Expr::Path(p) => {
-            if let Some(ident) = crate::front::syn_metadata::path_as_single_ident(&p.path) {
-                state.read_names.insert(ident.to_string());
-            }
-        }
-        syn::Expr::Assign(a) => {
-            // Simple LHS `name = rhs` is a pure rebind; complex LHS
-            // (e.g. `obj.field = ...`, `arr[i] = ...`) reads the
-            // base/index instead.
-            if let syn::Expr::Path(p) = a.left.as_ref()
-                && let Some(ident) = crate::front::syn_metadata::path_as_single_ident(&p.path)
-            {
-                state.rebound_names.insert(ident.to_string());
-            } else {
-                visit_expr_for_loop_locals(&a.left, state);
-            }
-            visit_expr_for_loop_locals(&a.right, state);
-        }
-        syn::Expr::Binary(b) => {
-            // Compound assign (`a += b`, `a |= b`, …) lowers to
-            // `Expr::Binary` with one of the `BinOp::*Assign(_)`
-            // variants; a simple-ident LHS is BOTH read and rebound.
-            if crate::front::syn_metadata::is_compound_assign(b.op) {
-                if let syn::Expr::Path(p) = b.left.as_ref()
-                    && let Some(ident) = crate::front::syn_metadata::path_as_single_ident(&p.path)
-                {
-                    let name = ident.to_string();
-                    state.read_names.insert(name.clone());
-                    state.rebound_names.insert(name);
-                } else {
-                    visit_expr_for_loop_locals(&b.left, state);
-                }
-            } else {
-                visit_expr_for_loop_locals(&b.left, state);
-            }
-            visit_expr_for_loop_locals(&b.right, state);
-        }
-        syn::Expr::Block(b) => visit_block_for_loop_locals(&b.block, state),
-        syn::Expr::Unsafe(u) => visit_block_for_loop_locals(&u.block, state),
-        syn::Expr::Async(a) => visit_block_for_loop_locals(&a.block, state),
-        syn::Expr::If(e) => {
-            visit_expr_for_loop_locals(&e.cond, state);
-            visit_block_for_loop_locals(&e.then_branch, state);
-            if let Some((_, else_branch)) = &e.else_branch {
-                visit_expr_for_loop_locals(else_branch, state);
-            }
-        }
-        syn::Expr::Match(m) => {
-            visit_expr_for_loop_locals(&m.expr, state);
-            for arm in &m.arms {
-                if let Some((_, guard)) = &arm.guard {
-                    visit_expr_for_loop_locals(guard, state);
-                }
-                visit_expr_for_loop_locals(&arm.body, state);
-            }
-        }
-        syn::Expr::While(e) => {
-            visit_expr_for_loop_locals(&e.cond, state);
-            visit_block_for_loop_locals(&e.body, state);
-        }
-        syn::Expr::Loop(e) => visit_block_for_loop_locals(&e.body, state),
-        syn::Expr::ForLoop(e) => {
-            // The for-loop's pat introduces a new inner-scope binding;
-            // the allocator filters it out by intersecting against the
-            // pre-loop framestate.  Visit iterable for reads + body
-            // for any rebinds of *outer* locals.
-            visit_expr_for_loop_locals(&e.expr, state);
-            visit_block_for_loop_locals(&e.body, state);
-        }
-        syn::Expr::Let(l) => {
-            // `if let Some(x) = expr { .. }` — pattern bindings are
-            // inner-scope; only the scrutinee is a read of the
-            // enclosing names.
-            visit_expr_for_loop_locals(&l.expr, state);
-        }
-        syn::Expr::Closure(_) => {
-            // Skip closure body.  A closure
-            // captures enclosing locals via a synthetic capture list;
-            // those captures do not flow through the loop's
-            // straight-line control path, so bindings inside the
-            // closure must not influence the header phi set.  RPython
-            // parity: a closure compiles to its own bytecode with
-            // `LOAD_DEREF` / `STORE_DEREF`, distinct from the outer
-            // `LOAD_FAST` / `STORE_FAST` sequence.
-        }
-        syn::Expr::Call(c) => {
-            visit_expr_for_loop_locals(&c.func, state);
-            for arg in &c.args {
-                visit_expr_for_loop_locals(arg, state);
-            }
-        }
-        syn::Expr::MethodCall(m) => {
-            visit_expr_for_loop_locals(&m.receiver, state);
-            for arg in &m.args {
-                visit_expr_for_loop_locals(arg, state);
-            }
-        }
-        syn::Expr::Field(f) => visit_expr_for_loop_locals(&f.base, state),
-        syn::Expr::Index(i) => {
-            visit_expr_for_loop_locals(&i.expr, state);
-            visit_expr_for_loop_locals(&i.index, state);
-        }
-        syn::Expr::Reference(r) => visit_expr_for_loop_locals(&r.expr, state),
-        syn::Expr::Unary(u) => visit_expr_for_loop_locals(&u.expr, state),
-        syn::Expr::Paren(p) => visit_expr_for_loop_locals(&p.expr, state),
-        syn::Expr::Try(t) => visit_expr_for_loop_locals(&t.expr, state),
-        syn::Expr::TryBlock(t) => visit_block_for_loop_locals(&t.block, state),
-        syn::Expr::Tuple(t) => {
-            for elem in &t.elems {
-                visit_expr_for_loop_locals(elem, state);
-            }
-        }
-        syn::Expr::Cast(c) => visit_expr_for_loop_locals(&c.expr, state),
-        syn::Expr::Array(a) => {
-            for elem in &a.elems {
-                visit_expr_for_loop_locals(elem, state);
-            }
-        }
-        syn::Expr::Range(r) => {
-            if let Some(s) = &r.start {
-                visit_expr_for_loop_locals(s, state);
-            }
-            if let Some(e) = &r.end {
-                visit_expr_for_loop_locals(e, state);
-            }
-        }
-        syn::Expr::Return(r) => {
-            if let Some(e) = &r.expr {
-                visit_expr_for_loop_locals(e, state);
-            }
-        }
-        syn::Expr::Break(b) => {
-            if let Some(e) = &b.expr {
-                visit_expr_for_loop_locals(e, state);
-            }
-        }
-        syn::Expr::Yield(y) => {
-            if let Some(e) = &y.expr {
-                visit_expr_for_loop_locals(e, state);
-            }
-        }
-        syn::Expr::Await(a) => visit_expr_for_loop_locals(&a.base, state),
-        syn::Expr::Group(g) => visit_expr_for_loop_locals(&g.expr, state),
-        syn::Expr::Struct(s) => {
-            for field in &s.fields {
-                visit_expr_for_loop_locals(&field.expr, state);
-            }
-            if let Some(rest) = &s.rest {
-                visit_expr_for_loop_locals(rest, state);
-            }
-        }
-        syn::Expr::Repeat(r) => {
-            visit_expr_for_loop_locals(&r.expr, state);
-            visit_expr_for_loop_locals(&r.len, state);
-        }
-        // Read-free leaves and constructs that cannot be statically
-        // introspected for reads.  Macro args fall here (same
-        // fail-loud rationale as `Stmt::Macro`).
-        _ => {}
-    }
-}
-
-fn collect_pat_idents(pat: &syn::Pat, out: &mut std::collections::HashSet<String>) {
-    match pat {
-        syn::Pat::Ident(i) => {
-            out.insert(i.ident.to_string());
-            if let Some((_, sub)) = &i.subpat {
-                collect_pat_idents(sub, out);
-            }
-        }
-        syn::Pat::Type(t) => collect_pat_idents(&t.pat, out),
-        syn::Pat::Tuple(t) => {
-            for elem in &t.elems {
-                collect_pat_idents(elem, out);
-            }
-        }
-        syn::Pat::TupleStruct(t) => {
-            for elem in &t.elems {
-                collect_pat_idents(elem, out);
-            }
-        }
-        syn::Pat::Struct(s) => {
-            for field in &s.fields {
-                collect_pat_idents(&field.pat, out);
-            }
-        }
-        syn::Pat::Or(o) => {
-            for case in &o.cases {
-                collect_pat_idents(case, out);
-            }
-        }
-        syn::Pat::Reference(r) => collect_pat_idents(&r.pat, out),
-        syn::Pat::Paren(p) => collect_pat_idents(&p.pat, out),
-        syn::Pat::Slice(s) => {
-            for elem in &s.elems {
-                collect_pat_idents(elem, out);
-            }
-        }
-        // Other variants (Lit, Path, Range, Rest, Wild, Macro, …)
-        // bind no local names directly.
-        _ => {}
-    }
-}
+// LoopBodyLocals + loop_body_locals + visitors + collect_pat_idents
+// moved to crate::front::syn_metadata.
 
 /// Eagerly allocate the loop header's phi inputargs for every name in
 /// `must_merge.read_names ∪ must_merge.rebound_names` that is also
@@ -1281,7 +1024,7 @@ fn allocate_loop_header_phis(
     pre_loop_block: BlockId,
     header_entry: BlockId,
     pre_loop_snapshot: &FrameState,
-    must_merge: &LoopBodyLocals,
+    must_merge: &crate::front::syn_metadata::LoopBodyLocals,
 ) -> Vec<String> {
     let mut header_phi_names = Vec::new();
     // Walk `pre_loop_snapshot.locals_w` per upstream
@@ -5371,7 +5114,7 @@ fn lower_expr(
             let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
-            let must_merge = loop_body_locals(&w.body);
+            let must_merge = crate::front::syn_metadata::loop_body_locals(&w.body);
             let _ = allocate_loop_header_phis(
                 graph,
                 ctx,
@@ -5495,7 +5238,7 @@ fn lower_expr(
             let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, body_entry, vec![]);
 
-            let must_merge = loop_body_locals(&l.body);
+            let must_merge = crate::front::syn_metadata::loop_body_locals(&l.body);
             let _ = allocate_loop_header_phis(
                 graph,
                 ctx,
@@ -5578,7 +5321,7 @@ fn lower_expr(
             let pre_loop_snapshot = ctx.getstate(graph, 0);
             graph.set_goto(pre_loop_block, header_entry, vec![]);
 
-            let must_merge = loop_body_locals(&f.body);
+            let must_merge = crate::front::syn_metadata::loop_body_locals(&f.body);
             let _ = allocate_loop_header_phis(
                 graph,
                 ctx,
