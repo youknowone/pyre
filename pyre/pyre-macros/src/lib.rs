@@ -90,15 +90,16 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let call_inner = quote! { #inner_name( #(#call_args),* ) };
     let body = wrap_return(&user_sig.output, call_inner)?;
 
-    // Strip `#[default(expr)]` arg attributes from the emitted inner fn so
-    // rustc doesn't choke on the unknown attribute.  The wrapper above has
-    // already consumed them via `unwrap_arg`.
+    // Strip `#[default(expr)]` arg attributes + rewrite typed-receiver
+    // aliases (PyTuple → PyObjectRef) so rustc accepts the emitted inner
+    // fn.  The wrapper above has already consumed both transforms.
     let mut stripped = inner_sig.clone();
     for arg in stripped.inputs.iter_mut() {
         if let FnArg::Typed(pt) = arg {
             pt.attrs.retain(|a| !a.path().is_ident("default"));
         }
     }
+    rewrite_alias_args(&mut stripped);
     let inner_fn = quote! {
         #(#user_attrs)*
         #[inline]
@@ -140,7 +141,39 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
         },
         None => unwrap,
     };
-    Ok((quote! { let #ident: #ty = #expr; }, ident))
+    // Typed-receiver aliases (`PyTuple`, `PyList`, …) erase to
+    // `PyObjectRef` for the let-binding — the alias name has no Rust
+    // existence; the inner fn signature is rewritten in parallel.
+    let binding_ty = if let Type::Path(p) = unwrap_type_group(ty) {
+        if let Some(seg) = p.path.segments.last() {
+            if typed_alias_check(&seg.ident.to_string()).is_some() {
+                quote! { ::pyre_object::PyObjectRef }
+            } else {
+                quote! { #ty }
+            }
+        } else {
+            quote! { #ty }
+        }
+    } else {
+        quote! { #ty }
+    };
+    Ok((quote! { let #ident: #binding_ty = #expr; }, ident))
+}
+
+/// Substitute typed-receiver aliases in a fn signature with `PyObjectRef`.
+/// Applied to inner fns (`#[pyre_function]`) and impl-block methods
+/// (`#[pyre_methods]`) so the user-visible alias name (`PyTuple`) is
+/// erased to a real Rust type before the body compiles.
+fn rewrite_alias_args(sig: &mut syn::Signature) {
+    for arg in sig.inputs.iter_mut() {
+        let FnArg::Typed(pt) = arg else { continue };
+        let ty = unwrap_type_group(&pt.ty);
+        let Type::Path(p) = ty else { continue };
+        let Some(seg) = p.path.segments.last() else { continue };
+        if typed_alias_check(&seg.ident.to_string()).is_some() {
+            pt.ty = Box::new(parse_quote!(::pyre_object::PyObjectRef));
+        }
+    }
 }
 
 /// Extract the inner expression from `#[default(expr)]` on a fn arg.
@@ -160,8 +193,59 @@ fn arg_default(pt: &PatType) -> syn::Result<Option<proc_macro2::TokenStream>> {
     Ok(None)
 }
 
+/// Recognise `PyTuple` / `PyList` / `PyDict` / … typed-receiver
+/// aliases.  Mirrors PyPy `@unwrap_spec(w_x=W_TupleObject)` which
+/// `gateway.py:311-316` lowers to `space.interp_w(W_TupleObject,
+/// scope_w[i])` — a typecheck that returns the value cast to the
+/// declared W_X class and raises TypeError on mismatch.  Here the macro
+/// emits an `is_X` check that bails out with a TypeError; the inner fn
+/// keeps the alias as its arg type, but the typed body still receives
+/// the value as a plain `PyObjectRef` because every alias erases to
+/// `PyObjectRef` once we hit the body.
+fn typed_alias_check(name: &str) -> Option<proc_macro2::TokenStream> {
+    let check = match name {
+        "PyTuple" => quote! { ::pyre_object::is_tuple },
+        "PyList" => quote! { ::pyre_object::is_list },
+        "PyDict" => quote! { ::pyre_object::is_dict },
+        "PyStr" => quote! { ::pyre_object::is_str },
+        "PyBytes" => quote! { ::pyre_object::is_bytes },
+        "PyByteArray" => quote! { ::pyre_object::is_bytearray },
+        "PyInt" => quote! { ::pyre_object::is_int },
+        "PyFloat" => quote! { ::pyre_object::is_float },
+        "PyBool" => quote! { ::pyre_object::is_bool },
+        "PySet" => quote! { ::pyre_object::is_set },
+        "PyFrozenSet" => quote! { ::pyre_object::is_frozenset },
+        _ => return None,
+    };
+    Some(check)
+}
+
 fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     let ty = unwrap_type_group(ty);
+    // Typed-receiver aliases — `state: PyTuple` becomes a typecheck +
+    // PyObjectRef binding.  Inner fn signatures get rewritten elsewhere
+    // so the body's parameter type is the alias name (no Rust-side
+    // existence required — the macro substitutes `PyObjectRef`).
+    if let Type::Path(p) = ty {
+        if let Some(seg) = p.path.segments.last() {
+            let nm = seg.ident.to_string();
+            if let Some(check) = typed_alias_check(&nm) {
+                return Ok(quote! {
+                    {
+                        let __a = args[#idx];
+                        if !unsafe { #check(__a) } {
+                            return ::std::result::Result::Err(
+                                crate::PyError::type_error(format!(
+                                    "argument {} must be {}", #idx, #nm
+                                )),
+                            );
+                        }
+                        __a
+                    }
+                });
+            }
+        }
+    }
     // `&[PyObjectRef]` — pass the whole slice (varargs).
     // `&[u8]`        — bytes-like (bytes + bytearray) → `bytes_like_data`,
     //                  with a runtime type check that returns a TypeError
@@ -1204,6 +1288,7 @@ fn expand_pyre_methods(
                 pt.attrs.retain(|a| !a.path().is_ident("default"));
             }
         }
+        rewrite_alias_args(&mut m.sig);
     }
 
     let type_object_fn = quote! {

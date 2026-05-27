@@ -64,15 +64,20 @@ impl W_Random {
     fn getstate(&self) -> PyObjectRef {
         w_tuple_new(vec![w_int_new(self.state as i64)])
     }
-    fn setstate(&mut self, state_tuple: PyObjectRef) {
+    fn setstate(&mut self, state_tuple: PyTuple) -> Result<(), crate::PyError> {
         unsafe {
-            if is_tuple(state_tuple) && w_tuple_len(state_tuple) >= 1
-                && let Some(state) = w_tuple_getitem(state_tuple, 0)
-                && is_int(state)
-            {
-                self.state = w_int_get_value(state) as u64;
+            if w_tuple_len(state_tuple) < 1 {
+                crate::bail_value_error!("setstate: tuple must have at least 1 element");
             }
+            let Some(state) = w_tuple_getitem(state_tuple, 0) else {
+                crate::bail_value_error!("setstate: missing state element");
+            };
+            if !is_int(state) {
+                crate::bail_type_error!("setstate: element 0 must be int");
+            }
+            self.state = w_int_get_value(state) as u64;
         }
+        Ok(())
     }
     #[getter]
     fn raw_state(&self) -> i64 {
