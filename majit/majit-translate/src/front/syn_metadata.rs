@@ -764,3 +764,114 @@ pub fn collect_immutable_field_attrs(
     }
     specs
 }
+
+/// `syn::Path` shape probe — returns `Some(ident)` when the path is a
+/// bare single-segment identifier with no leading colon and no generic
+/// arguments. Used by call-site canonicalisation to detect bare
+/// function-name expressions like `helper` vs qualified `mod::helper`.
+pub(crate) fn path_as_single_ident(path: &syn::Path) -> Option<&syn::Ident> {
+    if path.leading_colon.is_none() && path.segments.len() == 1 {
+        let seg = &path.segments[0];
+        if matches!(seg.arguments, syn::PathArguments::None) {
+            return Some(&seg.ident);
+        }
+    }
+    None
+}
+
+/// Returns `true` when the binary operator is one of Rust's compound
+/// assignment forms (`+=`, `-=`, ...). Mirrors the lowering decision
+/// to emit a `read-then-write` pair vs a plain `Assign`.
+pub(crate) fn is_compound_assign(op: syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
+}
+
+/// Lowering-side name for a `syn::UnOp`. Returns `"unknown_unary"` for
+/// non-exhaustive future syn variants.
+pub(crate) fn unary_op_name(op: &syn::UnOp) -> &'static str {
+    match op {
+        syn::UnOp::Deref(_) => "deref",
+        syn::UnOp::Not(_) => "not",
+        syn::UnOp::Neg(_) => "neg",
+        _ => "unknown_unary",
+    }
+}
+
+/// Lowering-side name for a `syn::BinOp`. Returns `"unknown_binop"` for
+/// non-exhaustive future syn variants.
+pub(crate) fn binary_op_name(op: &syn::BinOp) -> &'static str {
+    match op {
+        syn::BinOp::Add(_) => "add",
+        syn::BinOp::Sub(_) => "sub",
+        syn::BinOp::Mul(_) => "mul",
+        syn::BinOp::Div(_) => "div",
+        syn::BinOp::Rem(_) => "mod",
+        syn::BinOp::And(_) => "and",
+        syn::BinOp::Or(_) => "or",
+        syn::BinOp::BitXor(_) => "bitxor",
+        syn::BinOp::BitAnd(_) => "bitand",
+        syn::BinOp::BitOr(_) => "bitor",
+        syn::BinOp::Shl(_) => "lshift",
+        syn::BinOp::Shr(_) => "rshift",
+        syn::BinOp::Eq(_) => "eq",
+        syn::BinOp::Lt(_) => "lt",
+        syn::BinOp::Le(_) => "le",
+        syn::BinOp::Ne(_) => "ne",
+        syn::BinOp::Ge(_) => "ge",
+        syn::BinOp::Gt(_) => "gt",
+        syn::BinOp::AddAssign(_) => "add_assign",
+        syn::BinOp::SubAssign(_) => "sub_assign",
+        syn::BinOp::MulAssign(_) => "mul_assign",
+        syn::BinOp::DivAssign(_) => "div_assign",
+        syn::BinOp::RemAssign(_) => "mod_assign",
+        syn::BinOp::BitXorAssign(_) => "bitxor_assign",
+        syn::BinOp::BitAndAssign(_) => "bitand_assign",
+        syn::BinOp::BitOrAssign(_) => "bitor_assign",
+        syn::BinOp::ShlAssign(_) => "lshift_assign",
+        syn::BinOp::ShrAssign(_) => "rshift_assign",
+        _ => "unknown_binop",
+    }
+}
+
+/// Field accessor name from a `syn::Member` — `.foo` returns `"foo"`,
+/// `.0` returns `"0"`.
+pub(crate) fn member_name(member: &syn::Member) -> String {
+    match member {
+        syn::Member::Named(ident) => ident.to_string(),
+        syn::Member::Unnamed(idx) => idx.index.to_string(),
+    }
+}
+
+/// Splits a macro-argument `TokenStream` at the first top-level
+/// `,` punctuation (spacing == Alone), returning `(prefix, suffix)`.
+/// Returns `None` when no top-level comma exists. Used by macro
+/// recognisers that take a head expression followed by a `pat [if guard]`
+/// tail.
+pub(crate) fn split_macro_args_at_first_top_comma(
+    tokens: proc_macro2::TokenStream,
+) -> Option<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+    let mut prefix: Vec<proc_macro2::TokenTree> = Vec::new();
+    let mut iter = tokens.into_iter();
+    for tt in iter.by_ref() {
+        if let proc_macro2::TokenTree::Punct(ref p) = tt {
+            if p.as_char() == ',' && p.spacing() == proc_macro2::Spacing::Alone {
+                let suffix: proc_macro2::TokenStream = iter.collect();
+                return Some((prefix.into_iter().collect(), suffix));
+            }
+        }
+        prefix.push(tt);
+    }
+    None
+}
