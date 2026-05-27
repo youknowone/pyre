@@ -2458,6 +2458,11 @@ fn push_fresh_ref(state: &mut FrameState, graph: &mut super::flow::FunctionGraph
     state.stack.push(fresh_ref_value(graph));
 }
 
+fn pop_and_decr_depth(state: &mut FrameState, depth: &mut u16) {
+    let _ = state.stack.pop();
+    *depth = depth.saturating_sub(1);
+}
+
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -8418,8 +8423,7 @@ impl CodeWriter {
                             // stack effect still consumes one value. STORE_GLOBAL
                             // follows the same shape in flowcontext.py:884-890.
                             emit_abort_permanent!();
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_vsd!(current_depth, py_pc);
                         }
                         Instruction::MakeFunction { .. } => {
@@ -8518,8 +8522,7 @@ impl CodeWriter {
                             let n = count.get(op_arg) as usize;
                             // Pop iterable, push n unpacked items.
                             // pypy/interpreter/pyopcode.py:872.
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             for _ in 0..n {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
@@ -8562,8 +8565,7 @@ impl CodeWriter {
                         // pyopcode.py BINARY_SLICE / eval.rs:2857-2935.
                         Instruction::BinarySlice => {
                             for _ in 0..3 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8575,8 +8577,7 @@ impl CodeWriter {
                         // pyopcode.py CONTAINS_OP / eval.rs:1784-1798.
                         Instruction::ContainsOp { .. } => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8591,8 +8592,7 @@ impl CodeWriter {
                             let nargs = argc.get(op_arg) as usize;
                             // Pop kwnames + nargs args + null_or_self + callable.
                             for _ in 0..nargs + 3 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8628,8 +8628,7 @@ impl CodeWriter {
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
                         // shared_opcode.rs opcode_list_append.
                         Instruction::ListAppend { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
@@ -8638,8 +8637,7 @@ impl CodeWriter {
                         Instruction::BuildMap { count } => {
                             let n = count.get(op_arg) as usize;
                             for _ in 0..n * 2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8650,8 +8648,7 @@ impl CodeWriter {
                         // eval.rs map_add.
                         Instruction::MapAdd { .. } => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             emit_abort_permanent!();
                         }
@@ -8664,8 +8661,7 @@ impl CodeWriter {
                         // IsOp: pops 2, pushes 1 bool. Net: -1.
                         Instruction::IsOp { .. } => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8676,8 +8672,7 @@ impl CodeWriter {
                         Instruction::BuildTuple { count } => {
                             let n = count.get(op_arg) as usize;
                             for _ in 0..n {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8688,8 +8683,7 @@ impl CodeWriter {
                         Instruction::BuildSet { count } => {
                             let n = count.get(op_arg) as usize;
                             for _ in 0..n {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8700,8 +8694,7 @@ impl CodeWriter {
                         Instruction::BuildString { count } => {
                             let n = count.get(op_arg) as usize;
                             for _ in 0..n {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8711,8 +8704,7 @@ impl CodeWriter {
                         // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.
                         Instruction::CallFunctionEx => {
                             for _ in 0..4 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8722,52 +8714,45 @@ impl CodeWriter {
                         // DeleteSubscr: pops 2 (key, obj). Net: -2.
                         Instruction::DeleteSubscr => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             emit_abort_permanent!();
                         }
 
                         // DeleteAttr: pops 1 (obj). Net: -1.
                         Instruction::DeleteAttr { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
                         Instruction::PopJumpIfNone { .. }
                         | Instruction::PopJumpIfNotNone { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
                         Instruction::SetAdd { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
                         // ListExtend(i): peek list, pop iterable. Net: -1.
                         Instruction::ListExtend { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
                         Instruction::SetUpdate { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
                         // DictUpdate(i) / DictMerge(i): peek dict, pop source. Net: -1.
                         Instruction::DictUpdate { .. } | Instruction::DictMerge { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
@@ -8799,8 +8784,7 @@ impl CodeWriter {
                         // ImportName: pops 2 (level, fromlist), pushes 1 module. Net: -1.
                         Instruction::ImportName { .. } => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8817,8 +8801,7 @@ impl CodeWriter {
                         // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.
                         Instruction::StoreSlice => {
                             for _ in 0..4 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             emit_abort_permanent!();
                         }
@@ -8826,8 +8809,7 @@ impl CodeWriter {
                         // FormatWithSpec: pops 2 (spec, value), pushes 1 string. Net: -1.
                         Instruction::FormatWithSpec => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8841,8 +8823,7 @@ impl CodeWriter {
                         Instruction::LoadSuperAttr { .. } => {
                             let is_method = (u32::from(op_arg) & 1) != 0;
                             for _ in 0..3 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8858,8 +8839,7 @@ impl CodeWriter {
                             let args = counts.get(op_arg);
                             let before = args.before as usize;
                             let after = args.after as usize;
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             for _ in 0..before + 1 + after {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
@@ -8875,12 +8855,10 @@ impl CodeWriter {
                         Instruction::BuildInterpolation { format } => {
                             let has_format_spec = (u32::from(format.get(op_arg)) & 1) != 0;
                             if has_format_spec {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8890,8 +8868,7 @@ impl CodeWriter {
                         // BuildTemplate: pops 2, pushes 1. Net: -1.
                         Instruction::BuildTemplate => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8918,8 +8895,7 @@ impl CodeWriter {
                                 }
                                 _ => {
                                     for _ in 0..2 {
-                                        let _ = current_state.stack.pop();
-                                        current_depth = current_depth.saturating_sub(1);
+                                        pop_and_decr_depth(&mut current_state, &mut current_depth);
                                     }
                                     push_fresh_ref(&mut current_state, &mut graph);
                                     current_depth += 1;
@@ -8938,8 +8914,7 @@ impl CodeWriter {
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
                         // pyopcode.rs:2059 delegates to load_method; eval.rs:2365 pops 1 pushes 2.
                         Instruction::LoadSpecial { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             push_fresh_ref(&mut current_state, &mut graph);
@@ -8998,8 +8973,7 @@ impl CodeWriter {
 
                         // StoreDeref: pops 1 value. Net: -1.
                         Instruction::StoreDeref { .. } => {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                            pop_and_decr_depth(&mut current_state, &mut current_depth);
                             emit_abort_permanent!();
                         }
 
@@ -9065,8 +9039,7 @@ impl CodeWriter {
                         // adaptation: pyre targets CPython opcode shape here.
                         Instruction::EndAsyncFor => {
                             for _ in 0..2 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             emit_abort_permanent!();
                         }
@@ -9074,8 +9047,7 @@ impl CodeWriter {
                         // CleanupThrow: pops 3, pushes 1. Net: -2.
                         Instruction::CleanupThrow => {
                             for _ in 0..3 {
-                                let _ = current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
