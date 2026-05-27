@@ -7575,7 +7575,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::LoadLocals
             | Instruction::LoadBuildClass
             | Instruction::BuildTemplate
-            | Instruction::PushNull
             | Instruction::Copy { .. }
             | Instruction::BinarySlice
             | Instruction::StoreSlice
@@ -7633,7 +7632,13 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CopyFreeVars { .. }
             | Instruction::MakeCell { .. }
             | Instruction::ConvertValue { .. }
-            | Instruction::Reraise { .. }
+            // Instruction::Reraise excluded: `trace_code_step` reads
+            // `reraise_lasti` only from `step_result.err()`
+            // (trace_opcode.rs:6839-6843).  A walker-handled Reraise
+            // returns `StepResult::Continue` (Ok), so reraise_lasti is
+            // always -1 and `Reraise { depth > 0 }` aborts the trace.
+            // Keep on trait dispatch until the walker can propagate the
+            // saved lasti.
             | Instruction::PopJumpIfNone { .. }
             | Instruction::PopJumpIfNotNone { .. }
             | Instruction::ForIter { .. }
@@ -7691,7 +7696,29 @@ fn resync_sym_vsd_from_concrete_frame(state: &mut MIFrame) {
         // here indicates the seed contract was violated upstream.
         None => return,
     };
-    state.sym_mut().valuestackdepth = new_vsd;
+    // Mirror `sym.concrete_stack` from the live `PyFrame` so trait-
+    // dispatched callers reading `concrete_stack[stack_idx]` after a
+    // walker push/pop see the post-opcode value instead of the
+    // pre-opcode placeholder.  Same pattern as `PyreSym::setup_call`
+    // (state.rs:3336-3347).
+    let frame_addr = state.concrete_frame_addr;
+    let nlocals = state.sym().nlocals;
+    let new_stack_len = new_vsd.saturating_sub(nlocals);
+    let s = state.sym_mut();
+    let old_stack_len = s.concrete_stack.len();
+    if new_stack_len < old_stack_len {
+        s.concrete_stack.truncate(new_stack_len);
+    } else if new_stack_len > old_stack_len {
+        s.concrete_stack
+            .resize(new_stack_len, crate::state::ConcreteValue::Null);
+        for stack_idx in old_stack_len..new_stack_len {
+            let abs_idx = nlocals + stack_idx;
+            let obj = crate::state::concrete_stack_value(frame_addr, abs_idx)
+                .unwrap_or(pyre_object::PY_NULL);
+            s.concrete_stack[stack_idx] = crate::state::concrete_value_from_slot(obj);
+        }
+    }
+    s.valuestackdepth = new_vsd;
 }
 
 /// Mirrors `liveness.rs:528..588 _opcode_stack_effect` (Python
@@ -7730,7 +7757,6 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadLocals
         | Instruction::LoadBuildClass
         | Instruction::BuildTemplate
-        | Instruction::PushNull
         | Instruction::Copy { .. }
         | Instruction::BinarySlice
         | Instruction::StoreSlice

@@ -3623,6 +3623,12 @@ fn collect_outer_active_boxes(
     }
     for &idx in &banks.ref_ {
         let color = idx as usize;
+        let fallback = || {
+            sym.registers_r
+                .get(color)
+                .copied()
+                .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
+        };
         let value = if color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX {
             sym.frame
         } else if color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX {
@@ -3641,13 +3647,16 @@ fn collect_outer_active_boxes(
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                     trace_ctx
                         .virtualizable_box_at(nvs + s_idx)
-                        .unwrap_or(sym.registers_r[color])
+                        .unwrap_or_else(fallback)
                 }
-                _ => sym.registers_r[color],
+                _ => fallback(),
             }
         } else {
-            sym.registers_r[color]
+            fallback()
         };
+        if value == OpRef::NONE {
+            panic!("{}", dump_ctx("ref", idx));
+        }
         active.push(value);
     }
     for &idx in &banks.float {
