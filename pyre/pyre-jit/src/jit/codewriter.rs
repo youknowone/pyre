@@ -2454,6 +2454,10 @@ fn pop_ref_or_fresh(
     state.stack.pop().unwrap_or_else(|| fresh_ref_value(graph))
 }
 
+fn push_fresh_ref(state: &mut FrameState, graph: &mut super::flow::FunctionGraph) {
+    state.stack.push(fresh_ref_value(graph));
+}
+
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -7834,7 +7838,7 @@ impl CodeWriter {
                                     let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 }
                                 emit_abort_permanent!();
-                                current_state.stack.push(fresh_ref_value(&mut graph));
+                                push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                                 emit_vsd!(current_depth, py_pc);
                                 continue;
@@ -8345,7 +8349,7 @@ impl CodeWriter {
                             // the shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
                             emit_abort_permanent!();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
                         }
@@ -8423,7 +8427,7 @@ impl CodeWriter {
                             // Replace shadow value so SET_FUNCTION_ATTRIBUTE sees func.
                             // RustPython: (1 pushed, 1 popped).
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
                         Instruction::StoreAttr { namei } => {
@@ -8517,7 +8521,7 @@ impl CodeWriter {
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
                             for _ in 0..n {
-                                current_state.stack.push(fresh_ref_value(&mut graph));
+                                push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
                             emit_abort_permanent!();
@@ -8530,7 +8534,7 @@ impl CodeWriter {
                             // Pop iterable, push iterator. Net: 0. Replace shadow value.
                             // pypy/interpreter/pyopcode.py:1281.
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -8561,7 +8565,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8574,7 +8578,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8590,7 +8594,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8637,7 +8641,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8663,7 +8667,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8675,7 +8679,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8687,7 +8691,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8699,7 +8703,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8710,7 +8714,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8798,14 +8802,14 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
                         Instruction::ImportFrom { .. } => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8825,7 +8829,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8840,10 +8844,10 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             if is_method {
-                                current_state.stack.push(fresh_ref_value(&mut graph));
+                                push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
                             emit_abort_permanent!();
@@ -8857,7 +8861,7 @@ impl CodeWriter {
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
                             for _ in 0..before + 1 + after {
-                                current_state.stack.push(fresh_ref_value(&mut graph));
+                                push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
                             emit_abort_permanent!();
@@ -8878,7 +8882,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8889,7 +8893,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8897,7 +8901,7 @@ impl CodeWriter {
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
                         Instruction::CallIntrinsic1 { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -8917,7 +8921,7 @@ impl CodeWriter {
                                         let _ = current_state.stack.pop();
                                         current_depth = current_depth.saturating_sub(1);
                                     }
-                                    current_state.stack.push(fresh_ref_value(&mut graph));
+                                    push_fresh_ref(&mut current_state, &mut graph);
                                     current_depth += 1;
                                 }
                             }
@@ -8926,7 +8930,7 @@ impl CodeWriter {
 
                         // GetLen: peeks obj, pushes len. Net: +1.
                         Instruction::GetLen => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8936,9 +8940,9 @@ impl CodeWriter {
                         Instruction::LoadSpecial { .. } => {
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8947,7 +8951,7 @@ impl CodeWriter {
                         // Replace shadow value. eval.rs:2028.
                         Instruction::LoadFromDictOrGlobals { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -8957,7 +8961,7 @@ impl CodeWriter {
                         // shape, not current pyre runtime behavior.
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -8967,7 +8971,7 @@ impl CodeWriter {
                         | Instruction::LoadCommonConstant { .. }
                         | Instruction::LoadLocals
                         | Instruction::LoadBuildClass => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -8979,7 +8983,7 @@ impl CodeWriter {
                         | Instruction::UnaryInvert
                         | Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -8988,7 +8992,7 @@ impl CodeWriter {
                         // Stack effects model intended CPython shape for convergence.
                         Instruction::GetAiter | Instruction::GetAwaitable { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -9025,13 +9029,13 @@ impl CodeWriter {
                         // liveness.rs:569, assemble.py:1543.
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
                         Instruction::ReturnGenerator => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -9040,7 +9044,7 @@ impl CodeWriter {
                         // Replace shadow value.
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!();
                         }
 
@@ -9050,7 +9054,7 @@ impl CodeWriter {
 
                         // GetAnext: pushes 1. Net: +1.
                         Instruction::GetAnext => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -9073,7 +9077,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                                 current_depth = current_depth.saturating_sub(1);
                             }
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -9081,7 +9085,7 @@ impl CodeWriter {
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
                         // assemble.py:1614, liveness.rs:601.
                         Instruction::MatchSequence => {
-                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!();
                         }
@@ -9152,7 +9156,7 @@ impl CodeWriter {
                 // linking the landing block to the handler block.
                 sync_stack_state(&mut graph, &mut current_state, site.stack_depth);
                 if site.push_lasti {
-                    current_state.stack.push(fresh_ref_value(&mut graph));
+                    push_fresh_ref(&mut current_state, &mut graph);
                 }
                 // `flatten.py:336-352 generate_last_exc` emits the
                 // `last_exc_value` SSARepr op at flatten time only — there
