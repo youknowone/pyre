@@ -601,3 +601,166 @@ pub fn qualified_full_type_string_with_imports(
         _ => None,
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Top-level item walkers.
+//
+// Each helper does a single recursive descent over a `[syn::Item]`
+// slice (including nested `mod foo { ... }` content) and accumulates
+// one specific projection — struct name set, trait name set,
+// `bare → defining-module-path` origin map, or
+// `#[jit_immutable_fields]` attribute extraction.  PyPy parity citations
+// are inline.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Walk `items` (and nested `mod`s) and add every `Item::Struct`'s
+/// bare name plus `prefix::bare` qualified form to `known_struct_names`.
+/// Used by `collect_program_metadata_pub` to build the program-wide
+/// set of struct identifiers `qualified_full_type_string_with_imports`
+/// keys off of.
+pub fn collect_struct_names(
+    items: &[syn::Item],
+    prefix: &str,
+    known_struct_names: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Struct(s) => {
+                let bare_name = s.ident.to_string();
+                known_struct_names.insert(bare_name.clone());
+                if !prefix.is_empty() {
+                    known_struct_names.insert(format!("{}::{}", prefix, bare_name));
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_struct_names(sub_items, &mod_prefix, known_struct_names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `collect_struct_names`'s sibling for trait identifiers.  Walks
+/// `Item::Trait` declarations recursively through nested `mod`s and
+/// inserts both bare and `prefix::bare` qualified forms into
+/// `known_trait_names`.
+pub fn collect_trait_names(
+    items: &[syn::Item],
+    prefix: &str,
+    known_trait_names: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Trait(trait_def) => {
+                let bare_name = trait_def.ident.to_string();
+                known_trait_names.insert(bare_name.clone());
+                if !prefix.is_empty() {
+                    known_trait_names.insert(format!("{}::{}", prefix, bare_name));
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_trait_names(sub_items, &mod_prefix, known_trait_names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk every top-level (and nested `mod`) `Item::Struct` declaration
+/// in `items` and record each struct's bare name → defining module
+/// path.  Mirrors PyPy `bookkeeper.getdesc(TYPE)` resolution: every
+/// observed lltype STRUCT identity has a canonical home module; pyre
+/// carries names as strings so this map serves the same role.
+///
+/// Nested `mod foo { struct Bar; }` extends the prefix to `outer::foo`
+/// so the registered origin matches what `path_hash(canonical)` would
+/// produce for the qualified key.  First-write-wins on duplicate bare
+/// names — callers can disambiguate via use-import alias.
+pub fn collect_struct_origins(
+    items: &[syn::Item],
+    module_prefix: &str,
+    origins: &mut std::collections::HashMap<String, String>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Struct(s) => {
+                let bare = s.ident.to_string();
+                origins
+                    .entry(bare)
+                    .or_insert_with(|| module_prefix.to_string());
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let nested = if module_prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", module_prefix, m.ident)
+                    };
+                    collect_struct_origins(sub_items, &nested, origins);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read `#[jit_immutable_fields("a", "b?", "c[*]", "d?[*]")]` attributes
+/// off a struct declaration and return the declared field names paired
+/// with their [`crate::model::ImmutableRank`].  Bare idents
+/// (`#[jit_immutable_fields(a, b)]`) remain accepted as
+/// `ImmutableRank::Immutable` for backward compatibility.
+///
+/// Multiple attributes accumulate; non-recognised tokens are silently
+/// skipped (matching `syn::Meta::parse` looseness).  Rank suffix encoding
+/// follows RPython `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
+pub fn collect_immutable_field_attrs(
+    attrs: &[syn::Attribute],
+) -> Vec<(String, crate::model::ImmutableRank)> {
+    use crate::model::ImmutableRank;
+    use syn::punctuated::Punctuated;
+    use syn::{Expr, ExprLit, ExprPath, Lit, Token};
+
+    let mut specs = Vec::new();
+    for attr in attrs {
+        let Some(ident) = attr.path().get_ident() else {
+            continue;
+        };
+        if ident != "jit_immutable_fields" {
+            continue;
+        }
+        let parsed = attr.parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated);
+        let Ok(items) = parsed else {
+            continue;
+        };
+        for item in items {
+            match item {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) => {
+                    specs.push(ImmutableRank::parse(&s.value()));
+                }
+                Expr::Path(ExprPath { path, .. }) => {
+                    if let Some(id) = path.get_ident() {
+                        specs.push((id.to_string(), ImmutableRank::Immutable));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    specs
+}

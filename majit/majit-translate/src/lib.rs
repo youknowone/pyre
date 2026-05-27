@@ -872,7 +872,7 @@ fn analyze_pipeline_from_parsed(
         std::collections::HashMap::new();
     for parsed in parsed_files {
         if !parsed.module_path.is_empty() {
-            front::ast::collect_struct_origins(
+            front::syn_metadata::collect_struct_origins(
                 &parsed.file.items,
                 &parsed.module_path,
                 &mut struct_origins,
