@@ -29,18 +29,27 @@ fn xorshift(state: u64) -> u64 {
 
 #[crate::pyre_methods]
 impl W_Random {
-    fn __init__(&mut self, seed: Option<i64>) {
-        self.state = seed.unwrap_or(DEFAULT_SEED as i64) as u64;
+    #[staticmethod]
+    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
+        W_Random::allocate(W_Random {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            state: DEFAULT_SEED,
+        })
     }
-    fn seed(&mut self, s: Option<i64>) {
-        self.state = s.unwrap_or(DEFAULT_SEED as i64) as u64;
+    fn __init__(&mut self, #[default(DEFAULT_SEED as i64)] seed: i64) {
+        self.state = seed as u64;
+    }
+    fn seed(&mut self, #[default(DEFAULT_SEED as i64)] s: i64) {
+        self.state = s as u64;
     }
     fn random(&mut self) -> f64 {
         self.state = xorshift(self.state);
         (self.state as f64) / (u64::MAX as f64)
     }
-    fn getrandbits(&mut self, k: Option<u32>) -> i64 {
-        let k = k.unwrap_or(32);
+    fn getrandbits(&mut self, #[default(32u32)] k: u32) -> i64 {
         self.state = xorshift(self.state);
         let mask = if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
         (self.state & mask) as i64
@@ -60,30 +69,9 @@ impl W_Random {
     }
 }
 
-/// `Random.__new__(cls, *args)` — allocate a fresh `W_Random` payload,
-/// stamping the typed `RANDOM_TYPE` header so subsequent method calls
-/// can downcast via `W_Random::from_obj`.  Mirrors
-/// `pypy/module/_random/interp_random.py W_Random.descr_new`.
-fn random_new(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(W_Random::allocate(W_Random {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
-        state: DEFAULT_SEED,
-    }))
-}
-
 crate::py_module! {
     "_random",
     interpleveldefs: {
-        "Random" => {
-            let tp = type_object();
-            let _ = crate::baseobjspace::setattr(
-                tp, "__new__",
-                crate::make_builtin_function("__new__", random_new),
-            );
-            tp
-        },
+        "Random" => type_object(),
     },
 }

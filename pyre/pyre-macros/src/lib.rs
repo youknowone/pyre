@@ -68,11 +68,6 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // Build typed inner fn — verbatim original body, just renamed.
     let mut inner_sig = user_sig.clone();
     inner_sig.ident = inner_name.clone();
-    let inner_fn = quote! {
-        #(#user_attrs)*
-        #[inline]
-        #inner_sig #user_body
-    };
 
     // Generate unwrap statements for each parameter.
     let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
@@ -95,6 +90,21 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let call_inner = quote! { #inner_name( #(#call_args),* ) };
     let body = wrap_return(&user_sig.output, call_inner)?;
 
+    // Strip `#[default(expr)]` arg attributes from the emitted inner fn so
+    // rustc doesn't choke on the unknown attribute.  The wrapper above has
+    // already consumed them via `unwrap_arg`.
+    let mut stripped = inner_sig.clone();
+    for arg in stripped.inputs.iter_mut() {
+        if let FnArg::Typed(pt) = arg {
+            pt.attrs.retain(|a| !a.path().is_ident("default"));
+        }
+    }
+    let inner_fn = quote! {
+        #(#user_attrs)*
+        #[inline]
+        #stripped #user_body
+    };
+
     let wrapper = quote! {
         #vis fn #user_name(
             args: &[::pyre_object::PyObjectRef],
@@ -111,6 +121,11 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 }
 
 /// Generate `let <ident>: <T> = <unwrap-from-args[idx]>;`.
+///
+/// `#[default(expr)]` on an arg substitutes `expr` whenever
+/// `args.len() <= idx`.  Mirrors PyPy `@unwrap_spec(w_x=WrappedDefault(v))`
+/// — when the caller omits a positional, the wrapper synthesises a value
+/// in the user's typed coordinate space, not in `PyObjectRef` space.
 fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream, syn::Ident)> {
     let ident = match &*pt.pat {
         Pat::Ident(pi) => pi.ident.clone(),
@@ -118,8 +133,31 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
     };
     let ty = &*pt.ty;
 
-    let expr = unwrap_expr(ty, idx)?;
+    let unwrap = unwrap_expr(ty, idx)?;
+    let expr = match arg_default(pt)? {
+        Some(default) => quote! {
+            if args.len() > #idx { #unwrap } else { #default }
+        },
+        None => unwrap,
+    };
     Ok((quote! { let #ident: #ty = #expr; }, ident))
+}
+
+/// Extract the inner expression from `#[default(expr)]` on a fn arg.
+fn arg_default(pt: &PatType) -> syn::Result<Option<proc_macro2::TokenStream>> {
+    for a in pt.attrs.iter() {
+        if !a.path().is_ident("default") {
+            continue;
+        }
+        let expr: syn::Expr = a.parse_args().map_err(|e| {
+            syn::Error::new(
+                a.span(),
+                format!("#[default(...)]: expected a single expression — {e}"),
+            )
+        })?;
+        return Ok(Some(quote! { #expr }));
+    }
+    Ok(None)
 }
 
 fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
@@ -180,8 +218,13 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                     return Ok(quote! { unsafe { ::pyre_object::w_int_get_value(args[#idx]) } });
                 }
                 "i32" | "u32" | "usize" | "isize" | "u16" | "i16" | "u8" | "i8" => {
+                    // Parenthesised so the cast composes inside `if/else`
+                    // / `match` arms when a `#[default(...)]` wrapper sits
+                    // around the unwrap.  Without the parens,
+                    // `if ... { unsafe{} as u32 } else { ... }` fails to
+                    // parse because `as` doesn't accept a block-form LHS.
                     return Ok(quote! {
-                        unsafe { ::pyre_object::w_int_get_value(args[#idx]) } as #ty
+                        (unsafe { ::pyre_object::w_int_get_value(args[#idx]) } as #ty)
                     });
                 }
                 "f64" => {
@@ -699,6 +742,39 @@ pub fn pyre_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MethodKind {
+    Instance,
+    Static,
+    Class,
+}
+
+/// Inspect `#[staticmethod]` / `#[classmethod]` markers on an impl-fn.
+/// Mutual exclusion is enforced; an unannotated fn is `Instance`.
+fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
+    let mut kind = MethodKind::Instance;
+    let mut seen = false;
+    for a in m.attrs.iter() {
+        let label = if a.path().is_ident("staticmethod") {
+            Some(MethodKind::Static)
+        } else if a.path().is_ident("classmethod") {
+            Some(MethodKind::Class)
+        } else {
+            None
+        };
+        let Some(new_kind) = label else { continue };
+        if seen {
+            return Err(syn::Error::new(
+                a.span(),
+                "#[pyre_methods]: at most one of `#[classmethod]` / `#[staticmethod]`",
+            ));
+        }
+        kind = new_kind;
+        seen = true;
+    }
+    Ok(kind)
+}
+
 fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
     if let Some((_, path, _)) = &imp.trait_ {
         return Err(syn::Error::new(
@@ -730,31 +806,81 @@ fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStrea
         }
         let mname = &m.sig.ident;
         let wrapper_name = format_ident!("__pyre_wrap_{}", mname);
+        let kind = classify_method(m)?;
 
-        // Split first arg (must be `&mut self` / `&self`) from the rest.
-        let mut inputs = m.sig.inputs.iter();
-        let recv = match inputs.next() {
-            Some(FnArg::Receiver(r)) => r,
-            _ => {
-                return Err(syn::Error::new(
-                    m.sig.span(),
-                    "#[pyre_methods]: every method must take `&self` or `&mut self` \
-                     as its first arg — static/class methods are not supported yet",
-                ));
+        // Build per-kind wrapper preamble (self extraction) + call form,
+        // and pick the registration constructor.
+        //
+        // PyPy `gateway.py`: `interp2app(W_X.fn, as_classmethod=True)` /
+        // `as_staticmethod=True` decide whether the descriptor binds
+        // `cls` / nothing instead of `self`.  Here the descriptor wrap is
+        // applied at `make_builtin_function` time via `w_classmethod_new`
+        // / `w_staticmethod_new`; everything else (arg unwrap, return
+        // wrap) reuses the regular machinery.
+        let mut inputs = m.sig.inputs.iter().peekable();
+        let (preamble, call_target, first_arg_idx) = match kind {
+            MethodKind::Instance => {
+                let recv = match inputs.next() {
+                    Some(FnArg::Receiver(r)) => r,
+                    _ => {
+                        return Err(syn::Error::new(
+                            m.sig.span(),
+                            "#[pyre_methods]: instance method needs `&self` or `&mut self` \
+                             — add `#[staticmethod]` / `#[classmethod]` to opt out",
+                        ));
+                    }
+                };
+                let from_obj_call = if recv.mutability.is_some() {
+                    quote! { <#self_ty>::from_obj(args[0]) }
+                } else {
+                    // `from_obj` returns `Option<&mut Self>` even for
+                    // `&self` callers — reborrow as `&Self` so the
+                    // method's signature matches without a separate
+                    // `from_obj_ref` API.
+                    quote! { <#self_ty>::from_obj(args[0]).map(|m| &*m) }
+                };
+                let preamble = quote! {
+                    if args.is_empty() {
+                        return ::std::result::Result::Err(
+                            crate::PyError::type_error(
+                                concat!("descriptor '", stringify!(#mname), "' requires self argument"),
+                            ),
+                        );
+                    }
+                    let __pyre_self = match #from_obj_call {
+                        ::std::option::Option::Some(s) => s,
+                        ::std::option::Option::None => {
+                            return ::std::result::Result::Err(
+                                crate::PyError::type_error(
+                                    concat!("descriptor '", stringify!(#mname), "' got wrong receiver type"),
+                                ),
+                            );
+                        }
+                    };
+                };
+                (preamble, quote! { __pyre_self.#mname }, 1)
+            }
+            MethodKind::Static => {
+                if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {
+                    return Err(syn::Error::new(
+                        m.sig.span(),
+                        "#[staticmethod]: must not take `self` / `&self` / `&mut self`",
+                    ));
+                }
+                (quote! {}, quote! { <#self_ty>::#mname }, 0)
+            }
+            MethodKind::Class => {
+                if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {
+                    return Err(syn::Error::new(
+                        m.sig.span(),
+                        "#[classmethod]: first arg must be a typed `cls: PyObjectRef`, \
+                         not `&self` / `&mut self`",
+                    ));
+                }
+                (quote! {}, quote! { <#self_ty>::#mname }, 0)
             }
         };
-        let recv_is_mut = recv.mutability.is_some();
-        let from_obj_call = if recv_is_mut {
-            quote! { <#self_ty>::from_obj(args[0]) }
-        } else {
-            // `from_obj` returns `Option<&mut Self>` even for `&self`
-            // callers — re-borrow as `&Self` to match the method's
-            // receiver kind without forcing a separate `from_obj_ref`.
-            quote! { <#self_ty>::from_obj(args[0]).map(|m| &*m) }
-        };
 
-        // Unwrap remaining args.  `args[0]` is `self`, so user-arg
-        // indices are `1`, `2`, ….
         let mut unwrap_stmts = Vec::<proc_macro2::TokenStream>::new();
         let mut call_args = Vec::<proc_macro2::TokenStream>::new();
         for (offset, arg) in inputs.enumerate() {
@@ -764,13 +890,13 @@ fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStrea
                     "#[pyre_methods]: unexpected receiver mid-signature",
                 ));
             };
-            let arg_idx = offset + 1;
+            let arg_idx = offset + first_arg_idx;
             let (stmt, ident) = unwrap_arg(arg_idx, pt)?;
             unwrap_stmts.push(stmt);
             call_args.push(quote! { #ident });
         }
 
-        let call_inner = quote! { __pyre_self.#mname( #(#call_args),* ) };
+        let call_inner = quote! { #call_target( #(#call_args),* ) };
         let body = wrap_return(&m.sig.output, call_inner)?;
 
         let py_name = mname.to_string();
@@ -779,44 +905,39 @@ fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStrea
             pub fn #wrapper_name(
                 args: &[::pyre_object::PyObjectRef],
             ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
-                if args.is_empty() {
-                    return ::std::result::Result::Err(
-                        crate::PyError::type_error(
-                            concat!("descriptor '", #py_name, "' requires self argument"),
-                        ),
-                    );
-                }
-                let __pyre_self = match #from_obj_call {
-                    ::std::option::Option::Some(s) => s,
-                    ::std::option::Option::None => {
-                        return ::std::result::Result::Err(
-                            crate::PyError::type_error(
-                                concat!("descriptor '", #py_name, "' got wrong receiver type"),
-                            ),
-                        );
-                    }
-                };
+                #preamble
                 #(#unwrap_stmts)*
                 #body
             }
         });
+        let raw_fn = quote! { crate::make_builtin_function(#py_name, #wrapper_name) };
+        let descr = match kind {
+            MethodKind::Instance => raw_fn,
+            MethodKind::Static => quote! { ::pyre_object::w_staticmethod_new(#raw_fn) },
+            MethodKind::Class => quote! { ::pyre_object::w_classmethod_new(#raw_fn) },
+        };
         registrations.push(quote! {
-            crate::dict_storage_store(
-                ns,
-                #py_name,
-                crate::make_builtin_function(#py_name, #wrapper_name),
-            );
+            crate::dict_storage_store(ns, #py_name, #descr);
         });
     }
 
-    // Strip `#[pyre_method]` / `#[pyre_property]` marker attrs the user
-    // may have placed (future-compat; ignored today).  Other attrs
-    // pass through.
+    // Strip marker attrs the user placed.  `#[pyre_method]` /
+    // `#[pyre_property]` are future-compat no-ops today; `#[classmethod]`
+    // / `#[staticmethod]` / `#[default(...)]` were already consumed by
+    // the wrapper-generation pass above and would otherwise leak into
+    // the emitted impl block and confuse rustc.
     for item in imp.items.iter_mut() {
-        if let ImplItem::Fn(m) = item {
-            m.attrs.retain(|a| {
-                !(a.path().is_ident("pyre_method") || a.path().is_ident("pyre_property"))
-            });
+        let ImplItem::Fn(m) = item else { continue };
+        m.attrs.retain(|a| {
+            !(a.path().is_ident("pyre_method")
+                || a.path().is_ident("pyre_property")
+                || a.path().is_ident("classmethod")
+                || a.path().is_ident("staticmethod"))
+        });
+        for arg in m.sig.inputs.iter_mut() {
+            if let FnArg::Typed(pt) = arg {
+                pt.attrs.retain(|a| !a.path().is_ident("default"));
+            }
         }
     }
 
