@@ -77,4 +77,7 @@ crate::py_module! {
     interpleveldefs: {
         "Random" => type_object(),
     },
+    appleveldefs: {
+        "app_random.py" => ["_ascii_seed"],
+    },
 }

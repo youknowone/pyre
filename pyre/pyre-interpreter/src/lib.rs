@@ -118,6 +118,7 @@ macro_rules! py_module {
     (
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
         $(, inline_functions: {
             $(
                 fn $ifn_name:ident ( $($ifn_args:tt)* ) $(-> $ifn_ret:ty)? $ifn_body:block
@@ -132,6 +133,20 @@ macro_rules! py_module {
             let _name = $name;
             $($(
                 $crate::dict_storage_store(ns, $key, $value);
+            )*)?
+            // appleveldefs: bundle Python source via `include_str!` at
+            // compile time, then resolve each name through
+            // `appleveldef_install`.  Mirrors PyPy MixedModule's
+            // `appleveldefs = {"name": "app_X:name"}` lookup, but the
+            // .py file is statically linked into the binary rather than
+            // read off the filesystem at module-init time.
+            $($(
+                $crate::importing::appleveldef_install(
+                    ns,
+                    include_str!($appfile),
+                    $appfile,
+                    &[ $( $appname ),* ],
+                );
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the

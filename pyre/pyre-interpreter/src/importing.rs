@@ -631,6 +631,54 @@ fn exec_code_module(
     frame.run()
 }
 
+// ── appleveldef_install ──────────────────────────────────────────────
+// PyPy equivalent: `pypy/interpreter/mixedmodule.py:135 MixedModule.get`
+// resolves an `appleveldefs` entry by lazily executing the sibling
+// `app_*.py` file into a per-mixedmodule namespace and reading the
+// named attribute.  Pyre's macro form bundles all entries from one app
+// file into a single install call; the source is included at
+// compile time via `include_str!` so no filesystem read happens at
+// module-init time.
+
+/// Execute `source` (a Python module) into a fresh namespace and copy
+/// each binding in `names` into the caller's module dict `ns`.
+///
+/// `filename` is used as the source path for tracebacks / co_filename
+/// only.  The intermediate namespace is intentionally leaked: every
+/// function defined in `source` retains it as its `__globals__`, so the
+/// box must outlive the bound names — which, for module-init artifacts,
+/// is "forever".
+pub fn appleveldef_install(
+    ns: &mut DictStorage,
+    source: &str,
+    filename: &str,
+    names: &[&str],
+) {
+    let code = compile_source_with_filename(source, Mode::Exec, filename)
+        .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
+    let ctx = crate::call::getexecutioncontext();
+    if ctx.is_null() {
+        panic!("appleveldef `{filename}`: no execution context at module init");
+    }
+    let mut app_ns = Box::new(unsafe { (*ctx).fresh_dict_storage() });
+    app_ns.fix_ptr();
+    let app_ns_ptr: *mut DictStorage = Box::leak(app_ns);
+    let code_ptr = Box::into_raw(Box::new(code));
+    let w_code = crate::w_code_new(code_ptr as *const ());
+    let mut frame = crate::createframe(w_code as *const (), app_ns_ptr, ctx, None)
+        .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
+    if let Err(e) = frame.run() {
+        panic!("appleveldef `{filename}`: exec — {e:?}");
+    }
+    let app_ns_ref = unsafe { &*app_ns_ptr };
+    for &name in names {
+        match crate::dict_storage_get(app_ns_ref, name) {
+            Some(val) => crate::dict_storage_store(ns, name, val),
+            None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
+        }
+    }
+}
+
 // ── load_source_module ───────────────────────────────────────────────
 // PyPy equivalent: importing.py `load_source_module()`
 //
