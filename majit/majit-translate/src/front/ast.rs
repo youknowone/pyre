@@ -9,9 +9,8 @@ use syn::{Item, ItemFn};
 use crate::ParsedInterpreter;
 use crate::flowspace::model::ConstValue;
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FrameState, FunctionGraph, ImmutableRank, Link,
-    LinkArg, OpKind, UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueType,
-    exception_exitcase,
+    BlockId, CallTarget, ExitSwitch, FrameState, FunctionGraph, ImmutableRank, Link, LinkArg,
+    OpKind, UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueType, exception_exitcase,
 };
 
 pub use crate::front::semantic::{
@@ -5281,9 +5280,9 @@ fn lower_expr(
             if m.arms.is_empty() {
                 return Ok(Lowered::no_value());
             }
-            let bool_exitcases = classify_match_bool_exitcases(&m.arms);
+            let bool_exitcases = crate::front::syn_metadata::classify_match_bool_exitcases(&m.arms);
             let switch_exitcases = if bool_exitcases.is_none() {
-                classify_match_switch_exitcases(&m.arms)
+                crate::front::syn_metadata::classify_match_switch_exitcases(&m.arms)
             } else {
                 None
             };
@@ -6434,7 +6433,7 @@ fn lower_expr(
                     {
                         if let (Ok(scrutinee_expr), Ok((pat, guard))) = (
                             syn::parse2::<syn::Expr>(scrutinee_tokens),
-                            syn::parse::Parser::parse2(parse_matches_pat_and_guard, rest_tokens),
+                            syn::parse::Parser::parse2(crate::front::syn_metadata::parse_matches_pat_and_guard, rest_tokens),
                         ) {
                             let arm_then_body: syn::Expr = syn::parse_quote!(true);
                             let arm_else_body: syn::Expr = syn::parse_quote!(false);
@@ -6854,184 +6853,6 @@ fn lower_expr(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// Split a macro token stream at the first top-level (depth-0) comma,
-/// returning `(prefix, suffix)` token streams without the comma. Used
-/// by the `matches!` desugar to peel `(scrutinee, pat [if guard])` —
-/// the first comma separates `scrutinee` from the rest, but commas
-/// inside `(...)` / `[...]` / `{...}` (e.g. tuple struct patterns,
-/// inner expression lists) must not split. Returns `None` when no
-/// top-level comma is present.
-/// `syn::parse::Parser` adapter for the `pat [if guard]` tail of a
-/// `matches!` invocation. Mirrors the std `matches!` macro grammar
-/// (`std::macros::matches`): a single `Pat`, optionally followed by
-/// `if Expr`. The `Pat` parse uses `Pat::parse_multi_with_leading_vert`
-/// so top-level `|` alternations (`Some(_) | None`) are accepted.
-fn parse_matches_pat_and_guard(
-    input: syn::parse::ParseStream,
-) -> syn::Result<(syn::Pat, Option<syn::Expr>)> {
-    let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
-    let guard = if input.peek(syn::Token![if]) {
-        let _: syn::Token![if] = input.parse()?;
-        Some(input.parse::<syn::Expr>()?)
-    } else {
-        None
-    };
-    Ok((pat, guard))
-}
-
-fn classify_match_bool_exitcases(arms: &[syn::Arm]) -> Option<Vec<Vec<ExitCase>>> {
-    if arms.len() != 2 {
-        return None;
-    }
-    let mut all = Vec::with_capacity(arms.len());
-    let mut seen_bools = Vec::<bool>::new();
-    for (arm_idx, arm) in arms.iter().enumerate() {
-        if arm.guard.is_some() {
-            return None;
-        }
-        let is_last_arm = arm_idx + 1 == arms.len();
-        let mut sub_pats = Vec::new();
-        flatten_or_pattern(&arm.pat, &mut sub_pats);
-        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
-            return None;
-        }
-        let mut arm_cases = Vec::with_capacity(sub_pats.len());
-        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
-            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
-            match classify_bool_pattern(sub_pat, is_last, &seen_bools)? {
-                BoolPatternCase::Value(value) => {
-                    if seen_bools.contains(&value) {
-                        return None;
-                    }
-                    seen_bools.push(value);
-                    arm_cases.push(ExitCase::Bool(value));
-                }
-                BoolPatternCase::Default(values) => {
-                    if values.is_empty() {
-                        return None;
-                    }
-                    for value in values {
-                        seen_bools.push(value);
-                        arm_cases.push(ExitCase::Bool(value));
-                    }
-                }
-            }
-        }
-        all.push(arm_cases);
-    }
-    let mut sorted = seen_bools;
-    sorted.sort();
-    sorted.dedup();
-    if sorted.as_slice() == &[false, true] {
-        Some(all)
-    } else {
-        None
-    }
-}
-
-enum BoolPatternCase {
-    Value(bool),
-    Default(Vec<bool>),
-}
-
-fn classify_bool_pattern(
-    pat: &syn::Pat,
-    is_last: bool,
-    seen_bools: &[bool],
-) -> Option<BoolPatternCase> {
-    match pat {
-        syn::Pat::Wild(_) if is_last => {
-            let mut values = Vec::new();
-            if !seen_bools.contains(&false) {
-                values.push(false);
-            }
-            if !seen_bools.contains(&true) {
-                values.push(true);
-            }
-            Some(BoolPatternCase::Default(values))
-        }
-        syn::Pat::Wild(_) => None,
-        syn::Pat::Lit(lit) => match &lit.lit {
-            syn::Lit::Bool(value) => Some(BoolPatternCase::Value(value.value)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn classify_match_switch_exitcases(arms: &[syn::Arm]) -> Option<Vec<Vec<ExitCase>>> {
-    if arms.len() < 2 {
-        return None;
-    }
-    let mut all = Vec::with_capacity(arms.len());
-    let mut seen = Vec::<ExitCase>::new();
-    for (arm_idx, arm) in arms.iter().enumerate() {
-        if arm.guard.is_some() {
-            return None;
-        }
-        let is_last_arm = arm_idx + 1 == arms.len();
-        let mut sub_pats = Vec::new();
-        flatten_or_pattern(&arm.pat, &mut sub_pats);
-        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
-            return None;
-        }
-        let mut arm_cases = Vec::with_capacity(sub_pats.len());
-        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
-            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
-            let exitcase = classify_switch_pattern(sub_pat, is_last)?;
-            if !is_default_exitcase(&exitcase) {
-                if seen.iter().any(|existing| existing == &exitcase) {
-                    return None;
-                }
-                seen.push(exitcase.clone());
-            }
-            arm_cases.push(exitcase);
-        }
-        all.push(arm_cases);
-    }
-    Some(all)
-}
-
-fn flatten_or_pattern<'a>(pat: &'a syn::Pat, out: &mut Vec<&'a syn::Pat>) {
-    match pat {
-        syn::Pat::Or(or_pat) => {
-            for case in &or_pat.cases {
-                flatten_or_pattern(case, out);
-            }
-        }
-        syn::Pat::Paren(paren) => flatten_or_pattern(&paren.pat, out),
-        other => out.push(other),
-    }
-}
-
-fn classify_switch_pattern(pat: &syn::Pat, is_last: bool) -> Option<ExitCase> {
-    match pat {
-        syn::Pat::Wild(_) if is_last => Some(default_exitcase()),
-        syn::Pat::Wild(_) => None,
-        syn::Pat::Lit(lit) => match &lit.lit {
-            syn::Lit::Int(int_lit) => int_lit
-                .base10_parse::<i64>()
-                .ok()
-                .map(|value| ExitCase::Const(ConstValue::Int(value))),
-            syn::Lit::Byte(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
-            syn::Lit::Char(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn default_exitcase() -> ExitCase {
-    ExitCase::Const(ConstValue::byte_str("default"))
-}
-
-fn is_default_exitcase(exitcase: &ExitCase) -> bool {
-    matches!(
-        exitcase,
-        ExitCase::Const(ConstValue::ByteStr(bytes)) if bytes.as_slice() == b"default"
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnaryNotOperandKind {

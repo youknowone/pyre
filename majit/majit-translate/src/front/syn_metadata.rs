@@ -875,3 +875,200 @@ pub(crate) fn split_macro_args_at_first_top_comma(
     }
     None
 }
+
+// ── `match`-arm pattern classifiers ──────────────────────────────────
+//
+// Used by the AST lowering of `match`-on-bool and `match`-on-integer
+// scrutinees to extract per-arm `ExitCase` data. All helpers below
+// inspect `syn::Arm` / `syn::Pat` without touching the graph builder,
+// so they live in this module alongside the other syn-walk helpers.
+
+/// `syn::parse::Parser` adapter for the `pat [if guard]` tail of a
+/// `matches!` invocation. Mirrors the std `matches!` macro grammar
+/// (`std::macros::matches`): a single `Pat`, optionally followed by
+/// `if Expr`. The `Pat` parse uses `Pat::parse_multi_with_leading_vert`
+/// so top-level `|` alternations (`Some(_) | None`) are accepted.
+pub(crate) fn parse_matches_pat_and_guard(
+    input: syn::parse::ParseStream,
+) -> syn::Result<(syn::Pat, Option<syn::Expr>)> {
+    let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+    let guard = if input.peek(syn::Token![if]) {
+        let _: syn::Token![if] = input.parse()?;
+        Some(input.parse::<syn::Expr>()?)
+    } else {
+        None
+    };
+    Ok((pat, guard))
+}
+
+/// Classify the arms of a `match` whose scrutinee is bool-typed.
+/// Returns `Some(per-arm exit cases)` when the arms exhaustively cover
+/// `{false, true}` with no `if`-guards; otherwise `None`.
+pub(crate) fn classify_match_bool_exitcases(
+    arms: &[syn::Arm],
+) -> Option<Vec<Vec<crate::model::ExitCase>>> {
+    use crate::model::ExitCase;
+    if arms.len() != 2 {
+        return None;
+    }
+    let mut all = Vec::with_capacity(arms.len());
+    let mut seen_bools = Vec::<bool>::new();
+    for (arm_idx, arm) in arms.iter().enumerate() {
+        if arm.guard.is_some() {
+            return None;
+        }
+        let is_last_arm = arm_idx + 1 == arms.len();
+        let mut sub_pats = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
+            return None;
+        }
+        let mut arm_cases = Vec::with_capacity(sub_pats.len());
+        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
+            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
+            match classify_bool_pattern(sub_pat, is_last, &seen_bools)? {
+                BoolPatternCase::Value(value) => {
+                    if seen_bools.contains(&value) {
+                        return None;
+                    }
+                    seen_bools.push(value);
+                    arm_cases.push(ExitCase::Bool(value));
+                }
+                BoolPatternCase::Default(values) => {
+                    if values.is_empty() {
+                        return None;
+                    }
+                    for value in values {
+                        seen_bools.push(value);
+                        arm_cases.push(ExitCase::Bool(value));
+                    }
+                }
+            }
+        }
+        all.push(arm_cases);
+    }
+    let mut sorted = seen_bools;
+    sorted.sort();
+    sorted.dedup();
+    if sorted.as_slice() == &[false, true] {
+        Some(all)
+    } else {
+        None
+    }
+}
+
+pub(crate) enum BoolPatternCase {
+    Value(bool),
+    Default(Vec<bool>),
+}
+
+pub(crate) fn classify_bool_pattern(
+    pat: &syn::Pat,
+    is_last: bool,
+    seen_bools: &[bool],
+) -> Option<BoolPatternCase> {
+    match pat {
+        syn::Pat::Wild(_) if is_last => {
+            let mut values = Vec::new();
+            if !seen_bools.contains(&false) {
+                values.push(false);
+            }
+            if !seen_bools.contains(&true) {
+                values.push(true);
+            }
+            Some(BoolPatternCase::Default(values))
+        }
+        syn::Pat::Wild(_) => None,
+        syn::Pat::Lit(lit) => match &lit.lit {
+            syn::Lit::Bool(value) => Some(BoolPatternCase::Value(value.value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Classify the arms of a `match` whose scrutinee is integer-typed.
+/// Returns `Some(per-arm exit cases)` when arms are exhaustive (last
+/// arm may be `_` wildcard for the default) with no `if`-guards.
+pub(crate) fn classify_match_switch_exitcases(
+    arms: &[syn::Arm],
+) -> Option<Vec<Vec<crate::model::ExitCase>>> {
+    use crate::model::ExitCase;
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut all = Vec::with_capacity(arms.len());
+    let mut seen = Vec::<ExitCase>::new();
+    for (arm_idx, arm) in arms.iter().enumerate() {
+        if arm.guard.is_some() {
+            return None;
+        }
+        let is_last_arm = arm_idx + 1 == arms.len();
+        let mut sub_pats = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
+            return None;
+        }
+        let mut arm_cases = Vec::with_capacity(sub_pats.len());
+        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
+            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
+            let exitcase = classify_switch_pattern(sub_pat, is_last)?;
+            if !is_default_exitcase(&exitcase) {
+                if seen.iter().any(|existing| existing == &exitcase) {
+                    return None;
+                }
+                seen.push(exitcase.clone());
+            }
+            arm_cases.push(exitcase);
+        }
+        all.push(arm_cases);
+    }
+    Some(all)
+}
+
+pub(crate) fn flatten_or_pattern<'a>(pat: &'a syn::Pat, out: &mut Vec<&'a syn::Pat>) {
+    match pat {
+        syn::Pat::Or(or_pat) => {
+            for case in &or_pat.cases {
+                flatten_or_pattern(case, out);
+            }
+        }
+        syn::Pat::Paren(paren) => flatten_or_pattern(&paren.pat, out),
+        other => out.push(other),
+    }
+}
+
+pub(crate) fn classify_switch_pattern(
+    pat: &syn::Pat,
+    is_last: bool,
+) -> Option<crate::model::ExitCase> {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::ExitCase;
+    match pat {
+        syn::Pat::Wild(_) if is_last => Some(default_exitcase()),
+        syn::Pat::Wild(_) => None,
+        syn::Pat::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(int_lit) => int_lit
+                .base10_parse::<i64>()
+                .ok()
+                .map(|value| ExitCase::Const(ConstValue::Int(value))),
+            syn::Lit::Byte(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
+            syn::Lit::Char(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn default_exitcase() -> crate::model::ExitCase {
+    crate::model::ExitCase::Const(crate::flowspace::model::ConstValue::byte_str("default"))
+}
+
+pub(crate) fn is_default_exitcase(exitcase: &crate::model::ExitCase) -> bool {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::ExitCase;
+    matches!(
+        exitcase,
+        ExitCase::Const(ConstValue::ByteStr(bytes)) if bytes.as_slice() == b"default"
+    )
+}
