@@ -21,6 +21,12 @@ pub use crate::front::syn_metadata::{
     full_type_string, qualified_full_type_string, qualified_full_type_string_with_imports,
     trait_object_root_name,
 };
+use crate::front::syn_metadata::{
+    array_item_value_type_from_array_type_id, bare_type_root_from_type_str,
+    dyn_trait_root_from_type_str, extract_element_type_from_str, method_as_ref_return_type,
+    outer_generic_inner_type, split_tuple_type_elements, transparent_option_inner_type,
+    transparent_result_err_type, type_root_from_type_string, type_string_to_value_type,
+};
 
 /// Result of lowering one expression or statement-list tail.
 ///
@@ -7390,47 +7396,6 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
 /// first path segment of the innermost type).  Returns `None` for
 /// `dyn Trait`-shaped strings — callers handle those via
 /// [`dyn_trait_root_from_type_str`] first.
-fn bare_type_root_from_type_str(s: &str) -> Option<String> {
-    let mut trimmed = s.trim();
-    // Drop leading `&` / `&mut` / lifetime annotations.
-    while let Some(rest) = trimmed.strip_prefix('&') {
-        let rest = rest.trim_start();
-        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
-        let rest = if let Some(after_quote) = rest.strip_prefix('\'') {
-            let rest = after_quote
-                .split_once(char::is_whitespace)
-                .map(|(_lt, tail)| tail.trim_start())
-                .unwrap_or("");
-            rest
-        } else {
-            rest
-        };
-        trimmed = rest;
-    }
-    if trimmed.starts_with("dyn ") {
-        return None;
-    }
-    for wrapper in ["Box", "Rc", "Arc"] {
-        let prefix = format!("{wrapper}<");
-        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
-            && let Some(inner) = rest.strip_suffix('>')
-        {
-            return bare_type_root_from_type_str(inner);
-        }
-    }
-    // `Vec<T>` / `Option<T>` / generic containers do not map to a
-    // method-call receiver root.
-    if trimmed.contains('<') {
-        return None;
-    }
-    let leaf = trimmed.split_whitespace().next()?;
-    if leaf.is_empty() {
-        None
-    } else {
-        Some(leaf.to_string())
-    }
-}
-
 /// Variable-direct lookup that walks the op-result chain first then the
 /// link-arg unification fold (`graph_result_value_type_var` →
 /// `graph_link_input_value_type_var`).  No slot projection; the
@@ -7999,27 +7964,6 @@ fn lookup_method_return_type<'a>(
 /// object — direct (`"dyn Foo"`) or wrapped (`"Box<dyn Foo>"`,
 /// `"Rc<dyn Foo>"`, `"Arc<dyn Foo>"`).  The trailing `+ 'a` lifetime
 /// bound is stripped.  Returns `None` for non-dyn types.
-fn dyn_trait_root_from_type_str(s: &str) -> Option<String> {
-    let trimmed = s.trim();
-    if let Some(rest) = trimmed.strip_prefix("dyn ") {
-        // `dyn Trait + 'a` — drop everything after the first `+`.
-        let head = rest.split('+').next()?.trim();
-        if head.is_empty() {
-            return None;
-        }
-        return Some(head.to_string());
-    }
-    for wrapper in ["Box", "Rc", "Arc"] {
-        let prefix = format!("{wrapper}<");
-        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
-            && let Some(inner) = rest.strip_suffix('>')
-        {
-            return dyn_trait_root_from_type_str(inner);
-        }
-    }
-    None
-}
-
 /// Return the trait root when the receiver's static type is a
 /// `dyn Trait` (including `&dyn T` / `&mut dyn T` / `Box<dyn T>`),
 /// otherwise `None`.  Looks up local/parameter bindings via
@@ -8268,50 +8212,6 @@ fn bind_pattern_locals(
 /// then walks balanced `<>` / `()` / `[]` depth so nested generics
 /// (`Option<Result<T, E>>`) and inner tuples (`Vec<(A, B)>`) survive
 /// the split intact.
-fn split_tuple_type_elements(type_str: &str) -> Option<Vec<String>> {
-    let mut s = type_str.trim();
-    loop {
-        let stripped = s
-            .strip_prefix("*const ")
-            .or_else(|| s.strip_prefix("*mut "))
-            .or_else(|| s.strip_prefix("&mut "))
-            .or_else(|| s.strip_prefix("&"));
-        match stripped {
-            Some(rest) => s = rest.trim_start(),
-            None => break,
-        }
-    }
-    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
-    let mut elements: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut depth: i32 = 0;
-    for ch in inner.chars() {
-        match ch {
-            '(' | '<' | '[' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | '>' | ']' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                let trimmed = current.trim();
-                if !trimmed.is_empty() {
-                    elements.push(trimmed.to_string());
-                }
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    let last = current.trim();
-    if !last.is_empty() {
-        elements.push(last.to_string());
-    }
-    Some(elements)
-}
-
 /// `descr.py:359 ARRAY_INSIDE._hints.get('nolength', False)` source-level
 /// reader. PyPy's flowgraph carries the lltype object on every array op
 /// and the JIT consults `_hints` directly; pyre's source-level analysis
@@ -8377,54 +8277,6 @@ fn matches_constructor_path(path: &[String], leaf: &str) -> bool {
 /// disambiguate, mirroring the analyser's flat name table.  The
 /// raw-pointer / reference prefix strip preserves single-identity
 /// behaviour for `let x = obj as *mut Foo;` bindings.
-fn type_root_from_type_string(type_str: &str) -> Option<String> {
-    let mut trimmed = type_str.trim();
-    loop {
-        let stripped = trimmed
-            .strip_prefix("*const ")
-            .or_else(|| trimmed.strip_prefix("*mut "))
-            .or_else(|| trimmed.strip_prefix("&mut "))
-            .or_else(|| trimmed.strip_prefix("&"));
-        match stripped {
-            Some(rest) => trimmed = rest.trim_start(),
-            None => break,
-        }
-    }
-    if trimmed.is_empty() || is_primitive_type_string(trimmed) {
-        return None;
-    }
-    let head = trimmed
-        .split(['<', ' ', '('])
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
-    if head.is_empty() {
-        None
-    } else {
-        Some(head.to_string())
-    }
-}
-
-fn is_primitive_type_string(type_str: &str) -> bool {
-    matches!(
-        type_str,
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "usize"
-            | "bool"
-            | "char"
-            | "f32"
-            | "f64"
-            | "()"
-    )
-}
-
 /// RPython: lltype graph identity — returns the full type path.
 /// For `Foo` → "Foo", for `a::Foo` → "a::Foo".
 /// Classify a Rust parameter/return `syn::Type` into one of the three
@@ -8660,87 +8512,7 @@ fn extract_dyn_trait_root_with_context(
 ///
 /// RPython: `getkind(TYPE)[0]` — map type string to ValueType for kind suffix.
 /// Used by InteriorFieldRead/Write to determine the i/r/f suffix.
-fn type_string_to_value_type(type_str: &str) -> ValueType {
-    let type_str = type_str.trim();
-    match type_str {
-        // u* folded into Int alongside i* — see
-        // `classify_fn_arg_ty`'s TODO(unsigned-producer-flip) for the
-        // cascade list.  Must stay in sync with the producer there so
-        // the InteriorFieldRead/Write kind suffix agrees with the
-        // inputarg type.
-        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-        | "char" | "Self::Truth" => ValueType::Int,
-        // `lltype.Bool` — see `classify_fn_arg_ty`'s `"bool"` arm for
-        // the SomeBool/BoolRepr rationale.
-        "bool" => ValueType::Bool,
-        "f32" | "f64" => ValueType::Float,
-        "()" => ValueType::Void,
-        _ => ValueType::Ref(None),
-    }
-}
-
 pub(crate) use crate::front::syn_metadata::transparent_result_ok_type;
-
-fn transparent_result_err_type(type_str: &str) -> Option<&str> {
-    let trimmed = type_str.trim();
-    for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
-        let Some(inner) = trimmed
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix('>'))
-        else {
-            continue;
-        };
-        let err_type = second_top_level_generic_arg(inner).map(str::trim)?;
-        if err_type == "()" {
-            return None;
-        }
-        return Some(err_type);
-    }
-    None
-}
-
-fn transparent_option_inner_type(type_str: &str) -> Option<&str> {
-    let trimmed = type_str.trim();
-    for prefix in ["Option<", "std::option::Option<", "core::option::Option<"] {
-        let Some(inner) = trimmed
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix('>'))
-        else {
-            continue;
-        };
-        return first_top_level_generic_arg(inner).map(str::trim);
-    }
-    None
-}
-
-fn first_top_level_generic_arg(args: &str) -> Option<&str> {
-    let mut depth = 0usize;
-    for (idx, ch) in args.char_indices() {
-        match ch {
-            '<' | '(' | '[' => depth += 1,
-            '>' | ')' | ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => return Some(&args[..idx]),
-            _ => {}
-        }
-    }
-    if args.is_empty() { None } else { Some(args) }
-}
-
-fn second_top_level_generic_arg(args: &str) -> Option<&str> {
-    let mut depth = 0usize;
-    for (idx, ch) in args.char_indices() {
-        match ch {
-            '<' | '(' | '[' => depth += 1,
-            '>' | ')' | ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                let rest = args[idx + 1..].trim();
-                return if rest.is_empty() { None } else { Some(rest) };
-            }
-            _ => {}
-        }
-    }
-    None
-}
 
 fn field_value_type_from_expr(
     base: &syn::Expr,
@@ -9259,11 +9031,6 @@ fn lookup_function_return_type<'a>(
     None
 }
 
-fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Option<ValueType> {
-    let elem_type = extract_element_type_from_str(array_type_id?)?;
-    Some(type_string_to_value_type(&elem_type))
-}
-
 /// For `arr[idx]`, returns the ELEMENT TYPE of `arr` from context.
 /// This is the Rust equivalent of RPython's `op.args[0].concretetype.TO`
 /// which gives `GcArray(T)` — the `T` is what distinguishes array types.
@@ -9277,74 +9044,6 @@ fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Opti
 ///   stripped before the slice form is matched, mirroring
 ///   `type_root_from_type_string`'s prefix walk so chained
 ///   `Vec::as_slice` results retain their element type.
-fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    let s = strip_pointer_like_prefixes(type_str);
-    // Square brackets: [T] or [T; N]
-    if s.starts_with('[') && s.ends_with(']') {
-        let inner = &s[1..s.len() - 1];
-        // [T; N] → T (strip "; N" suffix)
-        let elem = if let Some(semi) = inner.find(';') {
-            inner[..semi].trim()
-        } else {
-            inner.trim()
-        };
-        if !elem.is_empty() {
-            return Some(elem.to_string());
-        }
-    }
-    // Angle brackets: Vec<T>, Box<T>, etc.  This is checked after the
-    // outer slice form so `[Rc<T>]` yields `Rc<T>`, not `T`.
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        if start < end {
-            return first_top_level_generic_arg(&s[start + 1..end])
-                .map(str::trim)
-                .filter(|elem| !elem.is_empty())
-                .map(ToOwned::to_owned);
-        }
-    }
-    None
-}
-
-fn strip_pointer_like_prefixes(type_str: &str) -> &str {
-    let mut s = type_str.trim();
-    loop {
-        let stripped = s
-            .strip_prefix("*const ")
-            .or_else(|| s.strip_prefix("*mut "))
-            .or_else(|| s.strip_prefix("&mut "))
-            .or_else(|| s.strip_prefix("&"));
-        match stripped {
-            Some(rest) => s = rest.trim_start(),
-            None => break,
-        }
-    }
-    s
-}
-
-fn outer_generic_inner_type(type_str: &str, wrappers: &[&str]) -> Option<String> {
-    let s = strip_pointer_like_prefixes(type_str);
-    let start = s.find('<')?;
-    let inner = s[start + 1..].strip_suffix('>')?;
-    let head = s[..start].trim().rsplit("::").next().unwrap_or("").trim();
-    if !wrappers.contains(&head) {
-        return None;
-    }
-    first_top_level_generic_arg(inner)
-        .map(str::trim)
-        .filter(|inner| !inner.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn method_as_ref_return_type(receiver_ty: &str) -> Option<String> {
-    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Rc", "Arc", "Box", "NonNull"]) {
-        return Some(format!("&{}", strip_pointer_like_prefixes(&inner)));
-    }
-    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Option"]) {
-        return Some(format!("Option<&{}>", strip_pointer_like_prefixes(&inner)));
-    }
-    extract_element_type_from_str(receiver_ty).map(|elem| format!("&[{}]", elem))
-}
-
 fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
     match expr {
         syn::Expr::Path(path) => path

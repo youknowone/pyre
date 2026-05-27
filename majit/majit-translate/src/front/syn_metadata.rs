@@ -1609,3 +1609,288 @@ pub(crate) fn collect_pat_idents(pat: &syn::Pat, out: &mut std::collections::Has
         _ => {}
     }
 }
+
+pub(crate) fn is_primitive_type_string(type_str: &str) -> bool {
+    matches!(
+        type_str,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "bool"
+            | "char"
+            | "f32"
+            | "f64"
+            | "()"
+    )
+}
+
+pub(crate) fn type_string_to_value_type(type_str: &str) -> crate::model::ValueType {
+    use crate::model::ValueType;
+    let type_str = type_str.trim();
+    match type_str {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+        | "char" | "Self::Truth" => ValueType::Int,
+        "bool" => ValueType::Bool,
+        "f32" | "f64" => ValueType::Float,
+        "()" => ValueType::Void,
+        _ => ValueType::Ref(None),
+    }
+}
+
+pub(crate) fn type_root_from_type_string(type_str: &str) -> Option<String> {
+    let mut trimmed = type_str.trim();
+    loop {
+        let stripped = trimmed
+            .strip_prefix("*const ")
+            .or_else(|| trimmed.strip_prefix("*mut "))
+            .or_else(|| trimmed.strip_prefix("&mut "))
+            .or_else(|| trimmed.strip_prefix("&"));
+        match stripped {
+            Some(rest) => trimmed = rest.trim_start(),
+            None => break,
+        }
+    }
+    if trimmed.is_empty() || is_primitive_type_string(trimmed) {
+        return None;
+    }
+    let head = trimmed
+        .split(['<', ' ', '('])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+pub(crate) fn bare_type_root_from_type_str(s: &str) -> Option<String> {
+    let mut trimmed = s.trim();
+    while let Some(rest) = trimmed.strip_prefix('&') {
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+        let rest = if let Some(after_quote) = rest.strip_prefix('\'') {
+            let rest = after_quote
+                .split_once(char::is_whitespace)
+                .map(|(_lt, tail)| tail.trim_start())
+                .unwrap_or("");
+            rest
+        } else {
+            rest
+        };
+        trimmed = rest;
+    }
+    if trimmed.starts_with("dyn ") {
+        return None;
+    }
+    for wrapper in ["Box", "Rc", "Arc"] {
+        let prefix = format!("{wrapper}<");
+        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+            && let Some(inner) = rest.strip_suffix('>')
+        {
+            return bare_type_root_from_type_str(inner);
+        }
+    }
+    if trimmed.contains('<') {
+        return None;
+    }
+    let leaf = trimmed.split_whitespace().next()?;
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf.to_string())
+    }
+}
+
+pub(crate) fn dyn_trait_root_from_type_str(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("dyn ") {
+        let head = rest.split('+').next()?.trim();
+        if head.is_empty() {
+            return None;
+        }
+        return Some(head.to_string());
+    }
+    for wrapper in ["Box", "Rc", "Arc"] {
+        let prefix = format!("{wrapper}<");
+        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+            && let Some(inner) = rest.strip_suffix('>')
+        {
+            return dyn_trait_root_from_type_str(inner);
+        }
+    }
+    None
+}
+
+pub(crate) fn transparent_result_err_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
+        let Some(inner) = trimmed
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        let err_type = second_top_level_generic_arg(inner).map(str::trim)?;
+        if err_type == "()" {
+            return None;
+        }
+        return Some(err_type);
+    }
+    None
+}
+
+pub(crate) fn transparent_option_inner_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    for prefix in ["Option<", "std::option::Option<", "core::option::Option<"] {
+        let Some(inner) = trimmed
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        return first_top_level_generic_arg(inner).map(str::trim);
+    }
+    None
+}
+
+pub(crate) fn second_top_level_generic_arg(args: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let rest = args[idx + 1..].trim();
+                return if rest.is_empty() { None } else { Some(rest) };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn split_tuple_type_elements(type_str: &str) -> Option<Vec<String>> {
+    let mut s = type_str.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .or_else(|| s.strip_prefix("&mut "))
+            .or_else(|| s.strip_prefix("&"));
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
+        }
+    }
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    let mut elements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    for ch in inner.chars() {
+        match ch {
+            '(' | '<' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | '>' | ']' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    elements.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let last = current.trim();
+    if !last.is_empty() {
+        elements.push(last.to_string());
+    }
+    Some(elements)
+}
+
+pub(crate) fn strip_pointer_like_prefixes(type_str: &str) -> &str {
+    let mut s = type_str.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .or_else(|| s.strip_prefix("&mut "))
+            .or_else(|| s.strip_prefix("&"));
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
+        }
+    }
+    s
+}
+
+/// `arr[idx]` element-type extraction from a stored array type id.
+/// `Vec<Point>` → `"Point"`, `[i64]` → `"i64"`, `[Point; 10]` → `"Point"`,
+/// `&[Point]` → `"Point"` (pointer-like prefixes are stripped first).
+pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
+    let s = strip_pointer_like_prefixes(type_str);
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let elem = if let Some(semi) = inner.find(';') {
+            inner[..semi].trim()
+        } else {
+            inner.trim()
+        };
+        if !elem.is_empty() {
+            return Some(elem.to_string());
+        }
+    }
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return first_top_level_generic_arg(&s[start + 1..end])
+                .map(str::trim)
+                .filter(|elem| !elem.is_empty())
+                .map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+pub(crate) fn outer_generic_inner_type(type_str: &str, wrappers: &[&str]) -> Option<String> {
+    let s = strip_pointer_like_prefixes(type_str);
+    let start = s.find('<')?;
+    let inner = s[start + 1..].strip_suffix('>')?;
+    let head = s[..start].trim().rsplit("::").next().unwrap_or("").trim();
+    if !wrappers.contains(&head) {
+        return None;
+    }
+    first_top_level_generic_arg(inner)
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn method_as_ref_return_type(receiver_ty: &str) -> Option<String> {
+    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Rc", "Arc", "Box", "NonNull"]) {
+        return Some(format!("&{}", strip_pointer_like_prefixes(&inner)));
+    }
+    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Option"]) {
+        return Some(format!("Option<&{}>", strip_pointer_like_prefixes(&inner)));
+    }
+    extract_element_type_from_str(receiver_ty).map(|elem| format!("&[{}]", elem))
+}
+
+pub(crate) fn array_item_value_type_from_array_type_id(
+    array_type_id: Option<&str>,
+) -> Option<crate::model::ValueType> {
+    let elem_type = extract_element_type_from_str(array_type_id?)?;
+    Some(type_string_to_value_type(&elem_type))
+}
