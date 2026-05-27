@@ -2818,21 +2818,17 @@ mod tests {
     #[test]
     fn shutil_copy_round_trip_in_tempdir() {
         // Mirrors `test_shutil_copy` at upstream
-        // `test_driver.py:124-131` — write a file, copy it, read it
-        // back. The Rust port uses `tempfile`-free std::env::temp_dir
-        // path; the test only needs filesystem semantics.
-        let dir = std::env::temp_dir();
-        let a = dir.join("majit_driver_test_a");
-        let b = dir.join("majit_driver_test_b");
+        // `test_driver.py:124-131`. Upstream uses pytest's per-session
+        // `udir.join(...)`; the Rust port uses `tempfile::TempDir` for
+        // the equivalent isolation so concurrent invocations cannot
+        // race on a shared path under `std::env::temp_dir()`.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let a = dir.path().join("file_a");
+        let b = dir.path().join("file_b");
         std::fs::write(&a, b"hello").expect("write a");
-        if b.exists() {
-            std::fs::remove_file(&b).expect("clean b");
-        }
         shutil_copy(&a, &b).expect("shutil_copy");
         let read = std::fs::read_to_string(&b).expect("read b");
         assert_eq!(read, "hello");
-        std::fs::remove_file(&a).ok();
-        std::fs::remove_file(&b).ok();
     }
 
     /// Upstream `instrument_result(self, args)` at `:218-248` is
