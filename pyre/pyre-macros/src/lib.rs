@@ -792,37 +792,113 @@ impl syn::parse::Parse for PyreMethodsAttrs {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MethodKind {
     Instance,
     Static,
     Class,
+    Getter(String),
+    Setter(String),
 }
 
-/// Inspect `#[staticmethod]` / `#[classmethod]` markers on an impl-fn.
-/// Mutual exclusion is enforced; an unannotated fn is `Instance`.
+/// Inspect `#[staticmethod]` / `#[classmethod]` / `#[getter]` /
+/// `#[setter]` markers on an impl-fn.  Mutually exclusive; the
+/// unannotated default is `Instance`.
+///
+/// `#[getter]` / `#[setter]` accept an optional `(py_name)` arg.  When
+/// omitted, the py-name is derived from the rust fn name (setters strip
+/// a leading `set_` to pair with their getter).  Mirrors PyPy
+/// `name = GetSetProperty(W_X.descr_get_name, W_X.descr_set_name)`
+/// where both descr handlers share the python-visible `name`.
 fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
     let mut kind = MethodKind::Instance;
     let mut seen = false;
     for a in m.attrs.iter() {
-        let label = if a.path().is_ident("staticmethod") {
+        let new_kind = if a.path().is_ident("staticmethod") {
             Some(MethodKind::Static)
         } else if a.path().is_ident("classmethod") {
             Some(MethodKind::Class)
+        } else if a.path().is_ident("getter") {
+            let py_name = attr_string_arg(a)?
+                .unwrap_or_else(|| m.sig.ident.to_string());
+            Some(MethodKind::Getter(py_name))
+        } else if a.path().is_ident("setter") {
+            let fn_name = m.sig.ident.to_string();
+            let derived = fn_name.strip_prefix("set_").map(str::to_owned);
+            let py_name = match attr_string_arg(a)? {
+                Some(n) => n,
+                None => derived.unwrap_or(fn_name),
+            };
+            Some(MethodKind::Setter(py_name))
         } else {
             None
         };
-        let Some(new_kind) = label else { continue };
+        let Some(new_kind) = new_kind else { continue };
         if seen {
             return Err(syn::Error::new(
                 a.span(),
-                "#[pyre_methods]: at most one of `#[classmethod]` / `#[staticmethod]`",
+                "#[pyre_methods]: at most one of \
+                 `#[classmethod]` / `#[staticmethod]` / `#[getter]` / `#[setter]`",
             ));
         }
         kind = new_kind;
         seen = true;
     }
     Ok(kind)
+}
+
+/// Insert a getter/setter wrapper into the `properties` Vec, merging
+/// with an existing pair on the same py-name and rejecting duplicates.
+fn record_property(
+    properties: &mut Vec<(String, Option<syn::Ident>, Option<syn::Ident>)>,
+    name: String,
+    new_fget: Option<syn::Ident>,
+    new_fset: Option<syn::Ident>,
+    m: &syn::ImplItemFn,
+) -> syn::Result<()> {
+    for entry in properties.iter_mut() {
+        if entry.0 != name {
+            continue;
+        }
+        if new_fget.is_some() {
+            if entry.1.is_some() {
+                return Err(syn::Error::new(
+                    m.sig.span(),
+                    format!("#[getter]: property `{name}` already has a getter"),
+                ));
+            }
+            entry.1 = new_fget;
+        }
+        if new_fset.is_some() {
+            if entry.2.is_some() {
+                return Err(syn::Error::new(
+                    m.sig.span(),
+                    format!("#[setter]: property `{name}` already has a setter"),
+                ));
+            }
+            entry.2 = new_fset;
+        }
+        return Ok(());
+    }
+    properties.push((name, new_fget, new_fset));
+    Ok(())
+}
+
+/// Extract `"name"` from `#[X("name")]`.  `None` if the attribute has
+/// no arguments; `Err` if the arg list is malformed.
+fn attr_string_arg(a: &syn::Attribute) -> syn::Result<Option<String>> {
+    use syn::Meta;
+    match &a.meta {
+        Meta::Path(_) => Ok(None),
+        Meta::List(_) => {
+            let lit: syn::LitStr = a.parse_args()?;
+            Ok(Some(lit.value()))
+        }
+        Meta::NameValue(_) => Err(syn::Error::new(
+            a.span(),
+            "expected `#[attr]` or `#[attr(\"name\")]`",
+        )),
+    }
 }
 
 fn expand_pyre_methods(
@@ -844,6 +920,12 @@ fn expand_pyre_methods(
     // a free-fn inside an attached `mod _pyre_wrappers_<Self>` module.
     let mut wrappers = Vec::<proc_macro2::TokenStream>::new();
     let mut registrations = Vec::<proc_macro2::TokenStream>::new();
+    // `(py_name, fget_wrapper, fset_wrapper)` accumulated across the
+    // method-loop.  Each `#[getter]` and `#[setter]` arm writes one
+    // slot; after the loop we emit one `w_getset_property_new` per
+    // distinct py_name.  Mirrors PyPy `name = GetSetProperty(fget=,
+    // fset=)` where both handlers share the python-visible name.
+    let mut properties: Vec<(String, Option<syn::Ident>, Option<syn::Ident>)> = Vec::new();
 
     for item in imp.items.iter() {
         let ImplItem::Fn(m) = item else { continue };
@@ -870,9 +952,16 @@ fn expand_pyre_methods(
         // applied at `make_builtin_function` time via `w_classmethod_new`
         // / `w_staticmethod_new`; everything else (arg unwrap, return
         // wrap) reuses the regular machinery.
+        //
+        // Getter / Setter share the Instance preamble — they both bind
+        // `self` and look identical to a 0-arg / 1-arg method to the
+        // wrapper machinery.  The distinction surfaces only at
+        // registration time, where instead of `dict_storage_store(...,
+        // make_builtin_function(...))` they participate in a deferred
+        // `w_getset_property_new(fget=, fset=)` build keyed by py_name.
         let mut inputs = m.sig.inputs.iter().peekable();
-        let (preamble, call_target, first_arg_idx) = match kind {
-            MethodKind::Instance => {
+        let (preamble, call_target, first_arg_idx) = match &kind {
+            MethodKind::Instance | MethodKind::Getter(_) | MethodKind::Setter(_) => {
                 let recv = match inputs.next() {
                     Some(FnArg::Receiver(r)) => r,
                     _ => {
@@ -883,17 +972,26 @@ fn expand_pyre_methods(
                         ));
                     }
                 };
+                // Method dispatch passes `(self,)`+args; GetSetProperty
+                // dispatch passes `(descriptor_self, w_obj,…)` so the
+                // actual `self` slides one slot right.  Mirrors
+                // `typedef.py:312-325` fget_unwrap_spec.
+                let self_idx: usize = match &kind {
+                    MethodKind::Getter(_) | MethodKind::Setter(_) => 1,
+                    _ => 0,
+                };
                 let from_obj_call = if recv.mutability.is_some() {
-                    quote! { <#self_ty>::from_obj(args[0]) }
+                    quote! { <#self_ty>::from_obj(args[#self_idx]) }
                 } else {
                     // `from_obj` returns `Option<&mut Self>` even for
                     // `&self` callers — reborrow as `&Self` so the
                     // method's signature matches without a separate
                     // `from_obj_ref` API.
-                    quote! { <#self_ty>::from_obj(args[0]).map(|m| &*m) }
+                    quote! { <#self_ty>::from_obj(args[#self_idx]).map(|m| &*m) }
                 };
+                let needed = self_idx + 1;
                 let preamble = quote! {
-                    if args.is_empty() {
+                    if args.len() < #needed {
                         return ::std::result::Result::Err(
                             crate::PyError::type_error(
                                 concat!("descriptor '", stringify!(#mname), "' requires self argument"),
@@ -911,7 +1009,7 @@ fn expand_pyre_methods(
                         }
                     };
                 };
-                (preamble, quote! { __pyre_self.#mname }, 1)
+                (preamble, quote! { __pyre_self.#mname }, self_idx + 1)
             }
             MethodKind::Static => {
                 if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {
@@ -964,13 +1062,60 @@ fn expand_pyre_methods(
             }
         });
         let raw_fn = quote! { crate::make_builtin_function(#py_name, #wrapper_name) };
-        let descr = match kind {
-            MethodKind::Instance => raw_fn,
-            MethodKind::Static => quote! { ::pyre_object::w_staticmethod_new(#raw_fn) },
-            MethodKind::Class => quote! { ::pyre_object::w_classmethod_new(#raw_fn) },
+        match &kind {
+            MethodKind::Instance => {
+                registrations.push(quote! {
+                    crate::dict_storage_store(ns, #py_name, #raw_fn);
+                });
+            }
+            MethodKind::Static => {
+                registrations.push(quote! {
+                    crate::dict_storage_store(ns, #py_name,
+                        ::pyre_object::w_staticmethod_new(#raw_fn));
+                });
+            }
+            MethodKind::Class => {
+                registrations.push(quote! {
+                    crate::dict_storage_store(ns, #py_name,
+                        ::pyre_object::w_classmethod_new(#raw_fn));
+                });
+            }
+            MethodKind::Getter(prop_name) => {
+                record_property(&mut properties, prop_name.clone(), Some(wrapper_name.clone()), None, m)?;
+            }
+            MethodKind::Setter(prop_name) => {
+                record_property(&mut properties, prop_name.clone(), None, Some(wrapper_name.clone()), m)?;
+            }
+        }
+    }
+
+    // Property pair emission: one `w_getset_property_new` per distinct
+    // py-name.  Slots not provided fall back to `PY_NULL` (matching
+    // PyPy `GetSetProperty(fget=W_X.descr_get_X, fset=None, fdel=None)`
+    // when only a getter is declared).
+    for (prop_name, fget, fset) in &properties {
+        let fget_expr = match fget {
+            Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
+            None => quote! { ::pyre_object::PY_NULL },
+        };
+        let fset_expr = match fset {
+            Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
+            None => quote! { ::pyre_object::PY_NULL },
         };
         registrations.push(quote! {
-            crate::dict_storage_store(ns, #py_name, #descr);
+            crate::dict_storage_store(
+                ns,
+                #prop_name,
+                ::pyre_object::getsetproperty::w_getset_property_new(
+                    #fget_expr,
+                    #fset_expr,
+                    ::pyre_object::PY_NULL,
+                    ::pyre_object::PY_NULL,
+                    ::pyre_object::PY_NULL,
+                    false,
+                    ::pyre_object::w_str_new(#prop_name),
+                ),
+            );
         });
     }
 
@@ -1012,7 +1157,9 @@ fn expand_pyre_methods(
             !(a.path().is_ident("pyre_method")
                 || a.path().is_ident("pyre_property")
                 || a.path().is_ident("classmethod")
-                || a.path().is_ident("staticmethod"))
+                || a.path().is_ident("staticmethod")
+                || a.path().is_ident("getter")
+                || a.path().is_ident("setter"))
         });
         for arg in m.sig.inputs.iter_mut() {
             if let FnArg::Typed(pt) = arg {

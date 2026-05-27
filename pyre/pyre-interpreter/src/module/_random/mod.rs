@@ -70,6 +70,14 @@ impl W_Random {
             }
         }
     }
+    #[getter]
+    fn raw_state(&self) -> i64 {
+        self.state as i64
+    }
+    #[setter]
+    fn set_raw_state(&mut self, v: i64) {
+        self.state = v as u64;
+    }
 }
 
 crate::py_module! {
