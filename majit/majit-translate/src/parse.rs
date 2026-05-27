@@ -1067,7 +1067,7 @@ fn collect_trait_impls_from_items(
                             // the same `<ImplType>::_orig_<name>_unlikely_name`
                             // path that `lib.rs:531-537` registers via
                             // `CallPath::for_impl_method`.
-                            for synth in crate::front::ast::synthesize_or_passthrough(
+                            for synth in crate::front::syn_metadata::synthesize_or_passthrough(
                                 fake_fn,
                                 self_ty_root.as_deref(),
                             ) {
@@ -1140,7 +1140,7 @@ fn collect_trait_impls_from_items(
                             // for S` block would re-emit the method
                             // with `self_ty_root = "S"` and lower the
                             // wrapper through this same path.
-                            for synth in crate::front::ast::synthesize_or_passthrough(fake_fn, None)
+                            for synth in crate::front::syn_metadata::synthesize_or_passthrough(fake_fn, None)
                             {
                                 let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
@@ -1329,7 +1329,7 @@ fn collect_inherent_methods_from_items(
                         // self-typed tail call and the body's `self.field`
                         // accesses share the same `owner_root` spelling
                         // the vable spec asserts on.
-                        for synth in crate::front::ast::synthesize_or_passthrough(
+                        for synth in crate::front::syn_metadata::synthesize_or_passthrough(
                             fake_fn,
                             self_ty_root_bare.as_deref(),
                         ) {

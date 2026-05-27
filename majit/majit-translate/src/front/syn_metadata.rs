@@ -1072,3 +1072,272 @@ pub(crate) fn is_default_exitcase(exitcase: &crate::model::ExitCase) -> bool {
         ExitCase::Const(ConstValue::ByteStr(bytes)) if bytes.as_slice() == b"default"
     )
 }
+
+// ── `#[elidable_promote]` synthesis (`rlib/jit.py:180-201`) ─────────
+//
+// Pure syn-tree transformation: takes a `syn::ItemFn` and expands it
+// into the (orig, wrapper) pair when the source carries
+// `#[elidable_promote]` / `#[purefunction_promote]`, otherwise returns
+// the source unchanged. The graph builder is not involved.
+
+/// `promote_args` selector for `#[elidable_promote(...)]` synthesis.
+///
+/// Mirrors `rlib/jit.py:189-191` — RPython splits a literal string at
+/// `,` when the value is not the special `"all"` marker:
+///
+/// ```python
+/// if promote_args != 'all':
+///     args = [args[int(i)] for i in promote_args.split(",")]
+/// ```
+#[derive(Debug, Clone)]
+pub(crate) enum PromoteArgsSelector {
+    /// `jit.py:180` default `promote_args='all'` — every non-self
+    /// positional arg flows through `hint(..., promote=True)`.
+    All,
+    /// `jit.py:189-191` index list (`"0,2"` → `[0, 2]`).  Indices are
+    /// 0-based and point into the **positional arg list including
+    /// `self`** when the decorated function is a method (RPython's
+    /// `_get_args(func)` reads the raw co_varnames; pyre mirrors the
+    /// same convention by treating `self` as index 0 when present).
+    Indices(Vec<usize>),
+}
+
+/// `rlib/jit.py:180-191` — parse the literal attribute value attached
+/// to `#[elidable_promote(promote_args = "...")]`.  Bare
+/// `#[elidable_promote]` defaults to `"all"` per the upstream default
+/// argument at jit.py:180.
+fn parse_elidable_promote_args(attr: &syn::Attribute) -> syn::Result<PromoteArgsSelector> {
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return Ok(PromoteArgsSelector::All);
+    }
+    let mut selector = None;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("promote_args") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            selector = Some(if lit.value() == "all" {
+                PromoteArgsSelector::All
+            } else {
+                let mut indices = Vec::new();
+                for piece in lit.value().split(',') {
+                    indices.push(piece.trim().parse::<usize>().map_err(|err| {
+                        syn::Error::new(lit.span(), format!("promote_args: {err}"))
+                    })?);
+                }
+                PromoteArgsSelector::Indices(indices)
+            });
+            Ok(())
+        } else {
+            Err(meta.error("unsupported elidable_promote argument"))
+        }
+    })?;
+    Ok(selector.unwrap_or(PromoteArgsSelector::All))
+}
+
+/// Expand a `syn::ItemFn` into `[orig, wrapper]` when it carries
+/// `#[elidable_promote]` / `#[purefunction_promote]`, else return the
+/// single function unchanged.  Mirrors `rlib/jit.py:184-201`'s "module
+/// import installs two callables" semantics at every entry point that
+/// hands a `syn::ItemFn` to `build_function_graph*` — free functions
+/// (`build_graphs_from_items`), inherent / trait-impl methods
+/// (`parse::extract_inherent_impl_methods`,
+/// `parse::extract_trait_impls`), and trait default methods
+/// (`parse::extract_trait_impls`).  Centralising the expansion here
+/// keeps the decorator behaviour uniform across all four lowering
+/// surfaces.
+///
+/// `impl_type` carries the qualified type root (`"S"`, `"a::S"`) when
+/// the source item lives inside an `impl` block, so the synthesizer can
+/// emit a type-qualified tail call (`a::S::_orig_<name>_unlikely_name(
+/// self, args)`) that matches the impl-method registration path built
+/// by `parse::CallPath::for_impl_method` at `lib.rs:531-537`.  Free
+/// functions and trait-default methods (which have no concrete `Self`
+/// type at synthesis time) pass `None` and fall back to the bare-path
+/// tail call.
+pub fn synthesize_or_passthrough(
+    fake_fn: syn::ItemFn,
+    impl_type: Option<&str>,
+) -> Vec<syn::ItemFn> {
+    match extract_elidable_promote_selector(&fake_fn.attrs) {
+        Some(selector) => {
+            let (orig, wrapper) = synthesize_elidable_promote_pair(&fake_fn, &selector, impl_type);
+            vec![orig, wrapper]
+        }
+        None => vec![fake_fn],
+    }
+}
+
+/// Locate `#[elidable_promote]` (or its deprecated `#[purefunction_promote]`
+/// alias from `rlib/jit.py:203-205`) and return its parsed
+/// `promote_args` selector, or `None` if neither attribute is present.
+///
+/// `rlib/jit.py:189-191` `args[int(i)]` propagates `ValueError` /
+/// `IndexError` to the caller — the decorator does not silently drop
+/// malformed input.  Pyre mirrors that fail-loud behaviour here: a
+/// malformed `promote_args = "..."` literal panics with the
+/// underlying `syn::Error` rather than falling through.
+fn extract_elidable_promote_selector(attrs: &[syn::Attribute]) -> Option<PromoteArgsSelector> {
+    for attr in attrs {
+        if let Some(segment) = attr.path().segments.last() {
+            let name = segment.ident.to_string();
+            if name == "elidable_promote" || name == "purefunction_promote" {
+                return Some(parse_elidable_promote_args(attr).unwrap_or_else(|err| {
+                    panic!("#[{name}(...)]: {err}");
+                }));
+            }
+        }
+    }
+    None
+}
+
+/// Synthesize the wrapper / original function pair from a single
+/// `#[elidable_promote] fn foo(...)` source item.
+///
+/// Line-by-line port of `rlib/jit.py:184-201`.
+fn synthesize_elidable_promote_pair(
+    func: &syn::ItemFn,
+    selector: &PromoteArgsSelector,
+    impl_type: Option<&str>,
+) -> (syn::ItemFn, syn::ItemFn) {
+    use quote::format_ident;
+    // jit.py:186 args = _get_args(func) — positional names, self included.
+    let arg_names: Vec<syn::Ident> = func
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| match arg {
+            syn::FnArg::Typed(pt) => match &*pt.pat {
+                syn::Pat::Ident(pi) => pi.ident.clone(),
+                _ => panic!(
+                    "#[elidable_promote] on `fn {}`: unsupported binder \
+                     pattern in arg position — RPython `_get_args(func)` \
+                     (jit.py:172-178) reads positional names off \
+                     `co_varnames`, which never include destructured \
+                     binders.  Rewrite the parameter as a plain `name: \
+                     Ty` instead.",
+                    func.sig.ident
+                ),
+            },
+            // `&self` / `&mut self` map to a positional name "self" so
+            // index 0 in `Indices` continues to address the receiver as
+            // RPython does (`_get_args(func)` reads co_varnames raw).
+            syn::FnArg::Receiver(_) => format_ident!("self"),
+        })
+        .collect();
+
+    let orig_ident = format_ident!("_orig_{}_unlikely_name", func.sig.ident);
+
+    // jit.py:184-185 — original keeps the body, gains `_elidable_function_`.
+    let orig_attrs: Vec<syn::Attribute> = func
+        .attrs
+        .iter()
+        .filter(|a| {
+            let name = a
+                .path()
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            name != "elidable_promote" && name != "purefunction_promote"
+        })
+        .cloned()
+        .collect();
+    let elidable_attr: syn::Attribute = syn::parse_quote!(#[elidable]);
+    let mut orig_fn = func.clone();
+    orig_fn.attrs = orig_attrs;
+    orig_fn.attrs.push(elidable_attr);
+    orig_fn.sig.ident = orig_ident.clone();
+
+    // jit.py:189-191 — promote_args=='all' → all indices; else parsed list.
+    // RPython `args[int(i)]` raises `IndexError` on out-of-range
+    // indices; pyre fails loudly here for the same reason.
+    let promote_indices: Vec<usize> = match selector {
+        PromoteArgsSelector::All => (0..arg_names.len()).collect(),
+        PromoteArgsSelector::Indices(ix) => {
+            for &i in ix {
+                if i >= arg_names.len() {
+                    panic!(
+                        "#[elidable_promote(promote_args = ...)] on `fn {}`: \
+                         index {} is out of range for a {}-arg function \
+                         (jit.py:191 `args[int(i)]` would IndexError)",
+                        func.sig.ident,
+                        i,
+                        arg_names.len()
+                    );
+                }
+            }
+            ix.clone()
+        }
+    };
+    // jit.py:191-194 — `for arg in args: hint(arg, promote=True,
+    // promote_string=True)`.
+    let promote_self = promote_indices.iter().any(|&i| arg_names[i] == "self");
+    let promote_stmts: Vec<syn::Stmt> = promote_indices
+        .iter()
+        .map(|&i| {
+            let id = &arg_names[i];
+            if id == "self" {
+                syn::parse_quote!(let __self_promoted = hint_promote_or_string(self);)
+            } else {
+                syn::parse_quote!(let #id = hint_promote_or_string(#id);)
+            }
+        })
+        .collect();
+
+    // jit.py:195 — return _orig_func_unlikely_name(args).
+    let call_args = arg_names.iter().map(|id| -> syn::Expr {
+        if id == "self" {
+            if promote_self {
+                syn::parse_quote!(__self_promoted)
+            } else {
+                syn::parse_quote!(self)
+            }
+        } else {
+            syn::parse_quote!(#id)
+        }
+    });
+    let tail_call: syn::Expr = match impl_type {
+        Some(ty_str) => {
+            let ty_path: syn::Path = syn::parse_str(ty_str).unwrap_or_else(|err| {
+                panic!(
+                    "synthesize_elidable_promote_pair: failed to parse impl type `{ty_str}`: {err}"
+                )
+            });
+            syn::parse_quote!(#ty_path::#orig_ident(#(#call_args),*))
+        }
+        None => syn::parse_quote!(#orig_ident(#(#call_args),*)),
+    };
+    let tail_stmt = syn::Stmt::Expr(tail_call, None);
+
+    // jit.py:198-201 — wrapper is the user-facing decorated name with
+    // the promote+forward body; `#[elidable_promote]` is stripped so
+    // `collect_jit_hints` does not register the wrapper itself as
+    // elidable (the binary flag belongs on the original alone, per
+    // jit.py:185 `elidable(func)`).
+    let wrapper_attrs: Vec<syn::Attribute> = func
+        .attrs
+        .iter()
+        .filter(|a| {
+            let name = a
+                .path()
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            name != "elidable_promote" && name != "purefunction_promote"
+        })
+        .cloned()
+        .collect();
+    let mut wrapper_block = syn::Block {
+        brace_token: Default::default(),
+        stmts: Vec::new(),
+    };
+    wrapper_block.stmts.extend(promote_stmts);
+    wrapper_block.stmts.push(tail_stmt);
+
+    let mut wrapper_fn = func.clone();
+    wrapper_fn.attrs = wrapper_attrs;
+    wrapper_fn.block = Box::new(wrapper_block);
+
+    (orig_fn, wrapper_fn)
+}
