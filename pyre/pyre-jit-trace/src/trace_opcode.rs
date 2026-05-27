@@ -7640,12 +7640,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CallKw { .. }
             | Instruction::CallFunctionEx
             | Instruction::LoadAttr { .. }
-            // StoreAttr 비활성: 2026-05-27 walker 재활성 회귀.
-            // synth/iteration_protocol 가 `self.n = self.n - 1` 경로에서
-            // SIGSEGV.  unit-variant wrapper 와 별개의 활성 회귀이며,
-            // 별도 slice (issue M4 StoreAttr) 에서 진단해야 함.
-            //
-            // | Instruction::StoreAttr { .. }
+            | Instruction::StoreAttr { .. }
             | Instruction::StoreFastStoreFast { .. }
     )
 }

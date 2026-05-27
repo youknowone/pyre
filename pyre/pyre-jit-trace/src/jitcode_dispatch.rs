@@ -3155,6 +3155,23 @@ fn try_fold_pure_call_via_executor(
         };
         args.push(v);
     }
+    // Refuse to invoke the helper when any Ref argument is NULL.  Pyre's
+    // getfield_gc_r walker handler propagates field reads (including
+    // pointer-valued fields like `PyFrame.f_back`) as concrete values
+    // when the parent struct is concrete-known; a top-level frame
+    // returns NULL for `f_back`, stamping `Value::Ref(GcRef(0))` into
+    // the constant pool.  Folding `helper(NULL)` would then dereference
+    // NULL and SEGV.  PyPy avoids this because its optimizer inserts
+    // `guard_nonnull` ahead of any pointer-deref residual call; pyre's
+    // walker folds before that guard exists, so guard the executor
+    // entry against NULL receivers and fall through to recording the
+    // IR op as-is.  The downstream optimizer then sees the call op and
+    // emits the necessary guards.
+    for (i, &arg) in args.iter().enumerate() {
+        if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            return;
+        }
+    }
     let result_i64 = majit_metainterp::executor::execute_pure_call(call_descr, func_ptr, &args);
     // pyjitpl.py:1392 `result_box.value = result`: stamp the recorded
     // OpRef with the executed concrete so downstream
@@ -8557,6 +8574,73 @@ mod tests {
                     _ => break,
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_store_attr_arm_bytes() {
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        use pyre_interpreter::bytecode::Arg;
+        let descrs = all_descrs();
+        for instr in [
+            Instruction::LoadAttr { namei: Arg::marker() },
+            Instruction::StoreAttr { namei: Arg::marker() },
+        ] {
+            let jc = jitcode_for_instruction(&instr)
+                .expect("Load/StoreAttr must resolve to an arm jitcode");
+            let code = jc.code.as_slice();
+            eprintln!(
+                "==== {} ====",
+                jc.name,
+            );
+            eprintln!(
+                "num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
+                jc.num_regs_r(),
+                jc.num_regs_i(),
+                jc.num_regs_f(),
+                code.len(),
+            );
+            eprintln!("Raw bytes: {:02x?}", code);
+            for op in decoded_ops(code) {
+                let operand_bytes = &code[op.pc + 1..op.next_pc];
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes,
+                );
+                if op.argcodes.contains('d') || op.argcodes.contains('j') {
+                    let mut cursor = 0usize;
+                    let mut chars = op.argcodes.chars();
+                    while let Some(c) = chars.next() {
+                        match c {
+                            'i' | 'c' | 'r' | 'f' => cursor += 1,
+                            'L' => cursor += 2,
+                            'd' | 'j' => {
+                                let idx = u16::from_le_bytes([
+                                    operand_bytes[cursor],
+                                    operand_bytes[cursor + 1],
+                                ]) as usize;
+                                let info = descrs
+                                    .get(idx)
+                                    .map(|d| format!("{:?}", d))
+                                    .unwrap_or_else(|| "<out-of-range>".to_string());
+                                eprintln!("      descr[{idx}] = {info}");
+                                cursor += 2;
+                            }
+                            'I' | 'R' | 'F' => {
+                                let n = operand_bytes[cursor] as usize;
+                                cursor += 1 + n;
+                            }
+                            '>' => {
+                                chars.next();
+                                cursor += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            eprintln!();
         }
     }
 
