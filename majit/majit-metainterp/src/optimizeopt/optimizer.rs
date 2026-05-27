@@ -1980,6 +1980,15 @@ impl Optimizer {
         // per-iter pool with fresh unbound `BoxRef::new_inputarg(tp, _)`;
         // the TreeLoop-owned strong `InputArgRc`s never reach it.
         ctx.ensure_inputarg_bindings();
+        // S-1: bind every input op's resop BoxRef so chain-walker
+        // terminals are guaranteed bound before any `&self` reader
+        // (e.g. `OptIntBounds::getintbound_box`) reaches a
+        // `set_forwarded_*` write. `TraceIterator::next()`
+        // (opencoder.rs:500) plants unbound resop slots; without this
+        // pre-pass, `get_box_replacement_box(&self)` could return an
+        // unbound terminal that fails `write_forwarded`'s bound-
+        // precondition assert.
+        ctx.bind_input_resops(ops);
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);

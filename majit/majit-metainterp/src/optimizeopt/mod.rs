@@ -1773,6 +1773,49 @@ impl OptContext {
         }
     }
 
+    /// S-1: bind every input op's resop `BoxRef` in `box_pool` to a
+    /// fresh `OpRc` of the input op so any `Forwarded::Op(_)` chain
+    /// step targeting the slot has an upgradable `Weak<Op>` from the
+    /// start of the optimization run. `TraceIterator::next()`
+    /// (opencoder.rs:500) plants unbound `BoxRef::new_resop` slots for
+    /// every visited op; absent this pre-pass, `getintbound_box` →
+    /// `get_box_replacement_box` (a `&self` reader) can land on the
+    /// unbound terminal and a subsequent `set_forwarded_info` write
+    /// trips `BoxRef::write_forwarded`'s bound-precondition assert.
+    ///
+    /// The bound `OpRc` is stashed in `resop_refs[pos]` so `emit()`'s
+    /// `bound_is_synthetic` check (`mod.rs::emit` rebind path) later
+    /// upgrades the binding to the emitted post-pass producer `OpRc`
+    /// via `bind_op`'s carry-over (forwarded state preserved).
+    ///
+    /// Inherited Phase 1 slots (already bound by Phase 1's end-of-pass
+    /// orphan binding at `optimizer.rs:2431-2460`) skip — the
+    /// `bound_op().is_some()` guard preserves their phase-1 identity.
+    pub(crate) fn bind_input_resops(&mut self, ops: &[Op]) {
+        if self.box_pool.is_empty() {
+            return;
+        }
+        for op in ops {
+            let pos = op.pos.get();
+            if pos.is_none() || pos.is_constant() {
+                continue;
+            }
+            let Some(b) = self.box_pool.get(pos) else {
+                continue;
+            };
+            if !b.is_resop() || b.bound_op().is_some() {
+                continue;
+            }
+            let op_rc = std::rc::Rc::new(op.clone());
+            b.bind_op(&op_rc);
+            let idx = pos.raw() as usize;
+            if idx >= self.resop_refs.len() {
+                self.resop_refs.resize_with(idx + 1, || None);
+            }
+            self.resop_refs[idx] = Some(op_rc);
+        }
+    }
+
     /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
     /// shifted to start above a parent trace's high water mark.
     ///
