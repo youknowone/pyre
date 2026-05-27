@@ -47,8 +47,12 @@
 //!
 //! ### Rvalues
 //!   - `Use(operand)` — same-Variable alias.
-//!   - `BinaryOp` / `UnaryOp` — `OpKind::BinOp` (unary uses a
-//!     `unary.` prefix on the op label).
+//!   - `BinaryOp` — `OpKind::BinOp` with a canonical snake_case label
+//!     (`add`, `eq`, `and`, …) so the assembler reaches the wired
+//!     `int_*` / `ptr_*` keys without inventing PascalCase shapes.
+//!   - `UnaryOp` — `OpKind::UnaryOp` with a canonical label
+//!     (`neg`, `invert`, `cast_int_to_float`, …) per `binop_label` /
+//!     `unary_op_label`.
 //!   - `Ref` / `RawPtr` — same-Variable alias (JIT does not model
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
@@ -792,27 +796,27 @@ impl<'a> Lowering<'a> {
                     res,
                 ))
             }
-            // `UnaryOp(op, operand)` — `Neg`, `Not`, etc. Modeled as a
-            // single-arg `BinOp` whose op label carries a `unary.` prefix
-            // so downstream consumers can spot the arity mismatch without
-            // re-parsing the label.  PRE-EXISTING-ADAPTATION: RPython has
-            // distinct `int_neg`/`int_invert` ops, but pyre's `OpKind` does
-            // not expose a typed unary form and front/mod.rs forbids
-            // introducing one from this layer.
+            // `UnaryOp(op, operand)` — `Neg`, `Not`, casts.  Lowered to
+            // `OpKind::UnaryOp` with a canonical snake_case label so the
+            // assembler reaches the wired `int_neg` / `int_invert`
+            // handlers instead of inventing a synthetic `int_unary.*`
+            // opname.  `Cast(...)` carries a JSON sub-payload encoding
+            // the cast kind; map the common JIT-no-op cases (RawPtr,
+            // Scalar Int↔UInt, Unsize) to RPython's canonical cast
+            // opnames so downstream dispatch matches `blackhole.py`'s
+            // `bhimpl_cast_*` handlers.  Genuinely unsupported cast
+            // shapes (e.g. VTable) fall back to a lowercased label that
+            // surfaces as an unwired-opname diagnostic.
             Rvalue::UnaryOp(op_json, operand) => {
                 let arg = self.resolve_operand(mir_bb, operand)?;
-                let op_label = format!("unary.{}", binop_label(&op_json)?);
+                let op_label = unary_op_label(&op_json)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 Ok((
-                    Some(OpKind::BinOp {
+                    Some(OpKind::UnaryOp {
                         op: op_label,
-                        // Repeat the arg on both sides so the existing
-                        // 2-operand shape stays usable; the `unary.`
-                        // label tells consumers to disregard `rhs`.
-                        lhs: arg.clone(),
-                        rhs: arg,
+                        operand: arg,
                         result_ty: ValueType::Int,
                     }),
                     res,
@@ -1961,27 +1965,168 @@ fn resolve_tyexpr_to_adt_def_id_free(llbc: &Llbc, ty: &serde_json::Value) -> Opt
     None
 }
 
+/// Canonicalise a Charon `BinaryOp` tag (PascalCase + JSON-tagged
+/// variants) to the RPython-style snake_case label the codewriter
+/// expects.  After this the assembler's `op_kind_to_opname` reaches the
+/// already-wired `int_{label}` / `ptr_{label}` keys instead of inventing
+/// `int_AddChecked` / `int_BitAnd` shapes that have no blackhole handler.
+///
+/// Mapping reflects RPython's `jtransform` / `rint` /  `rptr` rewrites:
+///   - `Add` / `Sub` / `Mul` plain → `add`/`sub`/`mul` (wrapping arith).
+///   - `*Checked` variants → `*_ovf` (overflow-guarded arith, paired
+///     with `guard_no_overflow` downstream).
+///   - Shift `*Wrap` / `*Checked` collapse onto the canonical
+///     `lshift`/`rshift` (RPython treats them identically because
+///     shifts cannot overflow into a different repr).
+///   - `BitAnd` / `BitOr` / `BitXor` → `and`/`or`/`xor` to match
+///     `blackhole.py:500` canonical bitwise opnames.
+///   - Comparisons `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge` pass through
+///     as lowercase; the assembler later branches on operand kind
+///     (`ii` → `int_eq`, `rr` → `ptr_eq`, …).
 fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
-    // Plain atom: `"Add"`, `"Eq"`, …
     if let Some(s) = v.as_str() {
-        return Ok(s.to_string());
+        return Ok(canonical_binop_label(s, None));
     }
-    // Tagged form: `{"Add": "Wrap"}`, `{"Shr": "Wrap"}` etc — combine
-    // into `"AddWrap"` style label. Distinct from the bare form so a
-    // future widening can route them to different OpKinds if
-    // semantics diverge (e.g. emitting wrapping vs. saturating math).
     if let Some(obj) = v.as_object() {
         if let Some((k, payload)) = obj.iter().next() {
             let suffix = match payload {
-                serde_json::Value::String(s) => s.clone(),
-                _ => payload.to_string(),
+                serde_json::Value::String(s) => Some(s.as_str()),
+                _ => None,
             };
-            return Ok(format!("{k}{suffix}"));
+            return Ok(canonical_binop_label(k, suffix));
         }
     }
     Err(LowerError::Schema(format!(
         "BinaryOp op label has unexpected shape: {v}"
     )))
+}
+
+/// Charon's `UnaryOp` tag → canonical RPython unary opname.  Plain
+/// atoms (`"Neg"`, `"Not"`) share `binop_label`'s mapping; tagged
+/// `{"Cast": {...}}` payloads encode the source/dest scalar shape and
+/// project onto `cast_int_to_float` / `cast_float_to_int` /
+/// `cast_int_to_ptr` / `cast_ptr_to_int` per `blackhole.py:603-816`.
+/// Cast shapes the JIT models as identity (RawPtr→RawPtr,
+/// Scalar Int↔UInt of the same width, Unsize) collapse to `same_as`
+/// so the assembler emits the per-kind copy op instead of an unwired
+/// `int_unary.*` shape.
+fn unary_op_label(v: &serde_json::Value) -> Result<String, LowerError> {
+    if let Some(s) = v.as_str() {
+        return Ok(canonical_binop_label(s, None));
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(LowerError::Schema(format!(
+            "UnaryOp op label has unexpected shape: {v}"
+        )));
+    };
+    let Some((tag, payload)) = obj.iter().next() else {
+        return Err(LowerError::Schema("UnaryOp object is empty".into()));
+    };
+    match tag.as_str() {
+        "Cast" => Ok(cast_label_from_payload(payload)),
+        _ => {
+            let suffix = payload.as_str();
+            Ok(canonical_binop_label(tag, suffix))
+        }
+    }
+}
+
+/// Translate a Charon `CastKind` JSON payload into a canonical RPython
+/// cast opname.  `Scalar([Int, Float])` (and the float-to-int reverse)
+/// drive `bhimpl_cast_int_to_float` / `bhimpl_cast_float_to_int`; ptr
+/// casts go through `bhimpl_cast_{int_to_ptr,ptr_to_int}`.  Same-repr
+/// casts (RawPtr→RawPtr, same-width Int↔UInt, Unsize) are JIT-no-ops
+/// → `same_as` (the assembler's per-kind copy fallback).  Variants the
+/// JIT does not model (`VTable` / `VTableUpcast`) remain identifiable
+/// in the unwired diagnostic via the lower-cased default.
+fn cast_label_from_payload(payload: &serde_json::Value) -> String {
+    let Some(obj) = payload.as_object() else {
+        return "same_as".into();
+    };
+    let Some((kind, inner)) = obj.iter().next() else {
+        return "same_as".into();
+    };
+    match kind.as_str() {
+        // `Scalar([src, dst])` — int↔float crossings surface as the
+        // canonical RPython cast opnames; int↔uint of any width is a
+        // JIT-no-op (`same_as` copies the i64 carrier).
+        "Scalar" => {
+            let arr = match inner.as_array() {
+                Some(a) if a.len() == 2 => a,
+                _ => return "same_as".into(),
+            };
+            let src_is_float = scalar_is_float(&arr[0]);
+            let dst_is_float = scalar_is_float(&arr[1]);
+            match (src_is_float, dst_is_float) {
+                (true, false) => "cast_float_to_int".into(),
+                (false, true) => "cast_int_to_float".into(),
+                _ => "same_as".into(),
+            }
+        }
+        // `RawPtr([_, _])` — pointer-to-pointer reinterpret; same i64
+        // machine repr, so the JIT copies through `same_as`.
+        "RawPtr" => "same_as".into(),
+        // `Unsize` produces a fat pointer at the source level; the JIT
+        // models the array head as a single Ref so this is a no-op.
+        "Unsize" => "same_as".into(),
+        // `FnPtr` / `Transmute` / `VTable*` etc. — preserve a stable
+        // identifier so the unwired diagnostic surfaces the shape.
+        _ => kind.to_lowercase(),
+    }
+}
+
+fn scalar_is_float(v: &serde_json::Value) -> bool {
+    if let Some(s) = v.as_str() {
+        return matches!(s, "F32" | "F64");
+    }
+    if let Some(obj) = v.as_object() {
+        if obj.contains_key("Float") {
+            return true;
+        }
+    }
+    false
+}
+
+fn canonical_binop_label(tag: &str, subkind: Option<&str>) -> String {
+    // Charon emits `*Checked` (Rust debug-mode trap-on-overflow) and
+    // `*Wrap` (release-mode wrapping) variants either as single
+    // PascalCase atoms (`"AddChecked"`, `"ShrWrap"`) or as tagged
+    // objects (`{"Add": "Checked"}`); both forms collapse onto the
+    // plain RPython opname because the JIT does not model Rust's
+    // debug-trap semantics — overflow guarding belongs to the
+    // optimizer / `guard_no_overflow` level (`pure.rs:int_add_ovf`)
+    // and is not emitted from MIR rvalues.
+    match (tag, subkind) {
+        // Arithmetic (atomic + tagged).
+        ("Add" | "AddChecked" | "AddWrap", _) => "add".into(),
+        ("Sub" | "SubChecked" | "SubWrap", _) => "sub".into(),
+        ("Mul" | "MulChecked" | "MulWrap", _) => "mul".into(),
+        ("Div", _) => "floordiv".into(),
+        ("Rem", _) => "mod".into(),
+        // Bitwise.
+        ("BitAnd", _) => "and".into(),
+        ("BitOr", _) => "or".into(),
+        ("BitXor", _) => "xor".into(),
+        // Shifts.
+        ("Shl" | "ShlChecked" | "ShlWrap", _) => "lshift".into(),
+        ("Shr" | "ShrChecked" | "ShrWrap", _) => "rshift".into(),
+        // Comparisons.
+        ("Eq", _) => "eq".into(),
+        ("Ne", _) => "ne".into(),
+        ("Lt", _) => "lt".into(),
+        ("Le", _) => "le".into(),
+        ("Gt", _) => "gt".into(),
+        ("Ge", _) => "ge".into(),
+        // Unary tags surface here through `Rvalue::UnaryOp`.
+        ("Neg", _) => "neg".into(),
+        ("Not", _) => "invert".into(),
+        // Default: lower-case the tag + subkind so unknown shapes
+        // remain identifiable in `unwired` diagnostics.
+        _ => match subkind {
+            Some(s) => format!("{}_{}", tag.to_lowercase(), s.to_lowercase()),
+            None => tag.to_lowercase(),
+        },
+    }
 }
 
 /// Best-effort name for an [`Rvalue::Aggregate`]'s constructor, used as
