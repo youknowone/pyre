@@ -13,7 +13,7 @@
 //! | `is_mixin` (classdesc.py:471) | [`is_mixin`] |
 //! | `is_primitive_type` (classdesc.py:474) | [`is_primitive_type`] |
 //! | `BuiltinTypeDesc` (classdesc.py:479-485) | [`BuiltinTypeDesc`] |
-//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`force_attributes_into_classes`] |
+//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`], read via [`forced_attributes_for`]) |
 //! | `ClassDesc` (classdesc.py:488-600) | [`ClassDesc`] |
 //!
 //! ## TODO: cyclic ClassDef ↔ ClassDesc
@@ -208,22 +208,90 @@ pub fn is_primitive_type(cls: &HostObject) -> bool {
 // FORCE_ATTRIBUTES_INTO_CLASSES (classdesc.py:957-961).
 // ---------------------------------------------------------------------------
 
-/// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-968).
+thread_local! {
+    /// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-968).
+    ///
+    /// Maps class qualnames to the attribute annotations that
+    /// `ClassDesc._init_classdef` must eagerly install. Upstream keys
+    /// on the live Python class object; the Rust port keys on the
+    /// qualname because that's the only identity we can carry without
+    /// Python runtime. The `WindowsError` entry is omitted
+    /// (classdesc.py:963-968) because the Rust port targets a portable
+    /// host.
+    ///
+    /// PyPy has two writers to this dict: the literal assignment at
+    /// classdesc.py:957-961 (EnvironmentError) and the conditional
+    /// `try: WindowsError except: pass else: ...` at :963-968.  The
+    /// Rust port adds a third writer — [`register_struct_fields`] —
+    /// which projects each Rust `ItemStruct`'s named fields into the
+    /// same dict at walker time, mirroring the source-language
+    /// difference (PyPy translator runs against live Python where
+    /// exception classes already have attributes; the Rust port walks
+    /// `syn::File` and discovers struct shapes there).  After all
+    /// writers complete the dict is read once at `_init_classdef`
+    /// (mirrors classdesc.py:679-682).
+    ///
+    /// Thread-local because [`SomeValue`] carries `Rc<...>` which is
+    /// not `Send`; matches RPython single-thread annotator parity.
+    /// Each thread initialises with the hand-coded EnvironmentError
+    /// block on first access; the walker pre-pass populates struct
+    /// entries within the same thread that subsequently consumes them
+    /// at `_init_classdef`.
+    pub static FORCE_ATTRIBUTES_INTO_CLASSES:
+        std::cell::RefCell<indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>>> =
+    std::cell::RefCell::new({
+        let mut map: indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>> =
+            indexmap::IndexMap::new();
+        // classdesc.py:957-961 — EnvironmentError forced attributes.
+        let mut env_error: indexmap::IndexMap<String, SomeValue> = indexmap::IndexMap::new();
+        env_error.insert(
+            "errno".to_string(),
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        env_error.insert(
+            "strerror".to_string(),
+            SomeValue::String(SomeString::new(true, false)),
+        );
+        env_error.insert(
+            "filename".to_string(),
+            SomeValue::String(SomeString::new(true, false)),
+        );
+        map.insert("EnvironmentError".to_string(), env_error);
+        map
+    });
+}
+
+/// Walker-time writer to [`FORCE_ATTRIBUTES_INTO_CLASSES`]: project a
+/// Rust `ItemStruct`'s named fields into the same dict consumed at
+/// `_init_classdef`.  Each `ValueType` is shelled to the matching
+/// `SomeValue` at write time via [`valuetype_to_someshell`] so the
+/// stored value is `SomeXxx` directly (matching the PyPy storage
+/// shape where `SomeInteger()` etc. are literal values in the dict).
 ///
-/// Maps exception-class qualnames to the attribute annotations that
-/// `ClassDesc._init_classdef` must eagerly install. Upstream keys on
-/// the live Python class object; the Rust port keys on the qualname
-/// because that's the only identity we can carry without Python
-/// runtime. The `WindowsError` entry is omitted (classdesc.py:963-968)
-/// because the Rust port targets a portable host.
-pub fn force_attributes_into_classes() -> HashMap<&'static str, HashMap<&'static str, SomeValue>> {
-    let mut map = HashMap::new();
-    let mut env_error = HashMap::new();
-    env_error.insert("errno", SomeValue::Integer(SomeInteger::default()));
-    env_error.insert("strerror", SomeValue::String(SomeString::new(true, false)));
-    env_error.insert("filename", SomeValue::String(SomeString::new(true, false)));
-    map.insert("EnvironmentError", env_error);
-    map
+/// Last-writer-wins on the outer key; re-registering the same qualname
+/// replaces the prior field set.  Matches PyPy where re-assignment
+/// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
+pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
+    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+        let mut table = cell.borrow_mut();
+        let entry = table.entry(qualname.to_string()).or_default();
+        entry.clear();
+        for (name, vt) in fields {
+            let Some(s_value) = crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
+            else {
+                continue;
+            };
+            entry.insert(name.clone(), s_value);
+        }
+    });
+}
+
+/// Snapshot the forced-attribute map for `qualname`, cloned out of
+/// [`FORCE_ATTRIBUTES_INTO_CLASSES`].  Returns `None` when no entry is
+/// registered.  Used by tests and walker-side assertions; production
+/// reads happen inline at `_init_classdef`.
+pub fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, SomeValue>> {
+    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().get(qualname).cloned())
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +940,10 @@ impl ClassDesc {
             self_ref.is_builtin_exception_class() && self_ref.all_enforced_attrs.is_none()
         };
         if need_force_empty {
-            let force_map = force_attributes_into_classes();
-            if !force_map.contains_key(cls.qualname()) {
+            let qualname = cls.qualname().to_string();
+            let in_force_map = FORCE_ATTRIBUTES_INTO_CLASSES
+                .with(|cell| cell.borrow().contains_key(&qualname));
+            if !in_force_map {
                 me.borrow_mut().all_enforced_attrs = Some(HashSet::new());
             }
         }
@@ -1128,50 +1198,24 @@ impl ClassDesc {
         this.borrow_mut().classdef = Some(Rc::downgrade(&classdef));
 
         // classdesc.py:679-682 — FORCE_ATTRIBUTES_INTO_CLASSES override.
-        let force_map = force_attributes_into_classes();
+        // Single read site for both the hand-coded entries (e.g. the
+        // EnvironmentError block at classdesc.py:957-961, ported into
+        // [`FORCE_ATTRIBUTES_INTO_CLASSES`]) and the walker-derived
+        // entries written by [`register_struct_fields`] from each
+        // `ItemStruct.fields` projection at parse time.
         let qualname = this.borrow().pyobj.qualname().to_string();
-        if let Some(overrides) = force_map.get(qualname.as_str()) {
-            for (attr_name, s_value) in overrides {
+        let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
+            FORCE_ATTRIBUTES_INTO_CLASSES
+                .with(|cell| cell.borrow().get(qualname.as_str()).cloned());
+        if let Some(overrides) = overrides {
+            for (attr_name, s_value) in &overrides {
                 ClassDef::generalize_attr(&classdef, attr_name, Some(s_value.clone()))?;
                 // upstream: classdef.find_attribute(name).modified(classdef)
                 let owner = ClassDef::locate_attribute(&classdef, attr_name)?;
                 let mut owner_mut = owner.borrow_mut();
-                let attr = owner_mut.attrs.get_mut(*attr_name).ok_or_else(|| {
-                    AnnotatorError::new(format!(
-                        "_init_classdef: attribute {:?} missing after generalize",
-                        attr_name
-                    ))
-                })?;
-                attr.modified(Some(&classdef))?;
-            }
-        }
-
-        // PRE-EXISTING-ADAPTATION: Rust struct field stubs.
-        // `register_rust_module` projects each `ItemStruct.fields` named
-        // entry to a `(field_name, ValueType)` pair in the
-        // `REGISTERED_STRUCT_FIELD_ATTRS` side-table.  Pre-populate
-        // `ClassDef.attrs` with the typed `Attribute` shell here so
-        // `derive_subject_inputcells`'s impl-method-self narrowing gate
-        // (`flowspace_adapter.rs::derive_subject_inputcells`) flips for
-        // structs whose fields are statically known at registration
-        // time.  Mirrors the `FORCE_ATTRIBUTES_INTO_CLASSES` semantics
-        // above but data-driven by parsed Rust source.
-        if let Some(field_stubs) =
-            crate::flowspace::rust_source::register::struct_field_attrs_snapshot(qualname.as_str())
-        {
-            for (attr_name, vt) in &field_stubs {
-                let Some(s_value) =
-                    crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
-                else {
-                    continue;
-                };
-                ClassDef::generalize_attr(&classdef, attr_name, Some(s_value))?;
-                let owner = ClassDef::locate_attribute(&classdef, attr_name)?;
-                let mut owner_mut = owner.borrow_mut();
                 let attr = owner_mut.attrs.get_mut(attr_name).ok_or_else(|| {
                     AnnotatorError::new(format!(
-                        "_init_classdef: attribute {:?} missing after generalize \
-                         (Rust struct field stub)",
+                        "_init_classdef: attribute {:?} missing after generalize",
                         attr_name
                     ))
                 })?;
@@ -3609,9 +3653,7 @@ mod tests {
 
     #[test]
     fn force_attributes_into_classes_has_environment_error() {
-        let map = force_attributes_into_classes();
-        let env = map
-            .get("EnvironmentError")
+        let env = forced_attributes_for("EnvironmentError")
             .expect("EnvironmentError entry present");
         assert!(env.contains_key("errno"));
         assert!(env.contains_key("strerror"));

@@ -707,8 +707,9 @@ pub fn translate_op(
         // synthesis was reverted because the `classdef=None` result
         // tripped downstream `find_attribute` lookups.
         //
-        // Post-Path A (REGISTERED_STRUCT_FIELD_ATTRS pre-population,
-        // commit 0891421811) impl-method `self` narrows to a populated
+        // Post-`FORCE_ATTRIBUTES_INTO_CLASSES` pre-population (struct
+        // field projection by `register_struct_fields`) impl-method
+        // `self` narrows to a populated
         // ClassDef, so the original classdef:None cascade is no longer
         // triggered by the receiver projection.  Abort's own
         // result_var is still un-narrowed, but every front-end

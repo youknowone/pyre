@@ -503,19 +503,20 @@ fn analyze_pipeline_from_parsed(
         .map(|parsed| (parsed.module_path.clone(), parsed.use_globs.clone()))
         .collect();
     crate::front::ast::populate_use_globs_by_source(&use_globs_by_source);
-    // Z2.5 M2.5g.2.c diagnostic pre-pass — populate
-    // `REGISTERED_STRUCT_FIELD_ATTRS` from each `parsed_files` entry's
-    // top-level structs so `ClassDesc::_init_classdef` can pre-fill
-    // `ClassDef.attrs` *before* the annotator's narrowing gate at
+    // Diagnostic pre-pass — populate
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) from each
+    // `parsed_files` entry's top-level structs so
+    // `ClassDesc::_init_classdef` can pre-fill `ClassDef.attrs` *before*
+    // the annotator's narrowing gate at
     // `flowspace_adapter.rs::derive_subject_inputcells` checks
     // `attrs_populated`.  Production never drives the walker (only
     // `extract_static_decls` and `extract_unsafe_fn_stubs` are called
-    // from `register`), which left the side-table empty and forced
-    // every impl-method `self` to carry `SomeInstance(classdef=None)`
-    // — task #133 / [[lower_expr_stacker_fix_2026_05_27]] closure
-    // step.  Empty `module_path` files (test fixtures) skip; their
-    // structs are registered through the bare-leaf walker path when
-    // the fixture explicitly calls `register_rust_module_at_with_source`.
+    // from `register`), which left the dict empty for parsed-only
+    // structs and forced every impl-method `self` to carry
+    // `SomeInstance(classdef=None)`.  Empty `module_path` files (test
+    // fixtures) skip; their structs are registered through the bare-
+    // leaf walker path when the fixture explicitly calls
+    // `register_rust_module_at_with_source`.
     for parsed in parsed_files {
         if !parsed.module_path.is_empty() {
             crate::flowspace::rust_source::register::pre_register_struct_fields_from_file(

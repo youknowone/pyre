@@ -3125,23 +3125,20 @@ fn eval_binop(
 /// the *instance* (not the class object) — the empty class dict
 /// matches that semantic exactly.
 ///
-/// Side effect: each `syn::Fields::Named` entry is also projected to
-/// the [`REGISTERED_STRUCT_FIELD_ATTRS`] side-table so
+/// Side effect: each `syn::Fields::Named` entry is also written into
+/// [`crate::annotator::classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`] via
+/// [`crate::annotator::classdesc::register_struct_fields`] so
 /// `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs` with
-/// the field's typed `Attribute` shell.  Mirrors
-/// `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) but data-
-/// driven by the parsed struct declaration instead of a hard-coded
-/// table.
+/// the field's typed `Attribute` shell.  Same dict as the hand-coded
+/// EnvironmentError entry (classdesc.py:957-961); the walker is just
+/// an additional writer to the same store.
 fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
     let name = item_struct.ident.to_string();
     let qualified_key = qualify_under_walker_prefix(&name);
-    // Z2.5 Path A — project the declared named fields into the
-    // REGISTERED_STRUCT_FIELD_ATTRS side-table so
-    // `ClassDesc::_init_classdef` can pre-populate `ClassDef.attrs`
-    // with the field's typed `Attribute` shell.  Mirrors
-    // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) but data-
-    // driven by the parsed struct declaration instead of a hard-coded
-    // table.
+    // Project the declared named fields into the
+    // `FORCE_ATTRIBUTES_INTO_CLASSES` dict.  Same store consumed by
+    // `ClassDesc::_init_classdef` for the hand-coded EnvironmentError
+    // override.
     //
     // Keyed under the current walker-scope module prefix (see
     // [`walker_module_prefix`]) so two structs with the same bare
@@ -3159,7 +3156,7 @@ fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
             stubs.push((field_name, ty));
         }
         if !stubs.is_empty() {
-            register_struct_field_attrs(&qualified_key, stubs);
+            crate::annotator::classdesc::register_struct_fields(&qualified_key, &stubs);
         }
     }
     let host = HostObject::new_class(&name, vec![]);
@@ -3422,8 +3419,9 @@ static PROCESS_WIDE_STRUCT_PTRS: std::sync::LazyLock<std::sync::Mutex<StdHashMap
 thread_local! {
     /// Per-walker-scope module-path prefix consulted by
     /// [`build_host_class_from_struct`] when keying
-    /// [`REGISTERED_STRUCT_FIELD_ATTRS`] and minting the
-    /// `HostObject::Class` qualname.  Empty at top-level walks;
+    /// `FORCE_ATTRIBUTES_INTO_CLASSES` (via
+    /// [`crate::annotator::classdesc::register_struct_fields`]) and
+    /// minting the `HostObject::Class` qualname.  Empty at top-level walks;
     /// inline-mod arms in [`register_items_into_namespace`] push the
     /// nested-mod ident so a `mod foo { struct Bar { ... } }` declared
     /// inside a parent file keys its field-attr stub under `"foo::Bar"`
@@ -3789,56 +3787,20 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
 }
 
 // ---------------------------------------------------------------------------
-// REGISTERED_STRUCT_FIELD_ATTRS — Rust struct field annotation side-table.
+// Rust struct field projection — writes into
+// `crate::annotator::classdesc::FORCE_ATTRIBUTES_INTO_CLASSES`.
 // ---------------------------------------------------------------------------
 
-/// Process-global mapping from struct qualname to its declared named
-/// fields, projected to [`crate::model::ValueType`].
-///
-/// Populated by [`build_host_class_from_struct`] at Rust-source
-/// registration time.  Consumed by
-/// `crate::annotator::classdesc::ClassDesc::_init_classdef` (via
-/// [`struct_field_attrs_snapshot`]) so the resulting `ClassDef.attrs`
-/// table carries a typed `Attribute` shell for every named struct
-/// field before any annotator pass sees the class.  Matches RPython
-/// `FORCE_ATTRIBUTES_INTO_CLASSES` semantics (classdesc.py:957-961),
-/// but the data source is the Rust struct declaration parsed by
-/// [`build_host_class_from_struct`] rather than a hard-coded table.
-///
-/// Last-writer-wins on the outer key.  Two `register_rust_module`
-/// walks that register a struct under the same local name converge
-/// to the most recent walk's field set; this mirrors
-/// [`super::host_env::HOST_RUST_MODULE_GLOBALS`]'s per-module
-/// last-writer-wins semantics for shared top-level names.
-static REGISTERED_STRUCT_FIELD_ATTRS: std::sync::LazyLock<
-    std::sync::Mutex<
-        indexmap::IndexMap<String, indexmap::IndexMap<String, crate::model::ValueType>>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(indexmap::IndexMap::new()));
-
-fn register_struct_field_attrs(struct_name: &str, fields: Vec<(String, crate::model::ValueType)>) {
-    let mut table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
-    let entry = table.entry(struct_name.to_string()).or_default();
-    entry.clear();
-    for (name, ty) in fields {
-        entry.insert(name, ty);
-    }
-}
-
-/// Z2.5 M2.5g.2.c pre-pass — populate the
-/// [`REGISTERED_STRUCT_FIELD_ATTRS`] side-table directly from a
-/// parsed `syn::File` without driving the full walker. The production
-/// pipeline (`analyze_pipeline_from_parsed`) does not call
-/// [`register_rust_module_at_with_source`], which means
-/// [`build_host_class_from_struct`] never fires there and the side-
-/// table stays empty.  Without these entries
-/// `ClassDesc::_init_classdef` cannot pre-fill `ClassDef.attrs`, so
-/// the receiver-narrowing gate at
-/// `flowspace_adapter.rs::derive_subject_inputcells` skips and every
-/// `impl`-method `self` carries `SomeInstance(classdef=None)` —
-/// turning every `self.field` read into an
-/// `AnnotatorError: SomeInstance.getattr on classdef-less instance`
-/// panic in the speculative loop.
+/// Pre-pass that mirrors [`build_host_class_from_struct`]'s field
+/// projection but runs on a parsed `syn::File` without driving the
+/// full walker.  The production pipeline (`analyze_pipeline_from_parsed`)
+/// does not call [`register_rust_module_at_with_source`], which means
+/// [`build_host_class_from_struct`] never fires there and the
+/// `FORCE_ATTRIBUTES_INTO_CLASSES` dict stays unpopulated for parsed-
+/// only structs.  Without these entries `ClassDesc::_init_classdef`
+/// cannot pre-fill `ClassDef.attrs`, so the receiver-narrowing gate
+/// at `flowspace_adapter.rs::derive_subject_inputcells` skips and
+/// every `impl`-method `self` carries `SomeInstance(classdef=None)`.
 ///
 /// `prefix` matches the walker-module-prefix shape: empty for
 /// top-level structs (registered under the bare ident), non-empty
@@ -3869,7 +3831,10 @@ fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
                         } else {
                             format!("{prefix}::{bare_name}")
                         };
-                        register_struct_field_attrs(&qualified_key, stubs);
+                        crate::annotator::classdesc::register_struct_fields(
+                            &qualified_key,
+                            &stubs,
+                        );
                     }
                 }
             }
@@ -3888,28 +3853,6 @@ fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
             _ => continue,
         }
     }
-}
-
-/// Snapshot the registered field-attr stubs for `struct_name`.
-///
-/// Returns `None` when no struct of that name has been registered.
-/// Returns an empty map only if a struct was registered with zero
-/// named fields, which the producer skips — so an empty map
-/// indicates a producer bug, not a normal state.
-///
-/// Key contract: the registry is keyed under the walker-scope
-/// qualified path (`{walker_module_prefix}::{ItemStruct.ident}` when
-/// the prefix is non-empty, else the bare ident).  Callers must look
-/// up under the exact same shape — no bare-leaf fallback, mirroring
-/// PyPy `ClassDesc` per-class identity (`classdesc.py:672`).
-///
-/// Consumed by `crate::annotator::classdesc::ClassDesc::_init_classdef`
-/// after the static `FORCE_ATTRIBUTES_INTO_CLASSES` block.
-pub fn struct_field_attrs_snapshot(
-    struct_name: &str,
-) -> Option<indexmap::IndexMap<String, crate::model::ValueType>> {
-    let table = REGISTERED_STRUCT_FIELD_ATTRS.lock().unwrap();
-    table.get(struct_name).cloned()
 }
 
 /// Test-only accessor for the per-`ModuleId` slice of the
@@ -4781,34 +4724,32 @@ mod tests {
         ));
     }
 
-    /// Verify that `build_host_class_from_struct` populates the
-    /// `REGISTERED_STRUCT_FIELD_ATTRS` side-table with one entry per
-    /// named field, projected to the expected `ValueType`.  Skips
-    /// other test cases' state by using a uniquely-named struct.
+    /// Verify that `build_host_class_from_struct` writes one entry per
+    /// named field into `FORCE_ATTRIBUTES_INTO_CLASSES`, shelled to
+    /// the matching `SomeValue` variant.  Skips other test cases'
+    /// state by using a uniquely-named struct.
     #[test]
     fn struct_field_attrs_snapshot_carries_named_field_value_types() {
         let item: ItemStruct =
             syn::parse_str("struct PyreFieldStubProbe { count: i64, name: String, flag: bool }")
                 .expect("test fixture must parse");
         let _ = build_host_class_from_struct(&item);
-        let snap = struct_field_attrs_snapshot("PyreFieldStubProbe")
-            .expect("registration must publish under the struct's local name");
+        let snap =
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubProbe")
+                .expect("registration must publish under the struct's local name");
         assert_eq!(snap.len(), 3, "every named field must round-trip");
-        assert_eq!(
+        assert!(matches!(
             snap.get("count"),
-            Some(&crate::model::ValueType::Int),
-            "i64 field must project to ValueType::Int"
-        );
-        assert_eq!(
+            Some(crate::annotator::model::SomeValue::Integer(_))
+        ));
+        assert!(matches!(
             snap.get("name"),
-            Some(&crate::model::ValueType::Ref(Some("String".to_string()))),
-            "user-typed (String) field must project to ValueType::Ref carrying the type root"
-        );
-        assert_eq!(
+            Some(crate::annotator::model::SomeValue::Instance(_))
+        ));
+        assert!(matches!(
             snap.get("flag"),
-            Some(&crate::model::ValueType::Bool),
-            "bool field must project to ValueType::Bool"
-        );
+            Some(crate::annotator::model::SomeValue::Bool(_))
+        ));
     }
 
     /// Verify that re-registering the same struct name overwrites
@@ -4822,7 +4763,10 @@ mod tests {
                 .expect("fixture parses");
         let _ = build_host_class_from_struct(&first);
         let _ = build_host_class_from_struct(&second);
-        let snap = struct_field_attrs_snapshot("PyreFieldStubOverwriteProbe").unwrap();
+        let snap = crate::annotator::classdesc::forced_attributes_for(
+            "PyreFieldStubOverwriteProbe",
+        )
+        .unwrap();
         assert_eq!(snap.len(), 2, "second registration replaces first");
         assert!(snap.contains_key("b"));
         assert!(snap.contains_key("c"));
@@ -4845,18 +4789,24 @@ mod tests {
         }
         // Bare lookup must miss — fallback was removed.
         assert!(
-            struct_field_attrs_snapshot("PyreFieldStubQualifiedProbe").is_none(),
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubQualifiedProbe")
+                .is_none(),
             "bare lookup must not resolve a qualified registration"
         );
         // Exact qualified lookup hits.
-        let snap = struct_field_attrs_snapshot("mymod::PyreFieldStubQualifiedProbe")
-            .expect("qualified lookup matches the registered key");
+        let snap = crate::annotator::classdesc::forced_attributes_for(
+            "mymod::PyreFieldStubQualifiedProbe",
+        )
+        .expect("qualified lookup matches the registered key");
         assert_eq!(snap.len(), 2);
-        assert_eq!(snap.get("count"), Some(&crate::model::ValueType::Int));
-        assert_eq!(
+        assert!(matches!(
+            snap.get("count"),
+            Some(crate::annotator::model::SomeValue::Integer(_))
+        ));
+        assert!(matches!(
             snap.get("name"),
-            Some(&crate::model::ValueType::Ref(Some("String".to_string())))
-        );
+            Some(crate::annotator::model::SomeValue::Instance(_))
+        ));
     }
 
     /// Nested-mod prefix composition: a struct inside `mod outer { mod
@@ -4874,20 +4824,27 @@ mod tests {
             let _ = build_host_class_from_struct(&item);
         }
         assert!(
-            struct_field_attrs_snapshot("PyreFieldStubNestedProbe").is_none(),
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubNestedProbe")
+                .is_none(),
             "bare lookup must miss"
         );
         assert!(
-            struct_field_attrs_snapshot("outer::PyreFieldStubNestedProbe").is_none(),
+            crate::annotator::classdesc::forced_attributes_for("outer::PyreFieldStubNestedProbe")
+                .is_none(),
             "single-segment lookup must miss when registered with two segments"
         );
-        let snap = struct_field_attrs_snapshot("outer::inner::PyreFieldStubNestedProbe")
-            .expect("nested-mod prefix must compose into the registry key");
-        assert_eq!(snap.get("value"), Some(&crate::model::ValueType::Bool));
+        let snap = crate::annotator::classdesc::forced_attributes_for(
+            "outer::inner::PyreFieldStubNestedProbe",
+        )
+        .expect("nested-mod prefix must compose into the registry key");
+        assert!(matches!(
+            snap.get("value"),
+            Some(crate::annotator::model::SomeValue::Bool(_))
+        ));
     }
 
     /// Tuple structs and unit structs have no named fields, so the
-    /// side-table must not be populated for them.
+    /// dict must not be populated for them.
     #[test]
     fn struct_field_attrs_snapshot_skips_unnamed_field_structs() {
         let tuple: ItemStruct =
@@ -4897,11 +4854,11 @@ mod tests {
         let _ = build_host_class_from_struct(&tuple);
         let _ = build_host_class_from_struct(&unit);
         assert!(
-            struct_field_attrs_snapshot("PyreFieldStubTupleProbe").is_none(),
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubTupleProbe").is_none(),
             "tuple structs do not publish field stubs"
         );
         assert!(
-            struct_field_attrs_snapshot("PyreFieldStubUnitProbe").is_none(),
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubUnitProbe").is_none(),
             "unit structs do not publish field stubs"
         );
     }
