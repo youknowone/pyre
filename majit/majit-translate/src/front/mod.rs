@@ -92,13 +92,22 @@
 //!   `qualify_type_name_with_imports` helper out of `front::ast`
 //!   into `front::semantic`.  `front::ast` retains `pub use`
 //!   re-exports.
-//! - **Slice 2 (partial, `7a538de2a9`)** — move the leaf
-//!   string-utility helpers `transparent_result_ok_type` and
-//!   `nolength_from_array_type_id` (used by `jit_codewriter::call`)
-//!   into `front::syn_metadata`.  Larger metadata collectors
-//!   (`collect_program_metadata_pub`, `collect_jit_hints_with_sig`,
-//!   `collect_struct_origins`) still live in `ast.rs` until their
-//!   internal graph-builder dependencies retire.
+//! - **Slice 2 (in progress, multiple commits)** — incremental
+//!   extractions out of `front::ast` into `front::syn_metadata`,
+//!   shrinking the AST surface so eventual deletion is mechanical.
+//!   Leaf string-utility helpers `transparent_result_ok_type` /
+//!   `nolength_from_array_type_id` landed first (`7a538de2a9`);
+//!   subsequent commits moved metadata collectors, syn-walk
+//!   operator + path helpers, match-arm classifiers, type-string
+//!   rendering helpers, `LoopBodyLocals` + visitors, pure
+//!   type-string parsers (with `first_top_level_generic_arg`
+//!   dedup), pure path/intrinsic classifiers + `cast_builtin_name`,
+//!   `UnaryNotOperandKind` + const/op value-type helpers, and
+//!   `classify_fn_arg_ty` + `extract_dyn_trait_root` +
+//!   `canonical_pat_name`.  The remaining `ast.rs` core is the
+//!   `GraphBuildContext`-bound `lower_*` walker which is structurally
+//!   tied to the opcode-arm AST extractor at
+//!   `parse.rs:extract_match_arms`.
 //! - **Slice 3 (in progress)** — populate
 //!   `SemanticFunction.self_ty_root` (`66423f0fc4`) and
 //!   `SemanticFunction.trait_root` (`36e3a6520b`) on MIR-built
@@ -195,7 +204,7 @@
 //!   no longer falls back to AST graph builds; production 39/39
 //!   dynasm + 39/39 cranelift.
 //!
-//!   What remains in `front/ast.rs` (~10146 LOC):
+//!   What remains in `front/ast.rs` (~7936 LOC after Slice 2 extractions):
 //!     - `lower_expr_into_graph_with_signature` and its walker
 //!       infrastructure (still used by
 //!       `parse::extract_opcode_dispatch_arms::extract_match_arms`
