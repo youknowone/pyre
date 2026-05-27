@@ -4317,25 +4317,30 @@ impl CodeWriter {
         // walker counterpart) leave their entry as `None` and fall back
         // to graph regalloc.
         let mut walker_slot_for_variable: Vec<Option<u16>> = Vec::new();
+        macro_rules! pin {
+            ($var:expr, $slot:expr $(,)?) => {
+                pair_walker_slot(&mut walker_slot_for_variable, $var, $slot)
+            };
+        }
+        macro_rules! pin_if_absent {
+            ($var:expr, $slot:expr $(,)?) => {
+                pair_walker_slot_if_absent(&mut walker_slot_for_variable, $var, $slot)
+            };
+        }
         // Seed the bridge with the portal `(frame, ec)` red Variables —
         // upstream `jtransform.py:840` threads `frame` (and `ec`) as the
         // leading red args of every vable op; pyre's walker reads them
         // out of `portal_frame_reg` / `portal_ec_reg` rather than allocating
         // them per-op, so canonical needs the same fixed slots.
-        pair_walker_slot(
-            &mut walker_slot_for_variable,
-            Some(frame_var),
-            portal_frame_reg,
-        );
-        pair_walker_slot(&mut walker_slot_for_variable, Some(ec_var), portal_ec_reg);
+        pin!(Some(frame_var), portal_frame_reg);
+        pin!(Some(ec_var), portal_ec_reg);
         // Function args occupy graph startblock inputargs `VariableId(0..nargs)`
         // and live in walker register slots `0..nargs` (the fast-local
         // bank base).  Without seeding them, ref_return on `arg0` falls
         // through to graph regalloc and gets a different colour than the
         // walker's `Operand::reg(Kind::Ref, 0)` emit.
         for idx in 0..entry_arg_slots(code) as u16 {
-            pair_walker_slot(
-                &mut walker_slot_for_variable,
+            pin!(
                 Some(super::flow::Variable::new(
                     super::flow::VariableId(idx as u32),
                     Kind::Ref,
@@ -5671,7 +5676,7 @@ impl CodeWriter {
                         Kind::Ref,
                         -1,
                     );
-                    pair_walker_slot(&mut walker_slot_for_variable, Some(result), dst);
+                    pin!(Some(result), dst);
                     Some(result)
                 } else {
                     None
@@ -6144,11 +6149,7 @@ impl CodeWriter {
                         Kind::Ref,
                         load_fast_py_pc,
                     );
-                    pair_walker_slot(
-                        &mut walker_slot_for_variable,
-                        Some(v_loaded),
-                        stack_base + $depth,
-                    );
+                    pin!(Some(v_loaded), stack_base + $depth);
                     let loaded: super::flow::FlowValue = v_loaded.into();
                     let v_stack_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(stack_slot).into();
@@ -6627,11 +6628,7 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                boxed,
-                                stack_base + current_depth,
-                            );
+                            pin!(boxed, stack_base + current_depth);
                             let stack_value = boxed
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -6743,7 +6740,7 @@ impl CodeWriter {
                                     ResKind::Ref,
                                     py_pc as i64,
                                 );
-                                pair_walker_slot(&mut walker_slot_for_variable, loaded, dst_slot);
+                                pin!(loaded, dst_slot);
                                 loaded
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph))
@@ -6775,11 +6772,7 @@ impl CodeWriter {
                                     py_pc as i64,
                                 )
                                 .expect("load_const_fn returns Ref result");
-                                pair_walker_slot(
-                                    &mut walker_slot_for_variable,
-                                    Some(loaded),
-                                    dst_slot,
-                                );
+                                pin!(Some(loaded), dst_slot);
                                 loaded.into()
                             };
                             current_state.stack.push(value);
@@ -6897,11 +6890,7 @@ impl CodeWriter {
                                     Kind::Ref,
                                     -1,
                                 );
-                                pair_walker_slot(
-                                    &mut walker_slot_for_variable,
-                                    Some(v_loaded),
-                                    stack_base + current_depth,
-                                );
+                                pin!(Some(v_loaded), stack_base + current_depth);
                                 let loaded: super::flow::FlowValue = v_loaded.into();
                                 let v_stack_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(stack_slot).into();
@@ -7023,11 +7012,7 @@ impl CodeWriter {
                                 rhs_value,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(result_value),
-                                stack_base + current_depth,
-                            );
+                            pin!(Some(result_value), stack_base + current_depth);
                             // BINARY_OP family retirement: emit the lowered
                             // `residual_call_ir_r` Insn directly here via
                             // `build_binary_op_residual_call_ir_r_insn`.
@@ -7068,11 +7053,7 @@ impl CodeWriter {
                                 rhs_value,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(result_value),
-                                stack_base + current_depth,
-                            );
+                            pin!(Some(result_value), stack_base + current_depth);
                             // COMPARE_OP family retirement: same closure as
                             // BinaryOp above.  Graph carries only the
                             // `lt(lhs, rhs)` (or sibling) HLOp from
@@ -7115,7 +7096,7 @@ impl CodeWriter {
                             let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if let super::flow::FlowValue::Variable(v) = &cond_value {
-                                pair_walker_slot(&mut walker_slot_for_variable, Some(*v), cond_reg);
+                                pin!(Some(*v), cond_reg);
                             }
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
@@ -7127,11 +7108,7 @@ impl CodeWriter {
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(bool_value),
-                                scratch_truth,
-                            );
+                            pin!(Some(bool_value), scratch_truth);
                             // BOOL family retirement: emit the lowered
                             // `residual_call_r_i` Insn directly here via the
                             // `(Ref) → Int` shape constructor.  Graph carries
@@ -7222,7 +7199,7 @@ impl CodeWriter {
                             let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if let super::flow::FlowValue::Variable(v) = &cond_value {
-                                pair_walker_slot(&mut walker_slot_for_variable, Some(*v), cond_reg);
+                                pin!(Some(*v), cond_reg);
                             }
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
@@ -7234,11 +7211,7 @@ impl CodeWriter {
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(bool_value),
-                                scratch_truth,
-                            );
+                            pin!(Some(bool_value), scratch_truth);
                             // BOOL family
                             // retirement (sibling of the PopJumpIfFalse
                             // closure above) — same `(Ref) → Int` shape
@@ -7469,11 +7442,7 @@ impl CodeWriter {
                                 )
                                 .expect("load_global_fn returns Ref result")
                             };
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(loaded),
-                                loaded_dst_reg,
-                            );
+                            pin!(Some(loaded), loaded_dst_reg);
                             let result_value: super::flow::FlowValue = loaded.into();
                             // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
                             // const-source pushvalue writes the constant directly to
@@ -7519,11 +7488,7 @@ impl CodeWriter {
                                 let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let arg_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if let super::flow::FlowValue::Variable(v) = &arg_value {
-                                    pair_walker_slot(
-                                        &mut walker_slot_for_variable,
-                                        Some(*v),
-                                        arg_reg,
-                                    );
+                                    pin!(Some(*v), arg_reg);
                                 }
                                 arg_regs_rev.push(arg_reg);
                                 graph_arg_values_rev.push(arg_value);
@@ -7568,11 +7533,7 @@ impl CodeWriter {
                                     graph_call_args,
                                     py_pc as i64,
                                 );
-                                pair_walker_slot(
-                                    &mut walker_slot_for_variable,
-                                    Some(result),
-                                    stack_base + current_depth,
-                                );
+                                pin!(Some(result), stack_base + current_depth);
                                 result.into()
                             };
                             if nargs > 8 {
@@ -7756,16 +7717,8 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                zero_graph_var,
-                                scratch_zero,
-                            );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(negated),
-                                stack_base + current_depth,
-                            );
+                            pin!(zero_graph_var, scratch_zero);
+                            pin!(Some(negated), stack_base + current_depth);
                             if let Some(zero_var) = &zero_graph_var {
                                 let binary_result = record_residual_call_graph_op(
                                     &mut graph,
@@ -7779,11 +7732,7 @@ impl CodeWriter {
                                     ResKind::Ref,
                                     py_pc as i64,
                                 );
-                                pair_walker_slot(
-                                    &mut walker_slot_for_variable,
-                                    binary_result,
-                                    stack_base + current_depth,
-                                );
+                                pin!(binary_result, stack_base + current_depth);
                             }
                             current_state.stack.push(negated.into());
                             current_depth += 1;
@@ -7831,11 +7780,7 @@ impl CodeWriter {
                                 let item_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if let super::flow::FlowValue::Variable(v) = &item_value {
-                                    pair_walker_slot(
-                                        &mut walker_slot_for_variable,
-                                        Some(*v),
-                                        item_reg,
-                                    );
+                                    pin!(Some(*v), item_reg);
                                 }
                                 arg_regs_rev.push(item_reg);
                                 item_values_rev.push(item_value);
@@ -7855,11 +7800,7 @@ impl CodeWriter {
                                 item_values_rev.into_iter().rev().collect(),
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(result_value),
-                                stack_base + current_depth,
-                            );
+                            pin!(Some(result_value), stack_base + current_depth);
                             // BuildList factor
                             // refactor.  The prior `emit_residual_call(
                             // build_list_fn_idx, ...)` is replaced by a
@@ -7923,11 +7864,7 @@ impl CodeWriter {
                                 step_info.map(|(_, value)| value),
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                Some(result_value),
-                                stack_base + current_depth,
-                            );
+                            pin!(Some(result_value), stack_base + current_depth);
                             push_walker_emit(
                                 &current_block,
                                 super::flatten::build_build_slice_fn_residual_call_ir_r_insn(
@@ -8052,11 +7989,7 @@ impl CodeWriter {
                                     ResKind::Ref,
                                     py_pc as i64,
                                 );
-                                pair_walker_slot(
-                                    &mut walker_slot_for_variable,
-                                    normalized_var,
-                                    exc_reg,
-                                );
+                                pin!(normalized_var, exc_reg);
                                 let normalized_exc_fv = normalized_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -8147,7 +8080,7 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(&mut walker_slot_for_variable, prev_var, scratch_prev);
+                            pin!(prev_var, scratch_prev);
                             let _ = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
@@ -8230,11 +8163,7 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            pair_walker_slot(
-                                &mut walker_slot_for_variable,
-                                cmp_result,
-                                scratch_match,
-                            );
+                            pin!(cmp_result, scratch_match);
                             let result_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(result_value.clone());
                             emit_pushvalue_ref!(current_depth, scratch_match, result_value, py_pc);
@@ -9218,7 +9147,7 @@ impl CodeWriter {
                             ResKind::Ref,
                             -1,
                         );
-                        pair_walker_slot(&mut walker_slot_for_variable, boxed_lasti, exc_slot);
+                        pin!(boxed_lasti, exc_slot);
                         if let Some(boxed_var) = boxed_lasti {
                             let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
                             let v_lasti_idx: super::flow::FlowValue =
@@ -9376,11 +9305,7 @@ impl CodeWriter {
             for (idx, value) in state.mergeable().iter().enumerate() {
                 if let Some(super::flow::FlowValue::Variable(v)) = value {
                     if let Some(slot) = state.mergeable_index_to_slot(idx) {
-                        pair_walker_slot_if_absent(
-                            &mut walker_slot_for_variable,
-                            Some(v.clone()),
-                            slot,
-                        );
+                        pin_if_absent!(Some(v.clone()), slot);
                     }
                 }
             }
