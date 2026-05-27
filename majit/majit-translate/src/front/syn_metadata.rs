@@ -1894,3 +1894,153 @@ pub(crate) fn array_item_value_type_from_array_type_id(
     let elem_type = extract_element_type_from_str(array_type_id?)?;
     Some(type_string_to_value_type(&elem_type))
 }
+
+/// Both synthetic-wrapper and unit-variant ctor paths are valid
+/// call targets that are not registered in `PyreCallRegistry`; the
+/// discriminator is the caller's check at `canonical_call_target`
+/// that `registered_function_path` returns false.
+pub(crate) fn is_synthetic_ctor_path(segments: &[String]) -> bool {
+    is_synthetic_result_option_wrapper_path(segments) || is_synthetic_unit_variant_path(segments)
+}
+
+/// `Ok`/`Err`/`Some` and their qualified spellings.  Always one-arg
+/// transparent wrappers that `jtransform::is_synthetic_result_option_ctor`
+/// elides at the `args.len() == 1` site.  Valid only as call targets.
+pub(crate) fn is_synthetic_result_option_wrapper_path(segments: &[String]) -> bool {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        path.as_slice(),
+        ["Ok"]
+            | ["Err"]
+            | ["Some"]
+            | ["Result", "Ok"]
+            | ["Result", "Err"]
+            | ["Option", "Some"]
+            | ["result", "Result", "Ok"]
+            | ["result", "Result", "Err"]
+            | ["option", "Option", "Some"]
+            | ["std", "result", "Result", "Ok"]
+            | ["std", "result", "Result", "Err"]
+            | ["std", "option", "Option", "Some"]
+            | ["core", "result", "Result", "Ok"]
+            | ["core", "result", "Result", "Err"]
+            | ["core", "option", "Option", "Some"]
+    )
+}
+
+/// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
+/// as bare path-expression values; `flowspace_adapter` pre-folds them
+/// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
+/// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
+/// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
+/// before `jtransform`).  Re-exported `pub(crate)` from `front::ast`
+/// so `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
+/// reads the same allowlist.
+pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        path.as_slice(),
+        ["LoopResult", "Done"]
+            | ["LoopResult", "ContinueRunningNormally"]
+            | ["JitAction", "Return"]
+            | ["JitAction", "Continue"]
+            | ["StepResult", "Continue"]
+            | ["CompareOp", "Lt"]
+            | ["CompareOp", "Le"]
+            | ["CompareOp", "Gt"]
+            | ["CompareOp", "Ge"]
+            | ["CompareOp", "Eq"]
+            | ["CompareOp", "Ne"]
+    )
+}
+
+/// Path-as-value numeric constants — Rust counterpart of PyPy
+/// `flowspace.LOAD_GLOBAL` resolving a statically-known module
+/// attribute to a `Constant(value)` node.  Returns the `f64` bit
+/// pattern matching the `syn::Lit::Float` arm's `OpKind::ConstFloat`.
+pub(crate) fn path_as_value_float_constant(segments: &[String]) -> Option<u64> {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    let leaf = match path.as_slice() {
+        ["f64", leaf] => leaf,
+        ["std", "f64", leaf] => leaf,
+        ["core", "f64", leaf] => leaf,
+        _ => return None,
+    };
+    match *leaf {
+        "INFINITY" => Some(f64::INFINITY.to_bits()),
+        "NEG_INFINITY" => Some(f64::NEG_INFINITY.to_bits()),
+        "NAN" => Some(f64::NAN.to_bits()),
+        _ => None,
+    }
+}
+
+pub(crate) fn intrinsic_call_result_type(segments: &[String]) -> Option<crate::model::ValueType> {
+    use crate::model::ValueType;
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match path.as_slice() {
+        ["std", "mem", "size_of"] | ["core", "mem", "size_of"] | ["mem", "size_of"] => {
+            Some(ValueType::Int)
+        }
+        ["f64", "copysign"] | ["std", "f64", "copysign"] | ["core", "f64", "copysign"] => {
+            Some(ValueType::Float)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn kind_char_to_value_type(kind: char) -> Option<crate::model::ValueType> {
+    use crate::model::ValueType;
+    match kind {
+        'i' => Some(ValueType::Int),
+        'r' => Some(ValueType::Ref(None)),
+        'f' => Some(ValueType::Float),
+        'v' => Some(ValueType::Void),
+        _ => None,
+    }
+}
+
+/// RPython equivalent of Rust's `expr as T` for numeric / Bool /
+/// pointer casts.  Maps each `(source, target)` pair to the matching
+/// callable path — a single `__builtin__` name (one segment) for
+/// numeric/Bool casts, or a fully qualified `lltype` / `rarithmetic`
+/// path for pointer / Unsigned-bridging casts.  Pairs not covered
+/// return `None`, letting the caller emit an identity `same_as` op.
+pub(crate) fn cast_builtin_name(
+    source_ty: Option<&crate::model::ValueType>,
+    target_ty: &crate::model::ValueType,
+) -> Option<&'static [&'static str]> {
+    use crate::model::ValueType;
+    match (source_ty, target_ty) {
+        (Some(ValueType::Int), ValueType::Float) => Some(&["float"]),
+        (Some(ValueType::Bool), ValueType::Float) => Some(&["float"]),
+        (Some(ValueType::Unsigned), ValueType::Float) => Some(&["float"]),
+        (Some(ValueType::Float), ValueType::Int) => Some(&["int"]),
+        (Some(ValueType::Bool), ValueType::Int) => Some(&["int"]),
+        (Some(ValueType::Unsigned), ValueType::Int) => {
+            Some(&["rpython", "rlib", "rarithmetic", "intmask"])
+        }
+        (Some(ValueType::Int), ValueType::Bool) => Some(&["bool"]),
+        (Some(ValueType::Float), ValueType::Bool) => Some(&["bool"]),
+        (Some(ValueType::Unsigned), ValueType::Bool) => Some(&["bool"]),
+        (Some(ValueType::Ref(_)), ValueType::Int) => Some(&[
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]),
+        (Some(ValueType::Int), ValueType::Ref(_)) => Some(&[
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]),
+        (Some(ValueType::Int), ValueType::Unsigned)
+        | (Some(ValueType::Float), ValueType::Unsigned)
+        | (Some(ValueType::Bool), ValueType::Unsigned) => {
+            Some(&["rpython", "rlib", "rarithmetic", "r_uint"])
+        }
+        _ => None,
+    }
+}
