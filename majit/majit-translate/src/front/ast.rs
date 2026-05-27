@@ -3980,6 +3980,27 @@ thread_local! {
             ),
         >,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Z2.5 Slice #157 — per-source-module table of plain `use
+    /// <path>::*` glob imports collected by
+    /// `parse::collect_use_globs`.  Keyed by `ParsedInterpreter::
+    /// module_path` (the file's crate-stripped module path); each
+    /// value is the list of glob-root segments imported by that file.
+    ///
+    /// Consumed at the `Expr::Path` single-segment KNOWN_STATICS
+    /// lookup fallback in `lower_expr`.  When the bare name has no
+    /// `use_imports` entry and the `{module_prefix}::{name}`
+    /// catalogue probe fails, the lookup iterates this file's globs
+    /// and tries `{glob_root}::{name}` against `KNOWN_STATICS`.
+    /// Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
+    /// frame's module-globals namespace which includes glob-imported
+    /// names by host-import identity.
+    ///
+    /// Populated by `analyze_pipeline_from_parsed` before the
+    /// semantic build runs; read-only during `lower_expr`.
+    pub(crate) static USE_GLOBS_BY_SOURCE: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<Vec<String>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Z2.5 Cat 2.1 — install the static catalogue into the per-thread
@@ -4010,6 +4031,26 @@ pub fn populate_known_statics(
             m.insert(segments.join("::"), (ty.clone(), value.clone()));
         }
         register_stdlib_known_statics(&mut m);
+    });
+}
+
+/// Z2.5 Slice #157 — install per-source-module `use ::*` glob roots
+/// into the per-thread `USE_GLOBS_BY_SOURCE` cell before semantic
+/// build runs.  `entries` is the flat list `[(source_module, [glob_root,
+/// ...])]` aggregated by `analyze_pipeline_from_parsed` from each
+/// `ParsedInterpreter::{module_path, use_globs}`.  Each source_module
+/// is published exactly once with its glob list; later entries for
+/// the same source_module overwrite.
+pub fn populate_use_globs_by_source(entries: &[(String, Vec<Vec<String>>)]) {
+    USE_GLOBS_BY_SOURCE.with(|cell| {
+        let mut m = cell.borrow_mut();
+        m.clear();
+        for (source_module, globs) in entries {
+            if source_module.is_empty() || globs.is_empty() {
+                continue;
+            }
+            m.insert(source_module.clone(), globs.clone());
+        }
     });
 }
 
@@ -5330,6 +5371,31 @@ fn lower_expr(
     options: &AstGraphOptions,
     ctx: &mut GraphBuildContext,
 ) -> Result<Lowered, FlowingError> {
+    // `lower_expr` recurses through `syn::Expr` and `lower_if_expr` /
+    // `lower_stmt_list_with_tail_value` cycle back into `lower_expr`.
+    // Deeply-nested handler bodies — most notably
+    // `pyre-jit/src/eval.rs::eval_loop_jit` and its giant nested
+    // `match` over `Instruction` — push the recursion past 30+
+    // levels with sizeable per-frame locals (several `Vec`s + closure
+    // captures, ~50 KB per frame in debug builds), exhausting the
+    // default 2 MB test-thread stack on `cargo test`.  Guarding the
+    // entry with `stacker::maybe_grow` spills further frames onto a
+    // heap-allocated chunk so the lowering is depth-bounded only by
+    // heap rather than the OS thread stack.  `red_zone` is sized
+    // above the largest observed per-frame slot so the growth
+    // triggers before the next call frame can run off the end.
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+        lower_expr_inner(graph, block, expr, options, ctx)
+    })
+}
+
+fn lower_expr_inner(
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
+    expr: &syn::Expr,
+    options: &AstGraphOptions,
+    ctx: &mut GraphBuildContext,
+) -> Result<Lowered, FlowingError> {
     // RPython `flowspace/flowcontext.py:258,417` — when the abstract
     // interpreter hits an unsupported bytecode it raises `FlowingError`
     // and the walk stops at once.  Pyre's analogue: emit an
@@ -6131,10 +6197,33 @@ fn lower_expr(
             // Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`)
             // resolving the name through the frame's per-module
             // globals namespace.
+            // Multi-segment paths whose leading segment is `crate` /
+            // `self` / a `PYRE_INTERNAL_CRATES` alias are normalised
+            // by dropping that root so the lookup key matches
+            // `KNOWN_STATICS` which is published under crate-stripped
+            // paths (parse.rs::joined_use_path / strip_glob_root).
+            let strip_crate_root = |segs: Vec<String>| -> Vec<String> {
+                if segs.len() > 1 {
+                    let first = segs[0].as_str();
+                    if first == "crate"
+                        || first == "self"
+                        || crate::parse::PYRE_INTERNAL_CRATES.contains(&first)
+                    {
+                        return segs[1..].to_vec();
+                    }
+                }
+                segs
+            };
             let qualified_lookup_key: Option<String> = if path.qself.is_some() {
                 None
             } else if path.path.segments.len() > 1 {
-                Some(name.clone())
+                let segs: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                Some(strip_crate_root(segs).join("::"))
             } else if let Some(full) = ctx.use_imports.get(&name) {
                 Some(full.split("::").collect::<Vec<_>>().join("::"))
             } else if !ctx.module_prefix.is_empty() {
@@ -6142,16 +6231,49 @@ fn lower_expr(
             } else {
                 None
             };
-            let known_static_entry: Option<(
-                String,
-                ValueType,
-                Option<crate::flowspace::model::ConstValue>,
-            )> = qualified_lookup_key.as_ref().and_then(|key| {
+            let primary_lookup = qualified_lookup_key.as_ref().and_then(|key| {
                 KNOWN_STATICS.with(|m| {
                     m.borrow()
                         .get(key)
                         .cloned()
                         .map(|(ty, value)| (key.clone(), ty, value))
+                })
+            });
+            // Slice #157 — `use <path>::*` glob fallback.  When the
+            // primary lookup (`use_imports` alias or
+            // `module_prefix::name`) misses for a single-segment path,
+            // iterate the source file's plain-`use` glob roots and try
+            // `{glob_root}::{name}` against `KNOWN_STATICS`.  Mirrors
+            // PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
+            // frame's per-module globals which include glob-imported
+            // names — pyre carries glob entries explicitly because
+            // `parse::walk_use_tree`'s `UseTree::Glob` arm does not
+            // populate the per-name `use_imports` map.
+            let known_static_entry: Option<(
+                String,
+                ValueType,
+                Option<crate::flowspace::model::ConstValue>,
+            )> = primary_lookup.or_else(|| {
+                if path.qself.is_some() || path.path.segments.len() != 1 {
+                    return None;
+                }
+                if ctx.use_imports.contains_key(&name) || ctx.source_module.is_empty() {
+                    return None;
+                }
+                USE_GLOBS_BY_SOURCE.with(|globs| {
+                    let globs = globs.borrow();
+                    let glob_roots = globs.get(&ctx.source_module)?;
+                    for glob_root in glob_roots {
+                        if glob_root.is_empty() {
+                            continue;
+                        }
+                        let candidate = format!("{}::{}", glob_root.join("::"), name);
+                        let hit = KNOWN_STATICS.with(|m| m.borrow().get(&candidate).cloned());
+                        if let Some((ty, value)) = hit {
+                            return Some((candidate, ty, value));
+                        }
+                    }
+                    None
                 })
             });
             if let Some((qualified_key, static_ty, static_value)) = known_static_entry {
@@ -9742,13 +9864,25 @@ fn lookup_module_static_literal(
     None
 }
 
-/// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
-/// as bare path-expression values; `flowspace_adapter` pre-folds them
-/// to `Hlvalue::Constant(ConstValue::HostObject(prebuilt_instance))`
+/// Pyre-side `Class::Variant` ctors covered by the
+/// `SyntheticTransparentCtor` route.  Despite the name, the routing
+/// accepts both 0-arg unit-variants (lower to a 0-arg
+/// `HostObject::new_class(name, []) → SomeInstance(classdef)`) AND
+/// 1-arg or multi-arg variant ctors (`LoopResult::Done(PyResult)` is
+/// 1-arg; the adapter packs args after the class HostObject into the
+/// same `simple_call`).  jtransform does not elide these (in contrast
+/// to the `Result`/`Option` wrapper list, which IS elided).  These are
+/// valid as bare path-expression values; `flowspace_adapter` pre-folds
+/// the 0-arg ones to `Hlvalue::Constant(ConstValue::HostObject(...))`
 /// before the rtyper sees a call (mirrors PyPy `rtyper` resolving
 /// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
-/// before `jtransform`).  Exposed `pub(crate)` so
-/// `translator::rtyper::flowspace_adapter::is_synthetic_unit_variant_call`
+/// before `jtransform`).
+///
+/// Each entry must be a real pyre-source enum variant — the predicate
+/// is consulted before the registry lookup and a stale spelling here
+/// silently routes a real `FunctionPath` call to the ctor path.
+///
+/// Exposed `pub(crate)` so `translator::rtyper::flowspace_adapter`
 /// reads the same allowlist.
 pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
     let path: Vec<&str> = segments.iter().map(String::as_str).collect();
@@ -9758,7 +9892,11 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
             | ["LoopResult", "ContinueRunningNormally"]
             | ["JitAction", "Return"]
             | ["JitAction", "Continue"]
+            | ["JitAction", "ContinueRunningNormally"]
             | ["StepResult", "Continue"]
+            | ["StepResult", "Return"]
+            | ["StepResult", "Yield"]
+            | ["StepResult", "CloseLoop"]
             | ["CompareOp", "Lt"]
             | ["CompareOp", "Le"]
             | ["CompareOp", "Gt"]

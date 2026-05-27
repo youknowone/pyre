@@ -3825,6 +3825,71 @@ fn register_struct_field_attrs(struct_name: &str, fields: Vec<(String, crate::mo
     }
 }
 
+/// Z2.5 M2.5g.2.c pre-pass — populate the
+/// [`REGISTERED_STRUCT_FIELD_ATTRS`] side-table directly from a
+/// parsed `syn::File` without driving the full walker. The production
+/// pipeline (`analyze_pipeline_from_parsed`) does not call
+/// [`register_rust_module_at_with_source`], which means
+/// [`build_host_class_from_struct`] never fires there and the side-
+/// table stays empty.  Without these entries
+/// `ClassDesc::_init_classdef` cannot pre-fill `ClassDef.attrs`, so
+/// the receiver-narrowing gate at
+/// `flowspace_adapter.rs::derive_subject_inputcells` skips and every
+/// `impl`-method `self` carries `SomeInstance(classdef=None)` —
+/// turning every `self.field` read into an
+/// `AnnotatorError: SomeInstance.getattr on classdef-less instance`
+/// panic in the speculative loop.
+///
+/// `prefix` matches the walker-module-prefix shape: empty for
+/// top-level structs (registered under the bare ident), non-empty
+/// for structs declared inside an inline `mod` block (registered
+/// under `{prefix}::{ident}`).
+pub fn pre_register_struct_fields_from_file(file: &syn::File, prefix: &str) {
+    pre_register_struct_fields_from_items(&file.items, prefix);
+}
+
+fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
+    for item in items {
+        match item {
+            Item::Struct(item_struct) => {
+                if let syn::Fields::Named(named) = &item_struct.fields {
+                    let mut stubs: Vec<(String, crate::model::ValueType)> = Vec::new();
+                    for field in &named.named {
+                        let Some(ident) = field.ident.as_ref() else {
+                            continue;
+                        };
+                        let field_name = ident.to_string();
+                        let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+                        stubs.push((field_name, ty));
+                    }
+                    if !stubs.is_empty() {
+                        let bare_name = item_struct.ident.to_string();
+                        let qualified_key = if prefix.is_empty() {
+                            bare_name
+                        } else {
+                            format!("{prefix}::{bare_name}")
+                        };
+                        register_struct_field_attrs(&qualified_key, stubs);
+                    }
+                }
+            }
+            Item::Mod(item_mod) => {
+                let Some((_, inner)) = &item_mod.content else {
+                    continue;
+                };
+                let inner_name = item_mod.ident.to_string();
+                let inner_prefix = if prefix.is_empty() {
+                    inner_name
+                } else {
+                    format!("{prefix}::{inner_name}")
+                };
+                pre_register_struct_fields_from_items(inner, &inner_prefix);
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// Snapshot the registered field-attr stubs for `struct_name`.
 ///
 /// Returns `None` when no struct of that name has been registered.
@@ -9503,7 +9568,11 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         assert!(names.contains(&"SHADOW_STACK".to_string()));
         // Compound types fall through to `ValueType::Ref` per the
         // `compound_type_classifies_as_ref` invariant.
-        assert!(decls.iter().all(|(_, ty, _)| matches!(ty, ValueType::Ref(_))));
+        assert!(
+            decls
+                .iter()
+                .all(|(_, ty, _)| matches!(ty, ValueType::Ref(_)))
+        );
     }
 
     #[test]

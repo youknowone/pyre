@@ -1039,6 +1039,34 @@ pub fn translate_op(
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py:199`).
                 CallTarget::FunctionPath { segments } => {
+                    // `hint_promote_or_string` is a synthesised marker
+                    // emitted by `front/ast.rs::synthesize_or_passthrough`
+                    // (~`ast.rs:1246-1248`) when the elidable_promote
+                    // decorator wraps a function — it inserts
+                    // `let __self_promoted = hint_promote_or_string(self);`
+                    // for each promoted arg.  Upstream RPython
+                    // `rlib/jit.py:191-194` lifts this through a host
+                    // function that, in non-JIT contexts, is an identity
+                    // (`hint(x, promote_string=True)` returns `x`).  The
+                    // marker has no source-level implementation in pyre,
+                    // so the registry can never resolve it; lower it here
+                    // as `same_as(arg)` — the RPython internal renaming
+                    // op (`rtyper.py:478-481`) the rtyper already
+                    // handles via `rbuiltin::rtype_same_as`.  Tracing-
+                    // time JIT promotion semantics still get applied via
+                    // the wrapper's outer call structure and the rtyper-
+                    // side `hint` op recognition (`rtyper.rs:2033 "hint"`
+                    // arm); the inner identity is all the marker
+                    // contributes outside the JIT lift.
+                    if segments.len() == 1 && segments[0] == "hint_promote_or_string" {
+                        let mut iter = arg_hls.into_iter();
+                        let arg = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "hint_promote_or_string requires at least one arg".to_string(),
+                            )
+                        })?;
+                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg], result)]);
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -1163,7 +1191,7 @@ pub fn translate_op(
                         && let Some(attr) = module.module_get(&segments[segments.len() - 1])
                     {
                         // Branch 3b — fully-qualified inline path,
-                        // TODO as documented above.
+                        // PRE-EXISTING-ADAPTATION as documented above.
                         attr
                     } else if segments.len() == 2
                         && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
@@ -1179,6 +1207,39 @@ pub fn translate_op(
                         // (`call.rs:3155 target_to_path`).  Upstream
                         // resolves both spellings to one `FunctionDesc`.
                         entry.host_object.clone()
+                    } else if segments.len() == 2
+                        && segments[0] == "simple_call"
+                        && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
+                    {
+                        // Branch 3c — PRE-EXISTING-ADAPTATION closure
+                        // for `front/raise.rs::lower_exc_from_raise`
+                        // (~`raise.rs:153`).  Upstream RPython
+                        // `flowcontext.py:614/623` emits
+                        // `op.simple_call(const(exc_class), *args)`
+                        // with the class as `args[0]`; pyre stashes
+                        // the class name in `path[1]` of the
+                        // `FunctionPath` because its `Vec<Variable>`
+                        // arg carrier cannot yet hold a
+                        // `Constant(HostObject(class))` alongside
+                        // `Variable`s — that conversion is the
+                        // multi-session `Vec<Variable>` →
+                        // `Vec<LinkArg>` migration (see the
+                        // module-level "PRE-EXISTING-ADAPTATION"
+                        // block in `front/raise.rs:120-126` for the
+                        // detailed rationale).  The downstream
+                        // reconstruction is documented at
+                        // `raise.rs:122-123`:
+                        // > any downstream reader can reconstruct
+                        // > `(op, const_class, args…)` from
+                        // > `(path[0], path[1], op.args)`
+                        // This branch is exactly that
+                        // reconstruction: resolve `path[1]`
+                        // (the exception class name) as a builtin
+                        // HostObject and use it as the simple_call
+                        // callable, leaving `op.args` as the
+                        // trailing message arguments.  TODO retire
+                        // when the LinkArg migration lands.
+                        exc_class
                     } else {
                         return Err(TyperError::message(format!(
                             "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
@@ -1754,10 +1815,7 @@ pub(crate) fn derive_subject_inputcells(
             },
         ) = (op.result.as_ref(), &op.kind)
         {
-            input_by_result.insert(
-                result.clone(),
-                (ty, name.as_str(), class_root.as_deref()),
-            );
+            input_by_result.insert(result.clone(), (ty, name.as_str(), class_root.as_deref()));
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());

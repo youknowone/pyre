@@ -381,7 +381,23 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     }
     let name_segs_prefix: Vec<&str> = name.split("::").collect();
     let mod_segs_prefix: Vec<&str> = source_module.split("::").collect();
-    if !source_module.is_empty() && !name_segs_prefix.starts_with(&mod_segs_prefix) {
+    // The starts_with check is meant to skip the module-qualified loop
+    // when `name` already carries the module prefix (e.g. a nested
+    // `mod foo { fn bar() }` whose `sf.name` is set to "foo::bar"
+    // before the module stamp at `front/ast.rs:1669-1676`).  Without
+    // the length-strict guard, a function whose bare leaf happens to
+    // equal its containing module's name (`pyre-interpreter/src/
+    // stack_check.rs` `pub fn stack_check`) collides — its single-
+    // segment name "stack_check" `starts_with` ["stack_check"] is
+    // true, so the loop is skipped and the
+    // `["module", "name"]` / `["crate", "module", "name"]` / aliased
+    // spellings never get registered, leaving every call site that
+    // writes `crate::stack_check::stack_check` looking for an
+    // unregistered path.  Require `name` to be STRICTLY LONGER than
+    // `module` to count as already-prefixed.
+    let name_already_prefixed = name_segs_prefix.len() > mod_segs_prefix.len()
+        && name_segs_prefix.starts_with(&mod_segs_prefix);
+    if !source_module.is_empty() && !name_already_prefixed {
         let module_segs: Vec<&str> = source_module.split("::").collect();
         let mut module_qualified_segs: Vec<&str> = module_segs.clone();
         module_qualified_segs.extend(segments.iter().copied());
@@ -474,6 +490,40 @@ fn analyze_pipeline_from_parsed(
         })
         .collect();
     crate::front::ast::populate_known_statics(&early_static_decls);
+    // Slice #157 — per-source `use <path>::*` glob roots, used by the
+    // `Expr::Path` single-segment KNOWN_STATICS / fn_return_types
+    // fallback so glob-imported bare names (e.g. `PY_NULL` referenced
+    // from a file with `use crate::pyobject::*;`) resolve to their
+    // originating module's catalogue entry instead of falling through
+    // to `OpKind::Input` and triggering an adapter cross-block body
+    // Input Skip.
+    let use_globs_by_source: Vec<(String, Vec<Vec<String>>)> = parsed_files
+        .iter()
+        .filter(|parsed| !parsed.module_path.is_empty() && !parsed.use_globs.is_empty())
+        .map(|parsed| (parsed.module_path.clone(), parsed.use_globs.clone()))
+        .collect();
+    crate::front::ast::populate_use_globs_by_source(&use_globs_by_source);
+    // Z2.5 M2.5g.2.c diagnostic pre-pass — populate
+    // `REGISTERED_STRUCT_FIELD_ATTRS` from each `parsed_files` entry's
+    // top-level structs so `ClassDesc::_init_classdef` can pre-fill
+    // `ClassDef.attrs` *before* the annotator's narrowing gate at
+    // `flowspace_adapter.rs::derive_subject_inputcells` checks
+    // `attrs_populated`.  Production never drives the walker (only
+    // `extract_static_decls` and `extract_unsafe_fn_stubs` are called
+    // from `register`), which left the side-table empty and forced
+    // every impl-method `self` to carry `SomeInstance(classdef=None)`
+    // — task #133 / [[lower_expr_stacker_fix_2026_05_27]] closure
+    // step.  Empty `module_path` files (test fixtures) skip; their
+    // structs are registered through the bare-leaf walker path when
+    // the fixture explicitly calls `register_rust_module_at_with_source`.
+    for parsed in parsed_files {
+        if !parsed.module_path.is_empty() {
+            crate::flowspace::rust_source::register::pre_register_struct_fields_from_file(
+                &parsed.file,
+                "",
+            );
+        }
+    }
     // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
@@ -481,7 +531,7 @@ fn analyze_pipeline_from_parsed(
     // the correct response is to abort loudly so the coverage audit
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
-    mark_phase!("known_statics + struct_origins populated");
+    mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
     mark_phase!("build_semantic_program_from_parsed_files");
@@ -530,6 +580,31 @@ fn analyze_pipeline_from_parsed(
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
+    // Build the `pub use <src>::*` re-export index:
+    // `globbed_source_path -> [importing_module_path, ...]`.  For each
+    // file that does `pub use crate::M::*;`, M (as `::`-joined string)
+    // maps to that file's `module_path`, so a function defined in M
+    // also becomes callable under the importing module's namespace
+    // (and through the full set of crate-alias spellings the alias
+    // generator emits).  Mirrors Rust's resolution of `crate::
+    // ImportingMod::name` through the re-export; without this fan-out
+    // the registry would only carry the original `M::name` aliases
+    // and `crate::ImportingMod::name` would fail to resolve.
+    let mut glob_reexports: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for parsed in parsed_files {
+        if parsed.module_path.is_empty() || parsed.pub_use_globs.is_empty() {
+            continue;
+        }
+        for source_segments in &parsed.pub_use_globs {
+            let source_key = source_segments.join("::");
+            glob_reexports
+                .entry(source_key)
+                .or_default()
+                .push(parsed.module_path.clone());
+        }
+    }
+
     for func in &program.functions {
         if func.self_ty_root.is_none() {
             // Stamp the source return type onto the graph so the JIT
@@ -556,6 +631,40 @@ fn analyze_pipeline_from_parsed(
                     &func.name,
                     &graph,
                 );
+            }
+            // Additional alias spellings for `pub use crate::<func
+            // module>::*;` re-exports — without this, a caller that
+            // writes `crate::ImportingMod::func` (resolved through the
+            // Rust-side glob re-export) finds no registered graph
+            // because `free_function_alias_paths` only fans out under
+            // the function's own module.
+            if let Some(importing_modules) = glob_reexports.get(&func.module_path) {
+                // Use just the function's leaf name (without module
+                // prefix) so the re-export aliases mirror what the
+                // alias generator would emit for a function natively
+                // defined in `importing_module`.
+                let leaf = func
+                    .name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&func.name)
+                    .to_string();
+                for importing_module in importing_modules {
+                    let synthetic_name = if importing_module.is_empty() {
+                        leaf.clone()
+                    } else {
+                        format!("{importing_module}::{leaf}")
+                    };
+                    for path in free_function_alias_paths(&synthetic_name, importing_module) {
+                        register_function_graph_alias(
+                            &mut canonical_function_graphs,
+                            &mut canonical_function_alias_source,
+                            path,
+                            &func.name,
+                            &graph,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1076,6 +1185,18 @@ fn analyze_pipeline_from_parsed(
         // `[module, name]` form is registered FIRST and is the
         // source-of-truth canonical name for the graph; the longer
         // forms are crate-prefixed aliases for cross-crate callsites.
+        //
+        // Tie-break among same-length candidates by deprioritising
+        // keys whose first segment is a crate alias
+        // (`pyre_interpreter`, `pyre_object`, `pyre_jit`), then by
+        // lexicographic order.  Without this, two length-2 keys like
+        // `["eval", "eval_loop_jit"]` (the module-qualified form) and
+        // `["pyre_object", "eval_loop_jit"]` (a crate-alias form
+        // emitted by `free_function_alias_paths`) tie on length, and
+        // the winner depends on HashMap iteration order — the source
+        // of the eval_loop_jit_portal_* flake.
+        let is_crate_alias =
+            |seg: &str| matches!(seg, "pyre_interpreter" | "pyre_object" | "pyre_jit");
         let qualified = call_control
             .function_graphs()
             .keys()
@@ -1084,7 +1205,16 @@ fn analyze_pipeline_from_parsed(
                     && k.segments.len() > 1
                     && k.segments.first().map(|s| s != "crate").unwrap_or(false)
             })
-            .min_by_key(|k| k.segments.len())
+            .min_by_key(|k| {
+                (
+                    k.segments.len(),
+                    k.segments
+                        .first()
+                        .map(|s| is_crate_alias(s.as_str()))
+                        .unwrap_or(false),
+                    k.segments.clone(),
+                )
+            })
             .cloned();
         if let Some(qualified) = qualified {
             qualified
