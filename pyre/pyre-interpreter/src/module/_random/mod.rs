@@ -89,10 +89,18 @@ impl W_Random {
     }
 }
 
+/// `_seed_from_path(path)` — PyPath alias smoke: accepts str, bytes, or
+/// any `os.PathLike` and converts via `space.fsencode_w` parity.
+#[crate::pyre_function]
+fn _seed_from_path(path: PyPath) -> i64 {
+    path.bytes().map(|b| b as i64).sum()
+}
+
 crate::py_module! {
     "_random",
     interpleveldefs: {
         "Random" => type_object(),
+        "_seed_from_path" => crate::make_builtin_function("_seed_from_path", _seed_from_path),
     },
     appleveldefs: {
         "app_random.py" => ["_ascii_seed"],

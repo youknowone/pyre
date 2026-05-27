@@ -307,27 +307,10 @@ pub fn register_module(ns: &mut DictStorage) {
         );
     }
 
-    // ── Helper: extract a filesystem path (str or bytes) from a PyObjectRef ──
-    fn extract_path(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
-        unsafe {
-            if pyre_object::is_str(obj) {
-                return Ok(pyre_object::w_str_get_value(obj).to_string());
-            }
-            if pyre_object::bytesobject::is_bytes_like(obj) {
-                let data = pyre_object::bytesobject::bytes_like_data(obj);
-                return Ok(String::from_utf8_lossy(data).into_owned());
-            }
-        }
-        if let Ok(fspath) = crate::baseobjspace::getattr(obj, "__fspath__") {
-            let result = crate::call_function(fspath, &[obj]);
-            if !result.is_null() && unsafe { pyre_object::is_str(result) } {
-                return Ok(unsafe { pyre_object::w_str_get_value(result).to_string() });
-            }
-        }
-        Err(crate::PyError::type_error(
-            "expected str, bytes or os.PathLike",
-        ))
-    }
+    // PyPy `space.fsencode_w` — promoted to `crate::gateway::fsencode_w`
+    // so the `#[pyre_function]` / `#[pyre_methods]` `PyPath` alias and
+    // these posix call sites share one extraction path.
+    use crate::gateway::fsencode_w as extract_path;
 
     // ── Helper: convert std::io::Error → PyError (OSError) ──
     fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
