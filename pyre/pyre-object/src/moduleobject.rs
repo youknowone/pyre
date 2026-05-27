@@ -52,7 +52,9 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleObject>();
 pub const W_MODULE_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(W_ModuleObject, w_dict)];
 
 impl crate::lltype::GcType for W_ModuleObject {
-    const TYPE_ID: u32 = W_MODULE_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_MODULE_GC_TYPE_ID
+    }
     const SIZE: usize = W_MODULE_OBJECT_SIZE;
 }
 

@@ -47,7 +47,9 @@ pub const PREBUILTINTTO: i64 = 100;
 pub const W_INT_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObject>();
 
 impl crate::lltype::GcType for W_IntObject {
-    const TYPE_ID: u32 = W_INT_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_INT_GC_TYPE_ID
+    }
     const SIZE: usize = W_INT_OBJECT_SIZE;
 }
 

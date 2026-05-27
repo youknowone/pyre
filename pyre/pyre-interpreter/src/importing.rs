@@ -648,12 +648,7 @@ fn exec_code_module(
 /// function defined in `source` retains it as its `__globals__`, so the
 /// box must outlive the bound names — which, for module-init artifacts,
 /// is "forever".
-pub fn appleveldef_install(
-    ns: &mut DictStorage,
-    source: &str,
-    filename: &str,
-    names: &[&str],
-) {
+pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, names: &[&str]) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();

@@ -241,7 +241,9 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 11] = [
 ];
 
 impl pyre_object::lltype::GcType for Function {
-    const TYPE_ID: u32 = FUNCTION_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        FUNCTION_GC_TYPE_ID
+    }
     const SIZE: usize = FUNCTION_OBJECT_SIZE;
 }
 
@@ -2181,7 +2183,7 @@ mod tests {
     fn function_gc_type_id_matches_descr() {
         assert_eq!(FUNCTION_GC_TYPE_ID, 14);
         assert_eq!(
-            <Function as pyre_object::lltype::GcType>::TYPE_ID,
+            <Function as pyre_object::lltype::GcType>::type_id(),
             FUNCTION_GC_TYPE_ID
         );
         assert_eq!(

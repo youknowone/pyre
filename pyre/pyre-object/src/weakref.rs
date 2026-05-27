@@ -108,7 +108,9 @@ pub const W_GC_WEAKREF_OBJECT_SIZE: usize = std::mem::size_of::<W_GcWeakref>();
 pub const W_GC_WEAKREF_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(W_GcWeakref, inner)];
 
 impl crate::lltype::GcType for W_GcWeakref {
-    const TYPE_ID: u32 = W_GC_WEAKREF_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_GC_WEAKREF_GC_TYPE_ID
+    }
     const SIZE: usize = W_GC_WEAKREF_OBJECT_SIZE;
 }
 

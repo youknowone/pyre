@@ -58,7 +58,7 @@ mod tests {
     fn w_super_gc_type_id_matches_descr() {
         assert_eq!(W_SUPER_GC_TYPE_ID, 18);
         assert_eq!(
-            <W_SuperObject as crate::lltype::GcType>::TYPE_ID,
+            <W_SuperObject as crate::lltype::GcType>::type_id(),
             W_SUPER_GC_TYPE_ID
         );
         assert_eq!(

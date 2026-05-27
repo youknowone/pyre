@@ -9,19 +9,26 @@
 use pyre_object::*;
 
 fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = w_instance_new(crate::typedef::w_object());
-    if !args.is_empty() {
-        let _ = crate::baseobjspace::setattr(obj, "name", args[0]);
+    // `interp_contextvars` ContextVar(name, *, default=MISSING) — name is required.
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "ContextVar() missing required argument: 'name'",
+        ));
     }
+    let obj = w_instance_new(crate::typedef::w_object());
+    let _ = crate::baseobjspace::setattr(obj, "name", args[0]);
     let _ = crate::baseobjspace::setattr(
         obj,
         "get",
+        // `W_ContextVar.get(*default)` raises LookupError when no
+        // current value and no default supplied.
         crate::make_builtin_function("get", |args| {
             if args.len() > 1 {
-                Ok(args[1])
-            } else {
-                Ok(w_none())
+                return Ok(args[1]);
             }
+            Err(crate::PyError::lookup_error(
+                "context variable has no value and no default supplied",
+            ))
         }),
     );
     let _ = crate::baseobjspace::setattr(

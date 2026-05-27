@@ -54,11 +54,75 @@
 /// `debug_assert_eq!` there guards against drift.
 pub trait GcType {
     /// Backend-registered GC type id, equal to `c_type_id` in
-    /// `framework.py:809`.
-    const TYPE_ID: u32;
+    /// `framework.py:809`.  Read at runtime so the value can be
+    /// assigned by the JIT driver after `gc.register_type(...)`
+    /// returns — auto-id mode delivers the result through this
+    /// accessor.  Explicit `type_id = N` cells return `N` unchanged.
+    fn type_id() -> u32;
     /// Fixed payload size in bytes, equal to `info.fixedsize` in
     /// `framework.py:811`.
     const SIZE: usize;
+}
+
+/// Process-wide cell that the JIT driver uses to deliver the actual
+/// GC tid to a `#[pyre_class]` type after registration.  Two modes:
+///
+/// 1. `TypeIdCell::auto()` — initialized to [`TypeIdCell::UNASSIGNED`].
+///    The driver assigns the next available tid via [`Self::set`] and
+///    subsequent runtime reads return it.  This is the ergonomic
+///    default for `#[pyre_class("name")]` callers who do not want to
+///    reserve a slot up front.
+/// 2. `TypeIdCell::with(N)` — pre-initialized with a reserved tid.
+///    The driver asserts that its registration order produces the same
+///    `N` (drift check).  Used by every legacy `#[pyre_class("…",
+///    type_id = N)]` site so the contiguous-monotonic invariant the
+///    GC's `pytype_to_tid` table relies on stays self-checking.
+///
+/// The cell is `repr(transparent)` over `AtomicU32` so its layout is
+/// identical to the raw atomic; `const fn` constructors mean it can
+/// initialize a `pub static` without `LazyLock` overhead.
+#[repr(transparent)]
+pub struct TypeIdCell(::std::sync::atomic::AtomicU32);
+
+impl TypeIdCell {
+    /// Sentinel meaning "no tid assigned yet".  Picked at the high end
+    /// of `u32` so it cannot collide with a real registered tid; the
+    /// JIT's contiguous-monotonic table is several orders of magnitude
+    /// shorter than `u32::MAX`.
+    pub const UNASSIGNED: u32 = u32::MAX;
+
+    /// Cell initialized to [`Self::UNASSIGNED`] — auto-id mode.
+    pub const fn auto() -> Self {
+        Self(::std::sync::atomic::AtomicU32::new(Self::UNASSIGNED))
+    }
+
+    /// Cell pre-initialized with an explicit tid — explicit-id mode
+    /// (drift-checked at JIT init).
+    pub const fn with(n: u32) -> Self {
+        Self(::std::sync::atomic::AtomicU32::new(n))
+    }
+
+    /// Current value of the cell.  Returns [`Self::UNASSIGNED`] when
+    /// auto-mode and the JIT driver has not registered the type yet.
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0.load(::std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Write the runtime-assigned tid into the cell.  Called once per
+    /// type by the JIT driver's `register_pyre_class` helper.
+    #[inline]
+    pub fn set(&self, n: u32) {
+        self.0.store(n, ::std::sync::atomic::Ordering::Release)
+    }
+
+    /// `true` iff the cell still holds [`Self::UNASSIGNED`].  The JIT
+    /// driver uses this to decide between writing (auto) and asserting
+    /// (explicit).
+    #[inline]
+    pub fn is_unassigned(&self) -> bool {
+        self.get() == Self::UNASSIGNED
+    }
 }
 
 /// Compile-time descriptor every `#[pyre_class]` type emits, consumed
@@ -71,9 +135,10 @@ pub struct PyreClassDescriptor {
     /// Static `PyType` pointer used by `py_type_check` and stamped
     /// into `ob_header.ob_type`.
     pub pytype_ptr: *const crate::pyobject::PyType,
-    /// `GcType::TYPE_ID` for this payload.  Asserted equal to the id
-    /// returned by `gc.register_type(...)` in the JIT driver.
-    pub gc_type_id: u32,
+    /// Runtime-resolved GC tid cell.  Either pre-initialized with an
+    /// explicit `type_id = N` (then drift-checked) or starts at
+    /// [`TypeIdCell::UNASSIGNED`] and gets stamped by the JIT driver.
+    pub gc_type_id: &'static TypeIdCell,
     /// `GcType::SIZE` for this payload (in bytes).
     pub object_size: usize,
     /// Byte offsets of inline `PyObjectRef` fields the GC must trace.
@@ -81,8 +146,8 @@ pub struct PyreClassDescriptor {
 }
 
 // Safety: every field is either a static-`'static` reference (PyType,
-// ptr_offsets), a primitive, or a raw pointer to read-only static
-// storage; sharing across threads is sound.
+// gc_type_id, ptr_offsets), a primitive, or a raw pointer to read-only
+// static storage; sharing across threads is sound.
 unsafe impl Sync for PyreClassDescriptor {}
 
 /// Compile-time bridge between a `#[pyre_class]` struct and its
@@ -197,13 +262,15 @@ mod tests {
 
     struct DummyPayload(u64);
     impl GcType for DummyPayload {
-        const TYPE_ID: u32 = 0xDEAD_BEEF;
+        fn type_id() -> u32 {
+            0xDEAD_BEEF
+        }
         const SIZE: usize = std::mem::size_of::<DummyPayload>();
     }
 
     #[test]
     fn malloc_typed_writes_value_and_reads_type_metadata() {
-        assert_eq!(<DummyPayload as GcType>::TYPE_ID, 0xDEAD_BEEF);
+        assert_eq!(<DummyPayload as GcType>::type_id(), 0xDEAD_BEEF);
         assert_eq!(<DummyPayload as GcType>::SIZE, 8);
         let p = malloc_typed(DummyPayload(7));
         unsafe {

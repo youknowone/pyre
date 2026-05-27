@@ -142,9 +142,20 @@ pub fn register_module(ns: &mut DictStorage) {
         "PyCF_TYPE_COMMENTS",
         "PyCF_ALLOW_TOP_LEVEL_AWAIT",
     ];
+    // `pypy/interpreter/astcompiler/consts.py` — `compile()` /
+    // `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
+    // (`flags = PyCF_ONLY_AST; flags |= PyCF_TYPE_COMMENTS`).
     for name in ast_names {
         if name.starts_with("PyCF") {
-            crate::dict_storage_store(ns, name, pyre_object::w_int_new(0));
+            // Values mirror `pypy/interpreter/astcompiler/consts.py:33-42`.
+            let value: i64 = match *name {
+                "PyCF_ONLY_AST" => 0x0400,
+                "PyCF_ALLOW_TOP_LEVEL_AWAIT" => 0x2000,
+                "PyCF_TYPE_COMMENTS" => 0x40000000,
+                "PyCF_OPTIMIZED_AST" => 0x8000,
+                _ => 0,
+            };
+            crate::dict_storage_store(ns, name, pyre_object::w_int_new(value));
         } else {
             crate::dict_storage_store(ns, name, crate::typedef::make_builtin_type(name, |_| {}));
         }

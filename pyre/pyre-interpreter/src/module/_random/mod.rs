@@ -14,7 +14,8 @@ use pyre_object::*;
 
 const DEFAULT_SEED: u64 = 0x1234_5678;
 
-#[crate::pyre_class("_random.Random", type_id = 53)]
+#[crate::pyre_class("_random.Random")]
+#[derive(Default)]
 pub struct W_Random {
     pub state: u64,
 }
@@ -29,19 +30,9 @@ fn xorshift(state: u64) -> u64 {
 
 #[crate::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
-    weakrefable,
+    weakrefable
 )]
 impl W_Random {
-    #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> PyObjectRef {
-        W_Random::allocate(W_Random {
-            ob: PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
-            },
-            state: DEFAULT_SEED,
-        })
-    }
     fn __init__(&mut self, #[default(DEFAULT_SEED as i64)] seed: i64) {
         self.state = seed as u64;
     }
@@ -52,7 +43,7 @@ impl W_Random {
         self.state = xorshift(self.state);
         (self.state as f64) / (u64::MAX as f64)
     }
-    fn getrandbits(&mut self, #[default(32i64)] k: i64) -> Result<i64, crate::PyError> {
+    fn getrandbits(&mut self, #[default(32i64)] k: PyIndex) -> Result<i64, crate::PyError> {
         if k < 0 {
             crate::bail_value_error!("number of bits must be non-negative");
         }
@@ -62,7 +53,7 @@ impl W_Random {
         Ok((self.state & mask) as i64)
     }
     fn getstate(&self) -> PyObjectRef {
-        w_tuple_new(vec![w_int_new(self.state as i64)])
+        crate::pytuple![self.state as i64]
     }
     fn setstate(&mut self, state_tuple: PyTuple) -> Result<(), crate::PyError> {
         unsafe {
@@ -96,13 +87,24 @@ fn _seed_from_path(path: PyPath) -> i64 {
     path.bytes().map(|b| b as i64).sum()
 }
 
+/// `_path_bytes(path)` — `Vec<i64>` return auto-wraps to a list per
+/// PyPy `space.newlist([space.newint(b) for b in bytes])`.
+#[crate::pyre_function]
+fn _path_bytes(path: PyPath) -> Vec<i64> {
+    path.bytes().map(|b| b as i64).collect()
+}
+
 crate::py_module! {
     "_random",
     interpleveldefs: {
         "Random" => type_object(),
         "_seed_from_path" => crate::make_builtin_function("_seed_from_path", _seed_from_path),
+        "_path_bytes" => crate::make_builtin_function("_path_bytes", _path_bytes),
     },
     appleveldefs: {
         "app_random.py" => ["_ascii_seed"],
+    },
+    inline_app: {
+        "def _is_even(n):\n    return n % 2 == 0\n" => ["_is_even"],
     },
 }

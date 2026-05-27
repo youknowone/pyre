@@ -90,7 +90,9 @@ pub const PYTRACEBACK_GC_PTR_OFFSETS: [usize; 2] =
     [PYTRACEBACK_W_NEXT_OFFSET, PYTRACEBACK_W_CODE_OFFSET];
 
 impl pyre_object::lltype::GcType for W_PyTraceback {
-    const TYPE_ID: u32 = PYTRACEBACK_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        PYTRACEBACK_GC_TYPE_ID
+    }
     const SIZE: usize = PYTRACEBACK_OBJECT_SIZE;
 }
 
@@ -318,7 +320,7 @@ mod tests {
     fn pytraceback_gc_type_id_matches_descr() {
         assert_eq!(PYTRACEBACK_GC_TYPE_ID, 43);
         assert_eq!(
-            <W_PyTraceback as pyre_object::lltype::GcType>::TYPE_ID,
+            <W_PyTraceback as pyre_object::lltype::GcType>::type_id(),
             PYTRACEBACK_GC_TYPE_ID
         );
         assert_eq!(

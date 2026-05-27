@@ -140,7 +140,7 @@ mod tests {
     fn w_property_gc_type_id_matches_descr() {
         assert_eq!(W_PROPERTY_GC_TYPE_ID, 19);
         assert_eq!(
-            <W_PropertyObject as crate::lltype::GcType>::TYPE_ID,
+            <W_PropertyObject as crate::lltype::GcType>::type_id(),
             W_PROPERTY_GC_TYPE_ID
         );
         assert_eq!(
@@ -153,7 +153,7 @@ mod tests {
     fn w_staticmethod_gc_type_id_matches_descr() {
         assert_eq!(W_STATICMETHOD_GC_TYPE_ID, 20);
         assert_eq!(
-            <W_StaticMethodObject as crate::lltype::GcType>::TYPE_ID,
+            <W_StaticMethodObject as crate::lltype::GcType>::type_id(),
             W_STATICMETHOD_GC_TYPE_ID
         );
         assert_eq!(
@@ -166,7 +166,7 @@ mod tests {
     fn w_classmethod_gc_type_id_matches_descr() {
         assert_eq!(W_CLASSMETHOD_GC_TYPE_ID, 21);
         assert_eq!(
-            <W_ClassMethodObject as crate::lltype::GcType>::TYPE_ID,
+            <W_ClassMethodObject as crate::lltype::GcType>::type_id(),
             W_CLASSMETHOD_GC_TYPE_ID
         );
         assert_eq!(

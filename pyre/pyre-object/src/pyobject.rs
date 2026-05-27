@@ -53,6 +53,17 @@ pub struct PyObject {
     pub w_class: *mut PyObject,
 }
 
+impl Default for PyObject {
+    /// Null header — `Self::allocate` rewrites both fields at malloc time.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// The universal Python object reference — a raw pointer to `PyObject`.
 ///
 /// `pyre` currently passes this through the JIT as an integer-sized raw pointer.

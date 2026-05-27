@@ -119,6 +119,7 @@ macro_rules! py_module {
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
         $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
+        $(, inline_app: { $($inline_src:literal => [ $($inline_name:literal),* $(,)? ]),* $(,)? })?
         $(, inline_functions: {
             $(
                 fn $ifn_name:ident ( $($ifn_args:tt)* ) $(-> $ifn_ret:ty)? $ifn_body:block
@@ -146,6 +147,20 @@ macro_rules! py_module {
                     include_str!($appfile),
                     $appfile,
                     &[ $( $appname ),* ],
+                );
+            )*)?
+            // inline_app: PyPy `applevel(r'''…''')` (gateway.py:823) —
+            // embed a Python snippet inline; the runtime executes it the
+            // same way as appleveldefs but the source comes from a
+            // string literal instead of `include_str!` on a sibling .py
+            // file.  Names listed in the `=> [...]` brackets get copied
+            // out of the app namespace into the module dict.
+            $($(
+                $crate::importing::appleveldef_install(
+                    ns,
+                    $inline_src,
+                    "<inline>",
+                    &[ $( $inline_name ),* ],
                 );
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
@@ -458,6 +473,124 @@ macro_rules! pyre_module_init {
         pub mod $interp_mod;
         pub use $interp_mod::register_module as init;
     };
+}
+
+/// `space.newlist([…])` builder.  Each item is wrapped via the
+/// `pywrap!` per-item rule (literal kind ↦ `w_int_new` / `w_float_new`
+/// / `w_str_new` / `w_bool_from` / passthrough for already-wrapped
+/// `PyObjectRef`).  Mirrors PyPy `space.newlist([space.newint(1),
+/// space.newtext("abc")])` where the boilerplate per-item wrap is
+/// implicit in the helper rather than spelled out at every call site.
+///
+/// ```ignore
+/// pylist![1i64, "abc", 3.14, py_obj]        // → list [1, "abc", 3.14, py_obj]
+/// pytuple![1i64, "abc"]                     // → tuple (1, "abc")
+/// pydict! { "k1" => 1i64, "k2" => 3.14 }    // → {"k1": 1, "k2": 3.14}
+/// pyset! { 1i64, 2i64, 3i64 }               // → {1, 2, 3}
+/// ```
+///
+/// Mixing already-wrapped `PyObjectRef` with literals works because the
+/// passthrough `impl PywrapKind for PyObjectRef` returns the value
+/// verbatim.
+#[macro_export]
+macro_rules! pylist {
+    ( $($e:expr),* $(,)? ) => {
+        ::pyre_object::w_list_new(vec![ $( $crate::PywrapKind::into_py($e) ),* ])
+    };
+}
+
+#[macro_export]
+macro_rules! pytuple {
+    ( $($e:expr),* $(,)? ) => {
+        ::pyre_object::w_tuple_new(vec![ $( $crate::PywrapKind::into_py($e) ),* ])
+    };
+}
+
+#[macro_export]
+macro_rules! pydict {
+    ( $($k:expr => $v:expr),* $(,)? ) => {{
+        let __d = ::pyre_object::w_dict_new();
+        $(
+            unsafe {
+                ::pyre_object::w_dict_store(
+                    __d,
+                    $crate::PywrapKind::into_py($k),
+                    $crate::PywrapKind::into_py($v),
+                );
+            }
+        )*
+        __d
+    }};
+}
+
+#[macro_export]
+macro_rules! pyset {
+    ( $($e:expr),* $(,)? ) => {
+        ::pyre_object::w_set_from_items(&[ $( $crate::PywrapKind::into_py($e) ),* ])
+    };
+}
+
+/// Per-type wrap trait consumed by `pylist!` / `pytuple!` / `pydict!`
+/// / `pyset!`.  Each `impl` covers one literal kind; the `PyObjectRef`
+/// passthrough impl lets users mix already-wrapped values with
+/// literals (`pylist![1i64, w_int_new(2), "abc"]`).
+pub trait PywrapKind {
+    fn into_py(self) -> ::pyre_object::PyObjectRef;
+}
+
+impl PywrapKind for i64 {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_int_new(self)
+    }
+}
+impl PywrapKind for i32 {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_int_new(self as i64)
+    }
+}
+impl PywrapKind for u32 {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_int_new(self as i64)
+    }
+}
+impl PywrapKind for usize {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_int_new(self as i64)
+    }
+}
+impl PywrapKind for f64 {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_float_new(self)
+    }
+}
+impl PywrapKind for bool {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_bool_from(self)
+    }
+}
+impl PywrapKind for &str {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_str_new(self)
+    }
+}
+impl PywrapKind for String {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        ::pyre_object::w_str_new(&self)
+    }
+}
+impl PywrapKind for ::pyre_object::PyObjectRef {
+    #[inline]
+    fn into_py(self) -> ::pyre_object::PyObjectRef {
+        self
+    }
 }
 
 /// `raise oefmt(space.w_ValueError, "fmt", args)` equivalent.  Each

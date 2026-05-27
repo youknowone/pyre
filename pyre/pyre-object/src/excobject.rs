@@ -296,7 +296,9 @@ pub const W_EXCEPTION_GC_TYPE_ID: u32 = 31;
 pub const W_EXCEPTION_OBJECT_SIZE: usize = std::mem::size_of::<W_ExceptionObject>();
 
 impl crate::lltype::GcType for W_ExceptionObject {
-    const TYPE_ID: u32 = W_EXCEPTION_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_EXCEPTION_GC_TYPE_ID
+    }
     const SIZE: usize = W_EXCEPTION_OBJECT_SIZE;
 }
 
@@ -1037,7 +1039,7 @@ mod tests {
     fn w_exception_gc_type_id_matches_descr() {
         assert_eq!(W_EXCEPTION_GC_TYPE_ID, 31);
         assert_eq!(
-            <W_ExceptionObject as crate::lltype::GcType>::TYPE_ID,
+            <W_ExceptionObject as crate::lltype::GcType>::type_id(),
             W_EXCEPTION_GC_TYPE_ID
         );
         assert_eq!(

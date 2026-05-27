@@ -120,12 +120,16 @@ pub const W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS: [usize; 1] =
     [std::mem::offset_of!(W_ObjectMutableCell, w_value)];
 
 impl crate::lltype::GcType for W_ObjectMutableCell {
-    const TYPE_ID: u32 = W_OBJECT_MUTABLE_CELL_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_OBJECT_MUTABLE_CELL_GC_TYPE_ID
+    }
     const SIZE: usize = W_OBJECT_MUTABLE_CELL_OBJECT_SIZE;
 }
 
 impl crate::lltype::GcType for W_IntMutableCell {
-    const TYPE_ID: u32 = W_INT_MUTABLE_CELL_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_INT_MUTABLE_CELL_GC_TYPE_ID
+    }
     const SIZE: usize = W_INT_MUTABLE_CELL_OBJECT_SIZE;
 }
 

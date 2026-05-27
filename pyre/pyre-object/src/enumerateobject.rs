@@ -123,7 +123,7 @@ mod tests {
     fn w_enumerate_gc_type_id_matches_descr() {
         assert_eq!(W_ENUMERATE_GC_TYPE_ID, 41);
         assert_eq!(
-            <W_Enumerate as crate::lltype::GcType>::TYPE_ID,
+            <W_Enumerate as crate::lltype::GcType>::type_id(),
             W_ENUMERATE_GC_TYPE_ID
         );
         assert_eq!(

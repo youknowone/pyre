@@ -14,7 +14,15 @@ crate::py_module! {
     },
     functions: {
         // `copyreg.pickle(type, reduce_func, constructor=None)` — register
-        // a pickle reducer.  Stub ignores the call.
-        "pickle" / 3 = |_| Ok(w_none()),
+        // a pickle reducer.  `constructor` is optional, so the stub
+        // accepts both 2- and 3-argument calls.
+        "pickle" / * = |args| {
+            if !(2..=3).contains(&args.len()) {
+                return Err(crate::PyError::type_error(
+                    "pickle() takes 2 or 3 arguments",
+                ));
+            }
+            Ok(w_none())
+        },
     },
 }

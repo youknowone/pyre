@@ -60,28 +60,24 @@ pub fn register_pkg(ns: &mut DictStorage) {
 
 /// importlib.util stub — minimal subset.
 pub fn register_util(ns: &mut DictStorage) {
+    // `importlib.util.spec_from_file_location(name, location, *, ...)`,
+    // `module_from_spec(spec)`, and `find_spec(name, package=None)` —
+    // accept any positional/keyword shape so the stubs do not reject
+    // legitimate call signatures via the arity gate.
     crate::dict_storage_store(
         ns,
         "spec_from_file_location",
-        crate::make_builtin_function_with_arity(
-            "spec_from_file_location",
-            |_| Ok(pyre_object::w_none()),
-            0,
-        ),
+        crate::make_builtin_function("spec_from_file_location", |_| Ok(pyre_object::w_none())),
     );
     crate::dict_storage_store(
         ns,
         "module_from_spec",
-        crate::make_builtin_function_with_arity(
-            "module_from_spec",
-            |_| Ok(pyre_object::w_none()),
-            0,
-        ),
+        crate::make_builtin_function("module_from_spec", |_| Ok(pyre_object::w_none())),
     );
     crate::dict_storage_store(
         ns,
         "find_spec",
-        crate::make_builtin_function_with_arity("find_spec", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function("find_spec", |_| Ok(pyre_object::w_none())),
     );
     crate::dict_storage_store(
         ns,

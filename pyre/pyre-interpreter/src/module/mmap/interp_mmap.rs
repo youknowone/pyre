@@ -185,8 +185,18 @@ fn init_mmap_type(ns: &mut DictStorage) {
             }
             let obj = args[0];
             let (_, len) = mmap_ptr(obj)?;
+            if !unsafe { pyre_object::is_int(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "seek: offset must be an integer",
+                ));
+            }
             let off = unsafe { pyre_object::w_int_get_value(args[1]) };
             let whence = if args.len() >= 3 {
+                if !unsafe { pyre_object::is_int(args[2]) } {
+                    return Err(crate::PyError::type_error(
+                        "seek: whence must be an integer",
+                    ));
+                }
                 unsafe { pyre_object::w_int_get_value(args[2]) }
             } else {
                 0
@@ -392,18 +402,29 @@ fn init_mmap_type(ns: &mut DictStorage) {
                     )));
                 }
             }
-            let off = if args.len() >= 2 {
-                (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize
+            // Read as signed so negative user input does not wrap into
+            // a huge `usize` and underflow the `len - off` subtraction
+            // below (Critical: previously panicked / arbitrary length).
+            let off_raw = if args.len() >= 2 {
+                unsafe { pyre_object::w_int_get_value(args[1]) }
             } else {
                 0
             };
-            let raw_size = if args.len() >= 3 {
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize
+            let raw_size_raw = if args.len() >= 3 {
+                unsafe { pyre_object::w_int_get_value(args[2]) }
             } else {
                 0
             };
+            if off_raw < 0 || raw_size_raw < 0 {
+                return Err(crate::PyError::value_error("flush range out of bounds"));
+            }
+            let off = off_raw as usize;
+            let raw_size = raw_size_raw as usize;
+            if off > len {
+                return Err(crate::PyError::value_error("flush range out of bounds"));
+            }
             let n = if raw_size == 0 { len - off } else { raw_size };
-            if off + n > len {
+            if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
                 return Err(crate::PyError::value_error("flush range out of bounds"));
             }
             let r = unsafe { libc::msync(p.add(off) as *mut libc::c_void, n, libc::MS_SYNC) };
@@ -724,6 +745,13 @@ fn init_mmap_type(ns: &mut DictStorage) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("madvise() requires option"));
             }
+            for (idx, label) in [(1usize, "option"), (2, "start"), (3, "length")] {
+                if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "madvise: {label} must be an integer"
+                    )));
+                }
+            }
             let option = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
             let start: usize = args
                 .get(2)
@@ -944,6 +972,20 @@ fn mmap_construct(
         return Err(crate::PyError::type_error(
             "mmap() requires fileno + length",
         ));
+    }
+    for (idx, label) in [
+        (0usize, "fileno"),
+        (1, "length"),
+        (2, "flags"),
+        (3, "prot"),
+        (4, "access"),
+        (5, "offset"),
+    ] {
+        if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
+            return Err(crate::PyError::type_error(format!(
+                "mmap() {label} must be an integer"
+            )));
+        }
     }
     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
     let length = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::size_t;

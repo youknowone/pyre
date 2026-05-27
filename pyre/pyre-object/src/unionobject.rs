@@ -171,7 +171,7 @@ mod tests {
     fn w_union_gc_type_id_matches_descr() {
         assert_eq!(W_UNION_GC_TYPE_ID, 22);
         assert_eq!(
-            <W_UnionType as crate::lltype::GcType>::TYPE_ID,
+            <W_UnionType as crate::lltype::GcType>::type_id(),
             W_UNION_GC_TYPE_ID
         );
         assert_eq!(

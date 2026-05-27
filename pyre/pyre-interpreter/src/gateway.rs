@@ -524,7 +524,9 @@ pub struct BuiltinCode {
 pub const BUILTIN_CODE_OBJECT_SIZE: usize = std::mem::size_of::<BuiltinCode>();
 
 impl pyre_object::lltype::GcType for BuiltinCode {
-    const TYPE_ID: u32 = BUILTIN_CODE_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        BUILTIN_CODE_GC_TYPE_ID
+    }
     const SIZE: usize = BUILTIN_CODE_OBJECT_SIZE;
 }
 
@@ -712,7 +714,7 @@ mod tests {
     fn builtin_code_gc_type_id_matches_descr() {
         assert_eq!(BUILTIN_CODE_GC_TYPE_ID, 13);
         assert_eq!(
-            <BuiltinCode as pyre_object::lltype::GcType>::TYPE_ID,
+            <BuiltinCode as pyre_object::lltype::GcType>::type_id(),
             BUILTIN_CODE_GC_TYPE_ID
         );
         assert_eq!(

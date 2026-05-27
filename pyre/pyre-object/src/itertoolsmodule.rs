@@ -184,7 +184,7 @@ mod tests {
     fn w_count_gc_type_id_matches_descr() {
         assert_eq!(W_COUNT_GC_TYPE_ID, 24);
         assert_eq!(
-            <W_Count as crate::lltype::GcType>::TYPE_ID,
+            <W_Count as crate::lltype::GcType>::type_id(),
             W_COUNT_GC_TYPE_ID
         );
         assert_eq!(
@@ -197,7 +197,7 @@ mod tests {
     fn w_repeat_gc_type_id_matches_descr() {
         assert_eq!(W_REPEAT_GC_TYPE_ID, 25);
         assert_eq!(
-            <W_Repeat as crate::lltype::GcType>::TYPE_ID,
+            <W_Repeat as crate::lltype::GcType>::type_id(),
             W_REPEAT_GC_TYPE_ID
         );
         assert_eq!(

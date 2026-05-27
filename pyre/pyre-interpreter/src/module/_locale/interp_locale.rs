@@ -171,28 +171,33 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "setlocale",
         crate::make_builtin_function("setlocale", |args| {
+            // Argument contract is shared between host_env and the
+            // no-libc fallback so invalid calls always raise instead of
+            // silently echoing "C".
+            if args.is_empty() || args.len() > 2 {
+                return Err(crate::PyError::type_error(
+                    "setlocale() takes 1 or 2 arguments",
+                ));
+            }
+            if !unsafe { pyre_object::is_int(args[0]) } {
+                return Err(crate::PyError::type_error(
+                    "setlocale: category must be an integer",
+                ));
+            }
+            let locale_str: Option<String> =
+                if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
+                    if !unsafe { pyre_object::is_str(args[1]) } {
+                        return Err(crate::PyError::type_error(
+                            "setlocale: locale must be a string or None",
+                        ));
+                    }
+                    Some(unsafe { pyre_object::w_str_get_value(args[1]).to_string() })
+                } else {
+                    None
+                };
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error("setlocale() missing category"));
-                }
-                if !unsafe { pyre_object::is_int(args[0]) } {
-                    return Err(crate::PyError::type_error(
-                        "setlocale: category must be an integer",
-                    ));
-                }
                 let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                let locale_str: Option<String> =
-                    if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
-                        if !unsafe { pyre_object::is_str(args[1]) } {
-                            return Err(crate::PyError::type_error(
-                                "setlocale: locale must be a string or None",
-                            ));
-                        }
-                        Some(unsafe { pyre_object::w_str_get_value(args[1]).to_string() })
-                    } else {
-                        None
-                    };
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())
@@ -208,10 +213,9 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             #[cfg(not(all(unix, feature = "host_env")))]
             {
-                // No libc available — every category resolves to the
-                // POSIX "C" locale, mirroring what setlocale(LC_*, "C")
-                // returns on a real host.  Pure constant; no I/O.
-                let _ = args;
+                // No libc available — every valid call resolves to the
+                // POSIX "C" locale.  `locale_str` is dropped on purpose.
+                let _ = locale_str;
                 Ok(pyre_object::w_str_new("C"))
             }
         }),
@@ -324,7 +328,15 @@ pub fn register_module(ns: &mut DictStorage) {
         "strxfrm",
         crate::make_builtin_function_with_arity(
             "strxfrm",
-            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_str_new(""))),
+            |args| {
+                let s = args[0];
+                if !unsafe { pyre_object::is_str(s) } {
+                    return Err(crate::PyError::type_error(
+                        "strxfrm() argument must be str",
+                    ));
+                }
+                Ok(s)
+            },
             1,
         ),
     );

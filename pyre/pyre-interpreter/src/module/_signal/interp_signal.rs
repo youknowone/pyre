@@ -7,9 +7,10 @@ use crate::DictStorage;
 // `interp_signal.py:set_wakeup_fd` — stores the configured wakeup fd
 // for read-back via set_wakeup_fd(new) → previous_fd.  Real signal-to-fd
 // delivery is not wired up; this cell is the get/set contract only.
-thread_local! {
-    static WAKEUP_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
-}
+// PyPy keeps this fd process-wide (it lives on the signal action
+// handler, not per Python-thread), so we mirror that with an atomic.
+use std::sync::atomic::{AtomicI32, Ordering};
+static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// _signal module — PyPy: pypy/module/signal/.
 ///
@@ -25,10 +26,15 @@ pub fn register_module(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "signal",
-        crate::make_builtin_function("signal", |args| {
-            // signal(signalnum, handler) — return previous handler (None stub).
-            Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
-        }),
+        crate::make_builtin_function_with_arity(
+            "signal",
+            // signal(signalnum, handler) — pyre does not actually
+            // install handlers, so the "previous handler" is always
+            // SIG_DFL/None.  Returning `handler` would lie about the
+            // prior state and confuse callers that swap+restore.
+            |_| Ok(pyre_object::w_none()),
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -78,7 +84,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
                 ));
             }
-            let prev = WAKEUP_FD.with(|c| c.replace(fd));
+            let prev = WAKEUP_FD.swap(fd, Ordering::SeqCst);
             Ok(pyre_object::w_int_new(prev as i64))
         }),
     );
@@ -210,8 +216,16 @@ pub fn register_module(ns: &mut DictStorage) {
                 "pause",
                 |_| {
                     #[cfg(feature = "host_env")]
-                    rustpython_host_env::signal::pause();
-                    Ok(pyre_object::w_none())
+                    {
+                        rustpython_host_env::signal::pause();
+                        Ok(pyre_object::w_none())
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        Err(crate::PyError::not_implemented(
+                            "signal.pause requires host_env feature",
+                        ))
+                    }
                 },
                 0,
             ),

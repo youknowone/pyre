@@ -660,10 +660,19 @@ thread_local! {
                 object_tid,
                 descr.ptr_offsets.to_vec(),
             ));
-            debug_assert_eq!(
-                tid, descr.gc_type_id,
-                "PyreClassDescriptor::gc_type_id mismatch — adjust `#[pyre_class(type_id = N)]`",
-            );
+            // Auto-id mode (cell == UNASSIGNED): stamp the cell with
+            // the freshly-assigned tid so runtime readers see it.
+            // Explicit-id mode (cell pre-initialized): drift-check that
+            // the declared id matches registration order.
+            if descr.gc_type_id.is_unassigned() {
+                descr.gc_type_id.set(tid);
+            } else {
+                debug_assert_eq!(
+                    tid,
+                    descr.gc_type_id.get(),
+                    "PyreClassDescriptor::gc_type_id mismatch — adjust `#[pyre_class(type_id = N)]` or drop the explicit id",
+                );
+            }
             let pytype_ptr = descr.pytype_ptr as usize;
             majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
             pytype_to_tid.insert(pytype_ptr, tid);

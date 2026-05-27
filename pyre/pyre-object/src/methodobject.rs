@@ -78,7 +78,7 @@ mod tests {
     fn w_method_gc_type_id_matches_descr() {
         assert_eq!(W_METHOD_GC_TYPE_ID, 16);
         assert_eq!(
-            <W_MethodObject as crate::lltype::GcType>::TYPE_ID,
+            <W_MethodObject as crate::lltype::GcType>::type_id(),
             W_METHOD_GC_TYPE_ID
         );
         assert_eq!(

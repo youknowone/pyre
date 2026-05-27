@@ -39,7 +39,9 @@ pub const W_STR_GC_TYPE_ID: u32 = 34;
 pub const W_STR_OBJECT_SIZE: usize = std::mem::size_of::<W_StrObject>();
 
 impl crate::lltype::GcType for W_StrObject {
-    const TYPE_ID: u32 = W_STR_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_STR_GC_TYPE_ID
+    }
     const SIZE: usize = W_STR_OBJECT_SIZE;
 }
 

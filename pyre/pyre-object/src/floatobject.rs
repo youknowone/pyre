@@ -25,7 +25,9 @@ pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 pub const W_FLOAT_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObject>();
 
 impl crate::lltype::GcType for W_FloatObject {
-    const TYPE_ID: u32 = W_FLOAT_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_FLOAT_GC_TYPE_ID
+    }
     const SIZE: usize = W_FLOAT_OBJECT_SIZE;
 }
 

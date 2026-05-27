@@ -57,7 +57,9 @@ pub const W_DICT_VIEW_OBJECT_SIZE: usize = std::mem::size_of::<W_DictView>();
 pub const W_DICT_VIEW_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_W_DICT_OFFSET];
 
 impl crate::lltype::GcType for W_DictView {
-    const TYPE_ID: u32 = W_DICT_VIEW_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_DICT_VIEW_GC_TYPE_ID
+    }
     const SIZE: usize = W_DICT_VIEW_OBJECT_SIZE;
 }
 
@@ -179,7 +181,9 @@ pub const W_DICT_VIEW_ITERATOR_OBJECT_SIZE: usize = std::mem::size_of::<W_DictVi
 pub const W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_ITER_W_DICT_OFFSET];
 
 impl crate::lltype::GcType for W_DictViewIterator {
-    const TYPE_ID: u32 = W_DICT_VIEW_ITERATOR_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_DICT_VIEW_ITERATOR_GC_TYPE_ID
+    }
     const SIZE: usize = W_DICT_VIEW_ITERATOR_OBJECT_SIZE;
 }
 

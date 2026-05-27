@@ -35,7 +35,9 @@ pub const W_GENERATOR_GC_TYPE_ID: u32 = 32;
 pub const W_GENERATOR_OBJECT_SIZE: usize = std::mem::size_of::<W_GeneratorObject>();
 
 impl crate::lltype::GcType for W_GeneratorObject {
-    const TYPE_ID: u32 = W_GENERATOR_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_GENERATOR_GC_TYPE_ID
+    }
     const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
 }
 
@@ -99,7 +101,7 @@ mod tests {
     fn w_generator_gc_type_id_matches_descr() {
         assert_eq!(W_GENERATOR_GC_TYPE_ID, 32);
         assert_eq!(
-            <W_GeneratorObject as crate::lltype::GcType>::TYPE_ID,
+            <W_GeneratorObject as crate::lltype::GcType>::type_id(),
             W_GENERATOR_GC_TYPE_ID
         );
         assert_eq!(

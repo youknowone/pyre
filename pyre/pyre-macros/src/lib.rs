@@ -167,7 +167,9 @@ fn rewrite_alias_args(sig: &mut syn::Signature) {
         let FnArg::Typed(pt) = arg else { continue };
         let ty = unwrap_type_group(&pt.ty);
         let Type::Path(p) = ty else { continue };
-        let Some(seg) = p.path.segments.last() else { continue };
+        let Some(seg) = p.path.segments.last() else {
+            continue;
+        };
         if let Some(binding_ty) = typed_alias_binding_ty(&seg.ident.to_string()) {
             pt.ty = Box::new(syn::parse2(binding_ty).expect("alias binding ty parses"));
         }
@@ -246,6 +248,19 @@ fn typed_alias(
         "PyPath" => (
             quote! { ::std::string::String },
             quote! { crate::gateway::fsencode_w(args[#idx])? },
+        ),
+        "PyIndex" => (
+            // Mirrors PyPy `space.getindex_w(w_obj)` / `space_index` in
+            // baseobjspace.rs.  Consults `__index__` per PEP 357 and
+            // returns the underlying i64.  Raises TypeError when the
+            // object has no `__index__` and is not already int-like.
+            quote! { i64 },
+            quote! {
+                {
+                    let __obj = crate::baseobjspace::space_index(args[#idx])?;
+                    unsafe { ::pyre_object::w_int_get_value(__obj) }
+                }
+            },
         ),
         _ => return None,
     })
@@ -421,7 +436,14 @@ fn wrap_value_expr(
                 "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
                 _ => {}
             }
-            // `Vec<u8>` — bytes.  Borrow then wrap via `w_bytes_from_bytes`.
+            // `Vec<T>` — bytes / list-of-X.
+            //   * `Vec<u8>`                        → bytes via w_bytes_from_bytes
+            //   * `Vec<PyObjectRef>`               → list passthrough
+            //   * `Vec<i64> / <i32> / <f64> / <String> / <bool>` →
+            //     wrap each element via `PywrapKind` then `w_list_new`.
+            // Mirrors PyPy `space.newlist([space.newint(x) for x in vec])`
+            // where the interp2app auto-wraps a Rust `[W_Root]` return
+            // through `space.newlist`.
             if seg.ident == "Vec" {
                 if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
                     if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
@@ -431,6 +453,34 @@ fn wrap_value_expr(
                                 return Ok(quote! {
                                     ::pyre_object::bytesobject::w_bytes_from_bytes(&#value)
                                 });
+                            }
+                            if type_is_py_object_ref(inner) {
+                                return Ok(quote! { ::pyre_object::w_list_new(#value) });
+                            }
+                            if let Some(last) = ip.path.segments.last() {
+                                let nm = last.ident.to_string();
+                                if matches!(
+                                    nm.as_str(),
+                                    "i64"
+                                        | "i32"
+                                        | "u32"
+                                        | "usize"
+                                        | "isize"
+                                        | "u16"
+                                        | "i16"
+                                        | "i8"
+                                        | "f64"
+                                        | "bool"
+                                        | "String"
+                                ) {
+                                    return Ok(quote! {
+                                        ::pyre_object::w_list_new(
+                                            (#value).into_iter()
+                                                .map(<_ as crate::PywrapKind>::into_py)
+                                                .collect()
+                                        )
+                                    });
+                                }
                             }
                         }
                     }
@@ -607,7 +657,13 @@ pub fn pyre_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 struct PyreClassAttrs {
     name: syn::LitStr,
-    type_id: syn::LitInt,
+    /// Optional explicit `type_id = N`.  When `Some`, the macro emits
+    /// the legacy `pub const W_X_GC_TYPE_ID: u32 = N;` alias and the
+    /// runtime cell starts pre-initialized to `N` so the JIT driver
+    /// can drift-check it.  When `None`, no const is emitted and the
+    /// cell starts at `TypeIdCell::UNASSIGNED`; the JIT driver writes
+    /// the next available tid back into it.
+    type_id: Option<syn::LitInt>,
     /// Optional override for the upper-case suffix used in derived
     /// static / const names.  Defaults to `strip_prefix("W_")` over
     /// the struct ident, but legacy classes like `W_SuperObject` (which
@@ -626,13 +682,16 @@ struct PyreClassAttrs {
 
 impl syn::parse::Parse for PyreClassAttrs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `"name.path", type_id = N [, static_name = "PREFIX"]`
+        // `"name.path"[, type_id = N][, static_name = "PREFIX"]`
         let name: syn::LitStr = input.parse()?;
-        input.parse::<syn::Token![,]>()?;
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
         let mut pytype_static: Option<syn::LitStr> = None;
-        loop {
+        while !input.is_empty() {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
             let key: syn::Ident = input.parse()?;
             input.parse::<syn::Token![=]>()?;
             match key.to_string().as_str() {
@@ -649,17 +708,7 @@ impl syn::parse::Parse for PyreClassAttrs {
                     ));
                 }
             }
-            if input.is_empty() {
-                break;
-            }
-            input.parse::<syn::Token![,]>()?;
-            if input.is_empty() {
-                break;
-            }
         }
-        let type_id = type_id.ok_or_else(|| {
-            syn::Error::new(name.span(), "`#[pyre_class]` requires `type_id = N`")
-        })?;
         Ok(Self {
             name,
             type_id,
@@ -676,7 +725,6 @@ fn expand_pyre_class(
     let st_name = st.ident.clone();
     let st_vis = st.vis.clone();
     let name_lit = attrs.name;
-    let type_id_lit = attrs.type_id;
 
     // Derive static names from the struct name.
     //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
@@ -693,9 +741,28 @@ fn expand_pyre_class(
         None => format_ident!("{}_TYPE", suffix),
     };
     let gc_type_id_const = format_ident!("W_{}_GC_TYPE_ID", suffix);
+    let gc_type_id_cell = format_ident!("W_{}_GC_TYPE_ID_CELL", suffix);
     let object_size_const = format_ident!("W_{}_OBJECT_SIZE", suffix);
     let ptr_offsets_const = format_ident!("W_{}_GC_PTR_OFFSETS", suffix);
     let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
+
+    // When the user declared `type_id = N` we pre-initialize the cell
+    // to `N` and additionally emit the legacy `pub const W_X_GC_TYPE_ID:
+    // u32 = N;` alias so existing consumers (pyre-jit-trace,
+    // drift-detection unit tests) keep compiling.  When the user
+    // omitted `type_id`, the cell starts unassigned and the legacy
+    // const is not emitted — callers must read the cell at runtime via
+    // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
+    let (cell_init, legacy_const) = match attrs.type_id.as_ref() {
+        Some(n) => (
+            quote! { ::pyre_object::lltype::TypeIdCell::with(#n) },
+            quote! { #st_vis const #gc_type_id_const: u32 = #n; },
+        ),
+        None => (
+            quote! { ::pyre_object::lltype::TypeIdCell::auto() },
+            quote! {},
+        ),
+    };
 
     // Enforce `#[repr(C)]` and prepend the PyObject header.
     let already_repr_c = st.attrs.iter().any(|a| {
@@ -753,14 +820,23 @@ fn expand_pyre_class(
         #st_vis static #pytype_static: ::pyre_object::PyType =
             ::pyre_object::pyobject::new_pytype(#name_lit);
 
-        #st_vis const #gc_type_id_const: u32 = #type_id_lit;
+        /// Runtime-resolved GC tid for this class.  Initialized either
+        /// to the explicit `type_id = N` from the attribute (drift-
+        /// checked at JIT init) or to `TypeIdCell::UNASSIGNED` for
+        /// auto-mode (then stamped by the JIT driver).
+        #st_vis static #gc_type_id_cell: ::pyre_object::lltype::TypeIdCell =
+            #cell_init;
+        #legacy_const
         #st_vis const #object_size_const: usize = ::std::mem::size_of::<#st_name>();
         #st_vis const #ptr_offsets_const: [usize; #ptr_offsets_len] = [
             #(#ptr_offsets_inits),*
         ];
 
         impl ::pyre_object::lltype::GcType for #st_name {
-            const TYPE_ID: u32 = #gc_type_id_const;
+            #[inline]
+            fn type_id() -> u32 {
+                #gc_type_id_cell.get()
+            }
             const SIZE: usize = #object_size_const;
         }
 
@@ -771,7 +847,7 @@ fn expand_pyre_class(
         #st_vis static #descriptor_static: ::pyre_object::lltype::PyreClassDescriptor =
             ::pyre_object::lltype::PyreClassDescriptor {
                 pytype_ptr: &#pytype_static as *const ::pyre_object::PyType,
-                gc_type_id: #gc_type_id_const,
+                gc_type_id: &#gc_type_id_cell,
                 object_size: #object_size_const,
                 ptr_offsets: &#ptr_offsets_const,
             };
@@ -937,8 +1013,7 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
         } else if a.path().is_ident("classmethod") {
             Some(MethodKind::Class)
         } else if a.path().is_ident("getter") {
-            let py_name = attr_string_arg(a)?
-                .unwrap_or_else(|| m.sig.ident.to_string());
+            let py_name = attr_string_arg(a)?.unwrap_or_else(|| m.sig.ident.to_string());
             Some(MethodKind::Getter(py_name))
         } else if a.path().is_ident("setter") {
             let fn_name = m.sig.ident.to_string();
@@ -1030,6 +1105,30 @@ fn expand_pyre_methods(
         ));
     }
     let self_ty = (*imp.self_ty).clone();
+
+    // Auto-synthesize `__new__` when the user wrote `__init__` but no
+    // `__new__`.  Mirrors PyPy `TypeDef` behavior where a class without
+    // an explicit `__new__` inherits `object.__new__` which allocates a
+    // zero-initialized instance.  Requires the user struct to implement
+    // `Default` (typically via `#[derive(Default)]` — `PyObject` itself
+    // derives `Default` so the auto-derive resolves).
+    let has_init = imp
+        .items
+        .iter()
+        .any(|i| matches!(i, ImplItem::Fn(f) if f.sig.ident == "__init__"));
+    let has_new = imp
+        .items
+        .iter()
+        .any(|i| matches!(i, ImplItem::Fn(f) if f.sig.ident == "__new__"));
+    if has_init && !has_new {
+        let synth: ImplItem = parse_quote! {
+            #[staticmethod]
+            fn __new__(_cls: ::pyre_object::PyObjectRef) -> ::pyre_object::PyObjectRef {
+                <#self_ty>::allocate(<#self_ty as ::std::default::Default>::default())
+            }
+        };
+        imp.items.push(synth);
+    }
 
     // Collect (python_name, wrapper_ident) per method as we rewrite the
     // impl block in-place: every `fn name(&self|&mut self, …)` keeps
@@ -1237,10 +1336,22 @@ fn expand_pyre_methods(
                 });
             }
             MethodKind::Getter(prop_name) => {
-                record_property(&mut properties, prop_name.clone(), Some(wrapper_name.clone()), None, m)?;
+                record_property(
+                    &mut properties,
+                    prop_name.clone(),
+                    Some(wrapper_name.clone()),
+                    None,
+                    m,
+                )?;
             }
             MethodKind::Setter(prop_name) => {
-                record_property(&mut properties, prop_name.clone(), None, Some(wrapper_name.clone()), m)?;
+                record_property(
+                    &mut properties,
+                    prop_name.clone(),
+                    None,
+                    Some(wrapper_name.clone()),
+                    m,
+                )?;
             }
         }
     }

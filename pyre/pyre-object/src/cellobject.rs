@@ -103,7 +103,7 @@ mod tests {
     fn w_cell_gc_type_id_matches_descr() {
         assert_eq!(W_CELL_GC_TYPE_ID, 15);
         assert_eq!(
-            <W_CellObject as crate::lltype::GcType>::TYPE_ID,
+            <W_CellObject as crate::lltype::GcType>::type_id(),
             W_CELL_GC_TYPE_ID
         );
         assert_eq!(

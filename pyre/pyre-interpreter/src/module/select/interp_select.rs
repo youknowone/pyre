@@ -67,8 +67,8 @@ pub fn register_module(ns: &mut DictStorage) {
                                             "argument must be an int, or have a fileno() method",
                                         )
                                     })?;
-                                let res = crate::baseobjspace::call_function(fileno, &[]);
-                                if res.is_null() || !pyre_object::is_int(res) {
+                                let res = crate::call::call_function_impl_result(fileno, &[])?;
+                                if !pyre_object::is_int(res) {
                                     return Err(crate::PyError::type_error(
                                         "fileno() must return an integer",
                                     ));
@@ -78,6 +78,11 @@ pub fn register_module(ns: &mut DictStorage) {
                             if fd_val < 0 {
                                 return Err(crate::PyError::value_error(
                                     "file descriptor cannot be a negative integer",
+                                ));
+                            }
+                            if fd_val > i32::MAX as i64 {
+                                return Err(crate::PyError::overflow_error(
+                                    "file descriptor out of range",
                                 ));
                             }
                             out.push((item, fd_val as i32));

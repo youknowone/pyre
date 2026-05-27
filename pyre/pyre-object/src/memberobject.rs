@@ -64,7 +64,7 @@ mod tests {
     fn w_member_gc_type_id_matches_descr() {
         assert_eq!(W_MEMBER_GC_TYPE_ID, 26);
         assert_eq!(
-            <W_MemberDescr as crate::lltype::GcType>::TYPE_ID,
+            <W_MemberDescr as crate::lltype::GcType>::type_id(),
             W_MEMBER_GC_TYPE_ID
         );
         assert_eq!(

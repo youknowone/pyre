@@ -53,7 +53,9 @@ pub const W_DICT_PROXY_GC_PTR_OFFSETS: [usize; 1] =
     [std::mem::offset_of!(W_DictProxyObject, w_mapping)];
 
 impl crate::lltype::GcType for W_DictProxyObject {
-    const TYPE_ID: u32 = W_DICT_PROXY_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_DICT_PROXY_GC_TYPE_ID
+    }
     const SIZE: usize = W_DICT_PROXY_OBJECT_SIZE;
 }
 
@@ -108,7 +110,7 @@ mod tests {
     fn w_dict_proxy_gc_type_id_matches_descr() {
         assert_eq!(W_DICT_PROXY_GC_TYPE_ID, 38);
         assert_eq!(
-            <W_DictProxyObject as crate::lltype::GcType>::TYPE_ID,
+            <W_DictProxyObject as crate::lltype::GcType>::type_id(),
             W_DICT_PROXY_GC_TYPE_ID
         );
         assert_eq!(

@@ -60,7 +60,7 @@ mod tests {
     fn w_slice_gc_type_id_matches_descr() {
         assert_eq!(W_SLICE_GC_TYPE_ID, 17);
         assert_eq!(
-            <W_SliceObject as crate::lltype::GcType>::TYPE_ID,
+            <W_SliceObject as crate::lltype::GcType>::type_id(),
             W_SLICE_GC_TYPE_ID
         );
         assert_eq!(

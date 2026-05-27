@@ -88,8 +88,13 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "permutations",
         crate::make_builtin_function("permutations", |args| {
+            // `interp_itertools.py W_Permutations.__init__` — iterable
+            // is required; missing argument is a TypeError, not an
+            // empty result that silently hides call-site bugs.
             if args.is_empty() {
-                return Ok(pyre_object::w_list_new(vec![]));
+                return Err(crate::PyError::type_error(
+                    "permutations() missing required argument 'iterable'",
+                ));
             }
             let pool = crate::builtins::collect_iterable(args[0])?;
             let n = pool.len();
@@ -181,10 +186,39 @@ pub fn register_module(ns: &mut DictStorage) {
         ns,
         "product",
         crate::make_builtin_function("product", |args| {
-            let pools: Vec<Vec<_>> = args
+            // `interp_itertools.py W_Product.__init__` —
+            // `product(*iterables, repeat=1)`.  The kwarg arrives via
+            // the trailing `__pyre_kw__` dict, mirroring how
+            // `enumerate`/`zip` extract their kwargs in this module.
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
+            let repeat = match crate::builtins::kwarg_get(kwargs, "repeat") {
+                Some(w) => unsafe {
+                    if !pyre_object::is_int(w) {
+                        return Err(crate::PyError::type_error(
+                            "product() 'repeat' argument must be an integer",
+                        ));
+                    }
+                    pyre_object::w_int_get_value(w)
+                },
+                None => 1,
+            };
+            if repeat < 0 {
+                return Err(crate::PyError::value_error(
+                    "repeat argument cannot be negative",
+                ));
+            }
+            let base_pools: Vec<Vec<_>> = positional
                 .iter()
                 .map(|&a| crate::builtins::collect_iterable(a))
                 .collect::<Result<_, _>>()?;
+            let mut pools: Vec<Vec<pyre_object::PyObjectRef>> =
+                Vec::with_capacity(base_pools.len() * (repeat as usize));
+            for _ in 0..repeat {
+                for p in &base_pools {
+                    pools.push(p.clone());
+                }
+            }
             let mut result: Vec<Vec<pyre_object::PyObjectRef>> = vec![vec![]];
             for pool in &pools {
                 let mut new_result = Vec::with_capacity(result.len() * pool.len());

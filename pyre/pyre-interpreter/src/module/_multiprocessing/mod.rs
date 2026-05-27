@@ -34,18 +34,38 @@ crate::py_class! {
                 return Err(crate::PyError::value_error("SemLock handle is null"));
             }
             let blocking = blocking.map(|v| v != 0).unwrap_or(true);
+            // PEP 475 — sem_wait/sem_trywait retry on EINTR; otherwise
+            // EAGAIN (only meaningful for trywait) yields False and the
+            // remaining errnos propagate as OSError instead of being
+            // silently mapped to False.
             if blocking {
-                let r = unsafe { libc::sem_wait(handle) };
-                if r != 0 {
-                    return Err(crate::PyError::os_error_with_errno(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                        "sem_wait",
-                    ));
+                loop {
+                    let r = unsafe { libc::sem_wait(handle) };
+                    if r == 0 {
+                        break;
+                    }
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno == libc::EINTR {
+                        continue;
+                    }
+                    return Err(crate::PyError::os_error_with_errno(errno, "sem_wait"));
                 }
                 Ok(true)
             } else {
-                let r = unsafe { libc::sem_trywait(handle) };
-                Ok(r == 0)
+                loop {
+                    let r = unsafe { libc::sem_trywait(handle) };
+                    if r == 0 {
+                        return Ok(true);
+                    }
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno == libc::EINTR {
+                        continue;
+                    }
+                    if errno == libc::EAGAIN {
+                        return Ok(false);
+                    }
+                    return Err(crate::PyError::os_error_with_errno(errno, "sem_trywait"));
+                }
             }
         }
         fn release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
@@ -115,7 +135,10 @@ crate::py_module! {
                 ns,
                 "_SemLock_new",
                 crate::make_builtin_function("_SemLock_new", |args| {
-                    if args.len() < 5 {
+                    // Fail fast on arity mismatch: declared signature is
+                    // (kind, value, maxvalue, name, unlink) with no
+                    // optional/positional spillover.
+                    if args.len() != 5 {
                         return Err(crate::PyError::type_error(
                             "SemLock() needs (kind, value, maxvalue, name, unlink)",
                         ));
@@ -134,8 +157,12 @@ crate::py_module! {
                         rustpython_host_env::multiprocessing::SemHandle::create(&name, value, unlink)
                             .map_err(|_| crate::PyError::os_error("SemLock create failed"))?;
                     let raw = handle.as_ptr();
-                    // Leak the wrapper so its Drop doesn't close the fd —
-                    // sem_close runs manually when the instance dies.
+                    // SemHandle::Drop closes the sem fd; we cannot let
+                    // it run yet because the Python instance still
+                    // holds the raw pointer.  The handle currently
+                    // leaks per process — a typed-payload migration
+                    // (#31-style) would attach a __finalize__ that
+                    // calls sem_close on instance death.
                     core::mem::forget(handle);
                     let obj = w_instance_new(type_object());
                     let d = crate::baseobjspace::getdict(obj);

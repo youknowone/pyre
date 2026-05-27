@@ -152,7 +152,9 @@ pub const W_TYPE_GC_TYPE_ID: u32 = 33;
 pub const W_TYPE_OBJECT_SIZE: usize = std::mem::size_of::<W_TypeObject>();
 
 impl crate::lltype::GcType for W_TypeObject {
-    const TYPE_ID: u32 = W_TYPE_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_TYPE_GC_TYPE_ID
+    }
     const SIZE: usize = W_TYPE_OBJECT_SIZE;
 }
 
@@ -667,7 +669,7 @@ mod tests {
     fn w_type_gc_type_id_matches_descr() {
         assert_eq!(W_TYPE_GC_TYPE_ID, 33);
         assert_eq!(
-            <W_TypeObject as crate::lltype::GcType>::TYPE_ID,
+            <W_TypeObject as crate::lltype::GcType>::type_id(),
             W_TYPE_GC_TYPE_ID
         );
         assert_eq!(

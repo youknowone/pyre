@@ -30,7 +30,9 @@ impl crate::lltype::GcType for W_BoolObject {
     /// anchor for the GC registration's `debug_assert_eq!(_, SIZE)` so
     /// the singleton struct layout cannot drift from the registered
     /// type info.
-    const TYPE_ID: u32 = 5;
+    fn type_id() -> u32 {
+        5
+    }
     const SIZE: usize = W_BOOL_OBJECT_SIZE;
 }
 

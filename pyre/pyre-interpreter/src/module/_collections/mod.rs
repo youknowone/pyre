@@ -50,12 +50,14 @@ mod deque_class {
                     }
                 }
             }
-            fn pop(self_obj: PyObjectRef) -> PyObjectRef {
-                let Some(d) = data(self_obj) else { return w_none() };
+            fn pop(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `interp_deque.py W_Deque.pop` — empty raises IndexError.
+                let d = data(self_obj).ok_or_else(||
+                    crate::PyError::index_error("pop from an empty deque"))?;
                 unsafe {
                     let n = w_list_len(d);
                     if n == 0 {
-                        return w_none();
+                        return Err(crate::PyError::index_error("pop from an empty deque"));
                     }
                     let item = w_list_getitem(d, (n - 1) as i64).unwrap_or(w_none());
                     let items: Vec<_> = (0..n - 1)
@@ -63,15 +65,17 @@ mod deque_class {
                         .collect();
                     let _ = crate::baseobjspace::setattr(
                         self_obj, "__data__", w_list_new(items));
-                    item
+                    Ok(item)
                 }
             }
-            fn popleft(self_obj: PyObjectRef) -> PyObjectRef {
-                let Some(d) = data(self_obj) else { return w_none() };
+            fn popleft(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `interp_deque.py W_Deque.popleft` — empty raises IndexError.
+                let d = data(self_obj).ok_or_else(||
+                    crate::PyError::index_error("pop from an empty deque"))?;
                 unsafe {
                     let n = w_list_len(d);
                     if n == 0 {
-                        return w_none();
+                        return Err(crate::PyError::index_error("pop from an empty deque"));
                     }
                     let item = w_list_getitem(d, 0).unwrap_or(w_none());
                     let items: Vec<_> = (1..n)
@@ -79,7 +83,7 @@ mod deque_class {
                         .collect();
                     let _ = crate::baseobjspace::setattr(
                         self_obj, "__data__", w_list_new(items));
-                    item
+                    Ok(item)
                 }
             }
             fn clear(self_obj: PyObjectRef) {
@@ -131,27 +135,26 @@ mod defaultdict_class {
                     self_obj, "default_factory", factory.unwrap_or(w_none()));
                 let _ = crate::baseobjspace::setattr(self_obj, "__data__", w_dict_new());
             }
-            fn __getitem__(self_obj: PyObjectRef, key: PyObjectRef) -> PyObjectRef {
-                let Ok(d) = crate::baseobjspace::getattr(self_obj, "__data__") else {
-                    return w_none();
-                };
+            fn __getitem__(self_obj: PyObjectRef, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `interp_defaultdict.py W_DefaultDict.missing` — present key
+                // returns stored value; missing key + no factory raises
+                // KeyError(key); missing key + factory invokes the factory
+                // and stores the result.
+                let d = crate::baseobjspace::getattr(self_obj, "__data__")
+                    .map_err(|_| crate::PyError::key_error_with_key(key))?;
                 unsafe {
                     if let Some(v) = w_dict_lookup(d, key) {
-                        return v;
+                        return Ok(v);
                     }
                 }
-                let Ok(factory) = crate::baseobjspace::getattr(self_obj, "default_factory") else {
-                    return w_none();
-                };
-                if !factory.is_null() && !unsafe { is_none(factory) } {
-                    // factory invocation needs frame-level call infra;
-                    // store None as a placeholder so subsequent reads
-                    // are idempotent (matches PyPy `__missing__` returning None).
-                    let default = w_none();
-                    unsafe { w_dict_store(d, key, default) };
-                    return default;
+                let factory = crate::baseobjspace::getattr(self_obj, "default_factory")
+                    .unwrap_or_else(|_| w_none());
+                if factory.is_null() || unsafe { is_none(factory) } {
+                    return Err(crate::PyError::key_error_with_key(key));
                 }
-                w_none()
+                let value = crate::call::call_function_impl_result(factory, &[])?;
+                unsafe { w_dict_store(d, key, value) };
+                Ok(value)
             }
             fn __setitem__(self_obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
                 if let Ok(d) = crate::baseobjspace::getattr(self_obj, "__data__") {
@@ -168,6 +171,8 @@ crate::py_module! {
         "deque"           => deque_class::type_object(),
         "_deque_iterator" => crate::typedef::w_object(),
         "defaultdict"     => defaultdict_class::type_object(),
-        "OrderedDict"     => crate::typedef::w_type(),
+        // `OrderedDict` is a dict subclass; alias to the dict type
+        // object so `isinstance(d, OrderedDict)` matches dict instances.
+        "OrderedDict"     => crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE),
     },
 }

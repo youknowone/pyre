@@ -7,6 +7,13 @@
 //! empty lists; the DEBUG_* constants match CPython values.
 
 use pyre_object::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// `interp_gc.py` tracks a process-wide `enabled` flag on the GC
+/// frontend; pyre has no generational threshold knob, but
+/// `gc.isenabled()` should reflect the most recent `enable`/`disable`
+/// call so callers that toggle and re-read the state stay consistent.
+static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 
 crate::py_module! {
     "gc",
@@ -24,9 +31,9 @@ crate::py_module! {
         // upstream.  MethodCache / MapAttrCache clears (`:14-17`) skipped
         // because pyre has no equivalent caches.
         "collect"       / 1 = |_| { gc_hook::try_gc_collect(); Ok(w_int_new(0)) },
-        "disable"       / 0 = |_| Ok(w_none()),
-        "enable"        / 0 = |_| Ok(w_none()),
-        "isenabled"     / 0 = |_| Ok(w_bool_from(false)),
+        "disable"       / 0 = |_| { GC_ENABLED.store(false, Ordering::Relaxed); Ok(w_none()) },
+        "enable"        / 0 = |_| { GC_ENABLED.store(true, Ordering::Relaxed); Ok(w_none()) },
+        "isenabled"     / 0 = |_| Ok(w_bool_from(GC_ENABLED.load(Ordering::Relaxed))),
         "get_objects"   / 1 = |_| Ok(w_list_new(vec![])),
         "get_referrers" / * = |_| Ok(w_list_new(vec![])),
         "get_referents" / * = |_| Ok(w_list_new(vec![])),

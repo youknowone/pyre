@@ -89,13 +89,23 @@ pub fn register_module(ns: &mut DictStorage) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getgrgid() missing argument"));
                 }
-                // `Modules/grpmodule.c grp_getgrgid` — accept any
-                // python int (including bigint) via int_w; reject
-                // floats as TypeError.  PyPy's `lib_pypy/grp.py`
-                // forwards directly through ctypes which would
-                // do the same conversion.
+                // `Modules/grpmodule.c grp_getgrgid` routes through
+                // `_Py_Gid_Converter`, which permits `-1` as a sentinel
+                // and rejects other out-of-range values rather than
+                // silently truncating.  Mirror that here so a Python
+                // bigint that doesn't fit in `gid_t` raises OverflowError.
                 let val = crate::baseobjspace::int_w(args[0])?;
-                let gid = val as libc::gid_t;
+                let gid_min = libc::gid_t::MIN as i64;
+                let gid_max = libc::gid_t::MAX as i64;
+                let gid = if val == -1 {
+                    libc::gid_t::MAX
+                } else if (gid_min..=gid_max).contains(&val) {
+                    val as libc::gid_t
+                } else {
+                    return Err(crate::PyError::overflow_error(
+                        "getgrgid: gid is out of range",
+                    ));
+                };
                 #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::grp::getgrgid(gid) {

@@ -17,9 +17,9 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function("fcntl", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if args.len() < 2 {
+                if !(2..=3).contains(&args.len()) {
                     return Err(crate::PyError::type_error(
-                        "fcntl() requires at least 2 arguments",
+                        "fcntl() takes 2 or 3 arguments",
                     ));
                 }
                 if !unsafe { pyre_object::is_int(args[0]) }
@@ -60,9 +60,9 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function("ioctl", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if args.len() < 2 {
+                if !(2..=3).contains(&args.len()) {
                     return Err(crate::PyError::type_error(
-                        "ioctl() requires at least 2 arguments",
+                        "ioctl() takes 2 or 3 arguments",
                     ));
                 }
                 if !unsafe { pyre_object::is_int(args[0]) }
@@ -143,9 +143,9 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function("lockf", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if args.len() < 2 {
+                if !(2..=5).contains(&args.len()) {
                     return Err(crate::PyError::type_error(
-                        "lockf() requires at least 2 arguments",
+                        "lockf() takes from 2 to 5 arguments",
                     ));
                 }
                 for (i, &a) in args.iter().enumerate().take(5) {

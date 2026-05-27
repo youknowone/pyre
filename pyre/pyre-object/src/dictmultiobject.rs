@@ -394,7 +394,9 @@ pub const W_DICT_GC_TYPE_ID: u32 = 29;
 pub const W_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_DictObject>();
 
 impl crate::lltype::GcType for W_DictObject {
-    const TYPE_ID: u32 = W_DICT_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_DICT_GC_TYPE_ID
+    }
     const SIZE: usize = W_DICT_OBJECT_SIZE;
 }
 
@@ -731,7 +733,9 @@ pub const W_MODULE_DICT_STORAGE_PROXY_OFFSET: usize =
     std::mem::offset_of!(W_ModuleDictObject, dict_storage_proxy);
 
 impl crate::lltype::GcType for W_ModuleDictObject {
-    const TYPE_ID: u32 = W_MODULE_DICT_GC_TYPE_ID;
+    fn type_id() -> u32 {
+        W_MODULE_DICT_GC_TYPE_ID
+    }
     const SIZE: usize = W_MODULE_DICT_OBJECT_SIZE;
 }
 
@@ -3006,7 +3010,7 @@ mod tests {
     fn w_dict_gc_type_id_matches_descr() {
         assert_eq!(W_DICT_GC_TYPE_ID, 29);
         assert_eq!(
-            <W_DictObject as crate::lltype::GcType>::TYPE_ID,
+            <W_DictObject as crate::lltype::GcType>::type_id(),
             W_DICT_GC_TYPE_ID
         );
         assert_eq!(
@@ -3127,7 +3131,7 @@ mod tests {
         // that `pyre/pyre-jit/src/eval.rs` asserts at JitDriver init.
         assert_eq!(W_MODULE_DICT_GC_TYPE_ID, 48);
         assert_eq!(
-            <W_ModuleDictObject as crate::lltype::GcType>::TYPE_ID,
+            <W_ModuleDictObject as crate::lltype::GcType>::type_id(),
             W_MODULE_DICT_GC_TYPE_ID
         );
         assert_eq!(

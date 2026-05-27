@@ -213,7 +213,7 @@ mod seq_iter_tests {
     fn w_seq_iter_gc_type_id_matches_descr() {
         assert_eq!(W_SEQ_ITER_GC_TYPE_ID, 23);
         assert_eq!(
-            <W_SeqIterator as crate::lltype::GcType>::TYPE_ID,
+            <W_SeqIterator as crate::lltype::GcType>::type_id(),
             W_SEQ_ITER_GC_TYPE_ID
         );
         assert_eq!(

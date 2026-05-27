@@ -10,7 +10,7 @@ use pyre_object::*;
 
 #[cfg(all(unix, feature = "host_env"))]
 fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(crate::PyError::type_error(
             "shm_open() requires (path, flags[, mode])",
         ));
