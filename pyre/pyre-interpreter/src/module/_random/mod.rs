@@ -52,10 +52,14 @@ impl W_Random {
         self.state = xorshift(self.state);
         (self.state as f64) / (u64::MAX as f64)
     }
-    fn getrandbits(&mut self, #[default(32u32)] k: u32) -> i64 {
+    fn getrandbits(&mut self, #[default(32i64)] k: i64) -> Result<i64, crate::PyError> {
+        if k < 0 {
+            crate::bail_value_error!("number of bits must be non-negative");
+        }
         self.state = xorshift(self.state);
+        let k = k as u32;
         let mask = if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
-        (self.state & mask) as i64
+        Ok((self.state & mask) as i64)
     }
     fn getstate(&self) -> PyObjectRef {
         w_tuple_new(vec![w_int_new(self.state as i64)])

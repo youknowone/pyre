@@ -460,6 +460,56 @@ macro_rules! pyre_module_init {
     };
 }
 
+/// `raise oefmt(space.w_ValueError, "fmt", args)` equivalent.  Each
+/// `bail_*_error!` expands to `return Err(crate::PyError::*_error(
+/// format!(...)))`, mirroring PyPy's `oefmt` short-circuit that
+/// constructs an `OperationError` and raises it in one line.
+///
+/// ```ignore
+/// bail_value_error!("expected positive int, got {n}");
+/// bail_type_error!("expected str, got {}", typename);
+/// ```
+#[macro_export]
+macro_rules! bail_value_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::value_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_type_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::type_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_attr_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::attribute_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_key_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::key_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_index_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::index_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_runtime_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::runtime_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_os_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::os_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_overflow_error {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::overflow_error(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_zero_division {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::zero_division(format!($($t)+))) };
+}
+#[macro_export]
+macro_rules! bail_not_implemented {
+    ($($t:tt)+) => { return ::std::result::Result::Err($crate::PyError::not_implemented(format!($($t)+))) };
+}
+
 // ── Re-exports ──
 pub use baseobjspace::*;
 pub use builtins::*;
