@@ -902,6 +902,14 @@ impl syn::parse::Parse for PyreMethodsAttrs {
     }
 }
 
+// PyPy `interp_attrproperty('state', cls=W_X, wrapfn=newint)`
+// (`typedef.py:485`) is the read-only-field exposure helper.  The
+// `#[getter]` / `#[setter]` machinery below covers the exact same
+// ground in one line per slot — `#[getter] fn state(&self) -> i64
+// { self.state as i64 }` — without a separate alias.  Documented
+// here so future reviewers don't reintroduce `interp_attrproperty`
+// as its own macro: there is no syntactic gap left to close.
+
 #[derive(Clone)]
 enum MethodKind {
     Instance,

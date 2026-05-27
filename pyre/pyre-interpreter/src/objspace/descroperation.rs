@@ -984,7 +984,14 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 },
             );
         }
-        // Instance dunder dispatch: __add__
+        // Forward `__add__` + reflected `__radd__` per
+        // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
+        // already implements the reflected-first reordering rule for
+        // subclass operands.  Fall back to the legacy instance-only
+        // `__add__` path when neither side is a typedef-bearing class.
+        if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+            return Ok(result);
+        }
         if let Some(result) = try_instance_binop(a, b, "__add__") {
             return result;
         }
@@ -1023,6 +1030,9 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             } else {
                 pyre_object::w_set_from_items(&result)
             });
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__sub__") {
             return result;
@@ -1110,6 +1120,9 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
             return mul(b, a);
         }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
+            return Ok(result);
+        }
         if let Some(result) = try_instance_binop(a, b, "__mul__") {
             return result;
         }
@@ -1133,6 +1146,9 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_floordiv(a, b);
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__floordiv__") {
             return result;
@@ -1161,6 +1177,9 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // str % args — PyPy: unicodeobject.py mod__String_ANY
         if is_str(a) {
             return crate::objspace::std::formatting::str_format_percent(a, b);
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__mod__") {
             return result;
@@ -1200,6 +1219,9 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return Ok(w_float_new(as_float(a) / as_float(b)));
         }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
+            return Ok(result);
+        }
         if let Some(result) = try_instance_binop(a, b, "__truediv__") {
             return result;
         }
@@ -1225,6 +1247,9 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_pow_impl(as_float(a), as_float(b));
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__pow__") {
             return result;
@@ -1561,6 +1586,9 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_lshift(a, b);
         }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
+            return Ok(result);
+        }
         if let Some(result) = try_instance_binop(a, b, "__lshift__") {
             return result;
         }
@@ -1583,6 +1611,9 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_rshift(a, b);
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__rshift__") {
             return result;
@@ -1626,6 +1657,9 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             } else {
                 pyre_object::w_set_from_items(&result)
             });
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__and__") {
             return result;
@@ -1773,6 +1807,9 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             } else {
                 pyre_object::w_set_from_items(&out)
             });
+        }
+        if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
+            return Ok(result);
         }
         if let Some(result) = try_instance_binop(a, b, "__xor__") {
             return result;
