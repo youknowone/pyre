@@ -1248,8 +1248,7 @@ impl Assembler {
             // rewrote from `OpKind::Call { args: [] }` (PyPy
             // `rtyper/rpbc.py::SingleFrozenPBCRepr` parity).
             OpKind::ConstRef(obj) => {
-                let const_value =
-                    crate::flowspace::model::ConstValue::HostObject(obj.clone());
+                let const_value = crate::flowspace::model::ConstValue::HostObject(obj.clone());
                 let idx = self.emit_const_r(&const_value, state);
                 state.code.push(idx);
                 argcodes.push('r');

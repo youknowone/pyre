@@ -1163,23 +1163,21 @@ mod tests {
             .collect();
         assert_eq!(
             jc.code.len(),
-            27,
+            18,
             "PopTop jitcode size shifted — refresh the expected sequence below",
         );
-        // Current codewriter shape still carries the synthetic
-        // `Ok(StepResult::Continue)` return wrapper as
-        // `int_copy/i>i` + `residual_call_r_r/iRd>r` after the normal
-        // `catch_exception` shoulder.  That wrapper is the structural
-        // reason `production_walker_handles` keeps the PopTop/Nop-family
-        // walker cutover disabled: the residual-call function address is
-        // symbolic, not a callable runtime helper.
+        // After the pre-jtransform unit-variant ctor fold landed
+        // (`majit-translate/src/translator/rtyper/unit_variant_fold.rs`),
+        // the `Ok(StepResult::Continue)` return wrapper collapses to a
+        // single `ref_copy/r>r` of the prebuilt `Continue` instance
+        // instead of the previous `int_copy/i>i ; residual_call_r_r/iRd>r ;
+        // live/` triple.  The shorter tail is what allows
+        // `production_walker_handles` to keep PopTop activated.
         let expected: Vec<(String, String)> = [
             ("inline_call_r_r", "dR>r"),
             ("live", ""),
             ("catch_exception", "L"),
-            ("int_copy", "i>i"),
-            ("residual_call_r_r", "iRd>r"),
-            ("live", ""),
+            ("ref_copy", "r>r"),
             ("ref_return", "r"),
             ("reraise", ""),
         ]

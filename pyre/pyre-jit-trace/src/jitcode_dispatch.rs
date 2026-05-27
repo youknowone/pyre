@@ -8584,16 +8584,17 @@ mod tests {
         use pyre_interpreter::bytecode::Arg;
         let descrs = all_descrs();
         for instr in [
-            Instruction::LoadAttr { namei: Arg::marker() },
-            Instruction::StoreAttr { namei: Arg::marker() },
+            Instruction::LoadAttr {
+                namei: Arg::marker(),
+            },
+            Instruction::StoreAttr {
+                namei: Arg::marker(),
+            },
         ] {
             let jc = jitcode_for_instruction(&instr)
                 .expect("Load/StoreAttr must resolve to an arm jitcode");
             let code = jc.code.as_slice();
-            eprintln!(
-                "==== {} ====",
-                jc.name,
-            );
+            eprintln!("==== {} ====", jc.name,);
             eprintln!(
                 "num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
                 jc.num_regs_r(),
