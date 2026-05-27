@@ -236,3 +236,368 @@ pub fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>)
 pub fn collect_jit_hints_with_sig(attrs: &[syn::Attribute], sig: &syn::Signature) -> Vec<String> {
     collect_jit_hints(attrs, Some(sig))
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Type-string rendering helpers.
+//
+// Pure syn-tree projections: given a `syn::Type`, render the canonical
+// string identity pyre stores on `SemanticFunction.return_type`,
+// `StructFieldRegistry`, and the codewriter's signature validator.  The
+// `qualified_full_type_string*` family additionally consults the file's
+// `prefix` (module-stripped crate-relative path) and `use_imports` table
+// so the rendered identity matches the lexical resolution PyPy
+// `bookkeeper.getdesc` performs through `f_globals`
+// (`rpython/annotator/bookkeeper.py:353-409`).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Extract the declaring trait name from a `dyn T + 'a` bound list:
+/// returns the first `T::Trait`-style bound's canonical path.
+/// Used by `type_root_ident` / `full_type_string` / `extract_dyn_trait_root`
+/// to identify the indirect-call family key.
+pub fn trait_object_root_name(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> Option<String> {
+    bounds.iter().find_map(|b| match b {
+        syn::TypeParamBound::Trait(t) => Some(
+            t.path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+        ),
+        _ => None,
+    })
+}
+
+/// Promote a bare trait identifier to its qualified `prefix::Bare`
+/// form when the qualified name is in `known_trait_names`.  Mirrors
+/// the resolution PyPy `bookkeeper.py:353-409 getdesc` performs when
+/// a single-frame `f_globals` lookup binds the bare name to a trait
+/// declared in the same module.
+pub fn qualify_known_trait_name(
+    bare: &str,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> String {
+    let qualified = if prefix.is_empty() || bare.contains("::") {
+        None
+    } else {
+        Some(format!("{}::{}", prefix, bare))
+    };
+    if let Some(qualified) = qualified {
+        if known_trait_names.contains(&qualified) {
+            qualified
+        } else {
+            bare.to_string()
+        }
+    } else {
+        bare.to_string()
+    }
+}
+
+/// `trait_object_root_name` then qualified through
+/// [`qualify_known_trait_name`] in one call.
+pub fn trait_object_root_name_qualified(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    trait_object_root_name(bounds)
+        .map(|name| qualify_known_trait_name(&name, prefix, known_trait_names))
+}
+
+/// Canonical type string for a syn::Type.
+///
+/// Produces a string that includes generic arguments,
+/// e.g. `Vec<Point>` → `"Vec<Point>"`, `Point` → `"Point"`.
+pub fn full_type_string(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| {
+                    let name = seg.ident.to_string();
+                    match &seg.arguments {
+                        syn::PathArguments::None => name,
+                        syn::PathArguments::AngleBracketed(args) => {
+                            let inner: Vec<String> = args
+                                .args
+                                .iter()
+                                .filter_map(|arg| match arg {
+                                    syn::GenericArgument::Type(t) => full_type_string(t),
+                                    _ => None,
+                                })
+                                .collect();
+                            if inner.is_empty() {
+                                name
+                            } else {
+                                format!("{}<{}>", name, inner.join(","))
+                            }
+                        }
+                        syn::PathArguments::Parenthesized(_) => name,
+                    }
+                })
+                .collect();
+            Some(segments.join("::"))
+        }
+        syn::Type::Reference(r) => full_type_string(&r.elem),
+        syn::Type::Ptr(p) => {
+            let inner = full_type_string(&p.elem)?;
+            let mutability = if p.mutability.is_some() {
+                "*mut"
+            } else {
+                "*const"
+            };
+            Some(format!("{mutability} {inner}"))
+        }
+        syn::Type::Paren(p) => full_type_string(&p.elem),
+        syn::Type::Group(g) => full_type_string(&g.elem),
+        syn::Type::Slice(s) => full_type_string(&s.elem).map(|t| format!("[{}]", t)),
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        // `impl Trait` is a static opaque type — render as the underlying
+        // bound name without the `dyn ` prefix so downstream consumers
+        // do not mistake it for a trait object (see `type_root_ident`).
+        syn::Type::ImplTrait(obj) => trait_object_root_name(&obj.bounds),
+        // RPython: ARRAY identity preserves full type including length.
+        // [Point; 4] and [Point; 8] are different ARRAY types.
+        syn::Type::Array(a) => {
+            let elem = full_type_string(&a.elem)?;
+            // Extract length from Expr::Lit if possible.
+            let len_str = match &a.len {
+                syn::Expr::Lit(lit) => match &lit.lit {
+                    syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
+                    _ => "N".to_string(),
+                },
+                _ => "N".to_string(),
+            };
+            Some(format!("[{};{}]", elem, len_str))
+        }
+        syn::Type::Tuple(t) if t.elems.is_empty() => Some("()".to_string()),
+        syn::Type::Tuple(t) => {
+            let elems: Option<Vec<String>> = t.elems.iter().map(full_type_string).collect();
+            elems.map(|elems| format!("({})", elems.join(",")))
+        }
+        _ => None,
+    }
+}
+
+/// RPython: lltype identity — `full_type_string` with module-prefix qualification.
+///
+/// RPython's `T.TO` always returns the actual lltype object.
+/// This function qualifies single-segment leaf types that are KNOWN structs
+/// (in `known_struct_names`) with the module prefix, so `Bar` in `mod a`
+/// becomes `a::Bar`. Uses the actual struct name set, not a heuristic.
+pub fn qualified_full_type_string(
+    ty: &syn::Type,
+    prefix: &str,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    qualified_full_type_string_with_imports(
+        ty,
+        prefix,
+        &std::collections::HashMap::new(),
+        known_struct_names,
+        known_trait_names,
+    )
+}
+
+/// `qualified_full_type_string` variant that consults a per-source
+/// `use <path> as alias` table when qualifying single-segment leaf
+/// types — keeps struct field / fn return metadata in the same name
+/// namespace as `qualify_type_name_with_imports`-driven
+/// parameter/local lowering, mirroring PyPy `bookkeeper.getdesc`'s
+/// single-frame `f_globals` resolution
+/// (`rpython/annotator/bookkeeper.py:353-409`).
+///
+/// `use_imports` is the per-source map collected by
+/// `parse::collect_use_imports`; an empty map reduces this back to
+/// `qualified_full_type_string`'s plain `prefix::Bar` /
+/// `canonical_struct_name` behaviour.
+pub fn qualified_full_type_string_with_imports(
+    ty: &syn::Type,
+    prefix: &str,
+    use_imports: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    // Top-level files (`prefix=""`) still need to walk the match when a
+    // per-source `use_imports` table is available; PyPy `bookkeeper.getdesc`
+    // resolves bare names through the importing frame's `f_globals` even at
+    // module root (`rpython/annotator/bookkeeper.py:353`).  Only fall
+    // through to `full_type_string` when both qualification sources are
+    // empty.
+    if prefix.is_empty() && use_imports.is_empty() {
+        return full_type_string(ty);
+    }
+    match ty {
+        syn::Type::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| {
+                    let name = seg.ident.to_string();
+                    match &seg.arguments {
+                        syn::PathArguments::None => {
+                            // Leaf type (no generics).  Qualify when the
+                            // single-segment name is a known user struct
+                            // (direct match) OR aliases to one via
+                            // `use foo::Bar as B` — for the rename case
+                            // `B` does not itself appear in
+                            // `known_struct_names`, but the resolved
+                            // target's leaf name does.  Non-struct
+                            // imports (`use foo::helper` for a fn,
+                            // `use external_crate::Item` for an external
+                            // type) leave the bare name unqualified so
+                            // their identity stays distinct from the
+                            // file's own struct namespace.  PyPy
+                            // `bookkeeper.getdesc(value)` binds the alias
+                            // to the original Python object identity.
+                            let alias_targets_struct = path.path.segments.len() == 1
+                                && use_imports.get(&name).is_some_and(|full| {
+                                    let leaf = full
+                                        .rsplit_once("::")
+                                        .map(|(_, l)| l)
+                                        .unwrap_or(full.as_str());
+                                    known_struct_names.contains(leaf)
+                                });
+                            if path.path.segments.len() == 1
+                                && (known_struct_names.contains(&name) || alias_targets_struct)
+                            {
+                                crate::front::semantic::qualify_type_name_with_imports(
+                                    &name,
+                                    prefix,
+                                    use_imports,
+                                )
+                            } else {
+                                name
+                            }
+                        }
+                        syn::PathArguments::AngleBracketed(args) => {
+                            // Container<T,...> — qualify inner types, not the container.
+                            let inner: Vec<String> = args
+                                .args
+                                .iter()
+                                .filter_map(|arg| match arg {
+                                    syn::GenericArgument::Type(t) => {
+                                        qualified_full_type_string_with_imports(
+                                            t,
+                                            prefix,
+                                            use_imports,
+                                            known_struct_names,
+                                            known_trait_names,
+                                        )
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            if inner.is_empty() {
+                                name
+                            } else {
+                                format!("{}<{}>", name, inner.join(","))
+                            }
+                        }
+                        syn::PathArguments::Parenthesized(_) => name,
+                    }
+                })
+                .collect();
+            Some(segments.join("::"))
+        }
+        syn::Type::Reference(r) => qualified_full_type_string_with_imports(
+            &r.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
+        syn::Type::Ptr(p) => {
+            let inner = qualified_full_type_string_with_imports(
+                &p.elem,
+                prefix,
+                use_imports,
+                known_struct_names,
+                known_trait_names,
+            )?;
+            let mutability = if p.mutability.is_some() {
+                "*mut"
+            } else {
+                "*const"
+            };
+            Some(format!("{mutability} {inner}"))
+        }
+        syn::Type::Paren(p) => qualified_full_type_string_with_imports(
+            &p.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
+        syn::Type::Group(g) => qualified_full_type_string_with_imports(
+            &g.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        ),
+        syn::Type::Slice(s) => qualified_full_type_string_with_imports(
+            &s.elem,
+            prefix,
+            use_imports,
+            known_struct_names,
+            known_trait_names,
+        )
+        .map(|t| format!("[{}]", t)),
+        syn::Type::Array(a) => {
+            let elem = qualified_full_type_string_with_imports(
+                &a.elem,
+                prefix,
+                use_imports,
+                known_struct_names,
+                known_trait_names,
+            )?;
+            let len_str = match &a.len {
+                syn::Expr::Lit(lit) => match &lit.lit {
+                    syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
+                    _ => "N".to_string(),
+                },
+                _ => "N".to_string(),
+            };
+            Some(format!("[{};{}]", elem, len_str))
+        }
+        syn::Type::Tuple(t) if t.elems.is_empty() => Some("()".to_string()),
+        syn::Type::Tuple(t) => {
+            let elems: Option<Vec<String>> = t
+                .elems
+                .iter()
+                .map(|elem| {
+                    qualified_full_type_string_with_imports(
+                        elem,
+                        prefix,
+                        use_imports,
+                        known_struct_names,
+                        known_trait_names,
+                    )
+                })
+                .collect();
+            elems.map(|elems| format!("({})", elems.join(",")))
+        }
+        syn::Type::TraitObject(obj) => trait_object_root_name_qualified(
+            &obj.bounds,
+            prefix,
+            known_trait_names,
+        )
+        .map(|r| format!("dyn {r}")),
+        // `impl Trait` is a static opaque — render the bound name without
+        // the `dyn ` marker.  See `type_root_ident` for the full rationale.
+        syn::Type::ImplTrait(obj) => {
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+        }
+        _ => None,
+    }
+}

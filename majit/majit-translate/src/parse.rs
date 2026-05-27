@@ -1074,7 +1074,7 @@ fn collect_trait_impls_from_items(
                                 let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::qualified_full_type_string(
+                                        crate::front::syn_metadata::qualified_full_type_string(
                                             ty,
                                             prefix,
                                             known_struct_names,
@@ -1116,7 +1116,7 @@ fn collect_trait_impls_from_items(
             }
             // Trait definitions with default methods
             Item::Trait(trait_def) => {
-                let trait_name = qualify_known_trait_name(
+                let trait_name = crate::front::syn_metadata::qualify_known_trait_name(
                     &trait_def.ident.to_string(),
                     prefix,
                     known_trait_names,
@@ -1145,7 +1145,7 @@ fn collect_trait_impls_from_items(
                                 let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::qualified_full_type_string(
+                                        crate::front::syn_metadata::qualified_full_type_string(
                                             ty,
                                             prefix,
                                             known_struct_names,
@@ -1336,7 +1336,7 @@ fn collect_inherent_methods_from_items(
                             let method_name = synth.sig.ident.to_string();
                             let return_type = match &synth.sig.output {
                                 syn::ReturnType::Type(_, ty) => {
-                                    crate::front::ast::qualified_full_type_string(
+                                    crate::front::syn_metadata::qualified_full_type_string(
                                         ty,
                                         prefix,
                                         known_struct_names,
@@ -1712,27 +1712,6 @@ fn canonical_path_name(path: &syn::Path) -> String {
         .join("::")
 }
 
-fn qualify_known_trait_name(
-    bare: &str,
-    prefix: &str,
-    known_trait_names: &std::collections::HashSet<String>,
-) -> String {
-    let qualified = if prefix.is_empty() || bare.contains("::") {
-        None
-    } else {
-        Some(format!("{}::{}", prefix, bare))
-    };
-    if let Some(qualified) = qualified {
-        if known_trait_names.contains(&qualified) {
-            qualified
-        } else {
-            bare.to_string()
-        }
-    } else {
-        bare.to_string()
-    }
-}
-
 fn canonical_trait_path_name(
     path: &syn::Path,
     prefix: &str,
@@ -1740,7 +1719,11 @@ fn canonical_trait_path_name(
 ) -> String {
     let canonical = canonical_path_name(path);
     if path.segments.len() == 1 {
-        qualify_known_trait_name(&canonical, prefix, known_trait_names)
+        crate::front::syn_metadata::qualify_known_trait_name(
+            &canonical,
+            prefix,
+            known_trait_names,
+        )
     } else {
         canonical
     }
