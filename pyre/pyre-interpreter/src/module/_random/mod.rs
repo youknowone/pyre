@@ -27,7 +27,10 @@ fn xorshift(state: u64) -> u64 {
     x
 }
 
-#[crate::pyre_methods]
+#[crate::pyre_methods(
+    doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
+    weakrefable,
+)]
 impl W_Random {
     #[staticmethod]
     fn __new__(_cls: PyObjectRef) -> PyObjectRef {

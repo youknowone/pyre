@@ -734,11 +734,61 @@ fn expand_pyre_class(
 // ──────────────────────────────────────────────────────────────────────
 
 #[proc_macro_attribute]
-pub fn pyre_methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn pyre_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = parse_macro_input!(attr as PyreMethodsAttrs);
     let imp = parse_macro_input!(item as ItemImpl);
-    match expand_pyre_methods(imp) {
+    match expand_pyre_methods(attrs, imp) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `#[pyre_methods(doc = "...", weakrefable, unhashable)]` —
+/// declarative slot keys propagated into the `type_object()`
+/// registration closure.  Mirrors `TypeDef(..., __doc__=..., __weakref__=
+/// make_weakref_descr(W_X), __hash__=None)` in
+/// `pypy/interpreter/typedef.py`.
+#[derive(Default)]
+struct PyreMethodsAttrs {
+    doc: Option<syn::LitStr>,
+    weakrefable: bool,
+    unhashable: bool,
+}
+
+impl syn::parse::Parse for PyreMethodsAttrs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut out = PyreMethodsAttrs::default();
+        if input.is_empty() {
+            return Ok(out);
+        }
+        loop {
+            let key: syn::Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "doc" => {
+                    input.parse::<syn::Token![=]>()?;
+                    out.doc = Some(input.parse()?);
+                }
+                "weakrefable" => out.weakrefable = true,
+                "unhashable" => out.unhashable = true,
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `#[pyre_methods]` key `{other}` — expected \
+                             `doc = \"...\"` / `weakrefable` / `unhashable`",
+                        ),
+                    ));
+                }
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -775,7 +825,10 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
     Ok(kind)
 }
 
-fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+fn expand_pyre_methods(
+    attrs: PyreMethodsAttrs,
+    mut imp: ItemImpl,
+) -> syn::Result<proc_macro2::TokenStream> {
     if let Some((_, path, _)) = &imp.trait_ {
         return Err(syn::Error::new(
             path.span(),
@@ -918,6 +971,33 @@ fn expand_pyre_methods(mut imp: ItemImpl) -> syn::Result<proc_macro2::TokenStrea
         };
         registrations.push(quote! {
             crate::dict_storage_store(ns, #py_name, #descr);
+        });
+    }
+
+    // Append declarative-slot registrations after method entries.  Order
+    // matches PyPy `TypeDef("X", method=..., __doc__=..., __weakref__=...,
+    // __hash__=None)`: methods first, slots last.  `make_weakref_descr`
+    // returns the canonical descriptor; the typedef install pass
+    // (`make_builtin_type_with_layout`) sees `__weakref__` in `ns` and
+    // flips the `weakrefable` bit on the new type via
+    // `w_type_set_weakrefable`.
+    if let Some(lit) = attrs.doc.as_ref() {
+        registrations.push(quote! {
+            crate::dict_storage_store(ns, "__doc__", ::pyre_object::w_str_new(#lit));
+        });
+    }
+    if attrs.weakrefable {
+        registrations.push(quote! {
+            crate::dict_storage_store(
+                ns,
+                "__weakref__",
+                crate::typedef::make_weakref_descr(::pyre_object::PY_NULL),
+            );
+        });
+    }
+    if attrs.unhashable {
+        registrations.push(quote! {
+            crate::dict_storage_store(ns, "__hash__", ::pyre_object::w_none());
         });
     }
 
