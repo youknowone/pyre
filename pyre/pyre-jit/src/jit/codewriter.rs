@@ -5930,23 +5930,6 @@ impl CodeWriter {
             }};
         }
 
-        // `flatten.py:333-334` parity for `ref_copy` with a ConstRef source.
-        // Used when opcode semantics push a real `None`, not the internal
-        // CALL `NULL` sentinel.  Same graph-side prohibition as
-        // `emit_ref_copy!`.
-        macro_rules! emit_ref_const_copy {
-            ($dst:expr, $value:expr) => {{
-                let dst = $dst;
-                let value = $value;
-                let insn = Insn::op_with_result(
-                    "ref_copy",
-                    vec![Operand::ConstRef(value)],
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
         // pyframe.py:378-381 `pushvalue` lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
         // + `setfield_vable_i(valuestackdepth, depth + 1)` via
@@ -6052,7 +6035,15 @@ impl CodeWriter {
                     // Non-portal frames have no vable mirror; the runtime
                     // expects the pushed PY_NULL to be visible in the
                     // stack slot register for any downstream consumer.
-                    emit_ref_const_copy!(stack_base + $depth, value);
+                    // `flatten.py:333-334` parity: ref_copy with ConstRef
+                    // source.  Walker MUST NOT record a graph-side
+                    // `ref_copy` op (matching `emit_ref_copy!`).
+                    let const_copy_insn = Insn::op_with_result(
+                        "ref_copy",
+                        vec![Operand::ConstRef(value)],
+                        Register::new(Kind::Ref, stack_base + $depth),
+                    );
+                    push_walker_emit(&current_block, const_copy_insn);
                 }
                 $depth += 1;
                 emit_vsd!($depth, pushvalue_const_py_pc);
