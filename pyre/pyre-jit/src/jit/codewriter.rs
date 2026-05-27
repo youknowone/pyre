@@ -4773,6 +4773,19 @@ impl CodeWriter {
             };
         }
 
+        // Post-emit bookkeeping for a stack-pushing handler: append the
+        // produced FlowValue to the symbolic stack, bump `current_depth`,
+        // and emit the VSD sync.  Mirrors the inline triplet that every
+        // residual_call / HLOp-result emit runs after writing into the
+        // dst slot.
+        macro_rules! push_and_bump {
+            ($value:expr, $py_pc:expr $(,)?) => {{
+                current_state.stack.push($value);
+                current_depth += 1;
+                emit_vsd!(current_depth, $py_pc);
+            }};
+        }
+
         // Note: the `BC_ABORT_PERMANENT` runtime
         // bytecode does not appear in `rpython/jit/codewriter/` or
         // `rpython/jit/metainterp/`. RPython refuses to build jitcode for
@@ -6632,9 +6645,7 @@ impl CodeWriter {
                             let stack_value = boxed
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            current_state.stack.push(stack_value);
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(stack_value, py_pc);
                         }
 
                         Instruction::LoadConst { consti } => {
@@ -6775,9 +6786,7 @@ impl CodeWriter {
                                 pin!(Some(loaded), dst_slot);
                                 loaded.into()
                             };
-                            current_state.stack.push(value);
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(value, py_pc);
                         }
 
                         // CPython super-instructions LOAD_FAST_LOAD_FAST /
@@ -6911,9 +6920,7 @@ impl CodeWriter {
                                     stack_slot,
                                     stack_base + current_depth
                                 );
-                                current_state.stack.push(loaded);
-                                current_depth += 1;
-                                emit_vsd!(current_depth, py_pc);
+                                push_and_bump!(loaded, py_pc);
                             } else {
                                 current_state.store_local_value(store_reg as usize, stored);
                                 let loaded = current_state
@@ -7031,9 +7038,7 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            current_state.stack.push(result_value.into());
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
@@ -7070,9 +7075,7 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            current_state.stack.push(result_value.into());
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
@@ -7637,9 +7640,7 @@ impl CodeWriter {
                                 // appears post-flatten.
                                 let _ = (callable_value, graph_arg_values_rev);
                             }
-                            current_state.stack.push(call_result_value);
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(call_result_value, py_pc);
                         }
 
                         // Python 3.13: ToBool converts TOS to bool before branch.
@@ -7734,9 +7735,7 @@ impl CodeWriter {
                                 );
                                 pin!(binary_result, stack_base + current_depth);
                             }
-                            current_state.stack.push(negated.into());
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(negated.into(), py_pc);
                         }
 
                         // JumpBackwardNoInterrupt reuses `backward_jump_target`:
@@ -7826,9 +7825,7 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            current_state.stack.push(result_value.into());
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // pyopcode.py:1463 BUILD_SLICE:
@@ -7876,9 +7873,7 @@ impl CodeWriter {
                                     stack_base + current_depth,
                                 ),
                             );
-                            current_state.stack.push(result_value.into());
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // pyopcode.py:690 RAISE_VARARGS: argc=0 reraise,
@@ -8379,9 +8374,7 @@ impl CodeWriter {
                             emit_abort_permanent!();
                             current_state.stack.push(result_value.into());
                             if attr.is_method() {
-                                current_state.stack.push(null_stack_sentinel());
-                                current_depth += 1;
-                                emit_vsd!(current_depth, py_pc);
+                                push_and_bump!(null_stack_sentinel(), py_pc);
                             }
                         }
 
