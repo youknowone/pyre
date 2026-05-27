@@ -1050,6 +1050,44 @@ fn expand_pyre_methods(
         let call_inner = quote! { #call_target( #(#call_args),* ) };
         let body = wrap_return(&m.sig.output, call_inner)?;
 
+        // `__new__` subclass override — PyPy `space.allocate_instance(W_X,
+        // w_subtype)` semantics adapted for our static-PyType layout.
+        // The user's body allocates via `W_X::allocate(...)` which stamps
+        // the static `X_TYPE`; if the caller passed a subclass cls
+        // (`class MyR(_random.Random)`), re-point `(*obj).w_class = cls`
+        // so `type(obj)` / `isinstance(obj, MyR)` see the subclass while
+        // the Rust-side `from_obj` (which keys on the static `ob_type`)
+        // still resolves to W_X.  Mirrors `typedef.rs:int_descr_new`
+        // (line 905-925) which already applies the same fix-up to
+        // builtin int/float subclasses.
+        let is_new = mname == "__new__" && matches!(kind, MethodKind::Static);
+        let body = if is_new {
+            quote! {
+                let __pyre_obj: ::pyre_object::PyObjectRef = match { #body } {
+                    ::std::result::Result::Ok(o) => o,
+                    ::std::result::Result::Err(e) => return ::std::result::Result::Err(e),
+                };
+                if !__pyre_obj.is_null() {
+                    let __pyre_cls = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
+                    if !__pyre_cls.is_null() && unsafe { ::pyre_object::is_type(__pyre_cls) } {
+                        let __pyre_static_tp = crate::typedef::gettypefor(
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+                        );
+                        let __pyre_same_tp = match __pyre_static_tp {
+                            ::std::option::Option::Some(t) => __pyre_cls == t,
+                            ::std::option::Option::None => false,
+                        };
+                        if !__pyre_same_tp {
+                            unsafe { (*__pyre_obj).w_class = __pyre_cls; }
+                        }
+                    }
+                }
+                ::std::result::Result::Ok(__pyre_obj)
+            }
+        } else {
+            body
+        };
+
         let py_name = mname.to_string();
         wrappers.push(quote! {
             #[allow(non_snake_case)]
