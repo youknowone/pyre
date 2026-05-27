@@ -113,6 +113,10 @@ impl IdentityDictStrategy {
 }
 
 impl DictStrategy for IdentityDictStrategy {
+    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
+        crate::dictstrategy::StrategyKind::Identity
+    }
+
     /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
     /// instantiation for IdentityDictStrategy — `wrap` is identity
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into

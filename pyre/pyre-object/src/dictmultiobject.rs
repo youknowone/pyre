@@ -138,10 +138,7 @@ fn strategy_is(
     current: &'static dyn crate::dictstrategy::DictStrategy,
     expected: &'static dyn crate::dictstrategy::DictStrategy,
 ) -> bool {
-    std::ptr::eq(
-        current as *const _ as *const u8,
-        expected as *const _ as *const u8,
-    )
+    current.strategy_kind() == expected.strategy_kind()
 }
 
 #[inline]

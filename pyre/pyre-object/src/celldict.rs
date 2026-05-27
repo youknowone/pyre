@@ -774,6 +774,10 @@ impl ModuleDictStrategy {
 /// callers, but the canonical surface going forward is the
 /// trait dispatch below.
 impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
+    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
+        crate::dictstrategy::StrategyKind::Module
+    }
+
     /// `celldict.py:46-49 get_empty_storage` — pyre owns the
     /// `ModuleDictStorage` directly (no `rerased` indirection); return
     /// the storage as an erased `*mut u8` so the trait surface stays

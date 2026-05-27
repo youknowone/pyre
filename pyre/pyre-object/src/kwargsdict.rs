@@ -102,6 +102,10 @@ impl KwargsDictStrategy {
 }
 
 impl DictStrategy for KwargsDictStrategy {
+    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
+        crate::dictstrategy::StrategyKind::Kwargs
+    }
+
     /// `kwargsdict.py:30-32 get_empty_storage` — erased `([], [])`.
     fn get_empty_storage(&self) -> *mut u8 {
         let v: Box<(Vec<PyObjectRef>, Vec<PyObjectRef>)> = Box::new((Vec::new(), Vec::new()));

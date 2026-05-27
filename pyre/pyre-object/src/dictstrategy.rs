@@ -28,7 +28,30 @@ use crate::pyobject::PyObjectRef;
 /// has no `ObjSpace` shim, so callers that need str-wrapping
 /// (`getitem_str`'s default → `getitem(space.newtext(key))`) call
 /// `crate::w_str_new` directly.
+/// Identifies a concrete `DictStrategy` impl.  Used by
+/// `dictmultiobject::strategy_is` to discriminate strategies that share
+/// the same data pointer because each `*_DICT_STRATEGY` static is a
+/// unit-struct ZST (Rust collapses ZST static addresses, so
+/// pointer/`std::ptr::eq` checks cannot tell them apart reliably).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrategyKind {
+    Empty,
+    EmptyKwargs,
+    Object,
+    Bytes,
+    Unicode,
+    Int,
+    Identity,
+    Kwargs,
+    Module,
+}
+
 pub trait DictStrategy {
+    /// Discriminate strategies by concrete impl — see [`StrategyKind`]
+    /// for the rationale.  Required because pointer comparison on the
+    /// `&'static dyn DictStrategy` slot is unreliable for ZST strategies.
+    fn strategy_kind(&self) -> StrategyKind;
+
     /// `dictmultiobject.py:466-467 get_empty_storage` — return a
     /// freshly-allocated erased storage for this strategy.  Required.
     fn get_empty_storage(&self) -> *mut u8;
@@ -547,6 +570,10 @@ impl EmptyKwargsDictStrategy {
 }
 
 impl DictStrategy for EmptyKwargsDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::EmptyKwargs
+    }
+
     /// `kwargsdict.py:13-14` inherits `EmptyDictStrategy.get_empty_storage`.
     fn get_empty_storage(&self) -> *mut u8 {
         EMPTY_DICT_STRATEGY.get_empty_storage()
@@ -630,6 +657,10 @@ impl DictStrategy for EmptyKwargsDictStrategy {
 }
 
 impl DictStrategy for EmptyDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::Empty
+    }
+
     fn get_empty_storage(&self) -> *mut u8 {
         // `erased(None)` — null is the only inhabitant of "empty
         // storage" before a switch installs a real backing.  Pyre's
@@ -791,6 +822,10 @@ impl DictStrategy for EmptyDictStrategy {
 pub struct ObjectDictStrategy;
 
 impl DictStrategy for ObjectDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::Object
+    }
+
     fn get_empty_storage(&self) -> *mut u8 {
         // `dictmultiobject.py:1209-1212`: erased `r_dict(dict_keys_equal,
         // hash_w)`.  Pyre's typed map is
@@ -941,6 +976,10 @@ impl DictStrategy for ObjectDictStrategy {
 pub struct BytesDictStrategy;
 
 impl DictStrategy for BytesDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::Bytes
+    }
+
     /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
     /// instantiation for BytesDictStrategy — `wrap = newbytes` (`:1234`).
     /// Walks the typed `IndexMap<Vec<u8>, _>`, rebuilds
@@ -1107,6 +1146,10 @@ impl DictStrategy for BytesDictStrategy {
 pub struct UnicodeDictStrategy;
 
 impl DictStrategy for UnicodeDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::Unicode
+    }
+
     fn get_empty_storage(&self) -> *mut u8 {
         // `dictmultiobject.py:1302-1304 create_empty_unicode_key_dict`
         // returns an empty `r_dict(unicode_eq, unicode_hash)`.  Pyre
@@ -1288,6 +1331,10 @@ impl IntDictStrategy {
 }
 
 impl DictStrategy for IntDictStrategy {
+    fn strategy_kind(&self) -> StrategyKind {
+        StrategyKind::Int
+    }
+
     /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`:
     /// wraps each i64 key via `wrap = newint` (`:1342`), produces a
     /// fresh `IndexMap<ObjectKey, PyObjectRef>` and drops the old typed
