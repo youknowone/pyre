@@ -3989,6 +3989,30 @@ impl OptContext {
                     .cloned();
                 if let Some(op_rc) = op_rc {
                     cloned.bind_op(&op_rc);
+                } else {
+                    // Producer not yet emitted: bind to a synthetic stand-in
+                    // (mirrors the lazy-alloc miss path below at line 4044).
+                    // `emit()` swaps the binding to the real producer when
+                    // it arrives, with `bind_op`'s carry-over migrating the
+                    // forwarded state. Required so every BoxRef returned
+                    // from `ensure_box` is bound to an `Op` whose
+                    // `forwarded` slot is the canonical `_forwarded` host
+                    // (resoperation.py:233).
+                    use majit_ir::resoperation::{Op, OpCode};
+                    let opcode = match cloned.type_() {
+                        majit_ir::Type::Int => OpCode::SameAsI,
+                        majit_ir::Type::Float => OpCode::SameAsF,
+                        majit_ir::Type::Ref => OpCode::SameAsR,
+                        majit_ir::Type::Void => OpCode::Jump,
+                    };
+                    let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
+                    synthetic.pos.set(opref);
+                    let idx = opref.raw() as usize;
+                    if idx >= self.resop_refs.len() {
+                        self.resop_refs.resize_with(idx + 1, || None);
+                    }
+                    self.resop_refs[idx] = Some(synthetic.clone());
+                    cloned.bind_op(&synthetic);
                 }
             }
             return Some(cloned);
