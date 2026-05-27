@@ -4921,19 +4921,6 @@ impl CodeWriter {
         // `residual_call_*` dispatch that can reconstruct the pyre
         // caller-order list. See `B6_CODEWRITER_PIPELINE_PLAN.md`.
 
-        macro_rules! emit_load_const_i {
-            ($dst:expr, $value:expr $(,)?) => {{
-                let dst = $dst;
-                let value: i64 = $value;
-                let insn = Insn::op_with_result(
-                    "int_copy",
-                    vec![Operand::ConstInt(value)],
-                    Register::new(Kind::Int, dst),
-                );
-                push_walker_emit(&current_block, insn);
-            }};
-        }
-
         // Every site that used
         // to invoke `assembler.ref_return(src)` now also appends an
         // `Insn::Op { opname: "ref_return", args: [Register(Ref, src)] }`
