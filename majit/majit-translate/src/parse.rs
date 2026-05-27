@@ -262,8 +262,8 @@ pub struct ParsedInterpreter {
     /// `excobject.rs` records `["pyobject"]`.  Consumed at front-end
     /// `Expr::Path` single-segment lookup: when the bare name has no
     /// `use_imports` entry, the lowering iterates these prefixes and
-    /// tries `{glob_root}::{name}` against `KNOWN_STATICS` /
-    /// `fn_return_types` so glob-imported statics resolve to their
+    /// tries `{glob_root}::{name}` against `KnownStaticsCatalogue`
+    /// / `fn_return_types` so glob-imported statics resolve to their
     /// originating module instead of falling through to
     /// `OpKind::Input` and triggering an adapter cross-block body
     /// Input Skip.
@@ -362,7 +362,7 @@ pub(crate) fn collect_pub_use_globs(items: &[Item]) -> Vec<Vec<String>> {
 /// pyre-internal-crate-alias roots are stripped).  Mirrors
 /// [`collect_pub_use_globs`] but for plain `use` instead of `pub use`,
 /// and stores the result on [`ParsedInterpreter::use_globs`] for the
-/// front-end's single-segment KNOWN_STATICS / fn_return_types lookup
+/// front-end's single-segment static-catalogue / fn_return_types lookup
 /// fallback.
 pub(crate) fn collect_use_globs(items: &[Item]) -> Vec<Vec<String>> {
     let mut out = Vec::new();

@@ -1392,6 +1392,7 @@ fn build_graphs_from_items(
     // Threaded straight through to `build_function_graph` →
     // `GraphBuildContext::with_module_statics`.
     module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
+    known_statics: &KnownStaticsCatalogue,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     functions: &mut Vec<SemanticFunction>,
@@ -1418,6 +1419,7 @@ fn build_graphs_from_items(
                         source_module,
                         use_imports,
                         module_statics,
+                        known_statics,
                         known_struct_names,
                         known_trait_names,
                     )?;
@@ -1463,6 +1465,7 @@ fn build_graphs_from_items(
                                 source_module,
                                 use_imports,
                                 module_statics,
+                                known_statics,
                                 known_struct_names,
                                 known_trait_names,
                             )?;
@@ -1488,6 +1491,7 @@ fn build_graphs_from_items(
                         method_suffix_index,
                         use_imports,
                         module_statics,
+                        known_statics,
                         known_struct_names,
                         known_trait_names,
                         functions,
@@ -1552,6 +1556,7 @@ pub fn build_semantic_program_with_options(
         let module = qualify_module_path(&parsed.module_path, nested);
         module_statics.insert((module, name.clone()), decl.clone());
     }
+    let known_statics = KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed));
     let start_len = functions.len();
     let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     build_graphs_from_items(
@@ -1564,6 +1569,7 @@ pub fn build_semantic_program_with_options(
         &method_suffix_index,
         &parsed.use_imports,
         &module_statics,
+        &known_statics,
         &known_struct_names,
         &known_trait_names,
         &mut functions,
@@ -1650,6 +1656,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             module_statics.insert((module, name.clone()), decl.clone());
         }
     }
+    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files);
     // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
     // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
@@ -1666,6 +1673,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &method_suffix_index,
             &parsed.use_imports,
             &module_statics,
+            &known_statics,
             &known_struct_names,
             &known_trait_names,
             &mut functions,
@@ -1837,6 +1845,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
     let empty_trait_names = std::collections::HashSet::new();
     let empty_use_imports = HashMap::new();
     let empty_module_statics = HashMap::new();
+    let empty_known_statics = KnownStaticsCatalogue::empty();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -1848,6 +1857,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
         "",
         &empty_use_imports,
         &empty_module_statics,
+        &empty_known_statics,
         &empty_names,
         &empty_trait_names,
     )
@@ -1865,6 +1875,7 @@ pub fn build_function_graph_with_self_ty_pub(
 ) -> Result<SemanticFunction, FlowingError> {
     let empty_module_statics = HashMap::new();
     let method_suffix_index = MethodSuffixIndex::from_fn_return_types(fn_return_types);
+    let empty_known_statics = KnownStaticsCatalogue::empty();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -1876,6 +1887,7 @@ pub fn build_function_graph_with_self_ty_pub(
         "",
         use_imports,
         &empty_module_statics,
+        &empty_known_statics,
         known_struct_names,
         known_trait_names,
     )
@@ -2049,6 +2061,15 @@ struct GraphBuildContext<'a> {
     /// build site; defaults to empty when callers (tests, legacy entry
     /// points) construct a context without program-wide aggregation.
     module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
+    /// Program-wide catalogue of crate-local `static` / `const` /
+    /// `thread_local!` declarations available to the `Expr::Path`
+    /// arm.  Borrowed from
+    /// [`build_semantic_program_from_parsed_files_with_options`]'s
+    /// per-build catalogue.  `None` for legacy / test entry points
+    /// that construct a context without program-wide aggregation —
+    /// the `Expr::Path` lookup treats `None` as a fully-empty
+    /// catalogue.
+    known_statics: Option<&'a KnownStaticsCatalogue>,
     known_struct_names: &'a std::collections::HashSet<String>,
     known_trait_names: &'a std::collections::HashSet<String>,
     /// Loop targets active at the current lowering point.  Pushed on
@@ -2714,6 +2735,7 @@ impl<'a> GraphBuildContext<'a> {
             source_module: String::new(),
             use_imports,
             module_statics: HashMap::new(),
+            known_statics: None,
             known_struct_names,
             known_trait_names,
             loop_stack: Vec::new(),
@@ -2740,6 +2762,18 @@ impl<'a> GraphBuildContext<'a> {
         module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl>,
     ) -> Self {
         self.module_statics = module_statics;
+        self
+    }
+
+    /// Builder that attaches the program-wide static catalogue to
+    /// this graph build context.  Same opt-in pattern as
+    /// [`Self::with_module_statics`]: the production pipeline calls
+    /// this with the per-build catalogue produced by
+    /// [`KnownStaticsCatalogue::from_parsed_files`], and legacy /
+    /// test entry points leave it unset so reads observe an empty
+    /// catalogue.
+    fn with_known_statics(mut self, known_statics: &'a KnownStaticsCatalogue) -> Self {
+        self.known_statics = Some(known_statics);
         self
     }
 
@@ -3948,50 +3982,18 @@ thread_local! {
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 
-    /// Z2.5 Cat 2.1 — catalogue of crate-local `static` declarations
-    /// available to `lower_expr` so a single-segment `Expr::Path` whose
-    /// joined name matches a registered static can emit `OpKind::
-    /// LoadStatic` instead of the body-`OpKind::Input` fallthrough.
-    /// Keyed strictly on the fully-qualified joined path (e.g.
-    /// `crate::weakref::GC_WEAKREF_TYPE`) — PyPy `LOAD_GLOBAL`
-    /// (`flowcontext.py:856`) resolves the name through the frame's
-    /// globals/builtins namespace, which is module-scoped by host
-    /// Python identity; pyre carries names as strings, so the
-    /// equivalent narrowing is to require callers to qualify
-    /// single-segment reads via `module_prefix` / `use_imports`
-    /// before the lookup.  Bare-leaf entries are NOT installed — two
-    /// different modules with the same SHOUTY leaf must resolve to
-    /// distinct catalogue entries.  Populated by
-    /// `populate_known_statics` from `analyze_pipeline_from_parsed`
-    /// before the semantic build runs.  Read-only during `lower_expr`.
-    ///
-    /// Slice C: the value side carries an `Option<ConstValue>`
-    /// resolved from literal initializers at extract time.  `Some`
-    /// flows to the adapter as the concrete `Constant(value)` that
-    /// PyPy `LOAD_GLOBAL` would push; `None` retains the legacy
-    /// `UniStr(joined_path)` sentinel for non-literal RHS (function
-    /// calls, host constructors, expression RHS).
-    pub(crate) static KNOWN_STATICS: std::cell::RefCell<
-        std::collections::HashMap<
-            String,
-            (
-                ValueType,
-                Option<crate::flowspace::model::ConstValue>,
-            ),
-        >,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-
     /// Z2.5 Slice #157 — per-source-module table of plain `use
     /// <path>::*` glob imports collected by
     /// `parse::collect_use_globs`.  Keyed by `ParsedInterpreter::
     /// module_path` (the file's crate-stripped module path); each
     /// value is the list of glob-root segments imported by that file.
     ///
-    /// Consumed at the `Expr::Path` single-segment KNOWN_STATICS
+    /// Consumed at the `Expr::Path` single-segment static-catalogue
     /// lookup fallback in `lower_expr`.  When the bare name has no
     /// `use_imports` entry and the `{module_prefix}::{name}`
     /// catalogue probe fails, the lookup iterates this file's globs
-    /// and tries `{glob_root}::{name}` against `KNOWN_STATICS`.
+    /// and tries `{glob_root}::{name}` against
+    /// `KnownStaticsCatalogue`.
     /// Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
     /// frame's module-globals namespace which includes glob-imported
     /// names by host-import identity.
@@ -4003,35 +4005,74 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Z2.5 Cat 2.1 — install the static catalogue into the per-thread
-/// `KNOWN_STATICS` cell before semantic build runs.  `decls` is the
-/// flat list `[(segments, ty, value)]` produced by
-/// `flowspace::rust_source::register::extract_static_decls`; each
-/// entry is published exactly once under its joined `::`-path.
+/// Catalogue of crate-local `static` / `const` / `thread_local!`
+/// declarations available to `lower_expr` so a single-segment
+/// `Expr::Path` whose joined name matches a registered static can
+/// emit `OpKind::LoadStatic` (or a primitive `OpKind::Const{Int,
+/// Bool,Float}` for resolved literal RHS) instead of the body-
+/// `OpKind::Input` fallthrough.
 ///
-/// Bare-leaf publication was removed (reviewer 2026-05-24 round):
-/// two modules registering the same SHOUTY leaf would collapse
-/// last-writer-wins, breaking PyPy's per-module globals identity.
-/// Single-segment reads at the `lower_expr` lookup site must now
-/// qualify via `module_prefix` / `use_imports` before the lookup.
-pub fn populate_known_statics(
-    decls: &[(
-        Vec<String>,
-        ValueType,
-        Option<crate::flowspace::model::ConstValue>,
-    )],
-) {
-    KNOWN_STATICS.with(|cell| {
-        let mut m = cell.borrow_mut();
-        m.clear();
-        for (segments, ty, value) in decls {
-            if segments.is_empty() {
-                continue;
+/// Keyed strictly on the fully-qualified joined `::`-path (e.g.
+/// `crate::weakref::GC_WEAKREF_TYPE`) — PyPy `LOAD_GLOBAL`
+/// (`flowcontext.py:856`) resolves the name through the frame's
+/// per-module globals namespace, which is module-scoped by host
+/// Python identity; pyre carries names as strings, so the
+/// equivalent narrowing is to require callers to qualify single-
+/// segment reads via `module_prefix` / `use_imports` before the
+/// lookup.  Bare-leaf entries are NOT installed.
+///
+/// `IndexMap` matches PyPy dict identity (preserved insertion
+/// order).  The catalogue is constructed once per build pipeline
+/// in `build_semantic_program_from_parsed_files_with_options` and
+/// borrowed by reference into each `GraphBuildContext`, mirroring
+/// PyPy `Bookkeeper.immutablevalue` resolution which reads from
+/// the analyzer-owned bookkeeper rather than from process-wide
+/// state.
+#[derive(Debug, Default, Clone)]
+pub struct KnownStaticsCatalogue {
+    entries: indexmap::IndexMap<
+        String,
+        (ValueType, Option<crate::flowspace::model::ConstValue>),
+    >,
+}
+
+impl KnownStaticsCatalogue {
+    /// Empty catalogue — used by test / legacy entry points that do
+    /// not have access to a parsed program.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build the catalogue from a parsed program: walks each file's
+    /// top-level `Item::Static` / `Item::Const` / `thread_local!`
+    /// macro statics via `extract_static_decls`, then registers the
+    /// hand-coded stdlib enum variants pyre source carries through
+    /// the flowgraph as opaque constants.
+    pub fn from_parsed_files(parsed_files: &[crate::parse::ParsedInterpreter]) -> Self {
+        let mut entries = indexmap::IndexMap::new();
+        for parsed in parsed_files {
+            for (segments, ty, value) in
+                crate::flowspace::rust_source::register::extract_static_decls(
+                    &parsed.file,
+                    &parsed.module_path,
+                )
+            {
+                if segments.is_empty() {
+                    continue;
+                }
+                entries.insert(segments.join("::"), (ty, value));
             }
-            m.insert(segments.join("::"), (ty.clone(), value.clone()));
         }
-        register_stdlib_known_statics(&mut m);
-    });
+        register_stdlib_known_statics(&mut entries);
+        Self { entries }
+    }
+
+    pub fn get(
+        &self,
+        key: &str,
+    ) -> Option<&(ValueType, Option<crate::flowspace::model::ConstValue>)> {
+        self.entries.get(key)
+    }
 }
 
 /// Z2.5 Slice #157 — install per-source-module `use ::*` glob roots
@@ -4079,10 +4120,10 @@ pub fn populate_use_globs_by_source(entries: &[(String, Vec<Vec<String>>)]) {
 ///
 /// The two-segment key matches the in-source spelling — every pyre
 /// caller imports `Ordering` and writes `Ordering::Relaxed`, so the
-/// `populate_known_statics` map's qualified key matches the
-/// `lower_expr` lookup key directly.
+/// catalogue's qualified key matches the `lower_expr` lookup key
+/// directly.
 fn register_stdlib_known_statics(
-    m: &mut std::collections::HashMap<
+    m: &mut indexmap::IndexMap<
         String,
         (ValueType, Option<crate::flowspace::model::ConstValue>),
     >,
@@ -4117,24 +4158,28 @@ impl Drop for LoweringFnNameGuard {
     }
 }
 
-fn build_function_graph(
+fn build_function_graph<'a>(
     func: &ItemFn,
     options: &AstGraphOptions,
     self_ty_root: Option<String>,
-    struct_fields: &StructFieldRegistry,
-    fn_return_types: &HashMap<String, String>,
-    method_suffix_index: &MethodSuffixIndex,
+    struct_fields: &'a StructFieldRegistry,
+    fn_return_types: &'a HashMap<String, String>,
+    method_suffix_index: &'a MethodSuffixIndex,
     module_prefix: &str,
     source_module: &str,
-    use_imports: &HashMap<String, String>,
+    use_imports: &'a HashMap<String, String>,
     // Program-wide `pub const` / `pub static` table — attached to
     // `GraphBuildContext` via `with_module_statics` for the
-    // (future) `Expr::Path` arm consumer.  Empty for the legacy
-    // public wrappers (`build_function_graph_pub` / `_with_self_ty_pub`)
+    // `Expr::Path` arm consumer.  Empty for the legacy public
+    // wrappers (`build_function_graph_pub` / `_with_self_ty_pub`)
     // that don't have access to the aggregated program-wide table.
     module_statics: &HashMap<(String, String), crate::parse::ModuleStaticDecl>,
-    known_struct_names: &std::collections::HashSet<String>,
-    known_trait_names: &std::collections::HashSet<String>,
+    // Program-wide static catalogue — attached to `GraphBuildContext`
+    // via `with_known_statics`.  Empty (`KnownStaticsCatalogue::
+    // empty()`) for legacy public wrappers.
+    known_statics: &'a KnownStaticsCatalogue,
+    known_struct_names: &'a std::collections::HashSet<String>,
+    known_trait_names: &'a std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
     let fn_name = func.sig.ident.to_string();
     let previous = CURRENT_LOWERING_FN_NAME.with(|c| c.borrow_mut().replace(fn_name.clone()));
@@ -4154,6 +4199,7 @@ fn build_function_graph(
         known_trait_names,
     )
     .with_module_statics(module_statics.clone())
+    .with_known_statics(known_statics)
     .with_source_module(source_module);
     ctx.generic_trait_roots =
         collect_generic_trait_roots(&func.sig.generics, module_prefix, known_trait_names);
@@ -6177,19 +6223,17 @@ fn lower_expr_inner(
                     .map(|var| Lowered::from_value_var(graph, &var))
                     .unwrap_or_else(Lowered::no_value));
             }
-            // Z2.5 Cat 2.1 Slice 3c — `KNOWN_STATICS` lookup
-            // is populated at `analyze_pipeline_from_parsed` entry;
-            // a path identifier that matches a registered crate-level
+            // Static catalogue lookup — `ctx.known_statics` carries
+            // the program-wide `KnownStaticsCatalogue` built by
+            // [`KnownStaticsCatalogue::from_parsed_files`]; a path
+            // identifier that matches a registered crate-level
             // `static` / `const` decl (or a `thread_local!` static)
             // emits `OpKind::LoadStatic` (translated by
             // `flowspace_adapter::translate_op` to a
             // `same_as(Constant(UniStr(segments)))`) instead of the
-            // body-`OpKind::Input` fallthrough.  Closes the Cat 2.1
-            // Skip family — see [[project-z25-skip-profile-2026-05-23]].
+            // body-`OpKind::Input` fallthrough.
             //
-            // Reviewer 2026-05-24 round — qualified-only lookup:
-            // `populate_known_statics` no longer publishes a
-            // bare-leaf entry, so single-segment reads must be
+            // Qualified-only lookup: single-segment reads must be
             // qualified through `use_imports` (alias → fully
             // qualified path) or `module_prefix` (same-module
             // qualification) before the catalogue hit.  Multi-
@@ -6199,8 +6243,8 @@ fn lower_expr_inner(
             // globals namespace.
             // Multi-segment paths whose leading segment is `crate` /
             // `self` / a `PYRE_INTERNAL_CRATES` alias are normalised
-            // by dropping that root so the lookup key matches
-            // `KNOWN_STATICS` which is published under crate-stripped
+            // by dropping that root so the lookup key matches the
+            // catalogue, which is published under crate-stripped
             // paths (parse.rs::joined_use_path / strip_glob_root).
             let strip_crate_root = |segs: Vec<String>| -> Vec<String> {
                 if segs.len() > 1 {
@@ -6232,19 +6276,16 @@ fn lower_expr_inner(
                 None
             };
             let primary_lookup = qualified_lookup_key.as_ref().and_then(|key| {
-                KNOWN_STATICS.with(|m| {
-                    m.borrow()
-                        .get(key)
-                        .cloned()
-                        .map(|(ty, value)| (key.clone(), ty, value))
-                })
+                ctx.known_statics
+                    .and_then(|c| c.get(key))
+                    .map(|(ty, value)| (key.clone(), ty.clone(), value.clone()))
             });
-            // Slice #157 — `use <path>::*` glob fallback.  When the
-            // primary lookup (`use_imports` alias or
-            // `module_prefix::name`) misses for a single-segment path,
-            // iterate the source file's plain-`use` glob roots and try
-            // `{glob_root}::{name}` against `KNOWN_STATICS`.  Mirrors
-            // PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
+            // `use <path>::*` glob fallback.  When the primary lookup
+            // (`use_imports` alias or `module_prefix::name`) misses
+            // for a single-segment path, iterate the source file's
+            // plain-`use` glob roots and try `{glob_root}::{name}`
+            // against the static catalogue.  Mirrors PyPy
+            // `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
             // frame's per-module globals which include glob-imported
             // names — pyre carries glob entries explicitly because
             // `parse::walk_use_tree`'s `UseTree::Glob` arm does not
@@ -6268,7 +6309,10 @@ fn lower_expr_inner(
                             continue;
                         }
                         let candidate = format!("{}::{}", glob_root.join("::"), name);
-                        let hit = KNOWN_STATICS.with(|m| m.borrow().get(&candidate).cloned());
+                        let hit = ctx
+                            .known_statics
+                            .and_then(|c| c.get(&candidate))
+                            .map(|(ty, value)| (ty.clone(), value.clone()));
                         if let Some((ty, value)) = hit {
                             return Some((candidate, ty, value));
                         }

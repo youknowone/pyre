@@ -467,15 +467,11 @@ fn analyze_pipeline_from_parsed(
         }
     }
     majit_ir::descr::register_struct_origins(struct_origins);
-    // Z2.5 Cat 2.1 Slice 3 — publish the per-thread `KNOWN_STATICS`
-    // catalogue before the semantic build runs so `front/ast.rs::
-    // lower_expr`'s `Expr::Path` arm can emit `OpKind::LoadStatic` for
-    // single-segment SHOUTY_CASE references instead of falling through
-    // to the body-`OpKind::Input` Skip class.  The same catalogue
-    // re-populates `CallControl.static_decls` further down for the
-    // codewriter-side adapter consumer; deduplicating to a single
-    // walk would couple the call-control population to semantic build
-    // order, so the publish is kept as a cheap pre-pass.
+    // Codewriter-side static catalogue.  Collected here so it can be
+    // installed on `CallControl.static_decls` further down for the
+    // adapter consumer.  The front-end `Expr::Path` arm receives the
+    // same data through `KnownStaticsCatalogue` constructed inside
+    // `build_semantic_program_from_parsed_files_with_options`.
     let early_static_decls: Vec<(
         Vec<String>,
         crate::model::ValueType,
@@ -489,13 +485,13 @@ fn analyze_pipeline_from_parsed(
             )
         })
         .collect();
-    crate::front::ast::populate_known_statics(&early_static_decls);
-    // Slice #157 — per-source `use <path>::*` glob roots, used by the
-    // `Expr::Path` single-segment KNOWN_STATICS / fn_return_types
-    // fallback so glob-imported bare names (e.g. `PY_NULL` referenced
-    // from a file with `use crate::pyobject::*;`) resolve to their
-    // originating module's catalogue entry instead of falling through
-    // to `OpKind::Input` and triggering an adapter cross-block body
+    // Per-source `use <path>::*` glob roots, used by the
+    // `Expr::Path` single-segment static-catalogue /
+    // fn_return_types fallback so glob-imported bare names
+    // (e.g. `PY_NULL` referenced from a file with
+    // `use crate::pyobject::*;`) resolve to their originating
+    // module's catalogue entry instead of falling through to
+    // `OpKind::Input` and triggering an adapter cross-block body
     // Input Skip.
     let use_globs_by_source: Vec<(String, Vec<Vec<String>>)> = parsed_files
         .iter()
@@ -750,11 +746,11 @@ fn analyze_pipeline_from_parsed(
         );
     }
     call_control.unsafe_fn_stubs = unsafe_stubs;
-    // Z2.5 Cat 2.1 Slice 2/3 — codewriter-side mirror of the static
-    // catalogue.  Reuses the `early_static_decls` walk that already
-    // populated the front-end `KNOWN_STATICS` thread-local; both
-    // consumers expect the same `(segments, ty)` shape so a second
-    // walk would duplicate effort with no observable difference.
+    // Codewriter-side mirror of the static catalogue.  Same
+    // `(segments, ty)` shape that
+    // [`KnownStaticsCatalogue::from_parsed_files`] feeds to the
+    // front-end's `Expr::Path` lookup; reusing the
+    // `early_static_decls` walk avoids a second pass.
     call_control.static_decls = early_static_decls;
     // Populate CallControl with layouts from the provider.
     for struct_name in program.struct_fields.fields.keys() {
