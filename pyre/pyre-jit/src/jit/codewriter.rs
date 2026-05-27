@@ -4786,6 +4786,36 @@ impl CodeWriter {
             }};
         }
 
+        // Record a residual_call SpaceOperation on the current block.
+        // Captures the two boilerplate arguments
+        // (`&mut graph, &current_block.block()`) implicitly; positional
+        // tail matches `record_residual_call_graph_op`.
+        macro_rules! residual_call {
+            (
+                $fn_idx:expr,
+                $flavor:expr,
+                $args_i:expr,
+                $args_r:expr,
+                $args_f:expr,
+                $arg_kinds:expr,
+                $reskind:expr,
+                $offset:expr $(,)?
+            ) => {
+                record_residual_call_graph_op(
+                    &mut graph,
+                    &current_block.block(),
+                    $fn_idx,
+                    $flavor,
+                    $args_i,
+                    $args_r,
+                    $args_f,
+                    $arg_kinds,
+                    $reskind,
+                    $offset,
+                )
+            };
+        }
+
         // Note: the `BC_ABORT_PERMANENT` runtime
         // bytecode does not appear in `rpython/jit/codewriter/` or
         // `rpython/jit/metainterp/`. RPython refuses to build jitcode for
@@ -6629,9 +6659,7 @@ impl CodeWriter {
                             // frame_var or other portal-only Variable is
                             // threaded — the graph op is well-formed for
                             // every CodeWriter regardless of is_portal.
-                            let boxed = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
                                 vec![super::flow::Constant::signed(val).into()],
@@ -6739,9 +6767,7 @@ impl CodeWriter {
                             // `flatten_graph` driver sees the same
                             // residual_call_ir_r count.
                             let value = if let Some(pycode_var) = pycode_graph_var {
-                                let loaded = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                let loaded = residual_call!(
                                     load_const_fn_idx,
                                     CallFlavor::Plain,
                                     vec![super::flow::Constant::signed(idx as i64).into()],
@@ -6770,9 +6796,7 @@ impl CodeWriter {
                                 // Variable downstream (e.g. as a CALL arg).
                                 // Mirrors the analogous LoadGlobal non-portal
                                 // arm at codewriter.rs:7474-7503.
-                                let loaded = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                let loaded = residual_call!(
                                     load_const_fn_idx,
                                     CallFlavor::Plain,
                                     vec![super::flow::Constant::signed(idx as i64).into()],
@@ -7392,9 +7416,7 @@ impl CodeWriter {
                             let loaded = if let (Some(ns_var), Some(code_var)) =
                                 (ns_graph_var, code_graph_var)
                             {
-                                record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                residual_call!(
                                     load_global_fn_idx,
                                     CallFlavor::Plain,
                                     vec![super::flow::Constant::signed(raw_namei).into()],
@@ -7427,9 +7449,7 @@ impl CodeWriter {
                                 // Constants have no producer requirement so
                                 // make_dependencies does not need synthetic
                                 // startblock inputargs.
-                                record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                residual_call!(
                                     load_global_fn_idx,
                                     CallFlavor::Plain,
                                     vec![super::flow::Constant::signed(raw_namei).into()],
@@ -7706,9 +7726,7 @@ impl CodeWriter {
                             // upstream `jtransform.py rewrite_op_int_neg`
                             // (`0 - x`) which records both ops on the graph
                             // for EVERY function, not just the portal.
-                            let zero_graph_var = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let zero_graph_var = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
                                 vec![super::flow::Constant::signed(0).into()],
@@ -7721,9 +7739,7 @@ impl CodeWriter {
                             pin!(zero_graph_var, scratch_zero);
                             pin!(Some(negated), stack_base + current_depth);
                             if let Some(zero_var) = &zero_graph_var {
-                                let binary_result = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                let binary_result = residual_call!(
                                     binary_op_fn_idx,
                                     CallFlavor::MayForce,
                                     vec![super::flow::Constant::signed(subtract_tag as i64).into()],
@@ -7972,9 +7988,7 @@ impl CodeWriter {
                                 // canonical `flatten_graph` driver sees the same
                                 // op via passthrough.  `normalize_raise_varargs_fn`
                                 // takes `(frame:Ref, exc:Ref, cause:Ref) → Ref` MayForce.
-                                let normalized_var = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
+                                let normalized_var = residual_call!(
                                     normalize_raise_varargs_fn_idx,
                                     CallFlavor::MayForce,
                                     vec![],
@@ -8063,9 +8077,7 @@ impl CodeWriter {
                             // for the analyzer-equivalent `EF_CANNOT_RAISE
                             // + empty raw frozensets + can_collect=false`
                             // shape (`effectinfo.py:281-283`).
-                            let prev_var = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let prev_var = residual_call!(
                                 get_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
@@ -8076,9 +8088,7 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             pin!(prev_var, scratch_prev);
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
@@ -8146,9 +8156,7 @@ impl CodeWriter {
                             // Walker-orthodoxy: compare_fn(exc,
                             // match_type, ISINSTANCE_OP:Int) → Ref shape
                             // residual_call_ir_r.  No frame_var threading.
-                            let cmp_result = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let cmp_result = residual_call!(
                                 compare_fn_idx,
                                 CallFlavor::MayForce,
                                 vec![super::flow::Constant::signed(10).into()],
@@ -8193,9 +8201,7 @@ impl CodeWriter {
                             // TLS write, no GC heap touched,
                             // `PlainCannotRaiseNoHeap` (`effectinfo.py:281-283`
                             // analyzer output).
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
+                            let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
                                 vec![],
@@ -9128,9 +9134,7 @@ impl CodeWriter {
                     // `jtransform.py:1898 do_fixed_list_setitem` for the
                     // array write).
                     if is_portal {
-                        let boxed_lasti = record_residual_call_graph_op(
-                            &mut graph,
-                            &current_block.block(),
+                        let boxed_lasti = residual_call!(
                             box_int_fn_idx,
                             CallFlavor::Plain,
                             vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()],
