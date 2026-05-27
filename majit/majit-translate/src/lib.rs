@@ -447,6 +447,19 @@ fn analyze_pipeline_from_parsed(
         }};
     }
     mark_phase!("entry");
+    // Install the cross-file type-alias floor before any walker pass
+    // runs.  The floor is the union of every parsed file's top-level
+    // `type T = U;` declarations; it stays visible across the per-file
+    // walker calls that happen later in the pipeline (lazy
+    // `Translation::from_rust_*` creation).  Mirrors PyPy
+    // `Bookkeeper`'s whole-program import-resolution map — a struct
+    // field declared as `field: PyObjectRef` in `pyframe.rs` resolves
+    // through the alias declared in `pyobject.rs` regardless of
+    // walker iteration order.
+    let _walker_alias_floor =
+        crate::flowspace::rust_source::register::WalkerAliasFloorGuard::install(
+            parsed_files.iter().map(|p| &p.file),
+        );
     // Use-import resolver: harvest `(bare_name → defining_module_path)`
     // from every `ParsedInterpreter.module_path` non-empty entry, then
     // publish into the `majit_ir::descr::STRUCT_ORIGIN_REGISTRY` global
