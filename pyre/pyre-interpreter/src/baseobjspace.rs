@@ -789,70 +789,22 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // entrance so all downstream dict arms (and dict-subclass
     // overrides via the wrapped W_DictObject) see the underlying
     // mapping unchanged.
-    let obj = unsafe {
-        if pyre_object::is_dict_proxy(obj) {
+    unsafe {
+        let obj = if pyre_object::is_dict_proxy(obj) {
             pyre_object::w_dict_proxy_get_mapping(obj)
         } else {
             obj
-        }
-    };
-    unsafe {
+        };
         if is_list(obj) {
-            if is_slice(index) {
-                let len = w_list_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
-                let mut items = Vec::new();
-                let mut i = start;
-                while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                    if let Some(v) = w_list_getitem(obj, i) {
-                        items.push(v);
-                    }
-                    i += step;
-                }
-                return Ok(w_list_new(items));
-            }
-            if !is_int(index) {
-                return Err(PyError::type_error(
-                    "list indices must be integers or slices",
-                ));
-            }
-            let idx = w_int_get_value(index);
-            match w_list_getitem(obj, idx) {
-                Some(val) => Ok(val),
-                None => Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    "list index out of range",
-                )),
-            }
-        } else if is_tuple(obj) {
-            if is_slice(index) {
-                // PyPy: tupleobject.py descr_getslice → slice.indices.
-                let len = w_tuple_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
-                let mut items = Vec::new();
-                let mut i = start;
-                while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                    if let Some(v) = w_tuple_getitem(obj, i) {
-                        items.push(v);
-                    }
-                    i += step;
-                }
-                return Ok(w_tuple_new(items));
-            }
-            if !is_int(index) {
-                return Err(PyError::type_error("tuple indices must be integers"));
-            }
-            let idx = w_int_get_value(index);
-            match w_tuple_getitem(obj, idx) {
-                Some(val) => Ok(val),
-                None => Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    "tuple index out of range",
-                )),
-            }
-        } else if is_dict(obj) {
-            // `dictmultiobject.py:161-172 descr_getitem`
-            match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
+            return getitem_list(obj, index);
+        }
+        if is_tuple(obj) {
+            return getitem_tuple(obj, index);
+        }
+        if is_dict(obj) {
+            // `pypy/objspace/std/dictmultiobject.py:137-141 W_DictMultiObject
+            // .descr_getitem` → `space.getitem(self, w_key)` → strategy
+            return match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => {
                     // dictmultiobject.py:166-170 — dict subclass
@@ -860,201 +812,286 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                     dict_missing_or_key_error(obj, index)
                 }
                 Err(_) => Err(take_pending_hash_error()),
-            }
-        } else if is_str(obj) {
-            let s = w_str_get_value(obj);
-            if is_slice(index) {
-                // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
-                // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
-                // Reuse the shared `normalize_slice` helper so negative-step
-                // defaults (`s[::-1]`, `s[5::-1]`) match list/tuple semantics.
-                let chars: Vec<char> = s.chars().collect();
-                let len = chars.len() as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
-                let mut result = String::new();
-                let mut i = start;
-                while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                    if i >= 0 && (i as usize) < chars.len() {
-                        result.push(chars[i as usize]);
-                    }
-                    i += step;
-                }
-                Ok(w_str_new(&result))
-            } else if is_int(index) {
-                let idx = w_int_get_value(index);
-                let chars: Vec<char> = s.chars().collect();
-                let actual_idx = if idx < 0 {
-                    chars.len() as i64 + idx
-                } else {
-                    idx
-                } as usize;
-                if actual_idx < chars.len() {
-                    Ok(w_str_new(&chars[actual_idx].to_string()))
-                } else {
-                    Err(PyError::new(
-                        PyErrorKind::IndexError,
-                        "string index out of range",
-                    ))
-                }
-            } else {
-                Err(PyError::type_error("string indices must be integers"))
-            }
-        } else if pyre_object::bytesobject::is_bytes_like(obj) {
-            let is_bytes = pyre_object::bytesobject::is_bytes(obj);
-            if is_int(index) {
-                let idx = w_int_get_value(index);
-                let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-                let actual = if idx < 0 { len + idx } else { idx };
-                if actual >= 0 && actual < len {
-                    return Ok(w_int_new(pyre_object::bytesobject::bytes_like_getitem(
-                        obj,
-                        actual as usize,
-                    ) as i64));
-                }
-                let name = if is_bytes { "bytes" } else { "bytearray" };
-                return Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    format!("{name} index out of range"),
-                ));
-            }
-            if is_slice(index) {
-                let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let step = w_slice_get_step(index);
-                let step_val = if is_none(step) {
-                    1
-                } else {
-                    w_int_get_value(step)
-                };
-                let s_val = if is_none(start) {
-                    if step_val < 0 { len - 1 } else { 0 }
-                } else {
-                    let v = w_int_get_value(start);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                };
-                let e_val = if is_none(stop) {
-                    if step_val < 0 { -1 } else { len }
-                } else {
-                    let v = w_int_get_value(stop);
-                    if v < 0 { (len + v).max(-1) } else { v.min(len) }
-                };
-                let mut result = Vec::new();
-                let mut i = s_val;
-                if step_val > 0 {
-                    while i < e_val {
-                        if i >= 0 && i < len {
-                            result.push(pyre_object::bytesobject::bytes_like_getitem(
-                                obj, i as usize,
-                            ));
-                        }
-                        i += step_val;
-                    }
-                } else if step_val < 0 {
-                    while i > e_val {
-                        if i >= 0 && i < len {
-                            result.push(pyre_object::bytesobject::bytes_like_getitem(
-                                obj, i as usize,
-                            ));
-                        }
-                        i += step_val;
-                    }
-                }
-                return Ok(if is_bytes {
-                    pyre_object::bytesobject::w_bytes_from_bytes(&result)
-                } else {
-                    pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
-                });
-            }
-            let name = if is_bytes { "bytes" } else { "bytearray" };
-            return Err(PyError::type_error(format!(
-                "{name} indices must be integers"
-            )));
-        } else if is_type(obj) {
-            // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
-            // PyPy: typeobject.py type.__class_getitem__
-            if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-                let result = crate::call_function(method, &[obj, index]);
-                // Fallback if the user-defined __class_getitem__ raised
-                // a stub error or returned NULL — return the type so
-                // `class Foo(Generic[T]): pass` keeps working.
-                if !result.is_null() {
-                    return Ok(result);
-                }
-            }
-            // Default: return the type itself (stub for GenericAlias)
-            Ok(obj)
-        } else if is_instance(obj) {
-            // PyPy: descroperation.py __getitem__
-            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
-                return crate::call::call_function_impl_result(method, &[obj, index]);
-            }
-            Err(PyError::type_error(format!(
-                "'{}' object is not subscriptable",
-                w_type_get_name(w_instance_get_type(obj)),
-            )))
-        } else if is_range_iter(obj) {
-            let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
-            let len = if r.step > 0 {
-                (r.stop - r.current + r.step - 1) / r.step
-            } else if r.step < 0 {
-                (r.current - r.stop - r.step - 1) / (-r.step)
-            } else {
-                0
             };
-            if is_int(index) {
-                // range[i]
-                let i = w_int_get_value(index);
-                let idx = if i < 0 { len + i } else { i };
-                if idx < 0 || idx >= len {
-                    Err(PyError::new(
-                        PyErrorKind::IndexError,
-                        "range object index out of range",
-                    ))
-                } else {
-                    Ok(w_int_new(r.current + idx * r.step))
-                }
-            } else if is_slice(index) {
-                // range[start:stop:step] → returns a list
-                let s_raw = w_slice_get_start(index);
-                let e_raw = w_slice_get_stop(index);
-                let step_raw = w_slice_get_step(index);
-                let s = if is_none(s_raw) {
-                    0
-                } else {
-                    w_int_get_value(s_raw)
-                };
-                let e = if is_none(e_raw) {
-                    len
-                } else {
-                    w_int_get_value(e_raw)
-                };
-                let sl_step = if is_none(step_raw) {
-                    1
-                } else {
-                    w_int_get_value(step_raw)
-                };
-                let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
-                let e = if e < 0 { (len + e).max(0) } else { e.min(len) };
-                let mut items = Vec::new();
-                let mut i = s;
-                while (sl_step > 0 && i < e) || (sl_step < 0 && i > e) {
-                    items.push(w_int_new(r.current + i * r.step));
-                    i += sl_step;
-                }
-                Ok(w_list_new(items))
-            } else {
-                Err(PyError::type_error(
-                    "range indices must be integers or slices",
-                ))
+        }
+        if is_str(obj) {
+            return getitem_str(obj, index);
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return getitem_bytes_like(obj, index);
+        }
+        if is_type(obj) {
+            return getitem_type(obj, index);
+        }
+        if is_instance(obj) {
+            return getitem_instance(obj, index);
+        }
+        if is_range_iter(obj) {
+            return getitem_range_iter(obj, index);
+        }
+        Err(PyError::type_error(format!(
+            "'{}' object is not subscriptable",
+            (*(*obj).ob_type).name,
+        )))
+    }
+}
+
+#[inline(never)]
+unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    if is_slice(index) {
+        let len = w_list_len(obj) as i64;
+        let (start, stop, step) = normalize_slice(index, len)?;
+        let mut items = Vec::new();
+        let mut i = start;
+        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+            if let Some(v) = w_list_getitem(obj, i) {
+                items.push(v);
             }
+            i += step;
+        }
+        return Ok(w_list_new(items));
+    }
+    if !is_int(index) {
+        return Err(PyError::type_error(
+            "list indices must be integers or slices",
+        ));
+    }
+    let idx = w_int_get_value(index);
+    match w_list_getitem(obj, idx) {
+        Some(val) => Ok(val),
+        None => Err(PyError::new(
+            PyErrorKind::IndexError,
+            "list index out of range",
+        )),
+    }
+}
+
+#[inline(never)]
+unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    if is_slice(index) {
+        // tupleobject.py descr_getslice → slice.indices.
+        let len = w_tuple_len(obj) as i64;
+        let (start, stop, step) = normalize_slice(index, len)?;
+        let mut items = Vec::new();
+        let mut i = start;
+        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+            if let Some(v) = w_tuple_getitem(obj, i) {
+                items.push(v);
+            }
+            i += step;
+        }
+        return Ok(w_tuple_new(items));
+    }
+    if !is_int(index) {
+        return Err(PyError::type_error("tuple indices must be integers"));
+    }
+    let idx = w_int_get_value(index);
+    match w_tuple_getitem(obj, idx) {
+        Some(val) => Ok(val),
+        None => Err(PyError::new(
+            PyErrorKind::IndexError,
+            "tuple index out of range",
+        )),
+    }
+}
+
+#[inline(never)]
+unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let s = w_str_get_value(obj);
+    if is_slice(index) {
+        // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
+        // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
+        // Reuse the shared `normalize_slice` helper so negative-step
+        // defaults (`s[::-1]`, `s[5::-1]`) match list/tuple semantics.
+        let chars: Vec<char> = s.chars().collect();
+        let len = chars.len() as i64;
+        let (start, stop, step) = normalize_slice(index, len)?;
+        let mut result = String::new();
+        let mut i = start;
+        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+            if i >= 0 && (i as usize) < chars.len() {
+                result.push(chars[i as usize]);
+            }
+            i += step;
+        }
+        return Ok(w_str_new(&result));
+    }
+    if is_int(index) {
+        let idx = w_int_get_value(index);
+        let chars: Vec<char> = s.chars().collect();
+        let actual_idx = if idx < 0 {
+            chars.len() as i64 + idx
         } else {
-            Err(PyError::type_error(format!(
-                "'{}' object is not subscriptable",
-                (*(*obj).ob_type).name,
-            )))
+            idx
+        } as usize;
+        if actual_idx < chars.len() {
+            return Ok(w_str_new(&chars[actual_idx].to_string()));
+        }
+        return Err(PyError::new(
+            PyErrorKind::IndexError,
+            "string index out of range",
+        ));
+    }
+    Err(PyError::type_error("string indices must be integers"))
+}
+
+#[inline(never)]
+unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let is_bytes = pyre_object::bytesobject::is_bytes(obj);
+    if is_int(index) {
+        let idx = w_int_get_value(index);
+        let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
+        let actual = if idx < 0 { len + idx } else { idx };
+        if actual >= 0 && actual < len {
+            return Ok(w_int_new(
+                pyre_object::bytesobject::bytes_like_getitem(obj, actual as usize) as i64,
+            ));
+        }
+        let name = if is_bytes { "bytes" } else { "bytearray" };
+        return Err(PyError::new(
+            PyErrorKind::IndexError,
+            format!("{name} index out of range"),
+        ));
+    }
+    if is_slice(index) {
+        let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
+        let start = w_slice_get_start(index);
+        let stop = w_slice_get_stop(index);
+        let step = w_slice_get_step(index);
+        let step_val = if is_none(step) {
+            1
+        } else {
+            w_int_get_value(step)
+        };
+        let s_val = if is_none(start) {
+            if step_val < 0 { len - 1 } else { 0 }
+        } else {
+            let v = w_int_get_value(start);
+            if v < 0 { (len + v).max(0) } else { v.min(len) }
+        };
+        let e_val = if is_none(stop) {
+            if step_val < 0 { -1 } else { len }
+        } else {
+            let v = w_int_get_value(stop);
+            if v < 0 { (len + v).max(-1) } else { v.min(len) }
+        };
+        let mut result = Vec::new();
+        let mut i = s_val;
+        if step_val > 0 {
+            while i < e_val {
+                if i >= 0 && i < len {
+                    result.push(pyre_object::bytesobject::bytes_like_getitem(
+                        obj, i as usize,
+                    ));
+                }
+                i += step_val;
+            }
+        } else if step_val < 0 {
+            while i > e_val {
+                if i >= 0 && i < len {
+                    result.push(pyre_object::bytesobject::bytes_like_getitem(
+                        obj, i as usize,
+                    ));
+                }
+                i += step_val;
+            }
+        }
+        return Ok(if is_bytes {
+            pyre_object::bytesobject::w_bytes_from_bytes(&result)
+        } else {
+            pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
+        });
+    }
+    let name = if is_bytes { "bytes" } else { "bytearray" };
+    Err(PyError::type_error(format!(
+        "{name} indices must be integers"
+    )))
+}
+
+#[inline(never)]
+unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
+    // typeobject.py type.__class_getitem__
+    if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
+        let result = crate::call_function(method, &[obj, index]);
+        // Fallback if the user-defined __class_getitem__ raised
+        // a stub error or returned NULL — return the type so
+        // `class Foo(Generic[T]): pass` keeps working.
+        if !result.is_null() {
+            return Ok(result);
         }
     }
+    // Default: return the type itself (stub for GenericAlias)
+    Ok(obj)
+}
+
+#[inline(never)]
+unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    // descroperation.py __getitem__
+    if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
+        return crate::call::call_function_impl_result(method, &[obj, index]);
+    }
+    Err(PyError::type_error(format!(
+        "'{}' object is not subscriptable",
+        w_type_get_name(w_instance_get_type(obj)),
+    )))
+}
+
+#[inline(never)]
+unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+    let len = if r.step > 0 {
+        (r.stop - r.current + r.step - 1) / r.step
+    } else if r.step < 0 {
+        (r.current - r.stop - r.step - 1) / (-r.step)
+    } else {
+        0
+    };
+    if is_int(index) {
+        // range[i]
+        let i = w_int_get_value(index);
+        let idx = if i < 0 { len + i } else { i };
+        if idx < 0 || idx >= len {
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                "range object index out of range",
+            ));
+        }
+        return Ok(w_int_new(r.current + idx * r.step));
+    }
+    if is_slice(index) {
+        // range[start:stop:step] → returns a list
+        let s_raw = w_slice_get_start(index);
+        let e_raw = w_slice_get_stop(index);
+        let step_raw = w_slice_get_step(index);
+        let s = if is_none(s_raw) {
+            0
+        } else {
+            w_int_get_value(s_raw)
+        };
+        let e = if is_none(e_raw) {
+            len
+        } else {
+            w_int_get_value(e_raw)
+        };
+        let sl_step = if is_none(step_raw) {
+            1
+        } else {
+            w_int_get_value(step_raw)
+        };
+        let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
+        let e = if e < 0 { (len + e).max(0) } else { e.min(len) };
+        let mut items = Vec::new();
+        let mut i = s;
+        while (sl_step > 0 && i < e) || (sl_step < 0 && i > e) {
+            items.push(w_int_new(r.current + i * r.step));
+            i += sl_step;
+        }
+        return Ok(w_list_new(items));
+    }
+    Err(PyError::type_error(
+        "range indices must be integers or slices",
+    ))
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
@@ -1088,121 +1125,143 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
             ));
         }
         if is_list(obj) {
-            if is_slice(index) {
-                let len = w_list_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
-                // listobject.py:709-714 wraps non-list iterables into a
-                // temporary W_ListObject so the strategy-aware setslice
-                // (`listobject.py:1746-1758`) and extended-slice
-                // (`listobject.py:descr_setitem` step != 1 branch) paths
-                // see a list operand.
-                let w_other = if pyre_object::is_list(value) {
-                    value
-                } else {
-                    let items = crate::builtins::collect_iterable(value)?;
-                    pyre_object::listobject::w_list_new(items)
-                };
-                if step == 1 {
-                    let s_lo = start.max(0) as usize;
-                    let s_hi = stop.max(0) as usize;
-                    pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
-                        .expect("w_other is always a valid list");
-                    return Ok(w_none());
-                }
-                // Extended slice: `pypy/objspace/std/listobject.py
-                // W_ListObject.descr_setitem` enforces equal length
-                // ("attempt to assign sequence of size %d to extended
-                // slice of size %d") and writes positions in order.
-                let mut indices = Vec::new();
-                let mut i = start;
-                while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                    if i >= 0 && i < len {
-                        indices.push(i);
-                    }
-                    i += step;
-                }
-                let other_len = pyre_object::w_list_len(w_other);
-                if other_len != indices.len() {
-                    return Err(PyError::new(
-                        PyErrorKind::ValueError,
-                        format!(
-                            "attempt to assign sequence of size {} to extended slice of size {}",
-                            other_len,
-                            indices.len()
-                        ),
-                    ));
-                }
-                for (k, &idx) in indices.iter().enumerate() {
-                    let item = pyre_object::w_list_getitem(w_other, k as i64)
-                        .expect("k < other_len by construction");
-                    if !pyre_object::w_list_setitem(obj, idx, item) {
-                        return Err(PyError::new(
-                            PyErrorKind::IndexError,
-                            "list assignment index out of range",
-                        ));
-                    }
-                }
-                return Ok(w_none());
-            }
-            if !is_int(index) {
-                let tp = if index.is_null() {
-                    "NULL"
-                } else {
-                    (*(*index).ob_type).name
-                };
-                return Err(PyError::type_error(format!(
-                    "list indices must be integers, not {tp}"
-                )));
-            }
-            let idx = w_int_get_value(index);
-            if w_list_setitem(obj, idx, value) {
-                Ok(w_none())
-            } else {
-                Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    "list assignment index out of range",
-                ))
-            }
-        } else if is_dict(obj) {
-            match unsafe { pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) } {
+            return setitem_list(obj, index, value);
+        }
+        if is_dict(obj) {
+            return match pyre_object::dictmultiobject::w_dict_store_checked(obj, index, value) {
                 Ok(()) => Ok(w_none()),
                 Err(_) => Err(take_pending_hash_error()),
-            }
-        } else if pyre_object::bytearrayobject::is_bytearray(obj) {
-            if is_int(index) {
-                let idx = w_int_get_value(index);
-                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let actual = if idx < 0 { len + idx } else { idx };
-                if actual >= 0 && actual < len {
-                    let val = w_int_get_value(value) as u8;
-                    pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, val);
-                    return Ok(w_none());
-                }
-                return Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    "bytearray index out of range",
-                ));
-            }
-            Err(PyError::type_error("bytearray indices must be integers"))
-        } else if is_instance(obj) {
-            // PyPy: descroperation.py __setitem__ — `space.get_and_call_function`
-            // raises on instance error.  pyre `call_function` stashes errors
-            // as PY_NULL; `call_and_check` recovers them.
-            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
-                crate::builtins::call_and_check(method, &[obj, index, value])?;
-                return Ok(w_none());
-            }
-            Err(PyError::type_error(format!(
-                "'{}' object does not support item assignment",
-                w_type_get_name(w_instance_get_type(obj)),
-            )))
+            };
+        }
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            return setitem_bytearray(obj, index, value);
+        }
+        if is_instance(obj) {
+            return setitem_instance(obj, index, value);
+        }
+        Err(PyError::type_error(format!(
+            "'{}' object does not support item assignment",
+            (*(*obj).ob_type).name,
+        )))
+    }
+}
+
+#[inline(never)]
+unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if is_slice(index) {
+        return setitem_list_slice(obj, index, value);
+    }
+    if !is_int(index) {
+        let tp = if index.is_null() {
+            "NULL"
         } else {
-            Err(PyError::type_error(format!(
-                "'{}' object does not support item assignment",
-                (*(*obj).ob_type).name,
-            )))
+            (*(*index).ob_type).name
+        };
+        return Err(PyError::type_error(format!(
+            "list indices must be integers, not {tp}"
+        )));
+    }
+    let idx = w_int_get_value(index);
+    if w_list_setitem(obj, idx, value) {
+        Ok(w_none())
+    } else {
+        Err(PyError::new(
+            PyErrorKind::IndexError,
+            "list assignment index out of range",
+        ))
+    }
+}
+
+#[inline(never)]
+unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let len = w_list_len(obj) as i64;
+    let (start, stop, step) = normalize_slice(index, len)?;
+    // listobject.py:709-714 wraps non-list iterables into a
+    // temporary W_ListObject so the strategy-aware setslice
+    // (`listobject.py:1746-1758`) and extended-slice
+    // (`listobject.py:descr_setitem` step != 1 branch) paths
+    // see a list operand.
+    let w_other = if pyre_object::is_list(value) {
+        value
+    } else {
+        let items = crate::builtins::collect_iterable(value)?;
+        pyre_object::listobject::w_list_new(items)
+    };
+    if step == 1 {
+        let s_lo = start.max(0) as usize;
+        let s_hi = stop.max(0) as usize;
+        pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
+            .expect("w_other is always a valid list");
+        return Ok(w_none());
+    }
+    // Extended slice: `pypy/objspace/std/listobject.py
+    // W_ListObject.descr_setitem` enforces equal length
+    // ("attempt to assign sequence of size %d to extended
+    // slice of size %d") and writes positions in order.
+    let mut indices = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        if i >= 0 && i < len {
+            indices.push(i);
+        }
+        i += step;
+    }
+    let other_len = pyre_object::w_list_len(w_other);
+    if other_len != indices.len() {
+        return Err(PyError::new(
+            PyErrorKind::ValueError,
+            format!(
+                "attempt to assign sequence of size {} to extended slice of size {}",
+                other_len,
+                indices.len()
+            ),
+        ));
+    }
+    for (k, &idx) in indices.iter().enumerate() {
+        let item =
+            pyre_object::w_list_getitem(w_other, k as i64).expect("k < other_len by construction");
+        if !pyre_object::w_list_setitem(obj, idx, item) {
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                "list assignment index out of range",
+            ));
         }
     }
+    Ok(w_none())
+}
+
+#[inline(never)]
+unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !is_int(index) {
+        return Err(PyError::type_error("bytearray indices must be integers"));
+    }
+    let idx = w_int_get_value(index);
+    let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual >= 0 && actual < len {
+        let val = w_int_get_value(value) as u8;
+        pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, val);
+        return Ok(w_none());
+    }
+    Err(PyError::new(
+        PyErrorKind::IndexError,
+        "bytearray index out of range",
+    ))
+}
+
+#[inline(never)]
+unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    // descroperation.py __setitem__ — `space.get_and_call_function`
+    // raises on instance error.  pyre `call_function` stashes errors
+    // as PY_NULL; `call_and_check` recovers them.
+    if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
+        crate::builtins::call_and_check(method, &[obj, index, value])?;
+        return Ok(w_none());
+    }
+    Err(PyError::type_error(format!(
+        "'{}' object does not support item assignment",
+        w_type_get_name(w_instance_get_type(obj)),
+    )))
 }
 
 /// String-keyed `finditem` shorthand: `space.finditem_str(w_obj, key)`.
