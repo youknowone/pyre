@@ -2447,6 +2447,13 @@ fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowV
     graph.fresh_variable(Kind::Ref).into()
 }
 
+fn pop_ref_or_fresh(
+    state: &mut FrameState,
+    graph: &mut super::flow::FunctionGraph,
+) -> super::flow::FlowValue {
+    state.stack.pop().unwrap_or_else(|| fresh_ref_value(graph))
+}
+
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -6544,10 +6551,7 @@ impl CodeWriter {
                         Instruction::StoreFast { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
                             let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let stored = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if is_portal {
                                 // Graph dual-write of jtransform.py:1898
                                 // `do_fixed_list_setitem` — STORE_FAST →
@@ -6822,10 +6826,7 @@ impl CodeWriter {
                             let store_reg = u32::from(pair.idx_1()) as u16;
                             let load_reg = u32::from(pair.idx_2()) as u16;
                             let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let stored = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if is_portal {
                                 // STORE_FAST half graph dual-write
                                 // (jtransform.py:1898 `do_fixed_list_setitem`).
@@ -6957,24 +6958,15 @@ impl CodeWriter {
                             // because ResKind::Void.
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
-                            let key_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let key_reg = stack_base + current_depth;
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
-                            let obj_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let obj_reg = stack_base + current_depth;
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
-                            let stored_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let value_reg = stack_base + current_depth;
                             emit_frontend_setitem(
                                 &mut graph,
@@ -7033,16 +7025,10 @@ impl CodeWriter {
                                 as i64;
                             // Pop rhs (blackhole will see vsd reflect this pop).
                             let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let rhs_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // Pop lhs.
                             let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let lhs_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_binary(
                                 &mut graph,
                                 &current_block.block(),
@@ -7085,15 +7071,9 @@ impl CodeWriter {
                             let op_kind = opname.get(op_arg);
                             let op_val = compare_op_tag(op_kind);
                             let rhs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let rhs_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let lhs_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let lhs_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_compare(
                                 &mut graph,
                                 &current_block.block(),
@@ -7147,10 +7127,7 @@ impl CodeWriter {
                             // flatten.py:240-260 which feeds the Variable straight to
                             // `goto_if_not`.
                             let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let cond_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if let super::flow::FlowValue::Variable(v) = &cond_value {
                                 pair_walker_slot(&mut walker_slot_for_variable, Some(*v), cond_reg);
                             }
@@ -7257,10 +7234,7 @@ impl CodeWriter {
                             // A-slice 7: see PopJumpIfFalse — no obj_tmp0 staging
                             // needed; the residual call reads the popped stack slot.
                             let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let cond_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if let super::flow::FlowValue::Variable(v) = &cond_value {
                                 pair_walker_slot(&mut walker_slot_for_variable, Some(*v), cond_reg);
                             }
@@ -7379,10 +7353,7 @@ impl CodeWriter {
                         // flatten.py: int_return / ref_return
                         Instruction::ReturnValue => {
                             let retval_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let retval = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let retval = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // A-slice 3: ref_return reads from the stack slot
                             // directly — the obj_tmp0 staging was redundant since
                             // this is the terminating op of the block.
@@ -7560,10 +7531,7 @@ impl CodeWriter {
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
                                 let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let arg_value = current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                let arg_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if let super::flow::FlowValue::Variable(v) = &arg_value {
                                     pair_walker_slot(
                                         &mut walker_slot_for_variable,
@@ -7580,15 +7548,9 @@ impl CodeWriter {
                             let arg_values: Vec<super::flow::FlowValue> =
                                 graph_arg_values_rev.iter().rev().cloned().collect();
                             let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let callable_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc); // NULL (discard)
-                            let _null_or_self = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let _null_or_self = pop_ref_or_fresh(&mut current_state, &mut graph);
 
                             // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                             // call_fn(frame, callable, arg0, ...) → result
@@ -7741,10 +7703,7 @@ impl CodeWriter {
                         // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                         Instruction::UnaryNegative => {
                             let operand_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let operand_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let operand_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let operand_value_for_dual = operand_value.clone();
                             let negated = emit_frontend_neg(
                                 &mut graph,
@@ -7872,10 +7831,7 @@ impl CodeWriter {
                             if argc > 3 {
                                 for _ in 0..argc {
                                     let _ = emit_popvalue_ref!(current_depth, py_pc);
-                                    let _ = current_state
-                                        .stack
-                                        .pop()
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 }
                                 emit_abort_permanent!();
                                 current_state.stack.push(fresh_ref_value(&mut graph));
@@ -7887,10 +7843,7 @@ impl CodeWriter {
                             let mut item_values_rev = Vec::with_capacity(argc);
                             for _ in 0..argc {
                                 let item_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let item_value = current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if let super::flow::FlowValue::Variable(v) = &item_value {
                                     pair_walker_slot(
                                         &mut walker_slot_for_variable,
@@ -7965,24 +7918,15 @@ impl CodeWriter {
                             };
                             let step_info = if raw_argc == 3 {
                                 let reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let step_value = current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                let step_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 Some((reg, step_value))
                             } else {
                                 None
                             };
                             let stop_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let stop_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let start_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let start_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let step_reg = step_info.as_ref().map(|(reg, _)| *reg);
                             let result_value = emit_frontend_buildslice_shadow_graph(
                                 &mut graph,
@@ -8031,10 +7975,7 @@ impl CodeWriter {
                                     super::flatten::Operand,
                                     super::flow::FlowValue,
                                 ) = if n >= 2 {
-                                    let cause_fv = current_state
-                                        .stack
-                                        .pop()
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                    let cause_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                     let cause_reg = emit_popvalue_ref!(current_depth, py_pc);
                                     (
                                         super::flatten::Operand::Register(
@@ -8074,10 +8015,7 @@ impl CodeWriter {
                                 // rewrite `raise SomeExcClass` into a fresh
                                 // instance, so the exception edge must carry a
                                 // NEW FlowValue representing the normalized result.
-                                let exc_fv = current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                let exc_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
                                 // normalization + `set_cause` attachment.  Call ABI
@@ -8163,10 +8101,7 @@ impl CodeWriter {
                             // nested exception state (pyopcode.py:786 saves the
                             // previous sys_exc_info so `POP_EXCEPT` can restore it).
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let exc_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // pyopcode.py:786 keeps `exc` in a local after
                             // `popvalue()`.  Mirror that with a scratch register:
                             // the following `push(prev)` writes to the popped
@@ -8258,10 +8193,7 @@ impl CodeWriter {
                             // runtime exception type; the residual helper owns
                             // the check.
                             let match_type_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let match_type_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let match_type_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let exc_reg = stack_base + current_depth - 1;
                             // Peek (don't pop) the exception value for the graph
                             // dual-write — net stack effect is zero (pop match
@@ -8333,10 +8265,7 @@ impl CodeWriter {
                             // reinstated as the "current" one so a bare `raise`
                             // re-propagates it.
                             let prev_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let prev_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let prev_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // set_current_exception is a TLS write — EF_CANNOT_RAISE.
                             // PopExcept
                             // set_current_exception factor refactor.
@@ -8392,10 +8321,7 @@ impl CodeWriter {
                                 let _ = current_state.stack.pop();
                             }
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let exc_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // RERAISE: pyre-only deviation from RPython
                             // (which has no RERAISE bytecode — its
                             // `Reraise.nomoreblocks` calls reraise
@@ -8506,16 +8432,10 @@ impl CodeWriter {
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
-                            let obj_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
-                            let stored_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             emit_frontend_setattr(
                                 &mut graph,
                                 &current_block.block(),
@@ -8534,10 +8454,7 @@ impl CodeWriter {
                             let name_idx = attr.name_idx() as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
-                            let obj_value = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
                                 &current_block.block(),
@@ -8563,10 +8480,7 @@ impl CodeWriter {
                             let reg_b = u32::from(pair.idx_2()) as u16;
                             for reg in [reg_a, reg_b] {
                                 let stored_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let stored = current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 if is_portal {
                                     // Graph-side dual-write — same shape as
                                     // the StoreFast handler.  SSA emission
@@ -8857,10 +8771,7 @@ impl CodeWriter {
                         // pushes same func back. Net: -1. Preserve func identity.
                         // eval.rs:1907-1908: func = pop(), attr = pop().
                         Instruction::SetFunctionAttribute { .. } => {
-                            let func = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let func = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             let _ = current_state.stack.pop(); // attr
                             current_depth = current_depth.saturating_sub(1);
@@ -8872,10 +8783,7 @@ impl CodeWriter {
                         // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
                         // Net: -1. Preserve result identity. eval.rs:2305-2309.
                         Instruction::EndSend => {
-                            let result = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             let _ = current_state.stack.pop(); // iter
                             current_depth = current_depth.saturating_sub(1);
