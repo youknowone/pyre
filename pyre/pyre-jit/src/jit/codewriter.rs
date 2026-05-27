@@ -753,6 +753,24 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
 }
 
+/// `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)` emits a
+/// register-to-register move as `ref_copy/r>r`.  Identity copies are
+/// dropped — same reg on both sides is a no-op at runtime and at regalloc
+/// time, so callers freely route a producer directly into its stack-slot
+/// register without inserting a redundant byte.  Walker MUST NOT record a
+/// graph-side `ref_copy` op; `insert_renamings` (flatten.py:320) owns
+/// emission.
+fn emit_ref_copy(current_block: &SpamBlockRef, dst: u16, src: u16) {
+    if dst != src {
+        let insn = Insn::op_with_result(
+            "ref_copy",
+            vec![Operand::reg(Kind::Ref, src)],
+            Register::new(Kind::Ref, dst),
+        );
+        push_walker_emit(current_block, insn);
+    }
+}
+
 /// Drain per-block accumulators into a single contiguous `Insn`
 /// stream, stripping the defensive walker-emitted `goto pcN; ---`
 /// pair when the next block opens with that label (block boundary
@@ -5898,38 +5916,6 @@ impl CodeWriter {
             }};
         }
 
-        // RPython parity: `flatten.py:333`
-        // `self.emitline('%s_copy' % kind, v, "->", w)` emits the
-        // register-to-register move as `ref_copy` when `kind == 'ref'`;
-        // `assembler.py:220` turns it into the bytecode key
-        // `ref_copy/r>r`. The SSARepr arg list follows the upstream
-        // `(src, '->', dst)` shape via `op_with_result`.
-        //
-        // RPython generates `ref_copy` ONLY at flatten.py:320 during
-        // link renaming (`GraphFlattener::insert_renamings`), never as
-        // a flow graph SpaceOperation.  Walker MUST NOT record a
-        // graph-side `ref_copy` op.
-        macro_rules! emit_ref_copy {
-            ($dst:expr, $src:expr) => {{
-                let dst = $dst;
-                let src = $src;
-                // Identity copies are dead: same reg on both sides is a
-                // no-op at runtime (no register file mutation) and at
-                // regalloc time (no new SSA def).  Skipping them lets
-                // callers freely route a value's producer directly into
-                // its stack-slot register without inserting a redundant
-                // `ref_copy` byte.
-                if dst != src {
-                    let insn = Insn::op_with_result(
-                        "ref_copy",
-                        vec![Operand::reg(Kind::Ref, src)],
-                        Register::new(Kind::Ref, dst),
-                    );
-                    push_walker_emit(&current_block, insn);
-                }
-            }};
-        }
-
         // pyframe.py:378-381 `pushvalue` lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
         // + `setfield_vable_i(valuestackdepth, depth + 1)` via
@@ -5947,7 +5933,7 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
-                emit_ref_copy!(stack_base + $depth, src_reg);
+                emit_ref_copy(&current_block, stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
@@ -6037,7 +6023,7 @@ impl CodeWriter {
                     // stack slot register for any downstream consumer.
                     // `flatten.py:333-334` parity: ref_copy with ConstRef
                     // source.  Walker MUST NOT record a graph-side
-                    // `ref_copy` op (matching `emit_ref_copy!`).
+                    // `ref_copy` op (matching `emit_ref_copy`).
                     let const_copy_insn = Insn::op_with_result(
                         "ref_copy",
                         vec![Operand::ConstRef(value)],
@@ -6215,7 +6201,7 @@ impl CodeWriter {
         // Endgame: dropping the portal mirror is the
         // first step in retiring walker's raw-register local model.
         // Subsequent slices will retire the equivalent push-side
-        // `emit_ref_copy!` in `emit_pushvalue_ref!` and the various
+        // `emit_ref_copy` in `emit_pushvalue_ref!` and the various
         // CALL / catch-landing inline ref_copies.
         macro_rules! emit_store_local_with_mirror {
             ($reg:expr, $stored_reg:expr) => {{
@@ -6229,7 +6215,7 @@ impl CodeWriter {
                         stored_reg
                     );
                 } else {
-                    emit_ref_copy!(reg, stored_reg);
+                    emit_ref_copy(&current_block, reg, stored_reg);
                 }
             }};
         }
@@ -7390,7 +7376,7 @@ impl CodeWriter {
                             // `raw_namei & 1` LOAD_GLOBAL(push_null) variant).
                             // The trailing `emit_pushvalue_ref!` then sees
                             // `src == dst` and elides its `ref_copy` per the
-                            // identity-elide guard in `emit_ref_copy!`,
+                            // identity-elide guard in `emit_ref_copy`,
                             // matching upstream RPython where pushvalue is
                             // symbolic and the residual_call writes directly
                             // to the consumer slot.  Walker non-orthodoxy
@@ -7507,9 +7493,9 @@ impl CodeWriter {
                             // `loaded_dst_reg == stack_base + current_depth` here
                             // (computed before the optional NULL push that bumps
                             // current_depth by `null_offset`), so the trailing
-                            // `emit_ref_copy!(stack_base + current_depth, loaded_dst_reg)`
+                            // `emit_ref_copy(stack_base + current_depth, loaded_dst_reg)`
                             // inside `emit_pushvalue_ref!` is the identity copy
-                            // elided by `emit_ref_copy!`'s `dst != src` guard.
+                            // elided by `emit_ref_copy`'s `dst != src` guard.
                             emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_value, py_pc);
                         }
 
@@ -8109,7 +8095,7 @@ impl CodeWriter {
                             // `push(exc)` would read back `prev` instead of the
                             // caught exception.
                             let scratch_exc = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            emit_ref_copy!(scratch_exc, exc_reg);
+                            emit_ref_copy(&current_block, scratch_exc, exc_reg);
                             let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // get_current_exception / set_current_exception are TLS read/write —
                             // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
