@@ -2179,6 +2179,189 @@ pub(crate) fn op_result_value_type(
     }
 }
 
+pub(crate) fn canonical_pat_name(pat: &syn::Pat) -> String {
+    match pat {
+        syn::Pat::Ident(ident) => ident.ident.to_string(),
+        syn::Pat::Reference(reference) => canonical_pat_name(&reference.pat),
+        syn::Pat::Type(typed) => canonical_pat_name(&typed.pat),
+        syn::Pat::TupleStruct(tuple_struct) => tuple_struct
+            .path
+            .segments
+            .iter()
+            .map(|seg| seg.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        syn::Pat::Struct(strukt) => strukt
+            .path
+            .segments
+            .iter()
+            .map(|seg| seg.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        syn::Pat::Tuple(_) => "tuple_pat".into(),
+        syn::Pat::Slice(_) => "slice_pat".into(),
+        syn::Pat::Lit(_) => "lit_pat".into(),
+        syn::Pat::Path(_) => "path_pat".into(),
+        syn::Pat::Wild(_) => "_".into(),
+        syn::Pat::Or(_) => "or_pat".into(),
+        syn::Pat::Range(_) => "range_pat".into(),
+        syn::Pat::Macro(_) => "macro_pat".into(),
+        syn::Pat::Paren(paren) => canonical_pat_name(&paren.pat),
+        _ => "unsupported_pat".into(),
+    }
+}
+
+pub(crate) fn matches_constructor_path(path: &[String], leaf: &str) -> bool {
+    path.last().is_some_and(|last| last == leaf)
+}
+
+/// Classify a Rust parameter/return `syn::Type` into one of the
+/// RPython `lltype` register classes (`Int`/`Ref`/`Float`/`Bool`/
+/// `Unsigned`).  Assigned to `OpKind::Input { ty }` so the annotator
+/// + rtyper reach every function parameter with a concrete class.
+pub fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
+    use crate::model::ValueType;
+    match ty {
+        syn::Type::Path(path) => {
+            let last = match path.path.segments.last() {
+                Some(s) => s,
+                None => return ValueType::Ref(None),
+            };
+            if path.path.segments.len() == 2
+                && path.path.segments[0].ident == "Self"
+                && path.path.segments[1].ident == "Truth"
+            {
+                return ValueType::Int;
+            }
+            let name = last.ident.to_string();
+            if matches!(name.as_str(), "Box" | "Rc" | "Arc") {
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                    for arg in &args.args {
+                        if let syn::GenericArgument::Type(inner) = arg {
+                            return classify_fn_arg_ty(inner);
+                        }
+                    }
+                }
+                return ValueType::Ref(type_root_ident(ty));
+            }
+            match name.as_str() {
+                "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
+                "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
+                "bool" => ValueType::Bool,
+                "f32" | "f64" => ValueType::Float,
+                // Carry the joined path segments as diagnostic metadata
+                // on the legacy tag. Precise typed pointers must be
+                // attached by producers that can resolve the actual
+                // HostObject/lltype identity; `valuetype_to_someshell`
+                // deliberately keeps `Ref(_)` on the classdef-less
+                // fallback.
+                _ => ValueType::Ref(type_root_ident(ty)),
+            }
+        }
+        syn::Type::Reference(_) => ValueType::Ref(type_root_ident(ty)),
+        syn::Type::Ptr(_) => ValueType::Ref(type_root_ident(ty)),
+        syn::Type::Paren(paren) => classify_fn_arg_ty(&paren.elem),
+        syn::Type::Group(group) => classify_fn_arg_ty(&group.elem),
+        syn::Type::TraitObject(_) => ValueType::Ref(type_root_ident(ty)),
+        syn::Type::Tuple(_) | syn::Type::Array(_) | syn::Type::Slice(_) => ValueType::Ref(None),
+        _ => ValueType::Ref(None),
+    }
+}
+
+/// RPython lltype.Struct objects have globally unique identities;
+/// returning all path segments ensures `a::Foo` and `b::Foo` don't
+/// alias.  Recurses through `Box`/`Rc`/`Arc` so `Box<dyn Trait>`
+/// returns the trait root, not the container.
+pub(crate) fn type_root_ident(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => {
+            if let Some(last) = path.path.segments.last() {
+                let wrapper = last.ident.to_string();
+                if matches!(wrapper.as_str(), "Box" | "Rc" | "Arc") {
+                    if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Type(inner) = arg {
+                                if let Some(root) = type_root_ident(inner) {
+                                    return Some(root);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.is_empty() {
+                None
+            } else {
+                Some(segments.join("::"))
+            }
+        }
+        syn::Type::Reference(reference) => type_root_ident(&reference.elem),
+        syn::Type::Ptr(ptr) => type_root_ident(&ptr.elem),
+        syn::Type::Paren(paren) => type_root_ident(&paren.elem),
+        syn::Type::Group(group) => type_root_ident(&group.elem),
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        syn::Type::ImplTrait(_) => None,
+        _ => None,
+    }
+}
+
+/// Returns the bare trait root (no `dyn ` prefix) when `ty` denotes
+/// a `dyn Trait` / `&dyn Trait` / `Box<dyn Trait>` receiver; `None`
+/// otherwise.  Used by method-call lowering to decide whether the
+/// call should be modeled as an RPython `indirect_call`.
+pub fn extract_dyn_trait_root(ty: &syn::Type) -> Option<String> {
+    extract_dyn_trait_root_with_context(ty, "", &std::collections::HashSet::new())
+}
+
+pub(crate) fn extract_dyn_trait_root_with_context(
+    ty: &syn::Type,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    match ty {
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+        }
+        syn::Type::ImplTrait(_) => None,
+        syn::Type::Reference(r) => {
+            extract_dyn_trait_root_with_context(&r.elem, prefix, known_trait_names)
+        }
+        syn::Type::Paren(p) => {
+            extract_dyn_trait_root_with_context(&p.elem, prefix, known_trait_names)
+        }
+        syn::Type::Group(g) => {
+            extract_dyn_trait_root_with_context(&g.elem, prefix, known_trait_names)
+        }
+        syn::Type::Path(path) => {
+            let last = path.path.segments.last()?;
+            if !matches!(last.ident.to_string().as_str(), "Box" | "Rc" | "Arc") {
+                return None;
+            }
+            if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                for arg in &args.args {
+                    if let syn::GenericArgument::Type(inner) = arg {
+                        if let Some(r) =
+                            extract_dyn_trait_root_with_context(inner, prefix, known_trait_names)
+                        {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// RPython equivalent of Rust's `expr as T` for numeric / Bool /
 /// pointer casts.  Maps each `(source, target)` pair to the matching
 /// callable path — a single `__builtin__` name (one segment) for

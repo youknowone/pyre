@@ -18,19 +18,21 @@ pub use crate::front::semantic::{
     SemanticProgram, StructFieldRegistry, qualify_module_path, qualify_type_name_with_imports,
 };
 pub use crate::front::syn_metadata::{
-    full_type_string, qualified_full_type_string, qualified_full_type_string_with_imports,
-    trait_object_root_name,
+    classify_fn_arg_ty, extract_dyn_trait_root, full_type_string, qualified_full_type_string,
+    qualified_full_type_string_with_imports, trait_object_root_name,
 };
 pub(crate) use crate::front::syn_metadata::is_synthetic_unit_variant_path;
 use crate::front::syn_metadata::{
     UnaryNotOperandKind, array_item_value_type_from_array_type_id, bare_type_root_from_type_str,
-    binary_result_value_type_inner, cast_builtin_name, const_value_value_type,
-    dyn_trait_root_from_type_str, extract_element_type_from_str, intrinsic_call_result_type,
-    is_synthetic_ctor_path, is_synthetic_result_option_wrapper_path, kind_char_to_value_type,
+    binary_result_value_type_inner, canonical_pat_name, cast_builtin_name, const_value_value_type,
+    dyn_trait_root_from_type_str, extract_dyn_trait_root_with_context,
+    extract_element_type_from_str, intrinsic_call_result_type, is_synthetic_ctor_path,
+    is_synthetic_result_option_wrapper_path, kind_char_to_value_type, matches_constructor_path,
     method_as_ref_return_type, op_result_value_type, outer_generic_inner_type,
     path_as_value_float_constant, split_tuple_type_elements, transparent_option_inner_type,
-    transparent_result_err_type, type_root_from_type_string, type_string_to_unary_not_kind,
-    type_string_to_value_type, unwrap_result_or_option, value_type_to_unary_not_kind,
+    transparent_result_err_type, type_root_from_type_string, type_root_ident,
+    type_string_to_unary_not_kind, type_string_to_value_type, unwrap_result_or_option,
+    value_type_to_unary_not_kind,
 };
 
 /// Result of lowering one expression or statement-list tail.
@@ -7463,38 +7465,6 @@ fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Opt
     }
 }
 
-fn canonical_pat_name(pat: &syn::Pat) -> String {
-    match pat {
-        syn::Pat::Ident(ident) => ident.ident.to_string(),
-        syn::Pat::Reference(reference) => canonical_pat_name(&reference.pat),
-        syn::Pat::Type(typed) => canonical_pat_name(&typed.pat),
-        syn::Pat::TupleStruct(tuple_struct) => tuple_struct
-            .path
-            .segments
-            .iter()
-            .map(|seg| seg.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-        syn::Pat::Struct(strukt) => strukt
-            .path
-            .segments
-            .iter()
-            .map(|seg| seg.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-        syn::Pat::Tuple(_) => "tuple_pat".into(),
-        syn::Pat::Slice(_) => "slice_pat".into(),
-        syn::Pat::Lit(_) => "lit_pat".into(),
-        syn::Pat::Path(_) => "path_pat".into(),
-        syn::Pat::Wild(_) => "_".into(),
-        syn::Pat::Or(_) => "or_pat".into(),
-        syn::Pat::Range(_) => "range_pat".into(),
-        syn::Pat::Macro(_) => "macro_pat".into(),
-        syn::Pat::Paren(paren) => canonical_pat_name(&paren.pat),
-        _ => "unsupported_pat".into(),
-    }
-}
-
 fn bind_pattern_locals(
     pat: &syn::Pat,
     matched_type: Option<&str>,
@@ -7674,187 +7644,6 @@ fn bind_ident_type(ident: &syn::Ident, type_str: &str, ctx: &mut GraphBuildConte
     }
 }
 
-fn matches_constructor_path(path: &[String], leaf: &str) -> bool {
-    path.last().is_some_and(|last| last == leaf)
-}
-
-/// Extract the head identifier from a Rust type string for
-/// receiver / method / field-owner lookups.
-///
-/// **Structural adaptation (parity rule §1):** RPython carries
-/// `concretetype` as an `lltype.Ptr(GcStruct)` object whose identity
-/// is structural; field/method lookups compare type objects directly.
-/// Rust's `syn` AST surfaces types as strings, and the analyser
-/// keeps them as strings throughout, so type identity resolves by
-/// head-identifier match.  Wrapper info (`Box<T>`, `Vec<T>`,
-/// generic args, lifetime params) is discarded here — the caller is
-/// expected to have already applied the appropriate transparent-
-/// container unwrapping (`extract_element_type_from_str` for arrays,
-/// `transparent_option_inner_type` etc.) when the wrapper carries
-/// payload type information.  Two distinct types that happen to share
-/// a head identifier (e.g. via `use crate::foo::Bar` and
-/// `use crate::baz::Bar`) will collide; pyre does not currently
-/// disambiguate, mirroring the analyser's flat name table.  The
-/// raw-pointer / reference prefix strip preserves single-identity
-/// behaviour for `let x = obj as *mut Foo;` bindings.
-/// RPython: lltype graph identity — returns the full type path.
-/// For `Foo` → "Foo", for `a::Foo` → "a::Foo".
-/// Classify a Rust parameter/return `syn::Type` into one of the three
-/// RPython `lltype` register classes (`Int`/`Ref`/`Float`).  This is the
-/// pyre-side bridge for what RPython does implicitly: each `Variable`
-/// carries `concretetype`, and `getkind(concretetype)` picks the class
-/// (`rpython/jit/codewriter/support.py:getkind`).  pyre's front-end
-/// records only a `syn::Type` so we reproduce the mapping here.
-///
-/// Returned value is assigned to `OpKind::Input { ty }` so the annotator
-/// + rtyper reach every function parameter with a concrete class; the
-/// assembler's `lookup_reg_with_kind` then finds a coloring for every
-/// operand it encounters, matching upstream's invariant that every
-/// Variable reaching `assembler.py:write_insn` has a `concretetype`.
-pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
-    use crate::model::ValueType;
-    match ty {
-        syn::Type::Path(path) => {
-            let last = match path.path.segments.last() {
-                Some(s) => s,
-                None => return ValueType::Ref(None),
-            };
-            if path.path.segments.len() == 2
-                && path.path.segments[0].ident == "Self"
-                && path.path.segments[1].ident == "Truth"
-            {
-                return ValueType::Int;
-            }
-            let name = last.ident.to_string();
-            // `Box<T>` / `Rc<T>` / `Arc<T>` — classify on the inner type
-            // so `Box<i64>` stays Int (RPython `lltype.Ptr(Signed)`
-            // collapses to the primitive), matching the downstream
-            // `ValueType::Ref` vs `Int` distinction the assembler keys
-            // off.
-            if matches!(name.as_str(), "Box" | "Rc" | "Arc") {
-                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                    for arg in &args.args {
-                        if let syn::GenericArgument::Type(inner) = arg {
-                            return classify_fn_arg_ty(inner);
-                        }
-                    }
-                }
-                return ValueType::Ref(type_root_ident(ty));
-            }
-            match name.as_str() {
-                // `lltype.Signed` family.
-                "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
-                // `lltype.Unsigned` family — `getkind(Unsigned) == 'int'`
-                // collapses storage to the int register class
-                // (`rpython/jit/codewriter/flatten.py:getkind`).  The
-                // producer-side type tag stays Unsigned so the annotator
-                // selects `SomeInteger(unsigned=True)` and the
-                // rtyper-side `signed_repr_of` / `intmask` cast paths
-                // distinguish signed vs unsigned at the LL boundary.
-                "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
-                // `lltype.Bool` annotates as `SomeBool(SomeInteger)`
-                // (`annotator/model.py:185-198`, distinct lattice node).
-                // `getkind(Bool) == 'int'` so register-class code paths
-                // alias Bool to Int (jit_codewriter sites added in
-                // commit 4318ebb51b2); the producer-side type tag
-                // remains Bool so the rtyper picks `BoolRepr`.
-                "bool" => ValueType::Bool,
-                // `lltype.Float` — `f32` widens up to f64 at the SSA
-                // level but stays in the Float class either way.
-                "f32" | "f64" => ValueType::Float,
-                // Anything else is a user type / GC ref / opaque struct.
-                // Carry the joined path segments as diagnostic metadata
-                // on the legacy tag. Precise typed pointers must be
-                // attached by producers that can resolve the actual
-                // HostObject/lltype identity; `valuetype_to_someshell`
-                // deliberately keeps `Ref(_)` on the classdef-less
-                // fallback.
-                _ => ValueType::Ref(type_root_ident(ty)),
-            }
-        }
-        // `&T` / `&mut T` — pointer → Ref (lltype.Ptr in RPython).
-        // `type_root_ident` recursively unwraps the reference and
-        // returns the inner Path's joined segments when present.
-        syn::Type::Reference(_) => ValueType::Ref(type_root_ident(ty)),
-        // `*const T` / `*mut T` — raw pointer, same class as Ref.  pyre
-        // often stores GC objects as `*mut PyObject`; classify as Ref
-        // so field/array bases reach the canonical `/rd>X` encoding
-        // rather than the pyre-only `*_intbase` aliases.
-        syn::Type::Ptr(_) => ValueType::Ref(type_root_ident(ty)),
-        syn::Type::Paren(paren) => classify_fn_arg_ty(&paren.elem),
-        syn::Type::Group(group) => classify_fn_arg_ty(&group.elem),
-        // `dyn Trait` — GC pointer to a trait object.
-        // `type_root_ident` returns `dyn <Trait>` so consumers can
-        // distinguish concrete structs from trait objects.
-        syn::Type::TraitObject(_) => ValueType::Ref(type_root_ident(ty)),
-        // Tuple/array/slice: treat as Ref (bulk data, not a register
-        // primitive).  RPython `lltype.Array` + `lltype.Struct` both
-        // flatten to `lltype.Ptr` at the call-site boundary.  No single
-        // ident makes sense as the type-root, so leave `None`.
-        syn::Type::Tuple(_) | syn::Type::Array(_) | syn::Type::Slice(_) => ValueType::Ref(None),
-        // `fn(T) -> T`, `impl Trait`, never — no runtime
-        // representation reaches the SSA level; default to Ref for
-        // safe-by-default classification.
-        _ => ValueType::Ref(None),
-    }
-}
-
-/// RPython's lltype.Struct objects have globally unique identities;
-/// returning all path segments ensures `a::Foo` and `b::Foo` don't alias.
-fn type_root_ident(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Path(path) => {
-            // `Box<dyn Trait>` / `Rc<dyn Trait>` / `Arc<dyn Trait>` —
-            // unwrap the first generic arg and try again; the resulting
-            // root identifies the trait, not the container.
-            if let Some(last) = path.path.segments.last() {
-                let wrapper = last.ident.to_string();
-                if matches!(wrapper.as_str(), "Box" | "Rc" | "Arc") {
-                    if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                        for arg in &args.args {
-                            if let syn::GenericArgument::Type(inner) = arg {
-                                if let Some(root) = type_root_ident(inner) {
-                                    return Some(root);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let segments: Vec<_> = path
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            if segments.is_empty() {
-                None
-            } else {
-                Some(segments.join("::"))
-            }
-        }
-        syn::Type::Reference(reference) => type_root_ident(&reference.elem),
-        syn::Type::Ptr(ptr) => type_root_ident(&ptr.elem),
-        syn::Type::Paren(paren) => type_root_ident(&paren.elem),
-        syn::Type::Group(group) => type_root_ident(&group.elem),
-        // `dyn Trait + 'a` / `&mut dyn Trait` (after deref) — return the
-        // first trait bound's canonical path, rendered as `dyn <Trait>` so
-        // callers can tell this is a trait object.
-        syn::Type::TraitObject(obj) => {
-            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
-        }
-        // `impl Trait` is a static opaque type (compiler monomorphizes
-        // each call site to a single concrete impl), not runtime
-        // family-dispatch.  RPython `indirect_call` is reserved for
-        // truly polymorphic callees (`rpython/jit/codewriter/call.py:103
-        // graphs_from`); treat impl Trait the same way concrete-type
-        // method calls are treated and bail out so downstream emits
-        // CallTarget::Method, not CallTarget::Indirect.
-        syn::Type::ImplTrait(_) => None,
-        _ => None,
-    }
-}
-
 fn trait_bound_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
     match expr {
         syn::Expr::Path(path) => path
@@ -7866,63 +7655,6 @@ fn trait_bound_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> O
         syn::Expr::Group(group) => trait_bound_root_for_receiver(&group.expr, ctx),
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
             trait_bound_root_for_receiver(&unary.expr, ctx)
-        }
-        _ => None,
-    }
-}
-
-/// Returns the bare trait root (no `dyn ` prefix) when `ty` denotes a
-/// `dyn Trait` / `&dyn Trait` / `Box<dyn Trait>` receiver; `None`
-/// otherwise.  Used by method-call lowering to decide whether the call
-/// should be modeled as an RPython `indirect_call`
-/// (`rewrite_op_indirect_call` entrypoint).
-pub fn extract_dyn_trait_root(ty: &syn::Type) -> Option<String> {
-    extract_dyn_trait_root_with_context(ty, "", &std::collections::HashSet::new())
-}
-
-fn extract_dyn_trait_root_with_context(
-    ty: &syn::Type,
-    prefix: &str,
-    known_trait_names: &std::collections::HashSet<String>,
-) -> Option<String> {
-    match ty {
-        syn::Type::TraitObject(obj) => {
-            crate::front::syn_metadata::trait_object_root_name_qualified(
-                &obj.bounds,
-                prefix,
-                known_trait_names,
-            )
-        }
-        // `impl Trait` is a static opaque type — no runtime family-dispatch.
-        // See `type_root_ident`'s ImplTrait arm for the rationale + RPython cite.
-        syn::Type::ImplTrait(_) => None,
-        syn::Type::Reference(r) => {
-            extract_dyn_trait_root_with_context(&r.elem, prefix, known_trait_names)
-        }
-        syn::Type::Paren(p) => {
-            extract_dyn_trait_root_with_context(&p.elem, prefix, known_trait_names)
-        }
-        syn::Type::Group(g) => {
-            extract_dyn_trait_root_with_context(&g.elem, prefix, known_trait_names)
-        }
-        syn::Type::Path(path) => {
-            // `Box<dyn Trait>` / `Rc<dyn Trait>` / `Arc<dyn Trait>`.
-            let last = path.path.segments.last()?;
-            if !matches!(last.ident.to_string().as_str(), "Box" | "Rc" | "Arc") {
-                return None;
-            }
-            if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                for arg in &args.args {
-                    if let syn::GenericArgument::Type(inner) = arg {
-                        if let Some(r) =
-                            extract_dyn_trait_root_with_context(inner, prefix, known_trait_names)
-                        {
-                            return Some(r);
-                        }
-                    }
-                }
-            }
-            None
         }
         _ => None,
     }
