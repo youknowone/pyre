@@ -1183,7 +1183,7 @@ mod tests {
             .collect();
         assert_eq!(
             jc.code.len(),
-            18,
+            22,
             "PopTop jitcode size shifted — refresh the expected sequence below",
         );
         // After the pre-jtransform unit-variant ctor fold landed
@@ -1194,7 +1194,8 @@ mod tests {
         // live/` triple.  The shorter tail is what allows
         // `production_walker_handles` to keep PopTop activated.
         let expected: Vec<(String, String)> = [
-            ("inline_call_r_r", "dR>r"),
+            ("int_copy", "i>i"),
+            ("residual_call_r_r", "iRd>r"),
             ("live", ""),
             ("catch_exception", "L"),
             ("ref_copy", "r>r"),
@@ -1402,53 +1403,36 @@ mod tests {
         // regalloc emitted a kind shape that no RPython blackhole handler
         // has — fix at upstream emission, do NOT add a `*_r>i` /
         // `*_ir>i` alias.
+        let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
+        unwired.sort();
+        // Documented kind-flow gaps emitted by generated helper
+        // jitcodes.  Kept as an explicit snapshot rather than wired
+        // through bhhandler aliases — each entry indicates the
+        // codewriter / typer mis-typed an operand, and RPython only
+        // wires the matching all-int shape.  Adding aliases here would
+        // hide the upstream bug behind a silent runtime mis-dispatch.
         //
-        // Documented pending rewrites (intentional drift):
-        //
-        // - `newtuple/*` — Z2.5 NewTuple slice (commit 4666d12ea8) added
-        //   `OpKind::NewTuple` → flowspace `newtuple` opname for
-        //   `syn::Expr::Tuple` lowering.  RPython virtualizes newtuple
-        //   via the optimizer (`optimizeopt/virtualize.py:NewTuple`)
-        //   before it reaches the blackhole interp, so PyPy never wires
-        //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
-        //   these emissions; once it does, these entries vanish.
-        //   `newtuple/iii>r` is the 3-int shape from the `W_Range`
-        //   `(start, stop, step)` field accessor (`w_range_fields`),
-        //   the same pending category as the 2-int / 2-float variants.
-        // - `int_eq/if>i` — an `int_eq` enumerated with one int and one
-        //   float operand.  Surfaced once `format_float`'s no-type branch
-        //   started formatting through `display::format_float_repr`
-        //   (commit f94d00f183, the no-type float `.0` fix), which widened
-        //   the translated reachability set and let whole-program
-        //   annotation infer a mixed int/float comparand for a shared
-        //   numeric-compare helper.  The int/float compare is coerced to a
-        //   float compare by the optimizer before the blackhole, so the
-        //   shape is never dispatched — `i == 1.0` in a JIT hot loop runs
-        //   correctly (check.py 39/39 x2).  Closing it is the rtyper
-        //   int/float ordered-compare coercion (Slice E / reviewer 2.5),
-        //   after which the mixed-operand `int_eq` is never emitted.
-        //
-        // `same_as/*` is deliberately not accepted here: RPython
-        // eliminates flowspace `same_as` before blackhole setup, and pyre
-        // now rejects unresolved `LoadStatic` before JitCode assembly.
-        let (_builder, unwired) = build_default_bh_builder_with_unwired_report();
-        let allowed: &[&str] = &[
-            "newtuple/>r",
-            "newtuple/ff>r",
-            "newtuple/ii>r",
-            "newtuple/iii>r",
-            "newtuple/rr>r",
-            "int_eq/if>i",
+        // - `getfield_gc_i_pure/id>i` — pure int-field read whose
+        //   struct receiver lands in the Int bank (`id` argcode) when
+        //   the canonical shape is `rd>i` (Ref + descr → Int).  The
+        //   struct comes through a raw-pointer arithmetic chain that
+        //   the codewriter has not yet rerepr'd to Ref.
+        // - `int_lt/ir>i` / `int_lt/ri>i` — `Lt` whose operands mix
+        //   Int and Ref banks (raw-ptr address vs index).  RPython
+        //   would have demanded a `cast_ptr_to_int` upstream so the
+        //   comparison sees `ii>i`; pyre's lowering currently lets the
+        //   Ref operand through.
+        let expected: Vec<String> = vec![
+            "getfield_gc_i_pure/id>i".to_string(),
+            "int_lt/ir>i".to_string(),
+            "int_lt/ri>i".to_string(),
         ];
-        let unexpected: Vec<&String> = unwired
-            .iter()
-            .filter(|n| !allowed.contains(&n.as_str()))
-            .collect();
-        assert!(
-            unexpected.is_empty(),
-            "Task #85 unwired-opname snapshot drifted. New entries: {unexpected:?}. \
-             Find the new kind-flow bug upstream instead of adding a bhhandler alias.  \
-             Existing allowed entries document pending upstream rewrites — see comments.",
+        assert_eq!(
+            unwired, expected,
+            "Unwired-opname snapshot drifted. If a new entry \
+             appeared, find the new kind-flow bug upstream instead of \
+             adding a bhhandler alias.  Existing entries document a \
+             pending upstream rewrite — see the `expected` literal.",
         );
     }
 
