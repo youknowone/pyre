@@ -363,6 +363,12 @@ impl FrameState {
         self.locals_w.get(reg).and_then(|v| v.clone())
     }
 
+    fn store_local_value(&mut self, reg: usize, value: super::flow::FlowValue) {
+        if let Some(slot) = self.locals_w.get_mut(reg) {
+            *slot = Some(value);
+        }
+    }
+
     fn copy<F>(&self, fresh_variable: &mut F) -> Self
     where
         F: FnMut(Option<Kind>) -> super::flow::Variable,
@@ -6564,9 +6570,7 @@ impl CodeWriter {
                                 );
                             }
                             emit_store_local_with_mirror!(reg, stored_reg);
-                            if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
-                                *slot = Some(stored);
-                            }
+                            current_state.store_local_value(reg as usize, stored);
                         }
 
                         Instruction::LoadSmallInt { i } => {
@@ -6865,11 +6869,7 @@ impl CodeWriter {
                                 // update before recording the graph LOAD half so
                                 // any prior Variable on `store_reg` is replaced
                                 // with `stored` first.
-                                if let Some(slot) =
-                                    current_state.locals_w.get_mut(store_reg as usize)
-                                {
-                                    *slot = Some(stored);
-                                }
+                                current_state.store_local_value(store_reg as usize, stored);
                                 // Graph-side dual-write of BOTH halves of the
                                 // LOAD half lowering — symmetric to
                                 // `emit_load_fast_ref!` (codewriter.rs:3833+):
@@ -6939,11 +6939,7 @@ impl CodeWriter {
                                 current_depth += 1;
                                 emit_vsd!(current_depth, py_pc);
                             } else {
-                                if let Some(slot) =
-                                    current_state.locals_w.get_mut(store_reg as usize)
-                                {
-                                    *slot = Some(stored);
-                                }
+                                current_state.store_local_value(store_reg as usize, stored);
                                 let loaded = current_state
                                     .local_value_at(load_reg as usize)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -8592,9 +8588,7 @@ impl CodeWriter {
                                     );
                                 }
                                 emit_store_local_with_mirror!(reg, stored_reg);
-                                if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
-                                    *slot = Some(stored);
-                                }
+                                current_state.store_local_value(reg as usize, stored);
                             }
                         }
 
