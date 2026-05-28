@@ -1892,13 +1892,23 @@ impl OptContext {
         if let Some(op) = self.find_producer_op(opref) {
             return Some(crate::r#box::BoxRef::from_bound_op(&op));
         }
+        // Match `ensure_box`'s resolution order exactly so the write host
+        // (a `set_forwarded_*` through `ensure_box`'s BoxRef) and the read
+        // host (this resolver, behind `get_box_replacement_box`) coincide:
+        // consult the authoritative `box_pool` slot before the
+        // `inputarg_refs` mirror. `ensure_box` returns the `box_pool` slot
+        // for an existing entry and only falls to `inputarg_refs` when it
+        // must lazy-allocate; without this ordering an InputArg whose
+        // `box_pool` slot is bound to a different `InputArgRc` than
+        // `inputarg_refs[idx]` would read its forwarded state from the wrong
+        // host. Both are transitional and retire with `BoxPool` in S-9.
         let idx = opref.raw() as usize;
-        if let Some(ia) = self.inputarg_refs.get(idx) {
-            return Some(crate::r#box::BoxRef::from_bound_inputarg(ia));
+        if let Some(b) = self.box_pool.get(opref) {
+            return Some(b.clone());
         }
-        // Transitional `BoxPool` fallback — see doc above. Retired
-        // alongside `BoxPool` in S-9.
-        self.box_pool.get(opref).cloned()
+        self.inputarg_refs
+            .get(idx)
+            .map(crate::r#box::BoxRef::from_bound_inputarg)
     }
 
     /// S-8.A: write `Forwarded::None` to the canonical host for
@@ -4142,6 +4152,20 @@ impl OptContext {
                 )
             });
             return Some(crate::r#box::BoxRef::new_const_with_index(value, ci));
+        }
+        // S-8.A.4: align the write-path host with `resolve_to_boxref`
+        // (the read path behind `get_box_replacement_box`). For ResOp
+        // variants, resolve to the producing `Op`'s canonical `_forwarded`
+        // host first. `find_producer_op` distinguishes the ResOp namespace
+        // from the InputArg namespace by full `OpRef` (`op.pos == opref`),
+        // so a `Box.value`-style position-collapse — where this raw slot
+        // also holds an InputArg box (`box_pool[idx]`) — no longer routes a
+        // ResOp write to `inputarg_refs[idx].forwarded` while the matching
+        // read routes to `op.forwarded`. Returns `None` for InputArg / input
+        // positions (no producing op), falling through to the InputArg /
+        // box_pool / lazy-alloc paths below unchanged.
+        if let Some(op_rc) = self.find_producer_op(opref) {
+            return Some(crate::r#box::BoxRef::from_bound_op(&op_rc));
         }
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
