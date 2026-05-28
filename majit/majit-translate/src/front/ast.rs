@@ -1679,11 +1679,19 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             }
             let prefix = format!("{}::", glob_root.join("::"));
             for full_path in known_statics.keys_with_prefix(&prefix) {
-                let leaf = match full_path.rsplit("::").next() {
-                    Some(s) => s.to_string(),
-                    None => continue,
+                // Rust `use root::*` binds only direct children, not
+                // nested `root::sub::NAME`; skip catalogue keys below
+                // the glob root so a bare `NAME` is not bound to a name
+                // the Rust source would leave out of scope.
+                let Some(leaf) = full_path.strip_prefix(&prefix) else {
+                    continue;
                 };
-                entries.entry(leaf).or_insert_with(|| full_path.to_string());
+                if leaf.contains("::") {
+                    continue;
+                }
+                entries
+                    .entry(leaf.to_string())
+                    .or_insert_with(|| full_path.to_string());
             }
         }
         expanded_use_imports.insert(parsed.module_path.clone(), entries);

@@ -5938,6 +5938,94 @@ mod tests {
         }
     }
 
+    /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
+    /// box register is unseeded (`OpRef::NONE`) rather than feed
+    /// `u32::MAX` into the heapcache flag vector (a 16 GiB resize).
+    #[test]
+    fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = vec![OpRef::NONE];
+        let mut regs_i = vec![OpRef::NONE];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
+        let code = [0u8, 0x00, 0x00, 0x00, 0x00];
+        let op = DecodedOp {
+            key: "getfield_vable_i/rd>i",
+            opname: "getfield_vable_i",
+            argcodes: "rd>i",
+            pc: 0,
+            next_pc: 5,
+        };
+        assert_eq!(
+            getfield_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            Err(DispatchError::VableBoxNotSeeded { pc: 0 })
+        );
+    }
+
+    /// `setfield_vable_*` carries the same unseeded-box guard.
+    #[test]
+    fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = vec![OpRef::NONE];
+        let mut regs_i = vec![OpRef::NONE];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
+        let code = [0u8, 0x00, 0x00, 0x00, 0x00];
+        let op = DecodedOp {
+            key: "setfield_vable_i/rid",
+            opname: "setfield_vable_i",
+            argcodes: "rid",
+            pc: 0,
+            next_pc: 5,
+        };
+        assert_eq!(
+            setfield_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            Err(DispatchError::VableBoxNotSeeded { pc: 0 })
+        );
+    }
+
     #[test]
     #[ignore = "T3 audit probe — dumps runtime opnames + walker-handled set + \
                 per-opname JitCode hit count. Run with \

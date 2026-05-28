@@ -3764,10 +3764,7 @@ fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
                         } else {
                             format!("{prefix}::{bare_name}")
                         };
-                        crate::annotator::classdesc::register_struct_fields(
-                            &qualified_key,
-                            &stubs,
-                        );
+                        crate::annotator::classdesc::register_struct_fields(&qualified_key, &stubs);
                     }
                 }
             }
@@ -4667,9 +4664,8 @@ mod tests {
             syn::parse_str("struct PyreFieldStubProbe { count: i64, name: String, flag: bool }")
                 .expect("test fixture must parse");
         let _ = build_host_class_from_struct(&item, "");
-        let snap =
-            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubProbe")
-                .expect("registration must publish under the struct's local name");
+        let snap = crate::annotator::classdesc::forced_attributes_for("PyreFieldStubProbe")
+            .expect("registration must publish under the struct's local name");
         assert_eq!(snap.len(), 3, "every named field must round-trip");
         assert!(matches!(
             snap.get("count"),
@@ -4696,10 +4692,9 @@ mod tests {
                 .expect("fixture parses");
         let _ = build_host_class_from_struct(&first, "");
         let _ = build_host_class_from_struct(&second, "");
-        let snap = crate::annotator::classdesc::forced_attributes_for(
-            "PyreFieldStubOverwriteProbe",
-        )
-        .unwrap();
+        let snap =
+            crate::annotator::classdesc::forced_attributes_for("PyreFieldStubOverwriteProbe")
+                .unwrap();
         assert_eq!(snap.len(), 2, "second registration replaces first");
         assert!(snap.contains_key("b"));
         assert!(snap.contains_key("c"));

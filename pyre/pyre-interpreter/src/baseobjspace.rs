@@ -1245,7 +1245,19 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
         let v = if is_int(value) {
             w_int_get_value(value)
         } else {
-            w_int_get_value(space_index(value)?)
+            let indexed = space_index(value)?;
+            if is_int(indexed) {
+                w_int_get_value(indexed)
+            } else {
+                // `space.index` may yield a long; one that overflows i64
+                // is necessarily outside 0..256 → the ValueError below.
+                match i64::try_from(w_long_get_value(indexed)) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(PyError::value_error("byte must be in range(0, 256)"));
+                    }
+                }
+            }
         };
         if !(0..=255).contains(&v) {
             return Err(PyError::value_error("byte must be in range(0, 256)"));

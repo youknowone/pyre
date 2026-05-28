@@ -941,8 +941,8 @@ impl ClassDesc {
         };
         if need_force_empty {
             let qualname = cls.qualname().to_string();
-            let in_force_map = FORCE_ATTRIBUTES_INTO_CLASSES
-                .with(|cell| cell.borrow().contains_key(&qualname));
+            let in_force_map =
+                FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().contains_key(&qualname));
             if !in_force_map {
                 me.borrow_mut().all_enforced_attrs = Some(HashSet::new());
             }
@@ -3653,8 +3653,8 @@ mod tests {
 
     #[test]
     fn force_attributes_into_classes_has_environment_error() {
-        let env = forced_attributes_for("EnvironmentError")
-            .expect("EnvironmentError entry present");
+        let env =
+            forced_attributes_for("EnvironmentError").expect("EnvironmentError entry present");
         assert!(env.contains_key("errno"));
         assert!(env.contains_key("strerror"));
         assert!(env.contains_key("filename"));
