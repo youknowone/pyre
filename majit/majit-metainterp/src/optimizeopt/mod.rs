@@ -1836,6 +1836,58 @@ impl OptContext {
         synthetic
     }
 
+    /// S-8.A: read `_forwarded` for `opref` directly off the canonical
+    /// host (`op.forwarded` / `inputarg.forwarded`) without going
+    /// through `box_pool`. Mirrors `BoxRef::get_forwarded` semantics
+    /// but bypasses the wrapper allocation. Returns `Forwarded::None`
+    /// for constants (`resoperation.py:50` `Const._forwarded` is
+    /// permanently `None`), `None` for sentinel `OpRef::none()` and
+    /// for ResOp positions whose producer is not in any canonical
+    /// store (`new_operations` / `phase1_emit_ops` / `resop_refs`).
+    pub(crate) fn read_forwarded(&self, opref: OpRef) -> Option<crate::r#box::Forwarded> {
+        if opref.is_none() {
+            return None;
+        }
+        if opref.is_constant() {
+            return Some(crate::r#box::Forwarded::None);
+        }
+        match opref {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let idx = opref.raw() as usize;
+                self.inputarg_refs
+                    .get(idx)
+                    .map(|ia| ia.forwarded.borrow().clone())
+            }
+            _ => self
+                .find_producer_op(opref)
+                .map(|op| op.forwarded.borrow().clone()),
+        }
+    }
+
+    /// S-8.A: write `Forwarded::None` to the canonical host for
+    /// `opref` (`resoperation.py:240` `set_forwarded(None)` /
+    /// `:50` clear semantics). No-op for sentinel `OpRef::none()`,
+    /// constants (whose `_forwarded` is permanently `None`), and
+    /// positions without a canonical Op/InputArg.
+    pub(crate) fn clear_forwarded(&self, opref: OpRef) {
+        if opref.is_none() || opref.is_constant() {
+            return;
+        }
+        match opref {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let idx = opref.raw() as usize;
+                if let Some(ia) = self.inputarg_refs.get(idx) {
+                    *ia.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
+                }
+            }
+            _ => {
+                if let Some(op) = self.find_producer_op(opref) {
+                    *op.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
+                }
+            }
+        }
+    }
+
     /// S-1: bind every input op's resop `BoxRef` in `box_pool` to a
     /// fresh `OpRc` of the input op so any `Forwarded::Op(_)` chain
     /// step targeting the slot has an upgradable `Weak<Op>` from the
@@ -3027,14 +3079,14 @@ impl OptContext {
         let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
             // shortpreamble.py:387 `info = arg.get_forwarded()` — PyPy
             // returns the AbstractInfo subtype stored in `_forwarded`.
-            // Pyre's BoxRef carries:
+            // Pyre's canonical `_forwarded` host carries:
             //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py:600 PtrInfo
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
             //   `Forwarded::Info(OpInfo::FloatConst(_))` — info.py:851
             //       FloatConstInfo planted via set_preamble_forwarded_info.
-            let b = ctx.box_pool.get(arg)?;
+            let forwarded = ctx.read_forwarded(arg)?;
             use crate::optimizeopt::info::OpInfo;
-            match &b.get_forwarded() {
+            match &forwarded {
                 crate::r#box::Forwarded::Info(OpInfo::Ptr(info)) => {
                     Some(ForwardedInfo::Ptr(info.borrow().clone()))
                 }
@@ -3188,9 +3240,8 @@ impl OptContext {
         // Const targets can still appear from legacy bridge/fixture replay
         // paths; normalize them to the OpInfo shape consumed by
         // `setinfo_from_preamble_item_option`.
-        let b = self.box_pool.get(source).cloned()?;
         let result = {
-            let fwd = b.get_forwarded();
+            let fwd = self.read_forwarded(source)?;
             match &fwd {
                 crate::r#box::Forwarded::Info(OpInfo::Ptr(p)) => Some(OpInfo::Ptr(p.clone())),
                 crate::r#box::Forwarded::Info(OpInfo::IntBound(ib)) => {
@@ -3220,8 +3271,10 @@ impl OptContext {
             }
         };
         if result.is_some() {
-            // shortpreamble.py:401 preamble_op.set_forwarded(None).
-            b.clear_forwarded();
+            // shortpreamble.py:401 preamble_op.set_forwarded(None) —
+            // write directly to the canonical host so we don't
+            // re-fetch the BoxRef wrapper.
+            self.clear_forwarded(source);
         }
         result
     }

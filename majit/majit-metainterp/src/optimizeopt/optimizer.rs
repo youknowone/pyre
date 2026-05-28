@@ -335,17 +335,17 @@ pub enum ImportedVirtualKind {
 }
 
 impl Optimizer {
-    fn is_constant_placeholder_op(op: &Op, box_pool: &crate::r#box::BoxPool) -> bool {
+    fn is_constant_placeholder_op(op: &Op, ctx: &OptContext) -> bool {
         if !matches!(
             op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             return false;
         }
-        let Some(b) = box_pool.get(op.pos.get()) else {
+        let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_, _)) {
+        if !matches!(forwarded, crate::r#box::Forwarded::Const(_, _)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -2872,8 +2872,16 @@ impl Optimizer {
         // the final trace. Drop constant-only SameAs placeholders before the
         // backend sees the trace; their OpRefs remain available through the
         // constants table.
-        ctx.new_operations
-            .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.box_pool));
+        // Manual filter (instead of `.retain`) because the predicate
+        // borrows `ctx` while `ctx.new_operations` would be borrowed
+        // mutably by `retain`.
+        let keep: Vec<bool> = ctx
+            .new_operations
+            .iter()
+            .map(|op| !Self::is_constant_placeholder_op(op, &ctx))
+            .collect();
+        let mut keep_iter = keep.into_iter();
+        ctx.new_operations.retain(|_| keep_iter.next().unwrap_or(true));
 
         // Drain remaining extra ops.
         self.drain_extra_operations_from(0, &mut ctx);

@@ -2948,11 +2948,14 @@ impl OptUnroll {
                         return rc;
                     }
                 }
-                if let Some(b) = ctx.box_pool.get(*ia_opref) {
-                    if let Some(ia_rc) = b.bound_inputarg() {
-                        return ia_rc;
-                    }
-                }
+                // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
+                // to the same `InputArgRc` as `inputarg_refs[idx]` after
+                // `ensure_inputarg_bindings` / `ensure_box`'s InputArg
+                // placeholder arm have run (both write the canonical
+                // `InputArgRc` matching the OpRef's type). Drop the
+                // box_pool fallback — fall through to a fresh `InputArg`
+                // allocation, matching the original last-resort behaviour
+                // for the type-mismatch edge case.
                 std::rc::Rc::new(majit_ir::InputArg::from_type(want_ty, idx as u32))
             })
             .collect();
