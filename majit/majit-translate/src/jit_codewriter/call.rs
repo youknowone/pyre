@@ -511,7 +511,7 @@ pub struct CallControl {
     /// `IndirectCallTargets`, `JitDriverStaticData.mainjitcode`,
     /// `enum_pending_graphs`) can hold stable handles before the assembler
     /// commits the body via `OnceLock` interior mutability.
-    jitcodes: HashMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
+    jitcodes: indexmap::IndexMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
 
     /// RPython call.py:174-187 resolves `getfunctionptr(graph)` to the
     /// graph's real helper address before constructing `JitCode(name,
@@ -1036,7 +1036,7 @@ impl CallControl {
             portal_targets: HashSet::new(),
             jitdrivers_sd: Vec::new(),
             builtin_targets: HashSet::new(),
-            jitcodes: HashMap::new(),
+            jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
             need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
@@ -3429,7 +3429,7 @@ impl CallControl {
     /// read-only view so `CodeWriter::make_jitcodes` can pair it with
     /// `collect_jitcodes_in_alloc_order` into a single `AllJitCodes`
     /// return value.
-    pub fn jitcodes(&self) -> &HashMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>> {
+    pub fn jitcodes(&self) -> &indexmap::IndexMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>> {
         &self.jitcodes
     }
 

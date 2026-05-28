@@ -84,7 +84,7 @@ pub struct ProgramPipelineResult {
     /// `self.all_jitcodes` from `call.py:88`) so consumers can look up a
     /// JitCode either by alloc-order index or by graph key.
     ///
-    /// Skipped by serde because serde_json cannot serialize a HashMap
+    /// Skipped by serde because serde_json cannot serialize a map
     /// keyed by a struct (`CallPath` is not a `String`). The
     /// `jit_metadata.json` round-trip used by `pyre-jit-trace/build.rs`
     /// does not need this view — it reads the alloc-ordered `jitcodes`
@@ -93,7 +93,7 @@ pub struct ProgramPipelineResult {
     /// artifact.
     #[serde(skip)]
     pub jitcodes_by_path:
-        std::collections::HashMap<crate::parse::CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
+        indexmap::IndexMap<crate::parse::CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
     /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
     /// table grown on-demand by `write_insn`. Persisted alongside the
     /// jitcodes so the runtime can map bytecode bytes back to opnames —
@@ -156,7 +156,7 @@ mod tests {
                 flattened: Some(flattened),
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
-            jitcodes_by_path: std::collections::HashMap::new(),
+            jitcodes_by_path: indexmap::IndexMap::new(),
             insns: majit_ir::vec_assoc::VecAssoc::new(),
             descrs: Vec::new(),
             total_blocks: 1,

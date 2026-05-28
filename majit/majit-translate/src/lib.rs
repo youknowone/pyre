@@ -1033,7 +1033,7 @@ fn analyze_pipeline_from_parsed(
         functions: Vec::new(),
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
-        jitcodes_by_path: std::collections::HashMap::new(),
+        jitcodes_by_path: indexmap::IndexMap::new(),
         insns: majit_ir::vec_assoc::VecAssoc::new(),
         descrs: Vec::new(),
         total_blocks: 0,

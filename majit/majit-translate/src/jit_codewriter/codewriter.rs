@@ -14,7 +14,6 @@ pub use codegen::{
     CodegenValueKind, IoShim, JitDriverConfig, VirtualizableCodegenConfig, generate_jitcode,
 };
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::assembler::Assembler;
@@ -39,7 +38,7 @@ use crate::parse::CallPath;
 pub struct AllJitCodes {
     /// RPython `call.py:87 self.jitcodes = {}` (graph-keyed dict). Pyre's
     /// graph identity at this boundary is `CallPath`.
-    pub by_path: HashMap<CallPath, Arc<JitCode>>,
+    pub by_path: indexmap::IndexMap<CallPath, Arc<JitCode>>,
     /// RPython `call.py:88 self.all_jitcodes = []` (alloc-order list). The
     /// `jitcode.index == i` invariant from `codewriter.py:80` is enforced
     /// by `CallControl::collect_jitcodes_in_alloc_order`.
