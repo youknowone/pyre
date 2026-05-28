@@ -3429,7 +3429,9 @@ impl CallControl {
     /// read-only view so `CodeWriter::make_jitcodes` can pair it with
     /// `collect_jitcodes_in_alloc_order` into a single `AllJitCodes`
     /// return value.
-    pub fn jitcodes(&self) -> &indexmap::IndexMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>> {
+    pub fn jitcodes(
+        &self,
+    ) -> &indexmap::IndexMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>> {
         &self.jitcodes
     }
 

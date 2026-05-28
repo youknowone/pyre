@@ -352,26 +352,19 @@ impl OpRef {
         matches!(self, Self::TempVar(_))
     }
 
-    /// `resoperation.py:38 AbstractValue.same_box(other)` — identity
-    /// comparison. PyPy's base implementation reads `self is other`, so
-    /// two distinct `ConstInt(42)` Box instances return `false` even
-    /// though their `.value` agrees; value equality is the separate
-    /// `same_constant` method (history.py:204/244).
+    /// `resoperation.py:38 AbstractValue.same_box(other)` — the base
+    /// identity comparison (`self is other`). A flat `OpRef` is an index
+    /// with no carried value, so identity reduces to variant + raw
+    /// payload equality (`derive(PartialEq)`); this is the explicit API
+    /// name so callers don't reach for `==`.
     ///
-    /// Pyre's flat `OpRef` encoding makes Box identity = variant + raw
-    /// payload equality (`derive(PartialEq)`), so the implementation is
-    /// `self == other`. This method exists as the explicit API name so
-    /// callers don't reach for `==` for an identity check (the operator
-    /// is also used for non-Box comparisons elsewhere).
-    ///
-    /// Const-namespace OpRefs minted by `ConstantPool::get_or_insert`
-    /// receive fresh indices per call (history.py:220 fresh-alloc), so
-    /// `same_box` returns `false` for two pool-minted ConstInts of the
-    /// same value — matching PyPy. Use `ConstantPool::same_constant` for
-    /// value-aware Const comparison; that path is the subject of the
-    /// Phase A.3 OpRef inline-storage epic which will let `same_box`
-    /// return value equality directly for Const variants without pool
-    /// consultation.
+    /// This implements the `AbstractValue` base only. The `Const.same_box`
+    /// override (history.py:211 → `same_constant`, value equality) needs
+    /// the constant's value, which lives in the `Box` / `ConstantPool`,
+    /// not the `OpRef`. Const-aware dispatch therefore lives on
+    /// `BoxRef::same_box` (identity for ResOp/InputArg, value for Const)
+    /// reached via `OptContext::same_box`; callers comparing Const values
+    /// use that or `ConstantPool::same_constant` directly.
     #[inline]
     pub fn same_box(self, other: OpRef) -> bool {
         self == other
