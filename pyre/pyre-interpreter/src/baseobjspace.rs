@@ -1239,8 +1239,18 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
-        let val = w_int_get_value(value) as u8;
-        pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, val);
+        // bytearrayobject.py `_getbytevalue`: coerce via `space.index`
+        // (honoring `__index__`), then enforce the `0 <= v < 256` rule.
+        // The index bounds are checked first, matching `bytearray_ass_subscript`.
+        let v = if is_int(value) {
+            w_int_get_value(value)
+        } else {
+            w_int_get_value(space_index(value)?)
+        };
+        if !(0..=255).contains(&v) {
+            return Err(PyError::value_error("byte must be in range(0, 256)"));
+        }
+        pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, v as u8);
         return Ok(w_none());
     }
     Err(PyError::new(
