@@ -7806,7 +7806,7 @@ mod boxref_forwarding_tests {
     fn h3_1_set_ptr_info_mirrors_box_info() {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, 0);
+        let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
@@ -7825,7 +7825,7 @@ mod boxref_forwarding_tests {
     fn audit_a_make_nonnull_preserves_box_constant_slot() {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, 0);
+        let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
@@ -7863,8 +7863,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn audit_a_chain_walker_reaches_constant_through_forwarded_box() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let b0 = BoxRef::new_inputarg(Type::Int, 0);
-        let b1 = BoxRef::new_inputarg(Type::Int, 1);
+        let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
+        let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
         ctx.box_pool = vec![b0, b1.clone()].into();
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(0);
@@ -7884,7 +7884,7 @@ mod boxref_forwarding_tests {
         ctx.const_pool.insert(1, Value::Int(42));
         assert!(b1.get_box_replacement(false).is_constant());
         // Negative case: BoxRef with no constant forwarding.
-        let nb = BoxRef::new_inputarg(Type::Int, 0);
+        let (nb, _ia_nb) = bound_inputarg_box(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
     }
 
@@ -8245,8 +8245,11 @@ mod boxref_forwarding_tests {
 
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let b = BoxRef::new_inputarg(Type::Ref, 0);
+        let (b, ia) = bound_inputarg_box(Type::Ref, 0);
         ctx.box_pool = vec![b.clone()].into();
+        // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
+        // `b.inputarg_handle` upgrades across the test body.
+        ctx.inputarg_refs = vec![ia];
         (ctx, b)
     }
 
@@ -8491,11 +8494,10 @@ mod boxref_forwarding_tests {
     /// `_forwarded` cell carrying the ConstPtrInfo-equivalent payload.
     #[test]
     fn ptr_info_handle_const_and_live_constant_use_constptr_same_info() {
-        use crate::r#box::BoxRef;
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::{GcRef, Type};
 
-        let b = BoxRef::new_resop(Type::Ref, 0);
+        let (b, _op) = bound_resop_box(Type::Ref, 0);
         b.set_forwarded_info(OpInfo::ptr(PtrInfo::Constant(GcRef(0x1000))));
         let live = PtrInfoHandle::Live(
             b.ptr_info_handle()
@@ -8515,11 +8517,10 @@ mod boxref_forwarding_tests {
     /// holds and mutation through one handle propagates to the other.
     #[test]
     fn int_bound_handle_live_identity_propagates_mutation() {
-        use crate::r#box::BoxRef;
         use majit_ir::Type;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let b = BoxRef::new_resop(Type::Int, 0);
+        let (b, _op) = bound_resop_box(Type::Int, 0);
         let h1 = ctx.getintbound_handle(&b);
         let h2 = ctx.getintbound_handle(&b);
         assert!(
@@ -8763,8 +8764,9 @@ mod boxref_forwarding_tests {
     #[test]
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let old_box = BoxRef::new_inputarg(Type::Int, 0);
+        let (old_box, ia) = bound_inputarg_box(Type::Int, 0);
         ctx.box_pool = vec![old_box.clone()].into();
+        ctx.inputarg_refs = vec![ia];
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
