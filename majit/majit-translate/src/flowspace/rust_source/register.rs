@@ -3284,26 +3284,30 @@ thread_local! {
     /// inside another — mirroring upstream
     /// `lltype.GcStruct("Outer", ("first", INNER_GCSTRUCT))` (the
     /// canonical "subclass marker" / `PyObject_HEAD` inheritance shape;
-    /// `lltype.py:296-303 Struct._first_struct`). Source-order
-    /// dependent: an embedding struct must follow its embedded struct
-    /// in the file; cross-file lookups are deferred to a later slice
-    /// (requires `use` import resolution).
+    /// `lltype.py:296-303 Struct._first_struct`).
+    ///
+    /// Cross-file struct ptrs are seeded by
+    /// [`WalkerStructPtrsFloorGuard::install`] at the top of
+    /// `analyze_pipeline_from_parsed`, so a struct declared in one
+    /// file resolves through this map when a sibling file embeds it
+    /// by bare ident.  Per-file / per-mod walker guards merge into
+    /// the same map (clone-on-enter, restore-on-drop) so the floor
+    /// stays visible across the whole walker pass.
     static WALKER_STRUCT_PTRS: RefCell<StdHashMap<String, Ptr>> =
         RefCell::new(StdHashMap::new());
 }
 
-/// RAII guard that clears the walker's thread-local struct-Ptr map
-/// on construction and restores the prior contents on drop. Mirrors
-/// [`WalkerTypeAliasGuard`]; nested guards compose by saving the
-/// prior outer scope and reverting to it on drop.
+/// RAII guard that snapshots the walker's thread-local struct-Ptr map
+/// on construction and restores the snapshot on drop. Mirrors
+/// [`WalkerTypeAliasGuard`]; nested guards compose by merging into
+/// the parent scope's map (clone-on-enter) and reverting on drop.
 struct WalkerStructPtrsGuard {
     prev: StdHashMap<String, Ptr>,
 }
 
 impl WalkerStructPtrsGuard {
     fn enter() -> Self {
-        let prev = WALKER_STRUCT_PTRS
-            .with(|cell| std::mem::replace(&mut *cell.borrow_mut(), StdHashMap::new()));
+        let prev = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().clone());
         WalkerStructPtrsGuard { prev }
     }
 }
@@ -3316,54 +3320,91 @@ impl Drop for WalkerStructPtrsGuard {
     }
 }
 
+/// Install-only RAII guard that pre-mints `Ptr(GcStruct(...))` entries
+/// for every top-level `Item::Struct` across the supplied parsed files,
+/// then keeps them visible on the per-thread walker map for the
+/// duration of the analyze pipeline.
+///
+/// Mirrors upstream `Bookkeeper`'s whole-program type cache (per-
+/// translation single dictionary in `pypy/annotation/bookkeeper.py:67
+/// self.descs = {}`) — a struct field declared as `pub ob_header:
+/// PyObject` in `bytesobject.rs` resolves through the `PyObject`
+/// minted from `pyobject.rs` regardless of walker iteration order.
+///
+/// Construct one at the top of `analyze_pipeline_from_parsed` (or
+/// any caller that walks multiple parsed files in sequence) and bind
+/// it as `let _floor = ...;` so it lives across the per-file calls.
+pub struct WalkerStructPtrsFloorGuard {
+    _inner: WalkerStructPtrsGuard,
+}
+
+impl WalkerStructPtrsFloorGuard {
+    /// Build the floor by running the same fixed-point minting
+    /// [`preseed_struct_ptrs`] uses, but over the union of every
+    /// parsed file's top-level `Item::Struct`s. Cross-file dependencies
+    /// (struct B in file 2 embeds struct A from file 1) resolve through
+    /// the same iteration: A mints on iteration 1, B mints on
+    /// iteration 2 once A is registered.
+    pub fn install<'a>(files: impl IntoIterator<Item = &'a syn::File>) -> Self {
+        let inner = WalkerStructPtrsGuard::enter();
+        let structs: Vec<&'a syn::ItemStruct> = files
+            .into_iter()
+            .flat_map(|file| file.items.iter())
+            .filter_map(|item| match item {
+                syn::Item::Struct(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let mut registered = std::collections::HashSet::new();
+        loop {
+            let mut progressed = false;
+            for item_struct in &structs {
+                let name = item_struct.ident.to_string();
+                if registered.contains(&name) {
+                    continue;
+                }
+                if let Some(ptr) = try_build_gc_struct_ptr(&name, &item_struct.fields) {
+                    walker_struct_ptr_register(&name, ptr);
+                    registered.insert(name);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Self { _inner: inner }
+    }
+}
+
 /// Register a freshly-minted `Ptr(GcStruct(...))` into the walker's
-/// struct-Ptr map under its bare name so that subsequent same-scope
-/// struct walks can embed it by-value via [`syn_primitive_to_lltype`].
-/// Silently overwrites a previous entry under the same name — mirrors
-/// upstream `lltype.Ptr.__new__`'s structural cache (`lltype.py:721-739`)
-/// where structurally equal `Ptr`s share identity.  Mirrors the same
-/// `Ptr` into the process-wide [`PROCESS_WIDE_STRUCT_PTRS`] for
-/// cross-file lookup so e.g. `pyobject.rs`'s `PyObject` becomes
-/// visible when `typeobject.rs` later embeds it as a first field.
+/// struct-Ptr map under its bare name so that subsequent struct walks
+/// can embed it by-value via [`syn_primitive_to_lltype`]. Silently
+/// overwrites a previous entry under the same name — mirrors upstream
+/// `lltype.Ptr.__new__`'s structural cache (`lltype.py:721-739`)
+/// where structurally equal `Ptr`s share identity.
 fn walker_struct_ptr_register(name: &str, ptr: Ptr) {
     WALKER_STRUCT_PTRS.with(|cell| {
-        cell.borrow_mut().insert(name.to_string(), ptr.clone());
+        cell.borrow_mut().insert(name.to_string(), ptr);
     });
-    if let Ok(mut map) = PROCESS_WIDE_STRUCT_PTRS.lock() {
-        map.insert(name.to_string(), ptr);
-    }
 }
 
 /// Consult the walker scope's struct-Ptr map for a single-segment
 /// ident.  Returns the inner `StructType` (`Ptr.TO` unwrapped) when
-/// the name matches a previously-minted `Ptr(GcStruct(...))`. Falls
-/// back to the process-wide registry [`PROCESS_WIDE_STRUCT_PTRS`] so
-/// cross-file embedding (e.g. `W_BytesObject { pub ob_header:
-/// PyObject }` in `bytesobject.rs` referencing the `PyObject`
-/// minted by `pyobject.rs`) resolves the same way same-file embedding
-/// does.
+/// the name matches a previously-minted `Ptr(GcStruct(...))`.
+///
+/// Cross-file embedding (e.g. `W_BytesObject { pub ob_header:
+/// PyObject }` in `bytesobject.rs` referencing the `PyObject` minted
+/// by `pyobject.rs`) resolves through the floor pre-mint installed
+/// by [`WalkerStructPtrsFloorGuard::install`] at the top of the
+/// analyze pipeline.
 fn walker_struct_ptr_lookup(name: &str) -> Option<StructType> {
-    let from_scope = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().get(name).cloned());
-    let ptr = match from_scope {
-        Some(ptr) => ptr,
-        None => PROCESS_WIDE_STRUCT_PTRS.lock().ok()?.get(name).cloned()?,
-    };
+    let ptr = WALKER_STRUCT_PTRS.with(|cell| cell.borrow().get(name).cloned())?;
     match ptr.TO {
         crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => Some(s),
         _ => None,
     }
 }
-
-/// Process-wide name → `Ptr(GcStruct(...))` registry populated by
-/// [`walker_struct_ptr_register`] each time
-/// [`build_host_class_from_struct`] catalogues a struct. Mirrors
-/// upstream cross-module `LOAD_GLOBAL`'s identity invariant
-/// (`flowcontext.py:847`): two files that reference the same struct
-/// name share the same lltype `Ptr`. Lives for the duration of the
-/// process — once registered, the entry stays addressable until the
-/// program exits, matching `HOST_CLASS_MINTS`'s lifetime semantics.
-static PROCESS_WIDE_STRUCT_PTRS: std::sync::LazyLock<std::sync::Mutex<StdHashMap<String, Ptr>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(StdHashMap::new()));
 
 /// Pre-collect `Item::Type T = U;` definitions from a flat list of
 /// items into an [`indexmap::IndexMap`]. Skips items with generic
@@ -3544,8 +3585,9 @@ fn syn_primitive_to_lltype(ty: &syn::Type) -> Option<LowLevelType> {
     // by `_ptrEntry.compute_annotation` (`lltype.py:1513-1518`) when
     // a Python-level instance is annotated. The catalog admits `&T`
     // only when `T` is a single-segment identifier resolving to a
-    // walker-registered struct (same-scope `WALKER_STRUCT_PTRS` or
-    // process-wide `PROCESS_WIDE_STRUCT_PTRS`).  `&str`, `&dyn
+    // walker-registered struct (visible through `WALKER_STRUCT_PTRS`
+    // either from the current walker scope or the cross-file floor
+    // installed at pipeline entry).  `&str`, `&dyn
     // Trait`, `&[T]` etc. reject — `rstr.STR` and trait-object
     // dispatch are not yet ported.  The borrow lifetime annotation
     // is dropped: lltype has no lifetime concept; the gc-pointer
@@ -8999,23 +9041,22 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
     }
 
     #[test]
-    fn register_host_lltype_embeds_cross_file_nested_gc_struct_via_process_registry() {
+    fn register_host_lltype_embeds_cross_file_nested_gc_struct_via_floor_guard() {
         // Two separate walker invocations (mirroring two pyre source
         // files, e.g. `pyobject.rs` + `bytesobject.rs`): the first
         // registers a base struct, the second names it by bare ident
-        // in a `pub ob_header: BaseName` field.  The same-scope
-        // `WALKER_STRUCT_PTRS` is per-walker (cleared between calls);
-        // cross-file resolution falls through to the process-wide
-        // [`PROCESS_WIDE_STRUCT_PTRS`] registry seeded by the first
-        // walk.  Mirrors upstream `LOAD_GLOBAL`'s identity invariant
-        // across files (`flowcontext.py:847`).
+        // in a `pub ob_header: BaseName` field.  Cross-file resolution
+        // works because [`WalkerStructPtrsFloorGuard::install`] mints
+        // every parsed file's top-level structs into the walker
+        // thread-local before any per-file walk runs.  Mirrors
+        // upstream `Bookkeeper`'s whole-program type cache
+        // (`bookkeeper.py:67 self.descs = {}`).
         let base_src = "
             pub struct ParityProbe_CrossFileBase {
                 pub flag: i64,
             }
         ";
         let base_file = syn::parse_file(base_src).expect("base fixture parses");
-        let _base_module = register_rust_module(&base_file).expect("base walk succeeds");
         let sub_src = "
             pub struct ParityProbe_CrossFileSub {
                 pub ob_header: ParityProbe_CrossFileBase,
@@ -9023,12 +9064,14 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
             }
         ";
         let sub_file = syn::parse_file(sub_src).expect("sub fixture parses");
+        let _floor = WalkerStructPtrsFloorGuard::install([&base_file, &sub_file]);
+        let _base_module = register_rust_module(&base_file).expect("base walk succeeds");
         let sub_module = register_rust_module(&sub_file).expect("sub walk succeeds");
         let sub_host = lookup_host(sub_module, "ParityProbe_CrossFileSub")
             .expect("ParityProbe_CrossFileSub must register as HostObject");
         let sub_ptr = super::super::host_env::lookup_host_lltype(&sub_host).expect(
             "cross-file nested-struct embedding must populate the lltype \
-             registry via the process-wide struct ptr fallback",
+             registry via the floor pre-mint",
         );
         let sub_target = match &sub_ptr.TO {
             crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(s) => s,
