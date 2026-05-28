@@ -1335,6 +1335,17 @@ impl<'a> Lowering<'a> {
         let bb_id = self.block_id[mir_bb];
         match term {
             TermKind::Return => {
+                // A `-> ()` body materializes its implicit return as a
+                // unit aggregate (`_0 = ()`), which lowers to a
+                // Ref-typed transparent ctor.  Feeding that into the
+                // return block colors the result kind 'r', contradicting
+                // the declared void kind ('v').  RPython filters void
+                // out of return links (NON_VOID); mirror that by routing
+                // an empty void return.
+                if is_unit_type(&self.body.locals.locals[0].ty, self.llbc) {
+                    self.graph.set_return(bb_id, None);
+                    return Ok(());
+                }
                 let ret = self.local_var[0].clone().ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: Return without any Assign to MIR local 0"
@@ -1427,7 +1438,18 @@ impl<'a> Lowering<'a> {
         // `getcalldescr`'s `RESULT == FUNC.RESULT` check (`call.py:230`)
         // satisfied for non-`Int` returns such as
         // `new_for_call_with_closure_and_globals_obj` (Ref).
-        let result_ty = tyref_to_value_type(&call.dest.ty, self.llbc);
+        //
+        // A `-> ()` callee's graph reports a void result kind (its
+        // `Return` lowers via `set_return(None)`, see [`is_unit_type`]),
+        // so the call site must declare the result Void too — otherwise
+        // `tyref_to_value_type`'s `Ref` projection for unit contradicts
+        // the callee's `FUNC.RESULT=Void` and trips `call.rs:4268`
+        // (e.g. `ExecutionContext.force_all_frames`).
+        let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
+            ValueType::Void
+        } else {
+            tyref_to_value_type(&call.dest.ty, self.llbc)
+        };
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
@@ -2229,9 +2251,12 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // …}}` shape, which we still accept for forward-compat with any
     // pre-extracted .ullbc artefacts still floating around.)
     //
-    // Unit type `()` lowers to `{"Adt": [tuple_arity = 0, []]}` which
-    // routes through the final `Ref` fallback; the codewriter treats
-    // void-typed Variables uniformly via `getkind`'s 'v' arm.
+    // Unit type `()` serializes as `{"Adt": {"id": "Tuple",
+    // "generics": {"types": []}}}` and routes through the final `Ref`
+    // fallback here.  A `-> ()` function's *return* is special-cased
+    // separately by [`is_unit_type`] at the `Return` terminator so the
+    // result kind comes out void ('v'); in operand position a unit
+    // value stays Ref like any other transparent-ctor result.
     if let Some(obj) = value.as_object()
         && let Some(lit) = obj.get("Literal")
     {
@@ -2259,6 +2284,47 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         }
     }
     ValueType::Ref(None)
+}
+
+/// True when `ty` is Charon's unit type `()`.
+///
+/// Unit serializes as an `Adt` carrying the synthetic `"Tuple"`
+/// type-id with zero type arguments:
+/// `{"Adt": {"id": "Tuple", "generics": {"types": [], …}}}`.  A
+/// non-empty `types` array is a real tuple (`(A, B)`) — a genuine
+/// aggregate that is NOT void — so the emptiness check matters.
+///
+/// Used by the `Return` terminator to route `-> ()` bodies through
+/// the void return path ([`FunctionGraph::set_return`] with `None`),
+/// which drops a `Const(None, VOID)` return link.  Without it the
+/// implicit `_0 = ()` unit aggregate lowers to a Ref-typed
+/// transparent ctor and colors the result kind 'r', contradicting the
+/// declared void kind and tripping the codewriter cross-check
+/// (`codewriter.rs:585`).
+fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let Some(adt) = value
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|a| a.as_object())
+    else {
+        return false;
+    };
+    let is_tuple = adt.get("id").and_then(|i| i.as_str()) == Some("Tuple");
+    let empty_types = adt
+        .get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| t.is_empty());
+    is_tuple && empty_types
 }
 
 /// Stable short label for an [`Rvalue::Aggregate`]'s [`Field`]
