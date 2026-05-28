@@ -7932,7 +7932,6 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::CopyFreeVars { .. }
         | Instruction::MakeCell { .. }
         | Instruction::ConvertValue { .. }
-        | Instruction::Reraise { .. }
         | Instruction::PopJumpIfNone { .. }
         | Instruction::PopJumpIfNotNone { .. }
         | Instruction::ForIter { .. }

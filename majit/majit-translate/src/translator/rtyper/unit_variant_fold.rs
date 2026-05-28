@@ -20,14 +20,63 @@
 //!
 //! This pass operates directly on `model::FunctionGraph` after
 //! `lower_indirect_calls` and before `Transformer::transform`, so it
-//! catches both gate arms.  HostObject identity is interned per pass
-//! by qualname so multiple ops referencing the same unit variant
-//! within one graph share the same Arc — the assembler's
-//! `emit_const_r` dedupes the ref-bank constant pool by
-//! `obj.identity_id()`, so per-pass interning is sufficient.
+//! catches both gate arms.  HostObject identity is interned in a
+//! process-wide [`UNIT_VARIANT_PREBUILT_INSTANCES`] registry shared
+//! with [`legacy_const_define_hlvalue`] so that every graph that
+//! references the same unit variant resolves to the *same* prebuilt
+//! `HostObject` Arc — mirroring `InstanceRepr.get_reusable_prebuilt_instance`
+//! caching on the per-rtyper `instance_reprs` map
+//! (`rpython/rtyper/rclass.py:804`, used from
+//! `rpython/rtyper/rpbc.py:1026`).  The assembler's `emit_const_r`
+//! dedupes the ref-bank constant pool by `obj.identity_id()`, so
+//! cross-graph identity sharing collapses the constant pool to a
+//! single slot per variant.
+
+use std::sync::{LazyLock, Mutex};
 
 use crate::flowspace::model::HostObject;
 use crate::model::{CallTarget, FunctionGraph, OpKind};
+
+/// Process-wide cache of unit-variant prebuilt instance singletons,
+/// keyed by qualname.  Mirrors RPython's per-rtyper
+/// `instance_reprs[classdef]` cache on top of
+/// `InstanceRepr.get_reusable_prebuilt_instance` — every graph
+/// referencing `StepResult::Continue` resolves to the same
+/// `HostObject` Arc, so downstream `obj.identity_id()` comparisons
+/// (assembler ref-bank dedupe, constfold equality, MergePoint
+/// greenkey) see a single canonical instance per variant.
+///
+/// `Vec<(String, HostObject)>` instead of `HashMap` per the
+/// project's no-HashMap policy ([[no-hashmap-ever]]).  The variant
+/// set is closed and small (~11 entries in
+/// `front::ast::is_synthetic_unit_variant_path`), so linear scan is
+/// both cheap and PyPy-orthodox.
+static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Find-or-mint the prebuilt singleton instance for an allowlisted
+/// unit-variant ctor (`StepResult::Continue`, `LoopResult::Done`, …).
+/// Returns the same `HostObject` Arc across all calls and all
+/// graphs, mirroring `InstanceRepr.get_reusable_prebuilt_instance`
+/// caching on the per-rtyper `instance_reprs` map.  Returns `None`
+/// only if `HostObject::Class` cannot produce a prebuilt instance,
+/// which by construction never happens for the allowlisted set
+/// (every allowlisted path is a unit-variant enum with no fields,
+/// so `reusable_prebuilt_instance()` always materialises the
+/// `OnceLock` instance — see
+/// `majit-translate/src/flowspace/model.rs:394-406`).
+pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<HostObject> {
+    let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES
+        .lock()
+        .expect("UNIT_VARIANT_PREBUILT_INSTANCES Mutex poisoned");
+    if let Some((_, instance)) = cache.iter().find(|(q, _)| q == qualname) {
+        return Some(instance.clone());
+    }
+    let class_obj = HostObject::new_class(qualname, Vec::new());
+    let instance = class_obj.reusable_prebuilt_instance()?;
+    cache.push((qualname.to_string(), instance.clone()));
+    Some(instance)
+}
 
 /// Rewrite `OpKind::Call { target: SyntheticTransparentCtor, args: [] }`
 /// ops whose qualified path matches
@@ -35,7 +84,6 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// `OpKind::ConstRef(prebuilt_instance)`, mirroring
 /// `rtyper/rpbc.py::SingleFrozenPBCRepr`.
 pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
-    let mut interned: Vec<(String, HostObject)> = Vec::new();
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
@@ -55,16 +103,8 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
                 continue;
             }
             let qualname = segments.join(".");
-            let instance = match interned.iter().find(|(q, _)| q == &qualname) {
-                Some((_, obj)) => obj.clone(),
-                None => {
-                    let class_obj = HostObject::new_class(qualname.clone(), Vec::new());
-                    let Some(instance) = class_obj.reusable_prebuilt_instance() else {
-                        continue;
-                    };
-                    interned.push((qualname, instance.clone()));
-                    instance
-                }
+            let Some(instance) = intern_unit_variant_prebuilt_instance(&qualname) else {
+                continue;
             };
             op.kind = OpKind::ConstRef(instance);
         }

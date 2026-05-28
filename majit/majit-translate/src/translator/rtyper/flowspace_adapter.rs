@@ -1420,8 +1420,17 @@ fn legacy_const_define_hlvalue(
             // `is_synthetic_result_option_ctor` to handle the args=0
             // case — tracked under M4 walker re-enable.
             let qualname = segments.join(".");
-            let class_obj = HostObject::new_class(qualname, Vec::new());
-            let instance = class_obj.reusable_prebuilt_instance()?;
+            // Reuse the process-wide prebuilt-instance interner so this
+            // legacy fold path produces the same `HostObject` Arc as the
+            // pre-jtransform `fold_unit_variant_ctors` pass — mirrors
+            // `InstanceRepr.get_reusable_prebuilt_instance` caching on
+            // the per-rtyper `instance_reprs` map
+            // (`rpython/rtyper/rclass.py:804`).  Without this, two
+            // graphs that reach the same unit variant via different
+            // gate arms would resolve to distinct singletons.
+            let instance = crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                &qualname,
+            )?;
             Some((
                 result,
                 Hlvalue::Constant(Constant::with_concretetype(
