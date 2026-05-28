@@ -771,6 +771,23 @@ fn emit_ref_copy(current_block: &SpamBlockRef, dst: u16, src: u16) {
     }
 }
 
+fn emit_vable_getfield_ref_walker_only(
+    current_block: &SpamBlockRef,
+    vable_reg: u16,
+    dst: u16,
+    field_idx: u16,
+) {
+    let insn = Insn::op_with_result(
+        "getfield_vable_r",
+        vec![
+            Operand::reg(Kind::Ref, vable_reg),
+            Operand::descr_vable_static_field(field_idx),
+        ],
+        Register::new(Kind::Ref, dst),
+    );
+    push_walker_emit(current_block, insn);
+}
+
 /// Drain per-block accumulators into a single contiguous `Insn`
 /// stream, stripping the defensive walker-emitted `goto pcN; ---`
 /// pair when the next block opens with that label (block boundary
@@ -2492,6 +2509,14 @@ fn null_stack_sentinel() -> super::flow::FlowValue {
     super::flow::Constant::none().into()
 }
 
+fn pyobject_const_ref_value(w_obj: pyre_object::PyObjectRef) -> super::flow::FlowValue {
+    super::flow::Constant::new(
+        super::flow::ConstantValue::Signed(w_obj as i64),
+        Some(Kind::Ref),
+    )
+    .into()
+}
+
 fn duplicate_shadow_tos(
     graph: &mut super::flow::FunctionGraph,
     state: &mut FrameState,
@@ -3169,38 +3194,50 @@ fn emit_frontend_compare(
     )
 }
 
-/// Pyre's `ConstantData` enum is richer than RPython's flat
-/// `Constant(value)` — it carries variant-typed payloads
-/// (None/Boolean/Integer/Str/...) that not all map cleanly into a
-/// flowgraph `Constant`. Returns `None` for variants the shadow graph
-/// cannot represent (the caller falls back to `fresh_ref_value`).
-/// `flowcontext.py:838-843` (`LOAD_CONST` → `getconstant_w()` +
-/// `pushvalue`) has no analogous variant filter because RPython
-/// constants are uniform Python objects.
-fn frontend_constant_flow_value(
-    constant: &pyre_interpreter::bytecode::ConstantData,
-) -> Option<super::flow::FlowValue> {
-    // Keep every representable frontend constant in the shadow graph
-    // instead of degrading immediately to a fresh Variable.
-    match constant {
-        pyre_interpreter::bytecode::ConstantData::None => {
-            Some(super::flow::Constant::none().into())
-        }
-        pyre_interpreter::bytecode::ConstantData::Boolean { value } => {
-            Some(super::flow::Constant::bool(*value).into())
-        }
-        pyre_interpreter::bytecode::ConstantData::Integer { value } => {
-            use num_traits::ToPrimitive;
-            value
-                .to_i64()
-                .map(|value| super::flow::Constant::signed(value).into())
-        }
-        pyre_interpreter::bytecode::ConstantData::Str { value } => Some(
-            super::flow::Constant::string(value.as_str().expect("non-UTF-8 string constant"))
-                .into(),
-        ),
-        _ => None,
+fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
+    // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
+    // and push that value.  Pyre's CodeObject stores RustPython
+    // `ConstantData`, so route through the same materializer used by the
+    // blackhole helper and carry the resulting W_Root as a Ref constant in
+    // the shadow graph.  The walker still emits `load_const_fn`; this is
+    // the graph-side RPython shape.
+    pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
+}
+
+fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
+    // `flowcontext.py:845-858 find_global` resolves globals during flow
+    // analysis and pushes a Constant.  Do the same when the current
+    // W_CodeObject exposes its globals/builtins; callers fall back to a
+    // fresh Ref only when pyre cannot reproduce the static lookup.
+    let w_code = w_code as pyre_object::PyObjectRef;
+    if w_code.is_null() {
+        return None;
     }
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
+    if w_globals.is_null() {
+        return None;
+    }
+    let globals = unsafe { &*w_globals };
+    if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, name) {
+        return Some(pyobject_const_ref_value(w_value));
+    }
+    let Some(w_builtin) = pyre_interpreter::dict_storage_get(globals, "__builtins__") else {
+        return None;
+    };
+    let lookup_obj = if unsafe { pyre_object::is_module(w_builtin) } {
+        unsafe { pyre_object::w_module_get_w_dict(w_builtin) }
+    } else if unsafe { pyre_object::is_dict(w_builtin) } {
+        w_builtin
+    } else {
+        return None;
+    };
+    if lookup_obj.is_null() {
+        return None;
+    }
+    pyre_interpreter::baseobjspace::finditem_str(lookup_obj, name)
+        .ok()
+        .flatten()
+        .map(pyobject_const_ref_value)
 }
 
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
@@ -5679,15 +5716,7 @@ impl CodeWriter {
                 // `BlackholeInterpreter::fill_portal_registers` at portal
                 // entry and encoded by the assembler as the canonical
                 // leading `r` operand.
-                let insn = Insn::op_with_result(
-                    "getfield_vable_r",
-                    vec![
-                        Operand::reg(Kind::Ref, vable_reg),
-                        Operand::descr_vable_static_field(field_idx),
-                    ],
-                    Register::new(Kind::Ref, dst),
-                );
-                push_walker_emit(&current_block, insn);
+                emit_vable_getfield_ref_walker_only(&current_block, vable_reg, dst, field_idx);
                 // Graph dual-write threads `frame_var.into()` which is
                 // only a startblock inputarg when `is_portal` (per
                 // `graph_entry_inputargs(code, is_portal)`).  Non-portal
@@ -6666,17 +6695,6 @@ impl CodeWriter {
                         Instruction::LoadConst { consti } => {
                             let idx = consti.get(op_arg).as_usize();
                             let dst_slot = stack_base + current_depth;
-                            // jtransform.py: getfield_vable_r for pycode (field 1)
-                            // — write straight to the target stack slot. The slot
-                            // is the next push destination (currently free); the
-                            // call below reads it as input and overwrites it with
-                            // the load_const result. SSA-wise: write1 (getfield)
-                            // → read (call input) → write2 (call result) — same
-                            // input-output share pattern as Sessions 1-3.
-                            // Portal vable sync at this slot relies on the next
-                            // opcode's pushvalue (LoadConst's existing A-slice 2
-                            // elision documented at LoadGlobal's caveat).
-                            //
                             // pyframe.py:509-510 `getcode(): hint(self.pycode,
                             // promote=True)`: the JIT treats `frame.pycode` as
                             // promote-to-constant on every trace.  In a portal
@@ -6688,34 +6706,14 @@ impl CodeWriter {
                             // and feed `w_code` as `ConstRef` directly — the
                             // portal `portal_frame_reg` would otherwise alias
                             // the caller's frame and read the wrong pycode.
-                            let pycode_graph_var = if is_portal {
-                                emit_vable_getfield_ref!(
+                            if is_portal {
+                                emit_vable_getfield_ref_walker_only(
+                                    &current_block,
                                     portal_frame_reg,
                                     dst_slot,
-                                    VABLE_CODE_FIELD_IDX
-                                )
-                            } else {
-                                None
-                            };
-                            // LoadConst factor
-                            // refactor.  The prior `emit_residual_call(
-                            // load_const_fn_idx, ...)` call is replaced by
-                            // a single direct push of
-                            // `build_load_const_fn_residual_call_ir_r_insn`,
-                            // which produces the same `residual_call_ir_r(
-                            // ConstInt(fn_idx), ListI([ConstInt(idx)]),
-                            // ListR([Reg(pycode)]), Descr) → Reg(dst)` Insn
-                            // shape `emit_residual_call_shape` would have
-                            // produced.  LoadConst has no frontend HLOp
-                            // (no `lower_load_const_hlop_to_insn` arm), so
-                            // the matching graph dual-write below is NOT
-                            // retired in this slice — this is incremental
-                            // factor refactor only, prepping the future
-                            // `flatten_graph(graph, regallocs)` migration.
-                            // The helper hardcodes `CallFlavor::Plain`
-                            // matching the production source at
-                            // codewriter.rs:2215, so `load_const_fn_flavor`
-                            // is no longer threaded into the SSARepr emit.
+                                    VABLE_CODE_FIELD_IDX,
+                                );
+                            }
                             if is_portal {
                                 push_walker_emit(
                                     &current_block,
@@ -6737,66 +6735,12 @@ impl CodeWriter {
                                     ),
                                 );
                             }
-                            // Graph-side `residual_call_ir_r` for
-                            // `load_const_fn(pycode:Ref, idx:Int) → Ref`.
-                            // RPython `flowcontext.py:135-139` keeps the
-                            // residual_call result as the consumer's input
-                            // (no separate fresh placeholder); the call is
-                            // recorded only when the symbolic stack is
-                            // about to consume its result Variable.
-                            //
-                            // Walker emits the inline `residual_call_ir_r`
-                            // unconditionally for every LoadConst regardless
-                            // of constant shape — the runtime must
-                            // materialize the value into the dst_slot
-                            // register either way.  The graph dual-write
-                            // mirrors that emit so the canonical
-                            // `flatten_graph` driver sees the same
-                            // residual_call_ir_r count.
-                            let value = if let Some(pycode_var) = pycode_graph_var {
-                                let loaded = residual_call!(
-                                    load_const_fn_idx,
-                                    CallFlavor::Plain,
-                                    vec![super::flow::Constant::signed(idx as i64).into()],
-                                    vec![pycode_var.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
-                                pin!(loaded, dst_slot);
-                                loaded
-                                    .map(super::flow::FlowValue::from)
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph))
-                            } else {
-                                // is_portal=false: pycode_var is None per
-                                // `emit_vable_getfield_ref!` gate above.
-                                // Non-portal graphs lack a `pycode_var`
-                                // inputarg.  Emit the graph SpaceOp with the
-                                // helper's real ABI shape (pycode:Ref,
-                                // idx:Int) → Ref using `Constant::none()` as
-                                // the absent pycode Variable.  This binds
-                                // the result Variable as op.result so
-                                // canonical SSARepr build's
-                                // `make_dependencies` (regalloc.py:38-77)
-                                // sees a producer rather than an unbound
-                                // Variable downstream (e.g. as a CALL arg).
-                                // Mirrors the analogous LoadGlobal non-portal
-                                // arm at codewriter.rs:7474-7503.
-                                let loaded = residual_call!(
-                                    load_const_fn_idx,
-                                    CallFlavor::Plain,
-                                    vec![super::flow::Constant::signed(idx as i64).into()],
-                                    vec![super::flow::Constant::none().into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                )
-                                .expect("load_const_fn returns Ref result");
-                                pin!(Some(loaded), dst_slot);
-                                loaded.into()
-                            };
+                            // Graph-side RPython parity: `flowcontext.py:841-843`
+                            // resolves LOAD_CONST to a Constant and pushes it.
+                            // Do not record the pyre runtime helper as a
+                            // SpaceOperation; that helper is walker/backend
+                            // adaptation only.
+                            let value = frontend_load_const_flow_value(code, idx);
                             push_and_bump!(value, py_pc);
                         }
 
@@ -7340,22 +7284,26 @@ impl CodeWriter {
                             // flow analysis and pushes the resolved Constant via
                             // `pushvalue(w_value)` — there is NO
                             // `SpaceOperation('load_global', ...)` at the graph
-                            // level. Pyre cannot fold runtime globals at compile
-                            // time, so the shadow stack receives the runtime
-                            // residual_call's result Variable (bound below).
+                            // level. Keep that graph shape; the residual helper
+                            // below is walker/backend adaptation only.
                             let scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // jtransform.py: getfield_vable_r for w_globals (field 3)
-                            // and pycode (field 1) — namespace for lookup, code for names.
-                            let ns_graph_var = emit_vable_getfield_ref!(
+                            // Walker-side getfield_vable_r for w_globals (field 3)
+                            // and pycode (field 1) — namespace for lookup,
+                            // code for names.  Do not dual-write these into the
+                            // graph: RPython flowspace's LOAD_GLOBAL path has
+                            // already folded the value to a Constant.
+                            emit_vable_getfield_ref_walker_only(
+                                &current_block,
                                 portal_frame_reg,
                                 scratch_ns,
-                                VABLE_NAMESPACE_FIELD_IDX
+                                VABLE_NAMESPACE_FIELD_IDX,
                             );
-                            let code_graph_var = emit_vable_getfield_ref!(
+                            emit_vable_getfield_ref_walker_only(
+                                &current_block,
                                 portal_frame_reg,
                                 scratch_code,
-                                VABLE_CODE_FIELD_IDX
+                                VABLE_CODE_FIELD_IDX,
                             );
                             // Write the load_global result directly to the
                             // stack slot it will occupy after the push (and
@@ -7383,77 +7331,15 @@ impl CodeWriter {
                                     loaded_dst_reg,
                                 ),
                             );
-                            // graph-side residual_call
-                            // dual-write for load_global_fn(ns:Ref, code:Ref,
-                            // frame:Ref, namei:Int) → Ref.  ns and code
-                            // Variables come from the preceding
-                            // emit_vable_getfield_ref! graph dual-writes; frame
-                            // is the portal red variable, matching PyPy's
-                            // `_load_global(self, ...)` receiver.
-                            // Match helper bind-site flavor at
-                            // codewriter.rs:2186 (`load_global_fn`
-                            // is `EF_CAN_RAISE`, not virtual-forcing)
-                            // — graph dual-write must agree with the
-                            // SSA helper so any future
-                            // `flatten_graph(graph, regallocs)`
-                            // migration sees a single classification.
-                            // RPython `flowcontext.py:135-139` keeps the
-                            // residual_call result as the consumer's input
-                            // (no separate fresh placeholder).
-                            let loaded = if let (Some(ns_var), Some(code_var)) =
-                                (ns_graph_var, code_graph_var)
-                            {
-                                residual_call!(
-                                    load_global_fn_idx,
-                                    CallFlavor::Plain,
-                                    vec![super::flow::Constant::signed(raw_namei).into()],
-                                    vec![ns_var.into(), code_var.into(), frame_var.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                )
-                                .expect("load_global_fn returns Ref result")
-                            } else {
-                                // Non-portal helpers: emit_vable_getfield_ref!
-                                // returned None (frame_var is not a startblock
-                                // inputarg here and `frame_var.id` aliases
-                                // `return_var.id` in non-portal graphs — see
-                                // LoweringContext.portal_frame_var gate at
-                                // codewriter.rs:4467-4478), so no ns/code/frame
-                                // Ref Variables are available to thread as args.
-                                // Emit the graph SpaceOp with the helper's real
-                                // ABI shape (ns:Ref, code:Ref, frame:Ref,
-                                // namei:Int) → Ref using `Constant::none()` Ref
-                                // placeholders for the absent Variables.  This:
-                                // (1) binds `loaded` as op.result so canonical
-                                // SSARepr build's `make_dependencies`
-                                // (regalloc.py:38-77) sees a producer rather
-                                // than an unbound Variable; (2) records the
-                                // intern_call_descr_stub with the actual helper
-                                // arg_kinds so descr-side parity matches the
-                                // SSARepr-emitted residual_call_ir_r helper.
-                                // Constants have no producer requirement so
-                                // make_dependencies does not need synthetic
-                                // startblock inputargs.
-                                residual_call!(
-                                    load_global_fn_idx,
-                                    CallFlavor::Plain,
-                                    vec![super::flow::Constant::signed(raw_namei).into()],
-                                    vec![
-                                        super::flow::Constant::none().into(),
-                                        super::flow::Constant::none().into(),
-                                        super::flow::Constant::none().into(),
-                                    ],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                )
-                                .expect("load_global_fn returns Ref result")
-                            };
-                            pin!(Some(loaded), loaded_dst_reg);
-                            let result_value: super::flow::FlowValue = loaded.into();
+                            let name_idx = raw_namei as usize >> 1;
+                            let result_value = code
+                                .names
+                                .get(name_idx)
+                                .and_then(|name| frontend_global_flow_value(w_code, name.as_ref()))
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            if let super::flow::FlowValue::Variable(v) = &result_value {
+                                pin!(Some(*v), loaded_dst_reg);
+                            }
                             // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
                             // const-source pushvalue writes the constant directly to
                             // the stack TOS register and (in portal case) to the
@@ -9211,17 +9097,13 @@ impl CodeWriter {
                 // `setarrayitem_vable_r(_, ConstInt(stack_base+depth),
                 // v_exc_value)` consumes it.
                 //
-                // Push lasti graph dual-write — STILL DEFERRED:
-                //   - `box_int(lasti_py_pc)` lowers to a `residual_call_*`
-                //     shape that pyre's graph layer does not yet record
-                //     (`flatten_arg` panics on
-                //     `SpaceOperationArg::Descr`, and per-call-shape
-                //     variant routing for `residual_call_ir_r` / `_r_r` /
-                //     `_r_v` / `_r_i` is absent).  Adding the
-                //     `setarrayitem_vable_r` dual-write alone would
-                //     introduce an orphan def-use chain (def: nothing,
-                //     use: setarrayitem) that breaks RPython's
-                //     "every Variable has exactly one def" invariant.
+                // Push lasti graph dual-write — LANDED above for portal
+                // catch landings: `box_int(lasti_py_pc)` records the
+                // `residual_call_ir_r` producer and the following
+                // `setarrayitem_vable_r(_, ConstInt(stack_base+depth),
+                // boxed_lasti)` consumes it.  Non-portal catch landings have
+                // no virtualizable frame graph inputarg, so they keep the
+                // walker-only stack write.
                 //
                 // Block-targeting is handled by
                 // `emit_mark_label_catch_landing!`, which runs at the
@@ -9230,9 +9112,6 @@ impl CodeWriter {
                 // invariant is locked in via `debug_assert_eq!` at the
                 // head of the loop body.
                 //
-                // The push_lasti dual-write joins when graph coverage for
-                // `residual_call_*` (via `flatten_arg` Descr handling +
-                // per-shape variant routing) lands.
                 depth += 1;
                 emit_vsd!(depth, site.handler_py_pc);
                 emit_goto!(site.handler_py_pc);
@@ -11647,14 +11526,42 @@ mod tests {
     }
 
     #[test]
-    fn frontend_constant_flow_value_preserves_string_constants() {
-        let constant = ConstantData::Str {
-            value: "hello".to_owned().into(),
-        };
+    fn frontend_load_const_flow_value_returns_ref_constant() {
+        let code = compile_exec("x = 'hello'\n").expect("compile failed");
+        let idx = code
+            .constants
+            .iter()
+            .position(|constant| matches!(constant, ConstantData::Str { .. }))
+            .expect("string constant");
 
-        let value = frontend_constant_flow_value(&constant);
+        let value = frontend_load_const_flow_value(&code, idx);
 
-        assert_eq!(value, Some(Constant::string("hello").into()));
+        match value {
+            FlowValue::Constant(c) => {
+                assert_eq!(c.kind, Some(Kind::Ref));
+                assert!(
+                    matches!(c.value, super::super::flow::ConstantValue::Signed(ptr) if ptr != 0)
+                );
+            }
+            other => panic!("LOAD_CONST graph value must be a Ref constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontend_global_flow_value_reads_w_code_globals_as_constant() {
+        let code = compile_exec("x\n").expect("compile failed");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let mut globals = Box::new(pyre_interpreter::DictStorage::new());
+        let w_value = pyre_object::intobject::w_int_new(42);
+        pyre_interpreter::dict_storage_store(globals.as_mut(), "x", w_value);
+        let globals_ptr = Box::into_raw(globals);
+        unsafe {
+            pyre_interpreter::w_code_set_w_globals(w_code, globals_ptr);
+        }
+
+        let value = frontend_global_flow_value(w_code as *const (), "x").expect("global constant");
+
+        assert_eq!(value, pyobject_const_ref_value(w_value));
     }
 
     #[test]

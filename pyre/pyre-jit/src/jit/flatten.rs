@@ -3981,26 +3981,11 @@ where
     if nargs > 8 {
         return None;
     }
-    // Non-portal helpers (`portal_frame_var = None`): walker emits the
-    // residual_call_r_r with `portal_frame_reg = u16::MAX` as the
-    // leading Ref operand (codewriter.rs:7656-7661) — a poisoned
-    // sentinel that flows through cleanly because non-portal helpers'
-    // CALL chains never actually dereference the frame pointer at
-    // runtime.  Canonical SSARepr build has no equivalent
-    // raw-u16::MAX escape hatch (every operand routes through a
-    // Variable via `get_register`), so the orthodox response is to
-    // skip this HLOp's lowering: returning `None` makes the
-    // canonical builder leave the raw `simple_call` HLOp in place
-    // (structurally divergent from walker but non-panicking).  This
-    // surfaces as a known canonical-build gap under the
-    // `PYRE_PHASE4_BUILD_CANONICAL` research gate; production
-    // (walker-only path) is unaffected.  True parity requires either
-    // reverting the `LoweringContext.portal_frame_var=None` Codex P1
-    // design (so non-portal helpers have a real frame Variable) or
-    // Path 4 (#238) walker_slot_for_variable retirement.
-    let Some(frame_var) = ctx.portal_frame_var else {
-        return None;
-    };
+    let frame_var = ctx.portal_frame_var.expect(
+        "lower_simple_call_hlop_to_insn requires LoweringContext::portal_frame_var \
+         to be seeded from portal_graph_inputvars(code).0; simple_call must not \
+         survive canonical lowering",
+    );
     // First arg is the callable, rest are call arguments.  All Ref.
     // The lowered ListR is `[portal_frame, callable, args...]` because
     // `bh_call_fn_N(frame, callable, args...)` receives the parent
@@ -4203,12 +4188,9 @@ fn build_residual_call_r_v_insn_from_operands(
 /// `[ConstInt(fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
 /// Descr] → Reg(Ref, dst)`.
 ///
-/// LoadConst has no frontend HLOp (the graph dual-write at
-/// codewriter.rs:4954-4965 IS the canonical post-rtype graph
-/// representation), so this slice adds no probe-side
-/// `lower_load_const_hlop_to_insn` — only the production-side
-/// builder.  Future `flatten_graph(graph, regallocs)` migration can
-/// reuse this helper without further refactor.
+/// LoadConst has no frontend HLOp: `flowcontext.py:841-843` pushes a
+/// Constant into the graph shadow.  This helper is the walker/backend
+/// adaptation that materializes that value from pyre's runtime CodeObject.
 pub fn build_load_const_fn_residual_call_ir_r_insn(
     load_const_fn_idx: u16,
     idx: i64,
@@ -8349,13 +8331,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_simple_call_hlop_returns_none_without_portal_frame_var() {
-        // Non-portal helpers carry `portal_frame_var = None` (Codex P1
-        // design — see codewriter.rs:4467-4478 portal_frame_var gate).
-        // The lowering returns None so canonical SSARepr build leaves
-        // the raw `simple_call` HLOp in place instead of panicking.
-        // Production unaffected because the walker path never invokes
-        // canonical lowering.
+    #[should_panic(expected = "portal_frame_var")]
+    fn lower_simple_call_hlop_panics_without_portal_frame_var() {
+        // PyPy's jtransform never leaves a lowered call as raw
+        // `simple_call`.  If pyre lacks the frame operand needed by its
+        // explicit-frame helper ABI, fail loudly instead of passing the
+        // HLOp through to canonical SSARepr.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let ctx = LoweringContext {
@@ -8378,12 +8359,11 @@ mod tests {
             index: 0,
         };
         let mut lower_constant = |_c: &Constant| unreachable!();
-        let result = super::lower_simple_call_hlop_to_insn(
+        let _ = super::lower_simple_call_hlop_to_insn(
             &op,
             &ctx,
             &mut get_register,
             &mut lower_constant,
         );
-        assert!(result.is_none());
     }
 }
