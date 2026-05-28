@@ -1864,6 +1864,47 @@ impl OptContext {
         }
     }
 
+    /// S-8.A: resolve `opref` to a `BoxRef` bound to its canonical
+    /// `_forwarded` host (`Op` / `InputArg`). Materialises a fresh
+    /// `BoxRef::from_bound_op` / `from_bound_inputarg` per call; the
+    /// bound handle ensures every `set_forwarded_*` / `get_forwarded`
+    /// routes through the same `Op.forwarded` / `InputArg.forwarded`
+    /// slot, so two calls for the same `opref` observe each other's
+    /// writes via the canonical host even though the `BoxRef` wrapper
+    /// identities differ (the wrapper carries no state post-S-0.C).
+    /// Const variants return `BoxRef::new_const_with_index`. Returns
+    /// `None` for sentinel `OpRef::none()` and for ResOp positions
+    /// without a producer in any canonical store.
+    ///
+    /// Transitional fallback: synthetic test fixtures (`ctx.box_pool =
+    /// vec![...]`) bypass the production canonical-store population
+    /// path. While `BoxPool` survives (until S-9), consult it after
+    /// the canonical stores so those fixtures continue resolving to
+    /// the same bound `BoxRef`. Production paths populate `inputarg_refs`
+    /// via S-1's `bind_input_resops` plus emit-time `bind_op`, so the
+    /// fallback is dead outside synthetic fixtures and disappears with
+    /// `BoxPool` in S-9.
+    pub(crate) fn resolve_to_boxref(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
+        if opref.is_none() {
+            return None;
+        }
+        if opref.is_constant() {
+            let ci = opref.const_index();
+            let value = self.const_pool.get(&ci).copied()?;
+            return Some(crate::r#box::BoxRef::new_const_with_index(value, ci));
+        }
+        if let Some(op) = self.find_producer_op(opref) {
+            return Some(crate::r#box::BoxRef::from_bound_op(&op));
+        }
+        let idx = opref.raw() as usize;
+        if let Some(ia) = self.inputarg_refs.get(idx) {
+            return Some(crate::r#box::BoxRef::from_bound_inputarg(ia));
+        }
+        // Transitional `BoxPool` fallback — see doc above. Retired
+        // alongside `BoxPool` in S-9.
+        self.box_pool.get(opref).cloned()
+    }
+
     /// S-8.A: write `Forwarded::None` to the canonical host for
     /// `opref` (`resoperation.py:240` `set_forwarded(None)` /
     /// `:50` clear semantics). No-op for sentinel `OpRef::none()`,
@@ -3962,7 +4003,7 @@ impl OptContext {
         if opref.is_constant() || opref.is_none() {
             return opref;
         }
-        let Some(start) = self.box_pool.get(opref).cloned() else {
+        let Some(start) = self.resolve_to_boxref(opref) else {
             return opref;
         };
         // resoperation.py:57-68: walk box._forwarded on the box itself.
