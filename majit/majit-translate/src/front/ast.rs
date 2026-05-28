@@ -1683,9 +1683,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                entries
-                    .entry(leaf)
-                    .or_insert_with(|| full_path.to_string());
+                entries.entry(leaf).or_insert_with(|| full_path.to_string());
             }
         }
         expanded_use_imports.insert(parsed.module_path.clone(), entries);
@@ -4045,10 +4043,7 @@ thread_local! {
 /// state.
 #[derive(Debug, Default, Clone)]
 pub struct KnownStaticsCatalogue {
-    entries: indexmap::IndexMap<
-        String,
-        (ValueType, Option<crate::flowspace::model::ConstValue>),
-    >,
+    entries: indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
 }
 
 impl KnownStaticsCatalogue {
@@ -4132,10 +4127,7 @@ impl KnownStaticsCatalogue {
 /// catalogue's qualified key matches the `lower_expr` lookup key
 /// directly.
 fn register_stdlib_known_statics(
-    m: &mut indexmap::IndexMap<
-        String,
-        (ValueType, Option<crate::flowspace::model::ConstValue>),
-    >,
+    m: &mut indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
 ) {
     use crate::flowspace::model::ConstValue;
     let ordering_variants: &[(&str, i64)] = &[
@@ -6278,7 +6270,7 @@ fn lower_expr_inner(
                     .collect();
                 Some(strip_crate_root(segs).join("::"))
             } else if let Some(full) = ctx.use_imports.get(&name) {
-                Some(full.split("::").collect::<Vec<_>>().join("::"))
+                Some(full.clone())
             } else if !ctx.module_prefix.is_empty() {
                 Some(format!("{}::{}", ctx.module_prefix, name))
             } else {
