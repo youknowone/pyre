@@ -1657,12 +1657,48 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         }
     }
     let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files);
+    // Glob expansion: each parsed file's `use <path>::*` resolves to
+    // explicit (alias → full_path) entries in `use_imports` here,
+    // mirroring Python's import-resolution step which binds glob-
+    // imported names into the importing module's namespace at module-
+    // load time.  The catalogue holds every crate-local
+    // `static` / `const` / `thread_local!` decl; for each file's
+    // glob roots we add a use_imports entry for every catalogue key
+    // under that root, leaving the leaf addressable via a bare
+    // single-segment `Expr::Path` read without the lower_expr glob
+    // fallback.
+    let mut expanded_use_imports: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for parsed in parsed_files {
+        if parsed.use_globs.is_empty() {
+            continue;
+        }
+        let mut entries = parsed.use_imports.clone();
+        for glob_root in &parsed.use_globs {
+            if glob_root.is_empty() {
+                continue;
+            }
+            let prefix = format!("{}::", glob_root.join("::"));
+            for full_path in known_statics.keys_with_prefix(&prefix) {
+                let leaf = match full_path.rsplit("::").next() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                entries
+                    .entry(leaf)
+                    .or_insert_with(|| full_path.to_string());
+            }
+        }
+        expanded_use_imports.insert(parsed.module_path.clone(), entries);
+    }
     // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
     // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
     let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     for parsed in parsed_files {
         let functions_before = functions.len();
+        let use_imports = expanded_use_imports
+            .get(&parsed.module_path)
+            .unwrap_or(&parsed.use_imports);
         build_graphs_from_items(
             &parsed.file.items,
             "",
@@ -1671,7 +1707,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &struct_fields,
             &fn_return_types,
             &method_suffix_index,
-            &parsed.use_imports,
+            use_imports,
             &module_statics,
             &known_statics,
             &known_struct_names,
@@ -3982,27 +4018,6 @@ thread_local! {
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 
-    /// Z2.5 Slice #157 — per-source-module table of plain `use
-    /// <path>::*` glob imports collected by
-    /// `parse::collect_use_globs`.  Keyed by `ParsedInterpreter::
-    /// module_path` (the file's crate-stripped module path); each
-    /// value is the list of glob-root segments imported by that file.
-    ///
-    /// Consumed at the `Expr::Path` single-segment static-catalogue
-    /// lookup fallback in `lower_expr`.  When the bare name has no
-    /// `use_imports` entry and the `{module_prefix}::{name}`
-    /// catalogue probe fails, the lookup iterates this file's globs
-    /// and tries `{glob_root}::{name}` against
-    /// `KnownStaticsCatalogue`.
-    /// Mirrors PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
-    /// frame's module-globals namespace which includes glob-imported
-    /// names by host-import identity.
-    ///
-    /// Populated by `analyze_pipeline_from_parsed` before the
-    /// semantic build runs; read-only during `lower_expr`.
-    pub(crate) static USE_GLOBS_BY_SOURCE: std::cell::RefCell<
-        std::collections::HashMap<String, Vec<Vec<String>>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Catalogue of crate-local `static` / `const` / `thread_local!`
@@ -4073,26 +4088,20 @@ impl KnownStaticsCatalogue {
     ) -> Option<&(ValueType, Option<crate::flowspace::model::ConstValue>)> {
         self.entries.get(key)
     }
-}
 
-/// Z2.5 Slice #157 — install per-source-module `use ::*` glob roots
-/// into the per-thread `USE_GLOBS_BY_SOURCE` cell before semantic
-/// build runs.  `entries` is the flat list `[(source_module, [glob_root,
-/// ...])]` aggregated by `analyze_pipeline_from_parsed` from each
-/// `ParsedInterpreter::{module_path, use_globs}`.  Each source_module
-/// is published exactly once with its glob list; later entries for
-/// the same source_module overwrite.
-pub fn populate_use_globs_by_source(entries: &[(String, Vec<Vec<String>>)]) {
-    USE_GLOBS_BY_SOURCE.with(|cell| {
-        let mut m = cell.borrow_mut();
-        m.clear();
-        for (source_module, globs) in entries {
-            if source_module.is_empty() || globs.is_empty() {
-                continue;
-            }
-            m.insert(source_module.clone(), globs.clone());
-        }
-    });
+    /// Iterate catalogue keys whose joined `::`-path starts with
+    /// `prefix`.  Used by `build_semantic_program_*` to expand each
+    /// parsed file's `use <path>::*` glob roots into explicit
+    /// `use_imports` entries (`name → glob_root::name`) at semantic
+    /// build time, mirroring Python's import-resolution step which
+    /// binds glob-imported names into the importing module's
+    /// namespace at module-load time.
+    pub fn keys_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> {
+        self.entries
+            .keys()
+            .filter(move |k| k.starts_with(prefix))
+            .map(String::as_str)
+    }
 }
 
 /// Pre-register stdlib enum variants that pyre source carries through
@@ -6275,50 +6284,21 @@ fn lower_expr_inner(
             } else {
                 None
             };
-            let primary_lookup = qualified_lookup_key.as_ref().and_then(|key| {
-                ctx.known_statics
-                    .and_then(|c| c.get(key))
-                    .map(|(ty, value)| (key.clone(), ty.clone(), value.clone()))
-            });
-            // `use <path>::*` glob fallback.  When the primary lookup
-            // (`use_imports` alias or `module_prefix::name`) misses
-            // for a single-segment path, iterate the source file's
-            // plain-`use` glob roots and try `{glob_root}::{name}`
-            // against the static catalogue.  Mirrors PyPy
-            // `LOAD_GLOBAL` (`flowcontext.py:856`) walking the
-            // frame's per-module globals which include glob-imported
-            // names — pyre carries glob entries explicitly because
-            // `parse::walk_use_tree`'s `UseTree::Glob` arm does not
-            // populate the per-name `use_imports` map.
+            // `use <path>::*` globs are expanded into explicit
+            // `use_imports` entries inside
+            // `build_semantic_program_*_with_options` (Python's import-
+            // resolution step binds glob-imported names into the
+            // importing module's namespace at module-load time), so
+            // the primary lookup above already covers glob-imported
+            // bare names — no separate fallback needed here.
             let known_static_entry: Option<(
                 String,
                 ValueType,
                 Option<crate::flowspace::model::ConstValue>,
-            )> = primary_lookup.or_else(|| {
-                if path.qself.is_some() || path.path.segments.len() != 1 {
-                    return None;
-                }
-                if ctx.use_imports.contains_key(&name) || ctx.source_module.is_empty() {
-                    return None;
-                }
-                USE_GLOBS_BY_SOURCE.with(|globs| {
-                    let globs = globs.borrow();
-                    let glob_roots = globs.get(&ctx.source_module)?;
-                    for glob_root in glob_roots {
-                        if glob_root.is_empty() {
-                            continue;
-                        }
-                        let candidate = format!("{}::{}", glob_root.join("::"), name);
-                        let hit = ctx
-                            .known_statics
-                            .and_then(|c| c.get(&candidate))
-                            .map(|(ty, value)| (ty.clone(), value.clone()));
-                        if let Some((ty, value)) = hit {
-                            return Some((candidate, ty, value));
-                        }
-                    }
-                    None
-                })
+            )> = qualified_lookup_key.as_ref().and_then(|key| {
+                ctx.known_statics
+                    .and_then(|c| c.get(key))
+                    .map(|(ty, value)| (key.clone(), ty.clone(), value.clone()))
             });
             if let Some((qualified_key, static_ty, static_value)) = known_static_entry {
                 // Slice C: when the static's RHS resolves to a primitive

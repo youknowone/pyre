@@ -498,20 +498,11 @@ fn analyze_pipeline_from_parsed(
             )
         })
         .collect();
-    // Per-source `use <path>::*` glob roots, used by the
-    // `Expr::Path` single-segment static-catalogue /
-    // fn_return_types fallback so glob-imported bare names
-    // (e.g. `PY_NULL` referenced from a file with
-    // `use crate::pyobject::*;`) resolve to their originating
-    // module's catalogue entry instead of falling through to
-    // `OpKind::Input` and triggering an adapter cross-block body
-    // Input Skip.
-    let use_globs_by_source: Vec<(String, Vec<Vec<String>>)> = parsed_files
-        .iter()
-        .filter(|parsed| !parsed.module_path.is_empty() && !parsed.use_globs.is_empty())
-        .map(|parsed| (parsed.module_path.clone(), parsed.use_globs.clone()))
-        .collect();
-    crate::front::ast::populate_use_globs_by_source(&use_globs_by_source);
+    // `use <path>::*` glob roots are expanded into explicit
+    // `use_imports` entries inside
+    // `build_semantic_program_*_with_options` so the front-end
+    // `Expr::Path` arm resolves glob-imported bare names through the
+    // primary `use_imports` lookup without a separate fallback.
     // Diagnostic pre-pass — populate
     // `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) from each
     // `parsed_files` entry's top-level structs so

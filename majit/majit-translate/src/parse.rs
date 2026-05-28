@@ -259,14 +259,16 @@ pub struct ParsedInterpreter {
     /// entry is the source-path segments after `crate::` / `self::` /
     /// pyre-internal-crate-alias roots are stripped, without the
     /// trailing glob.  Example: `use crate::pyobject::*;` in
-    /// `excobject.rs` records `["pyobject"]`.  Consumed at front-end
-    /// `Expr::Path` single-segment lookup: when the bare name has no
-    /// `use_imports` entry, the lowering iterates these prefixes and
-    /// tries `{glob_root}::{name}` against `KnownStaticsCatalogue`
-    /// / `fn_return_types` so glob-imported statics resolve to their
-    /// originating module instead of falling through to
-    /// `OpKind::Input` and triggering an adapter cross-block body
-    /// Input Skip.
+    /// `excobject.rs` records `["pyobject"]`.  Consumed at semantic
+    /// build time by
+    /// [`crate::front::ast::build_semantic_program_from_parsed_files_with_options`]
+    /// which expands each glob into explicit `(alias → full_path)`
+    /// entries on the per-file `use_imports` map — mirroring Python's
+    /// import-resolution step that binds glob-imported names into the
+    /// importing module's namespace at module-load time.  The
+    /// front-end `Expr::Path` arm then resolves bare names through
+    /// the primary `use_imports` lookup without a separate glob
+    /// fallback.
     pub use_globs: Vec<Vec<String>>,
 }
 
@@ -360,10 +362,11 @@ pub(crate) fn collect_pub_use_globs(items: &[Item]) -> Vec<Vec<String>> {
 /// Walk every file-root `use <path>::*` (non-`pub`) statement and
 /// collect the source-path segments (after `crate::` / `self::` /
 /// pyre-internal-crate-alias roots are stripped).  Mirrors
-/// [`collect_pub_use_globs`] but for plain `use` instead of `pub use`,
-/// and stores the result on [`ParsedInterpreter::use_globs`] for the
-/// front-end's single-segment static-catalogue / fn_return_types lookup
-/// fallback.
+/// [`collect_pub_use_globs`] but for plain `use` instead of `pub use`.
+/// The result is stored on [`ParsedInterpreter::use_globs`] and
+/// consumed by `front::ast::build_semantic_program_*_with_options`,
+/// which expands each glob root into explicit `use_imports` entries
+/// at semantic build time.
 pub(crate) fn collect_use_globs(items: &[Item]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for item in items {

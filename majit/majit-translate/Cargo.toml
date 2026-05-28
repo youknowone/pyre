@@ -17,6 +17,11 @@ quote = { workspace = true }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+# IndexMap — Rust analogue of Python 3.7+ insertion-ordered `dict`.
+# RPython's annotator (`bookkeeper.py:67 self.descs = {}`, classdesc
+# `classdict = {}`, ...) stores per-program data in Python dicts whose
+# iteration is insertion-ordered.  IndexMap preserves that semantic while
+# `HashMap` does not.
 indexmap = { workspace = true }
 majit-ir = { workspace = true }
 libc = { workspace = true }
