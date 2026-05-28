@@ -77,6 +77,30 @@ else
     targets="$*"
 fi
 
+# `cfg_select!` skew workaround.
+#
+# Charon's pinned release embeds rustc nightly-2026-02-07, where
+# `core::cfg_select!` is still feature-gated (E0658).  rustpython's
+# `host_env` crate (a transitive dep of pyre-interpreter / pyre-jit)
+# calls `cfg_select!` without a `#![feature(cfg_select)]` gate because
+# the macro is stable in the workspace's own toolchain (stable 1.95.0,
+# 2026-04-14).  Under charon's older nightly the gate is missing, so the
+# extraction `cargo build` fails to compile host_env.
+#
+# Inject the feature into every crate compiled during extraction via
+# `-Zcrate-attr` (needs `RUSTC_BOOTSTRAP=1` to allow `-Z` on the pinned
+# nightly).  This affects ONLY the charon extraction build — never the
+# production / stable build — and is a no-op for crates that don't use
+# the macro.  Remove once the charon pin advances to a nightly where
+# `cfg_select` is stable.
+export RUSTC_BOOTSTRAP=1
+charon_crate_attr="-Zcrate-attr=feature(cfg_select)"
+if [[ -n "${RUSTFLAGS:-}" ]]; then
+    export RUSTFLAGS="$RUSTFLAGS $charon_crate_attr"
+else
+    export RUSTFLAGS="$charon_crate_attr"
+fi
+
 for crate in $targets; do
     info="$(crate_info "$crate")"
     if [[ -z "$info" ]]; then
