@@ -761,8 +761,30 @@ impl std::hash::Hash for SpamBlockRef {
 /// flatten_graph(graph, regallocs, cpu)`).  Every walker emit site
 /// uniformly routes through this helper — no direct
 /// `ssarepr.insns.push` calls remain in production.
+///
+/// M2 PyPy parity gate — when `PYRE_PYPY_WALKER_GRAPH_ONLY=1`, the
+/// walker becomes structurally equivalent to `flowcontext.py`: it
+/// builds the `FunctionGraph` via `record_graph_op` but suppresses
+/// the inline SSARepr emit so the orthodox post-walk
+/// `flatten_graph(graph, regallocs, cpu)` driver owns SSARepr
+/// production.  Default-off; production unchanged.
 fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
+    if pypy_walker_graph_only() {
+        return;
+    }
     current_block.push_insn(insn);
+}
+
+/// Cache the `PYRE_PYPY_WALKER_GRAPH_ONLY` env decision per process.
+/// `std::env::var` involves a syscall; the gate is read on every
+/// walker emit site (52 callsites × N opcodes per graph), so a
+/// once-cached `OnceLock` avoids per-call syscall overhead while
+/// still respecting the env value at process start.
+fn pypy_walker_graph_only() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1")
+    })
 }
 
 /// `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)` emits a
