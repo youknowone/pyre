@@ -2407,3 +2407,346 @@ pub(crate) fn cast_builtin_name(
         _ => None,
     }
 }
+
+/// Build the program-wide [`ProgramMetadata`] consulted by jit_codewriter
+/// and other static analysis passes that need the same registries
+/// before invoking `build_function_graph_with_self_ty_pub`.  Accepts a
+/// slice so a callsite in one file can resolve a free function defined
+/// in another file.
+pub fn collect_program_metadata(
+    parsed_files: &[crate::ParsedInterpreter],
+) -> crate::front::semantic::ProgramMetadata {
+    use crate::front::semantic::{ProgramMetadata, StructFieldRegistry, qualify_module_path};
+    use std::collections::{HashMap, HashSet};
+
+    let mut known_struct_names: HashSet<String> = HashSet::new();
+    let mut known_trait_names: HashSet<String> = HashSet::new();
+    let mut struct_fields = StructFieldRegistry::default();
+    let mut fn_return_types: HashMap<String, String> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<(String, crate::model::ImmutableRank)>> =
+        HashMap::new();
+    let mut struct_origins: HashMap<String, String> = HashMap::new();
+    let mut use_imports: HashMap<(String, String), String> = HashMap::new();
+    let mut module_statics: HashMap<(String, String), crate::parse::ModuleStaticDecl> =
+        HashMap::new();
+    for parsed in parsed_files {
+        collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
+        collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
+        if !parsed.module_path.is_empty() {
+            collect_struct_origins(&parsed.file.items, &parsed.module_path, &mut struct_origins);
+        }
+        for (alias, full) in &parsed.use_imports {
+            use_imports.insert(
+                (parsed.module_path.clone(), alias.clone()),
+                full.clone(),
+            );
+        }
+        for ((nested, name), decl) in &parsed.module_statics {
+            let module = qualify_module_path(&parsed.module_path, nested);
+            module_statics.insert((module, name.clone()), decl.clone());
+        }
+    }
+    for parsed in parsed_files {
+        collect_fields_and_returns(
+            &parsed.file.items,
+            "",
+            &parsed.use_imports,
+            &known_struct_names,
+            &known_trait_names,
+            &mut struct_fields,
+            &mut fn_return_types,
+            &mut immutable_fields,
+        );
+    }
+    ProgramMetadata {
+        known_struct_names,
+        known_trait_names,
+        struct_fields,
+        fn_return_types,
+        struct_origins,
+        use_imports,
+        module_statics,
+    }
+}
+
+pub(crate) fn collect_fields_and_returns(
+    items: &[syn::Item],
+    prefix: &str,
+    use_imports: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    fn_return_types: &mut std::collections::HashMap<String, String>,
+    immutable_fields: &mut std::collections::HashMap<
+        String,
+        Vec<(String, crate::model::ImmutableRank)>,
+    >,
+) {
+    use crate::front::semantic::{qualify_type_name_with_imports};
+    use syn::Item;
+    for item in items {
+        match item {
+            Item::Struct(s) => {
+                let bare_name = s.ident.to_string();
+                let fields: Vec<(String, String)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        let field_name = f.ident.as_ref()?.to_string();
+                        let field_type = qualified_full_type_string_with_imports(
+                            &f.ty,
+                            prefix,
+                            use_imports,
+                            known_struct_names,
+                            known_trait_names,
+                        )?;
+                        Some((field_name, field_type))
+                    })
+                    .collect();
+                let immutables = collect_immutable_field_attrs(&s.attrs);
+                if !immutables.is_empty() {
+                    if prefix.is_empty() {
+                        immutable_fields
+                            .entry(bare_name.clone())
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                        let canonical = majit_ir::descr::canonical_struct_name(&bare_name);
+                        if canonical != bare_name {
+                            immutable_fields
+                                .entry(canonical)
+                                .or_default()
+                                .extend(immutables.iter().cloned());
+                        }
+                    } else {
+                        let qualified = format!("{}::{}", prefix, bare_name);
+                        immutable_fields
+                            .entry(qualified)
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                        immutable_fields
+                            .entry(bare_name.clone())
+                            .or_default()
+                            .extend(immutables.iter().cloned());
+                    }
+                }
+                if prefix.is_empty() {
+                    let canonical = majit_ir::descr::canonical_struct_name(&bare_name);
+                    struct_fields
+                        .fields
+                        .insert(bare_name.clone(), fields.clone());
+                    if canonical != bare_name {
+                        struct_fields.fields.insert(canonical, fields);
+                    }
+                } else {
+                    let qualified = format!("{}::{}", prefix, bare_name);
+                    struct_fields.fields.insert(qualified, fields);
+                }
+            }
+            Item::Fn(func) => {
+                let ret_ty = match &func.sig.output {
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+                        ty,
+                        prefix,
+                        use_imports,
+                        known_struct_names,
+                        known_trait_names,
+                    ),
+                    syn::ReturnType::Default => Some("()".to_string()),
+                };
+                if let Some(ret_ty) = ret_ty {
+                    let key = if prefix.is_empty() {
+                        func.sig.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, func.sig.ident)
+                    };
+                    fn_return_types.insert(key, ret_ty);
+                }
+                collect_nested_fn_returns(
+                    &func.block.stmts,
+                    prefix,
+                    use_imports,
+                    known_struct_names,
+                    known_trait_names,
+                    fn_return_types,
+                );
+            }
+            Item::Const(c) => {
+                if let Some(ty) = qualified_full_type_string_with_imports(
+                    &c.ty,
+                    prefix,
+                    use_imports,
+                    known_struct_names,
+                    known_trait_names,
+                ) {
+                    let key = if prefix.is_empty() {
+                        c.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, c.ident)
+                    };
+                    fn_return_types.insert(key, ty);
+                }
+            }
+            Item::Impl(impl_block) => {
+                let self_ty_root = type_root_ident(&impl_block.self_ty);
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
+                        let ret_ty = match &method.sig.output {
+                            syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+                                ty,
+                                prefix,
+                                use_imports,
+                                known_struct_names,
+                                known_trait_names,
+                            ),
+                            syn::ReturnType::Default => Some("()".to_string()),
+                        };
+                        if let Some(ret_ty) = ret_ty {
+                            if let Some(ref ty_root) = self_ty_root {
+                                let qualified_ty =
+                                    qualify_type_name_with_imports(ty_root, prefix, use_imports);
+                                fn_return_types.insert(
+                                    format!("{}::{}", qualified_ty, method.sig.ident),
+                                    ret_ty,
+                                );
+                            }
+                        }
+                    }
+                    if let syn::ImplItem::Const(item_const) = sub {
+                        if let Some(ty) = qualified_full_type_string_with_imports(
+                            &item_const.ty,
+                            prefix,
+                            use_imports,
+                            known_struct_names,
+                            known_trait_names,
+                        ) && let Some(ref ty_root) = self_ty_root
+                        {
+                            let qualified_ty =
+                                qualify_type_name_with_imports(ty_root, prefix, use_imports);
+                            fn_return_types.insert(
+                                format!("{}::{}", qualified_ty, item_const.ident),
+                                ty.clone(),
+                            );
+                            fn_return_types.insert(item_const.ident.to_string(), ty);
+                        }
+                    }
+                }
+            }
+            Item::Trait(trait_def) => {
+                let trait_root = qualify_type_name_with_imports(
+                    &trait_def.ident.to_string(),
+                    prefix,
+                    use_imports,
+                );
+                for sub in &trait_def.items {
+                    if let syn::TraitItem::Fn(method) = sub {
+                        let ret_ty = match &method.sig.output {
+                            syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+                                ty,
+                                prefix,
+                                use_imports,
+                                known_struct_names,
+                                known_trait_names,
+                            ),
+                            syn::ReturnType::Default => Some("()".to_string()),
+                        };
+                        if let Some(ret_ty) = ret_ty {
+                            fn_return_types
+                                .insert(format!("{}::{}", trait_root, method.sig.ident), ret_ty);
+                        }
+                    }
+                }
+            }
+            Item::Enum(e) => {
+                let bare_enum = e.ident.to_string();
+                let qualified_enum = if prefix.is_empty() {
+                    bare_enum.clone()
+                } else {
+                    format!("{}::{}", prefix, bare_enum)
+                };
+                for variant in &e.variants {
+                    if let syn::Fields::Named(named) = &variant.fields {
+                        let var_name = variant.ident.to_string();
+                        let fields: Vec<(String, String)> = named
+                            .named
+                            .iter()
+                            .filter_map(|f| {
+                                let field_name = f.ident.as_ref()?.to_string();
+                                let field_type = qualified_full_type_string_with_imports(
+                                    &f.ty,
+                                    prefix,
+                                    use_imports,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )?;
+                                Some((field_name, field_type))
+                            })
+                            .collect();
+                        struct_fields
+                            .fields
+                            .insert(format!("{}::{}", qualified_enum, var_name), fields);
+                    }
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_fields_and_returns(
+                        sub_items,
+                        &mod_prefix,
+                        use_imports,
+                        known_struct_names,
+                        known_trait_names,
+                        struct_fields,
+                        fn_return_types,
+                        immutable_fields,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn collect_nested_fn_returns(
+    stmts: &[syn::Stmt],
+    prefix: &str,
+    use_imports: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
+    fn_return_types: &mut std::collections::HashMap<String, String>,
+) {
+    for stmt in stmts {
+        if let syn::Stmt::Item(syn::Item::Fn(nested)) = stmt {
+            let ret_ty = match &nested.sig.output {
+                syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
+                    ty,
+                    prefix,
+                    use_imports,
+                    known_struct_names,
+                    known_trait_names,
+                ),
+                syn::ReturnType::Default => Some("()".to_string()),
+            };
+            if let Some(ret_ty) = ret_ty {
+                let key = if prefix.is_empty() {
+                    nested.sig.ident.to_string()
+                } else {
+                    format!("{}::{}", prefix, nested.sig.ident)
+                };
+                fn_return_types.entry(key).or_insert(ret_ty);
+            }
+            collect_nested_fn_returns(
+                &nested.block.stmts,
+                prefix,
+                use_imports,
+                known_struct_names,
+                known_trait_names,
+                fn_return_types,
+            );
+        }
+    }
+}
