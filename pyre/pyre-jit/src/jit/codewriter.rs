@@ -3162,16 +3162,13 @@ fn record_residual_call_graph_op(
             args_f,
         )));
     }
+    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    let can_raise = effect_info.check_can_raise(false);
     op_args.push(
-        super::flatten::intern_call_descr_stub(
-            super::flatten::effect_info_for_call_flavor(flavor),
-            arg_kinds,
-            reskind.to_kind(),
-        )
-        .into(),
+        super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
     );
 
-    match reskind.to_kind() {
+    let result_var = match reskind.to_kind() {
         Some(result_kind) => {
             let result = graph.fresh_variable(result_kind);
             record_graph_op(block, opname, op_args, Some(result.into()), offset);
@@ -3181,7 +3178,22 @@ fn record_residual_call_graph_op(
             record_graph_op(block, opname, op_args, None, offset);
             None
         }
+    };
+    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
+    // whose calldescr can raise is immediately followed by a trailing
+    // `-live-` so the liveness pass records the registers alive at the
+    // implicit GUARD_NO_EXCEPTION.  `flatten.py:206-217` recognises an
+    // actually-raising block by scanning this trailing `-live-`.
+    if can_raise {
+        record_graph_op(
+            block,
+            super::flatten::OPNAME_LIVE,
+            Vec::new(),
+            None,
+            offset,
+        );
     }
+    result_var
 }
 
 /// Emit a void-result `SpaceOperation` into `block` and return it.
