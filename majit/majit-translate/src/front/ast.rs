@@ -14,22 +14,21 @@ pub use crate::front::semantic::{
     AstGraphOptions, FlowingError, LoweringAbort, ProgramMetadata, SemanticFunction,
     SemanticProgram, StructFieldRegistry, qualify_module_path, qualify_type_name_with_imports,
 };
-pub use crate::front::syn_metadata::{
-    classify_fn_arg_ty, extract_dyn_trait_root, full_type_string, qualified_full_type_string,
-    qualified_full_type_string_with_imports, trait_object_root_name,
-};
 pub(crate) use crate::front::syn_metadata::is_synthetic_unit_variant_path;
 use crate::front::syn_metadata::{
     UnaryNotOperandKind, array_item_value_type_from_array_type_id, bare_type_root_from_type_str,
     binary_result_value_type_inner, canonical_pat_name, cast_builtin_name, const_value_value_type,
     dyn_trait_root_from_type_str, extract_dyn_trait_root_with_context,
     extract_element_type_from_str, intrinsic_call_result_type, is_synthetic_ctor_path,
-    matches_constructor_path,
-    method_as_ref_return_type, op_result_value_type, outer_generic_inner_type,
-    path_as_value_float_constant, split_tuple_type_elements, transparent_option_inner_type,
-    transparent_result_err_type, type_root_from_type_string, type_root_ident,
-    type_string_to_unary_not_kind, type_string_to_value_type, unwrap_result_or_option,
-    value_type_to_unary_not_kind,
+    matches_constructor_path, method_as_ref_return_type, op_result_value_type,
+    outer_generic_inner_type, path_as_value_float_constant, split_tuple_type_elements,
+    transparent_option_inner_type, transparent_result_err_type, type_root_from_type_string,
+    type_root_ident, type_string_to_unary_not_kind, type_string_to_value_type,
+    unwrap_result_or_option, value_type_to_unary_not_kind,
+};
+pub use crate::front::syn_metadata::{
+    classify_fn_arg_ty, extract_dyn_trait_root, full_type_string, qualified_full_type_string,
+    qualified_full_type_string_with_imports, trait_object_root_name,
 };
 
 /// Result of lowering one expression or statement-list tail.
@@ -107,7 +106,6 @@ macro_rules! get_value_var {
     }};
 }
 
-
 /// RPython `annrpython.py:103-150 build_types` whole-program walk —
 /// runs `collect_struct_names` + `collect_trait_names` +
 /// `collect_fields_and_returns` over the items of every parsed
@@ -122,7 +120,6 @@ macro_rules! get_value_var {
 /// (`!crate::is_str(...)` from dictobject.rs against `is_str`
 /// defined in strobject.rs) unclassified.
 pub use crate::front::syn_metadata::collect_program_metadata as collect_program_metadata_pub;
-
 
 /// Public entry for building a graph from a single function AST node.
 /// Lower a standalone expression into an existing graph.
@@ -1990,7 +1987,6 @@ thread_local! {
     static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
-
 
 // ── Statement lowering ──────────────────────────────────────────
 
@@ -5405,7 +5401,10 @@ fn lower_expr(
                     {
                         if let (Ok(scrutinee_expr), Ok((pat, guard))) = (
                             syn::parse2::<syn::Expr>(scrutinee_tokens),
-                            syn::parse::Parser::parse2(crate::front::syn_metadata::parse_matches_pat_and_guard, rest_tokens),
+                            syn::parse::Parser::parse2(
+                                crate::front::syn_metadata::parse_matches_pat_and_guard,
+                                rest_tokens,
+                            ),
                         ) {
                             let arm_then_body: syn::Expr = syn::parse_quote!(true);
                             let arm_else_body: syn::Expr = syn::parse_quote!(false);
@@ -7816,4 +7815,3 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
         _ => None,
     }
 }
-

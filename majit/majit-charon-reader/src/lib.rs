@@ -80,8 +80,7 @@ impl Llbc {
         // (input slice + Value + LlbcFile) but settles back to
         // LlbcFile + small `dedup_adt` / `dedup_body` once the Value
         // is dropped.
-        let raw: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        let raw: serde_json::Value = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
         let mut dedup_body: Vec<(u64, serde_json::Value)> = Vec::new();
         collect_dedup_bodies(&raw, &mut dedup_adt, &mut dedup_body);
@@ -89,9 +88,12 @@ impl Llbc {
         dedup_adt.dedup_by_key(|p| p.0);
         dedup_body.sort_by_key(|p| p.0);
         dedup_body.dedup_by_key(|p| p.0);
-        let file: LlbcFile =
-            serde_json::from_value(raw).map_err(SchemaError::Parse)?;
-        Ok(Self { file, dedup_adt, dedup_body })
+        let file: LlbcFile = serde_json::from_value(raw).map_err(SchemaError::Parse)?;
+        Ok(Self {
+            file,
+            dedup_adt,
+            dedup_body,
+        })
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the

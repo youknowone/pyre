@@ -1456,6 +1456,18 @@ fn raise_kind_as_usize(kind: RaiseKind) -> usize {
         .expect("u32 fits in usize on supported pyre targets (64-bit only)")
 }
 
+/// `Instruction::PopTop` handler, lifted out of `execute_opcode_step`'s
+/// match so the Charon/MIR front-end emits a standalone per-opcode
+/// graph the JIT dispatch can resolve by name rather than re-lowering
+/// the match arm body through the syn-AST walker.  The dispatch arm is
+/// the single tail-call `execute_pop_top(executor)`.
+pub fn execute_pop_top<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.pop_top()?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1588,10 +1600,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::PopTop => {
-            executor.pop_top()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::PopTop => execute_pop_top(executor),
 
         Instruction::PushNull => {
             executor.push_null()?;

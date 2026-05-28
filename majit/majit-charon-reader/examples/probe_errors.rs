@@ -19,9 +19,7 @@ fn main() {
                     let outer = outer_key(&st.kind);
                     let key = format!("[stmt:{outer}] {}", msg(&e));
                     *errors.entry(key.clone()).or_default() += 1;
-                    samples
-                        .entry(key)
-                        .or_insert_with(|| short_sample(&st.kind));
+                    samples.entry(key).or_insert_with(|| short_sample(&st.kind));
                 }
             }
             if let Err(e) = bb.term() {
@@ -29,9 +27,7 @@ fn main() {
                 let outer = outer_key(&raw);
                 let key = format!("[term:{outer}] {}", msg(&e));
                 *errors.entry(key.clone()).or_default() += 1;
-                samples
-                    .entry(key)
-                    .or_insert_with(|| short_sample(&raw));
+                samples.entry(key).or_insert_with(|| short_sample(&raw));
             }
         }
     }

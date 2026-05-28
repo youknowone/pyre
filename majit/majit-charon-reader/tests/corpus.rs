@@ -8,10 +8,7 @@ use majit_charon_reader::{
     ullbc::{CallClass, StmtKind, TermKind},
 };
 
-const CORPUS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../charon-spike/corpus.ullbc",
-);
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-spike/corpus.ullbc",);
 
 #[test]
 fn loads_spike_corpus() {
@@ -20,11 +17,7 @@ fn loads_spike_corpus() {
     assert!(!llbc.file.has_errors);
     let local_count = llbc
         .iter_local_fns()
-        .filter(|f| {
-            f.item_meta
-                .name_path()
-                .starts_with("charon_spike_corpus::")
-        })
+        .filter(|f| f.item_meta.name_path().starts_with("charon_spike_corpus::"))
         .count();
     assert_eq!(local_count, 5, "5 local fns expected");
 }
@@ -47,9 +40,9 @@ fn every_corpus_function_decodes() {
                     "Unknown StmtKind in {name} bb{bb_idx} stmt{s_idx}",
                 );
             }
-            let term = bb.term().unwrap_or_else(|e| {
-                panic!("terminator decode failed in {name} bb{bb_idx}: {e}")
-            });
+            let term = bb
+                .term()
+                .unwrap_or_else(|e| panic!("terminator decode failed in {name} bb{bb_idx}: {e}"));
             assert!(
                 !matches!(term, TermKind::Unknown),
                 "Unknown TermKind in {name} bb{bb_idx}",
@@ -83,9 +76,7 @@ fn straight_line_add_shape() {
 #[test]
 fn branch_loop_sum_has_switch_int_and_switch_if() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
-    let fd = llbc
-        .local_fn("branch_loop_sum")
-        .expect("function present");
+    let fd = llbc.local_fn("branch_loop_sum").expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
 
     let mut saw_switch_int = false;
@@ -94,9 +85,7 @@ fn branch_loop_sum_has_switch_int_and_switch_if() {
         if let Ok(TermKind::Switch { targets, .. }) = bb.term() {
             match targets {
                 majit_charon_reader::ullbc::SwitchTargets::If(..) => saw_switch_if = true,
-                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(..) => {
-                    saw_switch_int = true
-                }
+                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(..) => saw_switch_int = true,
             }
         }
     }
@@ -128,7 +117,10 @@ fn call_classify_covers_corpus() {
     // The corpus is straightforward Rust — every call should classify
     // as Direct (or Trait for the iterator `?` desugaring helpers).
     let unknown = counts.get("unknown").copied().unwrap_or(0);
-    assert_eq!(unknown, 0, "corpus should not produce unknown call classifications: {counts:?}");
+    assert_eq!(
+        unknown, 0,
+        "corpus should not produce unknown call classifications: {counts:?}"
+    );
     assert!(
         counts.get("direct").copied().unwrap_or(0) > 0,
         "expected at least one direct call: {counts:?}",
@@ -151,14 +143,21 @@ fn dedup_body_resolves_inline_shape() {
         for ty in &fd.signature.inputs {
             if let majit_charon_reader::ullbc::TyRef::Dedup { id } = ty {
                 let body = llbc.dedup_body(*id).unwrap_or_else(|| {
-                    panic!("dedup_body({id}) returned None for an input TyRef in {}",
-                        fd.item_meta.name_path())
+                    panic!(
+                        "dedup_body({id}) returned None for an input TyRef in {}",
+                        fd.item_meta.name_path()
+                    )
                 });
-                assert!(body.is_object() || body.is_string(),
-                    "dedup_body({id}) body was unexpectedly typed: {body}");
+                assert!(
+                    body.is_object() || body.is_string(),
+                    "dedup_body({id}) body was unexpectedly typed: {body}"
+                );
                 sampled += 1;
             }
         }
     }
-    assert!(sampled > 0, "expected at least one Deduplicated input TyRef in the corpus");
+    assert!(
+        sampled > 0,
+        "expected at least one Deduplicated input TyRef in the corpus"
+    );
 }

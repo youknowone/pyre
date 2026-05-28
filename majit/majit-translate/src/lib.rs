@@ -450,7 +450,8 @@ fn collect_hints_walk(
     for item in items {
         match item {
             syn::Item::Fn(item_fn) => {
-                let hints = front::syn_metadata::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
+                let hints =
+                    front::syn_metadata::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
                 if !hints.is_empty() {
                     out.insert(item_fn.sig.ident.to_string(), hints);
                 }
@@ -1261,9 +1262,8 @@ fn analyze_pipeline_from_parsed(
             } else {
                 mir_graph_lookup.lookup_impl_method(impl_type, &method.name)
             };
-            let graph_source: Option<model::FunctionGraph> = mir_graph
-                .cloned()
-                .or_else(|| method.graph.clone());
+            let graph_source: Option<model::FunctionGraph> =
+                mir_graph.cloned().or_else(|| method.graph.clone());
             if let Some(graph) = graph_source {
                 // Stamp the source return type onto the graph itself so
                 // the JIT codewriter signature validator reads
@@ -1296,9 +1296,8 @@ fn analyze_pipeline_from_parsed(
                     // Slice 3.B: prefer MIR's graph for the direct_path
                     // registration too; fall back to AST when MIR has
                     // no entry.
-                    let direct_source: Option<model::FunctionGraph> = mir_graph
-                        .cloned()
-                        .or_else(|| method.graph.clone());
+                    let direct_source: Option<model::FunctionGraph> =
+                        mir_graph.cloned().or_else(|| method.graph.clone());
                     if let Some(g) = direct_source {
                         let direct_graph = match &method.return_type {
                             Some(rt) => g.with_return_type(rt),

@@ -587,12 +587,10 @@ pub fn qualified_full_type_string_with_imports(
                 .collect();
             elems.map(|elems| format!("({})", elems.join(",")))
         }
-        syn::Type::TraitObject(obj) => trait_object_root_name_qualified(
-            &obj.bounds,
-            prefix,
-            known_trait_names,
-        )
-        .map(|r| format!("dyn {r}")),
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+                .map(|r| format!("dyn {r}"))
+        }
         // `impl Trait` is a static opaque — render the bound name without
         // the `dyn ` marker.  See `type_root_ident` for the full rationale.
         syn::Type::ImplTrait(obj) => {
@@ -2134,9 +2132,7 @@ pub(crate) fn const_value_value_type(
     }
 }
 
-pub(crate) fn op_result_value_type(
-    kind: &crate::model::OpKind,
-) -> Option<crate::model::ValueType> {
+pub(crate) fn op_result_value_type(kind: &crate::model::OpKind) -> Option<crate::model::ValueType> {
     use crate::model::{OpKind, ValueType};
     match kind {
         OpKind::Input { ty, .. }
@@ -2436,10 +2432,7 @@ pub fn collect_program_metadata(
             collect_struct_origins(&parsed.file.items, &parsed.module_path, &mut struct_origins);
         }
         for (alias, full) in &parsed.use_imports {
-            use_imports.insert(
-                (parsed.module_path.clone(), alias.clone()),
-                full.clone(),
-            );
+            use_imports.insert((parsed.module_path.clone(), alias.clone()), full.clone());
         }
         for ((nested, name), decl) in &parsed.module_statics {
             let module = qualify_module_path(&parsed.module_path, nested);
@@ -2482,7 +2475,7 @@ pub(crate) fn collect_fields_and_returns(
         Vec<(String, crate::model::ImmutableRank)>,
     >,
 ) {
-    use crate::front::semantic::{qualify_type_name_with_imports};
+    use crate::front::semantic::qualify_type_name_with_imports;
     use syn::Item;
     for item in items {
         match item {
@@ -2591,13 +2584,15 @@ pub(crate) fn collect_fields_and_returns(
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
                         let ret_ty = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
-                                ty,
-                                prefix,
-                                use_imports,
-                                known_struct_names,
-                                known_trait_names,
-                            ),
+                            syn::ReturnType::Type(_, ty) => {
+                                qualified_full_type_string_with_imports(
+                                    ty,
+                                    prefix,
+                                    use_imports,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )
+                            }
                             syn::ReturnType::Default => Some("()".to_string()),
                         };
                         if let Some(ret_ty) = ret_ty {
@@ -2640,13 +2635,15 @@ pub(crate) fn collect_fields_and_returns(
                 for sub in &trait_def.items {
                     if let syn::TraitItem::Fn(method) = sub {
                         let ret_ty = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => qualified_full_type_string_with_imports(
-                                ty,
-                                prefix,
-                                use_imports,
-                                known_struct_names,
-                                known_trait_names,
-                            ),
+                            syn::ReturnType::Type(_, ty) => {
+                                qualified_full_type_string_with_imports(
+                                    ty,
+                                    prefix,
+                                    use_imports,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )
+                            }
                             syn::ReturnType::Default => Some("()".to_string()),
                         };
                         if let Some(ret_ty) = ret_ty {

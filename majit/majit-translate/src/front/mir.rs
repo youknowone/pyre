@@ -191,15 +191,17 @@ pub fn build_semantic_program_from_llbcs(
             }
         }
     }
-    Ok(merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
-        functions: Vec::new(),
-        known_struct_names: std::collections::HashSet::new(),
-        known_trait_names: std::collections::HashSet::new(),
-        struct_fields: crate::front::semantic::StructFieldRegistry::default(),
-        fn_return_types: std::collections::HashMap::new(),
-        immutable_fields: std::collections::HashMap::new(),
-        module_statics: std::collections::HashMap::new(),
-    }))
+    Ok(
+        merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
+            functions: Vec::new(),
+            known_struct_names: std::collections::HashSet::new(),
+            known_trait_names: std::collections::HashSet::new(),
+            struct_fields: crate::front::semantic::StructFieldRegistry::default(),
+            fn_return_types: std::collections::HashMap::new(),
+            immutable_fields: std::collections::HashMap::new(),
+            module_statics: std::collections::HashMap::new(),
+        }),
+    )
 }
 
 /// Build a [`SemanticProgram`] by lowering every local function
@@ -228,8 +230,7 @@ pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls (Step 4.3.b) ────────
-    let (known_struct_names, known_trait_names, struct_fields) =
-        derive_program_metadata(llbc);
+    let (known_struct_names, known_trait_names, struct_fields) = derive_program_metadata(llbc);
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -391,10 +392,7 @@ fn derive_program_metadata(
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
-                        let fname = f
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("__pos_{i}"));
+                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                         (fname, f.ty.label())
                     })
                     .collect();
@@ -416,9 +414,7 @@ fn derive_program_metadata(
                     known_struct_names.insert(variant_path);
                 }
             }
-            TypeDeclKind::Alias(_)
-            | TypeDeclKind::Opaque
-            | TypeDeclKind::Unknown => {}
+            TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
         }
     }
 
@@ -520,7 +516,9 @@ impl<'a> Lowering<'a> {
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             // Register a stable name so canonical comparison can spot
             // arg-renames.
-            graph.value_names.insert(graph.slot_of(&var).unwrap(), name.clone());
+            graph
+                .value_names
+                .insert(graph.slot_of(&var).unwrap(), name.clone());
             local_var[i] = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
             input_ops.push(SpaceOperation {
@@ -615,9 +613,7 @@ impl<'a> Lowering<'a> {
             // semantics require panic-on-overflow.
             StmtKind::Assert(_) => Ok(()),
 
-            StmtKind::Assign(place, rvalue) => {
-                self.lower_assign(mir_bb, place, rvalue)
-            }
+            StmtKind::Assign(place, rvalue) => self.lower_assign(mir_bb, place, rvalue),
 
             StmtKind::Unknown => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb} stmt#{s_idx}: unknown StmtKind"
@@ -754,9 +750,8 @@ impl<'a> Lowering<'a> {
                 ))
             })?
             .clone();
-        let op: Operand = serde_json::from_value(offset).map_err(|e| {
-            LowerError::Schema(format!("bb{mir_bb}: Index offset decode: {e}"))
-        })?;
+        let op: Operand = serde_json::from_value(offset)
+            .map_err(|e| LowerError::Schema(format!("bb{mir_bb}: Index offset decode: {e}")))?;
         self.resolve_operand(mir_bb, op)
     }
 
@@ -912,7 +907,10 @@ impl<'a> Lowering<'a> {
                 let op_name = if let Some(s) = op_json.as_str() {
                     s.to_string()
                 } else if let Some(obj) = op_json.as_object() {
-                    obj.keys().next().cloned().unwrap_or_else(|| "nullary".into())
+                    obj.keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "nullary".into())
                 } else {
                     "nullary".into()
                 };
@@ -963,9 +961,8 @@ impl<'a> Lowering<'a> {
                         // Synthetic placeholders for non-Adt aggregates
                         // (`Tuple`, `Array`, `Closure`) — they have no
                         // user-defined class to resolve into.
-                        let positional = (0..arg_vars.len())
-                            .map(|i| format!("__pos_{i}"))
-                            .collect();
+                        let positional =
+                            (0..arg_vars.len()).map(|i| format!("__pos_{i}")).collect();
                         (Vec::new(), leaf, positional)
                     }
                 };
@@ -1141,8 +1138,7 @@ impl<'a> Lowering<'a> {
                 // JIT IR level, and any other Atom variant has no
                 // typed analogue today.
                 if let ProjectionElem::Tagged(v) = &elem
-                    && let Some(field_payload) =
-                        v.as_object().and_then(|m| m.get("Field"))
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner_root, field_name, field_ty)) =
                         self.resolve_adt_field(field_payload)
                 {
@@ -1270,10 +1266,7 @@ impl<'a> Lowering<'a> {
     /// downstream `struct_fields` registry — populated in
     /// AST-format by `merge_fn_return_types_from_parsed_files`
     /// (lib.rs:286) — resolves with the same leaf key.
-    fn resolve_adt_field(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Option<(String, String, TyRef)> {
+    fn resolve_adt_field(&self, payload: &serde_json::Value) -> Option<(String, String, TyRef)> {
         let arr = payload.as_array()?;
         if arr.len() != 2 {
             return None;
@@ -1294,14 +1287,20 @@ impl<'a> Lowering<'a> {
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
-                let name = f.name.clone().unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
                 Some((owner_root, name, ty))
             }
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
                 let f = variant.fields.get(field_idx)?;
-                let name = f.name.clone().unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
                 Some((owner_root, name, ty))
             }
@@ -1361,7 +1360,9 @@ impl<'a> Lowering<'a> {
                 self.graph.set_goto(bb_id, target_bb, vec![]);
                 Ok(())
             }
-            TermKind::Assert { target, on_unwind, .. } => {
+            TermKind::Assert {
+                target, on_unwind, ..
+            } => {
                 // Inline overflow assertion at terminator level —
                 // strip it: branch unconditionally to the success
                 // continuation. The unwind successor (which always
@@ -1374,12 +1375,12 @@ impl<'a> Lowering<'a> {
                 self.graph.set_goto(bb_id, target_bb, vec![]);
                 Ok(())
             }
-            TermKind::Switch { discr, targets } => {
-                self.lower_switch(mir_bb, discr, targets)
-            }
-            TermKind::Call { call, target, on_unwind } => {
-                self.lower_call(mir_bb, call, target as usize, on_unwind as usize)
-            }
+            TermKind::Switch { discr, targets } => self.lower_switch(mir_bb, discr, targets),
+            TermKind::Call {
+                call,
+                target,
+                on_unwind,
+            } => self.lower_call(mir_bb, call, target as usize, on_unwind as usize),
             // `Drop` is a destructor invocation — the JIT does not model
             // destructor semantics (RPython lacks them entirely), so
             // forward unconditionally to the success continuation and
@@ -1419,6 +1420,15 @@ impl<'a> Lowering<'a> {
             }
         };
 
+        // The call result kind is the MIR-declared type of the
+        // destination place. RPython `call.py:222` reads `FUNC.RESULT`
+        // off the callee funcptr; the destination local's declared type
+        // is that same value at the call site, so deriving it here keeps
+        // `getcalldescr`'s `RESULT == FUNC.RESULT` check (`call.py:230`)
+        // satisfied for non-`Int` returns such as
+        // `new_for_call_with_closure_and_globals_obj` (Ref).
+        let result_ty = tyref_to_value_type(&call.dest.ty, self.llbc);
+
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
@@ -1448,8 +1458,7 @@ impl<'a> Lowering<'a> {
                 // `.field` projection on it panics at
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
-                let (segments, method_hint) =
-                    self.call_target_segments(mir_bb, &reg.kind)?;
+                let (segments, method_hint) = self.call_target_segments(mir_bb, &reg.kind)?;
                 // `CallTarget::Method` requires a receiver in `args[0]`
                 // (the flowspace adapter lowers it to `getattr(recv,
                 // method_leaf) → simple_call(bound_method, …)`).
@@ -1470,7 +1479,7 @@ impl<'a> Lowering<'a> {
                 OpKind::Call {
                     target,
                     args,
-                    result_ty: ValueType::Int,
+                    result_ty: result_ty.clone(),
                 }
             }
             (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
@@ -1491,7 +1500,7 @@ impl<'a> Lowering<'a> {
                         segments: vec!["__dyn_call".to_string()],
                     },
                     args: full_args,
-                    result_ty: ValueType::Int,
+                    result_ty,
                 }
             }
             (CallClass::Ptr, _) => {
@@ -1646,7 +1655,9 @@ impl<'a> Lowering<'a> {
     /// because no other consumer needs it typed.
     fn impl_method_owner(&self, fd: &FunDecl) -> Option<(String, String)> {
         let segs = &fd.item_meta.name;
-        let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+        let last_idx = segs
+            .iter()
+            .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
         let leaf = match &segs[last_idx] {
             NameSeg::Ident { ident: (s, _) } => s.clone(),
             _ => return None,
@@ -1689,10 +1700,7 @@ impl<'a> Lowering<'a> {
     ///   through the opaque `trait_impls` array to find the impl's
     ///   first concrete type argument, then resolve through the same
     ///   inline-or-dedup path.
-    fn resolve_impl_owner_adt_def_id(
-        &self,
-        impl_payload: &serde_json::Value,
-    ) -> Option<u64> {
+    fn resolve_impl_owner_adt_def_id(&self, impl_payload: &serde_json::Value) -> Option<u64> {
         let obj = impl_payload.as_object()?;
         if let Some(ty) = obj.get("Ty") {
             let sb = ty.as_object()?.get("skip_binder")?;
@@ -1753,14 +1761,22 @@ impl<'a> Lowering<'a> {
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 links.push(
-                    Link::new_mixed(vec![], self.block_id[else_bb as usize], Some(ExitCase::Bool(false)))
-                        .with_prevblock(bb_id)
-                        .with_llexitcase_from_exitcase(),
+                    Link::new_mixed(
+                        vec![],
+                        self.block_id[else_bb as usize],
+                        Some(ExitCase::Bool(false)),
+                    )
+                    .with_prevblock(bb_id)
+                    .with_llexitcase_from_exitcase(),
                 );
                 links.push(
-                    Link::new_mixed(vec![], self.block_id[then_bb as usize], Some(ExitCase::Bool(true)))
-                        .with_prevblock(bb_id)
-                        .with_llexitcase_from_exitcase(),
+                    Link::new_mixed(
+                        vec![],
+                        self.block_id[then_bb as usize],
+                        Some(ExitCase::Bool(true)),
+                    )
+                    .with_prevblock(bb_id)
+                    .with_llexitcase_from_exitcase(),
                 );
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
@@ -1811,7 +1827,9 @@ impl<'a> Lowering<'a> {
 /// kept in sync with the `&self` version.
 fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
-    let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
     let leaf = match &segs[last_idx] {
         NameSeg::Ident { ident: (s, _) } => s.clone(),
         _ => return None,
@@ -1852,12 +1870,7 @@ fn resolve_impl_owner_adt_def_id_free(
         return resolve_tyexpr_to_adt_def_id_free(llbc, sb);
     }
     if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
-        let trait_impls = llbc
-            .file
-            .translated
-            .rest
-            .get("trait_impls")?
-            .as_array()?;
+        let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
         let ti = trait_impls.get(trait_impl_id as usize)?;
         let first_ty = ti
             .as_object()?
@@ -1887,7 +1900,9 @@ fn resolve_impl_owner_adt_def_id_free(
 /// through the AST-side `extract_trait_impls`.
 fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let segs = &fd.item_meta.name;
-    let last_idx = segs.iter().rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
     if last_idx == 0 {
         return None;
     }
@@ -1899,12 +1914,7 @@ fn trait_impl_trait_root_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         .as_object()?
         .get("Trait")
         .and_then(serde_json::Value::as_u64)?;
-    let trait_impls = llbc
-        .file
-        .translated
-        .rest
-        .get("trait_impls")?
-        .as_array()?;
+    let trait_impls = llbc.file.translated.rest.get("trait_impls")?.as_array()?;
     let ti = trait_impls.get(trait_impl_id as usize)?;
     let trait_id = ti
         .as_object()?
@@ -2169,7 +2179,9 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 fn clone_tyref(ty: &TyRef) -> TyRef {
     match ty {
         TyRef::Dedup { id } => TyRef::Dedup { id: *id },
-        TyRef::Inline { value: (id, v) } => TyRef::Inline { value: (*id, v.clone()) },
+        TyRef::Inline { value: (id, v) } => TyRef::Inline {
+            value: (*id, v.clone()),
+        },
         TyRef::Other(v) => TyRef::Other(v.clone()),
     }
 }
@@ -2388,10 +2400,7 @@ enum DecodedConst {
 ///   - `{kind: {Literal: {Char: "c"}}}`
 ///   - `{kind: {Literal: {ByteStr: "..."}}}`
 ///   - `{kind: {FnDef: {kind: {Fun: {Regular: id}}, generics: ...}}}`
-fn decode_constant(
-    llbc: &Llbc,
-    value: &serde_json::Value,
-) -> Result<DecodedConst, LowerError> {
+fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     let kind = value
         .as_object()
         .and_then(|m| m.get("kind"))
@@ -2433,7 +2442,9 @@ fn decode_constant(
                 LowerError::Unsupported(format!("FnDef shape not yet handled: {fn_def}"))
             })?;
         let fd = llbc.fn_by_id(inner).ok_or_else(|| {
-            LowerError::Schema(format!("FnDef constant references unknown FunDecl id {inner}"))
+            LowerError::Schema(format!(
+                "FnDef constant references unknown FunDecl id {inner}"
+            ))
         })?;
         return Ok(DecodedConst::FnPath(
             fd.item_meta
@@ -2487,7 +2498,11 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
         return Ok(DecodedConst::Bool(b));
     }
     if let Some(f) = lit_obj.get("Float") {
-        if let Some(s) = f.as_object().and_then(|m| m.get("value")).and_then(Value::as_str) {
+        if let Some(s) = f
+            .as_object()
+            .and_then(|m| m.get("value"))
+            .and_then(Value::as_str)
+        {
             if let Ok(v) = s.parse::<f64>() {
                 return Ok(DecodedConst::Float(v.to_bits()));
             }
@@ -2552,4 +2567,3 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
     }
     None
 }
-

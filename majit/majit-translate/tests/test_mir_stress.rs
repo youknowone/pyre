@@ -19,7 +19,11 @@ fn stress_path() -> Option<PathBuf> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../build/llbc/pyre-interpreter.ullbc"
     ));
-    if default.exists() { Some(default) } else { None }
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
 }
 
 #[test]

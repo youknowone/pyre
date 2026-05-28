@@ -237,7 +237,10 @@ pub struct Signature {
 #[serde(untagged)]
 pub enum TyRef {
     /// Pointer into the global type-dedup table.
-    Dedup { #[serde(rename = "Deduplicated")] id: u64 },
+    Dedup {
+        #[serde(rename = "Deduplicated")]
+        id: u64,
+    },
     /// Inline value with hash-cons id.
     Inline {
         #[serde(rename = "HashConsedValue")]
@@ -308,8 +311,7 @@ impl BasicBlock {
             .as_object()
             .and_then(|m| m.get("kind"))
             .ok_or_else(|| "terminator has no 'kind'".to_string())?;
-        serde_json::from_value(kind.clone())
-            .map_err(|e| format!("{e}; raw kind: {kind}"))
+        serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
     }
 }
 

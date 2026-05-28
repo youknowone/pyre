@@ -1140,7 +1140,8 @@ fn collect_trait_impls_from_items(
                             // for S` block would re-emit the method
                             // with `self_ty_root = "S"` and lower the
                             // wrapper through this same path.
-                            for synth in crate::front::syn_metadata::synthesize_or_passthrough(fake_fn, None)
+                            for synth in
+                                crate::front::syn_metadata::synthesize_or_passthrough(fake_fn, None)
                             {
                                 let method_name = synth.sig.ident.to_string();
                                 let return_type = match &synth.sig.output {
@@ -1157,8 +1158,9 @@ fn collect_trait_impls_from_items(
                                 // Slice 3.C/3.F/5: take MIR's trait-default
                                 // graph; emit `graph: None` on miss.  The
                                 // AST graph builder fallback is retired.
-                                let mir_hit = mir_graphs
-                                    .and_then(|m| m.lookup_trait_default(&trait_name, &method_name));
+                                let mir_hit = mir_graphs.and_then(|m| {
+                                    m.lookup_trait_default(&trait_name, &method_name)
+                                });
                                 let hints = crate::front::syn_metadata::collect_jit_hints_with_sig(
                                     &synth.attrs,
                                     &synth.sig,
@@ -1719,11 +1721,7 @@ fn canonical_trait_path_name(
 ) -> String {
     let canonical = canonical_path_name(path);
     if path.segments.len() == 1 {
-        crate::front::syn_metadata::qualify_known_trait_name(
-            &canonical,
-            prefix,
-            known_trait_names,
-        )
+        crate::front::syn_metadata::qualify_known_trait_name(&canonical, prefix, known_trait_names)
     } else {
         canonical
     }
@@ -2147,7 +2145,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn extract_opcode_dispatch_selector_uses_exact_variant_path() {

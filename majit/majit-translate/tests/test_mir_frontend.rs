@@ -7,10 +7,7 @@
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
 
-const CORPUS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../charon-spike/corpus.ullbc",
-);
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-spike/corpus.ullbc",);
 
 fn load_corpus() -> Llbc {
     Llbc::load(CORPUS).expect("load corpus.ullbc")
@@ -79,9 +76,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call { .. } => call_count += 1,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__discriminant" =>
-                {
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
                     discr_count += 1
                 }
                 _ => {}

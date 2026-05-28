@@ -2127,10 +2127,16 @@ impl HostEnv {
         // keeps either spelling resolvable when the front-end emits
         // the bare-namespace form.
         let core_ptr = HostObject::new_module("core.ptr");
-        core_ptr.module_set("null_mut", HostObject::new_builtin_callable("core.ptr.null_mut"));
+        core_ptr.module_set(
+            "null_mut",
+            HostObject::new_builtin_callable("core.ptr.null_mut"),
+        );
         core_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
         let std_ptr = HostObject::new_module("std.ptr");
-        std_ptr.module_set("null_mut", HostObject::new_builtin_callable("core.ptr.null_mut"));
+        std_ptr.module_set(
+            "null_mut",
+            HostObject::new_builtin_callable("core.ptr.null_mut"),
+        );
         std_ptr.module_set("null", HostObject::new_builtin_callable("core.ptr.null"));
 
         let mut mods = self.modules.lock().unwrap();
