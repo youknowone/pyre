@@ -708,6 +708,20 @@ pub enum DispatchError {
     /// benchmarks don't trigger; this guard is fail-loud against future
     /// silent TODOs.
     JitForceVirtualRequiresConcreteResolver { pc: usize },
+    /// `{get,set}field_vable_{i,r,f}` read its box operand from a Ref
+    /// register holding `OpRef::None`. RPython parity: `pyjitpl.py:1167-1199
+    /// opimpl_getfield_vable_{i,r,f}` / `_opimpl_setfield_vable(box, ...,
+    /// pc)` always receive a live `box` from the register file — the
+    /// virtualizable frame box. Pyre's walker initializes Ref register
+    /// slots to `OpRef::None`; an inlined callee frame may leave the vable
+    /// register unseeded (documented walker arg-seeding gap). Both vable
+    /// accessors route through `is_nonstandard_virtualizable` →
+    /// `heapcache.nonstandard_virtualizables_now_known(box)`, which would
+    /// feed `OpRef::None` (`raw() == u32::MAX`) into the dense heapcache
+    /// flag `Vec<u32>`, resizing it to `u32::MAX + 1` (16 GiB). Surface as
+    /// a trace abort so production falls back to trait dispatch rather
+    /// than allocating.
+    VableBoxNotSeeded { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -2303,6 +2317,13 @@ fn getfield_vable_via_metainterp(
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
+    // RPython's `box` is always a live virtualizable-frame box. An
+    // unseeded walker Ref register holds `OpRef::None` (`raw() ==
+    // u32::MAX`); feeding it into the metainterp vable path would resize
+    // the heapcache flag vector to 16 GiB. Bail to a trace abort instead.
+    if obj.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let descr = read_descr(code, op, 1, ctx)?;
 
     // R7 parity: RPython `opimpl_getfield_vable_{i,r,f}(box, fielddescr,
@@ -2416,6 +2437,11 @@ fn setfield_vable_via_metainterp(
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
+    // Same unseeded-register guard as `getfield_vable_via_metainterp`:
+    // a `None` box would resize the heapcache flag vector to 16 GiB.
+    if obj.is_none() {
+        return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+    }
     let value = match value_bank {
         'i' => read_int_reg(code, op, 1, ctx)?,
         'r' => read_ref_reg(code, op, 1, ctx)?,
