@@ -2183,11 +2183,11 @@ pub trait FailDescr: Descr {
     }
 
     /// Pyre-only cranelift bridge cache publish.  Atomic-stores
-    /// `(code_ptr, frame_depth)` into the cells whose addresses
+    /// `(code_ptr, body_ptr)` into the cells whose addresses
     /// `bridge_cache_addrs` reported.  Default panics — only
     /// Resume-family guards carry bridge cache cells.  Callers
     /// gate by `is_resume_guard() || is_resume_guard_copied()`.
-    fn store_bridge_caches(&self, _code_ptr: usize, _frame_depth: usize) {
+    fn store_bridge_caches(&self, _code_ptr: usize, _body_ptr: usize) {
         panic!(
             "store_bridge_caches invoked on a FailDescr that does not \
              carry the per-emission bridge cache cells (only \

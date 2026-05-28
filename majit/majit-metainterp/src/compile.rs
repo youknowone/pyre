@@ -2922,7 +2922,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
     })
@@ -3013,7 +3013,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
     })
@@ -3225,8 +3225,8 @@ impl FailDescr for ResumeAtPositionDescr {
     fn bridge_code_ptr(&self) -> usize {
         FailDescr::bridge_code_ptr(&self.inner)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, body_ptr);
     }
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
@@ -3273,7 +3273,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
         },
@@ -3491,8 +3491,8 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn bridge_code_ptr(&self) -> usize {
         FailDescr::bridge_code_ptr(&self.inner)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, body_ptr);
     }
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
@@ -3539,7 +3539,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
         },
@@ -3741,8 +3741,8 @@ impl FailDescr for ResumeGuardExcDescr {
     fn bridge_code_ptr(&self) -> usize {
         FailDescr::bridge_code_ptr(&self.inner)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, body_ptr);
     }
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
@@ -3789,7 +3789,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
         },
@@ -3897,11 +3897,12 @@ pub struct ResumeGuardCopiedDescr {
     /// ResumeGuardDescr and ResumeGuardCopiedDescr).  `0` means no
     /// bridge attached.
     bridge_code_ptr_cache: Box<std::sync::atomic::AtomicUsize>,
-    /// Pyre-only per-emission cranelift bridge frame-depth cache.
-    /// Same shape as `bridge_code_ptr_cache`; baked into the dispatch
-    /// path so the runtime verifies the JIT frame can fit the
-    /// bridge inputs before re-entering.
-    bridge_frame_depth_cache: Box<std::sync::atomic::AtomicUsize>,
+    /// Pyre-only per-emission cranelift bridge body-pointer cache.
+    /// Same shape as `bridge_code_ptr_cache`, but holds the bridge's
+    /// `CallConv::Tail` body entry; the in-code dispatch tail-calls it
+    /// so a guard failure transfers into the bridge without leaving a
+    /// machine-stack return frame (PyPy `patch_jump_for_descr` JMP).
+    bridge_body_ptr_cache: Box<std::sync::atomic::AtomicUsize>,
     /// Pyre-only per-emission cranelift bridge dispatch cell.
     /// Type-erased to `*mut ()` because `BridgeData` lives in
     /// `majit-backend-cranelift` (downstream); the cleanup function
@@ -4022,7 +4023,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
             bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -4252,15 +4253,15 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         Some((
             self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+            self.bridge_body_ptr_cache.as_ref() as *const _ as usize,
         ))
     }
     fn bridge_code_ptr(&self) -> usize {
         self.bridge_code_ptr_cache.load(Ordering::Acquire)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        self.bridge_frame_depth_cache
-            .store(frame_depth, Ordering::Release);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        self.bridge_body_ptr_cache
+            .store(body_ptr, Ordering::Release);
         self.bridge_code_ptr_cache
             .store(code_ptr, Ordering::Release);
     }
@@ -4338,7 +4339,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-                bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+                bridge_body_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
                 bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
                 external_jump_target: std::sync::OnceLock::new(),
@@ -4480,8 +4481,8 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn bridge_code_ptr(&self) -> usize {
         self.inner.bridge_code_ptr()
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        self.inner.store_bridge_caches(code_ptr, frame_depth);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        self.inner.store_bridge_caches(code_ptr, body_ptr);
     }
     fn bridge_dispatch_load(&self) -> *mut () {
         self.inner.bridge_dispatch_load()
@@ -4542,7 +4543,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-        bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+        bridge_body_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
         bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
         external_jump_target: std::sync::OnceLock::new(),
@@ -4582,7 +4583,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
             bridge_dispatch_cell: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -4747,7 +4748,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-                bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+                bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
             },
@@ -4920,8 +4921,8 @@ impl FailDescr for CompileLoopVersionDescr {
     fn bridge_code_ptr(&self) -> usize {
         FailDescr::bridge_code_ptr(&self.inner)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        FailDescr::store_bridge_caches(&self.inner, code_ptr, frame_depth);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        FailDescr::store_bridge_caches(&self.inner, code_ptr, body_ptr);
     }
     fn bridge_dispatch_load(&self) -> *mut () {
         FailDescr::bridge_dispatch_load(&self.inner)
@@ -5022,7 +5023,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
         },
@@ -5416,7 +5417,7 @@ mod fail_descr_tests {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-                bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+                bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
             },

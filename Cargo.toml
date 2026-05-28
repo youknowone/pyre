@@ -94,11 +94,11 @@ proc-macro2 = "1"
 smallvec = "1"
 
 # cranelift backend
-cranelift-codegen = "0.130"
-cranelift-frontend = "0.130"
-cranelift-jit = "0.130"
-cranelift-module = "0.130"
-cranelift-native = "0.130"
+cranelift-codegen = "0.132"
+cranelift-frontend = "0.132"
+cranelift-jit = "0.132"
+cranelift-module = "0.132"
+cranelift-native = "0.132"
 target-lexicon = "0.13"
 
 # dynasm backend

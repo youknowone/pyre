@@ -12,7 +12,7 @@
 //!
 //! Several slots — `trace_info` (`AtomicPtr<CompiledTraceInfo>`),
 //! `bridge_dispatch_cell` (`AtomicPtr<()>`), and `bridge_code_ptr_cache`
-//! / `bridge_frame_depth_cache` — are accessed through atomics so that
+//! / `bridge_body_ptr_cache` — are accessed through atomics so that
 //! JIT-baked machine code can read them without a Mutex.  The
 //! `Arc::into_raw` / `Arc::increment_strong_count` / `Arc::from_raw`
 //! protocol used on the dispatch / trace_info cells has a textbook
@@ -218,11 +218,15 @@ pub struct ResumeGuardDescr {
     /// `emit_attached_bridge_dispatch` (compiler.rs:5347) embeds this
     /// address as an immediate.  `0` = no bridge attached.
     pub bridge_code_ptr_cache: Box<AtomicUsize>,
-    /// Bridge frame-depth cache.  Same shape as
-    /// `bridge_code_ptr_cache`; baked into the dispatch path so the
-    /// runtime can verify the JIT frame can fit the bridge inputs
-    /// before re-entering.
-    pub bridge_frame_depth_cache: Box<AtomicUsize>,
+    /// Bridge body-pointer cache.  Same shape as
+    /// `bridge_code_ptr_cache`, but holds the bridge's `CallConv::Tail`
+    /// body entry (not the host-ABI wrapper).  The in-code dispatch
+    /// (`emit_attached_bridge_dispatch`) tail-calls this so a guard
+    /// failure transfers into the bridge without leaving a return frame
+    /// on the machine stack — the cranelift analogue of PyPy's
+    /// `patch_jump_for_descr` raw JMP.  The wrapper in
+    /// `bridge_code_ptr_cache` stays for the host-loop fallback dispatch.
+    pub bridge_body_ptr_cache: Box<AtomicUsize>,
     /// Bridge dispatch cell (cranelift-only TODO: PyPy patches guard
     /// JMP targets in place).  PyPy's `assembler.py:987 patch_jump_for_descr`
     /// rewrites the guard JMP target in place; cranelift cannot patch
@@ -291,7 +295,7 @@ impl Descr for ResumeGuardDescr {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
         }))
@@ -489,15 +493,15 @@ impl FailDescr for ResumeGuardDescr {
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         Some((
             self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+            self.bridge_body_ptr_cache.as_ref() as *const _ as usize,
         ))
     }
     fn bridge_code_ptr(&self) -> usize {
         self.bridge_code_ptr_cache.load(Ordering::Acquire)
     }
-    fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        self.bridge_frame_depth_cache
-            .store(frame_depth, Ordering::Release);
+    fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        self.bridge_body_ptr_cache
+            .store(body_ptr, Ordering::Release);
         self.bridge_code_ptr_cache
             .store(code_ptr, Ordering::Release);
     }
@@ -564,7 +568,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-        bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
+        bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
     })
@@ -683,20 +687,20 @@ impl ResumeGuardDescr {
 
     /// Heap-pinned addresses of the two bridge-cache atomic cells
     /// suitable for baking into JIT machine code as
-    /// immediates.  Returns `(code_ptr_addr, frame_depth_addr)`.
+    /// immediates.  Returns `(code_ptr_addr, body_ptr_addr)`.
     pub fn bridge_cache_addrs(&self) -> (usize, usize) {
         (
             self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+            self.bridge_body_ptr_cache.as_ref() as *const _ as usize,
         )
     }
 
     /// Atomically store the bridge code-pointer + frame-depth caches
     /// Called from cranelift `attach_bridge` after
     /// the bridge has been compiled.
-    pub fn store_bridge_caches(&self, code_ptr: usize, frame_depth: usize) {
-        self.bridge_frame_depth_cache
-            .store(frame_depth, Ordering::Release);
+    pub fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
+        self.bridge_body_ptr_cache
+            .store(body_ptr, Ordering::Release);
         self.bridge_code_ptr_cache
             .store(code_ptr, Ordering::Release);
     }

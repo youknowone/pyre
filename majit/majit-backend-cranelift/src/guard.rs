@@ -52,6 +52,11 @@ pub struct BridgeData {
     /// Same calling convention as a compiled loop:
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
     pub code_ptr: *const u8,
+    /// `CallConv::Tail` body entry of the bridge (wrapper-bypassing).
+    /// `emit_attached_bridge_dispatch` tail-calls this on guard failure so
+    /// the transfer leaves no machine-stack return frame — the cranelift
+    /// analogue of PyPy `patch_jump_for_descr`'s raw JMP into the bridge.
+    pub body_ptr: *const u8,
     /// Fail descriptors within the bridge (guards + finish).
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
     /// contract (compile.py:183-203 record_loop_or_bridge). Position

@@ -6143,30 +6143,27 @@ impl JitState for PyreJitState {
             first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
         let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
         let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
-        // virtualizable_gen.rs PyFrame layout: the resume payload prefix is
-        //   [vable, last_instr:Int, pycode:Ref, valuestackdepth:Int,
-        //    debugdata:Ref, lastblock:Ref, w_globals:Ref, locals_cells_stack_w...].
-        // virtualizable.py:139 read_boxes consumes typed boxes per declared
-        // field type, so decode_box's `kind` must be the field type — not a
-        // uniform Ref. last_instr/valuestackdepth are signed ints (matching
-        // publish_last_instr_to_vable's const_int), the rest Ref.
-        const VABLE_VALUE_TYPES: &[Type] = &[
-            Type::Ref, // vable pointer
-            Type::Int, // last_instr
-            Type::Ref, // pycode
-            Type::Int, // valuestackdepth
-            Type::Ref, // debugdata
-            Type::Ref, // lastblock
-            Type::Ref, // w_globals
-        ];
-        for (i, v) in vvals.iter().enumerate() {
-            // locals_cells_stack_w array items (index ≥ scalar prefix) are
-            // Ref (W_Root array).
-            let expected = VABLE_VALUE_TYPES.get(i).copied().unwrap_or(Type::Ref);
+        // resume.py:1264 `assert box.type == kind`: the vable payload is
+        // NOT uniformly Ref — the static fields carry their declared
+        // kinds (interp_jit.py:25-31: last_instr/valuestackdepth are Int).
+        // `virt_live_value_types` yields the full live layout WITH the
+        // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
+        // array...]); the vvals stream omits the extra reds, so strip them
+        // to recover the per-slot kind for each payload position.
+        let array_item_count = vvals
+            .len()
+            .saturating_sub(1 + crate::virtualizable_gen::NUM_VABLE_SCALARS);
+        let full_types = crate::virtualizable_gen::virt_live_value_types(array_item_count);
+        let nreds = crate::virtualizable_gen::NUM_EXTRA_REDS;
+        let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
+        vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
+        vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
+        for (idx, v) in vvals.iter().enumerate() {
+            let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
             let (op, val) = bridge_decode_box(
                 ctx,
                 v,
-                expected,
+                expected_kind,
                 rd_virtuals,
                 resume_data,
                 fail_values,
