@@ -9824,8 +9824,23 @@ impl CodeWriter {
         // no production behavior change.
         let phase4_splice_audit =
             std::env::var("PYRE_PHASE4_SPLICE_AUDIT").ok().as_deref() == Some("1");
+        // M1.2 — PyPy-orthodox regalloc measurement gate
+        // (`rpython/jit/codewriter/codewriter.py:45-47` then
+        // `rpython/jit/codewriter/flatten.py:63-70`).  When set, the
+        // canonical-side regalloc runs FRESH from the graph with NO
+        // `extra_coalesce_pairs` — no `walker_pin_pairs` ADAPTATION,
+        // no `cfg_variable_pairs` ADAPTATION.  Quantifies the splice
+        // eligibility under pure-PyPy coloring versus the
+        // walker-pin-merged baseline so the cost of the existing
+        // pre-merge ADAPTATIONs is measurable on real workloads.
+        let pypy_orthodox_regalloc =
+            std::env::var("PYRE_PYPY_ORTHODOX_REGALLOC").ok().as_deref() == Some("1");
         if phase4_build_canonical || phase4_diff_canonical || phase4_splice_audit {
-            let mut canonical_regallocs = graph_regallocs.clone();
+            let mut canonical_regallocs = if pypy_orthodox_regalloc {
+                super::regalloc::perform_register_allocation_all_kinds(&graph)
+            } else {
+                graph_regallocs.clone()
+            };
             let canonical_ssarepr = super::flatten::flatten_graph(
                 &graph,
                 &mut canonical_regallocs,
@@ -10395,7 +10410,8 @@ impl CodeWriter {
                      eligible_lax={eligible_lax} \
                      walker_filtered_len={walker_filtered_len} \
                      canonical_filtered_len={canonical_filtered_len} \
-                     walker_raw_len={} canonical_raw_len={}",
+                     walker_raw_len={} canonical_raw_len={} \
+                     pypy_orthodox_regalloc={pypy_orthodox_regalloc}",
                     ssarepr.name,
                     ssarepr.insns.len(),
                     canonical_ssarepr.insns.len(),
