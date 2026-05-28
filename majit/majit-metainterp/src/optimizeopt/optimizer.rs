@@ -2881,7 +2881,8 @@ impl Optimizer {
             .map(|op| !Self::is_constant_placeholder_op(op, &ctx))
             .collect();
         let mut keep_iter = keep.into_iter();
-        ctx.new_operations.retain(|_| keep_iter.next().unwrap_or(true));
+        ctx.new_operations
+            .retain(|_| keep_iter.next().unwrap_or(true));
 
         // Drain remaining extra ops.
         self.drain_extra_operations_from(0, &mut ctx);

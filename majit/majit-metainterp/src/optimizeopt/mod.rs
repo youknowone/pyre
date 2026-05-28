@@ -1787,11 +1787,7 @@ impl OptContext {
         if opref.is_none() || opref.is_constant() {
             return None;
         }
-        if let Some(op) = self
-            .new_operations
-            .iter()
-            .rfind(|op| op.pos.get() == opref)
-        {
+        if let Some(op) = self.new_operations.iter().rfind(|op| op.pos.get() == opref) {
             return Some(op.clone());
         }
         if let Some(op) = self
@@ -4099,24 +4095,17 @@ impl OptContext {
     /// without an upstream pool). Callers in that case fall back to the
     /// `OpRef`-returning walker.
     pub fn get_box_replacement_box(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
-        if opref.is_none() {
-            return None;
-        }
-        let start = if opref.is_constant() {
-            let ci = opref.const_index();
-            let value = self.const_pool.get(&ci).copied()?;
-            crate::r#box::BoxRef::new_const_with_index(value, ci)
-        } else {
-            // RPython invariant: every non-const `AbstractResOpOrInputArg`
-            // carries a Box (`resoperation.py:233-248`). pyre's `box_pool`
-            // is the Rust-side embodiment; a miss here means the producer
-            // failed to materialize the Box (production should always
-            // populate via `ensure_box`). The `None` fallthrough is
-            // tolerated for test fixtures that bypass the recorder; READ
-            // sites that need the materialize-always invariant should use
-            // `ensure_box` instead. Phase D-2.g audit pending.
-            self.box_pool.get(opref).cloned()?
-        };
+        // S-8.A.4: resolve the chain root through `resolve_to_boxref`, the
+        // variant-aware canonical-host resolver (producer `Op` for ResOp
+        // variants, `inputarg_refs` for InputArg, `const_pool` for Const),
+        // rather than `box_pool.get` whose position-collapse merges a ResOp
+        // and an InputArg sharing a raw slot index. Production `ensure_box`
+        // binds every resop slot to the same producer `Op`, so reads here
+        // and writes through `ensure_box` agree by hitting the identical
+        // `Op.forwarded` / `InputArg.forwarded` host. A `None` resolve
+        // (sentinel, or a position with no producer / inputarg / const)
+        // leaves callers on the OpRef-returning walker fallback.
+        let start = self.resolve_to_boxref(opref)?;
         Some(start.get_box_replacement(false))
     }
 
