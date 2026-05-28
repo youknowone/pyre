@@ -1773,6 +1773,69 @@ impl OptContext {
         }
     }
 
+    /// S-8.A.1 lookup primitive: find the canonical producer `OpRc`
+    /// for `opref` by scanning the current phase's `new_operations`
+    /// first, then cross-phase `phase1_emit_ops` (`history.py:220`
+    /// box.type parity for Phase 1 emit OpRefs visible from Phase 2),
+    /// then synthetic stand-ins / pre-bound input ops in
+    /// `resop_refs`. Reverse scan on the first two lists mirrors
+    /// `op_at`'s ordering so a later replacement at the same `pos`
+    /// wins. Returns `None` for inputargs, constants, OpRefs without
+    /// a producer in any of the three stores, and sentinel
+    /// `OpRef::none()`.
+    pub(crate) fn find_producer_op(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        if let Some(op) = self
+            .new_operations
+            .iter()
+            .rfind(|op| op.pos.get() == opref)
+        {
+            return Some(op.clone());
+        }
+        if let Some(op) = self
+            .phase1_emit_ops
+            .iter()
+            .rfind(|op| op.pos.get() == opref)
+        {
+            return Some(op.clone());
+        }
+        self.resop_refs
+            .get(opref.raw() as usize)
+            .and_then(|slot| slot.clone())
+    }
+
+    /// S-8.A.1: mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
+    /// stand-in `OpRc` for `opref` with the correct result type and
+    /// stash it in `resop_refs[idx]` so `emit()`'s
+    /// `bound_is_synthetic` rebind path later upgrades the binding to
+    /// the real producer via `bind_op`'s carry-over. The synthetic
+    /// stays referenced from `resop_refs` for the OptContext's
+    /// lifetime so lingering `Forwarded::Op(_)` `Weak<Op>` upgrades
+    /// stay valid until rebind.
+    pub(crate) fn mint_synthetic_resop(
+        &mut self,
+        opref: OpRef,
+        ty: majit_ir::Type,
+    ) -> majit_ir::OpRc {
+        use majit_ir::resoperation::{Op, OpCode};
+        let opcode = match ty {
+            majit_ir::Type::Int => OpCode::SameAsI,
+            majit_ir::Type::Float => OpCode::SameAsF,
+            majit_ir::Type::Ref => OpCode::SameAsR,
+            majit_ir::Type::Void => OpCode::Jump,
+        };
+        let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
+        synthetic.pos.set(opref);
+        let idx = opref.raw() as usize;
+        if idx >= self.resop_refs.len() {
+            self.resop_refs.resize_with(idx + 1, || None);
+        }
+        self.resop_refs[idx] = Some(synthetic.clone());
+        synthetic
+    }
+
     /// S-1: bind every input op's resop `BoxRef` in `box_pool` to a
     /// fresh `OpRc` of the input op so any `Forwarded::Op(_)` chain
     /// step targeting the slot has an upgradable `Weak<Op>` from the
@@ -4020,41 +4083,18 @@ impl OptContext {
             // host) and `make_equal_to`'s strict bound-target invariant
             // holds.
             if cloned.is_resop() && cloned.bound_op().is_none() {
-                let op_rc = self
-                    .new_operations
-                    .iter()
-                    .rfind(|op| op.pos.get() == opref)
-                    .or_else(|| {
-                        self.phase1_emit_ops
-                            .iter()
-                            .rfind(|op| op.pos.get() == opref)
-                    })
-                    .cloned();
-                if let Some(op_rc) = op_rc {
+                if let Some(op_rc) = self.find_producer_op(opref) {
                     cloned.bind_op(&op_rc);
                 } else {
-                    // Producer not yet emitted: bind to a synthetic stand-in
-                    // (mirrors the lazy-alloc miss path below at line 4044).
-                    // `emit()` swaps the binding to the real producer when
-                    // it arrives, with `bind_op`'s carry-over migrating the
-                    // forwarded state. Required so every BoxRef returned
-                    // from `ensure_box` is bound to an `Op` whose
-                    // `forwarded` slot is the canonical `_forwarded` host
-                    // (resoperation.py:233).
-                    use majit_ir::resoperation::{Op, OpCode};
-                    let opcode = match cloned.type_() {
-                        majit_ir::Type::Int => OpCode::SameAsI,
-                        majit_ir::Type::Float => OpCode::SameAsF,
-                        majit_ir::Type::Ref => OpCode::SameAsR,
-                        majit_ir::Type::Void => OpCode::Jump,
-                    };
-                    let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
-                    synthetic.pos.set(opref);
-                    let idx = opref.raw() as usize;
-                    if idx >= self.resop_refs.len() {
-                        self.resop_refs.resize_with(idx + 1, || None);
-                    }
-                    self.resop_refs[idx] = Some(synthetic.clone());
+                    // Producer not yet emitted: bind to a synthetic
+                    // stand-in. `emit()` swaps the binding to the
+                    // real producer when it arrives, with `bind_op`'s
+                    // carry-over migrating the forwarded state.
+                    // Required so every BoxRef returned from
+                    // `ensure_box` is bound to an `Op` whose
+                    // `forwarded` slot is the canonical `_forwarded`
+                    // host (resoperation.py:233).
+                    let synthetic = self.mint_synthetic_resop(opref, cloned.type_());
                     cloned.bind_op(&synthetic);
                 }
             }
@@ -4097,21 +4137,10 @@ impl OptContext {
             }
             _ => {
                 let p = crate::r#box::BoxRef::new_resop(placeholder_type, idx as u32);
-                // Bind to the producing OpRc when present so `box.set_forwarded`
-                // dual-writes to `op.forwarded` (resoperation.py:233 `_forwarded`
-                // host). Searches the current phase's `new_operations` first,
-                // then cross-phase `phase1_emit_ops`.
-                let op_rc = self
-                    .new_operations
-                    .iter()
-                    .rfind(|op| op.pos.get() == opref)
-                    .or_else(|| {
-                        self.phase1_emit_ops
-                            .iter()
-                            .rfind(|op| op.pos.get() == opref)
-                    })
-                    .cloned();
-                if let Some(op_rc) = op_rc {
+                // Bind to the producing OpRc when present so
+                // `box.set_forwarded` dual-writes to `op.forwarded`
+                // (resoperation.py:233 `_forwarded` host).
+                if let Some(op_rc) = self.find_producer_op(opref) {
                     p.bind_op(&op_rc);
                 } else {
                     // No producer Op yet — synthesise a `SameAsI/F/R`
@@ -4119,24 +4148,11 @@ impl OptContext {
                     // result type and bind so chain steps targeting
                     // this BoxRef route through `Forwarded::Op(_)`
                     // (`optimizer.py:394 op.set_forwarded(newop)`
-                    // where `newop` is an `AbstractResOp`) instead of
-                    // the deprecated `Forwarded::Box(_)` fallback.
-                    // `emit()` re-binds to the real producer when it
-                    // arrives, carrying the forwarded state across via
+                    // where `newop` is an `AbstractResOp`). `emit()`
+                    // re-binds to the real producer when it arrives,
+                    // carrying the forwarded state across via
                     // `BoxRef::bind_op`'s carry-over.
-                    use majit_ir::resoperation::{Op, OpCode};
-                    let opcode = match placeholder_type {
-                        majit_ir::Type::Int => OpCode::SameAsI,
-                        majit_ir::Type::Float => OpCode::SameAsF,
-                        majit_ir::Type::Ref => OpCode::SameAsR,
-                        majit_ir::Type::Void => OpCode::Jump,
-                    };
-                    let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
-                    synthetic.pos.set(opref);
-                    if idx >= self.resop_refs.len() {
-                        self.resop_refs.resize_with(idx + 1, || None);
-                    }
-                    self.resop_refs[idx] = Some(synthetic.clone());
+                    let synthetic = self.mint_synthetic_resop(opref, placeholder_type);
                     p.bind_op(&synthetic);
                 }
                 p
