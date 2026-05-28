@@ -5,7 +5,6 @@
 
 use majit_ir::{Op, OpCode, OpRef, Type};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 
 // ── vector.py:670-678: isomorphic ─────────────────────────────────────
@@ -790,17 +789,14 @@ pub struct VecScheduleState {
     pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// RPython `box._forwarded` storage used by the vectorizer for
-    /// `VectorizationInfo`. This is local to scheduling because upstream
-    /// clears the vectorization `_forwarded` state after the vector pass
-    /// (`vector.py:58-60`, `finaloplist`:88-90).
-    ///
-    /// Keyed by full `OpRef` (variant + payload) so the
-    /// `InputArg*` and `*Op` namespaces stay disjoint — PyPy uses Box
-    /// object identity (`AbstractValue` `is`), so e.g. an inputarg at
-    /// slot 0 and an op at position 0 cannot collide upstream and must
-    /// not collide here either.
-    box_pool: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, BoxRef>,
+    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache. PyPy reads
+    /// `op._forwarded` as the `VectorizationInfo` carrier; pyre splits
+    /// the slot — `Op.vecinfo` is the per-op canonical (cleared by
+    /// `vector.py:58-60 teardown_vectorization`) and this cache holds
+    /// the schedule-local stamps for InputArg/transient OpRefs that
+    /// don't own an Op. Keyed by full `OpRef` so InputArg/op namespaces
+    /// don't collide.
+    vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::VectorizationInfo>,
 }
 
 impl VecScheduleState {
@@ -816,7 +812,7 @@ impl VecScheduleState {
             invariant_oplist: Vec::new(),
             accumulation: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_pos: start_pos,
-            box_pool: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -837,9 +833,7 @@ impl VecScheduleState {
             } else {
                 self.vectorization_info_for_op(op)
             };
-            if let Some(b) = self.ensure_box_for_opref(op.pos.get()) {
-                b.set_forwarded_vector_info(info);
-            }
+            self.set_forwarded_vecinfo(op.pos.get(), info);
         }
     }
 
@@ -867,38 +861,18 @@ impl VecScheduleState {
         self.vectorization_info_for_op(op)
     }
 
-    fn ensure_box_for_opref(&mut self, opref: OpRef) -> Option<BoxRef> {
-        if opref.is_none() || opref.is_constant() {
-            return None;
-        }
-        if let Some(existing) = self.box_pool.get(&opref) {
-            return Some(existing.clone());
-        }
-        let tp = opref.ty().unwrap_or(Type::Void);
-        let raw = opref.raw();
-        let b = if matches!(
-            opref,
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-        ) {
-            BoxRef::new_inputarg(tp, raw)
-        } else {
-            BoxRef::new_resop(tp, raw)
-        };
-        self.box_pool.insert(opref, b.clone());
-        Some(b)
-    }
-
     fn get_forwarded_vecinfo(&self, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
         if opref.is_none() || opref.is_constant() {
             return None;
         }
-        self.box_pool.get(&opref).and_then(|b| b.vector_info())
+        self.vecinfo_cache.get(&opref).cloned()
     }
 
     fn set_forwarded_vecinfo(&mut self, opref: OpRef, info: majit_ir::VectorizationInfo) {
-        if let Some(b) = self.ensure_box_for_opref(opref) {
-            b.set_forwarded_vector_info(info);
+        if opref.is_none() || opref.is_constant() {
+            return;
         }
+        self.vecinfo_cache.insert(opref, info);
     }
 
     /// schedule.py:20-28 `forwarded_vecinfo(op)`.

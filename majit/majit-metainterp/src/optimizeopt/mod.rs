@@ -6297,10 +6297,6 @@ impl OptContext {
                  (info.py:876), got {:?}",
                 std::mem::discriminant(other),
             ),
-            Forwarded::VectorInfo(_) => panic!(
-                "getrawptrinfo: forwarded must be IntBound or AbstractRawPtrInfo \
-                 (info.py:876), got VectorizationInfo",
-            ),
             // Terminal of `get_box_replacement(false)` can only be `None`
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
@@ -6391,9 +6387,6 @@ impl OptContext {
                 "getptrinfo: forwarded must be PtrInfo (info.py:892), got {:?}",
                 std::mem::discriminant(other),
             ),
-            Forwarded::VectorInfo(_) => {
-                panic!("getptrinfo: forwarded must be PtrInfo (info.py:892), got VectorizationInfo",)
-            }
             // Terminal of `get_box_replacement(false)` can only be `None`
             // or `Info(_)` per the chain walker (box.rs:295-322); a
             // `Forwarded::Const` terminal is materialized inline by the
@@ -6766,10 +6759,8 @@ impl OptContext {
                     Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().getnullness(),
                     // optimizer.py:108-109: rare case (fw is RawBufferPtrInfo).
                     // optimizer.py:104-109 reads anything that is not an
-                    // IntBound through the same "return unbounded" path,
-                    // including a stray VectorizationInfo that survived
-                    // the vector pass teardown.
-                    Forwarded::Info(_) | Forwarded::VectorInfo(_) => {
+                    // IntBound through the same "return unbounded" path.
+                    Forwarded::Info(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
                     Forwarded::Box(_)

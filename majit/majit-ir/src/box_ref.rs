@@ -28,7 +28,7 @@ use std::rc::{Rc, Weak};
 use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
-use crate::resoperation::{Op, VectorizationInfo};
+use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
 use crate::{GcRef, OpRef, Type, Value};
 
@@ -190,12 +190,6 @@ pub enum Forwarded {
     /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
-
-    /// `resoperation.py:156 VectorizationInfo(AbstractValue)` written by
-    /// `schedule.py:20-28 forwarded_vecinfo`.  Separate from `Info`
-    /// because vectorizer metadata is not an `OpInfo` semantic class —
-    /// it's per-op codegen state.
-    VectorInfo(VectorizationInfo),
 }
 
 /// `Rc<Box>` newtype.
@@ -636,28 +630,6 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
-    /// `schedule.py:20-28 forwarded_vecinfo` — set the per-op vectorizer
-    /// metadata into the `_forwarded` slot via the dedicated
-    /// `VectorInfo` variant.
-    pub fn set_forwarded_vector_info(&self, info: VectorizationInfo) {
-        assert!(
-            !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_vector_info on Const violates RPython AbstractValue \
-             invariant (Const has no _forwarded slot)"
-        );
-        *self.0.forwarded.borrow_mut() = Forwarded::VectorInfo(info);
-    }
-
-    /// `schedule.py:30-36 forwarded_vecinfo` reader — return a clone of the
-    /// `VectorizationInfo` currently in the `_forwarded` slot, or `None`
-    /// if the slot does not hold `VectorInfo`.
-    pub fn vector_info(&self) -> Option<VectorizationInfo> {
-        match &*self.0.forwarded.borrow() {
-            Forwarded::VectorInfo(info) => Some(info.clone()),
-            _ => None,
-        }
-    }
-
     /// Per-type mixin slot read — `_resint` / `_resref` / `_resfloat`
     /// (resoperation.py:566/612/582).  Returns the cached runtime value
     /// for `ResOp` / `InputArg` boxes; the variant default for `Const`
@@ -780,7 +752,7 @@ impl BoxRef {
         let mut cur = self.clone();
         loop {
             match cur.get_forwarded() {
-                Forwarded::None | Forwarded::Info(_) | Forwarded::VectorInfo(_) => return cur,
+                Forwarded::None | Forwarded::Info(_) => return cur,
                 Forwarded::Box(b) => {
                     if not_const && b.is_constant() {
                         return cur;
