@@ -1215,13 +1215,15 @@ pub fn std_ptr_eq(
 /// `object_array::items_block_layout`.  Returns `SomeInteger` since
 /// the actual value is a compile-time `usize`; the rtyper folds the
 /// const at lowering time, but the annotator just needs the lattice
-/// position.
+/// position.  The value is a `usize` byte size, so it is non-negative —
+/// modeled as `SomeInteger(nonneg=True)` (the `rffi.sizeof` / `len`
+/// lattice), strictly more precise than the default and safe under join.
 pub fn std_mem_size_of(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(SomeValue::Integer(SomeInteger::default()))
+    Ok(SomeValue::Integer(SomeInteger::new(true, false)))
 }
 
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
