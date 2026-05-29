@@ -281,24 +281,42 @@ pub(crate) fn merge_backend_constants_from_ctx(
 ) {
     let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
-    for (idx, b) in ctx.box_pool.iter_indexed() {
-        // make_constant excludes InputArg positions from self.constants writes
-        // (mod.rs:3946) because regalloc.rs:1207 would treat them as inline
-        // constants, but the InputArg's runtime value flows through the input
-        // slot. Preserve that exclusion at the box_pool reader so the
-        // BoxRef-forwarding migration is a structural no-op.
-        if b.is_inputarg() {
-            continue;
+    // Iterate every bound ResOp across the canonical `_forwarded` hosts
+    // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`) rather than the
+    // `box_pool` side-table. `BoxRef::write_forwarded`'s bound-precondition
+    // (S-0.B.2) forbids a forwarded write to an unbound box, so every
+    // position carrying `Forwarded::Const` has a bound producer `Op`
+    // reachable through one of these stores. Body-namespace producers are
+    // never `InputArg`, so the original `b.is_inputarg()` skip
+    // (make_constant excludes InputArg positions, mod.rs:3946) is automatic.
+    // `entry_or_insert_with` dedups positions appearing in more than one
+    // store.
+    let mut consider = |op: &majit_ir::OpRc| {
+        let pos = op.pos.get();
+        if pos.is_none() || pos.is_constant() {
+            return;
         }
-        let value = match b.get_forwarded() {
+        let idx = pos.raw() as usize;
+        let value = match op.forwarded.borrow().clone() {
             crate::r#box::Forwarded::Const(c) => c.to_value(),
-            _ => continue,
+            _ => return,
         };
         if idx < live_positions.len() && live_positions[idx] {
-            continue;
+            return;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
         constants.entry_or_insert_with(key, || value);
+    };
+    for op in &ctx.new_operations {
+        consider(op);
+    }
+    for op in &ctx.phase1_emit_ops {
+        consider(op);
+    }
+    for slot in &ctx.resop_refs {
+        if let Some(op) = slot {
+            consider(op);
+        }
     }
 }
 
@@ -2960,6 +2978,19 @@ impl Optimizer {
                 if let Some(old_pos) = box_ref.position() {
                     if let Some(&new_pos) = remap.get(&old_pos) {
                         box_ref.set_position(new_pos);
+                        // Keep the canonical `Op.pos` aligned with the remapped
+                        // box position. The `new_operations` loop above only
+                        // remaps emitted live ops; removed constant-folded ops
+                        // (their box carries `Forwarded::Const`) are bound — the
+                        // orphan-binding pass above pushed every resop box's
+                        // producer into `phase1_emit_ops` — but their `Op.pos`
+                        // is otherwise left at the pre-compact value. Readers
+                        // off the canonical `Op.pos` (`merge_backend_constants`)
+                        // need the post-compact position too. Idempotent for
+                        // live ops (already set to `new_pos` above).
+                        if let Some(op) = box_ref.bound_op() {
+                            op.pos.set(op.pos.get().with_raw(new_pos));
+                        }
                     }
                 }
             }
