@@ -967,6 +967,17 @@ fn make_new_descr(func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     pyre_object::w_staticmethod_new(f)
 }
 
+/// Wrap a `maketrans` builtin function in a staticmethod descriptor.
+///
+/// `str.maketrans` / `bytes.maketrans` / `bytearray.maketrans` are static
+/// methods: an instance call such as `b''.maketrans(a, b)` must read `a`/`b`
+/// as the two arguments, not bind the receiver as the first one.
+fn make_maketrans_descr(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) -> PyObjectRef {
+    pyre_object::w_staticmethod_new(make_builtin_function("maketrans", func))
+}
+
 fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_ellipsis) = gettypefor(&pyre_object::ELLIPSIS_TYPE) {
@@ -1943,7 +1954,7 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "maketrans",
-        make_builtin_function("maketrans", |args| {
+        make_maketrans_descr(|args| {
             // maketrans(x[, y[, z]]) → translation dict
             let d = pyre_object::w_dict_new();
             if args.len() >= 3 {
@@ -7101,11 +7112,7 @@ fn init_bytes_type(ns: &mut DictStorage) {
         "expandtabs",
         make_builtin_function("expandtabs", bytes_method_expandtabs),
     );
-    dict_storage_store(
-        ns,
-        "maketrans",
-        make_builtin_function("maketrans", bytes_maketrans),
-    );
+    dict_storage_store(ns, "maketrans", make_maketrans_descr(bytes_maketrans));
     dict_storage_store(
         ns,
         "fromhex",
@@ -9280,11 +9287,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function("expandtabs", bytes_method_expandtabs),
     );
     dict_storage_store(ns, "hex", make_builtin_function("hex", bytes_method_hex));
-    dict_storage_store(
-        ns,
-        "maketrans",
-        make_builtin_function("maketrans", bytes_maketrans),
-    );
+    dict_storage_store(ns, "maketrans", make_maketrans_descr(bytes_maketrans));
     dict_storage_store(
         ns,
         "fromhex",
