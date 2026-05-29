@@ -1855,6 +1855,13 @@ pub fn dispatch_via_miframe(
     let trace_ctx = unsafe { &mut *ctx_ptr };
     let sym = unsafe { &mut *sym_ptr };
 
+    // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
+    // so guard snapshots can resolve a per-guard resume coordinate from
+    // `op_pc`.  Mark the thread-local for the walk's lifetime;
+    // `walker_capture_snapshot_for_last_guard` reads it.  Reached only
+    // under `PYRE_FULL_BODY_WALK`, so production default-off is unchanged.
+    let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
+
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
     // mirrors this as `Option<OpRef>` — `None` means "no active
@@ -2140,8 +2147,15 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     } else {
         unsafe { (*sym.jitcode).index as u32 }
     };
-    let outer_active_boxes =
-        collect_outer_active_boxes(sym, trace_ctx, outer_jitcode_index, entry_py_pc);
+    let outer_active_boxes = collect_outer_active_boxes(
+        sym,
+        trace_ctx,
+        &sym.registers_i,
+        &sym.registers_r,
+        &sym.registers_f,
+        outer_jitcode_index,
+        entry_py_pc,
+    );
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
     // `copy_constants(registers, constants, num_regs_X, ConstClass)`.
@@ -4396,6 +4410,9 @@ fn write_residual_call_result_to_dst(
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
     trace_ctx: &TraceCtx,
+    regs_i: &[OpRef],
+    regs_r: &[OpRef],
+    regs_f: &[OpRef],
     outer_jitcode_index: u32,
     entry_py_pc: u32,
 ) -> Vec<OpRef> {
@@ -4478,11 +4495,7 @@ fn collect_outer_active_boxes(
     let live_i = banks.int.clone();
     let live_r = banks.ref_.clone();
     let live_f = banks.float.clone();
-    let (ni, nr, nf) = (
-        sym.registers_i.len(),
-        sym.registers_r.len(),
-        sym.registers_f.len(),
-    );
+    let (ni, nr, nf) = (regs_i.len(), regs_r.len(), regs_f.len());
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
     // Int (last_instr, valuestackdepth, etc.); if liveness expects an Int
@@ -4511,8 +4524,7 @@ fn collect_outer_active_boxes(
         )
     };
     for &idx in &banks.int {
-        let v = sym
-            .registers_i
+        let v = regs_i
             .get(idx as usize)
             .copied()
             .unwrap_or_else(|| panic!("{}", dump_ctx("int", idx)));
@@ -4524,7 +4536,7 @@ fn collect_outer_active_boxes(
     for &idx in &banks.ref_ {
         let color = idx as usize;
         let fallback = || {
-            sym.registers_r
+            regs_r
                 .get(color)
                 .copied()
                 .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
@@ -4586,8 +4598,7 @@ fn collect_outer_active_boxes(
         active.push(value);
     }
     for &idx in &banks.float {
-        let v = sym
-            .registers_f
+        let v = regs_f
             .get(idx as usize)
             .copied()
             .unwrap_or_else(|| panic!("{}", dump_ctx("float", idx)));
@@ -4606,6 +4617,61 @@ fn collect_outer_active_boxes(
 /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
 /// `rd_resume_position >= 0` and can derive `op.fail_args` from the
 /// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
+thread_local! {
+    /// Set (to the outer `PyreSym`) only for the duration of a full-body
+    /// walk (`dispatch_via_miframe`, reached exclusively under
+    /// `PYRE_FULL_BODY_WALK`).  Null in the per-opcode / trait-shadow walk
+    /// and in production default-off, so [`walker_capture_snapshot_for_last_guard`]
+    /// keeps its legacy single-coordinate behavior there.
+    ///
+    /// The full-body walk processes the outer `sym.jitcode` directly, so a
+    /// guard's `op_pc` IS a valid resume coordinate in that jitcode.  This
+    /// pointer lets the snapshot helper map `op_pc` back to its containing
+    /// Python opcode and read the live walk register banks for liveness,
+    /// instead of the static entry coordinate the per-opcode path uses.
+    static FULL_BODY_SNAPSHOT_SYM: std::cell::Cell<*const crate::state::PyreSym> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
+/// full-body walk and restore the prior value on drop (so any nesting
+/// restores the parent rather than clearing to null).
+struct FullBodySnapshotSymGuard(*const crate::state::PyreSym);
+
+impl FullBodySnapshotSymGuard {
+    fn set(sym: *const crate::state::PyreSym) -> Self {
+        let prev = FULL_BODY_SNAPSHOT_SYM.with(|c| c.replace(sym));
+        FullBodySnapshotSymGuard(prev)
+    }
+}
+
+impl Drop for FullBodySnapshotSymGuard {
+    fn drop(&mut self) {
+        FULL_BODY_SNAPSHOT_SYM.with(|c| c.set(self.0));
+    }
+}
+
+/// Map a JitCode byte offset back to the Python PC of the opcode whose
+/// JitCode region contains it: the largest `py_pc` with
+/// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
+/// the start JitCode offset of Python opcode `py_pc`; unmapped gaps read
+/// `0` and are naturally skipped for `jit_pc > 0` because real opcode
+/// starts have a positive offset.  This is the inverse of `pc_map` /
+/// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
+/// snapshot with the Python opcode the blackhole resumes (and re-executes)
+/// at — matching the trait path's `orgpc` snapshot coordinate.
+fn python_pc_for_jitcode_pc(pc_map: &[usize], jit_pc: usize) -> u32 {
+    let mut best_py = 0u32;
+    let mut best_jc = 0usize;
+    for (py, &jc) in pc_map.iter().enumerate() {
+        if jc <= jit_pc && jc >= best_jc {
+            best_jc = jc;
+            best_py = py as u32;
+        }
+    }
+    best_py
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
@@ -4644,9 +4710,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
     // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
     // by_bank_at`).
     //
-    // `op_pc` (the walker's arm-local PC) is intentionally not used:
-    // the arm jitcode has no resume entry point in pyre's blackhole.
-    let _ = op_pc;
     // `opencoder.py:772-775 create_top_snapshot` writes vable_array +
     // vref_array on the top snapshot.  The walker-emitted guard IS
     // a top snapshot for pyre (helper frames don't resume), so feed
@@ -4654,6 +4717,54 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
     // virtualizable / virtualref is live, matching the upstream
     // 0-length-array shape.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+
+    // Full-body walk (Phase 7): the walk processes the outer
+    // `sym.jitcode` directly, so `op_pc` is a real resume coordinate.
+    // Map it back to the containing Python opcode (the blackhole resumes
+    // and re-executes that opcode — `orgpc` parity) and read liveness
+    // from the live walk register banks at that pc, instead of the
+    // static entry-time coordinate the per-opcode arm path uses.
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if !full_body_sym.is_null() {
+        // SAFETY: the pointer is set only for the lifetime of the
+        // full-body `dispatch_via_miframe` (the guard restores it on
+        // exit); the `PyreSym` outlives the walk.  Read-only access to
+        // immutable layout fields (jitcode / color maps / frame / ec) —
+        // the walk's mutable register file lives in `ctx.registers_*`
+        // (fresh `top_regs`), not in `sym.registers_*`.
+        let sym = unsafe { &*full_body_sym };
+        if !sym.jitcode.is_null() {
+            let (py_pc, jitcode_index) = unsafe {
+                let jc = &*sym.jitcode;
+                (
+                    python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op_pc),
+                    jc.index as u32,
+                )
+            };
+            let active = collect_outer_active_boxes(
+                sym,
+                ctx.trace_ctx,
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                jitcode_index,
+                py_pc,
+            );
+            ctx.trace_ctx
+                .capture_snapshot_for_last_guard_with_vable_vref(
+                    &active,
+                    jitcode_index,
+                    py_pc,
+                    &vable_boxes,
+                    &vref_boxes,
+                );
+            return;
+        }
+    }
+
+    // Per-opcode arm path: `op_pc` (arm-local PC) is not a blackhole
+    // resume point, so the snapshot uses the static outer coordinate.
+    let _ = op_pc;
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -7131,9 +7242,19 @@ fn handle(
             // `op.pc` here as resumepc and
             // capture the active-box snapshot the same way `MIFrame`
             // does.
+            // Branch guards resume at the runtime jump destination — the
+            // branch NOT taken in the trace — not the `goto_if_not` opcode
+            // itself (`trace_opcode.rs:4456-4462`, `resume_pc =
+            // other_target`).  The trace took the `switchcase` direction;
+            // a guard failure flips to the other arm, where the Python
+            // interpreter has already popped the comparison truth, so the
+            // blackhole must re-enter past `POP_JUMP_IF_*`.  GuardTrue
+            // (trace fell through to `op.next_pc`) → resume at `target`;
+            // GuardFalse (trace jumped to `target`) → resume at `op.next_pc`.
+            let other_target = if switchcase != 0 { target } else { op.next_pc };
             if !valuebox.is_constant() {
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                walker_capture_snapshot_for_last_guard(ctx, other_target);
                 ctx.trace_ctx.replace_box(valuebox, promoted);
                 for slot in ctx.registers_i.iter_mut() {
                     if *slot == valuebox {
