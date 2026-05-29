@@ -84,6 +84,19 @@ thread_local! {
 
 // ── builtin module registry ──────────────────────────────────────────
 // PyPy equivalent: space.builtin_modules dict + MixedModule.interpleveldefs
+//
+// Lazy loading (MixedModule.buildloaders / getdictvalue,
+// `mixedmodule.py:84-193`): PyPy defers two things — (1) creating a
+// module's contents until the module is first imported, and (2)
+// evaluating each interpleveldef/appleveldef until the corresponding
+// attribute is first accessed.  Pyre achieves (1) directly: this
+// registry stores `name → init` and `load_builtin_module` runs `init`
+// on demand at first import, never at interpreter startup.  (2) has no
+// counterpart and is deliberately not ported: pyre's interpleveldefs are
+// compile-time `const` / function-pointer expressions (not interp-eval
+// strings), so there is nothing expensive to defer per attribute — a
+// per-attribute loader table would be a side-table with no upstream
+// basis.  The import-triggered `init` IS the buildloaders equivalent.
 
 /// Register a builtin module initializer.
 ///
