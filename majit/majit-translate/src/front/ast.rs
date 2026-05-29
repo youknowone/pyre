@@ -1875,6 +1875,11 @@ enum SuffixMatch {
 /// instead of a linear scan over every registered return type. pyre-only
 /// resolution aid — RPython carries the callee's `concretetype` on the
 /// annotated op, so there is no name-suffix resolution upstream.
+///
+/// Convergence path: retired once the annotator binds a `concretetype` to
+/// each call result (`call.py:98 funcobj.graph` is the codewriter-side
+/// analog), so method return types are read off the op rather than
+/// recovered by matching a `(receiver_leaf, method)` name suffix.
 #[derive(Debug, Clone, Default)]
 struct MethodSuffixIndex {
     by_suffix: HashMap<(String, String), SuffixMatch>,

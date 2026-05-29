@@ -490,6 +490,12 @@ pub struct CallControl {
     /// times during effect inference). pyre-only resolution aid — RPython
     /// carries the callee graph pointer on the call op, so there is no
     /// suffix-scan upstream.
+    ///
+    /// Convergence path: retired together with `target_to_path` and the
+    /// whole name-resolution layer once the call op carries its resolved
+    /// graph directly (`call.py:98 funcobj = op.args[0].value._obj;
+    /// graph = funcobj.graph`) — i.e. when annotation/rtyper binds graph
+    /// identities onto call ops instead of leaving a `CallTarget` name.
     method_suffix_index: HashMap<(String, String), SuffixMatch>,
 
     /// Per-graph hint set, mirroring RPython `func._jit_*_` / `_elidable_function_`.
@@ -518,6 +524,11 @@ pub struct CallControl {
     /// into `trait_method_impls`, so the resolved multiset is identical.
     /// pyre-only resolution aid — RPython keys candidate lookup on the
     /// call op's exact candidate-graph list, not on a method-name global.
+    ///
+    /// Convergence path: retired with `impls_for_method_name` and the
+    /// name-resolution layer once indirect-call ops carry their candidate
+    /// graph list directly (`call.py:94 graphs_from`, `op.args[-1].value`),
+    /// removing the need to recover candidates from a method-name global.
     method_to_impl_types: HashMap<String, Vec<String>>,
 
     /// Candidate targets — graphs we will inline.
