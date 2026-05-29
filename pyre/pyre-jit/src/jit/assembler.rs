@@ -780,14 +780,23 @@ fn dispatch_op(
             };
             state.builder.loop_header(jdindex);
         }
-        "ref_return" => {
-            let src = expect_result_or_first_reg(args, result, Kind::Ref);
-            state.builder.ref_return(src);
-        }
-        "raise" => {
-            let src = expect_reg(&args[0], Kind::Ref);
-            state.builder.emit_raise(src);
-        }
+        // `flatten.py:130-146 make_return` / `:382-384 getcolor` pass a
+        // `Constant` operand through unchanged; the const arm encodes it
+        // into the ref constant window (`assembler.py:80-138 emit_const`).
+        "ref_return" => match &args[0] {
+            Operand::ConstRef(value) => state.builder.ref_return_const(*value),
+            _ => {
+                let src = expect_result_or_first_reg(args, result, Kind::Ref);
+                state.builder.ref_return(src);
+            }
+        },
+        "raise" => match &args[0] {
+            Operand::ConstRef(value) => state.builder.emit_raise_const(*value),
+            _ => {
+                let src = expect_reg(&args[0], Kind::Ref);
+                state.builder.emit_raise(src);
+            }
+        },
         "reraise" => state.builder.emit_reraise(),
         "last_exception" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);

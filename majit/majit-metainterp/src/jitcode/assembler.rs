@@ -1680,6 +1680,21 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
+    /// Constant-operand form of `ref_return`. `flatten.py:130-146
+    /// make_return` emits `ref_return` with `getcolor(v)`, and
+    /// `flatten.py:382-384 getcolor` passes a `Constant` through
+    /// unchanged; `assembler.py:80-138 emit_const` then encodes it as
+    /// the high register-index byte `num_regs_r + pool_idx`, which the
+    /// `r` argcode reader resolves transparently from the ref constant
+    /// window. See `load_const_r` for the shared const-patch mechanism.
+    pub fn ref_return_const(&mut self, value: i64) {
+        let const_idx = self.add_const_r(value);
+        self.write_insn("ref_return/r");
+        let off = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8.push((off, ConstKind::Ref, const_idx));
+    }
+
     pub fn float_return(&mut self, src: u16) {
         self.touch_float_reg(src);
         self.write_insn("float_return/f");
@@ -1703,6 +1718,20 @@ impl JitCodeBuilder {
         self.touch_ref_reg(src);
         self.write_insn("raise/r");
         self.push_u8(src as u8);
+    }
+
+    /// Constant-operand form of `emit_raise`. `flatten.py:148-176
+    /// make_exception_link` / `make_return` reraise paths emit `raise`
+    /// with `getcolor(exc_value)`, which is a `Constant` for a fixed
+    /// exception instance (e.g. the overflow reraise). Encodes it via
+    /// the high register-index ref constant window like
+    /// `ref_return_const`.
+    pub fn emit_raise_const(&mut self, value: i64) {
+        let const_idx = self.add_const_r(value);
+        self.write_insn("raise/r");
+        let off = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8.push((off, ConstKind::Ref, const_idx));
     }
 
     /// blackhole.py bhimpl_reraise(): re-raise exception_last_value.
@@ -4959,5 +4988,32 @@ mod tests {
         // Sanity: patched offset is preserved.
         let off = u16::from_le_bytes([builder.code[patch], builder.code[patch + 1]]);
         assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn ref_return_const_encodes_constant_in_ref_window() {
+        // `flatten.py:130-146 make_return` emits `ref_return getcolor(v)`
+        // where `getcolor` (`flatten.py:382-384`) passes a Constant
+        // through unchanged; `assembler.py:131-138 emit_const` encodes it
+        // as the high register-index byte `num_regs_r + pool_idx`.  With
+        // no ref registers touched, `num_regs_r == 0` and the first const
+        // lands at pool slot 0, so the operand byte is 0.
+        let mut builder = JitCodeBuilder::new();
+        builder.ref_return_const(0x1234);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("ref_return/r");
+        assert_eq!(jitcode.code, vec![opcode, 0]);
+    }
+
+    #[test]
+    fn emit_raise_const_encodes_constant_in_ref_window() {
+        // `make_exception_link` / `make_return` reraise paths emit
+        // `raise getcolor(exc_value)` with a Constant exception instance;
+        // the operand byte resolves to `num_regs_r + pool_idx` (0 here).
+        let mut builder = JitCodeBuilder::new();
+        builder.emit_raise_const(0x5678);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("raise/r");
+        assert_eq!(jitcode.code, vec![opcode, 0]);
     }
 }
