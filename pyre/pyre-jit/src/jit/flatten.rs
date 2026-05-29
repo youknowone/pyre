@@ -3192,6 +3192,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::BinaryOp,
         result_reg,
     ))
 }
@@ -3224,6 +3225,7 @@ pub fn build_binary_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::BinaryOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3258,9 +3260,19 @@ fn build_residual_call_ir_r_insn_from_operands(
     lhs_operand: Operand,
     rhs_operand: Operand,
     flavor: CallFlavor,
+    oopspec: majit_ir::OopSpecIndex,
     dst_reg: Register,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(flavor);
+    let mut effect_info = effect_info_for_call_flavor(flavor);
+    // Tag the BINARY_OP / COMPARE_OP helper calldescr so the full-body
+    // walker recognizes the call and re-emits the speculative int/float
+    // specialization (guard_class + getfield_gc + int/float_OP +
+    // new_with_vtable) instead of recording an opaque CALL_MAY_FORCE.
+    // The walker cannot match the helper by fnaddr (pyre-jit-trace does
+    // not depend on pyre-jit), so the oopspec on the descr's EffectInfo
+    // is the recognition vehicle. `OopSpecIndex::None` for callers that
+    // are not a recognized specialization.
+    effect_info.oopspecindex = oopspec;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -3337,6 +3349,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::CompareOp,
         result_reg,
     ))
 }
@@ -3365,6 +3378,7 @@ pub fn build_compare_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::CompareOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -6538,8 +6552,13 @@ mod tests {
         // pushes `args_i` before `args_r` per the upstream
         // `i,r,f` order; the `op_val` is bucketed into args_i because
         // its `Kind` is `Int` per arg_kinds.)
+        // BINARY_OP helper carries the `BinaryOp` oopspec so the
+        // full-body walker can recognize + specialize it (#57); the
+        // hand-built dual-write descr must mirror that tag.
+        let mut may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
+        may_force_ei.oopspecindex = majit_ir::OopSpecIndex::BinaryOp;
         let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::MayForce),
+            may_force_ei,
             vec![Kind::Ref, Kind::Ref, Kind::Int],
             Some(Kind::Ref),
         );

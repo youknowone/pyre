@@ -482,6 +482,17 @@ pub enum OopSpecIndex {
     UniCopyToRaw = 113,
     JitForceVirtual = 120,
     JitForceVirtualizable = 121,
+    // pyre-specific: the codewriter lowers BINARY_OP / COMPARE_OP to a
+    // single `binary_op` / `compare` helper residual_call carrying the
+    // operator as a compact int tag (`binary_op_tag` / `compare_op_tag`).
+    // Tagging the helper calldescr's EffectInfo lets the full-body walker
+    // recognize the call and re-emit the speculative int/float
+    // specialization (guard_class + getfield_gc + int/float_OP +
+    // new_with_vtable) instead of recording an opaque CALL_MAY_FORCE — the
+    // walker cannot match the helper by fnaddr because pyre-jit-trace does
+    // not depend on pyre-jit. Out of the upstream OS_* range (≤121).
+    BinaryOp = 200,
+    CompareOp = 201,
 }
 
 impl EffectInfo {

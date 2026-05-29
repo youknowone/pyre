@@ -297,6 +297,10 @@ pub fn shadow_validate_pre(
         jitcode.code.as_slice(),
         0,
         crate::jitcode_runtime::all_descr_refs(),
+        crate::jitcode_dispatch::RawDescrPool::Global,
+        // Shadow validation runs alongside the authoritative trait path,
+        // so the walker must not re-execute may-force calls.
+        false,
         &sub_jitcode_lookup,
         done_ref,
         done_int,

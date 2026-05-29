@@ -878,6 +878,60 @@ pub fn execute_residual_call(
 }
 
 #[cfg(test)]
+mod execute_residual_call_tests {
+    use super::*;
+    use majit_ir::descr::SimpleCallDescr;
+    use majit_ir::{EffectInfo, ExtraEffect, Type};
+
+    extern "C" fn add2_i64(a: i64, b: i64) -> i64 {
+        a.wrapping_add(b)
+    }
+
+    // A may-force helper that raises: publishes a non-zero exception
+    // pointer on `BH_LAST_EXC_VALUE` (the blackhole CALL_* convention)
+    // and returns the 0 result sentinel, exactly as a raising
+    // `bh_call_*` arm does.
+    extern "C" fn raises_stopiteration() -> i64 {
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD_BEEF));
+        0
+    }
+
+    fn make_may_force_descr(arg_types: Vec<Type>, result_type: Type) -> SimpleCallDescr {
+        let mut effect = EffectInfo::default();
+        // EF_CAN_RAISE / forces — the non-pure classification.
+        effect.extraeffect = ExtraEffect::CanRaise;
+        SimpleCallDescr::new(0, arg_types, result_type, false, 8, effect)
+    }
+
+    #[test]
+    fn non_raising_call_returns_ok_result() {
+        let descr = make_may_force_descr(vec![Type::Int, Type::Int], Type::Int);
+        let r = execute_residual_call(&descr, add2_i64 as *const () as i64, &[40, 2]);
+        assert_eq!(r, Ok(42), "a non-raising add2_i64(40, 2) must return Ok(42)");
+    }
+
+    #[test]
+    fn raising_call_reports_published_exception_pointer() {
+        let descr = make_may_force_descr(vec![], Type::Int);
+        let r = execute_residual_call(&descr, raises_stopiteration as *const () as i64, &[]);
+        assert_eq!(
+            r,
+            Err(0xDEAD_BEEF),
+            "the helper's BH_LAST_EXC_VALUE publication must surface as Err"
+        );
+    }
+
+    #[test]
+    fn clears_stale_exception_before_dispatch() {
+        // A prior call's exception must not bleed into a clean call.
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0x1234));
+        let descr = make_may_force_descr(vec![Type::Int, Type::Int], Type::Int);
+        let r = execute_residual_call(&descr, add2_i64 as *const () as i64, &[1, 2]);
+        assert_eq!(r, Ok(3), "stale BH_LAST_EXC_VALUE must be cleared before dispatch");
+    }
+}
+
+#[cfg(test)]
 mod execute_pure_call_tests {
     use super::*;
     use majit_ir::descr::SimpleCallDescr;

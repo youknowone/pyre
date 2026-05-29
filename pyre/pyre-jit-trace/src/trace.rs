@@ -5,7 +5,7 @@
 //! calls MIFrame::trace_code_step() for each bytecode, combining
 //! concrete execution and symbolic IR recording.
 
-use majit_metainterp::{MetaInterp, TraceAction};
+use majit_metainterp::{MetaInterp, TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 
 use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
@@ -54,12 +54,44 @@ pub fn trace_bytecode(
     // concrete execution — the interpreter does not run during tracing.
     concrete_frame.set_last_instr_from_next_instr(start_pc);
     let w_code = concrete_frame.pycode;
+    // Issue #73 walker-as-tracer foundation probe (read-only).
+    // `PYRE_DUMP_PERFN_JITCODE=1` dumps the per-CodeObject JitCode body
+    // — the byte stream the walker-as-tracer must learn to walk so that
+    // `miframe.pc == jitcode_pc` and `pc_map` can retire.  See
+    // `project_issue73_architecture_walker_as_tracer_2026_05_28`.
+    if std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some() {
+        dump_perfn_jitcode_for_trace(w_code, start_pc);
+    }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
     // construction. Callee (inline) frames are set up by perform_call
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
+    // `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the per-CodeObject
+    // JitCode body via `dispatch_via_miframe` from the resume entry pc,
+    // logs how far the symbolic walk gets (terminator outcome vs first
+    // `DispatchError` stop), then aborts the trace.  Default-off → zero
+    // production change.  Produces the Path A (payload-seeding) gap
+    // inventory on a live bench now that walk-capability gaps #1/#2/#3
+    // are closed.  See
+    // `project_issue73_architecture_walker_as_tracer_2026_05_28`.
+    if std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
+        probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
+        return (TraceAction::Abort, concrete_frame);
+    }
+    // Issue #73 Phase 5 production flip (gated, default-off).
+    // `PYRE_FULL_BODY_WALK=1` traces the per-CodeObject JitCode body via the
+    // authoritative full-body walk INSTEAD of the trait `metainterp.interpret`
+    // loop below — the walker-as-tracer path that makes `miframe.pc ==
+    // jitcode_pc` and lets `pc_map` retire.  Default-off → the trait path is
+    // unchanged (check.py 39/39).  The harness for validating
+    // guard-snapshot/resume correctness over a compiled full-body trace.
+    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() {
+        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
+        return (action, concrete_frame);
+    }
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
@@ -196,6 +228,488 @@ pub fn trace_bytecode(
             .expect("trace_bytecode must return the root concrete frame")
     };
     (action, root_frame)
+}
+
+/// Issue #73 walker-as-tracer foundation probe (slice #1).
+///
+/// Attempts to walk the per-CodeObject JitCode body via
+/// [`crate::jitcode_dispatch::dispatch_via_miframe`] from the resume
+/// entry pc (`pc_map[start_pc]`) and logs how far the symbolic walk
+/// gets: a terminator outcome (`Finish` / `CloseLoop` / `SubReturn`)
+/// or the first `DispatchError` stop with its pc.
+///
+/// Diagnostic-only: the caller aborts the trace immediately after this
+/// returns, so any IR / merge-point / heap-cache mutation the walk
+/// records is discarded with the aborted trace.  The recorder is also
+/// rolled back via `cut_trace` to keep the discarded trace tidy.
+///
+/// Purpose: with walk-capability gaps #1/#2/#3 closed (decode table +
+/// vable array ops + jit_merge_point/last_exception/abort handlers),
+/// this surfaces the next blocker for the full-body walk — the Path A
+/// payload-seeding gap (an op reading a register slot the entry never
+/// seeded, e.g. a `goto_if_not` over a non-concrete Int produced by an
+/// unfolded `residual_call`).  See
+/// `project_issue73_architecture_walker_as_tracer_2026_05_28`.
+/// Decode the loop-header `jit_merge_point` that governs the resume
+/// coordinate `entry` (the nearest one with `pc < entry`) and return its
+/// green-ref (`gr`) and red (`rr`) register lists.
+///
+/// These name the jitcode register colors the loop body reads its
+/// loop-invariant pycode (`gr`) and frame/ec (`rr`) from.  A mid-loop walk
+/// entering PAST the merge point never executes it, so those colors are
+/// left `OpRef::NONE` unless explicitly seeded — the 51d.1 / B1 blocker.
+///
+/// Operand layout `cIRFIRF`: jdindex(`c`, 1 byte) followed by six
+/// count-prefixed register lists `gi, gr, gf, ri, rr, rf`.  Returns `None`
+/// when no preceding merge point exists (straight-line resume) or the
+/// operand stream is truncated.
+fn loop_header_merge_point_regs(code: &[u8], entry: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mp_pc = crate::jitcode_runtime::decoded_ops(code)
+        .filter(|op| op.opname == "jit_merge_point" && op.pc < entry)
+        .map(|op| op.pc)
+        .max()?;
+    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
+    let mut lists: [Vec<u8>; 6] = Default::default();
+    for slot in lists.iter_mut() {
+        let count = *code.get(cursor)? as usize;
+        cursor += 1;
+        for _ in 0..count {
+            slot.push(*code.get(cursor)?);
+            cursor += 1;
+        }
+    }
+    let [_gi, gr, _gf, _ri, rr, _rf] = lists;
+    Some((gr, rr))
+}
+
+type PerfnWalkResult =
+    Result<(crate::jitcode_dispatch::DispatchOutcome, usize), crate::jitcode_dispatch::DispatchError>;
+
+/// Shared per-CodeObject full-body walk used by both the read-only
+/// diagnostic probe ([`probe_walk_perfn_jitcode`], `authoritative=false`,
+/// trace discarded) and the production full-body tracer
+/// ([`full_body_walk_trace`], `authoritative=true`, trace kept).
+///
+/// Returns `(entry, code_len, walk_result)` or `None` when the
+/// per-CodeObject setup is unavailable.  The caller owns the post-walk
+/// disposition: the probe captures a trace position beforehand and
+/// `cut_trace`s + logs; the production path maps `walk_result` to a
+/// `TraceAction` and keeps the recording.
+fn run_perfn_walk(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    w_code: *const (),
+    start_pc: usize,
+    cf_addr: usize,
+    authoritative: bool,
+) -> Option<(usize, usize, PerfnWalkResult)> {
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
+        return None;
+    };
+    let Some(entry) = pjc.resume_jitcode_pc_for(start_pc) else {
+        eprintln!(
+            "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={})",
+            pjc.metadata.pc_map.len()
+        );
+        return None;
+    };
+
+    let mut mi = crate::state::MIFrame::from_sym(ctx, sym, cf_addr, start_pc, start_pc);
+
+    // Resolve the five terminal descrs off MetaInterpStaticData so the
+    // walk's Finish / exit-with-exception records carry production descr
+    // identities.  A missing one means setup never ran — log and bail
+    // rather than feed placeholder descrs.
+    let (done_void, done_int, done_ref, done_float, exit_exc_ref) = {
+        let sd = mi.ctx().metainterp_sd();
+        match (
+            sd.done_with_this_frame_descr_void.clone(),
+            sd.done_with_this_frame_descr_int.clone(),
+            sd.done_with_this_frame_descr_ref.clone(),
+            sd.done_with_this_frame_descr_float.clone(),
+            sd.exit_frame_with_exception_descr_ref.clone(),
+        ) {
+            (Some(v), Some(i), Some(r), Some(f), Some(e)) => (v, i, r, f, e),
+            _ => {
+                eprintln!("[walk-perfn] terminal descrs not wired; skipping walk");
+                return None;
+            }
+        }
+    };
+
+    // setup_call argbox: seed r0 = the standard virtualizable identity box
+    // (`virtualizable_boxes[-1]`, the `InputArgRef(SYM_FRAME_IDX)` that
+    // `init_symbolic` seeded) — the SAME OpRef production's arm entry uses
+    // (`dispatch_via_miframe_at_opcode_entry` seeds r0 = `sym.frame`, and
+    // `sym.frame == OpRef::input_arg_typed(SYM_FRAME_IDX, Ref)`).  A fresh
+    // `const_ref(cf_addr)` would be a DIFFERENT OpRef than the identity box,
+    // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs:1842,
+    // keyed on `== standard_virtualizable_box()`) would miss and every vable
+    // read would fall through to the nonstandard GETFIELD_GC leg.  Falls back
+    // to `const_ref` only when no virtualizable is bound.
+    //
+    // NOTE (51d.1 root cause): seeding r0 is NECESSARY but not sufficient for
+    // the mid-loop resume entry (pc=107, after the loop-header
+    // `jit_merge_point` @ pc=94).  The loop body reads its vable from a
+    // post-merge LOOP-INPUT register (the merge-point reds), NOT from r0; that
+    // register is left `OpRef::NONE` because the probe enters past the merge
+    // point and never binds the reds.  `concrete_of_opref(NONE)` returns the
+    // `GcRef(usize::MAX)` sentinel → `is_nonstandard_virtualizable` takes the
+    // nonstandard leg → `getarrayitem_vable` returns `Value::Void` even though
+    // the virtualizable SHADOW entry is correct.  Closing that needs the live
+    // loop-input registers seeded at walk entry (task #53), not just r0.
+    let frame_box = mi
+        .ctx()
+        .standard_virtualizable_box()
+        .unwrap_or_else(|| mi.ctx().const_ref(cf_addr as i64));
+    // 51d.1 (B1 blocker): seed the loop's live INPUT registers so the
+    // post-merge-point loop body resolves its loop-invariant reads.  The
+    // walk enters PAST the loop-header `jit_merge_point`, which would
+    // otherwise leave those colors `OpRef::NONE` (→ sentinel concrete →
+    // nonstandard-virtualizable Void leg on the first `getarrayitem_vable`).
+    // Decode the merge point's green-ref (`gr` = [pycode]) and red (`rr` =
+    // [frame, ec], portal jitdriver convention) register lists and seed each
+    // named color.  Int greens (`gi` = next_instr, is_being_profiled) live
+    // in the int CONSTANT region and are seeded by `copy_constants` inside
+    // `dispatch_via_miframe`, so they need no entry seed.  `frame` is the
+    // standard-vable identity box (so the body's vable reads hit the
+    // standard fast path); `pycode`/`ec` are const-refs to the live
+    // pointers.  `argboxes_r[i] -> top_regs_r[i]` is the seed channel.
+    let ec_box = mi.ctx().const_ref(sym.concrete_execution_context as i64);
+    let pycode_box = mi.ctx().const_ref(w_code as i64);
+    let argboxes_r: Vec<majit_ir::OpRef> = {
+        let mut v = vec![majit_ir::OpRef::NONE; 1];
+        let mut seed = |reg: u8, val: majit_ir::OpRef| {
+            let reg = reg as usize;
+            if reg >= v.len() {
+                v.resize(reg + 1, majit_ir::OpRef::NONE);
+            }
+            v[reg] = val;
+        };
+        match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry) {
+            Some((gr, rr)) => {
+                if let Some(&r) = gr.first() {
+                    seed(r, pycode_box);
+                }
+                if let Some(&r) = rr.first() {
+                    seed(r, frame_box);
+                }
+                if let Some(&r) = rr.get(1) {
+                    seed(r, ec_box);
+                }
+            }
+            // Straight-line resume (no governing loop header): fall back to
+            // the per-opcode-arm convention of r0 = frame.
+            None => seed(0, frame_box),
+        }
+        v
+    };
+
+    // Per-fn descr-pool plumbing (task #50): the per-CodeObject body
+    // resolves `d`/`j` descr operands through its OWN runtime pool
+    // (`pjc.jitcode.exec.descrs`, `Vec<RuntimeBhDescr>`), NOT the global
+    // `all_descr_refs()`.  Build the index-parallel adapted `descr_refs`
+    // and resolve `inline_call` callee jitcodes through the same pool.
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    // The per-CodeObject JitCode lives in the process-global jitcode
+    // registry (installed by `install_jitcodes` before tracing); `pjc` is
+    // an `Arc` clone of that data, so the descr pool (and the callee
+    // jitcode bodies it references) outlive this diagnostic walk.
+    // Extend the borrow to `'static` so the `'static`-bodied
+    // `SubJitCodeBody` from `sub_jitcode_lookup` type-checks — mirrors the
+    // production arm-entry borrow extension at `trace_opcode.rs:6735`.
+    let perfn_descrs: &'static [RuntimeBhDescr] =
+        unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
+    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            // `inline_call`'s `d` operand resolves the callee through
+            // `JitCodeDescr::jitcode_index()` → `sub_jitcode_lookup`.
+            // Key the descr by its own pool slot `i` so the per-fn
+            // lookup below re-reads `exec.descrs[i].as_jitcode()`.
+            RuntimeBhDescr::JitCode(_) => crate::descr::make_jitcode_descr(i),
+            // `Call` (residual_call) / `AssemblerToken` (call_assembler)
+            // adapters need arg-type + EffectInfo plumbing absent from
+            // `JitCallTarget` — the next full-body-walk slice (50b).
+            // A jitcode-descr stand-in here surfaces a clean
+            // `ResidualCallDescrNotCallDescr` at the first such op
+            // instead of mis-dispatching, marking the next blocker.
+            RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
+                crate::descr::make_jitcode_descr(i)
+            }
+        })
+        .collect();
+
+    let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+        perfn_descrs
+            .get(idx)
+            .and_then(|d| d.as_jitcode())
+            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
+                code: jc.code.as_slice(),
+                num_regs_r: jc.num_regs_r() as usize,
+                num_regs_i: jc.num_regs_i() as usize,
+                num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
+            })
+    };
+
+    let code = pjc.jitcode.code.as_slice();
+    let code_len = code.len();
+    let mut walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
+        &mut mi,
+        code,
+        entry,
+        &perfn_descr_refs,
+        crate::jitcode_dispatch::RawDescrPool::PerFn(perfn_descrs),
+        // The diagnostic probe discards the trace (`cut_trace` + Abort)
+        // and the bench then runs interpreted, so the walker must NOT be
+        // the authoritative executor — executing may-force calls here
+        // would corrupt the live frame/iterator state `cut_trace` cannot
+        // roll back.  Concrete may-force execution lands with the
+        // production flip, not under the probe.
+        //
+        // (51d diagnosis, 2026-05-29: even with authoritative=true the walk
+        // STOPs at the loop `goto_if_not` because the boxed-PyLong compare
+        // may-force arg is non-concrete.  Root-caused with PYRE_DIAG_VGAI:
+        // the loop body's `getarrayitem_vable_r` (a `LOAD_FAST` of a boxed
+        // local) returns `Value::Void` NOT because the virtualizable shadow
+        // is wrong — the shadow ENTRY is the correct concrete Ref — but
+        // because the VABLE operand register read returns `OpRef::NONE`.  The
+        // post-merge-point loop body reads the frame from a LOOP-INPUT
+        // register bound by the `jit_merge_point` reds @ pc=94; the probe
+        // enters at pc=107 (past the merge point) seeding only r0, so that
+        // register stays NONE → `concrete_of_opref(NONE)` = `GcRef(usize::MAX)`
+        // sentinel → `is_nonstandard_virtualizable` takes the Void leg.  Fix =
+        // seed the live loop-input registers at walk entry, NOT a shadow/
+        // stack-depth issue (task #53).  Two further cascade gaps sit above
+        // it: a non-pure `CallR` result left symbolic (task #54), and
+        // may-force execution — now wired into BOTH residual dispatchers.)
+        //
+        // Authoritative concrete execution: `false` for the read-only probe
+        // (trace discarded → re-executing would corrupt live state); `true`
+        // for the production full-body tracer (the walk IS the execution, so
+        // there is no double-run and no rollback to miss).
+        authoritative,
+        &sub_jitcode_lookup,
+        done_ref,
+        done_int,
+        done_float,
+        done_void,
+        exit_exc_ref,
+        true,
+        pjc.jitcode.num_regs_r() as usize,
+        pjc.jitcode.num_regs_i() as usize,
+        pjc.jitcode.num_regs_f() as usize,
+        pjc.jitcode.constants_r.as_slice(),
+        pjc.jitcode.constants_i.as_slice(),
+        pjc.jitcode.constants_f.as_slice(),
+        &argboxes_r,
+        &[],
+        &[],
+    );
+
+    // Full-body-walk loop close: the walker's `jit_merge_point` handler
+    // produces RPython-style reds (`jump_args = [frame, ec]`, len 2 for the
+    // portal jitdriver), but pyre's runtime closes loops against the
+    // EXPLICIT scalar inputarg vector
+    // `[frame, ec, next_instr, code, valuestackdepth, debugdata, lastblock,
+    //  namespace, locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
+    // `validate_close_with_jump_args` (state.rs) rejects the reds shape, so
+    // rebuild the explicit vector via `close_loop_args_at`, mirroring the
+    // trait path's `reached_loop_header` (trace_opcode.rs close path).  The
+    // loop-carried local/stack OpRefs come from the virtualizable shadow in
+    // the TraceCtx (`virtualizable_box_at`, maintained by the authoritative
+    // walk's vable ops), NOT from the walk's private register file, so the
+    // shadow is live here even though `sym.registers_r` is not.
+    //
+    // Authoritative only: `close_loop_args_at` records SameAs ops and flushes
+    // the virtualizable shadow to the concrete frame heap, which the
+    // read-only probe (trace discarded) must not do.
+    if authoritative {
+        if let Ok((crate::jitcode_dispatch::DispatchOutcome::CloseLoop { jump_args, loop_header_pc }, _end_pc)) =
+            &mut walk_result
+        {
+            let loop_header_pc = *loop_header_pc;
+            // `close_loop_args_at` reads `self.orgpc` for the
+            // portal-bridge vsd lookup + last_instr anchor; the merge point
+            // closes at the loop header, so anchor orgpc there.
+            mi.orgpc = loop_header_pc;
+            *jump_args = mi.close_loop_args_at(ctx, Some(loop_header_pc));
+        }
+    }
+
+    Some((entry, code_len, walk_result))
+}
+
+/// Issue #73 walker-as-tracer foundation probe (slice #1, read-only).
+///
+/// Runs the per-CodeObject full-body walk via [`run_perfn_walk`] in
+/// non-authoritative mode, logs how far the symbolic walk got (terminator
+/// outcome vs first `DispatchError` stop), then rolls the recorder back so
+/// the diagnostic leaves no partial trace.  `PYRE_PROBE_AUTHORITATIVE=1`
+/// opts into authoritative execution for diagnosis ONLY (verifying the
+/// walk advances past the loop `goto_if_not`); it corrupts the live
+/// frame/iterator state because the probe still discards the trace, so it
+/// must never be set outside a throwaway run.
+fn probe_walk_perfn_jitcode(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    w_code: *const (),
+    start_pc: usize,
+    cf_addr: usize,
+) {
+    let authoritative = std::env::var_os("PYRE_PROBE_AUTHORITATIVE").is_some();
+    // Capture the trace position BEFORE the walk so `cut_trace` rolls back
+    // every op the diagnostic recorded (the walk discards its trace).
+    let pre_pos = ctx.get_trace_position();
+    let Some((entry, code_len, walk_result)) =
+        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative)
+    else {
+        return;
+    };
+    match &walk_result {
+        Ok((outcome, end_pc)) => eprintln!(
+            "[walk-perfn] entry={entry} code_len={code_len} OK end_pc={end_pc} outcome={outcome:?}"
+        ),
+        Err(e) => {
+            eprintln!("[walk-perfn] entry={entry} code_len={code_len} STOP err={e:?}");
+        }
+    }
+
+    // Roll the recorder back so the aborted trace leaves no partial ops.
+    ctx.cut_trace(pre_pos);
+}
+
+/// Issue #73 production full-body tracer (Phase 5 flip, gated).
+///
+/// `PYRE_FULL_BODY_WALK=1` drives the per-CodeObject JitCode body via
+/// [`run_perfn_walk`] in authoritative mode AS the production trace — the
+/// walk IS the concrete execution, so unlike the probe it keeps the
+/// recorded trace.  Maps the walk outcome to a [`TraceAction`] for the
+/// caller to compile.
+///
+/// Conservative mapping (first slice): only `CloseLoop` — the validated
+/// end-to-end case (the four loop benches close under authoritative) — is
+/// mapped to a real `CloseLoopWithArgs`; every other outcome (`Terminate`
+/// finish-arg recovery, `SubReturn`/`SubRaise`, `SwitchToBlackhole`, any
+/// `DispatchError`) aborts the trace so the portal falls back to the trait
+/// tracer.  Default-off → the trait `metainterp.interpret` path is
+/// untouched.  The remaining flip blocker is guard-snapshot/resume
+/// correctness, which this harness exists to validate.
+fn full_body_walk_trace(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    w_code: *const (),
+    start_pc: usize,
+    cf_addr: usize,
+) -> TraceAction {
+    // Mirror the trait path (trace_bytecode pre-interpret): register the
+    // initial merge point with typed input-arg boxes so the trace head
+    // carries the portal's entry signature (`inputarg_types()`).  Without
+    // it the compiled loop's entry args don't match what the portal
+    // supplies, so the portal cannot enter the compiled loop and re-traces
+    // every iteration (the observed spin).
+    {
+        let start_key = crate::driver::make_green_key(w_code, start_pc);
+        let input_types = ctx.inputarg_types();
+        let input_args: Vec<majit_metainterp::GreenBox> = input_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| {
+                majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
+            })
+            .collect();
+        ctx.add_merge_point(start_key, input_args, start_pc);
+    }
+    match run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true) {
+        Some((_entry, _code_len, Ok((outcome, _end_pc)))) => match outcome {
+            crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
+                jump_args,
+                loop_header_pc,
+            } => {
+                // Mirror trace_bytecode's post-interpret CloseLoop green-key
+                // handling: a loop header other than start_pc retargets the
+                // green key to the true merge point (cut-to-inner-loop);
+                // start_pc closes at the trace head.
+                if loop_header_pc != start_pc {
+                    let target_key = crate::driver::make_green_key(w_code, loop_header_pc);
+                    ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
+                    ctx.header_pc = loop_header_pc;
+                    ctx.cut_inner_green_key = Some(target_key);
+                } else {
+                    let key = crate::driver::make_green_key(w_code, start_pc);
+                    ctx.set_green_key(key, (w_code as usize, start_pc));
+                    ctx.header_pc = start_pc;
+                }
+                TraceAction::CloseLoopWithArgs {
+                    jump_args,
+                    loop_header_pc: Some(loop_header_pc),
+                }
+            }
+            _ => TraceAction::Abort,
+        },
+        _ => TraceAction::Abort,
+    }
+}
+
+/// Issue #73 walker-as-tracer foundation probe.
+///
+/// Dumps the per-CodeObject JitCode body that the walker-as-tracer must
+/// walk for `miframe.pc == jitcode_pc` (the precondition for retiring
+/// `pc_map`).  The per-CodeObject JitCode is built BEFORE this point by
+/// `register_portal_jitdriver` → `make_jitcodes`
+/// (`pyre/pyre-jit/src/eval.rs:3924`), so it is available here.
+///
+/// Read-only: logs the body op stream + entry offset, mutates nothing.
+fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        eprintln!("[perfn-jitcode] no per-CodeObject PyJitCode for code={w_code:?}");
+        return;
+    };
+    let code = pjc.jitcode.code.as_slice();
+    let entry = pjc.resume_jitcode_pc_for(start_pc);
+    eprintln!(
+        "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
+         num_regs_r={} num_regs_i={} num_regs_f={}",
+        code.len(),
+        pjc.metadata.pc_map.len(),
+        start_pc,
+        entry,
+        pjc.jitcode.num_regs_r(),
+        pjc.jitcode.num_regs_i(),
+        pjc.jitcode.num_regs_f(),
+    );
+    let mut count = 0usize;
+    let mut last_next = 0usize;
+    let mut histogram: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for op in crate::jitcode_runtime::decoded_ops(code) {
+        if count < 80 {
+            eprintln!(
+                "[perfn-jitcode]   pc={:>4} next={:>4} {}/{}",
+                op.pc, op.next_pc, op.opname, op.argcodes
+            );
+        }
+        *histogram.entry(op.key.to_string()).or_default() += 1;
+        count += 1;
+        last_next = op.next_pc;
+    }
+    let clean = last_next == code.len();
+    eprintln!("[perfn-jitcode] TOTAL ops={count} last_next={last_next} clean_eof={clean}");
+    for (key, n) in &histogram {
+        eprintln!("[perfn-jitcode] HIST {n:>4} {key}");
+    }
+    if !clean && last_next < code.len() {
+        let stop_byte = code[last_next];
+        eprintln!(
+            "[perfn-jitcode] STOP at pc={last_next}: byte=0x{stop_byte:02x} opname={:?}",
+            crate::jitcode_runtime::opname_for_byte(stop_byte),
+        );
+    }
 }
 
 #[cfg(test)]

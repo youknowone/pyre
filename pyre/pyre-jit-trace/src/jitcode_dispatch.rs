@@ -268,6 +268,48 @@ pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 /// also *would* write dst (after sub-jitcode recursion) but stays
 /// deferred — see the per-handler comments + module-level "Production
 /// fidelity gaps" below.
+///
+/// Raw `BhDescr` pool selector for the `(VableArray, Array)` recognition
+/// in vable-array ops (`vable_array_descrs_from_jitcode`).
+///
+/// RPython `MIFrame.vable_array_index_pair_at` (`blackhole.rs:1613`) reads
+/// `self.descrs[idx]` and asserts `isinstance(BhDescr_VableArray)` to
+/// recover the array `index`.  Pyre's single per-walk descr table is
+/// either the shared global pool (production per-opcode arm walks +
+/// build-time canonical jitcodes resolve through `ALL_DESCRS`) or the
+/// per-`CodeObject` body JitCode's own `exec.descrs`
+/// (`jitcode/mod.rs:332`) — runtime per-frame jitcodes have no global
+/// allocation index, so they carry their own pool.  This selector keeps
+/// the recognition logic byte-identical and only switches the pool
+/// source; it is NOT a swap of the adapted [`WalkContext::descr_refs`]
+/// (those still resolve `d`-coded operands index-parallel to whichever
+/// raw pool is selected).
+#[derive(Clone, Copy)]
+pub enum RawDescrPool<'a> {
+    /// Shared global `ALL_DESCRS` (`jitcode_runtime::all_descrs`).
+    /// Production per-opcode arm walks, sub-walks of arms, and tests use
+    /// this — the arm jitcodes' `d`/`j` operands index the global pool.
+    Global,
+    /// Per-`CodeObject` body pool (`JitCode.exec.descrs`).  Full-body
+    /// walks (the walker-as-tracer path) resolve `d`/`j` operands through
+    /// the body JitCode's own pool.
+    PerFn(&'a [majit_metainterp::jitcode::RuntimeBhDescr]),
+}
+
+impl<'a> RawDescrPool<'a> {
+    /// Resolve the raw `BhDescr` at `idx`, mirroring RPython
+    /// `self.descrs[idx]`.  `None` for an out-of-range index or a
+    /// per-fn slot whose `RuntimeBhDescr` is not an ordinary `Descr`
+    /// (a `JitCode` / `Call` / `AssemblerToken` slot — never read as a
+    /// vable-array descr operand).
+    fn bh_descr_at(self, idx: usize) -> Option<&'a majit_translate::jitcode::BhDescr> {
+        match self {
+            Self::Global => crate::jitcode_runtime::all_descrs().get(idx),
+            Self::PerFn(descrs) => descrs.get(idx).and_then(|d| d.as_bh_descr()),
+        }
+    }
+}
+
 /// `WalkContext` carries two lifetimes:
 /// * `'frame` — the inner-frame lifetime: register banks + trace
 ///   recorder. Sub-walk recursion (`inline_call_r_r/dR>r`) allocates
@@ -354,6 +396,31 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `BlackholeInterpBuilder.setup_descrs` (`blackhole.py:102-103`)
     /// — production callers pass the codewriter-emitted descr table.
     pub descr_refs: &'static_a [DescrRef],
+    /// Raw `BhDescr` pool source for vable-array `(VableArray, Array)`
+    /// recognition (`vable_array_descrs_from_jitcode`).  [`RawDescrPool::
+    /// Global`] for production arm walks + tests (the arm jitcodes index
+    /// the shared `ALL_DESCRS`); [`RawDescrPool::PerFn`] for full-body
+    /// walks (the per-`CodeObject` body resolves through its own
+    /// `exec.descrs`).  Index-parallel to [`Self::descr_refs`].
+    pub raw_descrs: RawDescrPool<'static_a>,
+    /// Whether this walk is the SOLE concrete-execution leg (task #51b).
+    ///
+    /// `false` (default — arm walks, shadow validation, the diagnostic
+    /// full-body probe): a separate concrete interpreter (the Python
+    /// interpreter on the trait path, or none for the discard-the-trace
+    /// probe) is authoritative, so the walker must NOT re-execute
+    /// may-force residual calls — doing so would double their side
+    /// effects / corrupt the live heap (`cut_trace` rolls back only the
+    /// IR recorder, not heap/iterator state).
+    ///
+    /// `true` (the full-body walk once it is the production tracer): the
+    /// walker is the only thing executing the JitCode body, so
+    /// [`try_execute_residual_call_via_executor`] runs may-force residual
+    /// calls concretely — RPython parity, where the metainterp executes
+    /// EVERY residual_call during tracing (`do_residual_call` →
+    /// `executor.execute_varargs`), pure or not, so a downstream
+    /// `goto_if_not` reads a concrete result.
+    pub is_authoritative_executor: bool,
     /// Live trace recorder. `record_finish` / `record_op` /
     /// `record_op_with_descr` go through this.
     pub trace_ctx: &'frame mut TraceCtx,
@@ -500,7 +567,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
 /// `DoneWithThisFrameRef`/`SwitchToBlackhole`/`ChangeFrame`. Pyre
 /// flattens that into an explicit enum because Rust has no analogous
 /// non-local exit and we want the walker to stay in plain Result form.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy`: the `CloseLoop` variant carries a `Vec<OpRef>` of merge-point
+/// jump args, mirroring `TraceAction::CloseLoopWithArgs` (`lib.rs:145`)
+/// which is likewise non-`Copy`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DispatchOutcome {
     /// Step succeeded, continue with the next opcode at the returned pc.
     Continue,
@@ -549,6 +620,23 @@ pub enum DispatchOutcome {
     SwitchToBlackhole {
         reason: i32,
         raising_exception: bool,
+    },
+    /// `jit_merge_point/cIRFIRF` reached a loop header that was already
+    /// visited with a matching red-bank shape — close the trace as a
+    /// loop. `jump_args` are the merge point's red boxes (the live loop
+    /// args, in `[int.., ref.., float..]` order); `loop_header_pc` is the
+    /// Python pc of the merge point (decoded from the op's `next_instr`
+    /// green).
+    ///
+    /// RPython parity: `pyjitpl.py:3002-3030 reached_loop_header` "found"
+    /// branch → `compile_trace`/close-loop. The production driver maps
+    /// this to `TraceAction::CloseLoopWithArgs { jump_args, loop_header_pc }`
+    /// (`lib.rs:145`); the trait-path counterpart is
+    /// `close_loop_args`'s `Ok(Some(live_args))`
+    /// (`opcode_handler_impls_post.template.rs:89`).
+    CloseLoop {
+        jump_args: Vec<OpRef>,
+        loop_header_pc: usize,
     },
 }
 
@@ -746,6 +834,89 @@ pub enum DispatchError {
     /// a trace abort so production falls back to trait dispatch rather
     /// than allocating.
     VableBoxNotSeeded { pc: usize },
+    /// `{get,set}arrayitem_vable_*` / `arraylen_vable` decoded its
+    /// `(VableArray, Array)` descr-pool pair but one of the two slots
+    /// was missing or held the wrong `BhDescr` variant. RPython parity:
+    /// `MIFrame.vable_array_index_pair_at` (`blackhole.rs:1613-1628`)
+    /// asserts the exact `(VableArray, Array)` pair and panics otherwise
+    /// — a malformed pair is a flatten/codewriter shape bug. The walker
+    /// surfaces it as a fail-loud abort instead of crashing the tracer.
+    VableArrayDescrMalformed {
+        pc: usize,
+        field_idx: usize,
+        array_idx: usize,
+    },
+    /// `{get,set}arrayitem_vable_*` / `arraylen_vable` reached the vable
+    /// resolution path but `TraceCtx::virtualizable_info()` was `None`.
+    /// RPython parity: these opnames only emit for the jitdriver's
+    /// virtualizable (`pyjitpl.py:1167-1263`); a missing
+    /// `virtualizable_info` means the descr pair pointed at an array
+    /// field of a struct that is not the registered virtualizable, which
+    /// is a codewriter shape mismatch.
+    VableArrayMissingVirtualizableInfo { pc: usize },
+    /// The `VableArray.index` decoded from the descr pair indexed past
+    /// `VirtualizableInfo::array_field_descrs` / `array_descrs`. Surfaces
+    /// a codewriter/virtualizable-layout mismatch between the emitted
+    /// array-field index and the registered virtualizable's array fields.
+    VableArrayIndexOutOfRange { pc: usize, index: usize },
+    /// `{get,set}arrayitem_vable_*` needs RPython's `indexbox.getint()`
+    /// at trace time (`pyjitpl.py:1201-1216 _get_arrayitem_vable_index`
+    /// calls `implement_guard_value(indexbox, pc)` then `indexbox.getint()`).
+    /// The symbolic walker can resolve that only when the index OpRef has
+    /// a concrete Int; without it the array slot can't be chosen, so
+    /// surface the missing concrete explicitly instead of guessing slot 0.
+    VableArrayIndexNotConcrete { pc: usize, value: OpRef },
+    /// `abort/` (BC_ABORT) reached. The front-end emits this marker for a
+    /// graph node with no dedicated `OpKind`; reaching it during a body
+    /// walk means the trace contains an untranslatable op and cannot be
+    /// recorded. Blackhole counterpart `handler_abort_marker_pyre`
+    /// (`blackhole.rs:5129`) sets `aborted = true` + `LeaveFrame`; the
+    /// walker surfaces it as a typed abort that the production driver
+    /// maps to `TraceAction::Abort` (recoverable — may retry later).
+    AbortMarkerReached { pc: usize },
+    /// `abort_permanent/` (BC_ABORT_PERMANENT) reached. pyre's codegen
+    /// emits this for fail-paths that must always terminate the frame
+    /// (e.g. BigInt-overflow / unported-op fallbacks). Blackhole
+    /// counterpart `bhimpl_abort_permanent` (`blackhole.rs:1798`) routes a
+    /// TLS-stashed exception or sets `aborted`; during a trace walk no
+    /// blackhole TLS exists, so the walker surfaces a typed permanent
+    /// abort that the production driver maps to `TraceAction::AbortPermanent`
+    /// (never trace this location again).
+    AbortPermanentMarkerReached { pc: usize },
+    /// `last_exception/>i` fired but no concrete standing exception was
+    /// available. RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
+    ///
+    ///   exc_value = self.metainterp.last_exc_value
+    ///   assert exc_value
+    ///   assert self.metainterp.class_of_last_exc_is_const
+    ///
+    /// The class pointer is read from the concrete exception's
+    /// `ob_header.ob_type`, so a missing `last_exc_value` OpRef or a
+    /// `Null`/non-Ref `last_exc_value_concrete` violates the same
+    /// codewriter invariant as [`LastExcValueWithoutActiveException`]:
+    /// this opname only emits inside a `catch_exception` body where the
+    /// unwinder has already stored the in-flight exception.
+    LastExceptionWithoutActiveException { pc: usize },
+    /// `jit_merge_point/cIRFIRF` could not derive its green key from the
+    /// op's green operands. pyre's portal jitdriver greens =
+    /// `[next_instr, is_being_profiled, pycode]` (`eval.rs:1936`), so the
+    /// green key is `make_green_key(concrete(gr[0]=pycode),
+    /// concrete(gi[0]=next_instr))`. This fires when the int/ref green
+    /// list is empty or its leading element has no concrete Int/Ref —
+    /// either a codewriter shape mismatch or (pre-Phase-5) the greens
+    /// weren't seeded with concretes. RPython parity:
+    /// `pyjitpl.py:2979 get_procedure_token(greenboxes)` always receives
+    /// concrete greens at a reached merge point.
+    JitMergePointGreenKeyUnresolved { pc: usize },
+    /// An `inline_call_*` sub-walk surfaced `DispatchOutcome::CloseLoop`.
+    /// `jit_merge_point` is the portal loop header; an inlined (non-portal)
+    /// callee body should never reach one and close a loop. RPython parity:
+    /// `_opimpl_inline_call*` (`pyjitpl.py:1266-1324`) inlines the callee
+    /// into the SAME trace — recursive portal re-entry takes the
+    /// `recursive_call` path, not `inline_call`. Reaching a loop-close
+    /// inside an inline sub-walk is therefore a codewriter/flatten shape
+    /// mismatch.
+    SubWalkClosedLoop { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -797,7 +968,8 @@ pub fn walk(
             DispatchOutcome::Continue => {}
             DispatchOutcome::Terminate
             | DispatchOutcome::SubReturn { .. }
-            | DispatchOutcome::SwitchToBlackhole { .. } => {
+            | DispatchOutcome::SwitchToBlackhole { .. }
+            | DispatchOutcome::CloseLoop { .. } => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -1626,6 +1798,8 @@ pub fn dispatch_via_miframe(
     jitcode_code: &[u8],
     position: usize,
     descr_refs: &[DescrRef],
+    raw_descrs: RawDescrPool,
+    is_authoritative_executor: bool,
     sub_jitcode_lookup: &SubJitCodeLookup,
     done_with_this_frame_descr_ref: DescrRef,
     done_with_this_frame_descr_int: DescrRef,
@@ -1797,6 +1971,8 @@ pub fn dispatch_via_miframe(
             concrete_registers_r: &mut top_concrete_r,
             concrete_registers_i: &mut top_concrete_i,
             descr_refs,
+            raw_descrs,
+            is_authoritative_executor,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -2021,6 +2197,8 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             concrete_registers_r: &mut concrete_r,
             concrete_registers_i: &mut concrete_i,
             descr_refs,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx,
             done_with_this_frame_descr_ref,
             done_with_this_frame_descr_int,
@@ -2615,6 +2793,211 @@ fn setfield_vable_via_metainterp(
     // JitCode PC, pass through.
     ctx.trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Resolve the `(fdescr, adescr)` virtualizable-array descr pair from a
+/// `(VableArray, Array)` jitcode descr-pool pair.
+///
+/// RPython parity: `MIFrame.vable_array_index_pair_at`
+/// (`blackhole.rs:1613-1628`) reads the two 2-byte descr-pool indices,
+/// asserts they resolve to `(BhDescr::VableArray { index }, BhDescr::Array
+/// { .. })`, and yields the `index`. `vable_array_descrs`
+/// (`pyjitpl/dispatch.rs:845-856`) then maps that index through the
+/// jitdriver's `VirtualizableInfo` to the canonical `array_field_descrs`
+/// /`array_descrs` pair.  The walker must use the *vinfo* descrs (not the
+/// raw jitcode-pool descrs) because `TraceCtx::vable_array_flat_index`
+/// keys on `array_field_by_descr` (descr identity, `virtualizable.rs:602`).
+///
+/// `field_offset` / `array_offset` are byte offsets (from `op.pc + 1`) of
+/// the two descr operands, matching the per-op argcode layout.
+fn vable_array_descrs_from_jitcode(
+    code: &[u8],
+    op: &DecodedOp,
+    field_offset: usize,
+    array_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Result<(DescrRef, DescrRef), DispatchError> {
+    let read_pool_idx = |off: usize| {
+        let lo = code[op.pc + 1 + off] as usize;
+        let hi = code[op.pc + 1 + off + 1] as usize;
+        lo | (hi << 8)
+    };
+    let field_idx = read_pool_idx(field_offset);
+    let array_pool_idx = read_pool_idx(array_offset);
+    // RPython `MIFrame.vable_array_index_pair_at` reads `self.descrs[idx]`
+    // — pyre's single per-walk pool, selected by `ctx.raw_descrs`
+    // (global `ALL_DESCRS` for arm walks, per-`CodeObject` `exec.descrs`
+    // for full-body walks).
+    let array_field_index = match (
+        ctx.raw_descrs.bh_descr_at(field_idx),
+        ctx.raw_descrs.bh_descr_at(array_pool_idx),
+    ) {
+        (
+            Some(majit_translate::jitcode::BhDescr::VableArray { index }),
+            Some(majit_translate::jitcode::BhDescr::Array { .. }),
+        ) => *index,
+        _ => {
+            return Err(DispatchError::VableArrayDescrMalformed {
+                pc: op.pc,
+                field_idx,
+                array_idx: array_pool_idx,
+            });
+        }
+    };
+    let info = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .ok_or(DispatchError::VableArrayMissingVirtualizableInfo { pc: op.pc })?;
+    let fdescr = info
+        .array_field_descrs()
+        .get(array_field_index)
+        .cloned()
+        .ok_or(DispatchError::VableArrayIndexOutOfRange {
+            pc: op.pc,
+            index: array_field_index,
+        })?;
+    let adescr =
+        info.array_descrs
+            .get(array_field_index)
+            .cloned()
+            .ok_or(DispatchError::VableArrayIndexOutOfRange {
+                pc: op.pc,
+                index: array_field_index,
+            })?;
+    Ok((fdescr, adescr))
+}
+
+/// `getarrayitem_vable_<i|r|f>/ridd>X` handler. Operand layout `ridd>X`:
+/// 1B r-reg(vable) + 1B i-reg(index) + 2B fdescr(VableArray) + 2B
+/// adescr(Array) + 1B X-dst.
+///
+/// RPython parity: `pyjitpl.py:1218-1234 _opimpl_getarrayitem_vable`
+/// (`opimpl_getarrayitem_vable_{i,r,f}`).  Delegates to
+/// `TraceCtx::vable_getarrayitem_{int,ref,float}_indexed`
+/// (`trace_ctx.rs:2982/3043/3099`) which implements the
+/// `_nonstandard_virtualizable` GETFIELD_GC + GETARRAYITEM_GC fallback
+/// and the standard-vable `virtualizable_boxes[index]` cache read.
+/// Mirrors `getfield_vable_via_metainterp`'s concrete-stamp + dst-write
+/// shape; the trait counterpart is `pyjitpl/dispatch.rs:1909-1977`.
+fn getarrayitem_vable_via_metainterp(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    // pyjitpl.py:1206 `indexbox.getint()` — the array slot is chosen from
+    // the concrete index. Fail loud if the walker can't resolve it.
+    let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
+        Some(Value::Int(v)) => v,
+        _ => return Err(DispatchError::VableArrayIndexNotConcrete { pc: op.pc, value: index }),
+    };
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
+    let (result, shadow_value) = match dst_bank {
+        'i' => ctx
+            .trace_ctx
+            .vable_getarrayitem_int_indexed(op.pc, vable, index, index_value, fdescr, adescr),
+        'r' => ctx
+            .trace_ctx
+            .vable_getarrayitem_ref_indexed(op.pc, vable, index, index_value, fdescr, adescr),
+        'f' => ctx
+            .trace_ctx
+            .vable_getarrayitem_float_indexed(op.pc, vable, index, index_value, fdescr, adescr),
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    };
+    // Mirror `getfield_vable_via_metainterp`: stamp the read result's
+    // concrete so `concrete_of_opref(result)` honors the Box.value
+    // contract for downstream consumers; `Value::Void` = no live concrete.
+    if !matches!(shadow_value, Value::Void) {
+        ctx.trace_ctx.set_opref_concrete(result, shadow_value);
+    }
+    let dst = code[op.pc + 7] as usize;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    match dst_bank {
+        'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'f' => {
+            let len = ctx.registers_f.len();
+            let slot =
+                ctx.registers_f
+                    .get_mut(dst)
+                    .ok_or(DispatchError::RegisterOutOfRange {
+                        pc: op.pc,
+                        reg: dst,
+                        len,
+                        bank: "f",
+                    })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `setarrayitem_vable_<i|r|f>/riXdd` handler. Operand layout `riXdd`:
+/// 1B r-reg(vable) + 1B i-reg(index) + 1B X-reg(value) + 2B
+/// fdescr(VableArray) + 2B adescr(Array). No dst byte.
+///
+/// RPython parity: `pyjitpl.py:1236-1247 _opimpl_setarrayitem_vable`.
+/// Delegates to `TraceCtx::vable_setarrayitem_indexed`
+/// (`trace_ctx.rs:3153`) which implements the `_nonstandard_virtualizable`
+/// SETARRAYITEM_GC fallback + the standard-vable
+/// `virtualizable_boxes[index] = valuebox` + `synchronize_virtualizable`.
+/// Trait counterpart: `pyjitpl/dispatch.rs:1978-2052`.
+fn setarrayitem_vable_via_metainterp(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    value_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
+        Some(Value::Int(v)) => v,
+        _ => return Err(DispatchError::VableArrayIndexNotConcrete { pc: op.pc, value: index }),
+    };
+    let value = match value_bank {
+        'i' => read_int_reg(code, op, 2, ctx)?,
+        'r' => read_ref_reg(code, op, 2, ctx)?,
+        'f' => read_float_reg(code, op, 2, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+    };
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
+    let concrete = ctx.trace_ctx.concrete_of_opref(value).unwrap_or(Value::Void);
+    ctx.trace_ctx.vable_setarrayitem_indexed(
+        op.pc, vable, index, index_value, fdescr, adescr, value, concrete,
+    );
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `arraylen_vable/rdd>i` handler. Operand layout `rdd>i`: 1B r-reg(vable)
+/// + 2B fdescr(VableArray) + 2B adescr(Array) + 1B i-dst.
+///
+/// RPython parity: `pyjitpl.py:1253-1263 opimpl_arraylen_vable`.
+/// Delegates to `TraceCtx::vable_arraylen_vable` (`trace_ctx.rs:3195`)
+/// which implements the `_nonstandard_virtualizable` GETFIELD_GC +
+/// ARRAYLEN_GC fallback and the standard-vable
+/// `ConstInt(get_array_length(...))` read.  Trait counterpart:
+/// `pyjitpl/dispatch.rs:2053-2068`.
+fn arraylen_vable_via_metainterp(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let vable_struct_ptr = match read_ref_reg_concrete(code, op, 0, ctx) {
+        ConcreteValue::Ref(ptr) => ptr as i64,
+        ConcreteValue::Null | ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
+    };
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
+    let result = ctx
+        .trace_ctx
+        .vable_arraylen_vable(op.pc, vable, vable_struct_ptr, fdescr, adescr);
+    let dst = code[op.pc + 6] as usize;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -3474,7 +3857,7 @@ fn try_fold_pure_call_via_executor(
 /// mutation never happens → next read derefs stale container → SIGBUS
 /// (M4 walker unactivated taxonomy: 5 STORE_SUBSCR-hot benches).  The
 /// orthodox fix is to widen this function across `Call*` /
-/// `CallLoopinvariant*` shapes, mirroring PyPy's
+/// `CallLoopinvariant*` / `CallMayForce*` shapes, mirroring PyPy's
 /// `_opimpl_residual_call*` which concrete-executes *every* residual
 /// call regardless of EI.
 ///
@@ -3504,6 +3887,14 @@ fn try_fold_pure_call_via_executor(
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
+/// **Authoritative-executor gate**: fires ONLY when the full-body walk
+/// is the sole concrete-execution leg
+/// ([`WalkContext::is_authoritative_executor`]).  In arm-walk / shadow /
+/// diagnostic-probe mode the flag is `false`, so the call is recorded
+/// symbolically only — re-executing there would double the side effects
+/// (the trait-path interpreter already ran it) or corrupt the live heap
+/// under the discard-the-trace probe.
+///
 /// **Return value**:
 /// * `Some(Ok(_))` — helper executed normally, `recorded` OpRef stamped
 ///   with the concrete result.
@@ -3512,9 +3903,10 @@ fn try_fold_pure_call_via_executor(
 ///   responsible for routing into `WalkContext.last_exc_value` so the
 ///   downstream `GuardNoException` walker handler picks it up; the
 ///   `recorded` OpRef is NOT stamped (no concrete result).
-/// * `None` — fold declined (preconditions not met: opcode out of set,
-///   funcbox non-const, arity exceeds [`MAX_HOST_CALL_ARITY`], any
-///   operand lacks a concrete `box_value`, or any Ref arg is NULL).
+/// * `None` — fold declined (preconditions not met: not the
+///   authoritative executor, opcode out of set, funcbox non-const, arity
+///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
+///   `box_value`, or any Ref arg is NULL).
 ///   The trace still has the recorded call op for the optimizer to
 ///   consume later; walker falls through as if this function did not
 ///   exist.
@@ -3529,6 +3921,13 @@ fn try_execute_residual_call_via_executor(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
 ) -> Option<Result<i64, i64>> {
+    // Authoritative-executor gate (#51b/#54): fire ONLY when the
+    // full-body walk is the sole concrete-execution leg.  Arm-walk /
+    // shadow / diagnostic-probe runs leave the flag `false` so the call
+    // is recorded symbolically without re-running its side effects.
+    if !ctx.is_authoritative_executor {
+        return None;
+    }
     let plain_or_loopinvariant = matches!(
         call_opcode,
         OpCode::CallI
@@ -5018,6 +5417,632 @@ fn dispatch_residual_call_iRd_kind(
 /// `capture_resumedata(after_residual_call=True)` on the guards. See
 /// `dispatch_residual_call_iRd_kind`'s docstring for the per-item
 /// blocking rationale.
+/// Shared #57 gate for the BINARY_OP / COMPARE_OP int specialization.
+/// Validates that both ref-list operands are concrete `W_IntObject` and
+/// obtains the authentic boxed result via the same `execute_residual_call`
+/// path the generic leg uses (so the concrete shadow holds the runtime
+/// object incl. small-int caching / identity).
+///
+/// Returns `Some((lhs, rhs, lhs_val, rhs_val, boxed_result_i64))` when the
+/// specialization may proceed, or `None` to fall through to the generic
+/// `CallMayForce` record (non-int operands, non-const funcptr/args, or a
+/// helper that raised).
+/// Shared tail of the int/float specialization gates: pull the helper
+/// `func_ptr` (the `allboxes[0]` constant) and the concrete arg words out
+/// of `allboxes`, then run the helper concretely via
+/// `execute_residual_call`.  Returns the authentic boxed-result pointer,
+/// or `None` when an arg is non-concrete (vable sentinel / unstamped) or
+/// the helper raises — both gates then defer to the generic record so the
+/// Python-level `__op__` semantics are preserved.
+fn walker_execute_may_force_boxed(
+    ctx: &mut WalkContext<'_, '_>,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<i64> {
+    if allboxes.is_empty() || !allboxes[0].is_constant() {
+        return None;
+    }
+    let func_ptr = match ctx.trace_ctx.box_value(allboxes[0]) {
+        Some(majit_ir::Value::Int(addr)) => addr,
+        _ => return None,
+    };
+    let mut args = Vec::with_capacity(allboxes.len() - 1);
+    for &arg in &allboxes[1..] {
+        let v = match ctx.trace_ctx.box_value(arg) {
+            Some(majit_ir::Value::Int(n)) => n,
+            Some(majit_ir::Value::Ref(r)) => {
+                if r == majit_ir::GcRef(usize::MAX) {
+                    return None;
+                }
+                r.as_usize() as i64
+            }
+            Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
+            Some(majit_ir::Value::Void) => 0,
+            None => return None,
+        };
+        args.push(v);
+    }
+    // Execute the helper concretely for the authentic boxed result
+    // (small-int caching / identity).  A raised helper (`Err`) or a NULL
+    // result defers to the generic `CallMayForce` record so the
+    // Python-level `__op__` semantics are preserved.
+    let boxed_result_i64 =
+        match majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args) {
+            Ok(result) if result != 0 => result,
+            _ => return None,
+        };
+    Some(boxed_result_i64)
+}
+
+/// Resolve the concrete `PyObjectRef` carried by a Ref-bank operand's
+/// recorded concrete, or `None` when it is the vable sentinel / null.
+fn walker_concrete_ref_object(
+    ctx: &mut WalkContext<'_, '_>,
+    opref: OpRef,
+) -> Option<pyre_object::PyObjectRef> {
+    match ctx.trace_ctx.concrete_of_opref(opref) {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+            let obj = r.as_usize() as pyre_object::PyObjectRef;
+            if obj.is_null() {
+                None
+            } else {
+                Some(obj)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn walker_int_specialization_operands(
+    ctx: &mut WalkContext<'_, '_>,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<(OpRef, OpRef, i64, i64, i64)> {
+    if r_args.len() != 2 {
+        return None;
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
+    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
+    let (lhs_val, rhs_val) = unsafe {
+        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
+            return None;
+        }
+        (
+            pyre_object::w_int_get_value(lhs_obj),
+            pyre_object::w_int_get_value(rhs_obj),
+        )
+    };
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((lhs, rhs, lhs_val, rhs_val, boxed_result_i64))
+}
+
+/// Float counterpart of [`walker_int_specialization_operands`].  Each
+/// operand must be a concrete int or float (long → `None`: the long→float
+/// cast can lose precision, matching `generated_binary_float_value`'s long
+/// fallback).  Two ints → `None` so they route through the int
+/// specialization (int `__op__`, not float).  Returns the per-operand
+/// `is_int` flag + coerced `f64` value alongside the authentic boxed
+/// result.
+fn walker_float_specialization_operands(
+    ctx: &mut WalkContext<'_, '_>,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<(OpRef, OpRef, bool, bool, f64, f64, i64)> {
+    if r_args.len() != 2 {
+        return None;
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
+    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
+    let coerce = |obj: pyre_object::PyObjectRef| -> Option<(bool, f64)> {
+        unsafe {
+            if pyre_object::is_int(obj) {
+                Some((true, pyre_object::w_int_get_value(obj) as f64))
+            } else if pyre_object::is_float(obj) {
+                Some((false, pyre_object::w_float_get_value(obj)))
+            } else {
+                None
+            }
+        }
+    };
+    let (lhs_is_int, lhs_f64) = coerce(lhs_obj)?;
+    let (rhs_is_int, rhs_f64) = coerce(rhs_obj)?;
+    if lhs_is_int && rhs_is_int {
+        return None;
+    }
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64))
+}
+
+/// Walker-native unbox of a boxed `W_IntObject` operand: `GUARD_CLASS`
+/// (with the walker snapshot) when the operand's class is not yet known,
+/// then the ctx-only `trace_unbox_int` getfield.  Mirrors
+/// `trace_unbox_int_with_resume` (`state.rs`) with the guard emitted
+/// walker-native (`record_guard` + `walker_capture_snapshot_for_last_guard`)
+/// instead of via `MIFrame::generate_guard` — the full-body walk has
+/// decomposed `MIFrame` into the reborrowed sym slices held by
+/// `WalkContext`, so reconstructing an `MIFrame` here would alias them.
+fn walker_unbox_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    int_type_addr: i64,
+) -> OpRef {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(int_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, int_type_addr);
+    }
+    crate::generated::trace_unbox_int(
+        ctx.trace_ctx,
+        obj,
+        int_type_addr,
+        crate::descr::ob_type_descr(),
+        crate::descr::int_intval_descr(),
+    )
+}
+
+/// Walker-native unbox of a boxed `W_FloatObject` operand: the float
+/// analogue of [`walker_unbox_int`].  `GUARD_CLASS` (with the walker
+/// snapshot) when the operand's class is not yet known, then the ctx-only
+/// `trace_unbox_float` getfield (its own `is_class_known` check is then a
+/// no-op because `class_now_known` was just set).
+fn walker_unbox_float(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    float_type_addr: i64,
+) -> OpRef {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(float_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, float_type_addr);
+    }
+    crate::generated::trace_unbox_float(
+        ctx.trace_ctx,
+        obj,
+        float_type_addr,
+        crate::descr::ob_type_descr(),
+        crate::descr::float_floatval_descr(),
+    )
+}
+
+/// Coerce a boxed operand to a raw `f64` OpRef for a float op: float →
+/// `walker_unbox_float`; int → `walker_unbox_int` then `cast_int_to_float`
+/// (`space.float_w` dispatches int through int2float).  Stamps the result
+/// with the already-known concrete `val` so downstream `box_value` sees it.
+/// Shared by the float-binary and float-compare specializations.
+fn walker_coerce_operand_to_float(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    is_int: bool,
+    val: f64,
+) -> OpRef {
+    let raw = if is_int {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let raw_int = walker_unbox_int(ctx, op_pc, obj, int_type_addr);
+        ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
+    } else {
+        let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+        walker_unbox_float(ctx, op_pc, obj, float_type_addr)
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(val));
+    raw
+}
+
+/// Emit a walker-native guard (`record_guard` + the walker snapshot for
+/// the just-recorded guard).  Mirrors `MIFrame::generate_guard` for the
+/// full-body walk.
+fn walker_emit_guard_with_snapshot(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    opcode: OpCode,
+    args: &[OpRef],
+) {
+    ctx.trace_ctx.record_guard(opcode, args, 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc);
+}
+
+/// Record `int_eq(raw, const k)` and stamp its already-known concrete
+/// truth.  Used to build the div/mod precondition guards walker-native.
+fn walker_int_eq_const(
+    ctx: &mut WalkContext<'_, '_>,
+    raw: OpRef,
+    k: i64,
+    concrete_truth: i64,
+) -> OpRef {
+    let k_const = ctx.trace_ctx.const_int(k);
+    let r = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, k_const]);
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
+    r
+}
+
+/// #57: walker-native speculative int specialization for the `BINARY_OP`
+/// helper residual_call (oopspec `BinaryOp`).  Re-derives
+/// `generated_binary_int_value`'s structure (`guard_class` +
+/// `getfield_gc_i` per operand, `int_OP_ovf` + `guard_no_overflow`,
+/// `wrapint`) walker-native rather than calling the trait
+/// `binary_int_value` (which would alias the reborrowed sym slices and
+/// emit `MIFrame`-style snapshots inconsistent with the walker model).
+///
+/// The concrete boxed result is obtained from the same
+/// `execute_residual_call` path the generic leg uses, so
+/// `concrete_registers_r[dst]` holds the authentic runtime `W_IntObject`.
+///
+/// Returns `Ok(Some(()))` when the specialization was emitted (caller
+/// returns `Continue`); `Ok(None)` when the operator is deferred
+/// (FloorDiv / Mod / Shift / TrueDiv / Power / Subscr), the operands are
+/// not both concrete `W_IntObject`, or the helper raises — the caller
+/// then falls through to the generic `CallMayForce` record so the
+/// Python-level `__op__` semantics are preserved.
+fn try_walker_specialize_binary_op_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    // INT_BINOP_TABLE → (OpCode, has_overflow, needs_concrete_check).
+    // Defer TrueDivide (int/int → float, separate helper) / Power /
+    // Subscr to the generic leg (`_ => None`).
+    let (op_code, has_overflow, needs_check) = match bin_op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => (OpCode::IntAddOvf, true, false),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+            (OpCode::IntSubOvf, true, false)
+        }
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+            (OpCode::IntMulOvf, true, false)
+        }
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            (OpCode::IntFloorDiv, false, true)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            (OpCode::IntMod, false, true)
+        }
+        BinaryOperator::And | BinaryOperator::InplaceAnd => (OpCode::IntAnd, false, false),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => (OpCode::IntOr, false, false),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => (OpCode::IntXor, false, false),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (OpCode::IntLshift, false, true),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (OpCode::IntRshift, false, true),
+        _ => return Ok(None),
+    };
+
+    // Speculation gate + authentic boxed result (shared with COMPARE_OP).
+    let Some((lhs, rhs, la, rb, boxed_result_i64)) =
+        walker_int_specialization_operands(ctx, r_args, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+
+    // intobject.py range validation (mirror generated_binary_int_value's
+    // needs_concrete_check): bail to the generic leg when the bare-IR-op
+    // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
+    // / overflowing shift); large right-shift folds to a const.
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    if needs_check {
+        match op_code {
+            OpCode::IntFloorDiv | OpCode::IntMod => {
+                if rb == 0 || (la == i64::MIN && rb == -1) {
+                    return Ok(None);
+                }
+            }
+            OpCode::IntLshift => {
+                let Ok(shift) = u32::try_from(rb) else {
+                    return Ok(None);
+                };
+                if shift >= i64::BITS {
+                    return Ok(None);
+                }
+                // intobject.py:207 ovfcheck(a << b)
+                let result = la.wrapping_shl(shift);
+                if result.wrapping_shr(shift) != la {
+                    return Ok(None);
+                }
+            }
+            OpCode::IntRshift => {
+                let Ok(shift) = u32::try_from(rb) else {
+                    return Ok(None);
+                };
+                if shift >= i64::BITS {
+                    // intobject.py:229-231 large shift → 0 or -1, no IR op.
+                    let result = if la < 0 { -1i64 } else { 0i64 };
+                    let raw = ctx.trace_ctx.const_int(result);
+                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+                    ctx.trace_ctx.set_opref_concrete(
+                        boxed,
+                        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+                    );
+                    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+                    return Ok(Some(()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr);
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr);
+    let (raw_result, concrete_value) = match op_code {
+        OpCode::IntFloorDiv | OpCode::IntMod => {
+            // rint.py:429/520 _ovf_zer guards: int_eq(rhs,0)→guard_false +
+            // (lhs==INT_MIN)&(rhs==-1)→guard_false ahead of the elidable
+            // helper call (so a re-used trace bails before the helper's
+            // wrapping_div / wrapping_rem returns a wrap value).
+            let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero]);
+            let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
+            let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
+            let ovf_both = ctx.trace_ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+            ctx.trace_ctx.set_opref_concrete(
+                ovf_both,
+                majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
+            );
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both]);
+            // jtransform.py:576-577 OS_INT_PY_DIV / OS_INT_PY_MOD elidable
+            // residual call (call_typed_with_effect_pure → CallI patched via
+            // record_result_of_call_pure).
+            let (func_ptr, effect_info, concrete_result) = if op_code == OpCode::IntFloorDiv {
+                (
+                    majit_metainterp::blackhole::ll_int_py_div as *const (),
+                    majit_metainterp::INT_PY_DIV_EFFECT_INFO,
+                    majit_metainterp::blackhole::ll_int_py_div(la, rb),
+                )
+            } else {
+                (
+                    majit_metainterp::blackhole::ll_int_py_mod as *const (),
+                    majit_metainterp::INT_PY_MOD_EFFECT_INFO,
+                    majit_metainterp::blackhole::ll_int_py_mod(la, rb),
+                )
+            };
+            let r = ctx.trace_ctx.call_typed_with_effect_pure(
+                OpCode::CallI,
+                func_ptr,
+                &[lhs_raw, rhs_raw],
+                &[majit_ir::Type::Int, majit_ir::Type::Int],
+                majit_ir::Type::Int,
+                effect_info,
+                &[
+                    majit_ir::Value::Int(func_ptr as usize as i64),
+                    majit_ir::Value::Int(la),
+                    majit_ir::Value::Int(rb),
+                ],
+                majit_ir::Value::Int(concrete_result),
+            );
+            (r, concrete_result)
+        }
+        _ => {
+            let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            (r, majit_metainterp::eval_binop_i(op_code, la, rb))
+        }
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
+    if has_overflow {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[]);
+    }
+    let boxed = crate::state::wrapint(ctx.trace_ctx, raw_result);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #57 SLICE 3b: walker-native speculative int specialization for the
+/// COMPARE_OP helper residual_call (oopspec `CompareOp`).  Emits
+/// `guard_class` + `getfield_gc_i` per operand + `int_<cmp>` for the raw
+/// truth, then boxes it to a `W_Bool`.  NON-fused: the walker sees
+/// COMPARE_OP and the following `goto_if_not` as separate JitCode ops, so
+/// it always materializes the boxed bool the generic `compare_fn` would
+/// have produced (the trait path's compare/jump fusion does not apply).
+///
+/// Same gate + return contract as
+/// [`try_walker_specialize_binary_op_int`].
+fn try_walker_specialize_compare_op_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::ComparisonOperator;
+    let cmp = match cmp_op {
+        ComparisonOperator::Less => OpCode::IntLt,
+        ComparisonOperator::LessOrEqual => OpCode::IntLe,
+        ComparisonOperator::Greater => OpCode::IntGt,
+        ComparisonOperator::GreaterOrEqual => OpCode::IntGe,
+        ComparisonOperator::Equal => OpCode::IntEq,
+        ComparisonOperator::NotEqual => OpCode::IntNe,
+    };
+    let Some((lhs, rhs, la, rb, boxed_result_i64)) =
+        walker_int_specialization_operands(ctx, r_args, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr);
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr);
+    let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+    let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
+    // residual_call lands a boxed bool in the dst Ref register; the
+    // separate goto_if_not op reads it).
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #57 SLICE 3c: walker-native speculative float specialization for the
+/// `BINARY_OP` helper residual_call (oopspec `BinaryOp`), the float
+/// analogue of [`try_walker_specialize_binary_op_int`].  Re-derives
+/// `generated_binary_float_value`'s structure walker-native: per operand
+/// either `guard_class FLOAT` + `getfield_gc_pure_f`, or (int operand)
+/// `guard_class INT` + `getfield_gc_i` + `cast_int_to_float`; then
+/// `float_OP` and `wrapfloat`.
+///
+/// Only the bare-primitive operators (`FloatAdd` / `FloatSub` /
+/// `FloatMul` / `FloatTrueDiv`) are specialized — Power / FloorDivide /
+/// Remainder have no FLOAT_* opcode and defer to the generic
+/// `CALL_MAY_FORCE` leg (Power lowers to a `call_may_force` +
+/// `guard_no_exception` there).  Tried as a fallback only after the int
+/// specialization declines, so two-int operands keep int `__op__`
+/// arithmetic.
+fn try_walker_specialize_binary_op_float(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    let op_code = match bin_op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::FloatMul,
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
+        _ => return Ok(None),
+    };
+
+    let Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64)) =
+        walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64);
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64);
+    let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+    let bits =
+        majit_metainterp::eval_binop_f(op_code, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        raw_result,
+        majit_ir::Value::Float(f64::from_bits(bits as u64)),
+    );
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw_result);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #57 SLICE 3c (compare): walker-native speculative float specialization
+/// for the `COMPARE_OP` helper residual_call (oopspec `CompareOp`), the
+/// float analogue of [`try_walker_specialize_compare_op_int`] and the
+/// float-compare arm of `generated_compare_value_direct`.  Per operand
+/// either `guard_class FLOAT` + `getfield_gc_pure_f`, or (int operand)
+/// `guard_class INT` + `getfield_gc_i` + `cast_int_to_float`; then
+/// `float_<cmp>` for the raw truth, then NON-fused box to a `W_Bool`.
+///
+/// Tried as a fallback only after the int compare specialization declines,
+/// so two-int operands keep int comparison.  All six `ComparisonOperator`
+/// variants are handled (float compare has no deferred operators).
+fn try_walker_specialize_compare_op_float(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::ComparisonOperator;
+    let cmp = match cmp_op {
+        ComparisonOperator::Less => OpCode::FloatLt,
+        ComparisonOperator::LessOrEqual => OpCode::FloatLe,
+        ComparisonOperator::Greater => OpCode::FloatGt,
+        ComparisonOperator::GreaterOrEqual => OpCode::FloatGe,
+        ComparisonOperator::Equal => OpCode::FloatEq,
+        ComparisonOperator::NotEqual => OpCode::FloatNe,
+    };
+    let Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64)) =
+        walker_float_specialization_operands(ctx, r_args, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64);
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64);
+    let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+    let folded =
+        majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
+    // residual_call lands a boxed bool; the separate goto_if_not reads it).
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iIRd_kind(
     code: &[u8],
@@ -5068,6 +6093,50 @@ fn dispatch_residual_call_iIRd_kind(
     // pyjitpl.py:2011-2014 OS_JIT_FORCE_VIRTUAL fail-loud — see
     // `dispatch_residual_call_iRd_kind` for the rationale.
     do_jit_force_virtual_guard(ei, op.pc)?;
+
+    // #57: speculative int specialization for the BINARY_OP / COMPARE_OP
+    // helper (oopspec `BinaryOp` / `CompareOp`, set codewriter-side at
+    // flatten.rs `build_residual_call_ir_r_insn_from_operands`).  When both
+    // operands are concrete `W_IntObject`, re-emit the guard_class + unbox
+    // + int_OP (+ rebox / bool-box) sequence instead of an opaque
+    // CALL_MAY_FORCE, matching the trait path's `binary_int_value` /
+    // `compare_value_direct`.  Falls through to the generic record for
+    // non-int operands / deferred operators.
+    if matches!(
+        ei.oopspecindex,
+        majit_ir::OopSpecIndex::BinaryOp | majit_ir::OopSpecIndex::CompareOp
+    ) {
+        if let Some(&tag_opref) = i_args.first() {
+            if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
+                let specialized = if ei.oopspecindex == majit_ir::OopSpecIndex::BinaryOp {
+                    // int specialization first; float (incl. mixed int/float)
+                    // as a fallback so two-int operands keep int arithmetic.
+                    match try_walker_specialize_binary_op_int(
+                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                    )? {
+                        Some(()) => Some(()),
+                        None => try_walker_specialize_binary_op_float(
+                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        )?,
+                    }
+                } else {
+                    // int compare first; float (incl. mixed int/float) as a
+                    // fallback so two-int operands keep int comparison.
+                    match try_walker_specialize_compare_op_int(
+                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                    )? {
+                        Some(()) => Some(()),
+                        None => try_walker_specialize_compare_op_float(
+                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        )?,
+                    }
+                };
+                if specialized.is_some() {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
 
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
@@ -5468,6 +6537,8 @@ fn dispatch_inline_call_dr_kind(
             concrete_registers_r: &mut callee_concrete_r,
             concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -5557,6 +6628,11 @@ fn dispatch_inline_call_dr_kind(
             },
             op.next_pc,
         )),
+        DispatchOutcome::CloseLoop { .. } => {
+            // An inlined callee body must not close a loop — see
+            // `SubWalkClosedLoop`.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -5650,6 +6726,8 @@ fn dispatch_inline_call_dir_kind(
             concrete_registers_r: &mut callee_concrete_r,
             concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -5725,6 +6803,11 @@ fn dispatch_inline_call_dir_kind(
             },
             op.next_pc,
         )),
+        DispatchOutcome::CloseLoop { .. } => {
+            // An inlined callee body must not close a loop — see
+            // `SubWalkClosedLoop`.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -5827,6 +6910,8 @@ fn dispatch_inline_call_dirf_kind(
             concrete_registers_r: &mut callee_concrete_r,
             concrete_registers_i: &mut callee_concrete_i,
             descr_refs: ctx.descr_refs,
+            raw_descrs: ctx.raw_descrs,
+            is_authoritative_executor: ctx.is_authoritative_executor,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -5915,6 +7000,11 @@ fn dispatch_inline_call_dirf_kind(
             },
             op.next_pc,
         )),
+        DispatchOutcome::CloseLoop { .. } => {
+            // An inlined callee body must not close a loop — see
+            // `SubWalkClosedLoop`.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -6272,6 +7362,34 @@ fn handle(
             // post-abort code path.
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        "abort/>i" => {
+            // Int-result twin of `abort/>r`. Blackhole counterpart
+            // `handler_abort_result_marker_i` (`blackhole.rs:5141`) is a
+            // pure PC bump — `infer_concrete_from_op`'s Abort→Int fallback
+            // classifies the untranslatable op's result as Int, so the
+            // dst byte is decoded (accounted for in `op.next_pc`) but
+            // never written. Same rationale as `abort/>r`: the real abort
+            // signal is `abort/` / `abort_permanent/`, not this marker.
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "abort/" => {
+            // pyre-only `BC_ABORT` marker (`handler_abort_marker_pyre`,
+            // `blackhole.rs:5129`): the front-end emitted a graph node
+            // with no dedicated `OpKind`, so reaching it means the body
+            // carries an untranslatable op. The trace cannot be recorded;
+            // surface a recoverable abort (production driver →
+            // `TraceAction::Abort`).
+            Err(DispatchError::AbortMarkerReached { pc: op.pc })
+        }
+        "abort_permanent/" => {
+            // pyre-only `BC_ABORT_PERMANENT` fail-path
+            // (`bhimpl_abort_permanent`, `blackhole.rs:1798`): emitted for
+            // paths that must always terminate the frame (BigInt-overflow
+            // / unported-op fallbacks). Surface a permanent abort
+            // (production driver → `TraceAction::AbortPermanent`) so the
+            // location is never traced again.
+            Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
+        }
         // Heapcache-aware getfield reads. RPython
         // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r|f>` →
         // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
@@ -6321,6 +7439,22 @@ fn handle(
         "setfield_vable_i/rid" => setfield_vable_via_metainterp(code, op, ctx, 'i'),
         "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
         "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
+        // Virtualizable array reads/writes + length. RPython
+        // `pyjitpl.py:1218-1263 _opimpl_{get,set}arrayitem_vable` /
+        // `opimpl_arraylen_vable` — walker delegates to the
+        // `TraceCtx::vable_{get,set}arrayitem_*` / `vable_arraylen_vable`
+        // ports which already implement the `_nonstandard_virtualizable`
+        // GC fallback and the standard-vable `virtualizable_boxes[index]`
+        // cache path.  The `(VableArray, Array)` descr pair is resolved to
+        // the vinfo's identity-keyed `(fdescr, adescr)` via
+        // `vable_array_descrs_from_jitcode`.
+        "getarrayitem_vable_i/ridd>i" => getarrayitem_vable_via_metainterp(code, op, ctx, 'i'),
+        "getarrayitem_vable_r/ridd>r" => getarrayitem_vable_via_metainterp(code, op, ctx, 'r'),
+        "getarrayitem_vable_f/ridd>f" => getarrayitem_vable_via_metainterp(code, op, ctx, 'f'),
+        "setarrayitem_vable_i/riidd" => setarrayitem_vable_via_metainterp(code, op, ctx, 'i'),
+        "setarrayitem_vable_r/rirdd" => setarrayitem_vable_via_metainterp(code, op, ctx, 'r'),
+        "setarrayitem_vable_f/rifdd" => setarrayitem_vable_via_metainterp(code, op, ctx, 'f'),
+        "arraylen_vable/rdd>i" => arraylen_vable_via_metainterp(code, op, ctx),
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.
@@ -6692,6 +7826,47 @@ fn handle(
             write_ref_reg(ctx, op.pc, dst, exc, exc_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        "last_exception/>i" => {
+            // RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
+            //
+            //   @arguments()
+            //   def opimpl_last_exception(self):
+            //       exc_value = self.metainterp.last_exc_value
+            //       assert exc_value
+            //       assert self.metainterp.class_of_last_exc_is_const
+            //       exc_cls = rclass.ll_cast_to_object(exc_value).typeptr
+            //       return ConstInt(ptr2int(exc_cls))
+            //
+            // The class pointer is the standing exception's `ob_type`.
+            // `read_typeptr_from_exception` (`dispatch.rs:1117`) routes
+            // through `cpu.cls_of_box`; the trait leg reads it directly off
+            // `W_ExceptionObject.ob_header.ob_type` (`trace_opcode.rs:7042`,
+            // `seed_raised_exception` at `:7171`). Walker mirrors the
+            // direct read from the live concrete exception. The result is
+            // a `ConstInt(typeptr)` — no IR op recorded, matching
+            // RPython's `return ConstInt(...)`.
+            //
+            // Operand layout `>i`: 1B dst register only; the dst byte sits
+            // at `op.pc + 1`.
+            let _exc = ctx
+                .last_exc_value
+                .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
+            let exc_ptr = match ctx.last_exc_value_concrete {
+                ConcreteValue::Ref(p) if !p.is_null() => p,
+                _ => {
+                    return Err(DispatchError::LastExceptionWithoutActiveException { pc: op.pc });
+                }
+            };
+            let typeptr = unsafe {
+                (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                    .ob_header
+                    .ob_type as i64
+            };
+            let dst = code[op.pc + 1] as usize;
+            let cls_const = ctx.trace_ctx.const_int(typeptr);
+            write_int_reg(ctx, op.pc, dst, cls_const, ConcreteValue::Int(typeptr))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "reraise/" => {
             // RPython parity: `pyjitpl.py:1700-1704 opimpl_reraise(self)` —
             //
@@ -6731,6 +7906,108 @@ fn handle(
                     },
                     op.next_pc,
                 ))
+            }
+        }
+        "jit_merge_point/cIRFIRF" => {
+            // RPython parity: `pyjitpl.py:1530 opimpl_jit_merge_point` →
+            // `reached_loop_header` (`pyjitpl.py:2950-3036`). pyre's trait
+            // mirror is `close_loop_args`
+            // (`opcode_handler_impls_post.template.rs:14-96`).
+            //
+            // The JitCode merge point carries its greens + reds inline
+            // (`blackhole.rs:1726 bhimpl_jit_merge_point` decodes the same
+            // six typed lists). Walking JitCode, the walker reads them
+            // directly — more orthodox than the trait leg, which recomputes
+            // live args via liveness (`close_loop_args_at`) because it
+            // walks CPython bytecode with no explicit merge-point op.
+            //
+            // Operand layout `cIRFIRF`: jdindex (`c`, 1 signed byte) +
+            // greens (`I`=gi, `R`=gr, `F`=gf) + reds (`I`=ri, `R`=rr,
+            // `F`=rf). pyre's portal jitdriver greens =
+            // `[next_instr, is_being_profiled, pycode]` (`eval.rs:1936`),
+            // so gi[0]=next_instr (the Python pc) and gr[0]=pycode
+            // (W_CodeObject). The green key is derivable from the op's own
+            // greens, and `next_instr` is the SAME Python-pc coordinate the
+            // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
+            // w_code, start_pc))`) — no jitcode-pc/python-pc mismatch.
+            let mut off = 1usize; // skip jdindex (`c`)
+            let (gi, n) = read_int_var_list(code, op, off, ctx)?;
+            off += n;
+            let (gr, n) = read_ref_var_list(code, op, off, ctx)?;
+            off += n;
+            let (_gf, n) = read_float_var_list(code, op, off, ctx)?;
+            off += n;
+            let (ri, n) = read_int_var_list(code, op, off, ctx)?;
+            off += n;
+            let (rr, n) = read_ref_var_list(code, op, off, ctx)?;
+            off += n;
+            let (rf, _n) = read_float_var_list(code, op, off, ctx)?;
+
+            // Green key from (pycode, next_instr) = (gr[0], gi[0]) concretes.
+            let (Some(&pc_green), Some(&code_green)) = (gi.first(), gr.first()) else {
+                return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+            };
+            let next_instr = match ctx.trace_ctx.concrete_of_opref(pc_green) {
+                Some(Value::Int(v)) => v as usize,
+                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
+            };
+            let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
+                Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
+                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
+            };
+            let key = crate::driver::make_green_key(code_ptr, next_instr);
+
+            // pyjitpl.py:2951 self.heapcache.reset()
+            ctx.trace_ctx.heap_cache_mut().reset();
+
+            // Reds = the live loop args, in bytecode bank order
+            // [int.., ref.., float..]. For pyre's portal jitdriver the
+            // reds are `[frame, ec]` (both Ref → rr), matching the
+            // reds-only LABEL inputargs after
+            // `patch_new_loop_to_load_virtualizable_fields`
+            // (`trace_opcode.rs:2959-2967`).
+            let mut live_args: Vec<OpRef> = Vec::with_capacity(ri.len() + rr.len() + rf.len());
+            live_args.extend(ri);
+            live_args.extend(rr);
+            live_args.extend(rf);
+
+            // pyjitpl.py:2994-3036: a matching merge point (same green key
+            // + red-bank shape) closes the loop; first visit registers and
+            // continues to unroll.
+            //
+            // SCOPE: the `compile_trace` / `has_compiled_targets` bridge
+            // attempt (`pyjitpl.py:2978-2983`, trait mirror
+            // `opcode_handler_impls_post.template.rs:40-72`) is omitted —
+            // this is primary-trace close only. The bridge close needs
+            // `driver.compile_trace` access and is a follow-up; reaching it
+            // is gated behind the Phase 5 full-body walk anyway (per-opcode
+            // arms never contain `jit_merge_point`).
+            if ctx
+                .trace_ctx
+                .has_merge_point_with_shape_assert(key, live_args.len())
+            {
+                Ok((
+                    DispatchOutcome::CloseLoop {
+                        jump_args: live_args,
+                        loop_header_pc: next_instr,
+                    },
+                    op.next_pc,
+                ))
+            } else {
+                let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
+                    .iter()
+                    .map(|opref| {
+                        let ty = ctx.trace_ctx.get_opref_type(*opref).unwrap_or_else(|| {
+                            panic!(
+                                "jit_merge_point live arg {opref:?} has no type in \
+                                 OptContext; RPython Box always carries its type"
+                            )
+                        });
+                        majit_metainterp::GreenBox::new(*opref, ty)
+                    })
+                    .collect();
+                ctx.trace_ctx.add_merge_point(key, green_boxes, next_instr);
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }
         other => Err(DispatchError::UnsupportedOpname {
@@ -6857,6 +8134,8 @@ mod tests {
             concrete_registers_r: &mut concrete,
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -6911,6 +8190,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -6955,6 +8236,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7118,6 +8401,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7163,6 +8448,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7207,6 +8494,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7260,6 +8549,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7305,6 +8596,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7349,6 +8642,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7488,6 +8783,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7648,6 +8945,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7753,6 +9052,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7852,6 +9153,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -7940,6 +9243,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8025,6 +9330,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8091,6 +9398,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8136,6 +9445,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8177,6 +9488,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8226,6 +9539,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8284,6 +9599,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8334,6 +9651,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: descr_int.clone(),
@@ -8395,6 +9714,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8449,6 +9770,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8507,6 +9830,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8551,6 +9876,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8598,6 +9925,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8645,6 +9974,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8740,6 +10071,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8783,6 +10116,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8838,6 +10173,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8926,6 +10263,8 @@ mod tests {
             concrete_registers_r: &mut concrete,
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -8996,6 +10335,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9060,6 +10401,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9102,6 +10445,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9207,6 +10552,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9312,6 +10659,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9370,6 +10719,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9424,6 +10775,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9469,6 +10822,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9513,6 +10868,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9578,6 +10935,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9631,6 +10990,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9675,6 +11036,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9718,6 +11081,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9771,6 +11136,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -9952,6 +11319,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10077,6 +11446,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10154,6 +11525,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10209,6 +11582,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10289,6 +11664,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10349,6 +11726,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10392,6 +11771,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10437,6 +11818,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10490,6 +11873,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10535,6 +11920,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10607,6 +11994,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10661,6 +12050,8 @@ mod tests {
             concrete_registers_r: &mut concrete_r,
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10731,6 +12122,8 @@ mod tests {
             concrete_registers_r: &mut concrete_r,
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10814,6 +12207,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10969,6 +12364,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -10996,6 +12393,197 @@ mod tests {
             last.opcode,
             majit_ir::OpCode::CallPureR,
             "EF_ELIDABLE_CANNOT_RAISE must rewrite to CALL_PURE_R",
+        );
+    }
+
+    // task #51b: when the walk is the authoritative concrete leg,
+    // `try_execute_residual_call_via_executor` runs a `CallMayForce*`
+    // residual call concretely (RPython runs every residual_call during
+    // tracing) and stamps the recorded result OpRef so a downstream
+    // `goto_if_not` reads a concrete value.  Gated OFF by
+    // `is_authoritative_executor` so arm/shadow/probe walks never
+    // re-execute (which would double side effects / corrupt the live
+    // heap `cut_trace` cannot roll back).
+    extern "C" fn add2_for_walker_test(a: i64, b: i64) -> i64 {
+        a.wrapping_add(b)
+    }
+
+    fn may_force_call_i_fixture(
+        tc: &mut TraceCtx,
+    ) -> ([OpRef; 3], DescrRef, OpRef) {
+        let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
+        let arg0 = tc.const_int(40);
+        let arg1 = tc.const_int(2);
+        let allboxes = [funcbox, arg0, arg1];
+        let descr = make_call_descr(
+            5,
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let recorded =
+            tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
+        (allboxes, descr, recorded)
+    }
+
+    #[test]
+    fn authoritative_walker_executes_may_force_call_and_stamps_result() {
+        let mut tc = fresh_trace_ctx();
+        let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+        let mut regs_i: Vec<OpRef> = Vec::new();
+        let mut regs_r: Vec<OpRef> = Vec::new();
+        let call_descr = descr.as_call_descr().expect("CallI descr");
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        let _ = try_execute_residual_call_via_executor(
+            &mut wc,
+            majit_ir::OpCode::CallMayForceI,
+            &allboxes,
+            call_descr,
+            recorded,
+        );
+        drop(wc);
+        assert_eq!(
+            tc.box_value(recorded),
+            Some(majit_ir::Value::Int(42)),
+            "authoritative walker must execute add2_for_walker_test(40, 2) and stamp 42",
+        );
+    }
+
+    #[test]
+    fn non_authoritative_walker_does_not_execute_may_force_call() {
+        let mut tc = fresh_trace_ctx();
+        let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+        let mut regs_i: Vec<OpRef> = Vec::new();
+        let mut regs_r: Vec<OpRef> = Vec::new();
+        let call_descr = descr.as_call_descr().expect("CallI descr");
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        let _ = try_execute_residual_call_via_executor(
+            &mut wc,
+            majit_ir::OpCode::CallMayForceI,
+            &allboxes,
+            call_descr,
+            recorded,
+        );
+        drop(wc);
+        assert_eq!(
+            tc.box_value(recorded),
+            None,
+            "non-authoritative walk (arm/shadow/probe) must NOT execute the may-force call",
+        );
+    }
+
+    // task #51c: a may-force call that RAISES (publishes on
+    // BH_LAST_EXC_VALUE) is transcribed onto WalkContext.last_exc_value
+    // (+ last_exc_value_concrete) and BH_LAST_EXC_VALUE is restored so the
+    // eval-loop walker-skip path can detect the pending exception; the
+    // result box is NOT stamped (only the normal-return path stamps a
+    // result, mirroring `execute_varargs`'s success-only `result_box.value`).
+    extern "C" fn raises_for_walker_test() -> i64 {
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
+        0
+    }
+
+    #[test]
+    fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
+        let mut tc = fresh_trace_ctx();
+        let funcbox = tc.const_int(raises_for_walker_test as *const () as i64);
+        let allboxes = [funcbox];
+        let descr = make_call_descr(6, vec![], Type::Int, majit_ir::ExtraEffect::CanRaise);
+        let recorded =
+            tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
+        let mut regs_i: Vec<OpRef> = Vec::new();
+        let mut regs_r: Vec<OpRef> = Vec::new();
+        let call_descr = descr.as_call_descr().expect("CallI descr");
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: true,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        let _ = try_execute_residual_call_via_executor(
+            &mut wc,
+            majit_ir::OpCode::CallMayForceI,
+            &allboxes,
+            call_descr,
+            recorded,
+        );
+        let captured_exc = wc.last_exc_value;
+        let captured_concrete = wc.last_exc_value_concrete;
+        drop(wc);
+        assert!(
+            captured_exc.is_some(),
+            "a raising may-force call must transcribe the exception to last_exc_value",
+        );
+        assert!(
+            matches!(captured_concrete, ConcreteValue::Ref(_)),
+            "last_exc_value_concrete must carry the raised exception pointer",
+        );
+        assert_eq!(
+            tc.box_value(recorded),
+            None,
+            "the raising path does not stamp `recorded`; the exception routes \
+             via last_exc_value (only the normal-return path stamps a result)",
         );
     }
 
@@ -11029,6 +12617,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11080,6 +12670,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11126,6 +12718,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11181,6 +12775,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11238,6 +12834,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11315,6 +12913,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11381,6 +12981,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11446,6 +13048,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11493,6 +13097,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11578,6 +13184,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11660,6 +13268,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11752,6 +13362,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11874,6 +13486,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11932,6 +13546,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -11978,6 +13594,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12048,6 +13666,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12163,6 +13783,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12254,6 +13876,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12344,6 +13968,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12413,6 +14039,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12485,6 +14113,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12555,6 +14185,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12631,6 +14263,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12705,6 +14339,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12767,6 +14403,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12850,6 +14488,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12911,6 +14551,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -12960,6 +14602,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13021,6 +14665,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13102,6 +14748,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13173,6 +14821,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13222,6 +14872,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13297,6 +14949,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13355,6 +15009,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13427,6 +15083,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13487,6 +15145,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13558,6 +15218,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13652,6 +15314,8 @@ mod tests {
             &code,
             0,
             &[],
+            RawDescrPool::Global,
+            false,
             &no_sub_jitcodes,
             descr.clone(),
             make_fail_descr(101),
@@ -13739,6 +15403,8 @@ mod tests {
             &code,
             0,
             &[],
+            RawDescrPool::Global,
+            false,
             &no_sub_jitcodes,
             descr_done,
             make_fail_descr(101),
@@ -13819,6 +15485,8 @@ mod tests {
             &code,
             0,
             &[],
+            RawDescrPool::Global,
+            false,
             &no_sub_jitcodes,
             make_fail_descr(1),
             make_fail_descr(101),
@@ -13859,6 +15527,8 @@ mod tests {
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
             done_with_this_frame_descr_int: make_fail_descr(101),
@@ -13877,6 +15547,129 @@ mod tests {
         assert_eq!(
             walk(&code, 0, &mut wc),
             Err(DispatchError::UndecodableOpcode { pc: 0 })
+        );
+    }
+
+    /// `jit_merge_point/cIRFIRF` reached_loop_header behaviour: first
+    /// visit of a (green key, red shape) registers the merge point and
+    /// continues unrolling; the second visit with the same key + shape
+    /// closes the loop with the reds as jump args.  Mirrors
+    /// `pyjitpl.py:2994-3036` first-visit/found split.
+    #[test]
+    fn jit_merge_point_first_visit_continues_then_closes_loop() {
+        let jmp_byte = *insns_opname_to_byte()
+            .get("jit_merge_point/cIRFIRF")
+            .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+        // cIRFIRF byte layout: jdindex(c) + greens(I gi, R gr, F gf) +
+        // reds(I ri, R rr, F rf).  greens = portal jitdriver's
+        // [next_instr(i0), pycode(r0)]; reds = [r1, r2] (loop-carried
+        // refs, e.g. [frame, ec]).
+        let code = [
+            jmp_byte, 0x00, // c: jdindex
+            0x01, 0x00, // gi: len=1, [i0 = next_instr]
+            0x01, 0x00, // gr: len=1, [r0 = pycode]
+            0x00, // gf: len=0
+            0x00, // ri: len=0
+            0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
+            0x00, // rf: len=0
+        ];
+        let mut tc = fresh_trace_ctx();
+        let next_instr = tc.const_int(42); // gi[0] = Python pc
+        let pycode = tc.const_ref(0x1_0000); // gr[0] = W_CodeObject ptr
+        let red0 = tc.const_ref(0x2_0000); // rr[0]
+        let red1 = tc.const_ref(0x3_0000); // rr[1]
+        let mut regs_i = vec![next_instr];
+        let mut regs_r = vec![pycode, red0, red1];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+
+        // First visit: registers (key, [red0, red1]) and continues.
+        let (first, first_next) =
+            step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
+        assert_eq!(first, DispatchOutcome::Continue);
+        assert_eq!(first_next, code.len());
+
+        // Second visit (same key + red shape): closes the loop.
+        let (second, _) = step(&code, 0, &mut wc).expect("second jit_merge_point must dispatch");
+        assert_eq!(
+            second,
+            DispatchOutcome::CloseLoop {
+                jump_args: vec![red0, red1],
+                loop_header_pc: 42,
+            }
+        );
+    }
+
+    /// A green list with no concrete leading element cannot form the
+    /// green key — surfaces `JitMergePointGreenKeyUnresolved` rather than
+    /// guessing.
+    #[test]
+    fn jit_merge_point_unresolved_green_key_fails_loud() {
+        let jmp_byte = *insns_opname_to_byte()
+            .get("jit_merge_point/cIRFIRF")
+            .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+        let code = [
+            jmp_byte, 0x00, // c
+            0x01, 0x00, // gi: len=1, [i0]
+            0x01, 0x00, // gr: len=1, [r0]
+            0x00, // gf
+            0x00, // ri
+            0x00, // rr
+            0x00, // rf
+        ];
+        let mut tc = fresh_trace_ctx();
+        // i0 is a non-constant input arg → no concrete next_instr.
+        let mut regs_i = vec![OpRef::input_arg_int(0)];
+        let mut regs_r = vec![tc.const_ref(0x1_0000)];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: 0,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+        };
+        assert_eq!(
+            step(&code, 0, &mut wc),
+            Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: 0 })
         );
     }
 }
