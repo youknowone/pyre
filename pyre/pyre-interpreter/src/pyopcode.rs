@@ -2293,6 +2293,20 @@ pub fn execute_delete_attr<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_store_attr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::StoreAttr { namei } = instruction else {
+        unreachable!()
+    };
+    let name_idx = u32_as_usize(namei.get(op_arg));
+    OpcodeStepExecutor::store_attr(executor, code.names[name_idx].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_import_name<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -2579,11 +2593,7 @@ where
 
         Instruction::LoadAttr { .. } => execute_load_attr(executor, code, instruction, op_arg),
 
-        Instruction::StoreAttr { namei } => {
-            let name_idx = u32_as_usize(namei.get(op_arg));
-            OpcodeStepExecutor::store_attr(executor, code.names[name_idx].as_ref())?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::StoreAttr { .. } => execute_store_attr(executor, code, instruction, op_arg),
 
         // ── Generators ──
         Instruction::YieldValue { .. } => {
