@@ -70,13 +70,19 @@ impl W_Random {
         }
         Ok(())
     }
-    #[getter]
+    #[getter(doc = "raw 64-bit PRNG state as a signed int")]
     fn raw_state(&self) -> i64 {
         self.state as i64
     }
     #[setter]
     fn set_raw_state(&mut self, v: i64) {
         self.state = v as u64;
+    }
+    #[deleter("raw_state")]
+    fn del_raw_state(&mut self) {
+        // Resetting on `del obj.raw_state` exercises the fdel slot —
+        // GetSetProperty(fget, fset, fdel, doc=) full-quad parity.
+        self.state = DEFAULT_SEED;
     }
 }
 

@@ -1251,8 +1251,63 @@ enum MethodKind {
     Instance,
     Static,
     Class,
-    Getter(String),
-    Setter(String),
+    // `(py_name, doc)` — doc is the optional `doc="…"` arg shared by all
+    // three accessors, mirroring `GetSetProperty(fget, fset, fdel, doc=)`.
+    Getter(String, Option<String>),
+    Setter(String, Option<String>),
+    Deleter(String, Option<String>),
+}
+
+/// One `#[getter(...)]` / `#[setter(...)]` / `#[deleter(...)]` argument:
+/// either a positional `"name"` (or `name = "…"`) or `doc = "…"`.
+enum GetSetArg {
+    Name(String),
+    Doc(String),
+}
+
+impl syn::parse::Parse for GetSetArg {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.peek(syn::LitStr) {
+            let s: syn::LitStr = input.parse()?;
+            return Ok(GetSetArg::Name(s.value()));
+        }
+        let key: syn::Ident = input.parse()?;
+        let _: syn::Token![=] = input.parse()?;
+        let val: syn::LitStr = input.parse()?;
+        match key.to_string().as_str() {
+            "name" => Ok(GetSetArg::Name(val.value())),
+            "doc" => Ok(GetSetArg::Doc(val.value())),
+            _ => Err(syn::Error::new(key.span(), "expected `name` or `doc`")),
+        }
+    }
+}
+
+/// Parse a `#[getter]` / `#[setter]` / `#[deleter]` attribute into its
+/// optional `(name, doc)`.  Accepts `#[x]`, `#[x("name")]`,
+/// `#[x(doc = "…")]`, and `#[x("name", doc = "…")]`.
+fn parse_getset_attr(a: &syn::Attribute) -> syn::Result<(Option<String>, Option<String>)> {
+    use syn::Meta;
+    match &a.meta {
+        Meta::Path(_) => Ok((None, None)),
+        Meta::List(_) => {
+            let args = a.parse_args_with(
+                syn::punctuated::Punctuated::<GetSetArg, syn::Token![,]>::parse_terminated,
+            )?;
+            let mut name = None;
+            let mut doc = None;
+            for arg in args {
+                match arg {
+                    GetSetArg::Name(s) => name = Some(s),
+                    GetSetArg::Doc(s) => doc = Some(s),
+                }
+            }
+            Ok((name, doc))
+        }
+        Meta::NameValue(_) => Err(syn::Error::new(
+            a.span(),
+            "expected `#[attr]`, `#[attr(\"name\")]`, or `#[attr(doc = \"…\")]`",
+        )),
+    }
 }
 
 /// Inspect `#[staticmethod]` / `#[classmethod]` / `#[getter]` /
@@ -1273,16 +1328,23 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
         } else if a.path().is_ident("classmethod") {
             Some(MethodKind::Class)
         } else if a.path().is_ident("getter") {
-            let py_name = attr_string_arg(a)?.unwrap_or_else(|| m.sig.ident.to_string());
-            Some(MethodKind::Getter(py_name))
+            let (name, doc) = parse_getset_attr(a)?;
+            let py_name = name.unwrap_or_else(|| m.sig.ident.to_string());
+            Some(MethodKind::Getter(py_name, doc))
         } else if a.path().is_ident("setter") {
+            let (name, doc) = parse_getset_attr(a)?;
             let fn_name = m.sig.ident.to_string();
-            let derived = fn_name.strip_prefix("set_").map(str::to_owned);
-            let py_name = match attr_string_arg(a)? {
-                Some(n) => n,
-                None => derived.unwrap_or(fn_name),
-            };
-            Some(MethodKind::Setter(py_name))
+            let py_name = name
+                .or_else(|| fn_name.strip_prefix("set_").map(str::to_owned))
+                .unwrap_or(fn_name);
+            Some(MethodKind::Setter(py_name, doc))
+        } else if a.path().is_ident("deleter") {
+            let (name, doc) = parse_getset_attr(a)?;
+            let fn_name = m.sig.ident.to_string();
+            let py_name = name
+                .or_else(|| fn_name.strip_prefix("del_").map(str::to_owned))
+                .unwrap_or(fn_name);
+            Some(MethodKind::Deleter(py_name, doc))
         } else {
             None
         };
@@ -1291,7 +1353,7 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
             return Err(syn::Error::new(
                 a.span(),
                 "#[pyre_methods]: at most one of \
-                 `#[classmethod]` / `#[staticmethod]` / `#[getter]` / `#[setter]`",
+                 `#[classmethod]` / `#[staticmethod]` / `#[getter]` / `#[setter]` / `#[deleter]`",
             ));
         }
         kind = new_kind;
@@ -1300,58 +1362,70 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
     Ok(kind)
 }
 
-/// Insert a getter/setter wrapper into the `properties` Vec, merging
-/// with an existing pair on the same py-name and rejecting duplicates.
-fn record_property(
-    properties: &mut Vec<(String, Option<syn::Ident>, Option<syn::Ident>)>,
+/// One python-visible GetSetProperty being assembled across `#[getter]` /
+/// `#[setter]` / `#[deleter]` arms that share a py-name.  Mirrors
+/// `GetSetProperty(fget, fset, fdel, doc=)`.
+#[derive(Default)]
+struct PropEntry {
     name: String,
-    new_fget: Option<syn::Ident>,
-    new_fset: Option<syn::Ident>,
-    m: &syn::ImplItemFn,
-) -> syn::Result<()> {
-    for entry in properties.iter_mut() {
-        if entry.0 != name {
-            continue;
-        }
-        if new_fget.is_some() {
-            if entry.1.is_some() {
-                return Err(syn::Error::new(
-                    m.sig.span(),
-                    format!("#[getter]: property `{name}` already has a getter"),
-                ));
-            }
-            entry.1 = new_fget;
-        }
-        if new_fset.is_some() {
-            if entry.2.is_some() {
-                return Err(syn::Error::new(
-                    m.sig.span(),
-                    format!("#[setter]: property `{name}` already has a setter"),
-                ));
-            }
-            entry.2 = new_fset;
-        }
-        return Ok(());
-    }
-    properties.push((name, new_fget, new_fset));
-    Ok(())
+    fget: Option<syn::Ident>,
+    fset: Option<syn::Ident>,
+    fdel: Option<syn::Ident>,
+    doc: Option<String>,
 }
 
-/// Extract `"name"` from `#[X("name")]`.  `None` if the attribute has
-/// no arguments; `Err` if the arg list is malformed.
-fn attr_string_arg(a: &syn::Attribute) -> syn::Result<Option<String>> {
-    use syn::Meta;
-    match &a.meta {
-        Meta::Path(_) => Ok(None),
-        Meta::List(_) => {
-            let lit: syn::LitStr = a.parse_args()?;
-            Ok(Some(lit.value()))
+/// Which accessor a `record_property` call contributes.
+enum Accessor {
+    Get,
+    Set,
+    Del,
+}
+
+/// Insert one accessor wrapper into the `properties` Vec, merging with an
+/// existing entry on the same py-name and rejecting duplicate accessors.
+/// A `doc` provided by any accessor is adopted; conflicting docs error.
+fn record_property(
+    properties: &mut Vec<PropEntry>,
+    name: String,
+    accessor: Accessor,
+    wrapper: syn::Ident,
+    doc: Option<String>,
+    m: &syn::ImplItemFn,
+) -> syn::Result<()> {
+    let entry = match properties.iter_mut().find(|e| e.name == name) {
+        Some(e) => e,
+        None => {
+            properties.push(PropEntry {
+                name: name.clone(),
+                ..PropEntry::default()
+            });
+            properties.last_mut().unwrap()
         }
-        Meta::NameValue(_) => Err(syn::Error::new(
-            a.span(),
-            "expected `#[attr]` or `#[attr(\"name\")]`",
-        )),
+    };
+    let (slot, label) = match accessor {
+        Accessor::Get => (&mut entry.fget, "getter"),
+        Accessor::Set => (&mut entry.fset, "setter"),
+        Accessor::Del => (&mut entry.fdel, "deleter"),
+    };
+    if slot.is_some() {
+        return Err(syn::Error::new(
+            m.sig.span(),
+            format!("#[{label}]: property `{name}` already has a {label}"),
+        ));
     }
+    *slot = Some(wrapper);
+    if let Some(doc) = doc {
+        match &entry.doc {
+            Some(existing) if *existing != doc => {
+                return Err(syn::Error::new(
+                    m.sig.span(),
+                    format!("property `{name}` has conflicting `doc` values"),
+                ));
+            }
+            _ => entry.doc = Some(doc),
+        }
+    }
+    Ok(())
 }
 
 fn expand_pyre_methods(
@@ -1402,7 +1476,7 @@ fn expand_pyre_methods(
     // slot; after the loop we emit one `w_getset_property_new` per
     // distinct py_name.  Mirrors PyPy `name = GetSetProperty(fget=,
     // fset=)` where both handlers share the python-visible name.
-    let mut properties: Vec<(String, Option<syn::Ident>, Option<syn::Ident>)> = Vec::new();
+    let mut properties: Vec<PropEntry> = Vec::new();
 
     for item in imp.items.iter() {
         let ImplItem::Fn(m) = item else { continue };
@@ -1438,7 +1512,10 @@ fn expand_pyre_methods(
         // `w_getset_property_new(fget=, fset=)` build keyed by py_name.
         let mut inputs = m.sig.inputs.iter().peekable();
         let (preamble, call_target, first_arg_idx) = match &kind {
-            MethodKind::Instance | MethodKind::Getter(_) | MethodKind::Setter(_) => {
+            MethodKind::Instance
+            | MethodKind::Getter(..)
+            | MethodKind::Setter(..)
+            | MethodKind::Deleter(..) => {
                 let recv = match inputs.next() {
                     Some(FnArg::Receiver(r)) => r,
                     _ => {
@@ -1454,7 +1531,7 @@ fn expand_pyre_methods(
                 // actual `self` slides one slot right.  Mirrors
                 // `typedef.py:312-325` fget_unwrap_spec.
                 let self_idx: usize = match &kind {
-                    MethodKind::Getter(_) | MethodKind::Setter(_) => 1,
+                    MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..) => 1,
                     _ => 0,
                 };
                 let from_obj_call = if recv.mutability.is_some() {
@@ -1595,38 +1672,55 @@ fn expand_pyre_methods(
                         ::pyre_object::w_classmethod_new(#raw_fn));
                 });
             }
-            MethodKind::Getter(prop_name) => {
+            MethodKind::Getter(prop_name, doc) => {
                 record_property(
                     &mut properties,
                     prop_name.clone(),
-                    Some(wrapper_name.clone()),
-                    None,
+                    Accessor::Get,
+                    wrapper_name.clone(),
+                    doc.clone(),
                     m,
                 )?;
             }
-            MethodKind::Setter(prop_name) => {
+            MethodKind::Setter(prop_name, doc) => {
                 record_property(
                     &mut properties,
                     prop_name.clone(),
-                    None,
-                    Some(wrapper_name.clone()),
+                    Accessor::Set,
+                    wrapper_name.clone(),
+                    doc.clone(),
+                    m,
+                )?;
+            }
+            MethodKind::Deleter(prop_name, doc) => {
+                record_property(
+                    &mut properties,
+                    prop_name.clone(),
+                    Accessor::Del,
+                    wrapper_name.clone(),
+                    doc.clone(),
                     m,
                 )?;
             }
         }
     }
 
-    // Property pair emission: one `w_getset_property_new` per distinct
+    // Property emission: one `w_getset_property_new` per distinct
     // py-name.  Slots not provided fall back to `PY_NULL` (matching
     // PyPy `GetSetProperty(fget=W_X.descr_get_X, fset=None, fdel=None)`
-    // when only a getter is declared).
-    for (prop_name, fget, fset) in &properties {
-        let fget_expr = match fget {
+    // when only a getter is declared).  A `doc="…"` provided on any
+    // accessor populates the `doc` slot; otherwise `PY_NULL`.
+    for prop in &properties {
+        let prop_name = &prop.name;
+        let accessor_expr = |slot: &Option<syn::Ident>| match slot {
             Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
             None => quote! { ::pyre_object::PY_NULL },
         };
-        let fset_expr = match fset {
-            Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
+        let fget_expr = accessor_expr(&prop.fget);
+        let fset_expr = accessor_expr(&prop.fset);
+        let fdel_expr = accessor_expr(&prop.fdel);
+        let doc_expr = match &prop.doc {
+            Some(doc) => quote! { ::pyre_object::w_str_new(#doc) },
             None => quote! { ::pyre_object::PY_NULL },
         };
         registrations.push(quote! {
@@ -1636,8 +1730,8 @@ fn expand_pyre_methods(
                 ::pyre_object::getsetproperty::w_getset_property_new(
                     #fget_expr,
                     #fset_expr,
-                    ::pyre_object::PY_NULL,
-                    ::pyre_object::PY_NULL,
+                    #fdel_expr,
+                    #doc_expr,
                     ::pyre_object::PY_NULL,
                     false,
                     ::pyre_object::w_str_new(#prop_name),
@@ -1686,7 +1780,8 @@ fn expand_pyre_methods(
                 || a.path().is_ident("classmethod")
                 || a.path().is_ident("staticmethod")
                 || a.path().is_ident("getter")
-                || a.path().is_ident("setter"))
+                || a.path().is_ident("setter")
+                || a.path().is_ident("deleter"))
         });
         for arg in m.sig.inputs.iter_mut() {
             if let FnArg::Typed(pt) = arg {
