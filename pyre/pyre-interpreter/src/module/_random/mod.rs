@@ -94,12 +94,31 @@ fn _path_bytes(path: PyPath) -> Vec<i64> {
     path.bytes().map(|b| b as i64).collect()
 }
 
+/// Smoke probe for the unwrap_spec aliases — each parameter instantiates
+/// one alias's unwrap + binding-type expansion so the generated code is
+/// exercised end-to-end, not just compiled inside the macro crate.
+#[crate::pyre_function]
+fn _unwrap_alias_probe(
+    u: PyUnicode,
+    u8s: PyUtf8,
+    ton: PyTextOrNone,
+    t0n: PyText0OrNone,
+    buf: PyBufferStr,
+    cnn: PyCNonNegInt,
+) -> i64 {
+    let mut acc = u.len() as i64 + u8s.len() as i64 + buf.len() as i64 + cnn as i64;
+    acc += ton.map(|s| s.len() as i64).unwrap_or(-1);
+    acc += t0n.map(|s| s.len() as i64).unwrap_or(-1);
+    acc
+}
+
 crate::py_module! {
     "_random",
     interpleveldefs: {
         "Random" => type_object(),
         "_seed_from_path" => crate::make_builtin_function("_seed_from_path", _seed_from_path),
         "_path_bytes" => crate::make_builtin_function("_path_bytes", _path_bytes),
+        "_unwrap_alias_probe" => crate::make_builtin_function("_unwrap_alias_probe", _unwrap_alias_probe),
     },
     appleveldefs: {
         "app_random.py" => ["_ascii_seed"],
