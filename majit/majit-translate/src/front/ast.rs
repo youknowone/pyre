@@ -1384,6 +1384,7 @@ fn build_graphs_from_items(
     options: &AstGraphOptions,
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
+    method_suffix_index: &MethodSuffixIndex,
     use_imports: &HashMap<String, String>,
     // Program-wide `pub const` / `pub static` table aggregated by the
     // caller (`build_semantic_program_*_with_options`).  Empty for
@@ -1412,6 +1413,7 @@ fn build_graphs_from_items(
                         None,
                         struct_fields,
                         fn_return_types,
+                        method_suffix_index,
                         prefix,
                         source_module,
                         use_imports,
@@ -1456,6 +1458,7 @@ fn build_graphs_from_items(
                                 self_ty_root.clone(),
                                 struct_fields,
                                 fn_return_types,
+                                method_suffix_index,
                                 prefix,
                                 source_module,
                                 use_imports,
@@ -1482,6 +1485,7 @@ fn build_graphs_from_items(
                         options,
                         struct_fields,
                         fn_return_types,
+                        method_suffix_index,
                         use_imports,
                         module_statics,
                         known_struct_names,
@@ -1536,6 +1540,7 @@ pub fn build_semantic_program_with_options(
         module_statics.insert((module, name.clone()), decl.clone());
     }
     let start_len = functions.len();
+    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     build_graphs_from_items(
         &parsed.file.items,
         "",
@@ -1543,6 +1548,7 @@ pub fn build_semantic_program_with_options(
         options,
         &struct_fields,
         &fn_return_types,
+        &method_suffix_index,
         &parsed.use_imports,
         &module_statics,
         &known_struct_names,
@@ -1624,6 +1630,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
     // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
+    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     for parsed in parsed_files {
         let functions_before = functions.len();
         build_graphs_from_items(
@@ -1633,6 +1640,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             options,
             &struct_fields,
             &fn_return_types,
+            &method_suffix_index,
             &parsed.use_imports,
             &module_statics,
             &known_struct_names,
@@ -1709,11 +1717,13 @@ pub fn lower_expr_into_graph_with_signature(
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
+    let empty_suffix_index = MethodSuffixIndex::default();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let mut ctx = GraphBuildContext::new(
         &empty_registry,
         &empty_fn_ret,
+        &empty_suffix_index,
         "",
         HashMap::new(),
         &empty_names,
@@ -1780,6 +1790,7 @@ pub fn lower_expr_into_graph_with_signature(
 pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, FlowingError> {
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
+    let empty_suffix_index = MethodSuffixIndex::default();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let empty_use_imports = HashMap::new();
@@ -1790,6 +1801,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, Flowi
         None,
         &empty_registry,
         &empty_fn_ret,
+        &empty_suffix_index,
         "",
         "",
         &empty_use_imports,
@@ -1810,12 +1822,14 @@ pub fn build_function_graph_with_self_ty_pub(
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
     let empty_module_statics = HashMap::new();
+    let method_suffix_index = MethodSuffixIndex::from_fn_return_types(fn_return_types);
     build_function_graph(
         func,
         &AstGraphOptions::default(),
         self_ty_root,
         struct_fields,
         fn_return_types,
+        &method_suffix_index,
         module_prefix,
         "",
         use_imports,
@@ -1842,6 +1856,66 @@ pub fn collect_jit_hints_pub(attrs: &[syn::Attribute]) -> Vec<String> {
 /// slots in the spec's `(...)` pattern to `Index(n)` placeholders.
 pub fn collect_jit_hints_with_sig(attrs: &[syn::Attribute], sig: &syn::Signature) -> Vec<String> {
     collect_jit_hints(attrs, Some(sig))
+}
+
+/// Resolution of a `(receiver_leaf, method)` suffix against the
+/// `fn_return_types` keys: either the single unique key carrying that
+/// suffix or `Ambiguous` when two distinct keys share it.
+#[derive(Debug, Clone)]
+enum SuffixMatch {
+    Unique(String),
+    Ambiguous,
+}
+
+/// Compile-time resolver for `lookup_method_return_type`'s leaf-suffix
+/// fallback. Maps `(receiver_leaf, method)` to the unique `fn_return_types`
+/// key with that suffix (or `Ambiguous`). Built once per whole-program
+/// build from the frozen `fn_return_types` map and borrowed into every
+/// per-function `GraphBuildContext`, so the fallback is an O(1) lookup
+/// instead of a linear scan over every registered return type. pyre-only
+/// resolution aid — RPython carries the callee's `concretetype` on the
+/// annotated op, so there is no name-suffix resolution upstream.
+#[derive(Debug, Clone, Default)]
+struct MethodSuffixIndex {
+    by_suffix: HashMap<(String, String), SuffixMatch>,
+}
+
+impl MethodSuffixIndex {
+    fn from_fn_return_types(map: &HashMap<String, String>) -> Self {
+        let mut by_suffix: HashMap<(String, String), SuffixMatch> = HashMap::new();
+        for key in map.keys() {
+            let Some((owner, method)) = key.rsplit_once("::") else {
+                continue;
+            };
+            let leaf = owner.rsplit("::").next().unwrap_or(owner);
+            match by_suffix.entry((leaf.to_string(), method.to_string())) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(SuffixMatch::Unique(key.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if let SuffixMatch::Unique(existing) = o.get()
+                        && existing != key
+                    {
+                        o.insert(SuffixMatch::Ambiguous);
+                    }
+                }
+            }
+        }
+        Self { by_suffix }
+    }
+
+    /// The unique `fn_return_types` key whose last two segments are
+    /// `(receiver_leaf, method)`, or `None` when no key or more than one
+    /// key carries that suffix.
+    fn unique_key(&self, receiver_leaf: &str, method: &str) -> Option<&str> {
+        match self
+            .by_suffix
+            .get(&(receiver_leaf.to_string(), method.to_string()))?
+        {
+            SuffixMatch::Unique(key) => Some(key.as_str()),
+            SuffixMatch::Ambiguous => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1890,6 +1964,11 @@ struct GraphBuildContext<'a> {
     /// Maps function name (or "Type::method") → return type string.
     /// Used by array_type_id_from_expr to resolve Call/MethodCall expressions.
     fn_return_types: &'a HashMap<String, String>,
+    /// O(1) leaf-suffix resolver over `fn_return_types`, built once per
+    /// whole-program build and shared across every per-function context.
+    /// Consulted by `lookup_method_return_type` when the exact
+    /// `receiver::method` key misses.
+    method_suffix_index: &'a MethodSuffixIndex,
     /// Module path prefix for qualifying bare type names.
     /// RPython: lltype identity is globally unique — bare "Foo" in mod "a"
     /// must resolve to "a::Foo" in struct_fields lookups.
@@ -2524,6 +2603,7 @@ impl<'a> GraphBuildContext<'a> {
     fn new(
         struct_fields: &'a StructFieldRegistry,
         fn_return_types: &'a HashMap<String, String>,
+        method_suffix_index: &'a MethodSuffixIndex,
         module_prefix: &str,
         use_imports: HashMap<String, String>,
         known_struct_names: &'a std::collections::HashSet<String>,
@@ -2541,6 +2621,7 @@ impl<'a> GraphBuildContext<'a> {
             local_closure_returns: HashMap::new(),
             struct_fields,
             fn_return_types,
+            method_suffix_index,
             module_prefix: module_prefix.to_string(),
             source_module: String::new(),
             use_imports,
@@ -3773,6 +3854,7 @@ fn build_function_graph(
     self_ty_root: Option<String>,
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
+    method_suffix_index: &MethodSuffixIndex,
     module_prefix: &str,
     source_module: &str,
     use_imports: &HashMap<String, String>,
@@ -3793,6 +3875,7 @@ fn build_function_graph(
     let mut ctx = GraphBuildContext::new(
         struct_fields,
         fn_return_types,
+        method_suffix_index,
         module_prefix,
         use_imports.clone(),
         known_struct_names,
@@ -4163,11 +4246,13 @@ pub fn lower_stmt_pub(
     let mut block = block;
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
+    let empty_suffix_index = MethodSuffixIndex::default();
     let empty_names = std::collections::HashSet::new();
     let empty_trait_names = std::collections::HashSet::new();
     let mut ctx = GraphBuildContext::new(
         &empty_registry,
         &empty_fn_ret,
+        &empty_suffix_index,
         "",
         HashMap::new(),
         &empty_names,
@@ -9638,26 +9723,14 @@ fn lookup_method_return_type<'a>(
         return Some(ret);
     }
 
-    let method_name = method.to_string();
-    let receiver_leaf = receiver_root.rsplit("::").next().unwrap_or(receiver_root);
     // Rust imports can make the call-site owner path shorter or longer
     // than the impl key. Use the leaf owner only when it is unambiguous.
-    let mut matches = ctx.fn_return_types.iter().filter_map(|(key, ret)| {
-        let (owner, candidate_method) = key.rsplit_once("::")?;
-        if candidate_method == method_name.as_str()
-            && owner.rsplit("::").next().unwrap_or(owner) == receiver_leaf
-        {
-            Some(ret)
-        } else {
-            None
-        }
-    });
-    let first = matches.next()?;
-    if matches.next().is_none() {
-        Some(first)
-    } else {
-        None
-    }
+    let method_name = method.to_string();
+    let receiver_leaf = receiver_root.rsplit("::").next().unwrap_or(receiver_root);
+    let key = ctx
+        .method_suffix_index
+        .unique_key(receiver_leaf, &method_name)?;
+    ctx.fn_return_types.get(key)
 }
 
 /// Extract the trait root from a type-string when the type is a trait
@@ -14094,11 +14167,13 @@ mod tests {
 
         let empty_registry = StructFieldRegistry::default();
         let empty_fn_ret = HashMap::new();
+        let empty_suffix_index = MethodSuffixIndex::default();
         let empty_names = std::collections::HashSet::new();
         let empty_trait_names = std::collections::HashSet::new();
         let mut ctx = GraphBuildContext::new(
             &empty_registry,
             &empty_fn_ret,
+            &empty_suffix_index,
             "",
             HashMap::new(),
             &empty_names,
@@ -15211,9 +15286,12 @@ mod tests {
         known_struct_names: &'a std::collections::HashSet<String>,
         known_trait_names: &'a std::collections::HashSet<String>,
     ) -> GraphBuildContext<'a> {
+        static EMPTY_SUFFIX_INDEX: std::sync::OnceLock<MethodSuffixIndex> =
+            std::sync::OnceLock::new();
         GraphBuildContext::new(
             struct_fields,
             fn_return_types,
+            EMPTY_SUFFIX_INDEX.get_or_init(MethodSuffixIndex::default),
             "",
             HashMap::new(),
             known_struct_names,
