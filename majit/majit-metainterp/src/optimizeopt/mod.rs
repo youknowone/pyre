@@ -4867,15 +4867,6 @@ impl OptContext {
             .and_then(|b| b.const_value())
     }
 
-    /// Register a concrete runtime value for an OpRef by writing it to
-    /// the corresponding `BoxRef`'s per-type mixin slot (RPython
-    /// `IntOp._resint` / `RefOp._resref` / `FloatOp._resfloat`).
-    pub fn register_runtime_value(&mut self, opref: OpRef, value: Value) {
-        if let Some(box_ref) = self.box_pool.get_at_position(opref.raw() as usize) {
-            box_ref.set_value(value);
-        }
-    }
-
     /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
     /// — extract the concrete runtime value carried by an OpRef.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
