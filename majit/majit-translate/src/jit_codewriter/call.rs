@@ -508,6 +508,18 @@ pub struct CallControl {
     /// they use `function_graphs` directly via `[impl_type, method_name]`.
     trait_method_impls: HashMap<(String, String), Vec<String>>,
 
+    /// O(1) index over `trait_method_impls` keyed by method name alone:
+    /// `method_name → [impl_type, …]` across every declaring trait.
+    /// Maintained incrementally in `register_trait_method` so
+    /// `impls_for_method_name` is a single lookup instead of a linear scan
+    /// over every `(trait_root, method_name)` entry (the effect analysis
+    /// runs that scan tens of thousands of times via `target_to_path`'s
+    /// trait-resolution fallback). Each entry mirrors the exact push order
+    /// into `trait_method_impls`, so the resolved multiset is identical.
+    /// pyre-only resolution aid — RPython keys candidate lookup on the
+    /// call op's exact candidate-graph list, not on a method-name global.
+    method_to_impl_types: HashMap<String, Vec<String>>,
+
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
     candidate_graphs: HashSet<CallPath>,
@@ -1051,6 +1063,7 @@ impl CallControl {
             method_suffix_index: HashMap::new(),
             function_hints: HashMap::new(),
             trait_method_impls: HashMap::new(),
+            method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
             portal_targets: HashSet::new(),
             jitdrivers_sd: Vec::new(),
@@ -1989,6 +2002,10 @@ impl CallControl {
         if let Some(trait_root) = trait_root {
             self.trait_method_impls
                 .entry((trait_root.to_string(), method_name.to_string()))
+                .or_default()
+                .push(impl_type.to_string());
+            self.method_to_impl_types
+                .entry(method_name.to_string())
                 .or_default()
                 .push(impl_type.to_string());
         }
@@ -3396,10 +3413,10 @@ impl CallControl {
     /// lookup uses the exact `(trait_root, method_name)` key via
     /// `all_impls_for_indirect` instead.
     fn impls_for_method_name<'b>(&'b self, method_name: &str) -> Vec<&'b String> {
-        self.trait_method_impls
-            .iter()
-            .filter(|((_, m), _)| m == method_name)
-            .flat_map(|(_, impls)| impls.iter())
+        self.method_to_impl_types
+            .get(method_name)
+            .into_iter()
+            .flatten()
             .collect()
     }
 
