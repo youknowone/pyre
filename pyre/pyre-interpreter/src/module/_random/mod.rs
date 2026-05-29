@@ -30,7 +30,11 @@ fn xorshift(state: u64) -> u64 {
 
 #[crate::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
-    weakrefable
+    weakrefable,
+    // Smoke probe for the `base = <expr>` arm — `object` is the implicit
+    // default, so this is behaviorally identical while exercising the
+    // declarative-base plumbing end-to-end.
+    base = crate::typedef::w_object()
 )]
 impl W_Random {
     fn __init__(&mut self, #[default(DEFAULT_SEED as i64)] seed: i64) {

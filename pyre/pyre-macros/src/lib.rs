@@ -1199,6 +1199,11 @@ struct PyreMethodsAttrs {
     doc: Option<syn::LitStr>,
     weakrefable: bool,
     unhashable: bool,
+    /// Optional base class expression — the `__base` of the TypeDef.
+    /// Mirrors `TypeDef("X", __base=W_Base.typedef)` in
+    /// `pypy/interpreter/typedef.py`.  Defaults to `w_object()` (the
+    /// `object` base) when omitted.
+    base: Option<syn::Expr>,
 }
 
 impl syn::parse::Parse for PyreMethodsAttrs {
@@ -1216,12 +1221,16 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                 }
                 "weakrefable" => out.weakrefable = true,
                 "unhashable" => out.unhashable = true,
+                "base" => {
+                    input.parse::<syn::Token![=]>()?;
+                    out.base = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `#[pyre_methods]` key `{other}` — expected \
-                             `doc = \"...\"` / `weakrefable` / `unhashable`",
+                             `doc = \"...\"` / `weakrefable` / `unhashable` / `base = <expr>`",
                         ),
                     ));
                 }
@@ -1791,6 +1800,13 @@ fn expand_pyre_methods(
         rewrite_alias_args(&mut m.sig);
     }
 
+    // Base class for the TypeDef.  `#[pyre_methods(base = <expr>)]`
+    // supplies the parent type; absent it, the class inherits `object`.
+    let base_expr = match &attrs.base {
+        Some(e) => quote! { #e },
+        None => quote! { crate::typedef::w_object() },
+    };
+
     let type_object_fn = quote! {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
             thread_local! {
@@ -1802,7 +1818,7 @@ fn expand_pyre_methods(
                     let tp = crate::typedef::make_builtin_type_with_layout(
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                         |ns| { #(#registrations)* },
-                        crate::typedef::w_object(),
+                        #base_expr,
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                     );
                     ::pyre_object::pyobject::set_instantiate(
