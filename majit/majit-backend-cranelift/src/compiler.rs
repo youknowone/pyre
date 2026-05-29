@@ -6025,24 +6025,25 @@ fn emit_guard_exit(
     // steady-state speedup over the legacy deadframe→`run_compiled_code`
     // dispatch.
     //
-    // Enabled by default on x86_64.  The cranelift x86_64 Tail-conv
-    // lowering (`return_call_indirect`) is balanced — verified by
-    // `tests/tail_sp_leak.rs`, which tail-calls 5M times with zero SP
-    // drift.  The historical "gate off" note blamed a ~12.5 bytes/take SP
-    // leak in `emit_return_call_common_sequence`; that diagnosis was wrong
-    // for x86_64.  The real stack growth came from
+    // Enabled by default on x86_64 and aarch64.  The cranelift Tail-conv
+    // lowering (`return_call_indirect`) is balanced — verified on both
+    // arches by `tests/tail_sp_leak.rs`, which tail-calls 5M times with
+    // zero SP drift.  The historical "gate off" note blamed a
+    // ~12.5 bytes/take SP leak in `emit_return_call_common_sequence`; that
+    // diagnosis was wrong.  The real stack growth came from
     // `emit_attached_bridge_dispatch` doing a nested call+return into the
     // bridge: under closing_jump the bridge tail-calls forward and never
     // returns, stranding one return frame per dispatch until the prologue
     // stack check raised RecursionError.  Fixed by making the bridge
     // dispatch a tail-call too (see `emit_attached_bridge_dispatch`); with
-    // that, nbody/spectral/fannkuch match dynasm exactly under the gate.
+    // that, nbody/spectral/fannkuch match dynasm exactly on both arches.
     //
-    // aarch64 stays off: the Tail-conv lowering concerns documented above
-    // were observed there and have not been re-verified post-fix.
-    // `PYRE_CL_NO_CLOSING_JUMP` is an opt-out hatch for A/B and rollback.
+    // aarch64 re-verified post-fix (cranelift 0.132): tail_sp_leak.rs has
+    // zero drift, nbody_50k matches the reference exactly, and the full
+    // bench suite is correct.  `PYRE_CL_NO_CLOSING_JUMP` is an opt-out
+    // hatch for A/B and rollback.
     if let Some((ll_loop_code_addr, label_block_id_addr)) = info.external_jump_ll_loop_code_addr {
-        let enabled = cfg!(target_arch = "x86_64")
+        let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             && std::env::var_os("PYRE_CL_NO_CLOSING_JUMP").is_none();
         if enabled {
             emit_attached_loop_dispatch(
