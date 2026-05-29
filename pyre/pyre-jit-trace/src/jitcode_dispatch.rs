@@ -672,6 +672,19 @@ pub enum DispatchError {
     /// variant fires only when test fixtures (or future deviations)
     /// route a non-CallDescr into a residual_call slot.
     ResidualCallDescrNotCallDescr { pc: usize, descr_index: usize },
+    /// A residual_call argument resolved to `OpRef::NONE` — an unbound
+    /// register.  RPython's `do_residual_call` reads every argbox out of
+    /// `env[box]`, so a missing binding is a `KeyError` there; the
+    /// cranelift/dynasm backends mirror that as a hard `resolve_opref`
+    /// assert when `OpRef::NONE` reaches arg-resolution.  A per-opcode
+    /// arm whose body forwards an unseeded dispatcher parameter (e.g. a
+    /// seam wrapper that residualizes `execute_<op>(executor, code,
+    /// instruction, op_arg)` — only `executor`=r0 is seeded at the arm
+    /// entry, so `code`/`instruction`/`op_arg` stay `OpRef::NONE`) would
+    /// record such a call.  Surfacing it here turns the would-be backend
+    /// crash into a graceful trace abort, matching the pre-seam inline
+    /// arm whose payload read aborted with `GotoIfNotValueNotConcrete`.
+    ResidualCallArgUnbound { pc: usize, arg_index: usize },
     /// `switch/id` decoded a descr that does not implement
     /// `SwitchDescr`. RPython parity: `pyjitpl.py:601` asserts
     /// `isinstance(switchdict, SwitchDictDescr)`.
@@ -2845,6 +2858,24 @@ fn build_allboxes(
     allboxes
 }
 
+/// Reject a residual_call whose `allboxes` (funcbox + permuted args)
+/// contains an `OpRef::NONE`.  RPython's `do_residual_call` resolves
+/// each argbox through `env[box]`, where an unbound box is a `KeyError`;
+/// recording the op anyway lets `OpRef::NONE` reach the backend's
+/// `resolve_opref`, which aborts the process.  Returning
+/// `ResidualCallArgUnbound` instead lets the outer walker fall back to a
+/// trace abort — the same graceful outcome a pre-seam inline arm reached
+/// when its payload read surfaced `GotoIfNotValueNotConcrete`.
+fn ensure_residual_call_args_bound(
+    allboxes: &[OpRef],
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if let Some(arg_index) = allboxes.iter().position(|b| b.is_none()) {
+        return Err(DispatchError::ResidualCallArgUnbound { pc, arg_index });
+    }
+    Ok(())
+}
+
 /// Decode the descr index from a 2-byte LE operand. Companion to
 /// [`read_descr`] for callers that need the raw index for error
 /// reporting (e.g. `ResidualCallDescrNotCallDescr`).
@@ -4029,6 +4060,7 @@ fn dispatch_residual_call_iRd_kind(
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
@@ -4233,6 +4265,7 @@ fn dispatch_residual_call_iIRd_kind(
     argboxes.extend_from_slice(&r_args);
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
+    ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
@@ -4369,6 +4402,7 @@ fn dispatch_residual_call_iIRFd_kind(
     argboxes.extend_from_slice(&f_args);
     argbox_types.extend(std::iter::repeat(Type::Float).take(f_args.len()));
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
+    ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
