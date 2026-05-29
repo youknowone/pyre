@@ -118,6 +118,7 @@ macro_rules! py_module {
     (
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, exceptions: { $($exc_key:literal => $exc_base:expr),* $(,)? })?
         $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
         $(, inline_app: { $($inline_src:literal => [ $($inline_name:literal),* $(,)? ]),* $(,)? })?
         $(, inline_functions: {
@@ -134,6 +135,23 @@ macro_rules! py_module {
             let _name = $name;
             $($(
                 $crate::dict_storage_store(ns, $key, $value);
+            )*)?
+            // exceptions: module-local exception classes — PyPy
+            // `new_exception_class("<mod>.Name", base)` (error.py:857).
+            // The class name is auto-qualified as `"<$name>.<key>"` and
+            // built via `make_exc_type` (which also records it in the
+            // exc-class registry); the short `key` is the attribute name
+            // stored in the module dict.  The RHS is the base class
+            // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
+            $($(
+                $crate::dict_storage_store(
+                    ns, $exc_key,
+                    $crate::builtins::make_exc_type(
+                        ::std::concat!($name, ".", $exc_key),
+                        $crate::builtins::exc_exception_new,
+                        $exc_base,
+                    ),
+                );
             )*)?
             // appleveldefs: bundle Python source via `include_str!` at
             // compile time, then resolve each name through

@@ -126,6 +126,13 @@ crate::py_module! {
         "_path_bytes" => crate::make_builtin_function("_path_bytes", _path_bytes),
         "_unwrap_alias_probe" => crate::make_builtin_function("_unwrap_alias_probe", _unwrap_alias_probe),
     },
+    exceptions: {
+        // Smoke probe for the `exceptions:` arm — builds a module-local
+        // `_random._ProbeError(Exception)` via `make_exc_type`, mirroring
+        // PyPy `new_exception_class("_random._ProbeError", space.w_Exception)`.
+        "_ProbeError" => crate::builtins::lookup_exc_class("Exception")
+            .expect("Exception must be installed before _random init"),
+    },
     appleveldefs: {
         "app_random.py" => ["_ascii_seed"],
     },
