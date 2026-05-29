@@ -843,6 +843,49 @@ fn phase4_insn_opname_key(insn: &super::flatten::Insn) -> String {
     }
 }
 
+/// Invert `walker_slot_for_variable` (`VariableId -> Option<slot>`) into
+/// `slot -> Option<VariableId>` over `[0, total_pre)`.  The walker pins
+/// each scratch/inputarg Variable to its pre-regalloc PyFrame slot; this
+/// inversion recovers the Variable that occupies a given slot so the
+/// canonical graph coloring (`regallocs[Ref].getcolor(v)`,
+/// `flatten.py:382-391`) can be looked up per slot.  When two Variables
+/// pin to the same slot the last writer wins, matching the dense
+/// side-table's own overwrite semantics.
+fn invert_walker_slot_for_variable(
+    walker_slot_for_variable: &[Option<u16>],
+    total_pre: usize,
+) -> Vec<Option<u32>> {
+    let mut slot_to_variable_id: Vec<Option<u32>> = vec![None; total_pre];
+    for (variable_id, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
+        if let Some(slot) = maybe_slot {
+            let slot_idx = *slot as usize;
+            if slot_idx < slot_to_variable_id.len() {
+                slot_to_variable_id[slot_idx] = Some(variable_id as u32);
+            }
+        }
+    }
+    slot_to_variable_id
+}
+
+/// Canonical Ref-register colour for a pre-regalloc PyFrame slot:
+/// `regallocs[Ref].getcolor(slot_to_variable_id[pre_slot])`
+/// (`flatten.py:382-391`).  Returns `None` when no Variable is bound to
+/// the slot (the slot is dead in the graph) or the bound Variable has no
+/// colour, so callers choose their own fallback (the diff probe counts
+/// it; a production canonical metadata build would keep the identity
+/// layout).
+fn canonical_ref_color_for_slot(
+    ref_alloc: &super::regalloc::GraphAllocationResult,
+    slot_to_variable_id: &[Option<u32>],
+    pre_slot: usize,
+) -> Option<u16> {
+    let var_id = slot_to_variable_id.get(pre_slot).copied().flatten()?;
+    ref_alloc
+        .coloring
+        .get(&super::flow::VariableId(var_id))
+        .copied()
+}
+
 /// Diagnostic helper: tally per-opname occurrences of the given Insn
 /// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
 /// resulting `Vec<(String, i64)>` is sortable and comparable across
@@ -10618,42 +10661,33 @@ impl CodeWriter {
         //              `walker_slot_for_variable`.
         if phase4_diff_canonical {
             let total_pre = stack_base as usize + max_stackdepth as usize;
-            let mut slot_to_variable_id: Vec<Option<u32>> = vec![None; total_pre];
-            for (variable_id, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
-                if let Some(slot) = maybe_slot {
-                    let slot_idx = *slot as usize;
-                    if slot_idx < slot_to_variable_id.len() {
-                        slot_to_variable_id[slot_idx] = Some(variable_id as u32);
-                    }
-                }
-            }
-            let ref_coloring = &graph_regallocs[super::flatten::Kind::Ref.index()].coloring;
+            let slot_to_variable_id =
+                invert_walker_slot_for_variable(&walker_slot_for_variable, total_pre);
+            let ref_alloc = &graph_regallocs[super::flatten::Kind::Ref.index()];
             let probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
-                if let Some(var_id) = slot_to_variable_id.get(pre_slot).copied().flatten() {
-                    let v_id = super::flow::VariableId(var_id);
-                    if let Some(&canonical_color) = ref_coloring.get(&v_id) {
+                if slot_to_variable_id
+                    .get(pre_slot)
+                    .copied()
+                    .flatten()
+                    .is_none()
+                {
+                    return (0u32, 0u32, 0u32); // no variable bound to slot — uncounted
+                }
+                match canonical_ref_color_for_slot(ref_alloc, &slot_to_variable_id, pre_slot) {
+                    Some(canonical_color) => {
                         if canonical_color != walker_color {
                             eprintln!(
                                 "[phase4-color-mismatch] graph={} kind={label} \
                                  pre_slot={pre_slot} walker={walker_color} \
                                  canonical={canonical_color} var={}",
-                                ssarepr.name, var_id,
+                                ssarepr.name,
+                                slot_to_variable_id[pre_slot].unwrap(),
                             );
                         }
-                        return (
-                            1u32,
-                            if canonical_color == walker_color {
-                                1
-                            } else {
-                                0
-                            },
-                            0u32,
-                        );
-                    } else {
-                        return (1u32, 0u32, 1u32); // walker-only (no canonical entry)
+                        (1u32, (canonical_color == walker_color) as u32, 0u32)
                     }
+                    None => (1u32, 0u32, 1u32), // walker-only (no canonical entry)
                 }
-                (0u32, 0u32, 0u32) // no variable bound to slot — uncounted
             };
             let mut stack_probed = 0u32;
             let mut stack_match = 0u32;
@@ -10702,7 +10736,7 @@ impl CodeWriter {
                     input_idx += 1;
                     continue;
                 }
-                let canonical_color = ref_coloring.get(&v.id).copied();
+                let canonical_color = ref_alloc.coloring.get(&v.id).copied();
                 eprintln!(
                     "[phase4-inputarg] graph={} input_idx={input_idx} var={} canonical_color={:?}",
                     ssarepr.name, v.id.0, canonical_color,
@@ -11427,6 +11461,46 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
+
+    /// `invert_walker_slot_for_variable` recovers slot → Variable from
+    /// the walker's Variable → slot pinning, last-writer-wins on a
+    /// shared slot, and `canonical_ref_color_for_slot` resolves the
+    /// bound Variable's colour through `regallocs[Ref]` (returning `None`
+    /// for an unbound slot or an uncoloured Variable).
+    #[test]
+    fn canonical_ref_color_source_resolves_via_slot_inversion() {
+        // VariableId 7 pinned to slot 2, VariableId 9 pinned to slot 0.
+        let walker_slot_for_variable: Vec<Option<u16>> =
+            vec![None, None, None, None, None, None, None, Some(2), None, Some(0)];
+        let slot_to_variable_id = invert_walker_slot_for_variable(&walker_slot_for_variable, 4);
+        assert_eq!(slot_to_variable_id, vec![Some(9), None, Some(7), None]);
+
+        let mut coloring = std::collections::HashMap::new();
+        coloring.insert(VariableId(9), 5u16);
+        coloring.insert(VariableId(7), 3u16);
+        let ref_alloc = crate::jit::regalloc::GraphAllocationResult {
+            coloring,
+            num_colors: 6,
+        };
+        // slot 0 → var 9 → colour 5; slot 2 → var 7 → colour 3.
+        assert_eq!(
+            canonical_ref_color_for_slot(&ref_alloc, &slot_to_variable_id, 0),
+            Some(5)
+        );
+        assert_eq!(
+            canonical_ref_color_for_slot(&ref_alloc, &slot_to_variable_id, 2),
+            Some(3)
+        );
+        // slot 1 → unbound; slot 3 → unbound; out-of-range slot.
+        assert_eq!(
+            canonical_ref_color_for_slot(&ref_alloc, &slot_to_variable_id, 1),
+            None
+        );
+        assert_eq!(
+            canonical_ref_color_for_slot(&ref_alloc, &slot_to_variable_id, 9),
+            None
+        );
+    }
 
     /// Tail-strip pass folds a `goto + Unreachable` tail into the
     /// following block when the goto's target name matches a leading
