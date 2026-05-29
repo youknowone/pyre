@@ -2165,6 +2165,230 @@ pub fn execute_unpack_ex<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+// Handlers for arms that index the `CodeObject` constant/name pools: the
+// dispatch forwards `code` alongside `instruction`/`op_arg`.
+pub fn execute_load_const<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ConstantOpcodeHandler,
+{
+    let Instruction::LoadConst { consti } = instruction else {
+        unreachable!()
+    };
+    let const_idx = consti.get(op_arg);
+    executor.load_const(&code.constants[const_idx])?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_name<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::StoreName { namei } = instruction else {
+        unreachable!()
+    };
+    let idx = u32_as_usize(namei.get(op_arg));
+    executor.store_name(code.names[idx].as_ref(), idx)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_global<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::StoreGlobal { namei } = instruction else {
+        unreachable!()
+    };
+    let idx = u32_as_usize(namei.get(op_arg));
+    executor.store_global(code.names[idx].as_ref(), idx)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_name<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::LoadName { namei } = instruction else {
+        unreachable!()
+    };
+    let idx = u32_as_usize(namei.get(op_arg));
+    executor.load_name(code.names[idx].as_ref(), idx)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_global<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::LoadGlobal { namei } = instruction else {
+        unreachable!()
+    };
+    let raw = u32_as_usize(namei.get(op_arg));
+    let name_idx = raw >> 1;
+    let push_null = (raw & 1) != 0;
+    executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_name<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DeleteName { namei } = instruction else {
+        unreachable!()
+    };
+    executor.delete_name(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_global<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DeleteGlobal { namei } = instruction else {
+        unreachable!()
+    };
+    executor.delete_global(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_attr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DeleteAttr { namei } = instruction else {
+        unreachable!()
+    };
+    executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_import_name<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ImportName { namei } = instruction else {
+        unreachable!()
+    };
+    let name_idx = u32_as_usize(namei.get(op_arg));
+    executor.import_name(code.names[name_idx].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_import_from<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ImportFrom { namei } = instruction else {
+        unreachable!()
+    };
+    let name_idx = u32_as_usize(namei.get(op_arg));
+    executor.import_from(code.names[name_idx].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_attr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::LoadAttr { namei } = instruction else {
+        unreachable!()
+    };
+    let attr = namei.get(op_arg);
+    let name_idx = u32_as_usize(attr.name_idx());
+    let name = code.names[name_idx].as_ref();
+    if attr.is_method() {
+        executor.load_method(name)?;
+    } else {
+        OpcodeStepExecutor::load_attr(executor, name)?;
+    }
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_from_dict_or_globals<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadFromDictOrGlobals { i } = instruction else {
+        unreachable!()
+    };
+    let idx = u32_as_usize(i.get(op_arg));
+    executor.load_from_dict_or_globals(code.names[idx].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_from_dict_or_deref<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadFromDictOrDeref { i } = instruction else {
+        unreachable!()
+    };
+    let idx = i.get(op_arg).as_usize();
+    executor.load_from_dict_or_deref(idx, code.names[idx].as_ref())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_super_attr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadSuperAttr { .. } = instruction else {
+        unreachable!()
+    };
+    let raw = op_arg_as_usize(op_arg);
+    let idx = raw >> 2;
+    let name = &code.names[idx];
+    let is_method = (raw & 1) != 0;
+    executor.load_super_attr_with(name, is_method)?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -2191,11 +2415,7 @@ where
         | Instruction::Cache
         | Instruction::NotTaken => Ok(StepResult::Continue),
 
-        Instruction::LoadConst { consti } => {
-            let const_idx = consti.get(op_arg);
-            executor.load_const(&code.constants[const_idx])?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadConst { .. } => execute_load_const(executor, code, instruction, op_arg),
 
         Instruction::LoadSmallInt { .. } => execute_load_small_int(executor, instruction, op_arg),
 
@@ -2265,31 +2485,13 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::StoreName { namei } => {
-            let idx = u32_as_usize(namei.get(op_arg));
-            executor.store_name(code.names[idx].as_ref(), idx)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::StoreName { .. } => execute_store_name(executor, code, instruction, op_arg),
 
-        Instruction::StoreGlobal { namei } => {
-            let idx = u32_as_usize(namei.get(op_arg));
-            executor.store_global(code.names[idx].as_ref(), idx)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::StoreGlobal { .. } => execute_store_global(executor, code, instruction, op_arg),
 
-        Instruction::LoadName { namei } => {
-            let idx = u32_as_usize(namei.get(op_arg));
-            executor.load_name(code.names[idx].as_ref(), idx)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadName { .. } => execute_load_name(executor, code, instruction, op_arg),
 
-        Instruction::LoadGlobal { namei } => {
-            let raw = u32_as_usize(namei.get(op_arg));
-            let name_idx = raw >> 1;
-            let push_null = (raw & 1) != 0;
-            executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadGlobal { .. } => execute_load_global(executor, code, instruction, op_arg),
 
         Instruction::PopTop => execute_pop_top(executor),
 
@@ -2375,21 +2577,7 @@ where
 
         Instruction::PopIter => execute_pop_iter(executor),
 
-        Instruction::LoadAttr { namei } => {
-            let attr = namei.get(op_arg);
-            let name_idx = u32_as_usize(attr.name_idx());
-            let name = code.names[name_idx].as_ref();
-            if attr.is_method() {
-                // Delegate to load_method — the default pushes [attr, NULL].
-                // PyFrame overrides this to push [attr, self] for instance
-                // method calls. This avoids runtime branches in the shared
-                // path that would cause trace/concrete divergence.
-                executor.load_method(name)?;
-            } else {
-                OpcodeStepExecutor::load_attr(executor, name)?;
-            }
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadAttr { .. } => execute_load_attr(executor, code, instruction, op_arg),
 
         Instruction::StoreAttr { namei } => {
             let name_idx = u32_as_usize(namei.get(op_arg));
@@ -2411,16 +2599,8 @@ where
         Instruction::DeleteDeref { .. } => execute_delete_deref(executor, instruction, op_arg),
 
         // ── Import ──
-        Instruction::ImportName { namei } => {
-            let name_idx = u32_as_usize(namei.get(op_arg));
-            executor.import_name(code.names[name_idx].as_ref())?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::ImportFrom { namei } => {
-            let name_idx = u32_as_usize(namei.get(op_arg));
-            executor.import_from(code.names[name_idx].as_ref())?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ImportName { .. } => execute_import_name(executor, code, instruction, op_arg),
+        Instruction::ImportFrom { .. } => execute_import_from(executor, code, instruction, op_arg),
 
         // ── Containment / identity tests ──
         Instruction::ContainsOp { .. } => execute_contains_op(executor, instruction, op_arg),
@@ -2516,29 +2696,13 @@ where
 
         // ── Delete ops ──
         Instruction::DeleteFast { .. } => execute_delete_fast(executor, instruction, op_arg),
-        Instruction::DeleteName { namei } => {
-            executor.delete_name(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DeleteGlobal { namei } => {
-            executor.delete_global(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DeleteAttr { namei } => {
-            executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::DeleteName { .. } => execute_delete_name(executor, code, instruction, op_arg),
+        Instruction::DeleteGlobal { .. } => execute_delete_global(executor, code, instruction, op_arg),
+        Instruction::DeleteAttr { .. } => execute_delete_attr(executor, code, instruction, op_arg),
 
         // ── Load super attr ──
         // CPython 3.12: stack = [global_super, class, self] → super(class, self).attr
-        Instruction::LoadSuperAttr { .. } => {
-            let raw = op_arg_as_usize(op_arg);
-            let idx = raw >> 2;
-            let name = &code.names[idx];
-            let is_method = (raw & 1) != 0;
-            executor.load_super_attr_with(name, is_method)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadSuperAttr { .. } => execute_load_super_attr(executor, code, instruction, op_arg),
 
         // ── Misc ──
         // SETUP_ANNOTATIONS: ensure that the current locals namespace has
@@ -2579,15 +2743,11 @@ where
         }
 
         // ── Scoping ──
-        Instruction::LoadFromDictOrGlobals { i } => {
-            let idx = u32_as_usize(i.get(op_arg));
-            executor.load_from_dict_or_globals(code.names[idx].as_ref())?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFromDictOrGlobals { .. } => {
+            execute_load_from_dict_or_globals(executor, code, instruction, op_arg)
         }
-        Instruction::LoadFromDictOrDeref { i } => {
-            let idx = i.get(op_arg).as_usize();
-            executor.load_from_dict_or_deref(idx, code.names[idx].as_ref())?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFromDictOrDeref { .. } => {
+            execute_load_from_dict_or_deref(executor, code, instruction, op_arg)
         }
 
         // ── Pattern matching (Python 3.10+) ──
