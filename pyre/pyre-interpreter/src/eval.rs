@@ -3124,7 +3124,9 @@ impl OpcodeStepExecutor for PyFrame {
             } else if pyre_object::is_list(value) {
                 pyre_object::w_list_items_copy_as_vec(value)
             } else {
-                return Err(PyError::type_error("cannot unpack non-sequence"));
+                // Any other iterable is materialised via the iteration
+                // protocol, matching `unpack_sequence_exact`'s fallback.
+                crate::builtins::collect_iterable(value)?
             }
         };
 
