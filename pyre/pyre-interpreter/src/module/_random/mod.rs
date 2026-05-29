@@ -130,6 +130,11 @@ crate::py_module! {
         "_path_bytes" => crate::make_builtin_function("_path_bytes", _path_bytes),
         "_unwrap_alias_probe" => crate::make_builtin_function("_unwrap_alias_probe", _unwrap_alias_probe),
     },
+    int_constants: {
+        // Smoke probe for the `int_constants:` arm — registers a plain
+        // integer module constant via `w_int_new`.
+        "_PROBE_CONST" => 42,
+    },
     exceptions: {
         // Smoke probe for the `exceptions:` arm — builds a module-local
         // `_random._ProbeError(Exception)` via `make_exc_type`, mirroring

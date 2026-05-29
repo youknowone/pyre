@@ -118,6 +118,7 @@ macro_rules! py_module {
     (
         $name:literal
         $(, interpleveldefs: { $($key:literal => $value:expr),* $(,)? })?
+        $(, int_constants: { $($int_key:literal => $int_value:expr),* $(,)? })?
         $(, exceptions: { $($exc_key:literal => $exc_base:expr),* $(,)? })?
         $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
         $(, inline_app: { $($inline_src:literal => [ $($inline_name:literal),* $(,)? ]),* $(,)? })?
@@ -135,6 +136,17 @@ macro_rules! py_module {
             let _name = $name;
             $($(
                 $crate::dict_storage_store(ns, $key, $value);
+            )*)?
+            // int_constants: integer module constants — PyPy MixedModule
+            // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
+            // common int case (errno/fcntl/select flags).  Each `$int_value`
+            // is an `i64`-valued expression wrapped via `w_int_new`, saving
+            // the per-entry `dict_storage_store(ns, k, w_int_new(v))`.
+            $($(
+                $crate::dict_storage_store(
+                    ns, $int_key,
+                    ::pyre_object::w_int_new($int_value as i64),
+                );
             )*)?
             // exceptions: module-local exception classes — PyPy
             // `new_exception_class("<mod>.Name", base)` (error.py:857).
