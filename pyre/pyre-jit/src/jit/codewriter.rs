@@ -782,9 +782,7 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// still respecting the env value at process start.
 fn pypy_walker_graph_only() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1"))
 }
 
 /// `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)` emits a
@@ -3263,13 +3261,7 @@ fn record_residual_call_graph_op(
     // implicit GUARD_NO_EXCEPTION.  `flatten.py:206-217` recognises an
     // actually-raising block by scanning this trailing `-live-`.
     if can_raise {
-        record_graph_op(
-            block,
-            super::flatten::OPNAME_LIVE,
-            Vec::new(),
-            None,
-            offset,
-        );
+        record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     }
     result_var
 }
@@ -10050,6 +10042,25 @@ impl CodeWriter {
                         canonical_ssarepr.name,
                     );
                 }
+                // #124(b).2 — quantify the dense→sparse `-live-` gap:
+                // the walker emits one `-live-` per Python PC (dense,
+                // backing the per-PC pc_byte_positions side-table);
+                // canonical emits `-live-` only trailing canraise +
+                // leading goto_if_not/switch (sparse).  The walker count
+                // is the dense side #287 retires; the canonical count is
+                // the sparse target the runtime resume must resolve
+                // against.
+                let walker_live = ssarepr.insns.iter().filter(|i| i.is_live()).count();
+                let canonical_live = canonical_ssarepr
+                    .insns
+                    .iter()
+                    .filter(|i| i.is_live())
+                    .count();
+                eprintln!(
+                    "[phase4-live-count] graph={} walker_live={walker_live} \
+                     canonical_live={canonical_live}",
+                    canonical_ssarepr.name,
+                );
                 // Per-opname tally so walker-only and
                 // canonical-only opnames are named.  Walker emits more
                 // insns than canonical (slice 3 finding); slicing the
@@ -11527,8 +11538,18 @@ mod tests {
     #[test]
     fn canonical_ref_color_source_resolves_via_slot_inversion() {
         // VariableId 7 pinned to slot 2, VariableId 9 pinned to slot 0.
-        let walker_slot_for_variable: Vec<Option<u16>> =
-            vec![None, None, None, None, None, None, None, Some(2), None, Some(0)];
+        let walker_slot_for_variable: Vec<Option<u16>> = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(2),
+            None,
+            Some(0),
+        ];
         let slot_to_variable_id = invert_walker_slot_for_variable(&walker_slot_for_variable, 4);
         assert_eq!(slot_to_variable_id, vec![Some(9), None, Some(7), None]);
 
