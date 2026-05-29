@@ -1468,6 +1468,124 @@ pub fn execute_pop_top<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+// Per-opcode handlers lifted out of `execute_opcode_step`'s match (same
+// seam as `execute_pop_top`): each dispatch arm becomes a single
+// tail-call so the Charon/MIR front-end emits a standalone graph the JIT
+// resolves by name instead of re-lowering the arm body through the
+// syn-AST walker.
+pub fn execute_push_null<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    executor.push_null()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_unary_negative<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ArithmeticOpcodeHandler,
+{
+    executor.unary_negative()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_unary_not<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: TruthOpcodeHandler,
+{
+    executor.unary_not()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_unary_invert<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ArithmeticOpcodeHandler,
+{
+    executor.unary_invert()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_iter<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: IterOpcodeHandler,
+{
+    executor.get_iter()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_end_for<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.end_for()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_pop_iter<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.pop_iter()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_subscr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.delete_subscript()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_push_exc_info<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.push_exc_info()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_pop_except<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.pop_except()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_check_exc_match<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.check_exc_match()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_to_bool<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.to_bool()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_binary_slice<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.binary_slice()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_slice<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.store_slice()?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1602,10 +1720,7 @@ where
 
         Instruction::PopTop => execute_pop_top(executor),
 
-        Instruction::PushNull => {
-            executor.push_null()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::PushNull => execute_push_null(executor),
 
         Instruction::Copy { i } => {
             executor.copy_value(u32_as_usize(i.get(op_arg)))?;
@@ -1627,20 +1742,11 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::UnaryNegative => {
-            executor.unary_negative()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::UnaryNegative => execute_unary_negative(executor),
 
-        Instruction::UnaryNot => {
-            executor.unary_not()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::UnaryNot => execute_unary_not(executor),
 
-        Instruction::UnaryInvert => {
-            executor.unary_invert()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::UnaryInvert => execute_unary_invert(executor),
 
         Instruction::JumpForward { delta } => {
             executor.jump_forward(jump_target_forward(
@@ -1717,10 +1823,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::GetIter => {
-            executor.get_iter()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::GetIter => execute_get_iter(executor),
 
         Instruction::ForIter { delta } => {
             executor.for_iter(jump_target_forward(
@@ -1731,15 +1834,9 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::EndFor => {
-            executor.end_for()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::EndFor => execute_end_for(executor),
 
-        Instruction::PopIter => {
-            executor.pop_iter()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::PopIter => execute_pop_iter(executor),
 
         Instruction::LoadAttr { namei } => {
             let attr = namei.get(op_arg);
@@ -1813,24 +1910,12 @@ where
         }
 
         // ── Delete subscript ──
-        Instruction::DeleteSubscr => {
-            executor.delete_subscript()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::DeleteSubscr => execute_delete_subscr(executor),
 
         // ── Exception handling (CPython 3.13) ──
-        Instruction::PushExcInfo => {
-            executor.push_exc_info()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::PopExcept => {
-            executor.pop_except()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::CheckExcMatch => {
-            executor.check_exc_match()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::PushExcInfo => execute_push_exc_info(executor),
+        Instruction::PopExcept => execute_pop_except(executor),
+        Instruction::CheckExcMatch => execute_check_exc_match(executor),
         Instruction::RaiseVarargs { argc } => {
             executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
@@ -1902,20 +1987,11 @@ where
         }
 
         // ── Slicing ──
-        Instruction::BinarySlice => {
-            executor.binary_slice()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::StoreSlice => {
-            executor.store_slice()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BinarySlice => execute_binary_slice(executor),
+        Instruction::StoreSlice => execute_store_slice(executor),
 
         // ── Boolean conversion ──
-        Instruction::ToBool => {
-            executor.to_bool()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ToBool => execute_to_bool(executor),
 
         // ── None comparison jumps ──
         Instruction::PopJumpIfNone { delta } => {
