@@ -1679,6 +1679,63 @@ pub fn execute_get_yield_from_iter<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+// Handlers for arms that read an instruction-embedded operand: the
+// dispatch forwards `instruction` (Copy) and `op_arg`, and the handler
+// re-destructures its own variant (the match already proved which one).
+pub fn execute_copy<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::Copy { i } = instruction else {
+        unreachable!()
+    };
+    executor.copy_value(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_swap<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: StackOpcodeHandler,
+{
+    let Instruction::Swap { i } = instruction else {
+        unreachable!()
+    };
+    executor.swap(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::StoreFast { var_num } = instruction else {
+        unreachable!()
+    };
+    executor.store_fast(var_num.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DeleteFast { var_num } = instruction else {
+        unreachable!()
+    };
+    executor.delete_fast(var_num.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1747,10 +1804,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::StoreFast { var_num } => {
-            executor.store_fast(var_num.get(op_arg).as_usize())?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::StoreFast { .. } => execute_store_fast(executor, instruction, op_arg),
 
         Instruction::LoadFastCheck { var_num } => {
             let idx = load_fast_var_num_to_index(var_num, op_arg);
@@ -1815,15 +1869,9 @@ where
 
         Instruction::PushNull => execute_push_null(executor),
 
-        Instruction::Copy { i } => {
-            executor.copy_value(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::Copy { .. } => execute_copy(executor, instruction, op_arg),
 
-        Instruction::Swap { i } => {
-            executor.swap(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::Swap { .. } => execute_swap(executor, instruction, op_arg),
 
         Instruction::BinaryOp { op } => {
             executor.binary_op(op.get(op_arg))?;
@@ -2129,10 +2177,7 @@ where
         Instruction::LoadBuildClass => execute_load_build_class(executor),
 
         // ── Delete ops ──
-        Instruction::DeleteFast { var_num } => {
-            executor.delete_fast(var_num.get(op_arg).as_usize())?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::DeleteFast { .. } => execute_delete_fast(executor, instruction, op_arg),
         Instruction::DeleteName { namei } => {
             executor.delete_name(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
             Ok(StepResult::Continue)
