@@ -1323,18 +1323,25 @@ mod tests {
         }
     }
 
+    /// Whole-program pipeline fixture: parse + lower the entire pyre
+    /// interpreter exactly once, then run every whole-program assertion
+    /// block against the shared result. `ProgramPipelineResult` holds
+    /// `Rc`-based IR (`!Send`/`!Sync`), so it cannot be shared across
+    /// cargo's parallel test threads via a `static`/`LazyLock`; merging
+    /// the formerly-separate per-block tests into one is the only way to
+    /// pay the (interpreter-size-linear) lowering cost a single time.
     #[test]
-    fn test_multi_file_analysis() {
+    fn test_full_pipeline_analysis() {
         let sources = read_all_pyre_sources();
-        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
-        let parsed_files: Vec<_> = sources
+        let source_refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let parsed_files: Vec<_> = source_refs
             .iter()
             .map(|source| parse::parse_source(source))
             .collect();
-        let result = analyze_multiple_pipeline_with_config(
-            &source_refs,
-            &crate::test_support::pyre_analyze_config(),
-        );
+        let config = crate::test_support::pyre_analyze_config();
+        // Single whole-program lowering shared by every block below.
+        let result =
+            analyze_pipeline_from_parsed(&parsed_files, &config, None, &|_, _| None, &[], &[]);
         // Walker-populated metadata mirrors the production
         // `analyze_pipeline_from_parsed` path: `extract_trait_impls`
         // lowers method bodies against this registry so the
@@ -1345,7 +1352,7 @@ mod tests {
         // fixture must populate the registries the same way production
         // does.
         let metadata = crate::front::ast::collect_program_metadata_pub(&parsed_files);
-        let trait_impls: Vec<_> = parsed_files
+        let trait_impls: Vec<TraitImplInfo> = parsed_files
             .iter()
             .flat_map(|p| {
                 parse::extract_trait_impls(
@@ -1357,6 +1364,16 @@ mod tests {
                 .expect("trait impls must lower")
             })
             .collect();
+
+        assert_multi_file_analysis(&result, &trait_impls);
+        assert_codegen_output(&result);
+        assert_recognition_report(&result);
+    }
+
+    fn assert_multi_file_analysis(
+        result: &pipeline::ProgramPipelineResult,
+        trait_impls: &[TraitImplInfo],
+    ) {
 
         eprintln!("=== Multi-file Analysis ===");
         eprintln!("Opcodes: {}", result.opcode_dispatch.len());
@@ -1482,15 +1499,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_codegen_output() {
-        let sources = read_all_pyre_sources();
-        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
-        let result = analyze_multiple_pipeline_with_config(
-            &source_refs,
-            &crate::test_support::pyre_analyze_config(),
-        );
-        let code = generate_trace_code_from_pipeline(&result);
+    fn assert_codegen_output(result: &pipeline::ProgramPipelineResult) {
+        let code = generate_trace_code_from_pipeline(result);
         let flattened_arms: Vec<_> = result
             .opcode_dispatch
             .iter()
@@ -1519,15 +1529,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recognition_report() {
-        let sources = read_all_pyre_sources();
-        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
-        let result = analyze_multiple_pipeline_with_config(
-            &source_refs,
-            &crate::test_support::pyre_analyze_config(),
-        );
-        let report = recognition_report(&result);
+    fn assert_recognition_report(result: &pipeline::ProgramPipelineResult) {
+        let report = recognition_report(result);
 
         eprintln!("=== Recognition Report ===");
         eprintln!(
