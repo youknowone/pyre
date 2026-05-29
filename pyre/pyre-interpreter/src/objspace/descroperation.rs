@@ -262,7 +262,7 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division("division by zero"));
     }
     // Python floor division: rounds toward negative infinity.
     // i64::MIN / -1 overflows → fall back to BigInt.
@@ -280,7 +280,7 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division("division by zero"));
     }
     // Python modulo: result has the same sign as the divisor.
     let r = va % vb;
@@ -305,7 +305,7 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division("division by zero"));
     }
     Ok(bigint_result(as_bigint(a).div_floor(&vb)))
 }
@@ -313,7 +313,7 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division("division by zero"));
     }
     Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
 }
@@ -355,7 +355,7 @@ unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_float(b);
     if vb == 0.0 {
-        return Err(PyError::zero_division("float division by zero"));
+        return Err(PyError::zero_division("division by zero"));
     }
     Ok(w_float_new(as_float(a) / vb))
 }
@@ -372,7 +372,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let y = as_float(b);
     if y == 0.0 {
         // floatobject.py:526
-        return Err(PyError::zero_division("float modulo"));
+        return Err(PyError::zero_division("division by zero"));
     }
     let mut m = x % y; // fmod
     if m != 0.0 {
@@ -391,7 +391,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
     if y == 0.0 {
         // floatobject.py:761
-        return Err(PyError::zero_division("float modulo"));
+        return Err(PyError::zero_division("division by zero"));
     }
     let mut m = x % y; // fmod
     // floatobject.py:767: div = (x - mod) / y
@@ -625,7 +625,7 @@ unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Concatenate two str objects.
 
-unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let sa = w_str_get_value(a);
     let sb = w_str_get_value(b);
     let mut result = String::with_capacity(sa.len() + sb.len());
@@ -651,7 +651,7 @@ unsafe fn repeat_count(n: PyObjectRef, msg: &str) -> Result<usize, PyError> {
 }
 
 /// unicodeobject.py:619-621 descr_mul
-unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let sv = w_str_get_value(s);
     let count = repeat_count(n, "new string is too long")?;
     let total = sv
@@ -667,7 +667,7 @@ unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     Ok(w_str_new(&out))
 }
 
-unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_a = w_list_len(a);
     let len_b = w_list_len(b);
     let mut items = Vec::with_capacity(len_a + len_b);
@@ -684,7 +684,7 @@ unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_list_new(items))
 }
 
-unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_a = w_tuple_len(a);
     let len_b = w_tuple_len(b);
     let mut items = Vec::with_capacity(len_a + len_b);
@@ -702,7 +702,7 @@ unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// listobject.py:638-641 descr_mul
-unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n, "list is too large")?;
     let len = w_list_len(list);
     let cap = len
@@ -997,6 +997,14 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let a_name = (*(*a).ob_type).name;
         let b_name = (*(*b).ob_type).name;
+        // Sequence concatenation slot (sq_concat) reports a distinct
+        // message when the left operand is a sequence — `unicode_concatenate`
+        // / `list_concat` / `tuple_concat`.
+        if is_str(a) || is_list(a) || is_tuple(a) {
+            return Err(PyError::type_error(format!(
+                "can only concatenate {a_name} (not \"{b_name}\") to {a_name}"
+            )));
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             a_name, b_name,
@@ -1017,8 +1025,10 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_sub(a, b);
         }
-        // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub
-        if pyre_object::is_set_or_frozenset(a) {
+        // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub.
+        // descr_sub returns NotImplemented for a non-set rhs, so `-` requires
+        // both operands to be sets (the `difference` method takes iterables).
+        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
             let other_items = crate::builtins::collect_iterable(b)?;
             let probe = pyre_object::w_set_from_items(&other_items);
             let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
@@ -1128,6 +1138,22 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let a_name = (*(*a).ob_type).name;
         let b_name = (*(*b).ob_type).name;
+        // Sequence repetition slot (sq_repeat): a sequence on either side
+        // with a non-int multiplier reports the non-int's type.
+        let a_seq =
+            is_str(a) || is_list(a) || is_tuple(a) || pyre_object::bytesobject::is_bytes_like(a);
+        let b_seq =
+            is_str(b) || is_list(b) || is_tuple(b) || pyre_object::bytesobject::is_bytes_like(b);
+        if a_seq {
+            return Err(PyError::type_error(format!(
+                "can't multiply sequence by non-int of type '{b_name}'"
+            )));
+        }
+        if b_seq {
+            return Err(PyError::type_error(format!(
+                "can't multiply sequence by non-int of type '{a_name}'"
+            )));
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for *: '{a_name}' and '{b_name}'"
         )))
@@ -1194,9 +1220,8 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// True division (`/` operator) — always produces a float result.
 ///
-/// intobject.py:332-345 `_truediv` raises "division by zero" for int/int;
-/// floatobject.py:519 `_floatdiv` raises "float division by zero" once
-/// any operand is a float.
+/// All zero-division paths raise "division by zero" (the unified
+/// ZeroDivisionError message) regardless of int/float/long operands.
 /// longobject.py:62-70 `_truediv` catches OverflowError from
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
@@ -1538,9 +1563,7 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     }
     // floatobject.py:844-847
     if x == 0.0 && y < 0.0 {
-        return Err(PyError::zero_division(
-            "0.0 cannot be raised to a negative power",
-        ));
+        return Err(PyError::zero_division("zero to a negative power"));
     }
     // floatobject.py:849-862
     let mut negate_result = false;
@@ -1644,8 +1667,10 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitand(a, b);
         }
-        // set / frozenset intersection — PyPy: setobject.py W_BaseSetObject.descr_and
-        if pyre_object::is_set_or_frozenset(a) {
+        // set / frozenset intersection — PyPy: setobject.py W_BaseSetObject.descr_and.
+        // descr_and returns NotImplemented for a non-set rhs, so `&` requires
+        // both operands to be sets (the `intersection` method takes iterables).
+        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
             let other_items = crate::builtins::collect_iterable(b)?;
             let probe = pyre_object::w_set_from_items(&other_items);
             let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
@@ -1724,8 +1749,11 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitor(a, b);
         }
-        // set / frozenset union — PyPy: setobject.py W_BaseSetObject.descr_or
-        if pyre_object::is_set_or_frozenset(a) {
+        // set / frozenset union — PyPy: setobject.py W_BaseSetObject.descr_or.
+        // descr_or returns NotImplemented unless w_other is a set/frozenset,
+        // so the binary `|` operator requires both operands to be sets
+        // (the `union` method accepts arbitrary iterables, descr_or does not).
+        if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
             let mut items = pyre_object::w_set_items(a);
             for item in crate::builtins::collect_iterable(b)? {
                 items.push(item);
@@ -1875,6 +1903,35 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ge => sa >= sb,
                 CompareOp::Eq => sa == sb,
                 CompareOp::Ne => sa != sb,
+            }));
+        }
+        // bytes / bytearray value comparison — bytesobject.py /
+        // bytearrayobject.py `descr_eq` / `descr_lt` / … compare the
+        // underlying byte sequence lexicographically; bytes and
+        // bytearray are mutually comparable by content.
+        if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
+        {
+            let la = pyre_object::bytesobject::bytes_like_len(a);
+            let lb = pyre_object::bytesobject::bytes_like_len(b);
+            let mut ord = std::cmp::Ordering::Equal;
+            for i in 0..la.min(lb) {
+                let ba = pyre_object::bytesobject::bytes_like_getitem(a, i);
+                let bb = pyre_object::bytesobject::bytes_like_getitem(b, i);
+                if ba != bb {
+                    ord = ba.cmp(&bb);
+                    break;
+                }
+            }
+            if ord == std::cmp::Ordering::Equal {
+                ord = la.cmp(&lb);
+            }
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                CompareOp::Eq => ord == std::cmp::Ordering::Equal,
+                CompareOp::Ne => ord != std::cmp::Ordering::Equal,
             }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
@@ -2047,6 +2104,37 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
+        // range value comparison — rangeobject.py W_Range.descr_eq:
+        // two ranges are equal iff they generate the same sequence
+        // (equal length, and for non-empty ranges equal start and —
+        // for length > 1 — equal step).  Only `==` / `!=` are defined;
+        // ordering falls through to the dunder dispatch (TypeError).
+        if pyre_object::rangeobject::is_range_iter(a)
+            && pyre_object::rangeobject::is_range_iter(b)
+            && matches!(op, CompareOp::Eq | CompareOp::Ne)
+        {
+            let range_len = |obj: PyObjectRef| -> i64 {
+                let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+                if r.step > 0 {
+                    ((r.stop - r.current + r.step - 1) / r.step).max(0)
+                } else if r.step < 0 {
+                    ((r.current - r.stop - r.step - 1) / (-r.step)).max(0)
+                } else {
+                    0
+                }
+            };
+            let ra = &*(a as *const pyre_object::rangeobject::W_RangeIterator);
+            let rb = &*(b as *const pyre_object::rangeobject::W_RangeIterator);
+            let la = range_len(a);
+            let lb = range_len(b);
+            let equal = la == lb
+                && (la == 0 || (ra.current == rb.current && (la == 1 || ra.step == rb.step)));
+            return Ok(w_bool_from(match op {
+                CompareOp::Eq => equal,
+                CompareOp::Ne => !equal,
+                _ => unreachable!(),
+            }));
+        }
         // Instance dunder dispatch for comparison
         let dunder = match op {
             CompareOp::Lt => "__lt__",
@@ -2097,8 +2185,9 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         }
         let a_name = (*(*a).ob_type).name;
         let b_name = (*(*b).ob_type).name;
+        let op_symbol = op.symbol();
         Err(PyError::type_error(format!(
-            "'{op:?}' not supported between instances of '{a_name}' and '{b_name}'"
+            "'{op_symbol}' not supported between instances of '{a_name}' and '{b_name}'"
         )))
     }
 }
@@ -2112,6 +2201,21 @@ pub enum CompareOp {
     Ge,
     Eq,
     Ne,
+}
+
+impl CompareOp {
+    /// The Python operator symbol (`<`, `<=`, `>`, `>=`, `==`, `!=`) used in
+    /// the "not supported between instances of" TypeError message.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            CompareOp::Lt => "<",
+            CompareOp::Le => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::Ge => ">=",
+            CompareOp::Eq => "==",
+            CompareOp::Ne => "!=",
+        }
+    }
 }
 
 /// Unary positive (`+a`).

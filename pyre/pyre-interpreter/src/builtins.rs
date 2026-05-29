@@ -32,6 +32,9 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("repr", || {
         make_module_builtin_function_with_arity("repr", builtin_repr, 1)
     });
+    namespace.get_or_insert_with("ascii", || {
+        make_module_builtin_function_with_arity("ascii", builtin_ascii, 1)
+    });
     namespace.get_or_insert_with("int", || crate::typedef::gettypeobject(&INT_TYPE));
     namespace.get_or_insert_with("float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
     namespace.get_or_insert_with("bool", || crate::typedef::gettypeobject(&BOOL_TYPE));
@@ -831,7 +834,10 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
         }
     }
-    Err(crate::PyError::type_error("bad operand type for abs()"))
+    Err(crate::PyError::type_error(format!(
+        "bad operand type for abs(): '{}'",
+        unsafe { (*(*obj).ob_type).name }
+    )))
 }
 
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
@@ -1893,6 +1899,35 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
+/// `unicodeobject.c:unicode_repr` post-pass — take the repr of `obj`
+/// and escape every non-ASCII code point as `\xXX` / `\uXXXX` /
+/// `\UXXXXXXXX`.  Shared by the `ascii()` builtin and the `!a`
+/// `str.format` conversion.
+pub(crate) fn py_ascii(obj: PyObjectRef) -> String {
+    let s = unsafe { crate::py_repr(obj) };
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if cp < 0x80 {
+            out.push(ch);
+        } else if cp <= 0xFF {
+            out.push_str(&format!("\\x{cp:02x}"));
+        } else if cp <= 0xFFFF {
+            out.push_str(&format!("\\u{cp:04x}"));
+        } else {
+            out.push_str(&format!("\\U{cp:08x}"));
+        }
+    }
+    out
+}
+
+/// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
+/// non-ASCII code point in the repr as `\xXX` / `\uXXXX` / `\UXXXXXXXX`.
+fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() == 1, "ascii() takes exactly one argument");
+    Ok(w_str_new(&py_ascii(args[0])))
+}
+
 /// `int(obj)` → convert to int
 /// call_function with exception propagation.
 /// PyPy's space.get_and_call_function returns normally or raises;
@@ -1967,9 +2002,10 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     return ensure_baseint_result(w_obj, obj);
                 }
                 // intobject.py:1020-1023
-                return Err(crate::PyError::type_error(
-                    "int() argument must be a string, a bytes-like object or a number, not '%T'",
-                ));
+                return Err(crate::PyError::type_error(format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    unsafe { (*(*obj).ob_type).name }
+                )));
             }
             return ensure_baseint_result(w_obj, obj);
         }
@@ -1986,9 +2022,10 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
         }
         // intobject.py:1040-1050: buffer interface fallback → TypeError
-        return Err(crate::PyError::type_error(
-            "int() argument must be a string, a bytes-like object or a number, not '%T'",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+            unsafe { (*(*obj).ob_type).name }
+        )));
     }
 
     // intobject.py:1051-1072: w_base is not None — parse with base
@@ -2076,9 +2113,10 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
     }
-    Err(crate::PyError::type_error(
-        "int() second argument must be an integer, not '%T'",
-    ))
+    Err(crate::PyError::type_error(format!(
+        "int() second argument must be an integer, not '{}'",
+        unsafe { (*(*w_obj).ob_type).name }
+    )))
 }
 
 /// Parse an integer from a string with the given base.
@@ -2129,6 +2167,31 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     ))
 }
 
+/// Remove PEP 515 underscore digit separators, rejecting any underscore
+/// that is not flanked by two ASCII digits — `_Py_string_to_number_with_
+/// underscores`. Returns `None` for an invalid placement (leading,
+/// trailing, doubled, or adjacent to `.`/`e`/sign).
+fn strip_numeric_underscores(s: &str) -> Option<String> {
+    if !s.contains('_') {
+        return Some(s.to_string());
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '_' {
+            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_digit = i + 1 < chars.len() && chars[i + 1].is_ascii_digit();
+            if prev_digit && next_digit {
+                continue;
+            }
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 /// `float(obj)` → convert to float
 pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -2168,8 +2231,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         }
         if is_str(obj) {
             let s = w_str_get_value(obj);
-            if let Ok(v) = s.trim().parse::<f64>() {
-                return Ok(floatobject::w_float_new(v));
+            // `float_from_string` strips PEP 515 underscore separators
+            // (between digits only) before parsing.
+            if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
+                if let Ok(v) = cleaned.parse::<f64>() {
+                    return Ok(floatobject::w_float_new(v));
+                }
             }
             // `floatobject.py:descr_new` — message uses single-quoted str:
             // "could not convert string to float: '<s>'".
@@ -3436,6 +3503,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // `dictmultiobject.py:1619 _is_set_like` views inherit set's
             // unhashable semantics; values view also isn't hashable.
             Some("dict view")
+        } else if pyre_object::sliceobject::is_slice(obj) {
+            // sliceobject.py:205 `__hash__ = None`.
+            Some("slice")
         } else {
             None
         };
@@ -3942,12 +4012,16 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     if val < 0 || val > 0x10ffff {
         // `pypy/module/__builtin__/operation.py:31-32 chr` — out-of-range
-        // raises ValueError, message "chr() arg out of range".
-        return Err(crate::PyError::value_error("chr() arg out of range"));
+        // raises ValueError.
+        return Err(crate::PyError::value_error(
+            "chr() arg not in range(0x110000)",
+        ));
     }
     match char::from_u32(val as u32) {
         Some(c) => Ok(w_str_new(&c.to_string())),
-        None => Err(crate::PyError::value_error("chr() arg out of range")),
+        None => Err(crate::PyError::value_error(
+            "chr() arg not in range(0x110000)",
+        )),
     }
 }
 
@@ -4166,6 +4240,31 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let t = pyre_object::w_tuple_new(items);
             return Ok(pyre_object::w_seq_iter_new(t, n));
         }
+        // range_iterator: `range()` returns the iterator directly, so
+        // `reversed(range(n))` lands here. rangeobject.py
+        // `W_AbstractRangeObject.descr_reversed` walks the span in
+        // reverse; mirror it by reflecting `(current, stop, step)` —
+        // start from the last element, negate the step, and stop one
+        // past the original start.
+        if pyre_object::is_range_iter(obj) {
+            let (current, stop, step) = pyre_object::w_range_iter_fields(obj);
+            let count: i64 = if step > 0 {
+                if current < stop {
+                    (stop - current + step - 1) / step
+                } else {
+                    0
+                }
+            } else if current > stop {
+                (current - stop - step - 1) / (-step)
+            } else {
+                0
+            };
+            if count <= 0 {
+                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
+            }
+            let last = current + (count - 1) * step;
+            return Ok(pyre_object::w_range_iter_new(last, current - step, -step));
+        }
         // Instance __reversed__
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -4212,7 +4311,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 ///   - kwargs limited to `{key, reverse}` (others → TypeError),
 ///   - per-comparison errors (e.g. user `__lt__` raises) propagate
 ///     instead of silently falling back to "treat as not less".
-fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     if positional.is_empty() {
         return Err(crate::PyError::type_error(
@@ -4695,6 +4794,14 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `sum(iterable, start=0)` — PyPy: operation.py sum
+///
+/// `bltinmodule.c builtin_sum_impl`: once the running total is an exact
+/// float, items are accumulated with the improved Kahan–Babuška (Neumaier)
+/// compensated algorithm so float and small-int operands sum accurately
+/// (`sum([0.1, 0.2, 0.3])` is `0.6`, not `0.6000000000000001`). Anything
+/// that is not an exact float or i64-range int falls back to the generic
+/// `__add__` path, after which the compensated loop re-enters if the total
+/// is still a float.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error(
@@ -4703,13 +4810,68 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let iterable = args[0];
     let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
-    let mut acc = start;
     // Use the generic iterator protocol so sum() works with any iterable
     // (generators, ranges, sets, dict views, ...), matching PyPy.
-    for item in crate::builtins::collect_iterable(iterable)? {
-        acc = crate::baseobjspace::add(acc, item)?;
+    let items = crate::builtins::collect_iterable(iterable)?;
+    let mut acc = start;
+    let mut idx = 0;
+    let n = items.len();
+    loop {
+        // Generic phase: accumulate through `__add__` until the total
+        // becomes an exact float (or the items are exhausted).
+        while idx < n && !unsafe { is_float(acc) } {
+            acc = crate::baseobjspace::add(acc, items[idx])?;
+            idx += 1;
+        }
+        if idx >= n {
+            return Ok(acc);
+        }
+        // Compensated phase: the total is an exact float here.
+        let mut f_result = unsafe { floatobject::w_float_get_value(acc) };
+        let mut c = 0.0f64;
+        while idx < n {
+            let item = items[idx];
+            let x = unsafe {
+                if is_float(item) {
+                    Some(floatobject::w_float_get_value(item))
+                } else if is_bool(item) {
+                    Some(if w_bool_get_value(item) { 1.0 } else { 0.0 })
+                } else if is_int(item) {
+                    Some(w_int_get_value(item) as f64)
+                } else {
+                    None
+                }
+            };
+            match x {
+                Some(x) => {
+                    let t = f_result + x;
+                    if f_result.abs() >= x.abs() {
+                        c += (f_result - t) + x;
+                    } else {
+                        c += (x - t) + f_result;
+                    }
+                    f_result = t;
+                    idx += 1;
+                }
+                None => break,
+            }
+        }
+        // The compensation term is only meaningful while the running total
+        // stays finite; once it reaches ±inf/nan the deltas degenerate to
+        // nan (`inf - inf`), so the bare total is the correct value.
+        acc = floatobject::w_float_new(if f_result.is_finite() {
+            f_result + c
+        } else {
+            f_result
+        });
+        if idx >= n {
+            return Ok(acc);
+        }
+        // Non-float / out-of-range item: one generic add, then the outer
+        // loop re-enters the compensated phase if the total is still float.
+        acc = crate::baseobjspace::add(acc, items[idx])?;
+        idx += 1;
     }
-    Ok(acc)
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
@@ -4729,7 +4891,35 @@ fn round_half_even(v: f64) -> f64 {
     }
 }
 
-fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `round(float, ndigits)` to `ndigits` decimal places, correctly rounded
+/// (round-half-to-even) on the true binary value — `floatobject.c
+/// double_round`, which formats with `_Py_dg_dtoa` mode 3 then parses the
+/// decimal string back. Scaling by `10**ndigits` and rounding loses
+/// precision (`2.675 * 100.0` rounds up to `267.5`, so the naive path
+/// yields `2.68` where the true value `2.67499…` rounds to `2.67`); the
+/// decimal-string round-trip avoids that.
+fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
+    // double_round bounds: beyond `NDIGITS_MAX` the value is unchanged;
+    // below `NDIGITS_MIN` it collapses to a zero with the sign of `v`.
+    const NDIGITS_MAX: i64 = 323;
+    const NDIGITS_MIN: i64 = -308;
+    if ndigits > NDIGITS_MAX {
+        return v;
+    }
+    if ndigits < NDIGITS_MIN {
+        return 0.0 * v;
+    }
+    if ndigits >= 0 {
+        format!("{:.*}", ndigits as usize, v)
+            .parse::<f64>()
+            .unwrap_or(v)
+    } else {
+        let factor = 10f64.powi((-ndigits) as i32);
+        round_half_even(v / factor) * factor
+    }
+}
+
+pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "round() missing required argument: 'number' (pos 1)",
@@ -4748,10 +4938,7 @@ fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         Ok(floatobject::w_float_new(v))
                     } else {
                         let n = w_int_get_value(*nd);
-                        let factor = 10f64.powi(n as i32);
-                        Ok(floatobject::w_float_new(
-                            round_half_even(v * factor) / factor,
-                        ))
+                        Ok(floatobject::w_float_new(float_round_ndigits(v, n)))
                     }
                 }
                 // `floatobject.py:954-960 _round_float`: single-argument
@@ -4763,8 +4950,43 @@ fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 ),
             };
         }
-        if is_int(obj) {
-            return Ok(obj);
+        if is_int(obj) || is_long(obj) {
+            // `longobject.c:long_round` — single-arg round and any
+            // ndigits >= 0 leave an int unchanged; ndigits < 0 rounds to
+            // the nearest multiple of 10**(-ndigits), ties to even.
+            let nd = match ndigits {
+                Some(nd) if is_int(*nd) => w_int_get_value(*nd),
+                _ => return Ok(obj),
+            };
+            if nd >= 0 {
+                return Ok(obj);
+            }
+            use num_integer::Integer;
+            let a = obj_to_bigint(obj);
+            let mut b = BigInt::from(1);
+            let ten = BigInt::from(10);
+            for _ in 0..(-nd) {
+                b = &b * &ten;
+            }
+            // `_PyLong_DivmodNear`: q = round(a / b) ties-to-even,
+            // result = q * b.  Floor division gives 0 <= r < b.
+            let (q, r) = a.div_mod_floor(&b);
+            let two_r = &r * BigInt::from(2);
+            let q_even = (&q % BigInt::from(2)) == BigInt::from(0);
+            let q = if two_r < b {
+                q
+            } else if two_r > b {
+                q + 1
+            } else if q_even {
+                q
+            } else {
+                q + 1
+            };
+            let result = q * b;
+            return match result.to_i64() {
+                Some(n) => Ok(w_int_new(n)),
+                None => Ok(w_long_new(result)),
+            };
         }
     }
     // operation.py:97 — lookup __round__ on user objects
@@ -4902,41 +5124,15 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else {
         String::new()
     };
-    // With format_spec: delegate to __format__ or handle basic int specs
-    if !spec.is_empty() {
-        unsafe {
-            let int_val = if pyre_object::is_bool(value) {
-                Some(pyre_object::w_bool_get_value(value) as i64)
-            } else if pyre_object::is_int(value) {
-                Some(pyre_object::w_int_get_value(value))
-            } else {
-                None
-            };
-            if let Some(v) = int_val {
-                let s = match spec.as_str() {
-                    "d" => format!("{v}"),
-                    "b" => format!("{v:b}"),
-                    "o" => format!("{v:o}"),
-                    "x" => format!("{v:x}"),
-                    "X" => format!("{v:X}"),
-                    "n" => format!("{v}"),
-                    _ => format!("{v}"),
-                };
-                return Ok(w_str_new(&s));
-            }
-            if pyre_object::is_float(value) {
-                let fv = pyre_object::w_float_get_value(value);
-                let s = match spec.as_str() {
-                    "f" => format!("{fv:.6}"),
-                    "e" => format!("{fv:e}"),
-                    "g" => format!("{fv}"),
-                    _ => format!("{fv}"),
-                };
-                return Ok(w_str_new(&s));
-            }
-        }
-    }
-    let s = unsafe { crate::py_str(args[0]) };
+    // `newformat.py format(value, spec)`: an empty spec yields
+    // `str(value)`, a non-empty spec routes through the shared
+    // format-spec parser — the same path f-string `{v:spec}` and
+    // `"{:spec}".format(v)` use, so all three produce identical output.
+    let s = if spec.is_empty() {
+        unsafe { crate::py_str(value) }
+    } else {
+        crate::type_methods::format_with_spec_public(value, &spec)
+    };
     Ok(w_str_new(&s))
 }
 

@@ -955,45 +955,22 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     if is_slice(index) {
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-        let start = w_slice_get_start(index);
-        let stop = w_slice_get_stop(index);
-        let step = w_slice_get_step(index);
-        let step_val = if is_none(step) {
-            1
-        } else {
-            w_int_get_value(step)
-        };
-        let s_val = if is_none(start) {
-            if step_val < 0 { len - 1 } else { 0 }
-        } else {
-            let v = w_int_get_value(start);
-            if v < 0 { (len + v).max(0) } else { v.min(len) }
-        };
-        let e_val = if is_none(stop) {
-            if step_val < 0 { -1 } else { len }
-        } else {
-            let v = w_int_get_value(stop);
-            if v < 0 { (len + v).max(-1) } else { v.min(len) }
-        };
+        let (start, stop, step) = normalize_slice(index, len)?;
         let mut result = Vec::new();
-        let mut i = s_val;
-        if step_val > 0 {
-            while i < e_val {
-                if i >= 0 && i < len {
-                    result.push(pyre_object::bytesobject::bytes_like_getitem(
-                        obj, i as usize,
-                    ));
-                }
-                i += step_val;
+        let mut i = start;
+        if step > 0 {
+            while i < stop {
+                result.push(pyre_object::bytesobject::bytes_like_getitem(
+                    obj, i as usize,
+                ));
+                i += step;
             }
-        } else if step_val < 0 {
-            while i > e_val {
-                if i >= 0 && i < len {
-                    result.push(pyre_object::bytesobject::bytes_like_getitem(
-                        obj, i as usize,
-                    ));
-                }
-                i += step_val;
+        } else {
+            while i > stop {
+                result.push(pyre_object::bytesobject::bytes_like_getitem(
+                    obj, i as usize,
+                ));
+                i += step;
             }
         }
         return Ok(if is_bytes {
@@ -1061,31 +1038,12 @@ unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     if is_slice(index) {
         // range[start:stop:step] → returns a list
-        let s_raw = w_slice_get_start(index);
-        let e_raw = w_slice_get_stop(index);
-        let step_raw = w_slice_get_step(index);
-        let s = if is_none(s_raw) {
-            0
-        } else {
-            w_int_get_value(s_raw)
-        };
-        let e = if is_none(e_raw) {
-            len
-        } else {
-            w_int_get_value(e_raw)
-        };
-        let sl_step = if is_none(step_raw) {
-            1
-        } else {
-            w_int_get_value(step_raw)
-        };
-        let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
-        let e = if e < 0 { (len + e).max(0) } else { e.min(len) };
+        let (start, stop, step) = normalize_slice(index, len)?;
         let mut items = Vec::new();
-        let mut i = s;
-        while (sl_step > 0 && i < e) || (sl_step < 0 && i > e) {
+        let mut i = start;
+        while (step > 0 && i < stop) || (step < 0 && i > stop) {
             items.push(w_int_new(r.current + i * r.step));
-            i += sl_step;
+            i += step;
         }
         return Ok(w_list_new(items));
     }
@@ -6677,6 +6635,8 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
             Some("bytearray")
         } else if pyre_object::dictviewobject::is_dict_view(obj) {
             Some("dict view")
+        } else if pyre_object::sliceobject::is_slice(obj) {
+            Some("slice")
         } else {
             None
         };
@@ -6745,21 +6705,33 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
             }
             if is_slice(index) {
                 let len = w_list_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let s = if is_none(start) {
-                    0
+                let (start, stop, step) = normalize_slice(index, len)?;
+                if step == 1 {
+                    w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
+                    return Ok(());
+                }
+                // Extended-slice delete: gather the selected indices, then
+                // pop them in descending order so earlier removals do not
+                // shift the positions of later targets.
+                let mut indices: Vec<i64> = Vec::new();
+                let mut i = start;
+                if step > 0 {
+                    while i < stop {
+                        indices.push(i);
+                        i += step;
+                    }
                 } else {
-                    let v = w_int_get_value(start);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                } as usize;
-                let e = if is_none(stop) {
-                    len
-                } else {
-                    let v = w_int_get_value(stop);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                } as usize;
-                w_list_delslice(obj, s, e);
+                    while i > stop {
+                        indices.push(i);
+                        i += step;
+                    }
+                }
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in indices {
+                    if idx >= 0 && idx < w_list_len(obj) as i64 {
+                        w_list_pop(obj, idx);
+                    }
+                }
                 return Ok(());
             }
         }

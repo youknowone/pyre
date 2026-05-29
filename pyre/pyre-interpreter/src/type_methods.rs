@@ -115,24 +115,20 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 }
 
 /// PyPy: listobject.py descr_sort — list.sort()
-///
-/// Simplified: only sorts int lists. Full sort requires comparison protocol.
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let list = args[0];
+    // listobject.py `descr_sort` shares `listsort.py`'s comparison
+    // machinery (general `space.lt`, `key=`, `reverse=`) with `sorted()`.
+    // The flat builtin ABI hands us `[self, kwargs?]`, exactly the shape
+    // `sorted()` expects, so produce the sorted sequence through the same
+    // path and copy it back into the list in place.
+    let sorted_list = crate::builtins::builtin_sorted(args)?;
     unsafe {
-        let n = w_list_len(list);
-        let mut items: Vec<PyObjectRef> = (0..n)
-            .filter_map(|i| w_list_getitem(list, i as i64))
+        let n = w_list_len(sorted_list);
+        let items: Vec<PyObjectRef> = (0..n)
+            .filter_map(|i| w_list_getitem(sorted_list, i as i64))
             .collect();
-        // Sort by int value (PyPy uses timsort with key/cmp)
-        items.sort_by(|a, b| {
-            if is_int(*a) && is_int(*b) {
-                w_int_get_value(*a).cmp(&w_int_get_value(*b))
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
         pyre_object::listobject::w_list_clear(list);
         for item in items {
             w_list_append(list, item);
@@ -165,10 +161,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
-            // listobject.py:805 `oefmt(space.w_ValueError, "%R is not in list", w_value)`
-            format!("{} is not in list", unsafe {
-                crate::display::py_repr(value)
-            }),
+            "list.index(x): x not in list".to_string(),
         )),
         crate::listobject::FindOrCountResult::Count(_) => {
             unreachable!("find_or_count with count=false never returns Count")
@@ -660,18 +653,61 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_str_new(&result))
 }
 
-pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+/// `unicodeobject.py:1319 _unwrap_and_compute_idx_params` — resolve the
+/// optional `start` / `end` search args (PyPy slice semantics via
+/// `unwrap_start_stop`) into a byte-offset window `(byte_start,
+/// byte_end)` into `s`.  Returns `None` when the codepoint window is
+/// empty because `start` is past the end or past `end` (the search-miss
+/// case shared by find / index / count).
+fn str_idx_window(s: &str, args: &[PyObjectRef]) -> Result<Option<(usize, usize)>, crate::PyError> {
+    let char_len = s.chars().count() as i64;
+    let w_start = if args.len() >= 3 { args[2] } else { w_none() };
+    let w_end = if args.len() >= 4 { args[3] } else { w_none() };
+    let (start, end) = crate::sliceobject::unwrap_start_stop(char_len, w_start, w_end)?;
+    if start > char_len {
+        return Ok(None);
+    }
+    let end = end.min(char_len);
+    if start > end {
+        return Ok(None);
+    }
+    let byte_start = s
+        .char_indices()
+        .nth(start as usize)
+        .map_or(s.len(), |(i, _)| i);
+    let byte_end = s
+        .char_indices()
+        .nth(end as usize)
+        .map_or(s.len(), |(i, _)| i);
+    Ok(Some((byte_start, byte_end)))
+}
+
+/// `unicodeobject.py:1288 _unwrap_and_search` — substring search over
+/// the codepoint window `s[start:end]`.  `forward` chooses `find` vs
+/// `rfind`.  Indices are codepoint-based on both input and output.
+fn str_search(args: &[PyObjectRef], forward: bool) -> Result<Option<i64>, crate::PyError> {
     let s = unsafe { w_str_get_value(args[0]) };
     let sub = unsafe { w_str_get_value(args[1]) };
-    Ok(w_int_new(s.find(sub).map(|i| i as i64).unwrap_or(-1)))
+    let Some((byte_start, byte_end)) = str_idx_window(s, args)? else {
+        return Ok(None);
+    };
+    let window = &s[byte_start..byte_end];
+    let found = if forward {
+        window.find(sub)
+    } else {
+        window.rfind(sub)
+    };
+    Ok(found.map(|byte_pos| s[..byte_start + byte_pos].chars().count() as i64))
+}
+
+pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2);
+    Ok(w_int_new(str_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sub = unsafe { w_str_get_value(args[1]) };
-    Ok(w_int_new(s.rfind(sub).map(|i| i as i64).unwrap_or(-1)))
+    Ok(w_int_new(str_search(args, false)?.unwrap_or(-1)))
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -714,6 +750,37 @@ fn str_method_format_core(
     mapping: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let fmt = unsafe { pyre_object::w_str_get_value(fmt_obj) };
+    let mut auto_idx = 0usize;
+    // `newformat.py` auto_numbering_state — `None` = ANS_INIT, `Some(true)`
+    // = ANS_AUTO (empty `{}` fields), `Some(false)` = ANS_MANUAL (numbered
+    // `{0}` fields).  Mixing the two raises ValueError.
+    let mut numbering: Option<bool> = None;
+    let rendered = format_render(
+        fmt,
+        positional,
+        kwargs_dict,
+        mapping,
+        &mut auto_idx,
+        &mut numbering,
+        2,
+    )?;
+    Ok(pyre_object::w_str_new(&rendered))
+}
+
+/// `newformat.py W_StringFormatter.format` rendering pass.  Renders the
+/// template `fmt`, threading the auto-/manual-numbering state through
+/// the recursive evaluation of nested `{...}` format specs so that
+/// `"{:{}}".format(42, ">5")` consumes positional args 0 then 1.
+/// `depth` bounds that recursion (the markup recursion limit is 2).
+fn format_render(
+    fmt: &str,
+    positional: &[PyObjectRef],
+    kwargs_dict: Option<PyObjectRef>,
+    mapping: Option<PyObjectRef>,
+    auto_idx: &mut usize,
+    numbering: &mut Option<bool>,
+    depth: u32,
+) -> Result<String, crate::PyError> {
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
             // `newformat.format_method(... w_mapping, True)` resolves
@@ -731,7 +798,6 @@ fn str_method_format_core(
     };
 
     let mut result = String::new();
-    let mut auto_idx = 0usize;
     let bytes = fmt.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -742,33 +808,91 @@ fn str_method_format_core(
                 continue;
             }
             i += 1;
-            let mut field = String::new();
-            let mut spec = String::new();
-            let mut in_spec = false;
-            while i < bytes.len() && bytes[i] != b'}' {
-                if bytes[i] == b':' && !in_spec {
-                    in_spec = true;
-                    i += 1;
-                    continue;
-                }
-                if in_spec {
-                    spec.push(bytes[i] as char);
-                } else {
-                    field.push(bytes[i] as char);
+            let field_start = i;
+            // Track brace depth so a nested `{...}` inside the format
+            // spec is captured whole rather than ending the field at the
+            // spec's first `}`.
+            let mut brace_depth = 1;
+            while i < bytes.len() {
+                if bytes[i] == b'{' {
+                    brace_depth += 1;
+                } else if bytes[i] == b'}' {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        break;
+                    }
                 }
                 i += 1;
             }
+            let field_text = &fmt[field_start..i];
             if i < bytes.len() {
                 i += 1;
             }
+
+            // `newformat.py:_parse_field` — split the replacement field
+            // into the argument name, an optional `!conversion`, and the
+            // trailing `:spec`.  A `:` or `!` inside `[...]` is part of an
+            // item key, not a separator, so brackets are skipped over.
+            let fb = field_text.as_bytes();
+            let mut p = 0;
+            let mut name_end = fb.len();
+            let mut conversion: Option<char> = None;
+            let mut spec = String::new();
+            while p < fb.len() {
+                let c = fb[p];
+                if c == b':' || c == b'!' {
+                    name_end = p;
+                    if c == b'!' {
+                        p += 1;
+                        if p < fb.len() {
+                            conversion = Some(fb[p] as char);
+                            p += 1;
+                        }
+                        if p < fb.len() && fb[p] == b':' {
+                            p += 1;
+                        }
+                    } else {
+                        p += 1;
+                    }
+                    spec = field_text.get(p..).unwrap_or("").to_string();
+                    break;
+                } else if c == b'[' {
+                    while p + 1 < fb.len() && fb[p + 1] != b']' {
+                        p += 1;
+                    }
+                }
+                p += 1;
+            }
+            let name = &field_text[..name_end];
+
+            // `newformat.py:_get_argument` — the argument name is the
+            // prefix up to the first `[` or `.`; the remainder is a chain
+            // of attribute / item lookups resolved by
+            // `resolve_format_lookups`.
+            let nb = name.as_bytes();
+            let mut k = 0;
+            while k < nb.len() && nb[k] != b'[' && nb[k] != b'.' {
+                k += 1;
+            }
+            let base = &name[..k];
+            let rest = &name[k..];
 
             // pypy/objspace/std/newformat.py:1066-1071 Template.get_arg:
             // missing positional → IndexError "Replacement index N out of
             // range for positional args tuple"; missing keyword →
             // KeyError(name).
-            let val = if field.is_empty() {
-                let idx = auto_idx;
-                auto_idx += 1;
+            let w_arg = if base.is_empty() {
+                if let Some(false) = *numbering {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        "cannot switch from manual field specification to automatic \
+                         field numbering"
+                            .to_string(),
+                    ));
+                }
+                *numbering = Some(true);
+                let idx = *auto_idx;
+                *auto_idx += 1;
                 match positional.get(idx).copied() {
                     Some(v) => v,
                     None => {
@@ -780,7 +904,16 @@ fn str_method_format_core(
                         ));
                     }
                 }
-            } else if let Ok(idx) = field.parse::<usize>() {
+            } else if let Ok(idx) = base.parse::<usize>() {
+                if let Some(true) = *numbering {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        "cannot switch from automatic field numbering to manual \
+                         field specification"
+                            .to_string(),
+                    ));
+                }
+                *numbering = Some(false);
                 match positional.get(idx).copied() {
                     Some(v) => v,
                     None => {
@@ -793,20 +926,57 @@ fn str_method_format_core(
                     }
                 }
             } else {
-                match lookup_kwarg(&field)? {
+                match lookup_kwarg(base)? {
                     Some(v) => v,
                     None => {
                         return Err(crate::PyError::new(
                             crate::PyErrorKind::KeyError,
-                            format!("'{field}'"),
+                            format!("'{base}'"),
                         ));
                     }
                 }
             };
-            let formatted = if spec.is_empty() {
-                unsafe { crate::py_str(val) }
+            let val = resolve_format_lookups(w_arg, rest)?;
+
+            // `newformat.py:_convert_field` — `!s`/`!r`/`!a` apply
+            // str / repr / ascii before the format spec.
+            let converted = match conversion {
+                None => val,
+                Some('s') => pyre_object::w_str_new(&unsafe { crate::py_str(val) }),
+                Some('r') => pyre_object::w_str_new(&unsafe { crate::py_repr(val) }),
+                Some('a') => pyre_object::w_str_new(&crate::builtins::py_ascii(val)),
+                Some(c) => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        format!("Unknown conversion specifier {c}"),
+                    ));
+                }
+            };
+            // A spec containing `{` is itself a template: render it
+            // (sharing the numbering state) before applying it.
+            let resolved_spec = if spec.bytes().any(|b| b == b'{') {
+                if depth == 0 {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        "Max string recursion exceeded".to_string(),
+                    ));
+                }
+                format_render(
+                    &spec,
+                    positional,
+                    kwargs_dict,
+                    mapping,
+                    auto_idx,
+                    numbering,
+                    depth - 1,
+                )?
             } else {
-                format_with_spec(val, &spec)
+                spec
+            };
+            let formatted = if resolved_spec.is_empty() {
+                unsafe { crate::py_str(converted) }
+            } else {
+                format_with_spec(converted, &resolved_spec)
             };
             result.push_str(&formatted);
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
@@ -817,15 +987,80 @@ fn str_method_format_core(
             i += 1;
         }
     }
-    Ok(pyre_object::w_str_new(&result))
+    Ok(result)
+}
+
+/// `newformat.py:_resolve_lookups` — walk the `.attr` / `[element]`
+/// suffix of a replacement-field name, resolving each step against
+/// `w_obj` via `getattr` / `getitem`.  A bracketed element made only
+/// of decimal digits is an integer index; anything else is a string
+/// key (`_parse_int` returns -1 for non-numeric elements).
+fn resolve_format_lookups(w_obj: PyObjectRef, rest: &str) -> Result<PyObjectRef, crate::PyError> {
+    let rb = rest.as_bytes();
+    let mut w_obj = w_obj;
+    let mut i = 0;
+    while i < rb.len() {
+        let c = rb[i];
+        if c == b'.' {
+            i += 1;
+            let start = i;
+            while i < rb.len() && rb[i] != b'[' && rb[i] != b'.' {
+                i += 1;
+            }
+            if start == i {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::ValueError,
+                    "Empty attribute in format string".to_string(),
+                ));
+            }
+            w_obj = crate::baseobjspace::getattr(w_obj, &rest[start..i])?;
+        } else if c == b'[' {
+            i += 1;
+            let start = i;
+            let mut got_bracket = false;
+            while i < rb.len() {
+                if rb[i] == b']' {
+                    got_bracket = true;
+                    break;
+                }
+                i += 1;
+            }
+            if got_bracket {
+                let elem = &rest[start..i];
+                i += 1;
+                let numeric = elem.len() > 0 && elem.bytes().all(|b| b.is_ascii_digit());
+                let w_item = if numeric {
+                    match elem.parse::<i64>() {
+                        Ok(idx) => pyre_object::w_int_new(idx),
+                        Err(_) => pyre_object::w_str_new(elem),
+                    }
+                } else {
+                    pyre_object::w_str_new(elem)
+                };
+                w_obj = crate::baseobjspace::getitem(w_obj, w_item)?;
+            } else {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::ValueError,
+                    "Missing ']' in format string".to_string(),
+                ));
+            }
+        } else {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "Only '[' and '.' may follow ']' in format string".to_string(),
+            ));
+        }
+    }
+    Ok(w_obj)
 }
 
 /// Mini Python format-spec parser — `pypy/objspace/std/newformat.py
 /// _parse_spec`.  Recognises the subset pyre exercises today:
-/// `[fill][align][sign][#][0][width][.precision][type]`.  `alt_form`
-/// (the `#` flag) is now stored on the parsed spec so int / float
-/// formatters can apply the base prefix or trailing-zero
-/// preservation per PyPy `newformat.py:454-468`.
+/// `[fill][align][sign][#][0][width][grouping][.precision][type]`.
+/// `alt_form` (the `#` flag) is now stored on the parsed spec so int /
+/// float formatters can apply the base prefix or trailing-zero
+/// preservation per PyPy `newformat.py:454-468`.  `grouping` holds the
+/// thousands separator (`,` or `_`) parsed at `newformat.py:501-512`.
 struct ParsedSpec {
     fill: char,
     align: Option<char>,
@@ -833,6 +1068,7 @@ struct ParsedSpec {
     alt_form: bool,
     zero_pad: bool,
     width: usize,
+    grouping: Option<char>,
     precision: Option<usize>,
     ty: char,
 }
@@ -881,6 +1117,13 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         width = width * 10 + (chars[i] as u8 - b'0') as usize;
         i += 1;
     }
+    // `pypy/objspace/std/newformat.py:501-512` — the thousands
+    // separator (`,` or `_`) sits between width and `.precision`.
+    let mut grouping: Option<char> = None;
+    if i < n && matches!(chars[i], ',' | '_') {
+        grouping = Some(chars[i]);
+        i += 1;
+    }
     let mut precision: Option<usize> = None;
     if i < n && chars[i] == '.' {
         i += 1;
@@ -899,9 +1142,39 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         alt_form,
         zero_pad,
         width,
+        grouping,
         precision,
         ty,
     }
+}
+
+/// `pypy/objspace/std/newformat.py:740 _group_digits` — insert the
+/// thousands separator `sep` into a run of plain digits every
+/// `interval` positions counted from the right (3 for decimal
+/// presentations, 4 for `_` on binary / octal / hex).
+fn group_digits(digits: &str, sep: char, interval: usize) -> String {
+    let chars: Vec<char> = digits.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len + len / interval);
+    for (idx, c) in chars.iter().enumerate() {
+        if idx > 0 && (len - idx) % interval == 0 {
+            out.push(sep);
+        }
+        out.push(*c);
+    }
+    out
+}
+
+/// Group only the leading integer run of a numeric body (the digits
+/// before any `.`, exponent, or `%`), leaving the fractional / suffix
+/// portion untouched.  Float groupings always use interval 3.
+fn group_integer_prefix(body: &str, sep: char) -> String {
+    let int_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
+    if int_len <= 3 {
+        return body.to_string();
+    }
+    let (int_part, rest) = body.split_at(int_len);
+    format!("{}{}", group_digits(int_part, sep, 3), rest)
 }
 
 fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
@@ -994,9 +1267,22 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
             } else {
                 pyre_object::w_int_get_value(val)
             };
+            // `newformat.py:1018-1026` — the `c` presentation type
+            // formats the integer as the single Unicode character
+            // `chr(v)`, then pads as text (default left align).
+            if p.ty == 'c' {
+                let body = u32::try_from(v)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map_or_else(|| format!("{v}"), |c| c.to_string());
+                // `c` keeps the integer default alignment (right).
+                let align = p.align.unwrap_or('>');
+                return pad_to_width(body, p.fill, align, p.width);
+            }
             // Float-style spec on int: coerce to f64 (matches CPython
-            // `int.__format__('.3f')` behaviour).
-            if matches!(p.ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G') {
+            // `int.__format__('.3f')` behaviour).  `%` is a float-only
+            // presentation type, so route ints through it too.
+            if matches!(p.ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%') {
                 return format_float(v as f64, &p);
             }
             return format_int(v, &p);
@@ -1029,6 +1315,18 @@ fn format_int(v: i64, p: &ParsedSpec) -> String {
         'o' => format!("{abs:o}"),
         'b' => format!("{abs:b}"),
         _ => format!("{abs}"),
+    };
+    // `newformat.py:646-651` — `,` always groups by 3; `_` groups by 4
+    // for the bit presentations (b/o/x/X) and by 3 otherwise.
+    let digits = if let Some(sep) = p.grouping {
+        let interval = if sep == '_' && matches!(p.ty, 'x' | 'X' | 'o' | 'b') {
+            4
+        } else {
+            3
+        };
+        group_digits(&digits, sep, interval)
+    } else {
+        digits
     };
     let sign_char = if v < 0 {
         "-"
@@ -1077,6 +1375,8 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
         'e' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$e}"), false),
         'E' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$E}"), true),
         'f' | 'F' => format!("{:.*}", prec, abs),
+        // `newformat.py` percent type: scale by 100, format fixed, suffix `%`.
+        '%' => format!("{:.*}%", prec, abs * 100.0),
         'g' | 'G' | '\0' => {
             // Match `format_g_like` in `baseobjspace.rs`'s % path:
             // alt-form keeps trailing zeros + the dot; default trims.
@@ -1111,6 +1411,13 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
     } else {
         body
     };
+    // `newformat.py:646-648` — float groupings always use interval 3,
+    // applied to the integer run only (the fractional / exponent / `%`
+    // suffix is left untouched).
+    let body = match p.grouping {
+        Some(sep) => group_integer_prefix(&body, sep),
+        None => body,
+    };
     let body = format!("{sign_char}{body}");
     // Same `=`/`'0'` promotion as `format_int`; pad_to_width does
     // the sign-aware insertion.
@@ -1143,36 +1450,215 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             if s.is_ascii() {
                 Ok(pyre_object::w_bytes_from_bytes(s.as_bytes()))
             } else {
-                let (i, ch) = s.chars().enumerate().find(|(_, c)| !c.is_ascii()).unwrap();
-                Err(crate::PyError::new(
-                    crate::PyErrorKind::UnicodeEncodeError,
-                    format!(
-                        "'ascii' codec can't encode character '\\x{:x}' in position {}",
-                        ch as u32, i
-                    ),
+                let chars: Vec<char> = s.chars().collect();
+                let start = chars.iter().position(|c| !c.is_ascii()).unwrap();
+                let end = chars[start..]
+                    .iter()
+                    .position(|c| c.is_ascii())
+                    .map_or(chars.len(), |off| start + off);
+                Err(crate::PyError::unicode_encode_error(
+                    "ascii",
+                    args[0],
+                    start as i64,
+                    end as i64,
+                    "ordinal not in range(128)",
                 ))
             }
         }
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            let mut out = Vec::with_capacity(s.len());
-            for (i, ch) in s.chars().enumerate() {
-                if (ch as u32) > 0xFF {
+            let chars: Vec<char> = s.chars().collect();
+            if let Some(start) = chars.iter().position(|c| (*c as u32) > 0xFF) {
+                let end = chars[start..]
+                    .iter()
+                    .position(|c| (*c as u32) <= 0xFF)
+                    .map_or(chars.len(), |off| start + off);
+                return Err(crate::PyError::unicode_encode_error(
+                    "latin-1",
+                    args[0],
+                    start as i64,
+                    end as i64,
+                    "ordinal not in range(256)",
+                ));
+            }
+            let out: Vec<u8> = chars.iter().map(|c| *c as u8).collect();
+            Ok(pyre_object::w_bytes_from_bytes(&out))
+        }
+        _ => {
+            if let Some(out) = encode_utf16_32(s, &enc_lower) {
+                return Ok(pyre_object::w_bytes_from_bytes(&out));
+            }
+            Err(crate::PyError::new(
+                crate::PyErrorKind::LookupError,
+                format!("unknown encoding: {encoding}"),
+            ))
+        }
+    }
+}
+
+/// Collapse a normalized encoding name to its separator-free form so
+/// that `utf-16-le`, `utf16le` and `utf_16_le` all compare equal.
+fn compact_codec_name(lower: &str) -> String {
+    lower
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .collect()
+}
+
+/// utf-16 / utf-32 encode for the `lower`-normalized codec name, or
+/// `None` if `lower` names neither.  The bare `utf-16` / `utf-32` forms
+/// emit a little-endian BOM; the `-le` / `-be` forms omit it.
+pub fn encode_utf16_32(s: &str, lower: &str) -> Option<Vec<u8>> {
+    let (is32, big_endian, bom) = match compact_codec_name(lower).as_str() {
+        "utf16" | "u16" => (false, false, true),
+        "utf16le" => (false, false, false),
+        "utf16be" => (false, true, false),
+        "utf32" | "u32" => (true, false, true),
+        "utf32le" => (true, false, false),
+        "utf32be" => (true, true, false),
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    if bom {
+        let cp = 0xFEFFu32;
+        if is32 {
+            out.extend_from_slice(&if big_endian {
+                cp.to_be_bytes()
+            } else {
+                cp.to_le_bytes()
+            });
+        } else {
+            let unit = 0xFEFFu16;
+            out.extend_from_slice(&if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+    }
+    if is32 {
+        for ch in s.chars() {
+            let cp = ch as u32;
+            out.extend_from_slice(&if big_endian {
+                cp.to_be_bytes()
+            } else {
+                cp.to_le_bytes()
+            });
+        }
+    } else {
+        let mut buf = [0u16; 2];
+        for ch in s.chars() {
+            for &unit in ch.encode_utf16(&mut buf).iter() {
+                out.extend_from_slice(&if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// utf-16 / utf-32 decode for the `lower`-normalized codec name, or
+/// `None` if `lower` names neither.  The bare `utf-16` / `utf-32` forms
+/// consume a leading BOM to choose endianness (defaulting to
+/// little-endian); the `-le` / `-be` forms are fixed.
+pub fn decode_utf16_32(data: &[u8], lower: &str) -> Option<Result<String, crate::PyError>> {
+    let (is32, fixed_be) = match compact_codec_name(lower).as_str() {
+        "utf16" | "u16" => (false, None),
+        "utf16le" => (false, Some(false)),
+        "utf16be" => (false, Some(true)),
+        "utf32" | "u32" => (true, None),
+        "utf32le" => (true, Some(false)),
+        "utf32be" => (true, Some(true)),
+        _ => return None,
+    };
+    Some(decode_utf16_32_impl(data, is32, fixed_be))
+}
+
+fn decode_utf16_32_impl(
+    data: &[u8],
+    is32: bool,
+    fixed_be: Option<bool>,
+) -> Result<String, crate::PyError> {
+    let unit = if is32 { 4usize } else { 2usize };
+    // Resolve endianness: a fixed -le/-be codec ignores any BOM, while
+    // the bare form consumes a leading BOM and otherwise defaults to LE.
+    let (big_endian, start) = match fixed_be {
+        Some(be) => (be, 0usize),
+        None => {
+            if is32 && data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+                (false, 4)
+            } else if is32 && data.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+                (true, 4)
+            } else if !is32 && data.starts_with(&[0xFF, 0xFE]) {
+                (false, 2)
+            } else if !is32 && data.starts_with(&[0xFE, 0xFF]) {
+                (true, 2)
+            } else {
+                (false, 0)
+            }
+        }
+    };
+    let body = &data[start..];
+    let codec = if is32 { "utf-32" } else { "utf-16" };
+    if body.len() % unit != 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::UnicodeDecodeError,
+            format!(
+                "'{codec}' codec can't decode bytes in position {}: truncated data",
+                body.len() - (body.len() % unit)
+            ),
+        ));
+    }
+    if is32 {
+        let mut s = String::new();
+        for (i, chunk) in body.chunks_exact(4).enumerate() {
+            let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let cp = if big_endian {
+                u32::from_be_bytes(arr)
+            } else {
+                u32::from_le_bytes(arr)
+            };
+            match char::from_u32(cp) {
+                Some(c) => s.push(c),
+                None => {
                     return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeEncodeError,
+                        crate::PyErrorKind::UnicodeDecodeError,
                         format!(
-                            "'latin-1' codec can't encode character '\\u{:04x}' in position {}",
-                            ch as u32, i
+                            "'utf-32' codec can't decode bytes in position {}: code point not in range(0x110000)",
+                            i * 4
                         ),
                     ));
                 }
-                out.push(ch as u8);
             }
-            Ok(pyre_object::w_bytes_from_bytes(&out))
         }
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown encoding: {encoding}"),
-        )),
+        Ok(s)
+    } else {
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|c| {
+                let arr = [c[0], c[1]];
+                if big_endian {
+                    u16::from_be_bytes(arr)
+                } else {
+                    u16::from_le_bytes(arr)
+                }
+            })
+            .collect();
+        let mut s = String::new();
+        for r in char::decode_utf16(units) {
+            match r {
+                Ok(c) => s.push(c),
+                Err(_) => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::UnicodeDecodeError,
+                        "'utf-16' codec can't decode bytes: illegal UTF-16 surrogate",
+                    ));
+                }
+            }
+        }
+        Ok(s)
     }
 }
 
@@ -1289,7 +1775,12 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
     let sub = unsafe { w_str_get_value(args[1]) };
-    Ok(w_int_new(s.matches(sub).count() as i64))
+    let Some((byte_start, byte_end)) = str_idx_window(s, args)? else {
+        return Ok(w_int_new(0));
+    };
+    Ok(w_int_new(
+        s[byte_start..byte_end].matches(sub).count() as i64
+    ))
 }
 
 /// PyPy: unicodeobject.py descr_index
@@ -1297,10 +1788,8 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sub = unsafe { w_str_get_value(args[1]) };
-    match s.find(sub) {
-        Some(i) => Ok(w_int_new(i as i64)),
+    match str_search(args, true)? {
+        Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
     }
 }
@@ -1310,40 +1799,8 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let sub = unsafe { w_str_get_value(args[1]) };
-    let char_len = s.chars().count() as i64;
-    let start = if args.len() >= 3 {
-        let v = unsafe { pyre_object::w_int_get_value(args[2]) };
-        if v < 0 {
-            (char_len + v).max(0) as usize
-        } else {
-            v as usize
-        }
-    } else {
-        0
-    };
-    let end = if args.len() >= 4 {
-        let v = unsafe { pyre_object::w_int_get_value(args[3]) };
-        if v < 0 {
-            (char_len + v).max(0) as usize
-        } else {
-            (v as usize).min(char_len as usize)
-        }
-    } else {
-        char_len as usize
-    };
-    let byte_start = s.char_indices().nth(start).map_or(s.len(), |(i, _)| i);
-    let byte_end = s.char_indices().nth(end).map_or(s.len(), |(i, _)| i);
-    if byte_start > byte_end {
-        return Err(crate::PyError::value_error("substring not found"));
-    }
-    let slice = &s[byte_start..byte_end];
-    match slice.rfind(sub) {
-        Some(byte_pos) => {
-            let char_pos = s[..byte_start + byte_pos].chars().count();
-            Ok(w_int_new(char_pos as i64))
-        }
+    match str_search(args, false)? {
+        Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
     }
 }
@@ -1669,11 +2126,36 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
     let tabsize = if args.len() > 1 {
-        (unsafe { w_int_get_value(args[1]) }) as usize
+        unsafe { w_int_get_value(args[1]) }
     } else {
         8
     };
-    let result = s.replace('\t', &" ".repeat(tabsize));
+    // Tabs advance to the next multiple of `tabsize` measured from the
+    // start of the current line (the column resets on `\n` / `\r`); a
+    // non-positive `tabsize` drops tabs entirely.
+    let mut result = String::with_capacity(s.len());
+    let mut col: i64 = 0;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                if tabsize > 0 {
+                    let incr = tabsize - (col % tabsize);
+                    col += incr;
+                    for _ in 0..incr {
+                        result.push(' ');
+                    }
+                }
+            }
+            '\n' | '\r' => {
+                result.push(c);
+                col = 0;
+            }
+            _ => {
+                result.push(c);
+                col += 1;
+            }
+        }
+    }
     Ok(w_str_new(&result))
 }
 
@@ -2088,17 +2570,17 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
-        return Err(crate::PyError::key_error("dictionary is empty"));
+        return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
     }
     unsafe {
         if pyre_object::w_dict_len(dict) == 0 {
-            return Err(crate::PyError::key_error("dictionary is empty"));
+            return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
         }
         let items = pyre_object::w_dict_items(dict);
         let (k, v) = items
             .last()
             .copied()
-            .ok_or_else(|| crate::PyError::key_error("dictionary is empty"))?;
+            .ok_or_else(|| crate::PyError::key_error("popitem(): dictionary is empty"))?;
         pyre_object::dictmultiobject::w_dict_delitem(dict, k);
         Ok(pyre_object::w_tuple_new(vec![k, v]))
     }

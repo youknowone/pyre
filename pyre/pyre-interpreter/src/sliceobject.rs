@@ -10,7 +10,7 @@ use pyre_object::{PyObjectRef, pyobject::is_none};
 ///
 /// Returns `w_int.__index__()` as an `i64`, converting to `TypeError`
 /// when the object has no `__index__` method.
-fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
     match crate::builtins::getindex_w(w_int) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(crate::PyError::new(
@@ -58,4 +58,61 @@ pub fn unwrap_start_stop(
         adapt_lower_bound(size, w_end)?
     };
     Ok((start, end))
+}
+
+/// sliceobject.py:170 `W_SliceObject.indices3(space, length)`.
+///
+/// Computes the `(start, stop, step)` triple for a slice over a sequence
+/// of `length` items, clipping out-of-bounds endpoints consistently with
+/// extended-slice handling. A zero `step` raises `ValueError`.
+pub fn indices3(
+    w_start: PyObjectRef,
+    w_stop: PyObjectRef,
+    w_step: PyObjectRef,
+    length: i64,
+) -> Result<(i64, i64, i64), crate::PyError> {
+    let step = if unsafe { is_none(w_step) } {
+        1
+    } else {
+        let step = eval_slice_index(w_step)?;
+        if step == 0 {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                "slice step cannot be zero".to_string(),
+            ));
+        }
+        step
+    };
+
+    let start = if unsafe { is_none(w_start) } {
+        if step < 0 { length - 1 } else { 0 }
+    } else {
+        let mut start = eval_slice_index(w_start)?;
+        if start < 0 {
+            start += length;
+            if start < 0 {
+                start = if step < 0 { -1 } else { 0 };
+            }
+        } else if start >= length {
+            start = if step < 0 { length - 1 } else { length };
+        }
+        start
+    };
+
+    let stop = if unsafe { is_none(w_stop) } {
+        if step < 0 { -1 } else { length }
+    } else {
+        let mut stop = eval_slice_index(w_stop)?;
+        if stop < 0 {
+            stop += length;
+            if stop < 0 {
+                stop = if step < 0 { -1 } else { 0 };
+            }
+        } else if stop >= length {
+            stop = if step < 0 { length - 1 } else { length };
+        }
+        stop
+    };
+
+    Ok((start, stop, step))
 }

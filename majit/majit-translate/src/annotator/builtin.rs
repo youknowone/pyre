@@ -315,6 +315,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.
     analyzer_for(&mut reg, "std.mem.size_of", std_mem_size_of);
+    // Rust `std::mem::align_of::<T>() -> usize` — same compile-time
+    // `usize` lattice as `size_of`; called by `object_array.rs` /
+    // `pyframe.rs`.
+    analyzer_for(&mut reg, "std.mem.align_of", std_mem_align_of);
     // External crate `majit_metainterp` bool flag helpers — both
     // qualnames share the same analyzer (returns `SomeBool`).
     analyzer_for(
@@ -1224,6 +1228,18 @@ pub fn std_mem_size_of(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::new(true, false)))
+}
+
+/// Analyzer for `std::mem::align_of::<T>() -> usize`.  Identical
+/// lattice to [`std_mem_size_of`] (a compile-time non-negative
+/// `usize`); registered against the `std.mem.align_of` stub so those
+/// callsites do not reach the "no analyser registered" error.
+pub fn std_mem_align_of(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    std_mem_size_of(bk, args_s, kwds)
 }
 
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag

@@ -90,6 +90,15 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_ITER_TYPE) }
 }
 
+/// Read the `(current, stop, step)` triple of a range iterator.
+///
+/// # Safety
+/// `obj` must point to a valid `W_RangeIterator`.
+pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
+    let iter = obj as *const W_RangeIterator;
+    unsafe { ((*iter).current, (*iter).stop, (*iter).step) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

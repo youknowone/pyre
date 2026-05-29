@@ -218,6 +218,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
             }
             format!("{{{}}}", parts.join(", "))
+        } else if pyre_object::sliceobject::is_slice(obj) {
+            // `pypy/objspace/std/sliceobject.py descr_repr` —
+            // `slice(%r, %r, %r)`.
+            format!(
+                "slice({}, {}, {})",
+                py_repr(pyre_object::sliceobject::w_slice_get_start(obj)),
+                py_repr(pyre_object::sliceobject::w_slice_get_stop(obj)),
+                py_repr(pyre_object::sliceobject::w_slice_get_step(obj)),
+            )
         } else if pyre_object::is_bytes_like(obj) {
             // `pypy/objspace/std/bytesobject.py W_BytesObject.descr_repr`
             // and `bytearrayobject.py W_BytearrayObject.descr_repr` —
@@ -475,6 +484,20 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
                 }
                 pyre_object::excobject::ExcKind::UnicodeEncodeError => {
                     return unicode_encode_error_str(obj);
+                }
+                // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
+                // a single-argument KeyError stringifies as `repr(args[0])`
+                // so `str(KeyError('k'))` is `"'k'"`; with any other arg
+                // count it falls back to `W_BaseException.descr_str` below.
+                pyre_object::excobject::ExcKind::KeyError => {
+                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                    if !args.is_null()
+                        && pyre_object::is_tuple(args)
+                        && pyre_object::w_tuple_len(args) == 1
+                    {
+                        let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+                        return py_repr(first);
+                    }
                 }
                 _ => {}
             }

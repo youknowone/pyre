@@ -116,6 +116,16 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
     }
 }
 
+/// Get a mutable reference to the backing `Vec`, for length-changing
+/// mutators (append / insert / remove / pop / clear).  Caller must
+/// ensure the bytearray is not aliased while the reference is live.
+pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        &mut *ba.data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

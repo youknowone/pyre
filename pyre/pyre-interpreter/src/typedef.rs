@@ -509,7 +509,7 @@ pub fn init_typeobjects() {
         // slice — PyPy: sliceobject.py, bases=(object,)
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("slice", |_| {}, object_type) as usize,
+            new_typeobject_with_base("slice", init_slice_type, object_type) as usize,
         );
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
@@ -1343,6 +1343,16 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // ── List TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
+/// Name of `obj`'s type, for operand-type error messages.
+fn arg_type_name(obj: PyObjectRef) -> String {
+    unsafe {
+        match r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*obj).ob_type).name.to_string(),
+        }
+    }
+}
+
 fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(list_descr_new));
     dict_storage_store(
@@ -1400,6 +1410,130 @@ fn init_list_type(ns: &mut DictStorage) {
         "remove",
         make_builtin_function_with_arity("remove", crate::type_methods::list_method_remove, 2),
     );
+    // Container slots exposed as callable dunders.  Each delegates to
+    // the generic object-space op, which fast-paths the concrete list
+    // (so no re-dispatch back through these methods).
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| crate::baseobjspace::getitem(args[0], args[1]),
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__setitem__",
+        make_builtin_function_with_arity(
+            "__setitem__",
+            |args| {
+                crate::baseobjspace::setitem(args[0], args[1], args[2])?;
+                Ok(pyre_object::w_none())
+            },
+            3,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__delitem__",
+        make_builtin_function_with_arity(
+            "__delitem__",
+            |args| {
+                crate::baseobjspace::delitem(args[0], args[1])?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity("__len__", |args| crate::baseobjspace::len(args[0]), 1),
+    );
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function_with_arity(
+            "__contains__",
+            |args| {
+                let found = crate::baseobjspace::contains(args[0], args[1])?;
+                Ok(pyre_object::w_bool_from(found))
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity("__iter__", |args| crate::baseobjspace::iter(args[0]), 1),
+    );
+    // Arithmetic slots.  `listobject.c:list_concat` rejects a non-list
+    // operand with TypeError (it does not return NotImplemented);
+    // `list_repeat` requires an integer count.
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity(
+            "__add__",
+            |args| {
+                if unsafe { pyre_object::is_list(args[1]) } {
+                    unsafe { crate::objspace::descroperation::list_concat(args[0], args[1]) }
+                } else {
+                    Err(crate::PyError::type_error(format!(
+                        "can only concatenate list (not \"{}\") to list",
+                        arg_type_name(args[1])
+                    )))
+                }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", list_descr_mul, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__rmul__",
+        make_builtin_function_with_arity("__rmul__", list_descr_mul, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__iadd__",
+        make_builtin_function_with_arity(
+            "__iadd__",
+            |args| {
+                crate::type_methods::list_method_extend(args)?;
+                Ok(args[0])
+            },
+            2,
+        ),
+    );
+    for (name, func) in [
+        ("__eq__", list_dunder_eq as DunderFn),
+        ("__ne__", list_dunder_ne),
+        ("__lt__", list_dunder_lt),
+        ("__le__", list_dunder_le),
+        ("__gt__", list_dunder_gt),
+        ("__ge__", list_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+}
+
+/// `listobject.c:list_repeat` — `list * n` / `n * list`.  A non-integer
+/// count raises the `__index__` TypeError.
+fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        unsafe { crate::objspace::descroperation::list_repeat(args[0], args[1]) }
+    } else {
+        // NotImplemented lets the `*` operator try a reflected `__rmul__`
+        // and otherwise emit the "can't multiply sequence by non-int"
+        // message, instead of this method's own slot error.
+        Ok(pyre_object::w_not_implemented())
+    }
 }
 
 // ── Str TypeDef ──────────────────────────────────────────────────────
@@ -1759,7 +1893,16 @@ fn init_str_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__add__"));
                 }
-                crate::baseobjspace::add(args[0], args[1])
+                // Self-contained concat: returning NotImplemented for a
+                // non-str operand lets the `+` operator emit the
+                // "can only concatenate" message, and avoids the
+                // recursion that delegating back to `add` would cause
+                // (descroperation::add re-dispatches to this dunder).
+                if unsafe { pyre_object::is_str(args[1]) } {
+                    unsafe { crate::objspace::descroperation::str_concat(args[0], args[1]) }
+                } else {
+                    Ok(pyre_object::w_not_implemented())
+                }
             },
             2,
         ),
@@ -1773,7 +1916,11 @@ fn init_str_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__mul__"));
                 }
-                crate::baseobjspace::mul(args[0], args[1])
+                if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+                    unsafe { crate::objspace::descroperation::str_repeat(args[0], args[1]) }
+                } else {
+                    Ok(pyre_object::w_not_implemented())
+                }
             },
             2,
         ),
@@ -1858,6 +2005,16 @@ fn init_str_type(ns: &mut DictStorage) {
             Ok(d)
         }),
     );
+    for (name, func) in [
+        ("__eq__", str_dunder_eq as DunderFn),
+        ("__ne__", str_dunder_ne),
+        ("__lt__", str_dunder_lt),
+        ("__le__", str_dunder_le),
+        ("__gt__", str_dunder_gt),
+        ("__ge__", str_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
@@ -3152,6 +3309,68 @@ fn init_tuple_type(ns: &mut DictStorage) {
             1,
         ),
     );
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| crate::baseobjspace::getitem(args[0], args[1]),
+            2,
+        ),
+    );
+    // `tupleobject.c:tuple_concat` rejects a non-tuple operand with
+    // TypeError; `*` requires an integer count.
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity(
+            "__add__",
+            |args| {
+                if unsafe { pyre_object::is_tuple(args[1]) } {
+                    unsafe { crate::objspace::descroperation::tuple_concat(args[0], args[1]) }
+                } else {
+                    Err(crate::PyError::type_error(format!(
+                        "can only concatenate tuple (not \"{}\") to tuple",
+                        arg_type_name(args[1])
+                    )))
+                }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", tuple_descr_mul, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__rmul__",
+        make_builtin_function_with_arity("__rmul__", tuple_descr_mul, 2),
+    );
+    for (name, func) in [
+        ("__eq__", tuple_dunder_eq as DunderFn),
+        ("__ne__", tuple_dunder_ne),
+        ("__lt__", tuple_dunder_lt),
+        ("__le__", tuple_dunder_le),
+        ("__gt__", tuple_dunder_gt),
+        ("__ge__", tuple_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+}
+
+/// `tupleobject.c` `tuple * n` / `n * tuple`.  A non-integer count
+/// raises the `__index__` TypeError.
+fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        crate::objspace::descroperation::mul(args[0], args[1])
+    } else {
+        // NotImplemented lets the `*` operator try a reflected `__rmul__`
+        // and otherwise emit the "can't multiply sequence by non-int"
+        // message, instead of this method's own slot error.
+        Ok(pyre_object::w_not_implemented())
+    }
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
@@ -3160,6 +3379,248 @@ fn init_tuple_type(ns: &mut DictStorage) {
 // PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
 
 /// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
+/// sliceobject.py:148 `W_SliceObject.descr_indices`.
+fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() == 2, "indices() takes exactly one argument");
+    let length = crate::builtins::getindex_w(args[1])?;
+    if length < 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "length should not be negative".to_string(),
+        ));
+    }
+    let (start, stop, step) = unsafe {
+        crate::sliceobject::indices3(
+            pyre_object::sliceobject::w_slice_get_start(args[0]),
+            pyre_object::sliceobject::w_slice_get_stop(args[0]),
+            pyre_object::sliceobject::w_slice_get_step(args[0]),
+            length,
+        )?
+    };
+    Ok(w_tuple_new(vec![
+        pyre_object::w_int_new(start),
+        pyre_object::w_int_new(stop),
+        pyre_object::w_int_new(step),
+    ]))
+}
+
+/// sliceobject.py `W_SliceObject.descr__new__` — `slice([start,] stop[, step])`.
+fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let params = &args[1..];
+    let none = pyre_object::w_none();
+    let (start, stop, step) = match params {
+        [stop] => (none, *stop, none),
+        [start, stop] => (*start, *stop, none),
+        [start, stop, step] => (*start, *stop, *step),
+        [] => {
+            return Err(crate::PyError::type_error(
+                "slice expected at least 1 argument, got 0",
+            ));
+        }
+        _ => {
+            return Err(crate::PyError::type_error(format!(
+                "slice expected at most 3 arguments, got {}",
+                params.len()
+            )));
+        }
+    };
+    Ok(pyre_object::sliceobject::w_slice_new(start, stop, step))
+}
+
+fn slice_getter(
+    args: &[PyObjectRef],
+    field: unsafe fn(PyObjectRef) -> PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if unsafe { pyre_object::sliceobject::is_slice(self_) } {
+        Ok(unsafe { field(self_) })
+    } else {
+        Ok(pyre_object::PY_NULL)
+    }
+}
+
+/// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
+fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_str_new(&unsafe { crate::display::py_repr(args[0]) }))
+}
+
+/// sliceobject.py `descr_eq` / `descr_ne` — compare the three components.
+/// `slice is slice` is always equal even with non-comparable params.
+fn slice_components_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
+    unsafe {
+        crate::baseobjspace::eq_w(
+            pyre_object::sliceobject::w_slice_get_start(a),
+            pyre_object::sliceobject::w_slice_get_start(b),
+        ) && crate::baseobjspace::eq_w(
+            pyre_object::sliceobject::w_slice_get_stop(a),
+            pyre_object::sliceobject::w_slice_get_stop(b),
+        ) && crate::baseobjspace::eq_w(
+            pyre_object::sliceobject::w_slice_get_step(a),
+            pyre_object::sliceobject::w_slice_get_step(b),
+        )
+    }
+}
+
+fn slice_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (a, b) = (args[0], args[1]);
+    if a == b {
+        return Ok(pyre_object::w_bool_from(true));
+    }
+    if unsafe { pyre_object::sliceobject::is_slice(b) } {
+        Ok(pyre_object::w_bool_from(slice_components_eq(a, b)))
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+
+fn slice_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (a, b) = (args[0], args[1]);
+    if a == b {
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    if unsafe { pyre_object::sliceobject::is_slice(b) } {
+        if slice_components_eq(a, b) {
+            Ok(pyre_object::w_bool_from(false))
+        } else {
+            Ok(pyre_object::w_bool_from(true))
+        }
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+
+/// sliceobject.py `descr_lt` — lexicographic on (start, stop, step).
+fn slice_descr_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (a, b) = (args[0], args[1]);
+    if a == b {
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    if unsafe { pyre_object::sliceobject::is_slice(b) } {
+        slice_lt_components(a, b)
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+
+fn slice_lt_components(a: PyObjectRef, b: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let (sa, sb) = unsafe {
+        (
+            pyre_object::sliceobject::w_slice_get_start(a),
+            pyre_object::sliceobject::w_slice_get_start(b),
+        )
+    };
+    if crate::baseobjspace::eq_w(sa, sb) {
+        let (ta, tb) = unsafe {
+            (
+                pyre_object::sliceobject::w_slice_get_stop(a),
+                pyre_object::sliceobject::w_slice_get_stop(b),
+            )
+        };
+        if crate::baseobjspace::eq_w(ta, tb) {
+            let (pa, pb) = unsafe {
+                (
+                    pyre_object::sliceobject::w_slice_get_step(a),
+                    pyre_object::sliceobject::w_slice_get_step(b),
+                )
+            };
+            crate::baseobjspace::compare(pa, pb, crate::baseobjspace::CompareOp::Lt)
+        } else {
+            crate::baseobjspace::compare(ta, tb, crate::baseobjspace::CompareOp::Lt)
+        }
+    } else {
+        crate::baseobjspace::compare(sa, sb, crate::baseobjspace::CompareOp::Lt)
+    }
+}
+
+/// sliceobject.py `descr__reduce__` — `(type(self), (start, stop, step))`.
+fn slice_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let s = args[0];
+    let ty = r#type(s).unwrap_or(pyre_object::PY_NULL);
+    let components = unsafe {
+        w_tuple_new(vec![
+            pyre_object::sliceobject::w_slice_get_start(s),
+            pyre_object::sliceobject::w_slice_get_stop(s),
+            pyre_object::sliceobject::w_slice_get_step(s),
+        ])
+    };
+    Ok(w_tuple_new(vec![ty, components]))
+}
+
+fn init_slice_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(slice_descr_new));
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function("__repr__", slice_descr_repr),
+    );
+    dict_storage_store(
+        ns,
+        "__eq__",
+        make_builtin_function("__eq__", slice_descr_eq),
+    );
+    dict_storage_store(
+        ns,
+        "__ne__",
+        make_builtin_function("__ne__", slice_descr_ne),
+    );
+    dict_storage_store(
+        ns,
+        "__lt__",
+        make_builtin_function("__lt__", slice_descr_lt),
+    );
+    // sliceobject.py:205 `__hash__ = None` — slice is unhashable, consistent
+    // with the value-based `__eq__`.  hash() raises via the unhashable
+    // ladder in `builtins::try_hash_value`; the dict entry surfaces
+    // `slice.__hash__ is None` to introspection.
+    dict_storage_store(ns, "__hash__", pyre_object::w_none());
+    dict_storage_store(
+        ns,
+        "__reduce__",
+        make_builtin_function("__reduce__", slice_descr_reduce),
+    );
+    dict_storage_store(
+        ns,
+        "start",
+        make_getset_descriptor_named(
+            make_builtin_function_with_arity(
+                "start",
+                |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_start),
+                2,
+            ),
+            "start",
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "stop",
+        make_getset_descriptor_named(
+            make_builtin_function_with_arity(
+                "stop",
+                |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_stop),
+                2,
+            ),
+            "stop",
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "step",
+        make_getset_descriptor_named(
+            make_builtin_function_with_arity(
+                "step",
+                |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_step),
+                2,
+            ),
+            "step",
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "indices",
+        make_builtin_function("indices", slice_method_indices),
+    );
+}
+
 fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
@@ -5081,6 +5542,283 @@ fn init_property_type(ns: &mut DictStorage) {
     );
 }
 
+/// `self` as a plain int — `int.real` / `numerator` / `conjugate` /
+/// `as_integer_ratio` return the integer value, so a `bool` receiver
+/// yields `1` / `0` rather than itself.
+fn int_as_plain_int(args: &[PyObjectRef]) -> PyObjectRef {
+    let obj = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
+    unsafe {
+        if pyre_object::is_bool(obj) {
+            return pyre_object::w_int_new(pyre_object::w_bool_get_value(obj) as i64);
+        }
+    }
+    obj
+}
+
+// ── Numeric binary-op dunders ────────────────────────────────────────
+// Each forwards to the object-space op when the operand is numerically
+// compatible, else returns NotImplemented so the interpreter can try the
+// reflected method.  `descroperation` fast-paths the concrete int/float,
+// so these never re-dispatch back through the dunder.
+macro_rules! int_binop_fwd {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+                $op(args[0], args[1])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+macro_rules! int_binop_rev {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+                $op(args[1], args[0])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+macro_rules! float_binop_fwd {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let b = args[1];
+            if unsafe {
+                pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b)
+            } {
+                $op(args[0], b)
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+macro_rules! float_binop_rev {
+    ($name:ident, $op:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let b = args[1];
+            if unsafe {
+                pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b)
+            } {
+                $op(b, args[0])
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+
+int_binop_fwd!(int_dunder_add, crate::objspace::descroperation::add);
+int_binop_rev!(int_dunder_radd, crate::objspace::descroperation::add);
+int_binop_fwd!(int_dunder_sub, crate::objspace::descroperation::sub);
+int_binop_rev!(int_dunder_rsub, crate::objspace::descroperation::sub);
+int_binop_fwd!(int_dunder_mul, crate::objspace::descroperation::mul);
+int_binop_rev!(int_dunder_rmul, crate::objspace::descroperation::mul);
+int_binop_fwd!(int_dunder_truediv, crate::objspace::descroperation::truediv);
+int_binop_rev!(
+    int_dunder_rtruediv,
+    crate::objspace::descroperation::truediv
+);
+int_binop_fwd!(
+    int_dunder_floordiv,
+    crate::objspace::descroperation::floordiv
+);
+int_binop_rev!(
+    int_dunder_rfloordiv,
+    crate::objspace::descroperation::floordiv
+);
+int_binop_fwd!(int_dunder_mod, crate::objspace::descroperation::mod_);
+int_binop_rev!(int_dunder_rmod, crate::objspace::descroperation::mod_);
+int_binop_fwd!(int_dunder_divmod, crate::objspace::descroperation::divmod);
+int_binop_rev!(int_dunder_rdivmod, crate::objspace::descroperation::divmod);
+int_binop_rev!(int_dunder_rpow, crate::objspace::descroperation::pow);
+int_binop_fwd!(int_dunder_lshift, crate::objspace::descroperation::lshift);
+int_binop_rev!(int_dunder_rlshift, crate::objspace::descroperation::lshift);
+int_binop_fwd!(int_dunder_rshift, crate::objspace::descroperation::rshift);
+int_binop_rev!(int_dunder_rrshift, crate::objspace::descroperation::rshift);
+int_binop_fwd!(int_dunder_and, crate::objspace::descroperation::and_);
+int_binop_rev!(int_dunder_rand, crate::objspace::descroperation::and_);
+int_binop_fwd!(int_dunder_or, crate::objspace::descroperation::or_);
+int_binop_rev!(int_dunder_ror, crate::objspace::descroperation::or_);
+int_binop_fwd!(int_dunder_xor, crate::objspace::descroperation::xor);
+int_binop_rev!(int_dunder_rxor, crate::objspace::descroperation::xor);
+
+/// `int.__pow__(self, exp[, mod])` — optional modulus routes through the
+/// three-argument modular power.
+fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        if args.len() >= 3 {
+            if unsafe { pyre_object::pyobject::is_none(args[2]) } {
+                crate::objspace::descroperation::pow(args[0], args[1])
+            } else {
+                crate::objspace::descroperation::pow3(args[0], args[1], args[2])
+            }
+        } else {
+            crate::objspace::descroperation::pow(args[0], args[1])
+        }
+    } else {
+        Ok(pyre_object::w_not_implemented())
+    }
+}
+
+float_binop_fwd!(float_dunder_add, crate::objspace::descroperation::add);
+float_binop_rev!(float_dunder_radd, crate::objspace::descroperation::add);
+float_binop_fwd!(float_dunder_sub, crate::objspace::descroperation::sub);
+float_binop_rev!(float_dunder_rsub, crate::objspace::descroperation::sub);
+float_binop_fwd!(float_dunder_mul, crate::objspace::descroperation::mul);
+float_binop_rev!(float_dunder_rmul, crate::objspace::descroperation::mul);
+float_binop_fwd!(
+    float_dunder_truediv,
+    crate::objspace::descroperation::truediv
+);
+float_binop_rev!(
+    float_dunder_rtruediv,
+    crate::objspace::descroperation::truediv
+);
+float_binop_fwd!(
+    float_dunder_floordiv,
+    crate::objspace::descroperation::floordiv
+);
+float_binop_rev!(
+    float_dunder_rfloordiv,
+    crate::objspace::descroperation::floordiv
+);
+float_binop_fwd!(float_dunder_mod, crate::objspace::descroperation::mod_);
+float_binop_rev!(float_dunder_rmod, crate::objspace::descroperation::mod_);
+float_binop_fwd!(float_dunder_divmod, crate::objspace::descroperation::divmod);
+float_binop_rev!(
+    float_dunder_rdivmod,
+    crate::objspace::descroperation::divmod
+);
+float_binop_fwd!(float_dunder_pow, crate::objspace::descroperation::pow);
+float_binop_rev!(float_dunder_rpow, crate::objspace::descroperation::pow);
+
+// Rich comparison dunders (`__eq__` / `__ne__` / `__lt__` / `__le__` /
+// `__gt__` / `__ge__`).  Each built-in numeric / sequence type only
+// compares against operands of an accepted type and returns
+// `NotImplemented` otherwise, so the reflected comparison on the other
+// operand gets a chance (`1 == 1.0` succeeds through `float.__eq__`).
+// When the operand passes the guard the value comparison is delegated to
+// `descroperation::compare`, whose matching-type fast paths return
+// directly without re-dispatching back through these dunders.
+fn cmp_guard_int(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::pyobject::is_int_or_long(b) }
+}
+fn cmp_guard_float(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) }
+}
+fn cmp_guard_str(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_str(b) }
+}
+fn cmp_guard_list(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_list(b) }
+}
+fn cmp_guard_tuple(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_tuple(b) }
+}
+fn cmp_guard_bytes(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::bytesobject::is_bytes(b) }
+}
+fn cmp_guard_bytearray(b: PyObjectRef) -> bool {
+    unsafe { pyre_object::bytesobject::is_bytes_like(b) }
+}
+
+macro_rules! cmp_dunder {
+    ($name:ident, $op:ident, $guard:path) => {
+        fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if $guard(args[1]) {
+                crate::objspace::descroperation::compare(
+                    args[0],
+                    args[1],
+                    crate::objspace::descroperation::CompareOp::$op,
+                )
+            } else {
+                Ok(pyre_object::w_not_implemented())
+            }
+        }
+    };
+}
+
+macro_rules! cmp_dunder_set {
+    ($eq:ident, $ne:ident, $lt:ident, $le:ident, $gt:ident, $ge:ident, $guard:path) => {
+        cmp_dunder!($eq, Eq, $guard);
+        cmp_dunder!($ne, Ne, $guard);
+        cmp_dunder!($lt, Lt, $guard);
+        cmp_dunder!($le, Le, $guard);
+        cmp_dunder!($gt, Gt, $guard);
+        cmp_dunder!($ge, Ge, $guard);
+    };
+}
+
+cmp_dunder_set!(
+    int_dunder_eq,
+    int_dunder_ne,
+    int_dunder_lt,
+    int_dunder_le,
+    int_dunder_gt,
+    int_dunder_ge,
+    cmp_guard_int
+);
+cmp_dunder_set!(
+    float_dunder_eq,
+    float_dunder_ne,
+    float_dunder_lt,
+    float_dunder_le,
+    float_dunder_gt,
+    float_dunder_ge,
+    cmp_guard_float
+);
+cmp_dunder_set!(
+    str_dunder_eq,
+    str_dunder_ne,
+    str_dunder_lt,
+    str_dunder_le,
+    str_dunder_gt,
+    str_dunder_ge,
+    cmp_guard_str
+);
+cmp_dunder_set!(
+    list_dunder_eq,
+    list_dunder_ne,
+    list_dunder_lt,
+    list_dunder_le,
+    list_dunder_gt,
+    list_dunder_ge,
+    cmp_guard_list
+);
+cmp_dunder_set!(
+    tuple_dunder_eq,
+    tuple_dunder_ne,
+    tuple_dunder_lt,
+    tuple_dunder_le,
+    tuple_dunder_gt,
+    tuple_dunder_ge,
+    cmp_guard_tuple
+);
+cmp_dunder_set!(
+    bytes_dunder_eq,
+    bytes_dunder_ne,
+    bytes_dunder_lt,
+    bytes_dunder_le,
+    bytes_dunder_gt,
+    bytes_dunder_ge,
+    cmp_guard_bytes
+);
+cmp_dunder_set!(
+    bytearray_dunder_eq,
+    bytearray_dunder_ne,
+    bytearray_dunder_lt,
+    bytearray_dunder_le,
+    bytearray_dunder_gt,
+    bytearray_dunder_ge,
+    cmp_guard_bytearray
+);
+
+type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
+
 fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(int_descr_new));
     dict_storage_store(
@@ -5089,15 +5827,16 @@ fn init_int_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "bit_length",
             |args| {
-                let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                    unsafe { pyre_object::w_int_get_value(args[0]) }
+                // `intobject.py descr_bit_length` — number of bits in the
+                // absolute value, so long/bigint operands must route
+                // through their magnitude rather than the i64 fast path
+                // (which leaves out-of-range values at 0).
+                let bits = if !args.is_empty()
+                    && unsafe { pyre_object::pyobject::is_int_or_long(args[0]) }
+                {
+                    unsafe { crate::builtins::obj_to_bigint(args[0]).bits() }
                 } else {
                     0
-                };
-                let bits = if val == 0 {
-                    0
-                } else {
-                    64 - val.unsigned_abs().leading_zeros()
                 };
                 Ok(pyre_object::w_int_new(bits as i64))
             },
@@ -5216,13 +5955,24 @@ fn init_int_type(ns: &mut DictStorage) {
             ),
         );
     }
-    // int.conjugate — identity
+    // int.conjugate — identity (bool → int)
     dict_storage_store(
         ns,
         "conjugate",
+        make_builtin_function_with_arity("conjugate", |args| Ok(int_as_plain_int(args)), 1),
+    );
+    // int.as_integer_ratio — (self, 1)
+    dict_storage_store(
+        ns,
+        "as_integer_ratio",
         make_builtin_function_with_arity(
-            "conjugate",
-            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0))),
+            "as_integer_ratio",
+            |args| {
+                Ok(pyre_object::w_tuple_new(vec![
+                    int_as_plain_int(args),
+                    pyre_object::w_int_new(1),
+                ]))
+            },
             1,
         ),
     );
@@ -5232,21 +5982,7 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "real",
         pyre_object::w_property_new(
-            make_builtin_function_with_arity(
-                "real",
-                |args| {
-                    let obj = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
-                    unsafe {
-                        if pyre_object::is_bool(obj) {
-                            return Ok(pyre_object::w_int_new(
-                                pyre_object::w_bool_get_value(obj) as i64
-                            ));
-                        }
-                    }
-                    Ok(obj)
-                },
-                1,
-            ),
+            make_builtin_function_with_arity("real", |args| Ok(int_as_plain_int(args)), 1),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         ),
@@ -5264,11 +6000,7 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "numerator",
         pyre_object::w_property_new(
-            make_builtin_function_with_arity(
-                "numerator",
-                |args| Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0))),
-                1,
-            ),
+            make_builtin_function_with_arity("numerator", |args| Ok(int_as_plain_int(args)), 1),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         ),
@@ -5276,6 +6008,122 @@ fn init_int_type(ns: &mut DictStorage) {
     let denom_getter =
         make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 1);
     dict_storage_store(ns, "denominator", make_getset_descriptor(denom_getter));
+    // Unary / conversion slots exposed as callable dunders.  These have
+    // no NotImplemented dispatch, so each delegates to the object-space
+    // op, which fast-paths the concrete int (no re-dispatch through the
+    // dunder).  Binary arithmetic dunders are registered separately.
+    dict_storage_store(
+        ns,
+        "__round__",
+        make_builtin_function("__round__", crate::builtins::builtin_round),
+    );
+    dict_storage_store(
+        ns,
+        "__float__",
+        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__abs__",
+        make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__neg__",
+        make_builtin_function_with_arity(
+            "__neg__",
+            |args| crate::objspace::descroperation::neg(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__pos__",
+        make_builtin_function_with_arity(
+            "__pos__",
+            |args| crate::objspace::descroperation::pos(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__invert__",
+        make_builtin_function_with_arity(
+            "__invert__",
+            |args| crate::objspace::descroperation::invert(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__bool__",
+        make_builtin_function_with_arity(
+            "__bool__",
+            |args| {
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+                    args[0],
+                )))
+            },
+            1,
+        ),
+    );
+    // `int.__floor__` / `int.__ceil__` return the int itself.
+    dict_storage_store(
+        ns,
+        "__floor__",
+        make_builtin_function_with_arity("__floor__", |args| Ok(args[0]), 1),
+    );
+    dict_storage_store(
+        ns,
+        "__ceil__",
+        make_builtin_function_with_arity("__ceil__", |args| Ok(args[0]), 1),
+    );
+    // Binary arithmetic / bitwise dunders (forward + reflected).
+    for (name, func) in [
+        ("__add__", int_dunder_add as DunderFn),
+        ("__radd__", int_dunder_radd),
+        ("__sub__", int_dunder_sub),
+        ("__rsub__", int_dunder_rsub),
+        ("__mul__", int_dunder_mul),
+        ("__rmul__", int_dunder_rmul),
+        ("__truediv__", int_dunder_truediv),
+        ("__rtruediv__", int_dunder_rtruediv),
+        ("__floordiv__", int_dunder_floordiv),
+        ("__rfloordiv__", int_dunder_rfloordiv),
+        ("__mod__", int_dunder_mod),
+        ("__rmod__", int_dunder_rmod),
+        ("__divmod__", int_dunder_divmod),
+        ("__rdivmod__", int_dunder_rdivmod),
+        ("__rpow__", int_dunder_rpow),
+        ("__lshift__", int_dunder_lshift),
+        ("__rlshift__", int_dunder_rlshift),
+        ("__rshift__", int_dunder_rshift),
+        ("__rrshift__", int_dunder_rrshift),
+        ("__and__", int_dunder_and),
+        ("__rand__", int_dunder_rand),
+        ("__or__", int_dunder_or),
+        ("__ror__", int_dunder_ror),
+        ("__xor__", int_dunder_xor),
+        ("__rxor__", int_dunder_rxor),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+    // `__pow__` takes an optional modulus, so it is variadic.
+    dict_storage_store(
+        ns,
+        "__pow__",
+        make_builtin_function("__pow__", int_dunder_pow),
+    );
+    for (name, func) in [
+        ("__eq__", int_dunder_eq as DunderFn),
+        ("__ne__", int_dunder_ne),
+        ("__lt__", int_dunder_lt),
+        ("__le__", int_dunder_le),
+        ("__gt__", int_dunder_gt),
+        ("__ge__", int_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
 }
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
@@ -5317,19 +6165,13 @@ fn init_float_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "hex",
             |args| {
-                // float.hex() — PyPy: descr_hex. Format the float as a hex
-                // literal compatible with float.fromhex.
+                // float.hex() — floatobject.c float_hex.  C99 hex-float
+                // literal round-trippable through float.fromhex.
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("hex() requires self"));
                 }
                 let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-                if v.is_nan() {
-                    return Ok(pyre_object::w_str_new("nan"));
-                }
-                if v.is_infinite() {
-                    return Ok(pyre_object::w_str_new(if v > 0.0 { "inf" } else { "-inf" }));
-                }
-                Ok(pyre_object::w_str_new(&format!("{v:e}")))
+                Ok(pyre_object::w_str_new(&float_hex_repr(v)))
             },
             1,
         ),
@@ -5440,26 +6282,73 @@ fn init_float_type(ns: &mut DictStorage) {
                         "cannot convert NaN/Infinity to integer ratio",
                     ));
                 }
-                // Simple conversion: use bit representation to get exact ratio.
-                // f = m * 2^e where m is an integer mantissa.
+                // Decompose f = m * 2^e with an integer mantissa, then
+                // reduce to lowest terms (the mantissa carries trailing
+                // zero bits for values like 0.5, so the raw ratio is not
+                // yet reduced).
                 let (mantissa, exponent, sign) = integer_decode(v);
-                let sign_i = sign as i64;
-                let m = mantissa as i64 * sign_i;
-                if exponent >= 0 {
-                    let num = m.saturating_mul(1i64 << exponent.min(62));
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(num),
-                        pyre_object::w_int_new(1),
-                    ]))
+                let m = mantissa as i64 * sign as i64;
+                let (num, denom) = if exponent >= 0 {
+                    (m.saturating_mul(1i64 << exponent.min(62)), 1i64)
                 } else {
-                    let denom = 1i64 << (-exponent).min(62);
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(m),
-                        pyre_object::w_int_new(denom),
-                    ]))
+                    (m, 1i64 << (-exponent).min(62))
+                };
+                fn gcd(mut a: i64, mut b: i64) -> i64 {
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    a.abs()
                 }
+                let g = gcd(num, denom).max(1);
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(num / g),
+                    pyre_object::w_int_new(denom / g),
+                ]))
             },
             1,
+        ),
+    );
+    // float.conjugate — identity for a real number.
+    dict_storage_store(
+        ns,
+        "conjugate",
+        make_builtin_function_with_arity(
+            "conjugate",
+            |args| {
+                Ok(args
+                    .first()
+                    .copied()
+                    .unwrap_or(pyre_object::w_float_new(0.0)))
+            },
+            1,
+        ),
+    );
+    // float.real / float.imag — a float is its own real part; imag is 0.0.
+    dict_storage_store(
+        ns,
+        "real",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity(
+                "real",
+                |args| {
+                    Ok(args
+                        .first()
+                        .copied()
+                        .unwrap_or(pyre_object::w_float_new(0.0)))
+                },
+                1,
+            ),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "imag",
+        pyre_object::w_property_new(
+            make_builtin_function_with_arity("imag", |_| Ok(pyre_object::w_float_new(0.0)), 1),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
         ),
     );
     // floatobject.py:713/715/449-455 — __int__/__trunc__ go through
@@ -5519,6 +6408,87 @@ fn init_float_type(ns: &mut DictStorage) {
             make_builtin_function_with_arity(method, func, 1),
         );
     }
+    // Unary / conversion slots exposed as callable dunders (no
+    // NotImplemented dispatch).  Binary arithmetic dunders are
+    // registered separately.
+    dict_storage_store(
+        ns,
+        "__round__",
+        make_builtin_function("__round__", crate::builtins::builtin_round),
+    );
+    dict_storage_store(
+        ns,
+        "__float__",
+        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__abs__",
+        make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__neg__",
+        make_builtin_function_with_arity(
+            "__neg__",
+            |args| crate::objspace::descroperation::neg(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__pos__",
+        make_builtin_function_with_arity(
+            "__pos__",
+            |args| crate::objspace::descroperation::pos(args[0]),
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__bool__",
+        make_builtin_function_with_arity(
+            "__bool__",
+            |args| {
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(
+                    args[0],
+                )))
+            },
+            1,
+        ),
+    );
+    // Binary arithmetic dunders (forward + reflected).  float has no
+    // bitwise ops; `__pow__` takes no modulus.
+    for (name, func) in [
+        ("__add__", float_dunder_add as DunderFn),
+        ("__radd__", float_dunder_radd),
+        ("__sub__", float_dunder_sub),
+        ("__rsub__", float_dunder_rsub),
+        ("__mul__", float_dunder_mul),
+        ("__rmul__", float_dunder_rmul),
+        ("__truediv__", float_dunder_truediv),
+        ("__rtruediv__", float_dunder_rtruediv),
+        ("__floordiv__", float_dunder_floordiv),
+        ("__rfloordiv__", float_dunder_rfloordiv),
+        ("__mod__", float_dunder_mod),
+        ("__rmod__", float_dunder_rmod),
+        ("__divmod__", float_dunder_divmod),
+        ("__rdivmod__", float_dunder_rdivmod),
+        ("__pow__", float_dunder_pow),
+        ("__rpow__", float_dunder_rpow),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
+    for (name, func) in [
+        ("__eq__", float_dunder_eq as DunderFn),
+        ("__ne__", float_dunder_ne),
+        ("__lt__", float_dunder_lt),
+        ("__le__", float_dunder_le),
+        ("__gt__", float_dunder_gt),
+        ("__ge__", float_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -5555,6 +6525,76 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         Some(n) => Ok(pyre_object::w_int_new(n)),
         None => Ok(pyre_object::w_long_new(big)),
     }
+}
+
+/// `frexp` — split `x` into mantissa `m` (`0.5 <= |m| < 1`) and
+/// exponent `e` so that `x == m * 2**e`.  std has no `frexp`, so the
+/// IEEE-754 bits are decomposed directly: clearing the stored exponent
+/// to `0x3fe` lands the value in `[0.5, 1)`.  Subnormals are first
+/// scaled into the normal range by `2**54`.
+fn float_frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let exp_field = ((bits >> 52) & 0x7ff) as i32;
+    if exp_field == 0 {
+        let scaled = (x * 18014398509481984.0).to_bits();
+        let m_bits = (scaled & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000;
+        let e = (((scaled >> 52) & 0x7ff) as i32) - 1022 - 54;
+        return (f64::from_bits(m_bits), e);
+    }
+    let m_bits = (bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000;
+    (f64::from_bits(m_bits), exp_field - 1022)
+}
+
+/// Map a 4-bit value to its lowercase hex digit.
+fn hex_digit_char(d: i64) -> char {
+    if d < 10 {
+        (b'0' + d as u8) as char
+    } else {
+        (b'a' + (d - 10) as u8) as char
+    }
+}
+
+/// `floatobject.c:float_hex` — render `x` as a C99 hexadecimal float
+/// literal (`[-]0x1.hhhhhhhhhhhhhp±d`) round-trippable through
+/// `float.fromhex`.  nan / inf reuse the ordinary float repr.
+fn float_hex_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        let s = if x > 0.0 { "inf" } else { "-inf" };
+        return s.to_string();
+    }
+    if x == 0.0 {
+        let neg = x.to_bits() >> 63 == 1;
+        let s = if neg { "-0x0.0p+0" } else { "0x0.0p+0" };
+        return s.to_string();
+    }
+    let ax = if x < 0.0 { -x } else { x };
+    let (mut m, mut e) = float_frexp(ax);
+    // shift = 1 - max(DBL_MIN_EXP - e, 0), DBL_MIN_EXP = -1021.
+    let underflow = -1021 - e;
+    let shift = 1 - if underflow > 0 { underflow } else { 0 };
+    m *= 2f64.powi(shift);
+    e -= shift;
+
+    let lead = m as i64;
+    let mut digits = String::new();
+    digits.push(hex_digit_char(lead));
+    m -= lead as f64;
+    digits.push('.');
+    for _ in 0..13 {
+        m *= 16.0;
+        let d = m as i64;
+        digits.push(hex_digit_char(d));
+        m -= d as f64;
+    }
+    let (esign, eabs) = if e < 0 { ('-', -e) } else { ('+', e) };
+    let sign = if x < 0.0 { "-" } else { "" };
+    format!("{sign}0x{digits}p{esign}{eabs}")
 }
 
 /// IEEE 754 double decomposition into (mantissa, exponent, sign).
@@ -5884,7 +6924,1317 @@ fn init_bytes_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity("__str__", bytes_method_repr, 1),
     );
     dict_storage_store(ns, "hex", make_builtin_function("hex", bytes_method_hex));
+    dict_storage_store(ns, "find", make_builtin_function("find", bytes_method_find));
+    dict_storage_store(
+        ns,
+        "rfind",
+        make_builtin_function("rfind", bytes_method_rfind),
+    );
+    dict_storage_store(
+        ns,
+        "index",
+        make_builtin_function("index", bytes_method_index),
+    );
+    dict_storage_store(
+        ns,
+        "rindex",
+        make_builtin_function("rindex", bytes_method_rindex),
+    );
+    dict_storage_store(
+        ns,
+        "count",
+        make_builtin_function("count", bytes_method_count),
+    );
+    dict_storage_store(
+        ns,
+        "startswith",
+        make_builtin_function("startswith", bytes_method_startswith),
+    );
+    dict_storage_store(
+        ns,
+        "endswith",
+        make_builtin_function("endswith", bytes_method_endswith),
+    );
+    dict_storage_store(
+        ns,
+        "upper",
+        make_builtin_function("upper", bytes_method_upper),
+    );
+    dict_storage_store(
+        ns,
+        "lower",
+        make_builtin_function("lower", bytes_method_lower),
+    );
+    dict_storage_store(
+        ns,
+        "strip",
+        make_builtin_function("strip", bytes_method_strip),
+    );
+    dict_storage_store(
+        ns,
+        "lstrip",
+        make_builtin_function("lstrip", bytes_method_lstrip),
+    );
+    dict_storage_store(
+        ns,
+        "rstrip",
+        make_builtin_function("rstrip", bytes_method_rstrip),
+    );
+    dict_storage_store(
+        ns,
+        "replace",
+        make_builtin_function("replace", bytes_method_replace),
+    );
+    dict_storage_store(
+        ns,
+        "split",
+        make_builtin_function("split", bytes_method_split),
+    );
+    dict_storage_store(
+        ns,
+        "rsplit",
+        make_builtin_function("rsplit", bytes_method_rsplit),
+    );
+    dict_storage_store(ns, "join", make_builtin_function("join", bytes_method_join));
+    dict_storage_store(
+        ns,
+        "partition",
+        make_builtin_function("partition", bytes_method_partition),
+    );
+    dict_storage_store(
+        ns,
+        "rpartition",
+        make_builtin_function("rpartition", bytes_method_rpartition),
+    );
+    dict_storage_store(
+        ns,
+        "translate",
+        make_builtin_function("translate", bytes_method_translate),
+    );
+    dict_storage_store(
+        ns,
+        "isdigit",
+        make_builtin_function("isdigit", bytes_method_isdigit),
+    );
+    dict_storage_store(
+        ns,
+        "isalpha",
+        make_builtin_function("isalpha", bytes_method_isalpha),
+    );
+    dict_storage_store(
+        ns,
+        "isalnum",
+        make_builtin_function("isalnum", bytes_method_isalnum),
+    );
+    dict_storage_store(
+        ns,
+        "isspace",
+        make_builtin_function("isspace", bytes_method_isspace),
+    );
+    dict_storage_store(
+        ns,
+        "isupper",
+        make_builtin_function("isupper", bytes_method_isupper),
+    );
+    dict_storage_store(
+        ns,
+        "islower",
+        make_builtin_function("islower", bytes_method_islower),
+    );
+    dict_storage_store(
+        ns,
+        "istitle",
+        make_builtin_function("istitle", bytes_method_istitle),
+    );
+    dict_storage_store(
+        ns,
+        "title",
+        make_builtin_function("title", bytes_method_title),
+    );
+    dict_storage_store(
+        ns,
+        "capitalize",
+        make_builtin_function("capitalize", bytes_method_capitalize),
+    );
+    dict_storage_store(
+        ns,
+        "swapcase",
+        make_builtin_function("swapcase", bytes_method_swapcase),
+    );
+    dict_storage_store(
+        ns,
+        "removeprefix",
+        make_builtin_function("removeprefix", bytes_method_removeprefix),
+    );
+    dict_storage_store(
+        ns,
+        "removesuffix",
+        make_builtin_function("removesuffix", bytes_method_removesuffix),
+    );
+    dict_storage_store(
+        ns,
+        "ljust",
+        make_builtin_function("ljust", bytes_method_ljust),
+    );
+    dict_storage_store(
+        ns,
+        "rjust",
+        make_builtin_function("rjust", bytes_method_rjust),
+    );
+    dict_storage_store(
+        ns,
+        "center",
+        make_builtin_function("center", bytes_method_center),
+    );
+    dict_storage_store(
+        ns,
+        "zfill",
+        make_builtin_function("zfill", bytes_method_zfill),
+    );
+    dict_storage_store(
+        ns,
+        "splitlines",
+        make_builtin_function("splitlines", bytes_method_splitlines),
+    );
+    dict_storage_store(
+        ns,
+        "expandtabs",
+        make_builtin_function("expandtabs", bytes_method_expandtabs),
+    );
+    dict_storage_store(
+        ns,
+        "maketrans",
+        make_builtin_function("maketrans", bytes_maketrans),
+    );
+    dict_storage_store(
+        ns,
+        "fromhex",
+        make_builtin_function("fromhex", bytes_fromhex),
+    );
+    for (name, func) in [
+        ("__eq__", bytes_dunder_eq as DunderFn),
+        ("__ne__", bytes_dunder_ne),
+        ("__lt__", bytes_dunder_lt),
+        ("__le__", bytes_dunder_le),
+        ("__gt__", bytes_dunder_gt),
+        ("__ge__", bytes_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
     // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+/// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
+/// `sub` argument of a bytes search/count method is either a bytes-like
+/// object or a single integer in `range(0, 256)` standing for one byte.
+fn bytes_sub_arg(w_sub: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(w_sub) {
+            Ok(pyre_object::bytesobject::bytes_like_data(w_sub).to_vec())
+        } else if pyre_object::is_int(w_sub) {
+            let v = pyre_object::w_int_get_value(w_sub);
+            if !(0..=255).contains(&v) {
+                return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
+            }
+            Ok(vec![v as u8])
+        } else {
+            Err(crate::PyError::type_error(
+                "argument should be integer or bytes-like object",
+            ))
+        }
+    }
+}
+
+/// `stringmethods.py:_convert_idx_params` — resolve the optional `start`
+/// / `end` search args (PyPy slice semantics) into a byte-offset window
+/// `[start, end)` into a bytes-like of length `len`.  Returns `None`
+/// when the window is empty because `start` is past the end or past
+/// `end` (the search-miss case shared by find / index / count).
+fn bytes_idx_window(
+    len: usize,
+    args: &[PyObjectRef],
+) -> Result<Option<(usize, usize)>, crate::PyError> {
+    let len_i = len as i64;
+    let w_start = if args.len() >= 3 {
+        args[2]
+    } else {
+        pyre_object::w_none()
+    };
+    let w_end = if args.len() >= 4 {
+        args[3]
+    } else {
+        pyre_object::w_none()
+    };
+    let (start, end) = crate::sliceobject::unwrap_start_stop(len_i, w_start, w_end)?;
+    if start > len_i {
+        return Ok(None);
+    }
+    let end = end.min(len_i);
+    if start > end {
+        return Ok(None);
+    }
+    Ok(Some((start as usize, end as usize)))
+}
+
+/// First index of `needle` within `hay`; empty needle matches at 0.
+fn bytes_find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Last index of `needle` within `hay`; empty needle matches at `len`.
+fn bytes_rfind_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(hay.len());
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len())
+        .rev()
+        .find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Non-overlapping occurrence count; empty needle yields `len + 1`.
+fn bytes_count_subslices(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return hay.len() + 1;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// `stringmethods.py:descr_find` / `descr_rfind` — search a bytes-like
+/// over the codepoint-irrelevant byte window selected by start / end.
+fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let sub = bytes_sub_arg(args[1])?;
+    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
+        return Ok(-1);
+    };
+    let window = &data[start..end];
+    let pos = if forward {
+        bytes_find_subslice(window, &sub)
+    } else {
+        bytes_rfind_subslice(window, &sub)
+    };
+    Ok(pos.map(|p| (start + p) as i64).unwrap_or(-1))
+}
+
+fn bytes_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "find() takes at least 1 argument");
+    Ok(pyre_object::w_int_new(bytes_search(args, true)?))
+}
+
+fn bytes_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "rfind() takes at least 1 argument");
+    Ok(pyre_object::w_int_new(bytes_search(args, false)?))
+}
+
+fn bytes_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    let res = bytes_search(args, true)?;
+    if res < 0 {
+        return Err(crate::PyError::value_error("subsection not found"));
+    }
+    Ok(pyre_object::w_int_new(res))
+}
+
+fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "rindex() takes at least 1 argument");
+    let res = bytes_search(args, false)?;
+    if res < 0 {
+        return Err(crate::PyError::value_error("subsection not found"));
+    }
+    Ok(pyre_object::w_int_new(res))
+}
+
+fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "count() takes at least 1 argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let sub = bytes_sub_arg(args[1])?;
+    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
+        return Ok(pyre_object::w_int_new(0));
+    };
+    Ok(pyre_object::w_int_new(
+        bytes_count_subslices(&data[start..end], &sub) as i64,
+    ))
+}
+
+/// `stringmethods.py:descr_startswith` / `descr_endswith` — test the
+/// byte window `[start, end)` against a single bytes-like prefix or a
+/// tuple of bytes-like prefixes.  `forward` selects starts/ends.
+fn bytes_prefix_match(
+    args: &[PyObjectRef],
+    method: &str,
+    forward: bool,
+) -> Result<bool, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // `start > len(value)` collapses the window to None → no match.
+    let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
+        return Ok(false);
+    };
+    let window = &data[start..end];
+    let test = |p: &[u8]| {
+        if forward {
+            window.starts_with(p)
+        } else {
+            window.ends_with(p)
+        }
+    };
+    let needle = args[1];
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(needle) {
+            return Ok(test(pyre_object::bytesobject::bytes_like_data(needle)));
+        }
+        if pyre_object::is_tuple(needle) {
+            let n = pyre_object::w_tuple_len(needle) as i64;
+            for i in 0..n {
+                let item = pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
+                if !pyre_object::bytesobject::is_bytes_like(item) {
+                    return Err(crate::PyError::type_error(format!(
+                        "a bytes-like object is required, not '{}'",
+                        (*(*item).ob_type).name
+                    )));
+                }
+                if test(pyre_object::bytesobject::bytes_like_data(item)) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        Err(crate::PyError::type_error(format!(
+            "{method} first arg must be bytes or a tuple of bytes, not {}",
+            (*(*needle).ob_type).name
+        )))
+    }
+}
+
+fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "startswith() takes at least 1 argument");
+    Ok(pyre_object::w_bool_from(bytes_prefix_match(
+        args,
+        "startswith",
+        true,
+    )?))
+}
+
+fn bytes_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "endswith() takes at least 1 argument");
+    Ok(pyre_object::w_bool_from(bytes_prefix_match(
+        args, "endswith", false,
+    )?))
+}
+
+/// `bytesobject.py:390 descr_upper` — ASCII-only case mapping (bytes
+/// outside `a`-`z` / `A`-`Z`, including non-ASCII, are unchanged).
+/// `stringmethods.py:_new` — the StringMethods mixin builds its result
+/// with `self._new(...)`, which each subclass overrides to produce its
+/// own kind.  So a transform on a `bytearray` receiver yields a
+/// `bytearray`, while the same transform on `bytes` yields `bytes`.
+fn new_bytes_like(recv: PyObjectRef, data: &[u8]) -> PyObjectRef {
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(recv) } {
+        pyre_object::bytearrayobject::w_bytearray_from_bytes(data)
+    } else {
+        pyre_object::bytesobject::w_bytes_from_bytes(data)
+    }
+}
+
+/// Empty result matching the receiver's kind (see [`new_bytes_like`]).
+fn empty_bytes_like(recv: PyObjectRef) -> PyObjectRef {
+    new_bytes_like(recv, b"")
+}
+
+fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let out: Vec<u8> = data.iter().map(|b| b.to_ascii_uppercase()).collect();
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytesobject.py:247 descr_lower` — ASCII-only case mapping.
+fn bytes_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let out: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `stringmethods.py:_strip` / `_strip_none` — trim bytes from the
+/// ends.  With no / `None` `chars` arg the default ASCII-whitespace set
+/// is stripped (` \t\n\r\x0b\x0c`); with a bytes-like arg any byte in
+/// that set is trimmed.  `left` / `right` select the sides.
+fn bytes_strip(
+    args: &[PyObjectRef],
+    left: bool,
+    right: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let chars: Option<Vec<u8>> = match args.get(1) {
+        Some(&a) if !a.is_null() && unsafe { !pyre_object::is_none(a) } => {
+            if unsafe { pyre_object::bytesobject::is_bytes_like(a) } {
+                Some(unsafe { pyre_object::bytesobject::bytes_like_data(a) }.to_vec())
+            } else {
+                return Err(crate::PyError::type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    unsafe { (*(*a).ob_type).name }
+                )));
+            }
+        }
+        _ => None,
+    };
+    let in_set = |b: u8| match &chars {
+        Some(set) => set.contains(&b),
+        None => matches!(b, 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20),
+    };
+    let mut lo = 0;
+    let mut hi = data.len();
+    if left {
+        while lo < hi && in_set(data[lo]) {
+            lo += 1;
+        }
+    }
+    if right {
+        while hi > lo && in_set(data[hi - 1]) {
+            hi -= 1;
+        }
+    }
+    Ok(new_bytes_like(args[0], &data[lo..hi]))
+}
+
+fn bytes_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    bytes_strip(args, true, true)
+}
+
+fn bytes_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    bytes_strip(args, true, false)
+}
+
+fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    bytes_strip(args, false, true)
+}
+
+/// Require `obj` to be a bytes-like object, returning its bytes; raises
+/// the CPython `a bytes-like object is required, not '<type>'` TypeError
+/// otherwise.
+fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            Ok(pyre_object::bytesobject::bytes_like_data(obj))
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                (*(*obj).ob_type).name
+            )))
+        }
+    }
+}
+
+/// Non-overlapping left-to-right byte replacement, capped at `limit`.
+/// An empty `old` inserts `new` before every byte and at the end, per
+/// CPython `bytes.replace(b"", ...)`.
+fn replace_bytes(data: &[u8], old: &[u8], new: &[u8], limit: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut count = 0;
+    if old.is_empty() {
+        for &b in data {
+            if count < limit {
+                out.extend_from_slice(new);
+                count += 1;
+            }
+            out.push(b);
+        }
+        if count < limit {
+            out.extend_from_slice(new);
+        }
+        return out;
+    }
+    let mut i = 0;
+    while i < data.len() {
+        if count < limit && data[i..].starts_with(old) {
+            out.extend_from_slice(new);
+            i += old.len();
+            count += 1;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+const BYTES_WHITESPACE: [u8; 6] = [0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20];
+
+fn split_bytes_sep(data: &[u8], sep: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut count = 0i64;
+    let mut i = 0;
+    while i + sep.len() <= data.len() {
+        if (maxsplit < 0 || count < maxsplit) && &data[i..i + sep.len()] == sep {
+            parts.push(data[start..i].to_vec());
+            i += sep.len();
+            start = i;
+            count += 1;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(data[start..].to_vec());
+    parts
+}
+
+fn rsplit_bytes_sep(data: &[u8], sep: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut end = data.len();
+    let mut count = 0i64;
+    let mut i = data.len();
+    while i >= sep.len() {
+        if (maxsplit < 0 || count < maxsplit) && &data[i - sep.len()..i] == sep {
+            parts.push(data[i..end].to_vec());
+            end = i - sep.len();
+            i = end;
+            count += 1;
+        } else {
+            i -= 1;
+        }
+    }
+    parts.push(data[..end].to_vec());
+    parts.reverse();
+    parts
+}
+
+fn split_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
+    let is_ws = |b: u8| BYTES_WHITESPACE.contains(&b);
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let n = data.len();
+    let mut i = 0;
+    loop {
+        while i < n && is_ws(data[i]) {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
+            let mut end = n;
+            while end > i && is_ws(data[end - 1]) {
+                end -= 1;
+            }
+            parts.push(data[i..end].to_vec());
+            break;
+        }
+        let start = i;
+        while i < n && !is_ws(data[i]) {
+            i += 1;
+        }
+        parts.push(data[start..i].to_vec());
+    }
+    parts
+}
+
+fn rsplit_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
+    let is_ws = |b: u8| BYTES_WHITESPACE.contains(&b);
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut i = data.len();
+    loop {
+        while i > 0 && is_ws(data[i - 1]) {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        if maxsplit >= 0 && parts.len() as i64 >= maxsplit {
+            let mut start = 0;
+            while start < i && is_ws(data[start]) {
+                start += 1;
+            }
+            parts.push(data[start..i].to_vec());
+            break;
+        }
+        let end = i;
+        while i > 0 && !is_ws(data[i - 1]) {
+            i -= 1;
+        }
+        parts.push(data[i..end].to_vec());
+    }
+    parts.reverse();
+    parts
+}
+
+/// `stringmethods.py:descr_split` / `descr_rsplit` — split a bytes-like
+/// on a bytes-like separator (empty separator → ValueError) or, when
+/// `sep` is absent / `None`, on runs of ASCII whitespace with empty
+/// fields dropped.  `maxsplit < 0` means unlimited.  `forward` selects
+/// split vs rsplit.
+fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let maxsplit = match args.get(2) {
+        Some(&m) if !m.is_null() && unsafe { pyre_object::is_int(m) } => unsafe {
+            pyre_object::w_int_get_value(m)
+        },
+        _ => -1,
+    };
+    let sep: Option<Vec<u8>> = match args.get(1) {
+        Some(&o) if !o.is_null() && unsafe { !pyre_object::is_none(o) } => {
+            if unsafe { pyre_object::bytesobject::is_bytes_like(o) } {
+                Some(unsafe { pyre_object::bytesobject::bytes_like_data(o) }.to_vec())
+            } else {
+                return Err(crate::PyError::type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    unsafe { (*(*o).ob_type).name }
+                )));
+            }
+        }
+        _ => None,
+    };
+    let parts = match sep {
+        Some(s) => {
+            if s.is_empty() {
+                return Err(crate::PyError::value_error("empty separator"));
+            }
+            if forward {
+                split_bytes_sep(data, &s, maxsplit)
+            } else {
+                rsplit_bytes_sep(data, &s, maxsplit)
+            }
+        }
+        None => {
+            if forward {
+                split_bytes_ws(data, maxsplit)
+            } else {
+                rsplit_bytes_ws(data, maxsplit)
+            }
+        }
+    };
+    let items: Vec<PyObjectRef> = parts.iter().map(|p| new_bytes_like(args[0], p)).collect();
+    Ok(pyre_object::w_list_new(items))
+}
+
+fn bytes_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    bytes_split(args, true)
+}
+
+fn bytes_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    bytes_split(args, false)
+}
+
+/// `stringmethods.py:descr_replace` — replace occurrences of `old` with
+/// `new` (both bytes-like); optional `count` caps the replacements (a
+/// negative or absent count means "no limit").
+fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 3, "replace() takes at least 2 arguments");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let old = require_bytes_like(args[1])?;
+    let new = require_bytes_like(args[2])?;
+    let limit = match args.get(3) {
+        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => {
+            let c = unsafe { pyre_object::w_int_get_value(w_count) };
+            if c < 0 { usize::MAX } else { c as usize }
+        }
+        _ => usize::MAX,
+    };
+    Ok(new_bytes_like(
+        args[0],
+        &replace_bytes(data, old, new, limit),
+    ))
+}
+
+/// `stringmethods.py:descr_join` — concatenate the bytes-like elements
+/// of an iterable, inserting the receiver between them.  A non-bytes
+/// element raises the CPython `sequence item N: expected a bytes-like
+/// object, <T> found` TypeError.
+fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() == 2, "join() takes exactly one argument");
+    let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let iterable = args[1];
+    let items: Vec<PyObjectRef> = unsafe {
+        if pyre_object::is_list(iterable) {
+            let n = pyre_object::w_list_len(iterable);
+            (0..n)
+                .filter_map(|i| pyre_object::w_list_getitem(iterable, i as i64))
+                .collect()
+        } else if pyre_object::is_tuple(iterable) {
+            let n = pyre_object::w_tuple_len(iterable);
+            (0..n)
+                .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
+                .collect()
+        } else {
+            crate::builtins::collect_iterable(iterable)?
+        }
+    };
+    let mut out: Vec<u8> = Vec::new();
+    for (i, &item) in items.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        if unsafe { !pyre_object::bytesobject::is_bytes_like(item) } {
+            return Err(crate::PyError::type_error(format!(
+                "sequence item {i}: expected a bytes-like object, {} found",
+                unsafe { (*(*item).ob_type).name }
+            )));
+        }
+        out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(item) });
+    }
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `stringmethods.py:descr_partition` / `descr_rpartition` — split once
+/// at the first / last occurrence of a non-empty bytes-like separator,
+/// returning a 3-tuple `(head, sep, tail)`.  Empty separator raises
+/// ValueError; when not found the whole value lands in the first
+/// (partition) or last (rpartition) slot with empty siblings.
+fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let sep = require_bytes_like(args[1])?;
+    if sep.is_empty() {
+        return Err(crate::PyError::value_error("empty separator"));
+    }
+    let found = if forward {
+        bytes_find_subslice(data, sep)
+    } else {
+        bytes_rfind_subslice(data, sep)
+    };
+    match found {
+        Some(i) => Ok(pyre_object::w_tuple_new(vec![
+            new_bytes_like(args[0], &data[..i]),
+            new_bytes_like(args[0], sep),
+            new_bytes_like(args[0], &data[i + sep.len()..]),
+        ])),
+        None => {
+            let empty = || empty_bytes_like(args[0]);
+            if forward {
+                Ok(pyre_object::w_tuple_new(vec![args[0], empty(), empty()]))
+            } else {
+                Ok(pyre_object::w_tuple_new(vec![empty(), empty(), args[0]]))
+            }
+        }
+    }
+}
+
+fn bytes_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "partition() takes exactly one argument");
+    bytes_partition(args, true)
+}
+
+fn bytes_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "rpartition() takes exactly one argument");
+    bytes_partition(args, false)
+}
+
+/// Non-empty and every byte satisfies `pred` — the shape shared by
+/// `bytes.isdigit` / `isalpha` / `isalnum` / `isspace`.
+fn bytes_all_nonempty(data: &[u8], pred: impl Fn(u8) -> bool) -> bool {
+    !data.is_empty() && data.iter().all(|&b| pred(b))
+}
+
+fn bytes_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
+        b.is_ascii_digit()
+    })))
+}
+
+fn bytes_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
+        b.is_ascii_alphabetic()
+    })))
+}
+
+fn bytes_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
+        b.is_ascii_alphanumeric()
+    })))
+}
+
+fn bytes_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
+        BYTES_WHITESPACE.contains(&b)
+    })))
+}
+
+/// `bytes.isupper` — at least one cased byte and no lowercase byte.
+fn bytes_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let mut cased = false;
+    for &b in data {
+        if b.is_ascii_lowercase() {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        if b.is_ascii_uppercase() {
+            cased = true;
+        }
+    }
+    Ok(pyre_object::w_bool_from(cased))
+}
+
+/// `bytes.islower` — at least one cased byte and no uppercase byte.
+fn bytes_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let mut cased = false;
+    for &b in data {
+        if b.is_ascii_uppercase() {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        if b.is_ascii_lowercase() {
+            cased = true;
+        }
+    }
+    Ok(pyre_object::w_bool_from(cased))
+}
+
+/// `bytes.istitle` — titlecased: every run of cased bytes starts with an
+/// uppercase byte followed by lowercase, with at least one cased byte.
+fn bytes_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let mut cased = false;
+    let mut prev_cased = false;
+    for &b in data {
+        if b.is_ascii_uppercase() {
+            if prev_cased {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else if b.is_ascii_lowercase() {
+            if !prev_cased {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(pyre_object::w_bool_from(cased))
+}
+
+/// `stringmethods.py` justification fill char — defaults to space; a
+/// non-length-1 bytes-like raises `<method>() argument 2 must be a
+/// single character`.
+fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8, crate::PyError> {
+    match args.get(idx) {
+        Some(&f) if !f.is_null() && unsafe { !pyre_object::is_none(f) } => {
+            let d = require_bytes_like(f)?;
+            if d.len() != 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "{method}() argument 2 must be a single character"
+                )));
+            }
+            Ok(d[0])
+        }
+        _ => Ok(b' '),
+    }
+}
+
+/// `stringmethods.py:descr_ljust` — left-justify within `width`.
+fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "ljust() takes at least 1 argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let fill = bytes_fill_char(args, 2, "ljust")?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(new_bytes_like(args[0], data));
+    }
+    let mut out = data.to_vec();
+    out.resize(width as usize, fill);
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `stringmethods.py:descr_rjust` — right-justify within `width`.
+fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "rjust() takes at least 1 argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let fill = bytes_fill_char(args, 2, "rjust")?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(new_bytes_like(args[0], data));
+    }
+    let mut out = vec![fill; (width - len) as usize];
+    out.extend_from_slice(data);
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `stringmethods.py:descr_center` — center within `width`; the extra
+/// fill byte (for odd padding) follows PyPy's `d//2 + (d & width & 1)`
+/// left-offset.
+fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "center() takes at least 1 argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let fill = bytes_fill_char(args, 2, "center")?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(new_bytes_like(args[0], data));
+    }
+    let d = width - len;
+    let offset = (d / 2 + (d & width & 1)) as usize;
+    let mut out = vec![fill; offset];
+    out.extend_from_slice(data);
+    out.resize(width as usize, fill);
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytesobject.py:descr_zfill` — left-pad with `b'0'` to `width`,
+/// keeping a leading `+`/`-` sign ahead of the zeros.
+fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "zfill() takes exactly one argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(new_bytes_like(args[0], data));
+    }
+    let pad = (width - len) as usize;
+    let mut out = Vec::with_capacity(width as usize);
+    let rest = match data.split_first() {
+        Some((&first, tail)) if first == b'+' || first == b'-' => {
+            out.push(first);
+            tail
+        }
+        _ => data,
+    };
+    out.resize(out.len() + pad, b'0');
+    out.extend_from_slice(rest);
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytes.title` — ASCII titlecase: the first alphabetic byte of each
+/// run is uppercased, the rest lowercased; non-alphabetic bytes reset
+/// the run.
+fn bytes_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let mut prev_cased = false;
+    let out: Vec<u8> = data
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_alphabetic() {
+                let mapped = if prev_cased {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                };
+                prev_cased = true;
+                mapped
+            } else {
+                prev_cased = false;
+                b
+            }
+        })
+        .collect();
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytes.capitalize` — ASCII: first byte uppercased, the rest
+/// lowercased.
+fn bytes_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let out: Vec<u8> = data
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if i == 0 {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytes.swapcase` — ASCII: swap the case of each cased byte.
+fn bytes_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let out: Vec<u8> = data
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_uppercase() {
+                b.to_ascii_lowercase()
+            } else if b.is_ascii_lowercase() {
+                b.to_ascii_uppercase()
+            } else {
+                b
+            }
+        })
+        .collect();
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytes.removeprefix` — drop a leading bytes-like prefix if present.
+fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "removeprefix() takes exactly one argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let prefix = require_bytes_like(args[1])?;
+    let out = if data.starts_with(prefix) {
+        &data[prefix.len()..]
+    } else {
+        data
+    };
+    Ok(new_bytes_like(args[0], out))
+}
+
+/// `bytes.removesuffix` — drop a trailing bytes-like suffix if present.
+fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "removesuffix() takes exactly one argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let suffix = require_bytes_like(args[1])?;
+    let out = if !suffix.is_empty() && data.ends_with(suffix) {
+        &data[..data.len() - suffix.len()]
+    } else {
+        data
+    };
+    Ok(new_bytes_like(args[0], out))
+}
+
+/// `bytesobject.py:descr_translate` — map each byte through a 256-entry
+/// `table` (or `None` for identity) after dropping any byte present in
+/// the optional `delete` set.  `delete` may be positional or the
+/// `delete=` keyword.
+fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "translate() takes at least 1 argument");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let Some(&table_obj) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "translate() takes at least 1 argument (0 given)",
+        ));
+    };
+    let table: Option<&[u8]> = unsafe {
+        if pyre_object::is_none(table_obj) {
+            None
+        } else if pyre_object::bytesobject::is_bytes_like(table_obj) {
+            let t = pyre_object::bytesobject::bytes_like_data(table_obj);
+            if t.len() != 256 {
+                return Err(crate::PyError::value_error(
+                    "translation table must be 256 characters long",
+                ));
+            }
+            Some(t)
+        } else {
+            return Err(crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                (*(*table_obj).ob_type).name
+            )));
+        }
+    };
+    let delete_obj = positional
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
+    let mut deleted = [false; 256];
+    if let Some(d) = delete_obj {
+        if !d.is_null() && unsafe { !pyre_object::is_none(d) } {
+            if unsafe { pyre_object::bytesobject::is_bytes_like(d) } {
+                for &b in unsafe { pyre_object::bytesobject::bytes_like_data(d) } {
+                    deleted[b as usize] = true;
+                }
+            } else {
+                return Err(crate::PyError::type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    unsafe { (*(*d).ob_type).name }
+                )));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for &b in data {
+        if deleted[b as usize] {
+            continue;
+        }
+        out.push(match table {
+            Some(t) => t[b as usize],
+            None => b,
+        });
+    }
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `stringmethods.py:descr_splitlines` — split on `\n`, `\r`, and
+/// `\r\n` line boundaries (the byte set; the extended Unicode line
+/// terminators are str-only).  `keepends=True` retains the terminator
+/// on each emitted line, and a trailing terminator does not produce an
+/// extra empty entry.
+fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let keepends = args.len() > 1 && crate::baseobjspace::is_true(args[1]);
+    let mut parts: Vec<PyObjectRef> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < data.len() {
+        if data[i] == b'\n' || data[i] == b'\r' {
+            let mut term_end = i + 1;
+            if data[i] == b'\r' && term_end < data.len() && data[term_end] == b'\n' {
+                term_end += 1;
+            }
+            let end = if keepends { term_end } else { i };
+            parts.push(new_bytes_like(args[0], &data[start..end]));
+            start = term_end;
+            i = term_end;
+        } else {
+            i += 1;
+        }
+    }
+    if start < data.len() {
+        parts.push(new_bytes_like(args[0], &data[start..]));
+    }
+    Ok(pyre_object::w_list_new(parts))
+}
+
+/// `stringmethods.py:descr_expandtabs` — replace each `\t` with spaces
+/// up to the next multiple of `tabsize`, measured from the start of the
+/// current line (the column resets on `\n` / `\r`); a non-positive
+/// `tabsize` drops tabs entirely.
+fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let tabsize = if args.len() > 1 {
+        unsafe { pyre_object::w_int_get_value(args[1]) }
+    } else {
+        8
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut col: i64 = 0;
+    for &b in data {
+        match b {
+            b'\t' => {
+                if tabsize > 0 {
+                    let incr = tabsize - (col % tabsize);
+                    col += incr;
+                    out.resize(out.len() + incr as usize, b' ');
+                }
+            }
+            b'\n' | b'\r' => {
+                out.push(b);
+                col = 0;
+            }
+            _ => {
+                out.push(b);
+                col += 1;
+            }
+        }
+    }
+    Ok(new_bytes_like(args[0], &out))
+}
+
+/// `bytesobject.py:descr_maketrans` — build a 256-byte translation table
+/// mapping each byte of `frm` to the byte at the same index in `to`;
+/// the two bytes-like arguments must have equal length.  Bytes not in
+/// `frm` map to themselves.
+fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "maketrans() takes exactly two arguments",
+        ));
+    }
+    let frm = require_bytes_like(args[0])?;
+    let to = require_bytes_like(args[1])?;
+    if frm.len() != to.len() {
+        return Err(crate::PyError::value_error(
+            "maketrans arguments must have same length",
+        ));
+    }
+    let mut table: Vec<u8> = (0..=255u8).collect();
+    for (&f, &t) in frm.iter().zip(to.iter()) {
+        table[f as usize] = t;
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&table))
+}
+
+/// `_PyBytes_FromHex` — parse a hex string into bytes.  ASCII spaces are
+/// skipped between byte pairs (but not within one); a stray nibble at
+/// the end raises the even-count error, any other non-hex byte raises
+/// the positional error.
+fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
+    let bytes: &[u8] = match args.first() {
+        Some(&a) if unsafe { pyre_object::is_str(a) } => {
+            unsafe { pyre_object::w_str_get_value(a) }.as_bytes()
+        }
+        Some(&a) if unsafe { pyre_object::bytesobject::is_bytes_like(a) } => unsafe {
+            pyre_object::bytesobject::bytes_like_data(a)
+        },
+        Some(&a) => {
+            return Err(crate::PyError::type_error(format!(
+                "fromhex() argument must be str or bytes-like, not {}",
+                unsafe { (*(*a).ob_type).name }
+            )));
+        }
+        None => {
+            return Err(crate::PyError::type_error(
+                "fromhex() takes exactly one argument",
+            ));
+        }
+    };
+    let nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        let Some(top) = nibble(bytes[i]) else {
+            return Err(crate::PyError::value_error(format!(
+                "non-hexadecimal number found in fromhex() arg at position {i}"
+            )));
+        };
+        i += 1;
+        if i >= bytes.len() {
+            return Err(crate::PyError::value_error(
+                "fromhex() arg must contain an even number of hexadecimal digits",
+            ));
+        }
+        let Some(bot) = nibble(bytes[i]) else {
+            return Err(crate::PyError::value_error(format!(
+                "non-hexadecimal number found in fromhex() arg at position {i}"
+            )));
+        };
+        i += 1;
+        out.push((top << 4) | bot);
+    }
+    Ok(out)
+}
+
+fn bytes_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let out = parse_hex_string(args)?;
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out))
+}
+
+fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let out = parse_hex_string(args)?;
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&out))
 }
 
 /// `pypy/objspace/std/bytesobject.py W_BytesObject.descr_hex` —
@@ -6390,10 +8740,14 @@ fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => data.iter().map(|&b| b as char).collect(),
         _ => {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::LookupError,
-                format!("unknown encoding: {encoding}"),
-            ));
+            if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower) {
+                result?
+            } else {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::LookupError,
+                    format!("unknown encoding: {encoding}"),
+                ));
+            }
         }
     };
     Ok(pyre_object::w_str_new(&s))
@@ -6474,10 +8828,15 @@ fn encode_str(
             }
             Ok(out)
         }
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown encoding: {enc}"),
-        )),
+        _ => {
+            if let Some(out) = crate::type_methods::encode_utf16_32(s, &lower) {
+                return Ok(out);
+            }
+            Err(crate::PyError::new(
+                crate::PyErrorKind::LookupError,
+                format!("unknown encoding: {enc}"),
+            ))
+        }
     }
 }
 
@@ -6528,7 +8887,7 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(data));
+            return Ok(new_bytes_like(args[0], data));
         }
     }
     // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence
@@ -6548,6 +8907,138 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
 }
 
+/// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
+/// argument; a non-int raises the CPython "object cannot be interpreted
+/// as an integer" TypeError, an out-of-range int the ValueError.
+fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
+    unsafe {
+        if pyre_object::is_int(obj) {
+            let v = pyre_object::w_int_get_value(obj);
+            if !(0..=255).contains(&v) {
+                return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
+            }
+            Ok(v as u8)
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                (*(*obj).ob_type).name
+            )))
+        }
+    }
+}
+
+/// `bytearrayobject.py:descr_append` — append one byte in place.
+fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "append() takes exactly one argument");
+    let b = bytearray_byte_arg(args[1])?;
+    unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_extend` — append a bytes-like object's
+/// bytes, or each integer yielded by an iterable.
+fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "extend() takes exactly one argument");
+    let other = args[1];
+    // Materialize the new bytes before mutating so `x.extend(x)` is safe.
+    let appended: Vec<u8> = unsafe {
+        if pyre_object::bytesobject::is_bytes_like(other) {
+            pyre_object::bytesobject::bytes_like_data(other).to_vec()
+        } else {
+            crate::builtins::collect_iterable(other)?
+                .into_iter()
+                .map(bytearray_byte_arg)
+                .collect::<Result<_, _>>()?
+        }
+    };
+    unsafe {
+        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).extend_from_slice(&appended)
+    };
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_insert` — insert one byte before `index`,
+/// clamping out-of-range indices (negative counts from the end).
+fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 3, "insert() takes exactly 2 arguments");
+    let index = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let b = bytearray_byte_arg(args[2])?;
+    unsafe {
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let len = vec.len() as i64;
+        let i = if index < 0 { index + len } else { index };
+        vec.insert(i.clamp(0, len) as usize, b);
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_remove` — remove the first byte equal to
+/// `value`; ValueError when absent.
+fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2, "remove() takes exactly one argument");
+    let b = bytearray_byte_arg(args[1])?;
+    unsafe {
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        match vec.iter().position(|&x| x == b) {
+            Some(pos) => vec.remove(pos),
+            None => {
+                return Err(crate::PyError::value_error("value not found in bytearray"));
+            }
+        };
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_pop` — remove and return the byte at
+/// `index` (default last); IndexError when empty or out of range.
+fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    unsafe {
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let len = vec.len() as i64;
+        if len == 0 {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::IndexError,
+                "pop from empty bytearray",
+            ));
+        }
+        let index = match args.get(1) {
+            Some(&a) if !a.is_null() && !pyre_object::is_none(a) => pyre_object::w_int_get_value(a),
+            _ => -1,
+        };
+        let i = if index < 0 { index + len } else { index };
+        if i < 0 || i >= len {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::IndexError,
+                "pop index out of range",
+            ));
+        }
+        Ok(pyre_object::w_int_new(vec.remove(i as usize) as i64))
+    }
+}
+
+/// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
+fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
+fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear() };
+    Ok(pyre_object::w_none())
+}
+
+/// `bytearrayobject.py:descr_copy` — return a new bytearray with the
+/// same bytes.
+fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
+}
+
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytearray_descr_new));
@@ -6559,25 +9050,74 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         "decode",
         make_builtin_function("decode", bytes_method_decode),
     );
+    // The scalar-returning read-only methods (int / bool results) read
+    // their payload via `bytes_like_data`, which handles both bytes and
+    // bytearray, so they share the bytes implementations verbatim.
+    dict_storage_store(ns, "find", make_builtin_function("find", bytes_method_find));
     dict_storage_store(
         ns,
-        "find",
-        make_builtin_function("find", |args| {
-            assert!(args.len() >= 2, "find() takes at least 1 argument");
-            let ba = args[0];
-            let value = args[1];
-            let start = if args.len() > 2 {
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize
-            } else {
-                0
-            };
-            unsafe {
-                let v = pyre_object::w_int_get_value(value) as u8;
-                Ok(pyre_object::w_int_new(
-                    pyre_object::bytearrayobject::w_bytearray_find(ba, v, start),
-                ))
-            }
-        }),
+        "rfind",
+        make_builtin_function("rfind", bytes_method_rfind),
+    );
+    dict_storage_store(
+        ns,
+        "index",
+        make_builtin_function("index", bytes_method_index),
+    );
+    dict_storage_store(
+        ns,
+        "rindex",
+        make_builtin_function("rindex", bytes_method_rindex),
+    );
+    dict_storage_store(
+        ns,
+        "count",
+        make_builtin_function("count", bytes_method_count),
+    );
+    dict_storage_store(
+        ns,
+        "startswith",
+        make_builtin_function("startswith", bytes_method_startswith),
+    );
+    dict_storage_store(
+        ns,
+        "endswith",
+        make_builtin_function("endswith", bytes_method_endswith),
+    );
+    dict_storage_store(
+        ns,
+        "isdigit",
+        make_builtin_function("isdigit", bytes_method_isdigit),
+    );
+    dict_storage_store(
+        ns,
+        "isalpha",
+        make_builtin_function("isalpha", bytes_method_isalpha),
+    );
+    dict_storage_store(
+        ns,
+        "isalnum",
+        make_builtin_function("isalnum", bytes_method_isalnum),
+    );
+    dict_storage_store(
+        ns,
+        "isspace",
+        make_builtin_function("isspace", bytes_method_isspace),
+    );
+    dict_storage_store(
+        ns,
+        "isupper",
+        make_builtin_function("isupper", bytes_method_isupper),
+    );
+    dict_storage_store(
+        ns,
+        "islower",
+        make_builtin_function("islower", bytes_method_islower),
+    );
+    dict_storage_store(
+        ns,
+        "istitle",
+        make_builtin_function("istitle", bytes_method_istitle),
     );
     dict_storage_store(
         ns,
@@ -6625,42 +9165,182 @@ fn init_bytearray_type(ns: &mut DictStorage) {
             2,
         ),
     );
+    // The transform methods read via `bytes_like_data` and build their
+    // result with `new_bytes_like`, which yields a bytearray for a
+    // bytearray receiver, so they share the bytes implementations.
     dict_storage_store(
         ns,
         "translate",
-        make_builtin_function_with_arity(
-            "translate",
-            |args| {
-                assert!(args.len() >= 2);
-                let ba = args[0];
-                let table = args[1];
-                unsafe {
-                    let data = pyre_object::bytesobject::bytes_like_data(ba);
-                    let table_bytes_owned;
-                    let table_data: &[u8] = if pyre_object::bytesobject::is_bytes_like(table) {
-                        pyre_object::bytesobject::bytes_like_data(table)
-                    } else if pyre_object::is_str(table) {
-                        table_bytes_owned = pyre_object::w_str_get_value(table).as_bytes();
-                        table_bytes_owned
-                    } else {
-                        return Ok(ba);
-                    };
-                    let mut result = Vec::with_capacity(data.len());
-                    for &b in data {
-                        if (b as usize) < table_data.len() {
-                            result.push(table_data[b as usize]);
-                        } else {
-                            result.push(b);
-                        }
-                    }
-                    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                        &result,
-                    ))
-                }
-            },
-            2,
-        ),
+        make_builtin_function("translate", bytes_method_translate),
     );
+    dict_storage_store(
+        ns,
+        "upper",
+        make_builtin_function("upper", bytes_method_upper),
+    );
+    dict_storage_store(
+        ns,
+        "lower",
+        make_builtin_function("lower", bytes_method_lower),
+    );
+    dict_storage_store(
+        ns,
+        "strip",
+        make_builtin_function("strip", bytes_method_strip),
+    );
+    dict_storage_store(
+        ns,
+        "lstrip",
+        make_builtin_function("lstrip", bytes_method_lstrip),
+    );
+    dict_storage_store(
+        ns,
+        "rstrip",
+        make_builtin_function("rstrip", bytes_method_rstrip),
+    );
+    dict_storage_store(
+        ns,
+        "replace",
+        make_builtin_function("replace", bytes_method_replace),
+    );
+    dict_storage_store(
+        ns,
+        "split",
+        make_builtin_function("split", bytes_method_split),
+    );
+    dict_storage_store(
+        ns,
+        "rsplit",
+        make_builtin_function("rsplit", bytes_method_rsplit),
+    );
+    dict_storage_store(
+        ns,
+        "splitlines",
+        make_builtin_function("splitlines", bytes_method_splitlines),
+    );
+    dict_storage_store(ns, "join", make_builtin_function("join", bytes_method_join));
+    dict_storage_store(
+        ns,
+        "partition",
+        make_builtin_function("partition", bytes_method_partition),
+    );
+    dict_storage_store(
+        ns,
+        "rpartition",
+        make_builtin_function("rpartition", bytes_method_rpartition),
+    );
+    dict_storage_store(
+        ns,
+        "title",
+        make_builtin_function("title", bytes_method_title),
+    );
+    dict_storage_store(
+        ns,
+        "capitalize",
+        make_builtin_function("capitalize", bytes_method_capitalize),
+    );
+    dict_storage_store(
+        ns,
+        "swapcase",
+        make_builtin_function("swapcase", bytes_method_swapcase),
+    );
+    dict_storage_store(
+        ns,
+        "removeprefix",
+        make_builtin_function("removeprefix", bytes_method_removeprefix),
+    );
+    dict_storage_store(
+        ns,
+        "removesuffix",
+        make_builtin_function("removesuffix", bytes_method_removesuffix),
+    );
+    dict_storage_store(
+        ns,
+        "ljust",
+        make_builtin_function("ljust", bytes_method_ljust),
+    );
+    dict_storage_store(
+        ns,
+        "rjust",
+        make_builtin_function("rjust", bytes_method_rjust),
+    );
+    dict_storage_store(
+        ns,
+        "center",
+        make_builtin_function("center", bytes_method_center),
+    );
+    dict_storage_store(
+        ns,
+        "zfill",
+        make_builtin_function("zfill", bytes_method_zfill),
+    );
+    dict_storage_store(
+        ns,
+        "expandtabs",
+        make_builtin_function("expandtabs", bytes_method_expandtabs),
+    );
+    dict_storage_store(ns, "hex", make_builtin_function("hex", bytes_method_hex));
+    dict_storage_store(
+        ns,
+        "maketrans",
+        make_builtin_function("maketrans", bytes_maketrans),
+    );
+    dict_storage_store(
+        ns,
+        "fromhex",
+        make_builtin_function("fromhex", bytearray_fromhex),
+    );
+    // In-place mutators specific to the mutable bytearray.
+    dict_storage_store(
+        ns,
+        "append",
+        make_builtin_function("append", bytearray_method_append),
+    );
+    dict_storage_store(
+        ns,
+        "extend",
+        make_builtin_function("extend", bytearray_method_extend),
+    );
+    dict_storage_store(
+        ns,
+        "insert",
+        make_builtin_function("insert", bytearray_method_insert),
+    );
+    dict_storage_store(
+        ns,
+        "remove",
+        make_builtin_function("remove", bytearray_method_remove),
+    );
+    dict_storage_store(
+        ns,
+        "pop",
+        make_builtin_function("pop", bytearray_method_pop),
+    );
+    dict_storage_store(
+        ns,
+        "reverse",
+        make_builtin_function("reverse", bytearray_method_reverse),
+    );
+    dict_storage_store(
+        ns,
+        "clear",
+        make_builtin_function("clear", bytearray_method_clear),
+    );
+    dict_storage_store(
+        ns,
+        "copy",
+        make_builtin_function("copy", bytearray_method_copy),
+    );
+    for (name, func) in [
+        ("__eq__", bytearray_dunder_eq as DunderFn),
+        ("__ne__", bytearray_dunder_ne),
+        ("__lt__", bytearray_dunder_lt),
+        ("__le__", bytearray_dunder_le),
+        ("__gt__", bytearray_dunder_gt),
+        ("__ge__", bytearray_dunder_ge),
+    ] {
+        dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 2));
+    }
 }
 
 // ── set / frozenset TypeDef ──────────────────────────────────────────
@@ -6749,22 +9429,22 @@ fn init_setlike_common(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__or__",
-        make_builtin_function_with_arity("__or__", set_method_union, 2),
+        make_builtin_function_with_arity("__or__", set_op_or, 2),
     );
     dict_storage_store(
         ns,
         "__and__",
-        make_builtin_function_with_arity("__and__", set_method_intersection, 2),
+        make_builtin_function_with_arity("__and__", set_op_and, 2),
     );
     dict_storage_store(
         ns,
         "__sub__",
-        make_builtin_function_with_arity("__sub__", set_method_difference, 2),
+        make_builtin_function_with_arity("__sub__", set_op_sub, 2),
     );
     dict_storage_store(
         ns,
         "__xor__",
-        make_builtin_function_with_arity("__xor__", set_method_symmetric_difference, 2),
+        make_builtin_function_with_arity("__xor__", set_op_xor, 2),
     );
     dict_storage_store(
         ns,
@@ -6889,6 +9569,46 @@ fn init_setlike_common(ns: &mut DictStorage) {
             1,
         ),
     );
+}
+
+// The `|` / `&` / `-` / `^` operator slots (`nb_or` etc.) require the
+// other operand to be a set/frozenset and return NotImplemented otherwise
+// — unlike the `union` / `intersection` / … methods, which accept any
+// iterable.  `setobject.py descr_or`/`descr_and`/`descr_sub`/`descr_xor`.
+fn set_op_requires_set(args: &[pyre_object::PyObjectRef]) -> bool {
+    args.len() >= 2 && !unsafe { pyre_object::is_set_or_frozenset(args[1]) }
+}
+fn set_op_or(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_union(args)
+}
+fn set_op_and(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_intersection(args)
+}
+fn set_op_sub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_difference(args)
+}
+fn set_op_xor(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_symmetric_difference(args)
 }
 
 fn set_method_union(

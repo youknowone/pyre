@@ -96,9 +96,7 @@ pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyErr
         FindOrCountResult::NotFound => {
             return Err(PyError::new(
                 crate::PyErrorKind::ValueError,
-                format!("list.remove(): {} is not in list", unsafe {
-                    crate::display::py_repr(w_value)
-                }),
+                "list.remove(x): x not in list".to_string(),
             ));
         }
         FindOrCountResult::Count(_) => unreachable!("find_or_count with count=false returns Count"),
