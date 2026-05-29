@@ -116,6 +116,15 @@ pub fn register_builtin_module(name: &'static str, init: fn(&mut DictStorage)) {
 /// * `name(module)`               — register `crate::module::module::init` under `"name"` (alias arm).
 /// * `module`                     — `name` defaults to the module identifier.
 /// * `name => path`               — explicit init function path.
+///
+/// This is an explicit hand-maintained list by design — the upstream
+/// equivalent (`pypy/config/pypyoption.py` `essential_modules` /
+/// `default_modules` / `working_modules`) is likewise an explicit set of
+/// string literals with platform conditionals, not filesystem discovery.
+/// Automatic discovery is intentionally not done: it could not express
+/// the alias arms (`"_operator"` → `operator`), explicit-path arms
+/// (`importlib.machinery` → a non-default init fn), or the
+/// `#[cfg(unix)]` gating that `resource` / `fcntl` / `syslog` require.
 pub fn install_builtin_modules() {
     macro_rules! pyre_install_module {
         // `module` — `register_builtin_module("module", crate::module::module::init)`.
