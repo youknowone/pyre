@@ -79,7 +79,7 @@ fi
 
 # `cfg_select!` skew workaround.
 #
-# Charon's pinned release embeds rustc nightly-2026-02-07, where
+# Charon's pinned release embeds rustc nightly-2026-02-22, where
 # `core::cfg_select!` is still feature-gated (E0658).  rustpython's
 # `host_env` crate (a transitive dep of pyre-interpreter / pyre-jit)
 # calls `cfg_select!` without a `#![feature(cfg_select)]` gate because

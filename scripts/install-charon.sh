@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-CHARON_VERSION_DEFAULT="nightly-2026.05.24"
+CHARON_VERSION_DEFAULT="nightly-2026.05.29"
 CHARON_VERSION="${CHARON_VERSION:-$CHARON_VERSION_DEFAULT}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
