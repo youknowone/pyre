@@ -4919,7 +4919,11 @@ impl CodeWriter {
                 // `Some(frame_var)` through `get_register` resolves the
                 // call-frame operand from `return_var`'s color, corrupting
                 // canonical `lower_simple_call_hlop_to_insn` lowering.
-                portal_frame_var: if is_portal { Some(frame_var) } else { None },
+                // `simple_call` lowering prepends this frame for
+                // `bh_call_fn_N(frame, callable, args)`; it is valid for
+                // non-portal graphs too since `frame_var` is the graph's
+                // leading ref input arg in both cases.
+                portal_frame_var: Some(frame_var),
             });
         }
 
