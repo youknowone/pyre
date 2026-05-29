@@ -5899,19 +5899,14 @@ fn emit_attached_loop_dispatch(
     builder.switch_to_block(take_block);
     builder.seal_block(take_block);
     let target_code_ptr = builder.block_params(take_block)[0];
-    // 2026-05-18 hypothesis tests (all reverted, none affect nbody_50k
-    // corruption -0.03513214049650899 vs. dynasm -0.035132020348426815):
-    //   - probe 1: per-LABEL `label_block_id == 0` gate
-    //   - probe 2: zero jf_gcmap / jf_descr / jf_guard_exc
-    //   - probe 3: zero source body's ref_root area
-    //   - probe 4: always-on frame-realloc check at main-loop prologue
-    //   - probe 5: wholesale zero of entire jf_frame tail beyond inputs
-    // The corruption is NOT in jf_frame heap state.  Both
-    // `return_call_indirect` and `call_indirect + return` transit
-    // cranelift's aarch64 Tail-conv function entry/exit lowering and
-    // both corrupt, pointing at the documented ~12.5 bytes/take SP
-    // leak in `emit_return_call_common_sequence` as the same root
-    // cause.  Pyre-side workarounds are exhausted.
+    // The earlier nbody_50k corruption (-0.03513214049650899 vs. the
+    // reference -0.035132020348426815) and the per-dispatch SP growth were
+    // both consequences of `emit_attached_bridge_dispatch` doing a nested
+    // call+return into the bridge, not a cranelift Tail-conv defect: under
+    // closing_jump the bridge tail-calls forward and never returns, so each
+    // dispatch stranded a return frame.  With the bridge dispatch itself
+    // now a tail-call, this loop dispatch is balanced on both x86_64 and
+    // aarch64 (tail_sp_leak.rs: zero drift over 5M tail-calls).
     emit_call_footer_shadowstack(builder, ptr_type);
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
@@ -14832,12 +14827,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // surface (resume-trace builder via `[`crate::pyre`]`) needs the
         // exit-slot bytes BEFORE virtual reconstruction.
         //
-        // External JUMP fallback: cranelift's
-        // in-code `closing_jump` dispatch (`emit_attached_loop_dispatch`)
-        // stays gated off pending the aarch64 Tail-conv defect fix
-        // (`project_cranelift_wrapper_body_tail_leak.md`).  Until then a
-        // guard exit may legitimately surface an `is_external_jump` descr
-        // here, and the host loop re-enters the target trace exactly as
+        // External JUMP fallback: the in-code `closing_jump` dispatch
+        // (`emit_attached_loop_dispatch`) is on by default for x86_64 and
+        // aarch64, but stays off on other arches and whenever
+        // `PYRE_CL_NO_CLOSING_JUMP` is set.  In those cases a guard exit may
+        // legitimately surface an `is_external_jump` descr here, and the
+        // host loop re-enters the target trace exactly as
         // `execute_with_inputs` (compiler.rs:7357) does.  This block
         // mirrors that dispatch loop with one additional raw-output
         // termination per `execute_token_ints_raw`'s contract.
@@ -14943,10 +14938,10 @@ impl majit_backend::Backend for CraneliftBackend {
             // llgraph/runner.py:1130-1140 cross-loop JUMP: switch to the
             // target trace identified by the TargetToken stored on the
             // fail descriptor and continue dispatch, mirroring
-            // `execute_with_inputs`.  Required until in-code `closing_jump`
-            // lands — see
-            // `project_cranelift_wrapper_body_tail_leak.md` for the
-            // upstream cranelift aarch64 Tail-conv blocker.
+            // `execute_with_inputs`.  Reached when in-code `closing_jump` is
+            // disabled (non-x86_64/non-aarch64 arch, or
+            // `PYRE_CL_NO_CLOSING_JUMP`); otherwise the JUMP transfers
+            // entirely inside generated code.
             if fail_descr_fd.is_external_jump() {
                 slice_x2_probe::record_execute_with_inputs_hit();
                 let target_entry = fail_descr_fd
@@ -21142,7 +21137,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "dispatch site gated off: enabling `emit_attached_loop_dispatch` triggers cranelift 0.130/0.131 aarch64 Tail-conv leak + jf_frame-slot corruption (project_cranelift_wrapper_body_tail_leak.md). Test passes the moment the gate at compiler.rs `emit_guard_exit` flips on."]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1500_260);

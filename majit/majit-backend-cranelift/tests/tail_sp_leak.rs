@@ -10,12 +10,12 @@
 // RSP value either drifts or the OS terminates the test with a stack
 // overflow.
 
+use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -26,8 +26,8 @@ fn current_sp() -> usize {
     &probe as *const usize as usize
 }
 
-// Counter probe so we can call from JIT with WindowsFastcall ABI without
-// worrying about how MSVC mangles a Rust extern "C" symbol.
+// Counter probe so we can call from JIT with the host ABI without
+// worrying about how the linker mangles a Rust extern "C" symbol.
 static PROBE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 extern "C" fn host_probe(_jf: usize) {
     PROBE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -42,8 +42,7 @@ fn tail_call_sp_drift_repro() {
     let mut flag_builder = settings::builder();
     flag_builder.set("preserve_frame_pointers", "true").unwrap();
     flag_builder.set("opt_level", "speed").unwrap();
-    let isa_builder =
-        cranelift_native::builder().expect("host machine is not a supported target");
+    let isa_builder = cranelift_native::builder().expect("host machine is not a supported target");
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .unwrap();
@@ -77,10 +76,8 @@ fn tail_call_sp_drift_repro() {
 
     // Build the body.
     let mut fbcx = FunctionBuilderContext::new();
-    let mut body_func = Function::with_name_signature(
-        UserFuncName::user(0, body_id.as_u32()),
-        body_sig.clone(),
-    );
+    let mut body_func =
+        Function::with_name_signature(UserFuncName::user(0, body_id.as_u32()), body_sig.clone());
     {
         let mut bx = FunctionBuilder::new(&mut body_func, &mut fbcx);
         let entry = bx.create_block();
@@ -89,9 +86,7 @@ fn tail_call_sp_drift_repro() {
         bx.seal_block(entry);
         let arg = bx.block_params(entry)[0];
 
-        let cap_addr = bx
-            .ins()
-            .iconst(ptr_type, &CHAIN_CAP as *const _ as i64);
+        let cap_addr = bx.ins().iconst(ptr_type, &CHAIN_CAP as *const _ as i64);
         let cap = bx.ins().load(ptr_type, MemFlags::trusted(), cap_addr, 0);
         let cont = bx.ins().icmp(IntCC::SignedLessThan, arg, cap);
         let tail = bx.create_block();
@@ -103,12 +98,10 @@ fn tail_call_sp_drift_repro() {
         let one = bx.ins().iconst(ptr_type, 1);
         let next = bx.ins().iadd(arg, one);
 
-        // Replicate pyre's tail-call epilogue: emit a windows_fastcall
-        // call to a host probe AND a shadow-stack-like in-memory pop.
-        let host_addr = bx
-            .ins()
-            .iconst(ptr_type, host_probe as *const () as i64);
-        let mut probe_sig = Signature::new(CallConv::WindowsFastcall);
+        // Replicate pyre's tail-call epilogue: emit a host-ABI call to a
+        // host probe AND a shadow-stack-like in-memory pop.
+        let host_addr = bx.ins().iconst(ptr_type, host_probe as *const () as i64);
+        let mut probe_sig = Signature::new(host_call_conv);
         probe_sig.params.push(AbiParam::new(ptr_type));
         let probe_sig_ref = bx.import_signature(probe_sig);
         bx.ins().call_indirect(probe_sig_ref, host_addr, &[next]);
@@ -120,7 +113,8 @@ fn tail_call_sp_drift_repro() {
         tail_sig.params.push(AbiParam::new(ptr_type));
         tail_sig.returns.push(AbiParam::new(ptr_type));
         let tail_sig_ref = bx.import_signature(tail_sig);
-        bx.ins().return_call_indirect(tail_sig_ref, body2_addr, &[next]);
+        bx.ins()
+            .return_call_indirect(tail_sig_ref, body2_addr, &[next]);
 
         bx.switch_to_block(exit);
         bx.seal_block(exit);
@@ -133,10 +127,8 @@ fn tail_call_sp_drift_repro() {
 
     // Build body2 — tail-calls back to body, with a different frame size
     // (larger local-slot usage to differentiate the prologue).
-    let mut body2_func = Function::with_name_signature(
-        UserFuncName::user(0, body2_id.as_u32()),
-        body_sig.clone(),
-    );
+    let mut body2_func =
+        Function::with_name_signature(UserFuncName::user(0, body2_id.as_u32()), body_sig.clone());
     {
         let mut bx = FunctionBuilder::new(&mut body2_func, &mut fbcx);
         let entry = bx.create_block();
@@ -147,11 +139,8 @@ fn tail_call_sp_drift_repro() {
 
         // Force a much larger frame so body and body2 have different sizes.
         use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
-        let big_slot = bx.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            128,
-            3,
-        ));
+        let big_slot =
+            bx.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 128, 3));
         let big_addr = bx.ins().stack_addr(ptr_type, big_slot, 0);
         bx.ins().store(MemFlags::trusted(), arg, big_addr, 0);
 
@@ -164,7 +153,8 @@ fn tail_call_sp_drift_repro() {
         tail_sig.params.push(AbiParam::new(ptr_type));
         tail_sig.returns.push(AbiParam::new(ptr_type));
         let tail_sig_ref = bx.import_signature(tail_sig);
-        bx.ins().return_call_indirect(tail_sig_ref, body_addr, &[next]);
+        bx.ins()
+            .return_call_indirect(tail_sig_ref, body_addr, &[next]);
         bx.finalize();
     }
     let mut ctx = Context::for_function(body2_func);
