@@ -886,6 +886,41 @@ fn canonical_ref_color_for_slot(
         .copied()
 }
 
+/// #124(b).2 probe: per Python PC, does the canonical SSARepr satisfy the
+/// runtime resume contract `get_live_vars_info` (`jitcode.py:82-93`) —
+/// a `-live-` marker AT the PC's first insn OR exactly one insn before?
+/// Returns `(covered, uncovered, up-to-8 sample (py_pc, first-insn
+/// opname) for uncovered PCs)`.  Quantifies which resume-target PCs the
+/// canonical canraise+branch `-live-` placement already covers, the
+/// gap the orthodox sparse-resume arc must close.
+fn phase4_live_marker_coverage(
+    ssarepr: &super::flatten::SSARepr,
+) -> (u32, u32, Vec<(i64, String)>) {
+    let mut covered = 0u32;
+    let mut uncovered = 0u32;
+    let mut samples: Vec<(i64, String)> = Vec::new();
+    for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
+        let at_pos = ssarepr.insns.get(pos).is_some_and(|i| i.is_live());
+        let one_before = pos
+            .checked_sub(1)
+            .and_then(|p| ssarepr.insns.get(p))
+            .is_some_and(|i| i.is_live());
+        if at_pos || one_before {
+            covered += 1;
+        } else {
+            uncovered += 1;
+            if samples.len() < 8 {
+                let opname = match ssarepr.insns.get(pos) {
+                    Some(super::flatten::Insn::Op { opname, .. }) => opname.clone(),
+                    _ => "<non-op>".to_string(),
+                };
+                samples.push((py_pc, opname));
+            }
+        }
+    }
+    (covered, uncovered, samples)
+}
+
 /// Diagnostic helper: tally per-opname occurrences of the given Insn
 /// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
 /// resulting `Vec<(String, i64)>` is sortable and comparable across
@@ -9993,6 +10028,28 @@ impl CodeWriter {
                      canonical_len={canonical_len} diff={diff}",
                     ssarepr.name,
                 );
+                // #124(b).2 — measure whether the canonical (sparse)
+                // `-live-` placement satisfies the runtime resume
+                // contract: `get_live_vars_info` (jitcode.py:82-93)
+                // accepts a `-live-` AT the resume pc's first insn OR
+                // exactly one insn before.  Per Python PC, check that
+                // adjacency on the canonical stream and report
+                // covered/uncovered so the orthodox sparse-resume arc
+                // can quantify which resume-target PCs canonical's
+                // canraise+branch `-live-` already covers.
+                let (live_covered, live_uncovered, live_samples) =
+                    phase4_live_marker_coverage(&canonical_ssarepr);
+                eprintln!(
+                    "[phase4-live-coverage] graph={} covered={live_covered} \
+                     uncovered={live_uncovered}",
+                    canonical_ssarepr.name,
+                );
+                for (py_pc, opname) in &live_samples {
+                    eprintln!(
+                        "[phase4-live-uncovered] graph={} py_pc={py_pc} opname={opname}",
+                        canonical_ssarepr.name,
+                    );
+                }
                 // Per-opname tally so walker-only and
                 // canonical-only opnames are named.  Walker emits more
                 // insns than canonical (slice 3 finding); slicing the
