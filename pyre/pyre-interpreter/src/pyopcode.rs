@@ -1586,6 +1586,99 @@ pub fn execute_store_slice<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_make_function<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    OpcodeStepExecutor::make_function(executor)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_subscr<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    OpcodeStepExecutor::store_subscr(executor)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_return_value<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ControlFlowOpcodeHandler,
+{
+    executor.return_value()
+}
+
+pub fn execute_return_generator<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.return_generator()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_call_function_ex<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.call_function_ex()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_build_class<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.load_build_class()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_setup_annotations<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.setup_annotations()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_locals<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.load_locals()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_format_simple<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.format_simple()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_format_with_spec<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.format_with_spec()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_end_send<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.end_send()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_with_except_start<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.with_except_start()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_yield_from_iter<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.get_yield_from_iter()?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1781,17 +1874,14 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::MakeFunction => {
-            OpcodeStepExecutor::make_function(executor)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::MakeFunction => execute_make_function(executor),
 
         Instruction::Call { argc } => {
             executor.call(u32_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
-        Instruction::ReturnValue => executor.return_value(),
+        Instruction::ReturnValue => execute_return_value(executor),
 
         Instruction::BuildList { count } => {
             OpcodeStepExecutor::build_list(executor, u32_as_usize(count.get(op_arg)))?;
@@ -1808,10 +1898,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::StoreSubscr => {
-            OpcodeStepExecutor::store_subscr(executor)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::StoreSubscr => execute_store_subscr(executor),
 
         Instruction::ListAppend { i } => {
             OpcodeStepExecutor::list_append(executor, u32_as_usize(i.get(op_arg)))?;
@@ -2022,20 +2109,14 @@ where
         }
 
         // ── Generator ──
-        Instruction::ReturnGenerator => {
-            executor.return_generator()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ReturnGenerator => execute_return_generator(executor),
 
         // ── Function call variants ──
         Instruction::CallKw { argc } => {
             executor.call_kw(u32_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
-        Instruction::CallFunctionEx => {
-            executor.call_function_ex()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::CallFunctionEx => execute_call_function_ex(executor),
 
         // ── Common constants ──
         Instruction::LoadCommonConstant { idx } => {
@@ -2045,10 +2126,7 @@ where
         }
 
         // ── Class support ──
-        Instruction::LoadBuildClass => {
-            executor.load_build_class()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadBuildClass => execute_load_build_class(executor),
 
         // ── Delete ops ──
         Instruction::DeleteFast { var_num } => {
@@ -2084,24 +2162,12 @@ where
         // an `__annotations__` dict. The class body / module top-level
         // emits this once before any annotated assignment so STORE_SUBSCR
         // can populate it.
-        Instruction::SetupAnnotations => {
-            executor.setup_annotations()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::LoadLocals => {
-            executor.load_locals()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::SetupAnnotations => execute_setup_annotations(executor),
+        Instruction::LoadLocals => execute_load_locals(executor),
 
         // ── String formatting (f-strings) ──
-        Instruction::FormatSimple => {
-            executor.format_simple()?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::FormatWithSpec => {
-            executor.format_with_spec()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::FormatSimple => execute_format_simple(executor),
+        Instruction::FormatWithSpec => execute_format_with_spec(executor),
         Instruction::ConvertValue { oparg: conv } => {
             executor.convert_value(conv.get(op_arg))?;
             Ok(StepResult::Continue)
@@ -2181,10 +2247,7 @@ where
         }
 
         // yield from: handled by PyFrame override in eval.rs
-        Instruction::GetYieldFromIter => {
-            executor.get_yield_from_iter()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::GetYieldFromIter => execute_get_yield_from_iter(executor),
 
         Instruction::Send { .. } => {
             let target =
@@ -2193,10 +2256,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::EndSend => {
-            executor.end_send()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::EndSend => execute_end_send(executor),
 
         // ── Misc stubs ──
         // Pops obj, pushes (callable, self_or_null).
@@ -2219,15 +2279,12 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::ExitInitCheck => Ok(StepResult::Continue),
-        Instruction::WithExceptStart => {
-            // CPython 3.14 WITH_EXCEPT_START:
-            //   val = TOS         (the exception)
-            //   exit_func = stack[-4]
-            //   res = exit_func(type(val), val, val.__traceback__)
-            //   push(res)
-            executor.with_except_start()?;
-            Ok(StepResult::Continue)
-        }
+        // CPython 3.14 WITH_EXCEPT_START:
+        //   val = TOS         (the exception)
+        //   exit_func = stack[-4]
+        //   res = exit_func(type(val), val, val.__traceback__)
+        //   push(res)
+        Instruction::WithExceptStart => execute_with_except_start(executor),
 
         other => executor.unsupported(&other),
     }
