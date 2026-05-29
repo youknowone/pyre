@@ -2952,20 +2952,35 @@ impl Optimizer {
             // and the backend will resolve the live op as the stale constant.
             // Give every such constant-only opref a fresh slot after the last
             // live op, mirroring RPython's separate constant identity.
+            // Scan the canonical `_forwarded` hosts (not box_pool) for
+            // constant-folded ops still at their pre-compact position. At this
+            // point set_position has not run, so a folded op's `Op.pos` still
+            // holds the old raw index; live emitted ops carry `Forwarded::Op`/
+            // info (not Const) so the forwarded filter excludes them, and the
+            // `remap.contains_key` guard dedups a position reached through more
+            // than one store.
             let mut next_const_pos = fni + ctx.new_operations.len() as u32;
-            for (idx, b) in ctx.box_pool.iter_indexed() {
-                let old_idx = idx as u32;
-                if remap.contains_key(&old_idx) {
-                    continue;
+            let mut consider_const = |op: &majit_ir::OpRc| {
+                let old_idx = op.pos.get().raw();
+                if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
+                    return;
                 }
-                if old_idx < num_inputs as u32 {
-                    continue;
-                }
-                if !matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_)) {
-                    continue;
+                if !matches!(op.forwarded.borrow().clone(), crate::r#box::Forwarded::Const(_)) {
+                    return;
                 }
                 remap.insert(old_idx, next_const_pos);
                 next_const_pos += 1;
+            };
+            for op in &ctx.new_operations {
+                consider_const(op);
+            }
+            for op in &ctx.phase1_emit_ops {
+                consider_const(op);
+            }
+            for slot in &ctx.resop_refs {
+                if let Some(op) = slot {
+                    consider_const(op);
+                }
             }
 
             // Walk box_pool and update each ResOp's position field in
