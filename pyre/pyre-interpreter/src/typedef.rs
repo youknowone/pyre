@@ -2331,12 +2331,13 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromkeys",
-        make_builtin_function("fromkeys", |args| {
-            // Called as dict.fromkeys(iter, val): args = [iter, val] (no cls binding)
-            let (iterable, value) = if args.len() >= 2 {
-                (args[0], args[1])
-            } else if args.len() == 1 {
-                (args[0], pyre_object::w_none())
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function("fromkeys", |args| {
+            // classmethod: args[0] is the bound cls; the user arguments are
+            // fromkeys(iterable, value=None).
+            let (iterable, value) = if args.len() >= 3 {
+                (args[1], args[2])
+            } else if args.len() == 2 {
+                (args[1], pyre_object::w_none())
             } else {
                 return Ok(pyre_object::w_dict_new());
             };
@@ -2346,7 +2347,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                 unsafe { pyre_object::w_dict_store(d, key, value) };
             }
             Ok(d)
-        }),
+        })),
     );
 }
 
