@@ -1904,7 +1904,13 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
                 && is_zero_numeric(rhs)
                 && (matches!(lhs, ConstValue::Float(_)) || matches!(rhs, ConstValue::Float(_))) =>
         {
-            Some(make_err("ZeroDivisionError: division by zero"))
+            let reason = match kind {
+                OpKind::Div => "ZeroDivisionError: float division by zero",
+                OpKind::FloorDiv => "ZeroDivisionError: float floor division by zero",
+                OpKind::Mod => "ZeroDivisionError: float modulo",
+                _ => unreachable!(),
+            };
+            Some(make_err(reason))
         }
         // ZeroDivisionError on truediv. Upstream `PureOperation.const
         // fold` calls `operator.truediv(lhs, rhs)`; for numeric lhs
@@ -1918,10 +1924,17 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
         // `Bool(false)` is again caught by `is_zero_int_like` per the
         // `bool ⊂ int` rule.
         //
-        // All zero-division cases raise the unified "division by zero"
-        // message regardless of int/float operands.
+        // truediv with a float operand uses the float-specific message
+        // (`float division by zero`); the all-integer case uses the
+        // unified `division by zero`.
         (OpKind::TrueDiv, [lhs, rhs]) if is_foldable_numeric(lhs) && is_zero_numeric(rhs) => {
-            Some(make_err("ZeroDivisionError: division by zero"))
+            let reason =
+                if matches!(lhs, ConstValue::Float(_)) || matches!(rhs, ConstValue::Float(_)) {
+                    "ZeroDivisionError: float division by zero"
+                } else {
+                    "ZeroDivisionError: division by zero"
+                };
+            Some(make_err(reason))
         }
         // TypeError on cross-type ordering comparisons. Eq/Ne deliberately
         // not included — upstream Python 3 returns Bool for those.

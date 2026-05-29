@@ -355,7 +355,7 @@ unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_float(b);
     if vb == 0.0 {
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("float division by zero"));
     }
     Ok(w_float_new(as_float(a) / vb))
 }
@@ -372,7 +372,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let y = as_float(b);
     if y == 0.0 {
         // floatobject.py:526
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("float modulo"));
     }
     let mut m = x % y; // fmod
     if m != 0.0 {
@@ -391,7 +391,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
     if y == 0.0 {
         // floatobject.py:761
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("float floor division by zero"));
     }
     let mut m = x % y; // fmod
     // floatobject.py:767: div = (x - mod) / y
