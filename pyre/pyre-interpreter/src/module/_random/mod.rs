@@ -59,6 +59,13 @@ impl W_Random {
     fn getstate(&self) -> PyObjectRef {
         crate::pytuple![self.state as i64]
     }
+    // Pickling hook — `__reduce__` is registered like any instance dunder
+    // by `#[pyre_methods]`, so typed payloads opt into pickle support just
+    // by defining the method.  Returns the `(callable, args, state)`
+    // triple: unpickling calls `Random()` then `obj.__setstate__(state)`.
+    fn __reduce__(&self) -> PyObjectRef {
+        crate::pytuple![type_object(), crate::pytuple![], self.getstate()]
+    }
     fn setstate(&mut self, state_tuple: PyTuple) -> Result<(), crate::PyError> {
         unsafe {
             if w_tuple_len(state_tuple) < 1 {
