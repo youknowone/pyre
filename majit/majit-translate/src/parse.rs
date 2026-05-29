@@ -16,6 +16,14 @@ pub struct ExtractedOpcodeArm {
     /// This is the handler's own graph — the primary input for
     /// jtransform/flatten. handler_calls are metadata only.
     pub body_graph: Option<crate::model::FunctionGraph>,
+    /// Set when the arm body is a single tail-call to a lifted
+    /// per-opcode handler free fn (`execute_<op>(dispatcher params)`).
+    /// In that case `body_graph` is the mechanically synthesized
+    /// dispatcher-shaped wrapper (not the syn-AST lowering), and this
+    /// records the handler's [`CallPath`] — the seam that lets the JIT
+    /// resolve the Charon/MIR handler graph by name instead of
+    /// re-lowering the arm body through `front::ast`.
+    pub mir_handler_path: Option<CallPath>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1459,6 +1467,20 @@ fn extract_match_arms(
             let handler_calls = extract_handler_calls(&arm.body);
             let selector = extract_opcode_dispatch_selector(&arm.pat);
             let name = selector.canonical_key();
+            // Seam: an arm whose body is a single tail-call to a lifted
+            // per-opcode handler free fn (`execute_<op>(dispatcher
+            // params)`) gets a mechanically synthesized
+            // dispatcher-shaped wrapper instead of a syn-AST lowering, so
+            // the JIT resolves the Charon/MIR handler graph by name.
+            if let Some((handler_path, forwarded)) = detect_single_tail_call(&arm.body) {
+                let graph = synthesize_tail_call_wrapper(&name, sig, &handler_path, &forwarded);
+                return ExtractedOpcodeArm {
+                    selector,
+                    handler_calls,
+                    body_graph: Some(graph),
+                    mir_handler_path: Some(handler_path),
+                };
+            }
             let mut graph = crate::model::FunctionGraph::new(name.clone());
             // Pre-bind `execute_opcode_step`'s formal parameters as
             // startblock inputargs so the arm body's `Expr::Path`
@@ -1484,9 +1506,126 @@ fn extract_match_arms(
                 selector,
                 handler_calls,
                 body_graph: Some(graph),
+                mir_handler_path: None,
             }
         })
         .collect()
+}
+
+/// Recognize an arm body of the form `execute_<op>(p0, p1, …)` where
+/// every argument is a bare parameter identifier (a forwarded
+/// dispatcher param).  Returns the handler `CallPath` and the forwarded
+/// parameter names in call order.  A leading single-statement block
+/// (`{ execute_<op>(…) }`) is unwrapped.  Anything else (method calls,
+/// multi-statement bodies, non-`execute_` callees, non-ident args)
+/// returns `None` and falls back to syn-AST lowering.
+fn detect_single_tail_call(body: &syn::Expr) -> Option<(CallPath, Vec<String>)> {
+    let expr = match body {
+        syn::Expr::Block(block) if block.block.stmts.len() == 1 => match &block.block.stmts[0] {
+            syn::Stmt::Expr(inner, _) => inner,
+            _ => return None,
+        },
+        other => other,
+    };
+    let call = match expr {
+        syn::Expr::Call(call) => call,
+        _ => return None,
+    };
+    let func_path = match &*call.func {
+        syn::Expr::Path(path) if path.qself.is_none() => &path.path,
+        _ => return None,
+    };
+    let leaf = func_path.segments.last()?.ident.to_string();
+    if !leaf.starts_with("execute_") {
+        return None;
+    }
+    let mut forwarded = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        match arg {
+            syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+                forwarded.push(path.path.segments[0].ident.to_string());
+            }
+            _ => return None,
+        }
+    }
+    let segments = func_path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    Some((CallPath { segments }, forwarded))
+}
+
+/// Build the dispatcher-shaped wrapper graph for a single-tail-call arm
+/// mechanically, reproducing what
+/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
+/// body but WITHOUT the syn-AST graph builder.  Shape: one
+/// `OpKind::Input` per dispatcher parameter (in signature order, typed
+/// via `classify_fn_arg_ty`) as the startblock inputargs, then one
+/// `OpKind::Call` to `handler_path` forwarding the mapped inputarg vars
+/// with `result_ty: Unknown`, then a return of the call result.  The
+/// runtime seeds the dispatch entry from the full dispatcher register
+/// layout, so the wrapper MUST keep every dispatcher param as an
+/// inputarg even when the handler forwards only a subset.
+fn synthesize_tail_call_wrapper(
+    name: &str,
+    sig: &syn::Signature,
+    handler_path: &CallPath,
+    forwarded: &[String],
+) -> crate::model::FunctionGraph {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let mut graph = crate::model::FunctionGraph::new(name.to_string());
+    let block = graph.startblock;
+    let mut param_vars: std::collections::HashMap<String, crate::flowspace::model::Variable> =
+        std::collections::HashMap::new();
+    for param in &sig.inputs {
+        let (pname, pty) = match param {
+            syn::FnArg::Receiver(recv) => (
+                "self".to_string(),
+                crate::front::syn_metadata::classify_fn_arg_ty(&recv.ty),
+            ),
+            syn::FnArg::Typed(pat_type) => (
+                crate::front::syn_metadata::canonical_pat_name(&pat_type.pat),
+                crate::front::syn_metadata::classify_fn_arg_ty(&pat_type.ty),
+            ),
+        };
+        if let Some(var) = graph.push_op_var(
+            block,
+            OpKind::Input {
+                name: pname.clone(),
+                ty: pty,
+            },
+            true,
+        ) {
+            graph.name_value_var(&var, pname.clone());
+            graph.push_inputarg_var(block, var.clone());
+            param_vars.insert(pname, var);
+        }
+    }
+    let args: Vec<crate::flowspace::model::Variable> = forwarded
+        .iter()
+        .map(|pname| {
+            param_vars.get(pname).cloned().unwrap_or_else(|| {
+                panic!(
+                    "opcode arm `{name}`: tail-call forwards `{pname}`, \
+                     which is not a dispatcher parameter"
+                )
+            })
+        })
+        .collect();
+    let result = graph.push_op_var(
+        block,
+        OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: handler_path.segments.clone(),
+            },
+            args,
+            result_ty: ValueType::Unknown,
+        },
+        true,
+    );
+    graph.set_return(block, result);
+    graph
 }
 
 fn reject_duplicate_opcode_selectors(arms: Vec<ExtractedOpcodeArm>) -> Vec<ExtractedOpcodeArm> {
@@ -1743,6 +1882,54 @@ fn canonical_type_name(ty: &syn::Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_tail_call_arm_synthesizes_dispatcher_shaped_wrapper() {
+        let body: syn::Expr = syn::parse_str("execute_pop_top(executor)").unwrap();
+        let (path, forwarded) =
+            detect_single_tail_call(&body).expect("single tail-call should be detected");
+        assert_eq!(path.segments, vec!["execute_pop_top".to_string()]);
+        assert_eq!(forwarded, vec!["executor".to_string()]);
+
+        let sig: syn::Signature = syn::parse_str(
+            "fn execute_opcode_step<E>(executor: &mut E, code: &CodeObject, instruction: Instruction, op_arg: OpArg, next_instr: usize) -> Result<StepResult, PyError>",
+        )
+        .unwrap();
+        let graph = synthesize_tail_call_wrapper("PopTop", &sig, &path, &forwarded);
+
+        let start = graph.block(graph.startblock);
+        // All 5 dispatcher params are inputargs even though only
+        // `executor` is forwarded (runtime seeds the full layout).
+        assert_eq!(start.inputargs.len(), 5);
+        // 5 Input ops + 1 Call op.
+        assert_eq!(start.operations.len(), 6);
+        match &start.operations[5].kind {
+            crate::model::OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } => {
+                assert_eq!(*result_ty, crate::model::ValueType::Unknown);
+                assert_eq!(args.len(), 1, "only the forwarded `executor` arg");
+                match target {
+                    crate::model::CallTarget::FunctionPath { segments } => {
+                        assert_eq!(segments, &vec!["execute_pop_top".to_string()]);
+                    }
+                    other => panic!("expected FunctionPath, got {other:?}"),
+                }
+            }
+            other => panic!("expected Call op as last operation, got {other:?}"),
+        }
+
+        // Non-matching shapes fall back to syn-AST lowering.
+        let method_call: syn::Expr = syn::parse_str("executor.pop_top()").unwrap();
+        assert!(detect_single_tail_call(&method_call).is_none());
+        let multi_stmt: syn::Expr =
+            syn::parse_str("{ let x = 1; execute_pop_top(executor) }").unwrap();
+        assert!(detect_single_tail_call(&multi_stmt).is_none());
+        let non_execute: syn::Expr = syn::parse_str("handle_pop_top(executor)").unwrap();
+        assert!(detect_single_tail_call(&non_execute).is_none());
+    }
 
     #[test]
     fn collect_module_statics_records_const_and_static_decls_at_file_root() {
