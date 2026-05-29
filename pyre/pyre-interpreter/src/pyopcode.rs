@@ -1736,6 +1736,435 @@ pub fn execute_delete_fast<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_load_small_int<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ConstantOpcodeHandler,
+{
+    let Instruction::LoadSmallInt { i } = instruction else {
+        unreachable!()
+    };
+    executor.load_small_int(u32_as_i64(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_list_append<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ListAppend { i } = instruction else {
+        unreachable!()
+    };
+    OpcodeStepExecutor::list_append(executor, u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_unpack_sequence<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::UnpackSequence { count } = instruction else {
+        unreachable!()
+    };
+    OpcodeStepExecutor::unpack_sequence(executor, u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_list<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildList { count } = instruction else {
+        unreachable!()
+    };
+    OpcodeStepExecutor::build_list(executor, u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_tuple<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildTuple { count } = instruction else {
+        unreachable!()
+    };
+    OpcodeStepExecutor::build_tuple(executor, u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_map<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildMap { count } = instruction else {
+        unreachable!()
+    };
+    OpcodeStepExecutor::build_map(executor, u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_set<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildSet { count } = instruction else {
+        unreachable!()
+    };
+    executor.build_set(u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_string<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildString { count } = instruction else {
+        unreachable!()
+    };
+    executor.build_string(u32_as_usize(count.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_slice<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildSlice { argc } = instruction else {
+        unreachable!()
+    };
+    executor.build_slice(argc.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_call<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::Call { argc } = instruction else {
+        unreachable!()
+    };
+    executor.call(u32_as_usize(argc.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_call_kw<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::CallKw { argc } = instruction else {
+        unreachable!()
+    };
+    executor.call_kw(u32_as_usize(argc.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_binary_op<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ArithmeticOpcodeHandler,
+{
+    let Instruction::BinaryOp { op } = instruction else {
+        unreachable!()
+    };
+    executor.binary_op(op.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_compare_op<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ArithmeticOpcodeHandler,
+{
+    let Instruction::CompareOp { opname } = instruction else {
+        unreachable!()
+    };
+    executor.compare_op(opname.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_contains_op<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ContainsOp { invert } = instruction else {
+        unreachable!()
+    };
+    executor.contains_op(invert.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_is_op<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::IsOp { invert } = instruction else {
+        unreachable!()
+    };
+    executor.is_op(invert.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_raise_varargs<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::RaiseVarargs { argc } = instruction else {
+        unreachable!()
+    };
+    executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_reraise<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::Reraise { depth } = instruction else {
+        unreachable!()
+    };
+    executor.reraise(depth.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_list_extend<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ListExtend { i } = instruction else {
+        unreachable!()
+    };
+    executor.list_extend(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_set_add<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::SetAdd { i } = instruction else {
+        unreachable!()
+    };
+    executor.set_add(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_dict_merge<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DictMerge { i } = instruction else {
+        unreachable!()
+    };
+    executor.dict_merge(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_dict_update<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DictUpdate { i } = instruction else {
+        unreachable!()
+    };
+    executor.dict_update(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_set_update<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::SetUpdate { i } = instruction else {
+        unreachable!()
+    };
+    executor.set_update(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_map_add<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::MapAdd { i } = instruction else {
+        unreachable!()
+    };
+    executor.map_add(u32_as_usize(i.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_make_cell<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::MakeCell { i } = instruction else {
+        unreachable!()
+    };
+    executor.make_cell(i.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_copy_free_vars<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::CopyFreeVars { n } = instruction else {
+        unreachable!()
+    };
+    executor.copy_free_vars(u32_as_usize(n.get(op_arg)))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_deref<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadDeref { i } = instruction else {
+        unreachable!()
+    };
+    executor.load_deref(i.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_deref<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::StoreDeref { i } = instruction else {
+        unreachable!()
+    };
+    executor.store_deref(i.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_delete_deref<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::DeleteDeref { i } = instruction else {
+        unreachable!()
+    };
+    executor.delete_deref(i.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_common_constant<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadCommonConstant { idx } = instruction else {
+        unreachable!()
+    };
+    executor.load_common_constant(idx.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_convert_value<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::ConvertValue { oparg: conv } = instruction else {
+        unreachable!()
+    };
+    executor.convert_value(conv.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_fast_and_clear<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::LoadFastAndClear { var_num } = instruction else {
+        unreachable!()
+    };
+    executor.load_fast_and_clear(var_num.get(op_arg).as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_set_function_attribute<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::SetFunctionAttribute { flag } = instruction else {
+        unreachable!()
+    };
+    executor.set_function_attribute_with_flag(flag.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_call_intrinsic_1<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::CallIntrinsic1 { func } = instruction else {
+        unreachable!()
+    };
+    executor.call_intrinsic_1(func.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_call_intrinsic_2<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::CallIntrinsic2 { func } = instruction else {
+        unreachable!()
+    };
+    executor.call_intrinsic_2(func.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_unpack_ex<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::UnpackEx { counts } = instruction else {
+        unreachable!()
+    };
+    executor.unpack_ex(counts.get(op_arg))?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1768,10 +2197,7 @@ where
             Ok(StepResult::Continue)
         }
 
-        Instruction::LoadSmallInt { i } => {
-            executor.load_small_int(u32_as_i64(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadSmallInt { .. } => execute_load_small_int(executor, instruction, op_arg),
 
         Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
             let idx = load_fast_var_num_to_index(var_num, op_arg);
@@ -1873,15 +2299,9 @@ where
 
         Instruction::Swap { .. } => execute_swap(executor, instruction, op_arg),
 
-        Instruction::BinaryOp { op } => {
-            executor.binary_op(op.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BinaryOp { .. } => execute_binary_op(executor, instruction, op_arg),
 
-        Instruction::CompareOp { opname } => {
-            executor.compare_op(opname.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::CompareOp { .. } => execute_compare_op(executor, instruction, op_arg),
 
         Instruction::UnaryNegative => execute_unary_negative(executor),
 
@@ -1924,39 +2344,21 @@ where
 
         Instruction::MakeFunction => execute_make_function(executor),
 
-        Instruction::Call { argc } => {
-            executor.call(u32_as_usize(argc.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::Call { .. } => execute_call(executor, instruction, op_arg),
 
         Instruction::ReturnValue => execute_return_value(executor),
 
-        Instruction::BuildList { count } => {
-            OpcodeStepExecutor::build_list(executor, u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BuildList { .. } => execute_build_list(executor, instruction, op_arg),
 
-        Instruction::BuildTuple { count } => {
-            OpcodeStepExecutor::build_tuple(executor, u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BuildTuple { .. } => execute_build_tuple(executor, instruction, op_arg),
 
-        Instruction::BuildMap { count } => {
-            OpcodeStepExecutor::build_map(executor, u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BuildMap { .. } => execute_build_map(executor, instruction, op_arg),
 
         Instruction::StoreSubscr => execute_store_subscr(executor),
 
-        Instruction::ListAppend { i } => {
-            OpcodeStepExecutor::list_append(executor, u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ListAppend { .. } => execute_list_append(executor, instruction, op_arg),
 
-        Instruction::UnpackSequence { count } => {
-            OpcodeStepExecutor::unpack_sequence(executor, u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::UnpackSequence { .. } => execute_unpack_sequence(executor, instruction, op_arg),
 
         Instruction::GetIter => execute_get_iter(executor),
 
@@ -2004,21 +2406,9 @@ where
         // All other opcodes fall through to unsupported handler.
         // Remaining opcodes (closures, exceptions, imports) will be added
         // ── Closures / cells ──
-        Instruction::LoadDeref { i } => {
-            let idx = i.get(op_arg).as_usize();
-            executor.load_deref(idx)?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::StoreDeref { i } => {
-            let idx = i.get(op_arg).as_usize();
-            executor.store_deref(idx)?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DeleteDeref { i } => {
-            let idx = i.get(op_arg).as_usize();
-            executor.delete_deref(idx)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::LoadDeref { .. } => execute_load_deref(executor, instruction, op_arg),
+        Instruction::StoreDeref { .. } => execute_store_deref(executor, instruction, op_arg),
+        Instruction::DeleteDeref { .. } => execute_delete_deref(executor, instruction, op_arg),
 
         // ── Import ──
         Instruction::ImportName { namei } => {
@@ -2033,16 +2423,8 @@ where
         }
 
         // ── Containment / identity tests ──
-        Instruction::ContainsOp { invert } => {
-            let inv = invert.get(op_arg);
-            executor.contains_op(inv)?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::IsOp { invert } => {
-            let inv = invert.get(op_arg);
-            executor.is_op(inv)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ContainsOp { .. } => execute_contains_op(executor, instruction, op_arg),
+        Instruction::IsOp { .. } => execute_is_op(executor, instruction, op_arg),
 
         // ── Delete subscript ──
         Instruction::DeleteSubscr => execute_delete_subscr(executor),
@@ -2051,28 +2433,13 @@ where
         Instruction::PushExcInfo => execute_push_exc_info(executor),
         Instruction::PopExcept => execute_pop_except(executor),
         Instruction::CheckExcMatch => execute_check_exc_match(executor),
-        Instruction::RaiseVarargs { argc } => {
-            executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::Reraise { depth } => {
-            executor.reraise(depth.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::RaiseVarargs { .. } => execute_raise_varargs(executor, instruction, op_arg),
+        Instruction::Reraise { .. } => execute_reraise(executor, instruction, op_arg),
 
         // ── Collection operations ──
-        Instruction::BuildSet { count } => {
-            executor.build_set(u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::BuildSlice { argc } => {
-            executor.build_slice(argc.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::BuildString { count } => {
-            executor.build_string(u32_as_usize(count.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::BuildSet { .. } => execute_build_set(executor, instruction, op_arg),
+        Instruction::BuildSlice { .. } => execute_build_slice(executor, instruction, op_arg),
+        Instruction::BuildString { .. } => execute_build_string(executor, instruction, op_arg),
         // Template strings (PEP 750) — `t"hello {name}"`. Stack: [strings, interps].
         // PyPy has no equivalent; we consume the operands and push a 2-tuple
         // that preserves the strings+interpolations structure. Sufficient for
@@ -2096,30 +2463,12 @@ where
             OpcodeStepExecutor::build_tuple(executor, 2)?;
             Ok(StepResult::Continue)
         }
-        Instruction::ListExtend { i } => {
-            executor.list_extend(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::SetAdd { i } => {
-            executor.set_add(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DictMerge { i } => {
-            executor.dict_merge(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::DictUpdate { i } => {
-            executor.dict_update(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::SetUpdate { i } => {
-            executor.set_update(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::MapAdd { i } => {
-            executor.map_add(u32_as_usize(i.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ListExtend { .. } => execute_list_extend(executor, instruction, op_arg),
+        Instruction::SetAdd { .. } => execute_set_add(executor, instruction, op_arg),
+        Instruction::DictMerge { .. } => execute_dict_merge(executor, instruction, op_arg),
+        Instruction::DictUpdate { .. } => execute_dict_update(executor, instruction, op_arg),
+        Instruction::SetUpdate { .. } => execute_set_update(executor, instruction, op_arg),
+        Instruction::MapAdd { .. } => execute_map_add(executor, instruction, op_arg),
 
         // ── Slicing ──
         Instruction::BinarySlice => execute_binary_slice(executor),
@@ -2147,30 +2496,19 @@ where
         }
 
         // ── Closure 3.11+ ──
-        Instruction::MakeCell { i } => {
-            executor.make_cell(i.get(op_arg).as_usize())?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::CopyFreeVars { n } => {
-            executor.copy_free_vars(u32_as_usize(n.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::MakeCell { .. } => execute_make_cell(executor, instruction, op_arg),
+        Instruction::CopyFreeVars { .. } => execute_copy_free_vars(executor, instruction, op_arg),
 
         // ── Generator ──
         Instruction::ReturnGenerator => execute_return_generator(executor),
 
         // ── Function call variants ──
-        Instruction::CallKw { argc } => {
-            executor.call_kw(u32_as_usize(argc.get(op_arg)))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::CallKw { .. } => execute_call_kw(executor, instruction, op_arg),
         Instruction::CallFunctionEx => execute_call_function_ex(executor),
 
         // ── Common constants ──
-        Instruction::LoadCommonConstant { idx } => {
-            let cc = idx.get(op_arg);
-            executor.load_common_constant(cc)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadCommonConstant { .. } => {
+            execute_load_common_constant(executor, instruction, op_arg)
         }
 
         // ── Class support ──
@@ -2213,10 +2551,7 @@ where
         // ── String formatting (f-strings) ──
         Instruction::FormatSimple => execute_format_simple(executor),
         Instruction::FormatWithSpec => execute_format_with_spec(executor),
-        Instruction::ConvertValue { oparg: conv } => {
-            executor.convert_value(conv.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::ConvertValue { .. } => execute_convert_value(executor, instruction, op_arg),
 
         // ── Sequence matching ──
         Instruction::GetLen => {
@@ -2234,17 +2569,13 @@ where
         }
 
         // ── Load fast and clear (comprehension scope) ──
-        Instruction::LoadFastAndClear { var_num } => {
-            let idx = var_num.get(op_arg).as_usize();
-            executor.load_fast_and_clear(idx)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFastAndClear { .. } => {
+            execute_load_fast_and_clear(executor, instruction, op_arg)
         }
 
         // ── Set function attribute (closure, annotations, etc.) ──
-        Instruction::SetFunctionAttribute { flag } => {
-            let f = flag.get(op_arg);
-            executor.set_function_attribute_with_flag(f)?;
-            Ok(StepResult::Continue)
+        Instruction::SetFunctionAttribute { .. } => {
+            execute_set_function_attribute(executor, instruction, op_arg)
         }
 
         // ── Scoping ──
@@ -2267,20 +2598,11 @@ where
         }
 
         // ── Unpack extended ──
-        Instruction::UnpackEx { counts } => {
-            executor.unpack_ex(counts.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::UnpackEx { .. } => execute_unpack_ex(executor, instruction, op_arg),
 
         // ── Intrinsics ──
-        Instruction::CallIntrinsic1 { func } => {
-            executor.call_intrinsic_1(func.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::CallIntrinsic2 { func } => {
-            executor.call_intrinsic_2(func.get(op_arg))?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::CallIntrinsic1 { .. } => execute_call_intrinsic_1(executor, instruction, op_arg),
+        Instruction::CallIntrinsic2 { .. } => execute_call_intrinsic_2(executor, instruction, op_arg),
 
         // ── Async stubs ──
         Instruction::GetAwaitable { .. }
