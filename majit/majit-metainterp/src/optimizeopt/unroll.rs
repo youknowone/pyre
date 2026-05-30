@@ -2688,6 +2688,10 @@ struct LoopTargetDescr {
     /// for second, ...) so cranelift's `br_table` body-entry dispatch
     /// can route to the right per-LABEL entry block.
     label_block_id: std::sync::atomic::AtomicU32,
+    /// Target loop's `max_output_slots + num_ref_roots`, published
+    /// alongside `ll_loop_code` so the closing-jump dispatcher can
+    /// gate on the source's already-allocated frame being big enough.
+    target_frame_depth: std::sync::atomic::AtomicUsize,
     state: Mutex<LoopTargetDescrState>,
 }
 
@@ -2698,6 +2702,7 @@ impl LoopTargetDescr {
             is_preamble_target,
             ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
             label_block_id: std::sync::atomic::AtomicU32::new(0),
+            target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(LoopTargetDescrState::default()),
         }
     }
@@ -2755,6 +2760,20 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
     fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
         &self.label_block_id as *const _
+    }
+
+    fn target_frame_depth(&self) -> usize {
+        self.target_frame_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_target_frame_depth(&self, depth: usize) {
+        self.target_frame_depth
+            .store(depth, std::sync::atomic::Ordering::Release);
+    }
+
+    fn target_frame_depth_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.target_frame_depth as *const _
     }
 
     fn target_arglocs(&self) -> Vec<majit_ir::TargetArgLoc> {

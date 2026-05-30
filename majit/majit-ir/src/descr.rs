@@ -1297,15 +1297,41 @@ pub trait LoopTargetDescr: Descr {
         );
     }
 
-    /// Publish `(ll_loop_code, label_block_id)` as one coherent dispatch
-    /// target.  Readers gate on `ll_loop_code != 0` (Acquire) and then
-    /// read `label_block_id` via baked address, so `label_block_id` MUST
-    /// become visible before `ll_loop_code` is non-zero — otherwise a
-    /// reader can observe the new code pointer alongside the stale
-    /// initial `label_block_id = 0` and route into the wrong block.
-    /// Default impl stores `label_block_id` first, then `ll_loop_code`,
-    /// matching the readiness ordering.
-    fn set_dispatch_target(&self, loop_code: usize, block_id: u32) {
+    /// Target loop's frame depth (`max_output_slots + num_ref_roots`).
+    /// Read by the closing-jump dispatcher to verify the source loop's
+    /// already-allocated JITFRAME has enough capacity for the target
+    /// before tail-calling into it.  `0` until the target has been
+    /// registered.
+    fn target_frame_depth(&self) -> usize {
+        0
+    }
+    fn set_target_frame_depth(&self, _depth: usize) {
+        panic!(
+            "set_target_frame_depth requires an AtomicUsize-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+    fn target_frame_depth_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        panic!(
+            "target_frame_depth_ptr requires an AtomicUsize-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
+
+    /// Publish `(ll_loop_code, label_block_id, target_frame_depth)` as
+    /// one coherent dispatch target.  Readers gate on
+    /// `ll_loop_code != 0` (Acquire) and then read `label_block_id` and
+    /// `target_frame_depth` via baked addresses, so both companion
+    /// cells MUST become visible before `ll_loop_code` is non-zero —
+    /// otherwise a reader can observe the new code pointer alongside a
+    /// stale companion (0 block-id routing into the wrong LABEL, or 0
+    /// depth bypassing the frame-capacity check).  Default impl stores
+    /// the companions first, then `ll_loop_code`, matching the
+    /// readiness ordering.
+    fn set_dispatch_target(&self, loop_code: usize, block_id: u32, frame_depth: usize) {
+        self.set_target_frame_depth(frame_depth);
         self.set_label_block_id(block_id);
         self.set_ll_loop_code(loop_code);
     }
@@ -1355,6 +1381,12 @@ struct BasicLoopTargetDescr {
     /// codegen; default 0 covers single-LABEL traces and dynasm (which
     /// ignores the slot and uses raw LABEL addresses in `_ll_loop_code`).
     label_block_id: std::sync::atomic::AtomicU32,
+    /// `max_output_slots + num_ref_roots` for the target loop.
+    /// Published with the dispatch target so the cranelift in-code
+    /// closing-jump dispatch can compare against the source frame's
+    /// `JF_FRAME_LENGTH` and fall back to the host loop when the
+    /// already-allocated frame is too small for the target.
+    target_frame_depth: std::sync::atomic::AtomicUsize,
     state: Mutex<BasicLoopTargetDescrState>,
 }
 
@@ -1365,6 +1397,7 @@ impl BasicLoopTargetDescr {
             is_preamble_target,
             ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
             label_block_id: std::sync::atomic::AtomicU32::new(0),
+            target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(BasicLoopTargetDescrState::default()),
         }
     }
@@ -1422,6 +1455,20 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 
     fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
         &self.label_block_id as *const _
+    }
+
+    fn target_frame_depth(&self) -> usize {
+        self.target_frame_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_target_frame_depth(&self, depth: usize) {
+        self.target_frame_depth
+            .store(depth, std::sync::atomic::Ordering::Release);
+    }
+
+    fn target_frame_depth_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
+        &self.target_frame_depth as *const _
     }
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc> {
