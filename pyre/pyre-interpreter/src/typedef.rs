@@ -7615,15 +7615,25 @@ fn rsplit_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
 /// fields dropped.  `maxsplit < 0` means unlimited.  `forward` selects
 /// split vs rsplit.
 fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let maxsplit = match args.get(2) {
-        Some(&m) if !m.is_null() && unsafe { pyre_object::is_int(m) } => unsafe {
-            pyre_object::w_int_get_value(m)
-        },
+    // `sep` and `maxsplit` are both positional-or-keyword; `maxsplit`
+    // routes through `__index__` (`space_index_w`), so a non-integer
+    // (including `None`) raises rather than silently defaulting.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let maxsplit = match pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
+    {
+        Some(m) if !m.is_null() => crate::builtins::space_index_w(m)?,
         _ => -1,
     };
-    let sep: Option<Vec<u8>> = match args.get(1) {
-        Some(&o) if !o.is_null() && unsafe { !pyre_object::is_none(o) } => {
+    let sep_arg = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
+    let sep: Option<Vec<u8>> = match sep_arg {
+        Some(o) if !o.is_null() && unsafe { !pyre_object::is_none(o) } => {
             if unsafe { pyre_object::bytesobject::is_bytes_like(o) } {
                 Some(unsafe { pyre_object::bytesobject::bytes_like_data(o) }.to_vec())
             } else {
@@ -7654,7 +7664,7 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
             }
         }
     };
-    let items: Vec<PyObjectRef> = parts.iter().map(|p| new_bytes_like(args[0], p)).collect();
+    let items: Vec<PyObjectRef> = parts.iter().map(|p| new_bytes_like(pos[0], p)).collect();
     Ok(pyre_object::w_list_new(items))
 }
 
@@ -7672,21 +7682,28 @@ fn bytes_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `new` (both bytes-like); optional `count` caps the replacements (a
 /// negative or absent count means "no limit").
 fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 3, "replace() takes at least 2 arguments");
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let old = require_bytes_like(args[1])?;
-    let new = require_bytes_like(args[2])?;
-    let limit = match args.get(3) {
-        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => {
-            let c = unsafe { pyre_object::w_int_get_value(w_count) };
+    // `replace` is positional-only; any keyword argument is rejected.
+    // `count` routes through `__index__` (`space_index_w`), so a
+    // non-integer raises rather than silently defaulting to "no limit".
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if kwargs.is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "{}.replace() takes no keyword arguments",
+            unsafe { (*(*pos[0]).ob_type).name }
+        )));
+    }
+    assert!(pos.len() >= 3, "replace() takes at least 2 arguments");
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let old = require_bytes_like(pos[1])?;
+    let new = require_bytes_like(pos[2])?;
+    let limit = match pos.get(3) {
+        Some(&w_count) if !w_count.is_null() => {
+            let c = crate::builtins::space_index_w(w_count)?;
             if c < 0 { usize::MAX } else { c as usize }
         }
         _ => usize::MAX,
     };
-    Ok(new_bytes_like(
-        args[0],
-        &replace_bytes(data, old, new, limit),
-    ))
+    Ok(new_bytes_like(pos[0], &replace_bytes(data, old, new, limit)))
 }
 
 /// `stringmethods.py:descr_join` — concatenate the bytes-like elements
