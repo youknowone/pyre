@@ -4796,15 +4796,13 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bool_from(true))
 }
 
-/// `sum(iterable, start=0)` — PyPy: operation.py sum
+/// `sum(sequence, start=0)` — PyPy `__builtin__/app_functional.py sum`.
 ///
-/// `bltinmodule.c builtin_sum_impl`: once the running total is an exact
-/// float, items are accumulated with the improved Kahan–Babuška (Neumaier)
-/// compensated algorithm so float and small-int operands sum accurately
-/// (`sum([0.1, 0.2, 0.3])` is `0.6`, not `0.6000000000000001`). Anything
-/// that is not an exact float or i64-range int falls back to the generic
-/// `__add__` path, after which the compensated loop re-enters if the total
-/// is still a float.
+/// A plain left-fold through `space.add` (`_regular_sum`'s
+/// `last = last + x`).  No Kahan/Neumaier compensation: float operands
+/// accumulate with ordinary left-to-right IEEE rounding, exactly as PyPy
+/// does (`sum([0.1, 0.2, 0.3])` is `0.6000000000000001`, not `0.6`).  A
+/// `str`/`bytes`/`bytearray` `start` is rejected up front.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error(
@@ -4813,68 +4811,30 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let iterable = args[0];
     let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
-    // Use the generic iterator protocol so sum() works with any iterable
-    // (generators, ranges, sets, dict views, ...), matching PyPy.
-    let items = crate::builtins::collect_iterable(iterable)?;
-    let mut acc = start;
-    let mut idx = 0;
-    let n = items.len();
-    loop {
-        // Generic phase: accumulate through `__add__` until the total
-        // becomes an exact float (or the items are exhausted).
-        while idx < n && !unsafe { is_float(acc) } {
-            acc = crate::baseobjspace::add(acc, items[idx])?;
-            idx += 1;
-        }
-        if idx >= n {
-            return Ok(acc);
-        }
-        // Compensated phase: the total is an exact float here.
-        let mut f_result = unsafe { floatobject::w_float_get_value(acc) };
-        let mut c = 0.0f64;
-        while idx < n {
-            let item = items[idx];
-            let x = unsafe {
-                if is_float(item) {
-                    Some(floatobject::w_float_get_value(item))
-                } else if is_bool(item) {
-                    Some(if w_bool_get_value(item) { 1.0 } else { 0.0 })
-                } else if is_int(item) {
-                    Some(w_int_get_value(item) as f64)
-                } else {
-                    None
-                }
-            };
-            match x {
-                Some(x) => {
-                    let t = f_result + x;
-                    if f_result.abs() >= x.abs() {
-                        c += (f_result - t) + x;
-                    } else {
-                        c += (x - t) + f_result;
-                    }
-                    f_result = t;
-                    idx += 1;
-                }
-                None => break,
-            }
-        }
-        // The compensation term is only meaningful while the running total
-        // stays finite; once it reaches ±inf/nan the deltas degenerate to
-        // nan (`inf - inf`), so the bare total is the correct value.
-        acc = floatobject::w_float_new(if f_result.is_finite() {
-            f_result + c
-        } else {
-            f_result
-        });
-        if idx >= n {
-            return Ok(acc);
-        }
-        // Non-float / out-of-range item: one generic add, then the outer
-        // loop re-enters the compensated phase if the total is still float.
-        acc = crate::baseobjspace::add(acc, items[idx])?;
-        idx += 1;
+    if unsafe { pyre_object::is_str(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum strings [use ''.join(seq) instead]",
+        ));
     }
+    if unsafe { pyre_object::is_bytes(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum bytes [use b''.join(seq) instead]",
+        ));
+    }
+    if unsafe { pyre_object::is_bytearray(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum bytearray [use b''.join(seq) instead]",
+        ));
+    }
+    // `_regular_sum`: `last = last + x` over the generic iterator protocol
+    // (so generators, ranges, sets, dict views, ... all work).  Very
+    // intentionally `last + x`, not `+=` — preserving a mutable `start`
+    // (e.g. a list) matches PyPy's app-level definition.
+    let mut last = start;
+    for item in crate::builtins::collect_iterable(iterable)? {
+        last = crate::baseobjspace::add(last, item)?;
+    }
+    Ok(last)
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
