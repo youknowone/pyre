@@ -9383,26 +9383,30 @@ impl CodeWriter {
         // inputargs/link-args (which would desync the walker renamings),
         // matching the upstream `all_passes` relative order:
         //
-        //   transform_dead_op_vars  (drops dead inputargs + matching args)
-        //   eliminate_empty_blocks  (+ rewrite_dead_forwarder_gotos bridge)
+        //   transform_dead_op_vars   (drops dead inputargs + matching args)
+        //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge)
         //   remove_identical_vars_SSA (dedups duplicate phi inputargs)
+        //   constfold_exitswitch     (no-op today — the walker folds constant
+        //                             branch conditions before emitting an
+        //                             exitswitch — but kept for all_passes
+        //                             parity and to fold any that do appear)
         //
-        // EMPIRICALLY VALIDATED (#73, 2026-05-30): this subset passes 25/25
-        // synthetic correctness tests.  The remaining active passes are
-        // still gated on a graph-driven drain (#73):
-        //   - `ssa_to_ssi` ADDS inputargs/link-args (5/25 fail) — it changes
-        //     the coalesce pairs and walker renamings the inline drain
-        //     depends on;
-        //   - `remove_trivial_links` (merges blocks) and `constfold_exitswitch`
-        //     (drops exits → unreachable blocks) remove SpamBlocks whose
-        //     `per_block_ssarepr` the drain would then lose (full driver:
-        //     21/25 fail).
+        // EMPIRICALLY VALIDATED (#73, 2026-05-30): this subset passes the
+        // full check.py gate (dynasm 39/39, correctness + 8-benchmark
+        // performance).  The remaining active passes are still gated on a
+        // graph-driven drain (#73):
+        //   - `ssa_to_ssi` ADDS inputargs/link-args (5/25 synthetic fail) —
+        //     it changes the coalesce pairs and walker renamings the inline
+        //     drain depends on;
+        //   - `remove_trivial_links` MERGES blocks (16/25 fail) — the merged
+        //     target's `per_block_ssarepr` would be lost from the drain.
         // The other `all_passes` entries are structural no-ops on today's
         // empty-`operations` walker blocks (see their classification in
         // `simplify.rs`).
         super::simplify::transform_dead_op_vars(&graph);
         eliminate_empty_blocks(&graph);
         super::simplify::remove_identical_vars_ssa(&graph);
+        super::simplify::constfold_exitswitch(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),
