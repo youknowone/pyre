@@ -1481,6 +1481,18 @@ fn extract_match_arms(
                     mir_handler_path: Some(handler_path),
                 };
             }
+            // Seam: a constant-return arm (`Ok(StepResult::Continue)`, …) gets
+            // a mechanically synthesized const-return wrapper instead of a
+            // syn-AST lowering — same two-`Call` ctor chain, no graph builder.
+            if let Some(ret) = detect_wrapped_unit_variant_return(&arm.body) {
+                let graph = synthesize_wrapped_unit_variant_wrapper(&name, sig, &ret);
+                return ExtractedOpcodeArm {
+                    selector,
+                    handler_calls,
+                    body_graph: Some(graph),
+                    mir_handler_path: None,
+                };
+            }
             let mut graph = crate::model::FunctionGraph::new(name.clone());
             // Pre-bind `execute_opcode_step`'s formal parameters as
             // startblock inputargs so the arm body's `Expr::Path`
@@ -1556,6 +1568,84 @@ fn detect_single_tail_call(body: &syn::Expr) -> Option<(CallPath, Vec<String>)> 
     Some((CallPath { segments }, forwarded))
 }
 
+/// A constant-return arm body of the form `Wrapper(Owner::Variant)` —
+/// e.g. `Ok(StepResult::Continue)`.  `wrapper_*` is the transparent
+/// result/option ctor (`Ok`/`Err`/`Some`); `inner_*` is the synthetic
+/// unit-variant ctor it wraps.  Carries the owner/leaf split so the
+/// synthesizer reproduces the exact two-`Call` chain `front::ast` emits
+/// for the same body, WITHOUT the syn-AST graph builder.
+struct WrappedUnitVariantReturn {
+    wrapper_owner: Vec<String>,
+    wrapper_name: String,
+    inner_owner: Vec<String>,
+    inner_name: String,
+}
+
+fn path_owner_leaf(segments: &[String]) -> (Vec<String>, String) {
+    let (leaf, owner) = segments
+        .split_last()
+        .expect("synthetic ctor path is non-empty");
+    (owner.to_vec(), leaf.clone())
+}
+
+/// Recognize an arm body of the form `Wrapper(Owner::Variant)` where
+/// `Wrapper` is a transparent result/option ctor (`Ok`/`Err`/`Some`)
+/// and the single argument is a synthetic unit-variant path
+/// (`StepResult::Continue`, …).  A leading single-statement block
+/// (`{ Ok(StepResult::Continue) }`) is unwrapped.  Returns the
+/// owner/leaf split of both ctors so the synthesizer can reproduce the
+/// two-`Call` chain `front::ast::lower_expr_into_graph_with_signature`
+/// emits for the same body.  Anything else (other call shapes, method
+/// calls, non-allowlisted paths, multi-arg wrappers) returns `None`.
+fn detect_wrapped_unit_variant_return(body: &syn::Expr) -> Option<WrappedUnitVariantReturn> {
+    use crate::front::syn_metadata::{
+        is_synthetic_result_option_wrapper_path, is_synthetic_unit_variant_path,
+    };
+    let expr = match body {
+        syn::Expr::Block(block) if block.block.stmts.len() == 1 => match &block.block.stmts[0] {
+            syn::Stmt::Expr(inner, _) => inner,
+            _ => return None,
+        },
+        other => other,
+    };
+    let call = match expr {
+        syn::Expr::Call(call) => call,
+        _ => return None,
+    };
+    let wrapper_path = match &*call.func {
+        syn::Expr::Path(path) if path.qself.is_none() => &path.path,
+        _ => return None,
+    };
+    let wrapper_segments: Vec<String> = wrapper_path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    if !is_synthetic_result_option_wrapper_path(&wrapper_segments) || call.args.len() != 1 {
+        return None;
+    }
+    let inner_path = match &call.args[0] {
+        syn::Expr::Path(path) if path.qself.is_none() => &path.path,
+        _ => return None,
+    };
+    let inner_segments: Vec<String> = inner_path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    if !is_synthetic_unit_variant_path(&inner_segments) {
+        return None;
+    }
+    let (wrapper_owner, wrapper_name) = path_owner_leaf(&wrapper_segments);
+    let (inner_owner, inner_name) = path_owner_leaf(&inner_segments);
+    Some(WrappedUnitVariantReturn {
+        wrapper_owner,
+        wrapper_name,
+        inner_owner,
+        inner_name,
+    })
+}
+
 /// Build the dispatcher-shaped wrapper graph for a single-tail-call arm
 /// mechanically, reproducing what
 /// `front::ast::lower_expr_into_graph_with_signature` emits for the same
@@ -1625,6 +1715,82 @@ fn synthesize_tail_call_wrapper(
         true,
     );
     graph.set_return(block, result);
+    graph
+}
+
+/// Build the dispatcher-shaped wrapper graph for a constant-return arm
+/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`),
+/// reproducing exactly what
+/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
+/// body but WITHOUT the syn-AST graph builder.  Shape: one
+/// `OpKind::Input` per dispatcher parameter (in signature order, typed
+/// via `classify_fn_arg_ty`) as the startblock inputargs, then a 0-arg
+/// `SyntheticTransparentCtor` Call for the inner unit-variant, then a
+/// 1-arg `SyntheticTransparentCtor` Call for the outer wrapper, then a
+/// return of the wrapper result.  Both ctor calls carry
+/// `result_ty: Unknown`; downstream `unit_variant_fold` folds the inner
+/// to a `ConstRef` and `jtransform` elides the transparent wrapper.  The
+/// dispatcher inputargs are kept (even though unused) so the runtime
+/// seeds the full register layout at the arm entry — the same invariant
+/// `synthesize_tail_call_wrapper` upholds.
+fn synthesize_wrapped_unit_variant_wrapper(
+    name: &str,
+    sig: &syn::Signature,
+    ret: &WrappedUnitVariantReturn,
+) -> crate::model::FunctionGraph {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let mut graph = crate::model::FunctionGraph::new(name.to_string());
+    let block = graph.startblock;
+    for param in &sig.inputs {
+        let (pname, pty) = match param {
+            syn::FnArg::Receiver(recv) => (
+                "self".to_string(),
+                crate::front::syn_metadata::classify_fn_arg_ty(&recv.ty),
+            ),
+            syn::FnArg::Typed(pat_type) => (
+                crate::front::syn_metadata::canonical_pat_name(&pat_type.pat),
+                crate::front::syn_metadata::classify_fn_arg_ty(&pat_type.ty),
+            ),
+        };
+        if let Some(var) = graph.push_op_var(
+            block,
+            OpKind::Input {
+                name: pname.clone(),
+                ty: pty,
+            },
+            true,
+        ) {
+            graph.name_value_var(&var, pname.clone());
+            graph.push_inputarg_var(block, var);
+        }
+    }
+    let inner = graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor_with_owner(
+                    ret.inner_owner.clone(),
+                    ret.inner_name.clone(),
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Unknown,
+            },
+            true,
+        )
+        .expect("SyntheticTransparentCtor Call has has_result=true");
+    let outer = graph.push_op_var(
+        block,
+        OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor_with_owner(
+                ret.wrapper_owner.clone(),
+                ret.wrapper_name.clone(),
+            ),
+            args: vec![inner],
+            result_ty: ValueType::Unknown,
+        },
+        true,
+    );
+    graph.set_return(block, outer);
     graph
 }
 
@@ -1929,6 +2095,77 @@ mod tests {
         assert!(detect_single_tail_call(&multi_stmt).is_none());
         let non_execute: syn::Expr = syn::parse_str("handle_pop_top(executor)").unwrap();
         assert!(detect_single_tail_call(&non_execute).is_none());
+    }
+
+    #[test]
+    fn wrapped_unit_variant_arm_synthesizes_const_return_wrapper() {
+        let body: syn::Expr = syn::parse_str("Ok(StepResult::Continue)").unwrap();
+        let ret = detect_wrapped_unit_variant_return(&body)
+            .expect("Ok(StepResult::Continue) should be detected");
+        assert_eq!(ret.wrapper_name, "Ok");
+        assert!(ret.wrapper_owner.is_empty());
+        assert_eq!(ret.inner_name, "Continue");
+        assert_eq!(ret.inner_owner, vec!["StepResult".to_string()]);
+
+        let sig: syn::Signature = syn::parse_str(
+            "fn execute_opcode_step<E>(executor: &mut E, code: &CodeObject, instruction: Instruction, op_arg: OpArg, next_instr: usize) -> Result<StepResult, PyError>",
+        )
+        .unwrap();
+        let graph = synthesize_wrapped_unit_variant_wrapper("NoOp", &sig, &ret);
+
+        let start = graph.block(graph.startblock);
+        // All 5 dispatcher params are inputargs (runtime seeds the full
+        // layout) even though the constant return reads none of them.
+        assert_eq!(start.inputargs.len(), 5);
+        // 5 Input ops + inner unit-variant ctor + outer wrapper ctor.
+        assert_eq!(start.operations.len(), 7);
+        // operations[5] = inner `StepResult::Continue` ctor (0 args).
+        match &start.operations[5].kind {
+            crate::model::OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } => {
+                assert_eq!(*result_ty, crate::model::ValueType::Unknown);
+                assert!(args.is_empty(), "unit-variant ctor takes no args");
+                match target {
+                    crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                        assert_eq!(name, "Continue");
+                        assert_eq!(owner_path, &vec!["StepResult".to_string()]);
+                    }
+                    other => panic!("expected SyntheticTransparentCtor, got {other:?}"),
+                }
+            }
+            other => panic!("expected inner Call op, got {other:?}"),
+        }
+        // operations[6] = outer `Ok` wrapper ctor (1 arg).
+        match &start.operations[6].kind {
+            crate::model::OpKind::Call { target, args, .. } => {
+                assert_eq!(args.len(), 1, "wrapper takes the inner ctor result");
+                match target {
+                    crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                        assert_eq!(name, "Ok");
+                        assert!(owner_path.is_empty());
+                    }
+                    other => panic!("expected SyntheticTransparentCtor, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Call op, got {other:?}"),
+        }
+
+        // A single-statement block body is unwrapped.
+        let block_body: syn::Expr = syn::parse_str("{ Ok(StepResult::Continue) }").unwrap();
+        assert!(detect_wrapped_unit_variant_return(&block_body).is_some());
+
+        // Non-matching shapes (async Err-with-call, method calls,
+        // non-allowlisted wrappers/variants) fall back to syn-AST lowering.
+        let async_body: syn::Expr =
+            syn::parse_str(r#"Err(crate::PyError::type_error("x").into())"#).unwrap();
+        assert!(detect_wrapped_unit_variant_return(&async_body).is_none());
+        let method_body: syn::Expr = syn::parse_str("executor.unsupported(&other)").unwrap();
+        assert!(detect_wrapped_unit_variant_return(&method_body).is_none());
+        let non_variant: syn::Expr = syn::parse_str("Ok(some_local)").unwrap();
+        assert!(detect_wrapped_unit_variant_return(&non_variant).is_none());
     }
 
     #[test]
