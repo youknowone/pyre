@@ -232,14 +232,34 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_str_new(&parts.join(sep)))
 }
 
+/// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
+/// keyword.  Builtin kwargs arrive as a trailing `__pyre_kw__` dict, so
+/// resolve each argument from its positional slot (after the receiver),
+/// falling back to the matching keyword.
+fn resolve_split_args(args: &[PyObjectRef]) -> (PyObjectRef, PyObjectRef) {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let sep = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"))
+        .unwrap_or(pyre_object::PY_NULL);
+    let maxsplit = pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
+        .unwrap_or(pyre_object::PY_NULL);
+    (sep, maxsplit)
+}
+
 pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    let sep = parse_split_sep(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
+    let (sep_arg, maxsplit_arg) = resolve_split_args(args);
+    let sep = parse_split_sep(sep_arg)?;
     // `unicodeobject.py:972 @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
     // int-like object (subclass, numpy int, etc.) is accepted.
-    let maxsplit = parse_split_maxsplit(args.get(2).copied().unwrap_or(pyre_object::PY_NULL))?;
+    let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
     let sep_view = sep.as_deref();
     let parts: Vec<PyObjectRef> = match sep_view {
         Some(sep) => {
@@ -325,8 +345,9 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    let sep = parse_split_sep(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
-    let maxsplit = parse_split_maxsplit(args.get(2).copied().unwrap_or(pyre_object::PY_NULL))?;
+    let (sep_arg, maxsplit_arg) = resolve_split_args(args);
+    let sep = parse_split_sep(sep_arg)?;
+    let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
     let sep_view = sep.as_deref();
     let parts: Vec<PyObjectRef> = match sep_view {
         Some(sep) => {
