@@ -1704,55 +1704,86 @@ impl OptContext {
         if self.box_pool.is_empty() {
             return;
         }
-        // Cross-phase: Phase 2 inherits Phase 1's box_pool snapshot, so
-        // Phase 1 inputarg slots reappear at Phase 2 entry with their
-        // earlier `Weak<InputArg>` dangling (the previous OptContext's
-        // `inputarg_refs` strong owners were dropped). Re-binding here
-        // restores `Forwarded::InputArg(_)` reachability across phases.
-        // Collect every materialized InputArg slot with its current binding
-        // (if any) and intrinsic type. Already-bound slots keep their
-        // canonical `InputArgRc`; unbound slots get a fresh one, bound below.
-        let slots: Vec<(usize, Option<majit_ir::InputArgRc>, majit_ir::Type)> = self
-            .box_pool
-            .iter_indexed()
-            .filter_map(|(pos, b)| {
-                if !b.is_inputarg() {
-                    return None;
+        // Production derives the materialized InputArg positions from `ctx`
+        // state without scanning `box_pool`. `box_pool`'s InputArg slots are
+        // exactly the canonical/inherited set (`self.inputargs` =
+        // `optimizer.py:34 self.inputargs`, positions `[0, num_inputs)` carried
+        // across Phase 1 → Phase 2 by `opt_p2.trace_inputargs =
+        // self.trace_inputargs`) UNION the fresh per-iteration label set at
+        // `[inputarg_base, inputarg_base + num_inputs)` (`TraceIterator`
+        // allocates these; their types match `self.inputargs` because Phase 2
+        // walks the body half with the same per-arg types). Pre-populating
+        // `inputarg_refs` for both subsets makes every InputArg OpRef resolve
+        // through `inputarg_refs` (read path: `resolve_to_boxref` /
+        // `read_forwarded`; write path: `ensure_box`'s InputArg branch), with
+        // no surviving production reader of `box_pool`'s InputArg binding (the
+        // `resolve_to_boxref` `box_pool` tail is `#[cfg(test)]`). `ensure_box`
+        // type-repairs any position this derive misses.
+        #[cfg(not(test))]
+        {
+            for op in self.inputargs.clone() {
+                if let Some(tp) = op.ty() {
+                    self.bind_canonical_inputarg(op.raw() as usize, tp);
                 }
-                Some((pos, b.bound_inputarg(), b.type_()))
-            })
-            .collect();
-        for (pos, bound, tp) in slots {
-            // Canonical `InputArgRc` for this slot: the one `box_pool` already
-            // binds, or a fresh one bound now. Mirror it into
-            // `inputarg_refs[pos]` so the canonical-host readers
-            // (`read_forwarded` / `clear_forwarded`) and `resolve_to_boxref`
-            // all reach the SAME `InputArg.forwarded` as `box_pool`. Without
-            // syncing the already-bound case, `inputarg_refs[pos]` stayed at a
-            // gap-fill placeholder (or a stale cross-phase `InputArgRc`), so
-            // the two stores forwarded to different hosts.
-            //
-            // `inputarg_refs` is keyed by raw OpRef position so
-            // `ensure_box(InputArg{Int,Ref,Float}(idx))` finds the canonical
-            // `InputArgRc` at `inputarg_refs[idx]`; assigning by index (never
-            // pushing) keeps the position→Rc mapping intact for bridges /
-            // Phase 2, which see scattered inputarg positions.
-            let ia = match bound {
-                Some(a) => a,
-                None => {
-                    let fresh = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
-                    if let Some(b) = self.box_pool.get_at_position(pos) {
-                        b.bind_inputarg(&fresh);
-                    }
-                    fresh
-                }
-            };
-            if pos >= self.inputarg_refs.len() {
-                self.inputarg_refs
-                    .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
             }
-            self.inputarg_refs[pos] = ia;
+            let base = self.inputarg_base as usize;
+            for i in 0..self.num_inputs as usize {
+                if let Some(tp) = self.inputargs.get(i).and_then(|op| op.ty()) {
+                    self.bind_canonical_inputarg(base + i, tp);
+                }
+            }
         }
+        // Synthetic `ctx.box_pool = vec![..]` fixtures populate `box_pool`
+        // directly and may leave `self.inputargs` empty, so the test build
+        // discovers InputArg slots by scanning `box_pool` and binds the box to
+        // the canonical `InputArgRc` so the `resolve_to_boxref` `box_pool` tail
+        // (also `#[cfg(test)]`) observes the same host.
+        #[cfg(test)]
+        {
+            let slots: Vec<(usize, Option<majit_ir::InputArgRc>, majit_ir::Type)> = self
+                .box_pool
+                .iter_indexed()
+                .filter_map(|(pos, b)| {
+                    if !b.is_inputarg() {
+                        return None;
+                    }
+                    Some((pos, b.bound_inputarg(), b.type_()))
+                })
+                .collect();
+            for (pos, bound, tp) in slots {
+                let ia = match bound {
+                    Some(a) => a,
+                    None => {
+                        let fresh =
+                            std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+                        if let Some(b) = self.box_pool.get_at_position(pos) {
+                            b.bind_inputarg(&fresh);
+                        }
+                        fresh
+                    }
+                };
+                if pos >= self.inputarg_refs.len() {
+                    self.inputarg_refs
+                        .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                }
+                self.inputarg_refs[pos] = ia;
+            }
+        }
+    }
+
+    /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
+    /// `tp` (the `_forwarded` host that `resolve_to_boxref` / `read_forwarded`
+    /// / `clear_forwarded` / `ensure_box` route the matching InputArg OpRef
+    /// through). Idempotent reassignment is harmless because no `_forwarded`
+    /// chain exists yet at setup time (`optimizer.rs` calls this before the
+    /// optimization pass).
+    #[cfg(not(test))]
+    fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
+        if pos >= self.inputarg_refs.len() {
+            self.inputarg_refs
+                .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+        }
+        self.inputarg_refs[pos] = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
     }
 
     /// S-8.A.1 lookup primitive: find the canonical producer `OpRc`
@@ -4193,6 +4224,33 @@ impl OptContext {
         // box_pool / lazy-alloc paths below unchanged.
         if let Some(op_rc) = self.find_producer_op(opref) {
             return Some(crate::r#box::BoxRef::from_bound_op(&op_rc));
+        }
+        // InputArg write path: route through the canonical `inputarg_refs`
+        // host (symmetric with `resolve_to_boxref`'s InputArg branch and the
+        // `read_forwarded` / `clear_forwarded` writers). The returned BoxRef is
+        // bound to `inputarg_refs[idx]`, so a `set_forwarded_*` write lands the
+        // same `InputArg.forwarded` slot a later `resolve_to_boxref` read
+        // observes — without returning `box_pool`'s (now-unbound in production)
+        // InputArg slot, whose write would silently vanish in a release build
+        // where the `BoxRef::write_forwarded` bound-precondition assert is off.
+        // Materialize / repair the slot's canonical `InputArgRc` by the OpRef's
+        // type tag, mirroring the lazy-alloc path below.
+        #[cfg(not(test))]
+        if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = opref {
+            let idx = opref.raw() as usize;
+            let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
+            if idx >= self.inputarg_refs.len() {
+                self.inputarg_refs
+                    .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                self.inputarg_refs[idx] =
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
+            } else if self.inputarg_refs[idx].tp != tp
+                || self.inputarg_refs[idx].index != idx as u32
+            {
+                self.inputarg_refs[idx] =
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
+            }
+            return Some(crate::r#box::BoxRef::from_bound_inputarg(&self.inputarg_refs[idx]));
         }
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
