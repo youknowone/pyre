@@ -919,6 +919,58 @@ fn phase4_live_marker_coverage(
     (covered, uncovered, samples)
 }
 
+/// #124(b).2 probe: enumerate the canonical SSARepr's structural
+/// RESUME targets — branch guards (`goto_if_not` / `goto_if_not_*` /
+/// `switch`) and can-raise residual calls (`residual_call_*`) — and
+/// report each one's `-live-` adjacency.  Unlike
+/// `phase4_live_marker_coverage`, which scans every Python PC's FIRST
+/// insn (the wrong adjacency: a PC's first insn is its setup op, not
+/// its guard), this narrows to the positions the runtime actually
+/// resolves against (`trace_opcode.rs` `live_pc`).
+///
+/// The two target classes carry their `-live-` on OPPOSITE sides, so
+/// coverage is per-kind:
+///   - a branch guard resumes AT the branch; its `-live-` is emitted
+///     LEADING (one insn before, `flatten.py:259/285`) → `live_before`.
+///   - a can-raise guard resumes at the fall-through AFTER the call;
+///     its `-live-` is emitted TRAILING (one insn after,
+///     `flatten.py:206-217`) → `live_after`.  The trailing marker also
+///     IDENTIFIES the call as can-raising — a non-raising
+///     `residual_call_*` has no trailing `-live-` and is not a resume
+///     target.
+/// Both mirror `get_live_vars_info`'s at-or-one-before rule
+/// (`jitcode.py:82-93`) on canonical insn ordinals.  `goto_if_not_*`
+/// (tuple-exitswitch) shares the leading-`-live-` emit path
+/// (flatten.rs:1868); `goto_if_exception_mismatch` is intentionally
+/// NOT a target (it reuses the can-raise resume, no own `-live-`).
+/// Returns `(pos, kind, live_before, live_after)` per target.
+fn phase4_resume_coverage(
+    ssarepr: &super::flatten::SSARepr,
+) -> Vec<(usize, &'static str, bool, bool)> {
+    let mut targets: Vec<(usize, &'static str, bool, bool)> = Vec::new();
+    for (pos, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Op { opname, .. } = insn else {
+            continue;
+        };
+        let kind = if opname == "goto_if_not" || opname == "switch" {
+            "branch"
+        } else if opname.starts_with("goto_if_not_") {
+            "branch_tuple"
+        } else if opname.starts_with("residual_call_") {
+            "residual_call"
+        } else {
+            continue;
+        };
+        let live_before = pos
+            .checked_sub(1)
+            .and_then(|p| ssarepr.insns.get(p))
+            .is_some_and(|i| i.is_live());
+        let live_after = ssarepr.insns.get(pos + 1).is_some_and(|i| i.is_live());
+        targets.push((pos, kind, live_before, live_after));
+    }
+    targets
+}
+
 /// Diagnostic helper: tally per-opname occurrences of the given Insn
 /// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
 /// resulting `Vec<(String, i64)>` is sortable and comparable across
@@ -10042,6 +10094,45 @@ impl CodeWriter {
                         canonical_ssarepr.name,
                     );
                 }
+                // #124(b).2 — narrow the at-or-one-before check to the
+                // ACTUAL runtime resume targets (branch guards + can-raise
+                // residual calls), not every Python PC.  A branch guard is
+                // covered by its LEADING `-live-` (live_before); a can-raise
+                // residual call by its TRAILING `-live-` (live_after, which
+                // also identifies it AS can-raising — non-raising calls have
+                // no trailing marker and are not resume targets).  This is
+                // the resume-target subset `get_live_vars_info` resolves
+                // against (trace_opcode.rs live_pc), so coverage here decides
+                // whether the canonical sparse stream can drive runtime
+                // resume directly (#286).
+                let resume_targets = phase4_resume_coverage(&canonical_ssarepr);
+                let mut branch_total = 0u32;
+                let mut branch_covered = 0u32;
+                let mut canraise_targets = 0u32;
+                for &(pos, kind, live_before, live_after) in &resume_targets {
+                    if kind == "residual_call" {
+                        if live_after {
+                            canraise_targets += 1;
+                        }
+                        continue;
+                    }
+                    branch_total += 1;
+                    if live_before {
+                        branch_covered += 1;
+                    } else {
+                        eprintln!(
+                            "[phase4-resume-uncovered] graph={} pos={pos} kind={kind} \
+                             live_before={live_before} live_after={live_after}",
+                            canonical_ssarepr.name,
+                        );
+                    }
+                }
+                eprintln!(
+                    "[phase4-resume-coverage] graph={} branch_covered={branch_covered}/{branch_total} \
+                     canraise_targets={canraise_targets} all_pc_covered={live_covered}/{}",
+                    canonical_ssarepr.name,
+                    live_covered + live_uncovered,
+                );
                 // #124(b).2 — quantify the dense→sparse `-live-` gap:
                 // the walker emits one `-live-` per Python PC (dense,
                 // backing the per-PC pc_byte_positions side-table);
