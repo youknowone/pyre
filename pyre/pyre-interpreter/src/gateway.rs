@@ -715,6 +715,42 @@ pub fn make_builtin_function_with_signature(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 
+/// `make_builtin_function`, optionally carrying a `Signature`.  `Some`
+/// routes through `make_builtin_function_with_signature` (keyword-aware
+/// binding); `None` falls back to the positional-only constructor.  Used
+/// by the `#[pyre_function]`-derived `<name>_pyre_sig()` companion so a
+/// builtin that declares keyword / kw-only parameters binds them by name.
+pub fn make_builtin_function_maybe_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    match signature {
+        Some(signature) => make_builtin_function_with_signature(name, func, signature),
+        None => make_builtin_function(name, func),
+    }
+}
+
+/// `make_builtin_function` recording both a fixed `fast_natural_arity`
+/// and an optional argument `Signature`.  The arity preserves the fast
+/// positional dispatch path; the `Some` signature additionally lets the
+/// keyword-call path bind arguments by name.  Used by the
+/// `inline_functions:` arm so a `#[pyre_function]` builtin keeps its
+/// derived arity while gaining keyword / kw-only binding.
+pub fn make_builtin_function_with_arity_and_maybe_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    let sig: *const Signature = match signature {
+        Some(signature) => Box::into_raw(Box::new(signature)),
+        None => std::ptr::null(),
+    };
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
 pub fn make_builtin_function_with_arity(
     name: &'static str,

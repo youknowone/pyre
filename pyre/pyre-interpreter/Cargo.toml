@@ -33,3 +33,4 @@ libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }
 indexmap = { workspace = true }
+paste = { workspace = true }

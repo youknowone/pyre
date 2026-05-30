@@ -203,10 +203,11 @@ macro_rules! py_module {
                     $crate::dict_storage_store(
                         ns,
                         stringify!($ifn_name),
-                        $crate::make_builtin_function_with_arity(
+                        $crate::make_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
                             $ifn_name,
                             $crate::pyre_count_typed_args!($($ifn_args)*) as u16,
+                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
                     );
                 }
@@ -682,12 +683,14 @@ pub use executioncontext::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, PASSTHROUGHARGS1,
-    Signature, builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_get_signature,
-    builtin_code_name, builtin_code_new, builtin_code_new_passthrough_args1,
-    builtin_code_new_with_arity, builtin_code_new_with_signature, is_builtin_code,
-    make_builtin_function, make_builtin_function_passthrough_args1,
-    make_builtin_function_with_arity, make_builtin_function_with_signature,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
+    Signature, SignatureBuilder, builtin_code_get, builtin_code_get_fast_natural_arity,
+    builtin_code_get_signature, builtin_code_name, builtin_code_new,
+    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
+    builtin_code_new_with_signature, is_builtin_code, make_builtin_function,
+    make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
+    make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
+    make_builtin_function_with_signature, make_module_builtin_function,
+    make_module_builtin_function_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use malachite_bigint::BigInt as PyBigInt;

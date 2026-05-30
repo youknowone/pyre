@@ -82,6 +82,7 @@ num-integer = "0.1"
 vecset = "0.0.4"
 vecmap_rs = { package = "vecmap-rs", version = "0.2.4", features = ["serde"] }
 indexmap = "2.14"
+paste = "1"
 
 # serde
 serde = { version = "1", features = ["derive"] }
