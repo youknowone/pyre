@@ -10804,6 +10804,51 @@ impl CodeWriter {
             inputs,
             &cfg_coalesce_pairs,
         );
+        // P4SUB-SSA (#238 role-2 measurement, gate-off-safe): does the
+        // SSA-side coloring depend on the walker-slot-projected
+        // `cfg_coalesce_pairs`, or is it subsumed (like the proven
+        // graph-side `graph_regallocs` pin-subsumption)?  Re-run the SAME
+        // allocator on the SAME pre-rename `ssarepr`/`inputs`/`nlocals`
+        // with an EMPTY pair slice, then compare the role-(2) outputs
+        // (stack_slot_color_map over 0..max_stackdepth and
+        // pyre_color_for_semantic_local over 0..nlocals) semantic-slot
+        // keyed so color relabelings are not false positives.  This runs
+        // BEFORE `apply_rename` mutates `ssarepr` below, so both colorings
+        // see the identical un-renamed SSARepr — the only differing input
+        // is the pair slice.
+        if std::env::var("PYRE_P4_SSA_CFGPAIR_SUBSUMPTION").as_deref() == Ok("1") {
+            let empty_pairs: Vec<(u16, u16)> = Vec::new();
+            let alloc_alt = super::regalloc::allocate_registers(
+                &ssarepr,
+                code.varnames.len(),
+                inputs,
+                &empty_pairs,
+            );
+            let mut stack_mismatch = 0u32;
+            for d in 0..(max_stackdepth as u16) {
+                let pre = stack_base + d;
+                let with = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
+                let without = super::regalloc::rename_lookup(&alloc_alt.rename, Kind::Ref, pre);
+                if with != without {
+                    stack_mismatch += 1;
+                }
+            }
+            let mut local_mismatch = 0u32;
+            for i in 0..nlocals as u16 {
+                let with = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
+                let without = super::regalloc::rename_lookup(&alloc_alt.rename, Kind::Ref, i);
+                if with != without {
+                    local_mismatch += 1;
+                }
+            }
+            let subsumed = stack_mismatch == 0 && local_mismatch == 0;
+            eprintln!(
+                "[p4-ssa-cfgpair-subsumption] graph={} subsumed={subsumed} \
+                 cfg_pairs={} stack_mismatch={stack_mismatch} local_mismatch={local_mismatch}",
+                ssarepr.name,
+                cfg_coalesce_pairs.len()
+            );
+        }
         // Run graph-side
         // `perform_register_allocation_all_kinds` +
         // `enforce_input_args` post-walker on every

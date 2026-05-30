@@ -633,6 +633,7 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
 ///   (blackhole.rs:1133-1140) at compile-time-fixed register slots
 ///   produced by `RegisterLayout::compute`; they get colors
 ///   `nlocals` and `nlocals+1` after `enforce_input_args` runs.
+#[derive(Clone, Copy)]
 pub(super) struct ExternalInputs {
     pub portal_frame_reg: u16,
     pub portal_ec_reg: u16,
