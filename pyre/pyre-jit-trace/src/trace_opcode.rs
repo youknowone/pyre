@@ -7628,35 +7628,6 @@ unsafe fn trace_check_exc_match_against(
 /// Subsequent batches grow this set until it covers every Python
 /// opcode, at which point the trait infra is deleted.
 ///
-/// PopTop is intentionally NOT in this set: 2026-05-21 diagnostic
-/// (synth/set_membership SIGBUS, exit 138) traced the failure to the
-/// walker's heap-based concrete read for `PyFrame.valuestackdepth`.
-/// PopTop's arm body inlines `eval.rs pop_value`'s `if vsd <= nlocals
-/// { return Err(stack_underflow_error(...)) }` underflow check.  The
-/// codewriter lowers `self.valuestackdepth` to `getfield_gc_i(frame,
-/// vsd_descr)`; the walker's `field_read_concrete` reads HEAP
-/// `PyFrame.valuestackdepth` at offset 24.  During tracing, the JIT
-/// trait-dispatch leg updates only the symbolic mirror (`sym.
-/// valuestackdepth`) and the `virtualizable_boxes` shadow via
-/// `push_typed_value` (`trace_opcode.rs:1796`) — it does NOT write
-/// through to the heap field.  Heap vsd therefore stays at its
-/// trace-entry value (= `nlocals` in a loop body with empty entry
-/// stack), the walker's `IntLe(vsd, nlocals)` evaluates `Int(3) <=
-/// Int(3) = 1`, and `goto_if_not/iL` records `GuardTrue(v39)` — the
-/// underflow path.  After the optimizer rewrites the GetfieldGcI to
-/// the JIT-tracked vable shadow (which IS correct at runtime), the
-/// guard direction is baked in: every loop iteration the runtime vsd
-/// is `nlocals + 1` (one Call result on stack), `IntLe(4, 3) = 0`,
-/// `GuardTrue` fails, deopt fires.  Repeated deopt eventually SIGBUSes
-/// in the recovery path.
-///
-/// RPython-orthodox fix: the codewriter must emit `getfield_vable_i`
-/// (not `getfield_gc_i`) for inlined vable field accesses (PyPy's
-/// `pyjitpl.py:1167-1186 opimpl_getfield_vable_i` reads from
-/// `metainterp.virtualizable_boxes[index]`, matching the JIT shadow).
-/// That codewriter slice is the next prerequisite; until it lands,
-/// PopTop walker activation is structurally blocked.  Documented in
-/// project memory `project-issue73-phase4-poptop-vable-getfield-blocker`.
 pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // Re-enabled 2026-05-27.  The pre-jtransform unit-variant fold
     // (`translator/rtyper/unit_variant_fold.rs::fold_unit_variant_ctors`)
@@ -7767,6 +7738,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::StoreFastStoreFast { .. }
             | Instruction::PopExcept
             | Instruction::PushExcInfo
+            | Instruction::PopTop
     )
 }
 
@@ -7943,7 +7915,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::StoreAttr { .. }
         | Instruction::StoreFastStoreFast { .. }
         | Instruction::PopExcept
-        | Instruction::PushExcInfo => {
+        | Instruction::PushExcInfo
+        | Instruction::PopTop => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
