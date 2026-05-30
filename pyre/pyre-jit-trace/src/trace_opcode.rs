@@ -7766,6 +7766,7 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::StoreAttr { .. }
             | Instruction::StoreFastStoreFast { .. }
             | Instruction::PopExcept
+            | Instruction::PushExcInfo
     )
 }
 
@@ -7941,7 +7942,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::LoadAttr { .. }
         | Instruction::StoreAttr { .. }
         | Instruction::StoreFastStoreFast { .. }
-        | Instruction::PopExcept => {
+        | Instruction::PopExcept
+        | Instruction::PushExcInfo => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
