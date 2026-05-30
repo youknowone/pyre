@@ -3937,7 +3937,45 @@ fn walker_abort_if_protected_may_force(
     op: &DecodedOp,
     can_raise: bool,
 ) -> Result<(), DispatchError> {
-    if can_raise && jitcode_has_exception_handler(code) {
+    if !can_raise {
+        return Ok(());
+    }
+    // Precise gate (full-body walk): abort only when THIS call's Python
+    // opcode is actually covered by an exception handler, instead of when
+    // the body contains ANY `catch_exception/L`.  The full-body walk's
+    // `FULL_BODY_SNAPSHOT_SYM` gives `sym.jitcode` → `pc_map` (JitCode pc →
+    // Python pc, the same inverse map `walker_capture_snapshot_for_last_guard`
+    // uses) and `code_ptr` → the `CodeObject.exceptiontable`.  A call whose
+    // Python pc has no covering handler range raises straight out of the
+    // frame (`GUARD_NO_EXCEPTION` deopt exits the frame, never routing into
+    // a handler the walk can't yet resume), so it is safe to walk.
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if !full_body_sym.is_null() {
+        // SAFETY: set only for the lifetime of the full-body
+        // `dispatch_via_miframe`; the `PyreSym`/jitcode/CodeObject outlive
+        // the walk.  Read-only access to immutable layout fields.
+        let sym = unsafe { &*full_body_sym };
+        if !sym.jitcode.is_null() {
+            let jc = unsafe { &*sym.jitcode };
+            if !jc.payload.code_ptr.is_null() {
+                let py_pc = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op.pc);
+                let pycode = unsafe { &*jc.payload.code_ptr };
+                let protected = pyre_interpreter::exception_table::lookup_exceptiontable(
+                    &pycode.exceptiontable,
+                    py_pc * 2,
+                )
+                .is_some();
+                return if protected {
+                    Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc })
+                } else {
+                    Ok(())
+                };
+            }
+        }
+    }
+    // Fallback (non-full-body walk / no sym pointer): conservative
+    // whole-body scan — abort if the body has any handler at all.
+    if jitcode_has_exception_handler(code) {
         return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
     }
     Ok(())
