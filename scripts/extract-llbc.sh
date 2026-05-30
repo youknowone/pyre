@@ -87,12 +87,26 @@ fi
 # 2026-04-14).  Under charon's older nightly the gate is missing, so the
 # extraction `cargo build` fails to compile host_env.
 #
-# Inject the feature into every crate compiled during extraction via
-# `-Zcrate-attr` (needs `RUSTC_BOOTSTRAP=1` to allow `-Z` on the pinned
-# nightly).  This affects ONLY the charon extraction build — never the
-# production / stable build — and is a no-op for crates that don't use
-# the macro.  Remove once the charon pin advances to a nightly where
-# `cfg_select` is stable.
+# Inject `#![feature(cfg_select)]` into every crate compiled during
+# extraction via `-Zcrate-attr` (needs `RUSTC_BOOTSTRAP=1` to allow `-Z`
+# on the pinned nightly).  This affects ONLY the charon extraction build
+# — never the production / stable build — and is a no-op for crates that
+# don't use the macro.  Remove once the charon pin advances to a nightly
+# where `cfg_select` is stable.
+#
+# Host/target graph split.  Charon always passes an explicit
+# `--target <host-triple>` so it can instrument the target crates while
+# leaving build scripts / proc-macros (the host graph) untouched.  Cargo
+# applies `RUSTFLAGS` only to the TARGET graph, so the crate-attr reaches
+# the target-side host_env but NOT the copy a build script drags into the
+# HOST graph (built under `target/debug/deps`, no flag) — that one still
+# fails E0658.  pyre-jit's dependency graph pulls host_env into the host
+# graph; pyre-interpreter's does not, which is why only pyre-jit tripped.
+# Inject the same crate-attr into the host graph via cargo's `[host]`
+# rustflags table (`-Zhost-config`, which also requires
+# `-Ztarget-applies-to-host` and `target-applies-to-host=false`).  Passed
+# as `--config` CLI args + `CARGO_UNSTABLE_*` env so no `.cargo/config.toml`
+# is written and the stable build stays untouched.
 export RUSTC_BOOTSTRAP=1
 charon_crate_attr="-Zcrate-attr=feature(cfg_select)"
 if [[ -n "${RUSTFLAGS:-}" ]]; then
@@ -100,6 +114,12 @@ if [[ -n "${RUSTFLAGS:-}" ]]; then
 else
     export RUSTFLAGS="$charon_crate_attr"
 fi
+export CARGO_UNSTABLE_HOST_CONFIG=true
+export CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST=true
+charon_host_config=(
+    --config target-applies-to-host=false
+    --config "host.rustflags=[\"$charon_crate_attr\"]"
+)
 
 for crate in $targets; do
     info="$(crate_info "$crate")"
@@ -122,10 +142,12 @@ for crate in $targets; do
     pushd "$path" > /dev/null
     # `--ullbc` = basic-block CFG form (the analog of CPython bytecode);
     # `--dest-file` overrides the default `<crate>.{ull,ll}bc` placement.
+    # `charon_host_config` (the `[host]` rustflags injection above) is
+    # forwarded to the inner `cargo build` after `--`.
     if [[ -n "$flags" ]]; then
-        "$charon_bin" cargo --ullbc --dest-file "$dest" -- $flags
+        "$charon_bin" cargo --ullbc --dest-file "$dest" -- $flags "${charon_host_config[@]}"
     else
-        "$charon_bin" cargo --ullbc --dest-file "$dest"
+        "$charon_bin" cargo --ullbc --dest-file "$dest" -- "${charon_host_config[@]}"
     fi
     popd > /dev/null
 
