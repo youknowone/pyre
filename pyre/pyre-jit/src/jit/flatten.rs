@@ -4542,7 +4542,8 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
     arg_operand: Operand,
     dst_reg: Register,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    effect_info.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],

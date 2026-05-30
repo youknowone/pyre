@@ -493,6 +493,12 @@ pub enum OopSpecIndex {
     // not depend on pyre-jit. Out of the upstream OS_* range (≤121).
     BinaryOp = 200,
     CompareOp = 201,
+    // pyre-specific: LOAD_CONST lowers to a `load_const_from_code(code, idx)`
+    // helper residual_call that re-materializes the constant on every call.
+    // Tagging the calldescr lets the full-body walker fold it to a constant
+    // ref at trace time (the indexed co_consts entry is loop-invariant)
+    // instead of recording an opaque CanRaise residual the optimizer keeps.
+    LoadConst = 202,
 }
 
 impl EffectInfo {

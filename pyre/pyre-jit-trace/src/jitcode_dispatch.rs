@@ -6278,6 +6278,39 @@ fn dispatch_residual_call_iIRd_kind(
     // `dispatch_residual_call_iRd_kind` for the rationale.
     do_jit_force_virtual_guard(ei, op.pc)?;
 
+    // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set
+    // codewriter-side at flatten.rs
+    // `build_residual_call_ir_r_single_ref_plain_insn_from_operands`)
+    // re-materializes `co_consts[idx]` on every call.  When both the const
+    // index (`i_args[0]`) and the code pointer (`r_args[0]`, the promoted
+    // `frame.pycode`) are concrete, fold to the constant ref the call would
+    // have produced — the indexed entry is loop-invariant — and suppress the
+    // residual.  Falls through to the generic record when either operand is
+    // not concrete (the residual stays correct in that case).
+    if ei.oopspecindex == majit_ir::OopSpecIndex::LoadConst {
+        if let (Some(&idx_opref), Some(&code_opref)) = (i_args.first(), r_args.first()) {
+            if let (
+                Some(majit_ir::Value::Int(consti)),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(idx_opref),
+                ctx.trace_ctx.box_value(code_opref),
+            ) {
+                // Materialize the constant identically to the runtime
+                // `bh_load_const_fn` helper (call_jit.rs).
+                let w_const = unsafe {
+                    let code = &*(pyre_interpreter::w_code_get_ptr(
+                        w_code_ptr as pyre_object::PyObjectRef,
+                    ) as *const pyre_interpreter::CodeObject);
+                    pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
+                };
+                let const_box = ctx.trace_ctx.const_ref(w_const as i64);
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, const_box)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
+    }
+
     // #57: speculative int specialization for the BINARY_OP / COMPARE_OP
     // helper (oopspec `BinaryOp` / `CompareOp`, set codewriter-side at
     // flatten.rs `build_residual_call_ir_r_insn_from_operands`).  When both
