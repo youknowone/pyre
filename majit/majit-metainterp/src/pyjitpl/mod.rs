@@ -398,6 +398,41 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
     slots
 }
 
+/// RAII guard that empties `MetaInterp.compile_snapshot_refs` when
+/// dropped. Every compile entry point that calls
+/// `collect_snapshot_const_ptr_slots` stores raw `*mut OpRef`
+/// pointers into local `SnapshotBoxes` storage; once the enclosing
+/// compile returns, those locals are dropped and the raw pointers
+/// are dangling. Holding this guard at the top of every such entry
+/// point forces the vector to be cleared before any subsequent GC
+/// walk (driven by `compile_snapshot_root_walker`) can observe the
+/// stale pointers.
+pub(crate) struct CompileSnapshotRootsGuard {
+    refs: *mut Vec<usize>,
+}
+
+impl CompileSnapshotRootsGuard {
+    pub(crate) fn new(refs: &mut Vec<usize>) -> Self {
+        Self {
+            refs: refs as *mut _,
+        }
+    }
+}
+
+impl Drop for CompileSnapshotRootsGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard is constructed from a `&mut Vec<usize>`
+        // and lives no longer than the enclosing `&mut self` borrow
+        // of `MetaInterp`. The raw pointer therefore stays valid for
+        // the guard's entire scope; nothing else mutates the vector
+        // through a competing reference, because the borrow checker
+        // observed the original `&mut` at construction.
+        unsafe {
+            (*self.refs).clear();
+        }
+    }
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
@@ -4427,6 +4462,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
         // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
         // "missing virtual_ref_finish()?"` — every `opimpl_virtual_ref`
         // must have a matching `opimpl_virtual_ref_finish` before the
@@ -5408,6 +5444,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<(u64, M)>,
     ) -> CompileOutcome {
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
@@ -5628,6 +5665,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
         // the rare missing-token path does not drain the active retrace.
@@ -6198,6 +6236,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
         // Cache driver descriptor before ctx is partially consumed below.
@@ -6654,6 +6693,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
