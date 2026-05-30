@@ -7703,7 +7703,10 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         _ => usize::MAX,
     };
-    Ok(new_bytes_like(pos[0], &replace_bytes(data, old, new, limit)))
+    Ok(new_bytes_like(
+        pos[0],
+        &replace_bytes(data, old, new, limit),
+    ))
 }
 
 /// `stringmethods.py:descr_join` — concatenate the bytes-like elements

@@ -1505,9 +1505,14 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
-        "ascii" | "us-ascii" | "646" => {
-            encode_narrow(s, args[0], "ascii", 0x7f, "ordinal not in range(128)", &errors)
-        }
+        "ascii" | "us-ascii" | "646" => encode_narrow(
+            s,
+            args[0],
+            "ascii",
+            0x7f,
+            "ordinal not in range(128)",
+            &errors,
+        ),
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => encode_narrow(
             s,
             args[0],
