@@ -668,6 +668,14 @@ impl UnrollOptimizer {
                 // from the recorded interpreter and never raise
                 // SpeculativeError under correct construction.  A raise
                 // here is a real bug and must propagate.
+                // Phase 1 binds the same `source_box_pool` (recorder ops) the
+                // seed names, so its `input_ops` can come from the seed too —
+                // only the read source changes; box_pool binding / `_forwarded`
+                // writes are untouched. No forwarding yet at Phase 1 setup, so
+                // seed and box_pool snapshot are trivially equal here.
+                if !self.phase2_input_ops_seed.is_empty() {
+                    opt_p1.explicit_input_ops_seed = Some(self.phase2_input_ops_seed.clone());
+                }
                 let p1_ops = opt_p1.optimize_with_constants_and_inputs(
                     &p1_ops_in,
                     &mut consts_p1,
