@@ -11017,6 +11017,29 @@ impl CodeWriter {
                 );
                 input_idx += 1;
             }
+            // #280 num_regs equality: production `num_regs[kind]` is
+            // `alloc_result.num_regs[kind]` (SSA-side max-color+1, used at
+            // 10949).  Under the gate-on splice the canonical metadata must
+            // instead come from `graph_regallocs[kind].num_colors`.  Compare
+            // the two per kind so the splice can substitute the canonical
+            // ceiling with zero JitCode.num_regs_* change.  Behavior-neutral
+            // (eprintln only); the production `num_regs` site below is
+            // untouched.
+            for (kind, label) in [
+                (super::flatten::Kind::Int, "int"),
+                (super::flatten::Kind::Ref, "ref"),
+                (super::flatten::Kind::Float, "float"),
+            ] {
+                let ssa_num_regs = alloc_result.num_regs[kind.index()];
+                let canonical_num_colors = graph_regallocs[kind.index()].num_colors;
+                eprintln!(
+                    "[phase4-numregs] graph={} kind={label} \
+                     ssa={ssa_num_regs} canonical={canonical_num_colors} \
+                     match={}",
+                    ssarepr.name,
+                    ssa_num_regs == canonical_num_colors,
+                );
+            }
         }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
