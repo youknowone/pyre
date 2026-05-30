@@ -1736,6 +1736,132 @@ pub fn execute_delete_fast<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_load_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let (Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num }) = instruction
+    else {
+        unreachable!()
+    };
+    let idx = load_fast_var_num_to_index(var_num, op_arg);
+    // closure-free, Option-pattern-free `varnames.get(idx)` rewrite to
+    // keep the body within the Rust-AST adapter's RPython-orthodox
+    // subset (Position-2 adaptation per the annotator-monomorphization
+    // plan; RPython has no closure or sum-type-destructure analogue
+    // at the annotator layer). The bounds check stays a plain `<`
+    // comparison + indexed access so the lowered op sequence stays
+    // `lt + getitem` rather than walking into an `Option<&str>` enum.
+    let name = if idx < code_varnames_len(code) {
+        code.varnames[idx].as_ref()
+    } else {
+        "<cell>"
+    };
+    executor.load_fast_checked(idx, name)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_fast_check<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::LoadFastCheck { var_num } = instruction else {
+        unreachable!()
+    };
+    let idx = load_fast_var_num_to_index(var_num, op_arg);
+    // closure-free, Option-pattern-free rewrite — see execute_load_fast
+    // for the rationale.
+    let name = if idx < code_varnames_len(code) {
+        code.varnames[idx].as_ref()
+    } else {
+        "<cell>"
+    };
+    executor.load_fast_checked(idx, name)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_fast_borrow_load_fast_borrow<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::LoadFastBorrowLoadFastBorrow { var_nums } = instruction else {
+        unreachable!()
+    };
+    let pair = var_nums.get(op_arg);
+    let idx1 = pair.idx_1().as_usize();
+    let idx2 = pair.idx_2().as_usize();
+    executor.load_fast_pair_checked(
+        idx1,
+        code.varnames[idx1].as_ref(),
+        idx2,
+        code.varnames[idx2].as_ref(),
+    )?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_load_fast_load_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::LoadFastLoadFast { var_nums } = instruction else {
+        unreachable!()
+    };
+    let pair = var_nums.get(op_arg);
+    executor.load_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_fast_load_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::StoreFastLoadFast { var_nums } = instruction else {
+        unreachable!()
+    };
+    let pair = var_nums.get(op_arg);
+    executor.store_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_store_fast_store_fast<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: LocalOpcodeHandler,
+{
+    let Instruction::StoreFastStoreFast { var_nums } = instruction else {
+        unreachable!()
+    };
+    let pair = var_nums.get(op_arg);
+    executor.store_fast_store_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_load_small_int<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
@@ -2433,70 +2559,30 @@ where
 
         Instruction::LoadSmallInt { .. } => execute_load_small_int(executor, instruction, op_arg),
 
-        Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
-            let idx = load_fast_var_num_to_index(var_num, op_arg);
-            // closure-free, Option-pattern-free `varnames.get(idx)` rewrite to
-            // keep the body within the Rust-AST adapter's RPython-orthodox
-            // subset (Position-2 adaptation per the annotator-monomorphization
-            // plan; RPython has no closure or sum-type-destructure analogue
-            // at the annotator layer). The bounds check stays a plain `<`
-            // comparison + indexed access so the lowered op sequence stays
-            // `lt + getitem` rather than walking into an `Option<&str>` enum.
-            let name = if idx < code_varnames_len(code) {
-                code.varnames[idx].as_ref()
-            } else {
-                "<cell>"
-            };
-            executor.load_fast_checked(idx, name)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFast { .. } | Instruction::LoadFastBorrow { .. } => {
+            execute_load_fast(executor, code, instruction, op_arg)
         }
 
-        Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
-            let pair = var_nums.get(op_arg);
-            let idx1 = pair.idx_1().as_usize();
-            let idx2 = pair.idx_2().as_usize();
-            executor.load_fast_pair_checked(
-                idx1,
-                code.varnames[idx1].as_ref(),
-                idx2,
-                code.varnames[idx2].as_ref(),
-            )?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFastBorrowLoadFastBorrow { .. } => {
+            execute_load_fast_borrow_load_fast_borrow(executor, code, instruction, op_arg)
         }
 
         Instruction::StoreFast { .. } => execute_store_fast(executor, instruction, op_arg),
 
-        Instruction::LoadFastCheck { var_num } => {
-            let idx = load_fast_var_num_to_index(var_num, op_arg);
-            // closure-free, Option-pattern-free rewrite — see LoadFast above
-            // for the rationale.
-            let name = if idx < code_varnames_len(code) {
-                code.varnames[idx].as_ref()
-            } else {
-                "<cell>"
-            };
-            executor.load_fast_checked(idx, name)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFastCheck { .. } => {
+            execute_load_fast_check(executor, code, instruction, op_arg)
         }
 
-        Instruction::LoadFastLoadFast { var_nums } => {
-            let pair = var_nums.get(op_arg);
-            let idx1 = pair.idx_1().as_usize();
-            let idx2 = pair.idx_2().as_usize();
-            executor.load_fast_load_fast(idx1, idx2)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadFastLoadFast { .. } => {
+            execute_load_fast_load_fast(executor, instruction, op_arg)
         }
 
-        Instruction::StoreFastLoadFast { var_nums } => {
-            let pair = var_nums.get(op_arg);
-            executor.store_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
-            Ok(StepResult::Continue)
+        Instruction::StoreFastLoadFast { .. } => {
+            execute_store_fast_load_fast(executor, instruction, op_arg)
         }
 
-        Instruction::StoreFastStoreFast { var_nums } => {
-            let pair = var_nums.get(op_arg);
-            executor.store_fast_store_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
-            Ok(StepResult::Continue)
+        Instruction::StoreFastStoreFast { .. } => {
+            execute_store_fast_store_fast(executor, instruction, op_arg)
         }
 
         Instruction::StoreName { .. } => execute_store_name(executor, code, instruction, op_arg),
