@@ -10766,89 +10766,21 @@ impl CodeWriter {
         // graph remains topology-only until a pre-regalloc Variable
         // environment is introduced.
 
-        // `regalloc.py:79-96 coalesce_variables` CFG-level loop:
-        // every Link's `(link.args[i], link.target.inputargs[i])`
-        // pair is unioned via try_coalesce, alongside the SSARepr
-        // `*_copy` scanner inside
-        // `SSAReprRegAllocator::coalesce_variables` (intra-block
-        // coalesce, pyre walker TODO because upstream defers
-        // `*_copy` to `flatten.py:306-334`).  Both sources feed the
-        // same union-find + depgraph.
-        //
-        // SSARepr-side regalloc is u16-keyed TODO;
-        // project the Variable pairs (collected pre-renaming above as
-        // `cfg_variable_pairs`) through `walker_slot_for_variable`
-        // at the consumer.  Pairs whose endpoints have no walker slot
-        // pinning are silently dropped here — they still participate
-        // in the canonical graph regalloc's normal
-        // `RegAllocator::coalesce_variables` sweep
-        // (`regalloc.py:79-96`), so coloring information is not lost,
-        // only the SSARepr-side u16 projection is.
-        let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
-            .iter()
-            .filter_map(|(src, dst)| {
-                let s = walker_slot_for_variable
-                    .get(src.0 as usize)
-                    .copied()
-                    .flatten()?;
-                let d = walker_slot_for_variable
-                    .get(dst.0 as usize)
-                    .copied()
-                    .flatten()?;
-                Some((s, d))
-            })
-            .collect();
-        let alloc_result = super::regalloc::allocate_registers(
-            &ssarepr,
-            code.varnames.len(),
-            inputs,
-            &cfg_coalesce_pairs,
-        );
-        // P4SUB-SSA (#238 role-2 measurement, gate-off-safe): does the
-        // SSA-side coloring depend on the walker-slot-projected
-        // `cfg_coalesce_pairs`, or is it subsumed (like the proven
-        // graph-side `graph_regallocs` pin-subsumption)?  Re-run the SAME
-        // allocator on the SAME pre-rename `ssarepr`/`inputs`/`nlocals`
-        // with an EMPTY pair slice, then compare the role-(2) outputs
-        // (stack_slot_color_map over 0..max_stackdepth and
-        // pyre_color_for_semantic_local over 0..nlocals) semantic-slot
-        // keyed so color relabelings are not false positives.  This runs
-        // BEFORE `apply_rename` mutates `ssarepr` below, so both colorings
-        // see the identical un-renamed SSARepr — the only differing input
-        // is the pair slice.
-        if std::env::var("PYRE_P4_SSA_CFGPAIR_SUBSUMPTION").as_deref() == Ok("1") {
-            let empty_pairs: Vec<(u16, u16)> = Vec::new();
-            let alloc_alt = super::regalloc::allocate_registers(
-                &ssarepr,
-                code.varnames.len(),
-                inputs,
-                &empty_pairs,
-            );
-            let mut stack_mismatch = 0u32;
-            for d in 0..(max_stackdepth as u16) {
-                let pre = stack_base + d;
-                let with = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
-                let without = super::regalloc::rename_lookup(&alloc_alt.rename, Kind::Ref, pre);
-                if with != without {
-                    stack_mismatch += 1;
-                }
-            }
-            let mut local_mismatch = 0u32;
-            for i in 0..nlocals as u16 {
-                let with = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, i);
-                let without = super::regalloc::rename_lookup(&alloc_alt.rename, Kind::Ref, i);
-                if with != without {
-                    local_mismatch += 1;
-                }
-            }
-            let subsumed = stack_mismatch == 0 && local_mismatch == 0;
-            eprintln!(
-                "[p4-ssa-cfgpair-subsumption] graph={} subsumed={subsumed} \
-                 cfg_pairs={} stack_mismatch={stack_mismatch} local_mismatch={local_mismatch}",
-                ssarepr.name,
-                cfg_coalesce_pairs.len()
-            );
-        }
+        // `regalloc.py:79-96 coalesce_variables` CFG-level coalescing —
+        // every Link's `(link.args[i], link.target.inputargs[i])` pair —
+        // is applied Variable-keyed to the graph-side `graph_regallocs`
+        // below via `cfg_variable_pairs` (P4.B.2).  The SSARepr-side
+        // allocator additionally runs the intra-block `*_copy` scanner in
+        // `SSAReprRegAllocator::coalesce_variables`; pyre's walker emits a
+        // `*_copy` for every link boundary, so that scanner already unions
+        // the same pairs the slot-projected CFG list would.  Feeding the
+        // SSARepr allocator the empty slice is therefore byte-identical to
+        // the former `walker_slot_for_variable`-projected list across all
+        // 26 production graphs (full rename + num_regs, all kinds), so the
+        // projection — the last SSARepr-side reader of
+        // `walker_slot_for_variable` — is dropped (#238 role-2).
+        let alloc_result =
+            super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs, &[]);
         // Run graph-side
         // `perform_register_allocation_all_kinds` +
         // `enforce_input_args` post-walker on every
