@@ -1468,6 +1468,23 @@ pub(crate) fn try_dispatch_binary_special(
     Ok(None)
 }
 
+/// descroperation.py:825 `inplace_impl` — try the in-place special
+/// (`__iadd__` etc.) on the lhs.  Returns `None` when the type has no
+/// such method or the call yields `NotImplemented`, so the caller falls
+/// back to the corresponding binary operation.
+pub(crate) fn try_inplace_special(
+    lhs: PyObjectRef,
+    rhs: PyObjectRef,
+    idunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
+        if let Some(result) = try_call_special(method, &[lhs, rhs])? {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
 /// descroperation.py:399 `def pow(space, w_obj1, w_obj2, w_obj3)` —
 /// the same forward/reverse dance as the binary version but threading
 /// the third (modulo) operand through to both arms.

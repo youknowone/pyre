@@ -7,6 +7,26 @@ use crate::{
     pow, rshift, sub, truediv, xor,
 };
 
+/// Maps an in-place `BinaryOperator` to its special-method name
+/// (`__iadd__` etc.), or `None` for non-in-place operators.
+fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
+    Some(match op {
+        BinaryOperator::InplaceAdd => "__iadd__",
+        BinaryOperator::InplaceSubtract => "__isub__",
+        BinaryOperator::InplaceMultiply => "__imul__",
+        BinaryOperator::InplaceFloorDivide => "__ifloordiv__",
+        BinaryOperator::InplaceRemainder => "__imod__",
+        BinaryOperator::InplaceTrueDivide => "__itruediv__",
+        BinaryOperator::InplacePower => "__ipow__",
+        BinaryOperator::InplaceLshift => "__ilshift__",
+        BinaryOperator::InplaceRshift => "__irshift__",
+        BinaryOperator::InplaceAnd => "__iand__",
+        BinaryOperator::InplaceOr => "__ior__",
+        BinaryOperator::InplaceXor => "__ixor__",
+        _ => return None,
+    })
+}
+
 pub fn binary_value(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -14,6 +34,16 @@ pub fn binary_value(
 ) -> Result<PyObjectRef, PyError> {
     let a = crate::baseobjspace::unwrap_cell(a);
     let b = crate::baseobjspace::unwrap_cell(b);
+    // descroperation.py:825 `inplace_impl` — consult the in-place
+    // special first; fall through to the binary op below when absent or
+    // `NotImplemented`.
+    if let Some(idunder) = inplace_dunder_name(op) {
+        if let Some(result) =
+            crate::objspace::descroperation::try_inplace_special(a, b, idunder)?
+        {
+            return Ok(result);
+        }
+    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => add(a, b),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => sub(a, b),
