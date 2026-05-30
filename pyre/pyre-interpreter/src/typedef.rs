@@ -8196,8 +8196,8 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&table))
 }
 
-/// `_PyBytes_FromHex` — parse a hex string into bytes.  ASCII spaces are
-/// skipped between byte pairs (but not within one); a stray nibble at
+/// `_PyBytes_FromHex` — parse a hex string into bytes.  ASCII whitespace
+/// is skipped between byte pairs (but not within one); a stray nibble at
 /// the end raises the even-count error, any other non-hex byte raises
 /// the positional error.
 fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
@@ -8231,7 +8231,9 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b' ' {
+        // `Py_ISSPACE`: space, tab, newline, vertical tab, form feed,
+        // carriage return.  (`u8::is_ascii_whitespace` omits 0x0b.)
+        if matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
             i += 1;
             continue;
         }
