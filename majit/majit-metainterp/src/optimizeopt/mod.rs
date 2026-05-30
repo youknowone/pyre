@@ -1971,9 +1971,21 @@ impl OptContext {
     /// upgrades the binding to the emitted post-pass producer `OpRc`
     /// via `bind_op`'s carry-over (forwarded state preserved).
     ///
-    /// Inherited Phase 1 slots (already bound by Phase 1's end-of-pass
-    /// orphan binding at `optimizer.rs:2431-2460`) skip — the
-    /// `bound_op().is_some()` guard preserves their phase-1 identity.
+    /// Production records the caller-threaded `OpRc` into `resop_refs`
+    /// (the producer store `find_producer_op` consults) and
+    /// `live_synthetics` without reading `box_pool` for identity: no
+    /// production reader observes `box_pool`'s resop binding (resolve
+    /// routes through `find_producer_op`; the `resolve_to_boxref`
+    /// `box_pool` tail is `#[cfg(test)]`). The `b.is_resop()` membership
+    /// test is replaced by an InputArg-variant filter on the OpRef
+    /// itself; the `bound_op().is_some()` skip is unnecessary in
+    /// production because each phase's input `ops` carry that phase's own
+    /// positions (Phase 2 body ops sit above the Phase 1 emit namespace,
+    /// so they never collide with an inherited bound slot), and the
+    /// `resop_refs[idx]` dedup covers intra-`ops` repeats. The
+    /// `box_pool` bind is retained `#[cfg(test)]` so synthetic
+    /// `ctx.box_pool = vec![..]` fixtures resolving through the
+    /// `resolve_to_boxref` `box_pool` tail still observe the producer.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         if self.box_pool.is_empty() {
             return;
@@ -1983,18 +1995,34 @@ impl OptContext {
             if pos.is_none() || pos.is_constant() {
                 continue;
             }
-            let Some(b) = self.box_pool.get(pos) else {
+            // InputArg slots are handled by `ensure_inputarg_bindings`; only
+            // resop positions land in `resop_refs`.
+            if matches!(
+                pos,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            ) {
                 continue;
-            };
-            if !b.is_resop() || b.bound_op().is_some() {
+            }
+            let idx = pos.raw() as usize;
+            // Dedup: a producer for this exact pos is already recorded.
+            if self
+                .resop_refs
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|o| o.pos.get() == pos)
+            {
                 continue;
             }
             // Bind the box to the caller-threaded `OpRc` so the box,
             // `resop_refs`, `live_synthetics`, and the iterated input op
             // share one `Op` identity (no second private copy).
             let op_rc = op.clone();
-            b.bind_op(&op_rc);
-            let idx = pos.raw() as usize;
+            #[cfg(test)]
+            if let Some(b) = self.box_pool.get(pos) {
+                if b.is_resop() && b.bound_op().is_none() {
+                    b.bind_op(&op_rc);
+                }
+            }
             if idx >= self.resop_refs.len() {
                 self.resop_refs.resize_with(idx + 1, || None);
             }
