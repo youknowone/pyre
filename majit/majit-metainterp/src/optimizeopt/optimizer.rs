@@ -1872,6 +1872,40 @@ impl Optimizer {
         num_inputs: usize,
         box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
+        // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
+        // fresh `Rc` (the #62 boundary-conversion pattern). The fresh wraps
+        // are not the producers `box_pool` binds to, so `input_ops` is
+        // snapshotted from `box_pool` (`input_ops_from_ops = false`).
+        let ops_rc: Vec<majit_ir::OpRc> =
+            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, box_pool, false)
+    }
+
+    /// `OpRc`-threading entry for callers that hold the canonical
+    /// `Rc<Op>` slice the recorder's `box_pool` is bound to (e.g.
+    /// `TreeLoop.ops` at the loop-finish / simple-loop sites, where the
+    /// recorder→TreeLoop handoff binds each box to `trace.ops[i]`).
+    /// Passing those canonical ops lets `input_ops` be seeded from them
+    /// directly (`input_ops_from_ops = true`), so `find_producer_op`'s
+    /// lowest-priority store needs no `box_pool` snapshot read.
+    pub fn optimize_with_constants_and_inputs_oprc(
+        &mut self,
+        ops: &[majit_ir::OpRc],
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        num_inputs: usize,
+        box_pool: crate::r#box::BoxPool,
+    ) -> Vec<Op> {
+        self.run_optimize_from_inputs(ops, constants, num_inputs, box_pool, true)
+    }
+
+    fn run_optimize_from_inputs(
+        &mut self,
+        ops: &[majit_ir::OpRc],
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        num_inputs: usize,
+        box_pool: crate::r#box::BoxPool,
+        input_ops_from_ops: bool,
+    ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -1883,17 +1917,14 @@ impl Optimizer {
             .max()
             .unwrap_or(0);
         let start_next_pos = ((max_pos as u32) + 1).max(num_inputs as u32);
-        // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
-        // fresh `Rc` (the #62 boundary-conversion pattern).
-        let ops_rc: Vec<majit_ir::OpRc> =
-            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         self.optimize_with_constants_and_inputs_at(
-            &ops_rc,
+            ops,
             constants,
             num_inputs,
             0,
             start_next_pos,
             box_pool,
+            input_ops_from_ops,
         )
     }
 
@@ -1913,6 +1944,7 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
         box_pool: crate::r#box::BoxPool,
+        input_ops_from_ops: bool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
         // Test-only auto-seed of `trace_inputargs` from the variant
@@ -1969,16 +2001,30 @@ impl Optimizer {
         // RPython parity: the optimizer sees the identical AbstractValue
         // objects flowing in from the tracer.
         ctx.box_pool = box_pool;
-        // Snapshot the recorder's bound trace ops into the canonical
-        // `find_producer_op` surface so input ops bound at the
-        // recorder→TreeLoop handoff resolve without the `resolve_to_boxref`
-        // `box_pool` tail. One setup read replaces N per-resolve `box_pool`
-        // reads; full-OpRef-keyed in `find_producer_op` (collision-safe).
-        ctx.input_ops = ctx
-            .box_pool
-            .iter_indexed()
-            .filter_map(|(_, b)| b.bound_op())
-            .collect();
+        // Seed the canonical `find_producer_op` surface (`input_ops`) with
+        // the input ops' producers so they resolve without the
+        // `resolve_to_boxref` `box_pool` tail; `find_producer_op` matches
+        // by full OpRef (collision-safe) and consults this store last.
+        // When the caller threads the canonical `Rc<Op>` slice the
+        // `box_pool` is bound to (`input_ops_from_ops`, e.g. `TreeLoop.ops`
+        // at the loop-finish / simple-loop sites), take them directly — no
+        // `box_pool` snapshot read. Otherwise (fresh-Rc `&[Op]` boundary
+        // wraps, bridges, Phase 2, fixtures) the threaded ops are not the
+        // bound producers, so snapshot from `box_pool`'s bound ops.
+        ctx.input_ops = if input_ops_from_ops {
+            ops.iter()
+                .filter(|op| {
+                    let p = op.pos.get();
+                    !p.is_none() && !p.is_constant()
+                })
+                .cloned()
+                .collect()
+        } else {
+            ctx.box_pool
+                .iter_indexed()
+                .filter_map(|(_, b)| b.bound_op())
+                .collect()
+        };
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
@@ -3355,6 +3401,9 @@ impl Optimizer {
             bridge_inputarg_base,
             start_next_pos,
             box_pool,
+            // Bridge ops are fresh-Rc `TraceIterator` wraps, not the bound
+            // producers; `input_ops` snapshots from `box_pool`.
+            false,
         );
 
         // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
@@ -5681,6 +5730,7 @@ mod tests {
             0,
             0,
             crate::r#box::BoxPool::new(),
+            false,
         );
 
         assert!(result.is_empty());

@@ -6355,8 +6355,12 @@ impl<M: Clone> MetaInterp<M> {
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs(
-                &trace_ops,
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // `trace.ops` are the canonical `Rc<Op>` the recorder's
+                // `box_pool` binds to (`from_oprc`/`with_box_pool` →
+                // `bind_ops`), so `input_ops` seeds from them without a
+                // `box_pool` snapshot read.
+                &trace.ops,
                 &mut constants,
                 trace.inputargs.len(),
                 trace_box_pool,
@@ -6770,8 +6774,10 @@ impl<M: Clone> MetaInterp<M> {
         let trace_box_pool = trace.box_pool.clone();
 
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs(
-                &trace_ops,
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // Canonical `Rc<Op>` the recorder's `box_pool` binds to;
+                // `input_ops` seeds from them, no `box_pool` snapshot read.
+                &trace.ops,
                 &mut constants,
                 num_trace_inputargs,
                 trace_box_pool,

@@ -1067,6 +1067,9 @@ impl UnrollOptimizer {
                 phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
                 p2_high_water,
                 iter.box_pool.clone(),
+                // Phase 2 ops are fresh-Rc `TraceIterator` wraps; `input_ops`
+                // snapshots from the Phase-1-prefix-bound `box_pool`.
+                false,
             )
         });
         self.clear_compile_snapshot_roots();
