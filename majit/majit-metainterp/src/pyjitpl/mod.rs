@@ -5718,6 +5718,7 @@ impl<M: Clone> MetaInterp<M> {
             trace,
             call_pure_results,
             close_loop_box_pool,
+            phase2_input_ops_seed,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -5760,6 +5761,18 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 trace
             };
+            // Seed the retrace optimizer's `input_ops` so it skips the
+            // `box_pool` snapshot. Provably equal to that snapshot: retrace runs
+            // no Phase 1, so the recorder ops carry no `_forwarded`, and
+            // `trace.ops` (non-cut) are the same `Rc<Op>` `source_box_pool` is
+            // bound to. Cut remaps ops into a namespace the original
+            // `source_box_pool` does not match, so an empty seed states what the
+            // snapshot could not resolve anyway.
+            let phase2_input_ops_seed = Some(if retrace_cut.is_none() {
+                trace.ops.clone()
+            } else {
+                Vec::new()
+            });
             (
                 green_key,
                 driver_descriptor,
@@ -5769,6 +5782,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace,
                 call_pure_results,
                 close_loop_box_pool,
+                phase2_input_ops_seed,
             )
         };
 
@@ -5816,6 +5830,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
         unroll_opt.source_box_pool = Some(close_loop_box_pool);
+        unroll_opt.phase2_input_ops_seed = phase2_input_ops_seed;
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             mut retrace_snapshot_boxes,
