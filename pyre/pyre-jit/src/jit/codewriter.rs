@@ -9375,35 +9375,34 @@ impl CodeWriter {
         // links; `rewrite_dead_forwarder_gotos` then retargets the
         // walker's inline-emitted `TLabel`s to match.
         //
-        // The full orthodox pass list now lives in
-        // [`super::simplify::simplify_graph`] / `all_passes` (issue #112),
-        // but only `eliminate_empty_blocks` is wired into the walker today.
-        // The other *active* passes — `remove_trivial_links` (merges
-        // blocks), `remove_identical_vars_ssa` / `ssa_to_ssi` (rename / add
-        // inputargs), `transform_dead_op_vars` (drops inputargs),
-        // `constfold_exitswitch` (drops exits) — would change graph
-        // topology / variables after the walker has already emitted SSARepr
-        // inline into `per_block_ssarepr`.  The drain below reads that
-        // SSARepr block-by-block in `graph.iterblocks()` order, and only
-        // `eliminate_empty_blocks` has a reconciliation bridge
-        // (`rewrite_dead_forwarder_gotos`).  Wiring the rest is therefore
-        // gated on making the drain graph-driven (issue #73); until then
-        // they would desync the emitted byte stream.  (The remaining
-        // `simplify_graph` passes are no-ops on today's empty-`operations`
-        // walker blocks anyway — see their classification in
-        // `simplify.rs`.)
+        // The full orthodox pass list lives in
+        // [`super::simplify::simplify_graph`] / `all_passes` (issue #112).
+        // Here we run the **walker-safe subset** — the graph-normalization
+        // passes that neither change block count (so the block-by-block
+        // drain below keeps every SpamBlock's `per_block_ssarepr`) nor add
+        // inputargs/link-args (which would desync the walker renamings),
+        // matching the upstream `all_passes` relative order:
         //
-        // EMPIRICALLY VERIFIED (#112, 2026-05-30): replacing this call with
-        // the full `super::simplify::simplify_graph(&graph)` driver FAILS
-        // 21/25 synthetic correctness tests — the active passes
-        // (`remove_trivial_links` merges blocks, `remove_identical_vars_SSA`/
-        // `ssa_to_ssi` rename/add inputargs, `transform_dead_op_vars` drops
-        // inputargs, `constfold_exitswitch` drops exits) restructure the
-        // graph after the walker already emitted SSARepr inline, desyncing
-        // the block-by-block drain below.  Wiring the rest stays gated on a
-        // graph-driven drain (#73); only `eliminate_empty_blocks` (with its
-        // `rewrite_dead_forwarder_gotos` bridge) is safe today.
+        //   transform_dead_op_vars  (drops dead inputargs + matching args)
+        //   eliminate_empty_blocks  (+ rewrite_dead_forwarder_gotos bridge)
+        //   remove_identical_vars_SSA (dedups duplicate phi inputargs)
+        //
+        // EMPIRICALLY VALIDATED (#73, 2026-05-30): this subset passes 25/25
+        // synthetic correctness tests.  The remaining active passes are
+        // still gated on a graph-driven drain (#73):
+        //   - `ssa_to_ssi` ADDS inputargs/link-args (5/25 fail) — it changes
+        //     the coalesce pairs and walker renamings the inline drain
+        //     depends on;
+        //   - `remove_trivial_links` (merges blocks) and `constfold_exitswitch`
+        //     (drops exits → unreachable blocks) remove SpamBlocks whose
+        //     `per_block_ssarepr` the drain would then lose (full driver:
+        //     21/25 fail).
+        // The other `all_passes` entries are structural no-ops on today's
+        // empty-`operations` walker blocks (see their classification in
+        // `simplify.rs`).
+        super::simplify::transform_dead_op_vars(&graph);
         eliminate_empty_blocks(&graph);
+        super::simplify::remove_identical_vars_ssa(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),
