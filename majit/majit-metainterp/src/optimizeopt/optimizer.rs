@@ -2245,6 +2245,25 @@ impl Optimizer {
             let inputarg_base = ctx.inputarg_base;
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
+            // `next_iteration_args` must not be longer than the trace's
+            // inputargs: every loop-back value needs a backing inputarg
+            // slot to forward to. A well-formed trait trace guarantees
+            // this (the JUMP carries exactly the loop-header inputargs).
+            // The full-body walk can violate it: when a cross-loop cut
+            // reduces the inputargs to the reds-only inner merge point
+            // while the loop virtualizes a heap object whose forced
+            // virtuals expand `next_iteration_args` (fannkuch's
+            // permutation list, nbody's body tuples), `n` exceeds
+            // `inputargs.len()`. Bail with `InvalidLoop` — the designed
+            // compile-failure path `compile_loop_body` catches to fall
+            // back to the interpreter — instead of letting
+            // `inputarg_type_at_strict` hard-panic the worker thread.
+            if (0..n).any(|i| ctx.inputarg_type_at(i).is_none()) {
+                std::panic::panic_any(crate::optimize::InvalidLoop(
+                    "next_iteration_args longer than inputargs (full-body-walk \
+                     cross-loop cut over a forced heap virtual)",
+                ));
+            }
             // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint typed
             // variants for each Phase 2 source slot from `inputarg_types`
             // (history.py:220 box.type). Variant-aware Eq requires the
