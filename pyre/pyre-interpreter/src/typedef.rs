@@ -5911,37 +5911,46 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "from_bytes",
         make_builtin_function("from_bytes", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_int_new(0));
-            }
-            // First arg can be the cls or the data depending on call site.
-            let data_arg = if args.len() >= 2 && !unsafe { pyre_object::is_type(args[0]) } {
-                args[0]
-            } else if args.len() >= 2 {
-                args[1]
-            } else {
-                args[0]
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            // The data argument is the first bytes-like / str positional;
+            // this skips a bound `cls`/instance receiver when present.
+            let data_idx = pos.iter().position(|&a| unsafe {
+                pyre_object::bytesobject::is_bytes_like(a) || pyre_object::is_str(a)
+            });
+            let bytes: Vec<u8> = match data_idx {
+                Some(i) => unsafe {
+                    let a = pos[i];
+                    if pyre_object::bytesobject::is_bytes_like(a) {
+                        pyre_object::bytesobject::bytes_like_data(a).to_vec()
+                    } else {
+                        pyre_object::w_str_get_value(a).as_bytes().to_vec()
+                    }
+                },
+                None => vec![],
             };
-            let byteorder_arg = if args.len() >= 3 {
-                args[2]
-            } else if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-                args[1]
-            } else {
-                pyre_object::w_str_new("big")
-            };
-            let bytes: Vec<u8> = unsafe {
-                if pyre_object::bytesobject::is_bytes_like(data_arg) {
-                    pyre_object::bytesobject::bytes_like_data(data_arg).to_vec()
-                } else if pyre_object::is_str(data_arg) {
-                    pyre_object::w_str_get_value(data_arg).as_bytes().to_vec()
-                } else {
-                    vec![]
-                }
-            };
-            let little_endian = unsafe {
-                pyre_object::is_str(byteorder_arg)
-                    && pyre_object::w_str_get_value(byteorder_arg) == "little"
-            };
+            // byteorder: the `byteorder` keyword, else the first str after
+            // the data argument (positional-or-keyword), else "big".
+            let byteorder = crate::builtins::kwarg_get(kwargs, "byteorder").or_else(|| {
+                let start = data_idx.map_or(0, |i| i + 1);
+                pos.iter()
+                    .skip(start)
+                    .find(|&&a| unsafe { pyre_object::is_str(a) })
+                    .copied()
+            });
+            let little_endian = byteorder
+                .map(|b| unsafe {
+                    pyre_object::is_str(b) && pyre_object::w_str_get_value(b) == "little"
+                })
+                .unwrap_or(false);
+            // signed: the `signed` keyword, else a positional bool, else False.
+            let signed = crate::builtins::kwarg_get(kwargs, "signed")
+                .or_else(|| {
+                    pos.iter()
+                        .find(|&&a| unsafe { pyre_object::is_bool(a) })
+                        .copied()
+                })
+                .map(crate::baseobjspace::is_true)
+                .unwrap_or(false);
             let mut val: u64 = 0;
             if little_endian {
                 for (i, &b) in bytes.iter().enumerate() {
@@ -5952,7 +5961,20 @@ fn init_int_type(ns: &mut DictStorage) {
                     val = (val << 8) | b as u64;
                 }
             }
-            Ok(pyre_object::w_int_new(val as i64))
+            // Two's-complement reinterpretation for `signed=True` (values up
+            // to 8 bytes; wider inputs keep the existing truncating path).
+            let n = bytes.len();
+            let result: i64 = if signed && (1..=8).contains(&n) {
+                let sign_bit_set = (val >> (8 * n - 1)) & 1 == 1;
+                if sign_bit_set && n < 8 {
+                    (val as i64) - (1i64 << (8 * n))
+                } else {
+                    val as i64
+                }
+            } else {
+                val as i64
+            };
+            Ok(pyre_object::w_int_new(result))
         }),
     );
     // int.__index__ / __int__ / __trunc__ — identity
