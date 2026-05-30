@@ -1183,24 +1183,25 @@ mod tests {
             .collect();
         assert_eq!(
             jc.code.len(),
-            22,
+            15,
             "PopTop jitcode size shifted — refresh the expected sequence below",
         );
-        // After the pre-jtransform unit-variant ctor fold landed
-        // (`majit-translate/src/translator/rtyper/unit_variant_fold.rs`),
-        // the `Ok(StepResult::Continue)` return wrapper collapses to a
-        // single `ref_copy/r>r` of the prebuilt `Continue` instance
-        // instead of the previous `int_copy/i>i ; residual_call_r_r/iRd>r ;
-        // live/` triple.  The shorter tail is what allows
-        // `production_walker_handles` to keep PopTop activated.
+        // `execute_pop_top` is `pop_value()? ; Ok(StepResult::Continue)`:
+        // one residual call that can raise, then return the prebuilt
+        // `Continue`.  After the inline-constants-into-OpRef /
+        // remove-ConstantPool lowering change the body is the `int_copy`
+        // arg setup, the `residual_call_r_r` to `pop_value`, the `live/`
+        // jit_merge_point marker, then a direct `ref_return/r` of the
+        // folded `Continue` OpRef.  The previous `catch_exception/L ;
+        // ref_copy/r>r ; reraise/` exception shoulder collapsed: the arm
+        // has no exception *handler* (only `?` propagation), so the
+        // residual call's implicit exception edge carries the raise and
+        // no explicit catch/reraise pair is emitted.
         let expected: Vec<(String, String)> = [
             ("int_copy", "i>i"),
             ("residual_call_r_r", "iRd>r"),
             ("live", ""),
-            ("catch_exception", "L"),
-            ("ref_copy", "r>r"),
             ("ref_return", "r"),
-            ("reraise", ""),
         ]
         .iter()
         .map(|(o, a)| (o.to_string(), a.to_string()))
@@ -1412,20 +1413,26 @@ mod tests {
         // wires the matching all-int shape.  Adding aliases here would
         // hide the upstream bug behind a silent runtime mis-dispatch.
         //
-        // - `getfield_gc_i_pure/id>i` — pure int-field read whose
-        //   struct receiver lands in the Int bank (`id` argcode) when
-        //   the canonical shape is `rd>i` (Ref + descr → Int).  The
-        //   struct comes through a raw-pointer arithmetic chain that
-        //   the codewriter has not yet rerepr'd to Ref.
-        // - `int_lt/ir>i` / `int_lt/ri>i` — `Lt` whose operands mix
-        //   Int and Ref banks (raw-ptr address vs index).  RPython
-        //   would have demanded a `cast_ptr_to_int` upstream so the
-        //   comparison sees `ii>i`; pyre's lowering currently lets the
-        //   Ref operand through.
+        // Refreshed after the inline-constants-into-OpRef / remove-
+        // ConstantPool lowering change: it retyped two prior gaps into
+        // their canonical wired shapes (`getfield_gc_i_pure/id>i` and
+        // `int_lt/ri>i` no longer appear) and surfaced two new ones
+        // (`int_lt/rr>i`, `residual_call_r_i/iRd`).  The remaining set is
+        // the same class of pending raw-ptr-vs-index kind-flow gaps.
+        //
+        // - `int_lt/ir>i` / `int_lt/rr>i` — `Lt` whose operands sit in
+        //   the Ref bank (raw-ptr address) instead of Int (index): one
+        //   side (`ir`) or both (`rr`).  RPython would have demanded a
+        //   `cast_ptr_to_int` upstream so the comparison sees `ii>i`;
+        //   pyre's lowering currently lets the Ref operand(s) through.
+        // - `residual_call_r_i/iRd` — a residual call returning Int with
+        //   a Ref argument that the all-int bh handler does not cover;
+        //   the generated helper jitcode emits the Ref-arg shape the
+        //   upstream rerepr has not yet collapsed to the wired form.
         let expected: Vec<String> = vec![
-            "getfield_gc_i_pure/id>i".to_string(),
             "int_lt/ir>i".to_string(),
-            "int_lt/ri>i".to_string(),
+            "int_lt/rr>i".to_string(),
+            "residual_call_r_i/iRd".to_string(),
         ];
         assert_eq!(
             unwired, expected,
