@@ -883,6 +883,20 @@ pub enum DispatchError {
     /// abort that the production driver maps to `TraceAction::AbortPermanent`
     /// (never trace this location again).
     AbortPermanentMarkerReached { pc: usize },
+    /// A result-bearing may-force CALL (`CallMayForce{R,I,F}`, a Python
+    /// function-entry call) was recorded with a concrete-NULL Ref
+    /// argument. This is the specialized direct-call shape: the callee
+    /// was folded to its entry address and the `PUSH_NULL` self-slot is
+    /// baked as `ptr(0x0)`. `try_execute_residual_call_via_walker` skips
+    /// such a call (its NULL-receiver SEGV guard), so the result stays
+    /// unresolved, and the baked NULL arg makes the compiled call pass
+    /// NULL where the entry needs the callee's globals/closure — yielding
+    /// a NULL result at runtime (closures / functions bound to a local
+    /// and called in a loop). The trait tracer declines to trace through
+    /// this shape (it aborts); the walker surfaces a typed abort so the
+    /// driver maps it to `TraceAction::Abort` and the loop falls back to
+    /// the interpreter instead of compiling a wrong trace.
+    MayForceNullRefArgUnsupported { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
     ///
@@ -2722,7 +2736,6 @@ fn getfield_vable_via_metainterp(
     if !matches!(shadow_value, Value::Void) {
         ctx.trace_ctx.set_opref_concrete(result, shadow_value);
     }
-
     let dst = code[op.pc + 4] as usize;
     // concrete_of_opref derivation: derive shadow concrete via `concrete_of_opref`.  The
     // `vable_getfield_*` helpers in `TraceCtx` already populate the
@@ -3848,6 +3861,46 @@ fn try_fold_pure_call_via_executor(
         majit_ir::Type::Void => return,
     };
     ctx.trace_ctx.set_opref_concrete(recorded, result_value);
+}
+
+/// Abort the walk when a result-bearing may-force CALL is recorded with a
+/// concrete-NULL Ref argument — the specialized direct-call shape whose
+/// baked `ptr(0x0)` (the `PUSH_NULL` self-slot) makes the runtime call pass
+/// NULL where the callee entry expects its globals/closure, yielding a NULL
+/// result (closures / locals-bound callees called in a loop).  Matches the
+/// trait tracer, which declines this shape and aborts.  See
+/// [`DispatchError::MayForceNullRefArgUnsupported`].
+fn walker_abort_if_mayforce_null_ref_arg(
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    ctx: &WalkContext<'_, '_>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if !matches!(
+        call_opcode,
+        OpCode::CallMayForceR | OpCode::CallMayForceI | OpCode::CallMayForceF
+    ) {
+        return Ok(());
+    }
+    // `allboxes[0]` is the funcbox; `allboxes[1 + i]` aligns with
+    // `arg_types[i]` (see `build_allboxes`).  A Ref arg folded to the
+    // NULL constant (`GcRef(0)`) is the broken self-slot; the sentinel
+    // `GcRef(usize::MAX)` means "no concrete known" and is left alone.
+    for (i, &ty) in call_descr.arg_types().iter().enumerate() {
+        if ty != majit_ir::Type::Ref {
+            continue;
+        }
+        if let Some(&b) = allboxes.get(1 + i) {
+            if matches!(
+                ctx.trace_ctx.box_value(b),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+            ) {
+                return Err(DispatchError::MayForceNullRefArgUnsupported { pc });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py:1346/1349/1354) port
@@ -5416,6 +5469,7 @@ fn dispatch_residual_call_iRd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
+        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` — fires
         // unconditionally on the forces branch.  Records FORCE_TOKEN +
@@ -6386,6 +6440,7 @@ fn dispatch_residual_call_iIRd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
+        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -6562,6 +6617,7 @@ fn dispatch_residual_call_iIRFd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
+        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
