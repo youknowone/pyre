@@ -909,6 +909,13 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
+        // `decode_instruction_for_dispatch` absorbs any EXTENDED_ARG prefix
+        // units, so the real opcode may sit past `pc`.  Re-point `last_instr`
+        // at the opcode unit (`opcode_pc`) so a falling-through handler's
+        // `next_instr()` (= last_instr + 1) lands at `fallthrough` rather than
+        // re-dispatching the opcode unit that trailed an EXTENDED_ARG.
+        // Mirrors interp_jit.py dispatch (`set_last_instr_from_next_instr`).
+        frame.set_last_instr_from_next_instr(fallthrough);
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
             Ok(StepResult::Continue)
             | Ok(StepResult::CloseLoop {
