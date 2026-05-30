@@ -314,6 +314,12 @@ pub struct UnrollOptimizer {
     /// TraceIterator copies those values onto the fresh per-phase boxes it
     /// mints, preserving RPython's box-carried `_res*` value shape.
     pub source_box_pool: Option<crate::r#box::BoxPool>,
+    /// Recorder `Rc<Op>` slice the source `box_pool` is bound to
+    /// (`preamble_data.base.operations()`). When non-empty, seeds Phase 2's
+    /// optimizer `input_ops` directly — same `Rc`, same Phase-1 `_forwarded`
+    /// as the `box_pool` snapshot — so Phase 2 does not read `box_pool` to
+    /// build `input_ops`. Empty on retrace / paths without a preamble base.
+    pub phase2_input_ops_seed: Vec<majit_ir::OpRc>,
     /// MetaInterp-owned compile snapshot root slot list. Stored as an address
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
@@ -354,6 +360,7 @@ impl UnrollOptimizer {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cpu: crate::cpu::default_cpu(),
             source_box_pool: None,
+            phase2_input_ops_seed: Vec::new(),
             compile_snapshot_root_slots: None,
         }
     }
@@ -1059,6 +1066,12 @@ impl UnrollOptimizer {
         // to InvalidLoop so the caller's catch handles it.
         let p2_ops_in_rc: Vec<majit_ir::OpRc> =
             p2_ops_in.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` the source
+        // `box_pool` is bound to (same `Rc`, same Phase-1 `_forwarded`) so
+        // the optimizer does not read `box_pool` to build `input_ops`.
+        if !self.phase2_input_ops_seed.is_empty() {
+            opt_p2.explicit_input_ops_seed = Some(self.phase2_input_ops_seed.clone());
+        }
         let p2_ops = with_speculative_to_invalid_loop(|| {
             opt_p2.optimize_with_constants_and_inputs_at(
                 &p2_ops_in_rc,
@@ -1067,8 +1080,9 @@ impl UnrollOptimizer {
                 phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
                 p2_high_water,
                 iter.box_pool.clone(),
-                // Phase 2 ops are fresh-Rc `TraceIterator` wraps; `input_ops`
-                // snapshots from the Phase-1-prefix-bound `box_pool`.
+                // Phase 2 ops are fresh-Rc `TraceIterator` wraps; when no
+                // explicit seed was threaded, `input_ops` snapshots from the
+                // Phase-1-prefix-bound `box_pool`.
                 false,
             )
         });

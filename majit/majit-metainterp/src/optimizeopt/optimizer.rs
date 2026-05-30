@@ -216,6 +216,15 @@ pub struct Optimizer {
     /// reasoning about descriptor-shared guards or other emit-bound
     /// metadata.
     pub emitted_operations: majit_ir::vec_set::VecSet<OpRef>,
+    /// One-shot explicit `input_ops` seed for the next
+    /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
+    /// canonical producer `Rc<Op>` slice is used directly as
+    /// `find_producer_op`'s lowest-priority store instead of snapshotting
+    /// `box_pool`'s bound ops. Set on the Phase 2 optimizer to the
+    /// recorder's `Vec<OpRc>` the source `box_pool` is bound to (same
+    /// `Rc`, so the Phase-1 `_forwarded` it carries is identical to the
+    /// box_pool snapshot). Consumed (`take`) by the run.
+    pub explicit_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
 }
 
 /// Lower a typed-`Value` constants pool into the dense
@@ -1116,6 +1125,7 @@ impl Optimizer {
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
             emitted_operations: majit_ir::vec_set::VecSet::new(),
+            explicit_input_ops_seed: None,
         }
     }
 
@@ -2011,7 +2021,18 @@ impl Optimizer {
         // `box_pool` snapshot read. Otherwise (fresh-Rc `&[Op]` boundary
         // wraps, bridges, Phase 2, fixtures) the threaded ops are not the
         // bound producers, so snapshot from `box_pool`'s bound ops.
-        ctx.input_ops = if input_ops_from_ops {
+        ctx.input_ops = if let Some(seed) = self.explicit_input_ops_seed.take() {
+            // Phase 2: the caller threaded the recorder `Rc<Op>` slice the
+            // source `box_pool` is bound to (`preamble_data.base.operations()`).
+            // Same `Rc` as the bound ops, so the Phase-1 `_forwarded` it
+            // carries is identical to the `box_pool` snapshot — no read.
+            seed.into_iter()
+                .filter(|op| {
+                    let p = op.pos.get();
+                    !p.is_none() && !p.is_constant()
+                })
+                .collect()
+        } else if input_ops_from_ops {
             ops.iter()
                 .filter(|op| {
                     let p = op.pos.get();
