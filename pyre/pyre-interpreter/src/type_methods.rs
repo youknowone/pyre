@@ -1478,58 +1478,43 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    // encoding arg (optional, default utf-8)
-    let encoding: String = if args.len() >= 2 {
-        unsafe {
-            if pyre_object::is_str(args[1]) {
-                w_str_get_value(args[1]).to_string()
-            } else {
-                "utf-8".to_string()
+    // `encoding` and `errors` arrive positionally or by keyword; builtin
+    // kwargs are packed in a trailing `__pyre_kw__` dict.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let str_arg = |obj: Option<PyObjectRef>, default: &str| -> String {
+        match obj {
+            Some(o) if !o.is_null() && unsafe { pyre_object::is_str(o) } => {
+                unsafe { w_str_get_value(o) }.to_string()
             }
+            _ => default.to_string(),
         }
-    } else {
-        "utf-8".to_string()
     };
+    let encoding = str_arg(
+        pos.get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding")),
+        "utf-8",
+    );
+    let errors = str_arg(
+        pos.get(2)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "errors")),
+        "strict",
+    );
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),
         "ascii" | "us-ascii" | "646" => {
-            if s.is_ascii() {
-                Ok(pyre_object::w_bytes_from_bytes(s.as_bytes()))
-            } else {
-                let chars: Vec<char> = s.chars().collect();
-                let start = chars.iter().position(|c| !c.is_ascii()).unwrap();
-                let end = chars[start..]
-                    .iter()
-                    .position(|c| c.is_ascii())
-                    .map_or(chars.len(), |off| start + off);
-                Err(crate::PyError::unicode_encode_error(
-                    "ascii",
-                    args[0],
-                    start as i64,
-                    end as i64,
-                    "ordinal not in range(128)",
-                ))
-            }
+            encode_narrow(s, args[0], "ascii", 0x7f, "ordinal not in range(128)", &errors)
         }
-        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            let chars: Vec<char> = s.chars().collect();
-            if let Some(start) = chars.iter().position(|c| (*c as u32) > 0xFF) {
-                let end = chars[start..]
-                    .iter()
-                    .position(|c| (*c as u32) <= 0xFF)
-                    .map_or(chars.len(), |off| start + off);
-                return Err(crate::PyError::unicode_encode_error(
-                    "latin-1",
-                    args[0],
-                    start as i64,
-                    end as i64,
-                    "ordinal not in range(256)",
-                ));
-            }
-            let out: Vec<u8> = chars.iter().map(|c| *c as u8).collect();
-            Ok(pyre_object::w_bytes_from_bytes(&out))
-        }
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => encode_narrow(
+            s,
+            args[0],
+            "latin-1",
+            0xff,
+            "ordinal not in range(256)",
+            &errors,
+        ),
         _ => {
             if let Some(out) = encode_utf16_32(s, &enc_lower) {
                 return Ok(pyre_object::w_bytes_from_bytes(&out));
@@ -1540,6 +1525,78 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             ))
         }
     }
+}
+
+/// Encode `s` with a single-byte codec (`ascii`, `latin-1`) where any code
+/// point `> max_cp` is unencodable, applying the `errors` handler.
+/// Supported handlers: `strict` (raise `UnicodeEncodeError` over the maximal
+/// run), `ignore`, `replace` (`?`), `backslashreplace`, `xmlcharrefreplace`.
+/// The handler is consulted lazily, so an all-encodable string never trips an
+/// unknown-handler `LookupError` — matching `PyUnicode_AsEncodedString`.
+fn encode_narrow(
+    s: &str,
+    source: PyObjectRef,
+    enc_name: &str,
+    max_cp: u32,
+    range_msg: &str,
+    errors: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<u8> = Vec::with_capacity(chars.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if (chars[i] as u32) <= max_cp {
+            out.push(chars[i] as u8);
+            i += 1;
+            continue;
+        }
+        // Maximal run of consecutive unencodable code points — `strict`
+        // reports the whole span as one error, like CPython.
+        let start = i;
+        let mut end = i;
+        while end < chars.len() && (chars[end] as u32) > max_cp {
+            end += 1;
+        }
+        match errors {
+            "strict" => {
+                return Err(crate::PyError::unicode_encode_error(
+                    enc_name,
+                    source,
+                    start as i64,
+                    end as i64,
+                    range_msg,
+                ));
+            }
+            "ignore" => {}
+            "replace" => out.resize(out.len() + (end - start), b'?'),
+            "backslashreplace" => {
+                for &c in &chars[start..end] {
+                    let cp = c as u32;
+                    let esc = if cp <= 0xff {
+                        format!("\\x{cp:02x}")
+                    } else if cp <= 0xffff {
+                        format!("\\u{cp:04x}")
+                    } else {
+                        format!("\\U{cp:08x}")
+                    };
+                    out.extend_from_slice(esc.as_bytes());
+                }
+            }
+            "xmlcharrefreplace" => {
+                for &c in &chars[start..end] {
+                    out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
+                }
+            }
+            _ => {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::LookupError,
+                    format!("unknown error handler name '{errors}'"),
+                ));
+            }
+        }
+        i = end;
+    }
+    Ok(pyre_object::w_bytes_from_bytes(&out))
 }
 
 /// Collapse a normalized encoding name to its separator-free form so
