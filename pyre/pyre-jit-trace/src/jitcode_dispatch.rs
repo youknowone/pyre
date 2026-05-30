@@ -4095,6 +4095,20 @@ fn try_execute_residual_call_via_executor(
     if call_descr.result_type() == majit_ir::Type::Void {
         return None;
     }
+    // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
+    // residual_call dispatchers: when the const index AND the code pointer
+    // (`frame.pycode`) are both concrete, it materializes `co_consts[idx]`
+    // directly and suppresses the residual.  When that fold declines — the
+    // promoted `frame.pycode` is concrete for the portal frame but an inlined
+    // callee sub-walk does not seed it — the residual is recorded so the
+    // loop computes it at runtime from the live frame's real `pycode`.
+    // Executing it concretely here would pass the unseeded (null/garbage)
+    // code pointer to `bh_load_const_fn`, which dereferences it via
+    // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
+    // "falls through to the generic record" contract.
+    if call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::LoadConst {
+        return None;
+    }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
