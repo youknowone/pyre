@@ -1992,6 +1992,36 @@ impl OptContext {
         }
     }
 
+    /// Test-only: seed the canonical producer stores (`resop_refs` /
+    /// `inputarg_refs`) from a list of already-bound `BoxRef`s, mirroring
+    /// what the production recorder→optimizer handoff populates. Each box
+    /// is distributed by its bound identity: InputArg boxes land in
+    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos.raw()]`. This
+    /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
+    /// `resolve_to_boxref` / `ensure_box` / `find_producer_op` resolve each
+    /// OpRef through the same canonical hosts production uses, returning a
+    /// fresh `BoxRef` bound to the seeded `Op` / `InputArg`.
+    #[cfg(test)]
+    pub(crate) fn seed_boxes_canonical(&mut self, boxes: &[crate::r#box::BoxRef]) {
+        for b in boxes {
+            if let Some(ia) = b.bound_inputarg() {
+                let idx = ia.index as usize;
+                if idx >= self.inputarg_refs.len() {
+                    self.inputarg_refs.resize_with(idx + 1, || {
+                        std::rc::Rc::new(majit_ir::InputArg::new_int(0))
+                    });
+                }
+                self.inputarg_refs[idx] = ia;
+            } else if let Some(op) = b.bound_op() {
+                let idx = op.pos.get().raw() as usize;
+                if idx >= self.resop_refs.len() {
+                    self.resop_refs.resize_with(idx + 1, || None);
+                }
+                self.resop_refs[idx] = Some(op);
+            }
+        }
+    }
+
     /// S-1: bind every input op's resop `BoxRef` in `box_pool` to a
     /// fresh `OpRc` of the input op so any `Forwarded::Op(_)` chain
     /// step targeting the slot has an upgradable `Weak<Op>` from the
@@ -7873,7 +7903,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (b0, ia0) = bound_inputarg_box(Type::Int, 0);
         let (b1, ia1) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![b0.clone(), b1.clone()].into();
+        ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         (ctx, b0, b1, vec![ia0, ia1])
     }
 
@@ -7967,7 +7997,7 @@ mod boxref_forwarding_tests {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(&b, info);
         match &b.get_forwarded() {
@@ -7986,7 +8016,7 @@ mod boxref_forwarding_tests {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         let opref = OpRef::input_arg_typed(0, Type::Ref);
         ctx.make_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
@@ -8025,7 +8055,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
         let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![b0, b1.clone()].into();
+        ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.ensure_box(const_opref).expect("const box");
@@ -8153,13 +8183,12 @@ mod boxref_forwarding_tests {
         let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
         let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
         let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
-        ctx.box_pool = vec![
+        ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
-            placeholder_other,
+            placeholder_other.clone(),
             source_box.clone(),
-            other_box,
-        ]
-        .into();
+            other_box.clone(),
+        ]);
 
         // BoxRef-first chain walker reconstructs the variant tag from
         // `box.type_()`; placeholders and source are both Ref, so use the
@@ -8227,13 +8256,12 @@ mod boxref_forwarding_tests {
         let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
         let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
         let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
-        ctx.box_pool = vec![
+        ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
-            placeholder_other,
+            placeholder_other.clone(),
             source_box.clone(),
-            other_box,
-        ]
-        .into();
+            other_box.clone(),
+        ]);
 
         let target_p1 = OpRef::ref_op(0);
         let source_p2 = OpRef::input_arg_ref(2);
@@ -8260,17 +8288,22 @@ mod boxref_forwarding_tests {
         ));
     }
 
-    /// H-3.2b: with a populated `box_pool` and no forwarding, the
-    /// BoxRef-returning reader returns the pool entry unchanged.
+    /// H-3.2b: with the canonical slot seeded and no forwarding, the
+    /// BoxRef-returning reader resolves the slot's bound InputArg.
     /// `resoperation.py:57-68` walker terminates on `None` immediately.
     #[test]
     fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
-        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, _b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
-            .expect("pool entry exists");
-        // Pointer identity: same `Rc` allocation as `b0`.
-        assert_eq!(got, b0);
+            .expect("canonical store resolves the slot");
+        // No forwarding: the resolver materialises a fresh terminal BoxRef
+        // bound to the same `InputArgRc` as the seeded slot.
+        assert!(std::rc::Rc::ptr_eq(
+            &got.bound_inputarg()
+                .expect("resolved terminal carries bound InputArg"),
+            &ia_holder[0],
+        ));
     }
 
     /// H-3.2b: with a forwarding chain installed via `make_equal_to`, the
@@ -8321,13 +8354,18 @@ mod boxref_forwarding_tests {
     /// PyPy `resoperation.py:60 isinstance(next, AbstractInfo)`.
     #[test]
     fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
-        let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
             .get_box_replacement_box(OpRef::int_op(0))
-            .expect("pool entry exists");
-        // Walker terminates at b0 (its `_forwarded` is Info, not Box).
-        assert_eq!(got, b0);
+            .expect("canonical store resolves the slot");
+        // Walker terminates at the slot (its `_forwarded` is Info, not a
+        // chain step); the resolved BoxRef shares b0's bound InputArg.
+        assert!(std::rc::Rc::ptr_eq(
+            &got.bound_inputarg()
+                .expect("resolved terminal carries bound InputArg"),
+            &ia_holder[0],
+        ));
     }
 
     // BoxRef-routing helpers `is_virtual` / `is_nonnull` read the same
@@ -8336,7 +8374,7 @@ mod boxref_forwarding_tests {
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, ia) = bound_inputarg_box(Type::Ref, 0);
-        ctx.box_pool = vec![b.clone()].into();
+        ctx.seed_boxes_canonical(&[b.clone()]);
         // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
         // `b.inputarg_handle` upgrades across the test body.
         ctx.inputarg_refs = vec![ia];
@@ -8705,7 +8743,7 @@ mod boxref_forwarding_tests {
         let (a, _ia_a) = bound_inputarg_box(Type::Ref, 0);
         let (b, _ia_b) = bound_inputarg_box(Type::Ref, 1);
         let (c, _ia_c) = bound_inputarg_box(Type::Ref, 2);
-        ctx.box_pool = vec![a.clone(), b.clone(), c.clone()].into();
+        ctx.seed_boxes_canonical(&[a.clone(), b.clone(), c.clone()]);
         ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
         ctx.make_equal_to(&a, &b);
@@ -8736,7 +8774,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
@@ -8773,7 +8811,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
@@ -8808,7 +8846,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
@@ -8832,7 +8870,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
-        ctx.box_pool = vec![old_box.clone(), new_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
@@ -8855,7 +8893,7 @@ mod boxref_forwarding_tests {
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (old_box, ia) = bound_inputarg_box(Type::Int, 0);
-        ctx.box_pool = vec![old_box.clone()].into();
+        ctx.seed_boxes_canonical(&[old_box.clone()]);
         ctx.inputarg_refs = vec![ia];
         ctx.setintbound(
             &old_box,
