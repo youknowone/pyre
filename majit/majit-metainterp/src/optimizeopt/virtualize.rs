@@ -290,6 +290,31 @@ impl VirtualizableTracker {
             });
         }
     }
+
+    /// Read counterpart to [`mirror_setarrayitem`]: returns the tracked
+    /// value box for `array_ref[index]` on the standard virtualizable
+    /// array state (seeded from the inputarg layout, updated by
+    /// `mirror_setarrayitem`), or `None` when `array_ref` is not the
+    /// standard virtualizable array field or the slot is untracked.
+    fn tracked_array_element(
+        &self,
+        array_ref: OpRef,
+        index: i64,
+        ctx: &mut OptContext,
+    ) -> Option<OpRef> {
+        if index < 0 {
+            return None;
+        }
+        let (frame_ref, array_idx) = self.resolve_array_source(array_ref, ctx)?;
+        let elem_idx = index as usize;
+        let b = ctx.ensure_box(frame_ref)?;
+        match ctx.peek_ptr_info(&b)? {
+            PtrInfo::Virtualizable(vstate) => {
+                get_array_element(&vstate.arrays, array_idx, elem_idx)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The virtualize optimization pass.
@@ -905,6 +930,32 @@ impl OptVirtualize {
                     ctx.make_equal_to(&b_old, &b_item);
                     return OptimizationResult::Remove;
                 }
+            }
+        }
+        // Standard virtualizable array read-after-write: the value-stack /
+        // array field of the standard virtualizable frame is tracked in
+        // `vstate.arrays` (seeded from the inputarg layout, updated by
+        // `mirror_setarrayitem`).  Fold a constant-index read to the
+        // tracked box, symmetric with the static-field fold in
+        // `optimize_getfield_gc`.  Read-only: the matching setarrayitem is
+        // left emitted, so no heap write is dropped.
+        if let Some(index) = ctx
+            .get_box_replacement_box(index_ref)
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
+            if let Some(item_ref) = self
+                .vable
+                .as_ref()
+                .and_then(|vt| vt.tracked_array_element(array_ref, index, ctx))
+            {
+                let b_old = ctx
+                    .ensure_box(op.pos.get())
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                let b_item = ctx
+                    .ensure_box(item_ref)
+                    .expect("body-namespace OpRef must have a BoxRef slot");
+                ctx.make_equal_to(&b_old, &b_item);
+                return OptimizationResult::Remove;
             }
         }
         // virtualize.py:287: self.make_nonnull(op.getarg(0))
@@ -3155,6 +3206,96 @@ mod tests {
         let result =
             pass.propagate_forward(&set_item, &std::rc::Rc::new(set_item.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    #[test]
+    fn test_standard_virtualizable_gc_getarrayitem_folds_after_setarrayitem() {
+        // GETARRAYITEM_GC on the standard virtualizable array field folds
+        // to the value written by a prior SETARRAYITEM_GC at the same
+        // const index (read-after-write), symmetric with the static-field
+        // fold.  The setarrayitem stays emitted (the heap write is kept);
+        // only the redundant read is removed.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            static_field_descrs: vec![],
+            array_field_offsets: vec![8],
+            array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
+            array_lengths: vec![1],
+            vable_input_offset: 0,
+        });
+        pass.setup();
+
+        let field_descr = test_vable_field_descr(8, Type::Int, 1);
+        let arr_descr = array_descr(20);
+        // const array index 0 and a stored value.
+        ctx.make_constant(OpRef::int_op(50), Value::Int(0));
+        ctx.make_constant(OpRef::int_op(51), Value::Int(42));
+
+        let get_array_ptr =
+            Op::with_descr(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], field_descr);
+        let set_item = Op::with_descr(
+            OpCode::SetarrayitemGc,
+            &[OpRef::input_arg_ref(0), OpRef::int_op(50), OpRef::int_op(51)],
+            arr_descr.clone(),
+        );
+        let get_item = Op::with_descr(
+            OpCode::GetarrayitemGcI,
+            &[OpRef::input_arg_ref(0), OpRef::int_op(50)],
+            arr_descr,
+        );
+
+        let mut ops = vec![get_array_ptr, set_item, get_item];
+        assign_positions(&mut ops);
+        // Route the array element ops through the GetfieldRawI result so
+        // resolve_array_source() sees the producing OpRef, not the bare
+        // vable inputarg.
+        let array_ptr_ref = ops[0].pos.get();
+        ops[1].setarg(0, array_ptr_ref);
+        ops[2].setarg(0, array_ptr_ref);
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            // optimizer.py:651-652 setarg loop parity.
+            for i in 0..resolved.num_args() {
+                resolved.setarg(i, ctx.get_box_replacement(resolved.arg(i)));
+            }
+            match pass.propagate_forward(&resolved, &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Replace(replaced)
+                | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop => panic!("unexpected InvalidLoop in test"),
+            }
+        }
+
+        let get_count = ctx
+            .new_operations
+            .iter()
+            .filter(|op| op.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            get_count, 0,
+            "GETARRAYITEM_GC on standard vable array should fold after a same-index SETARRAYITEM_GC"
+        );
+        let set_count = ctx
+            .new_operations
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetarrayitemGc)
+            .count();
+        assert_eq!(
+            set_count, 1,
+            "the heap write must be preserved (read-only fold)"
+        );
     }
 
     #[test]
