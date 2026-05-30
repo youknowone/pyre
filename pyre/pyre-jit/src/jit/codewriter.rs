@@ -10682,7 +10682,22 @@ impl CodeWriter {
             let total_pre = stack_base as usize + max_stackdepth as usize;
             let slot_to_variable_id =
                 invert_walker_slot_for_variable(&walker_slot_for_variable, total_pre);
-            let ref_alloc = &graph_regallocs[super::flatten::Kind::Ref.index()];
+            // Under the orthodox-regalloc gate the canonical SSARepr is colored
+            // from a fresh no-extra-coalesce allocation (the `canonical_regallocs`
+            // at the build block above is out of scope here).  Reproduce that same
+            // source so the divergence reflects the coloring the canonical jitcode
+            // actually uses, not the cfg-pair-merged `graph_regallocs`.
+            let orthodox_regallocs = if pypy_orthodox_regalloc {
+                let mut r = super::regalloc::perform_register_allocation_all_kinds(&graph);
+                super::regalloc::enforce_input_args(&graph, &mut r);
+                Some(r)
+            } else {
+                None
+            };
+            let ref_alloc = match &orthodox_regallocs {
+                Some(r) => &r[super::flatten::Kind::Ref.index()],
+                None => &graph_regallocs[super::flatten::Kind::Ref.index()],
+            };
             let probe_slot = |label: &str, pre_slot: usize, walker_color: u16| {
                 if slot_to_variable_id
                     .get(pre_slot)
@@ -10776,7 +10791,10 @@ impl CodeWriter {
                 (super::flatten::Kind::Float, "float"),
             ] {
                 let ssa_num_regs = alloc_result.num_regs[kind.index()];
-                let canonical_num_colors = graph_regallocs[kind.index()].num_colors;
+                let canonical_num_colors = match &orthodox_regallocs {
+                    Some(r) => r[kind.index()].num_colors,
+                    None => graph_regallocs[kind.index()].num_colors,
+                };
                 eprintln!(
                     "[phase4-numregs] graph={} kind={label} \
                      ssa={ssa_num_regs} canonical={canonical_num_colors} \
