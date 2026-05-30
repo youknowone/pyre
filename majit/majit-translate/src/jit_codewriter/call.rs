@@ -3266,7 +3266,22 @@ impl CallControl {
                                     .unwrap_or(false)
                             });
                             if all_same {
-                                return Some(matches[0].clone());
+                                // Every match is an alias clone of one source
+                                // graph (`g.name` identical).  Return a
+                                // deterministic canonical alias — the
+                                // lexicographically smallest segments — rather
+                                // than the bucket's arbitrary first entry, so
+                                // the resolved `CallPath` is stable across runs
+                                // and consistently lines up with the
+                                // path-keyed registries (`function_fnaddrs`,
+                                // `return_types`, `builtin_targets`,
+                                // `portal_targets`).
+                                let canonical = matches
+                                    .iter()
+                                    .copied()
+                                    .min_by(|a, b| a.segments.cmp(&b.segments))
+                                    .unwrap();
+                                return Some(canonical.clone());
                             }
                         }
                     }
