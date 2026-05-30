@@ -4263,29 +4263,27 @@ impl OptContext {
         // synthesize a body-namespace `new_resop` shape and `boxref_to_opref`
         // would round-trip to `op_at(pos)` (None) instead of
         // `inputargs[i]`.
+        // Production does NOT consult `box_pool` for the existing per-iter
+        // resop box: no production reader observes `box_pool`'s resop binding
+        // any more (emit migrates forwarded via `live_synthetics`; the
+        // orphan-binding pass drains `live_synthetics`; reshuffle and the
+        // `resolve_to_boxref` tail are `#[cfg(test)]`). A resop reaching here
+        // has no producer in any `find_producer_op` store (else it returned
+        // above), so it falls through to the lazy-alloc arm below, which
+        // mints a `SameAs*` synthetic into `resop_refs` and returns a BoxRef
+        // bound to it — behaviourally identical to this block's
+        // unbound-box mint, since the synthetic (not the `box_pool` slot) is
+        // the `_forwarded` host every subsequent `find_producer_op` reaches.
+        // Synthetic `ctx.box_pool = vec![..]` fixtures keep the box_pool
+        // existing-entry late-bind so their `resolve_to_boxref` `box_pool`
+        // tail observes the producer.
+        #[cfg(test)]
         if let Some(existing) = self.box_pool.get(opref) {
             let cloned = existing.clone();
-            // Phase 1's per-iter BoxPool plants unbound `BoxRef::new_resop`
-            // slots in `TraceIterator::next()` (opencoder.rs:500) without a
-            // producer OpRc to bind to. When Phase 2 (or a retrace) sees
-            // those slots via `p1_full_prefix` carry-over and the
-            // corresponding producer arrives via `phase1_emit_ops` or
-            // `new_operations`, late-bind here so the chain-walk reads
-            // through to `op.forwarded` (resoperation.py:233 `_forwarded`
-            // host) and `make_equal_to`'s strict bound-target invariant
-            // holds.
             if cloned.is_resop() && cloned.bound_op().is_none() {
                 if let Some(op_rc) = self.find_producer_op(opref) {
                     cloned.bind_op(&op_rc);
                 } else {
-                    // Producer not yet emitted: bind to a synthetic
-                    // stand-in. `emit()` swaps the binding to the
-                    // real producer when it arrives, with `bind_op`'s
-                    // carry-over migrating the forwarded state.
-                    // Required so every BoxRef returned from
-                    // `ensure_box` is bound to an `Op` whose
-                    // `forwarded` slot is the canonical `_forwarded`
-                    // host (resoperation.py:233).
                     let synthetic = self.mint_synthetic_resop(opref, cloned.type_());
                     cloned.bind_op(&synthetic);
                 }
@@ -4356,6 +4354,19 @@ impl OptContext {
                 p
             }
         };
+        // Production: the placeholder is bound to its producer / `resop_refs`
+        // synthetic (resops) or `inputarg_refs` host (the InputArg arm, only
+        // reachable in `#[cfg(test)]` since production InputArgs resolve
+        // through the `inputarg_refs` branch above), so it carries the
+        // canonical `_forwarded` host without a `box_pool` slot. The
+        // `box_pool` memoization is retained `#[cfg(test)]` so synthetic
+        // fixtures resolving through the `resolve_to_boxref` `box_pool` tail
+        // observe the materialized box on a subsequent lookup.
+        #[cfg(not(test))]
+        {
+            return Some(placeholder);
+        }
+        #[cfg(test)]
         Some(self.box_pool.set(opref, placeholder))
     }
 
