@@ -1240,7 +1240,13 @@ pub fn call_with_kwargs(
             {
                 let fname = unsafe { crate::builtin_code_name(code as pyre_object::PyObjectRef) };
                 let bound = bind_kwargs_to_signature(sig, fname, pos_args, kwargs)?;
-                return call_callable(frame, callable, &bound);
+                // `bound` is already the final flat slice (positional slots
+                // plus packed `*args` / `**kwargs` tail), so invoke the
+                // builtin directly — routing back through `call_callable`
+                // would re-enter `call_builtin_code_positional` and pack the
+                // tail a second time.
+                let func = unsafe { crate::builtin_code_get(code as pyre_object::PyObjectRef) };
+                return func(&bound);
             }
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
