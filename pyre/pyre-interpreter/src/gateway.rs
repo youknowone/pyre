@@ -737,12 +737,22 @@ pub fn make_builtin_function_maybe_sig(
 /// keyword-call path bind arguments by name.  Used by the
 /// `inline_functions:` arm so a `#[pyre_function]` builtin keeps its
 /// derived arity while gaining keyword / kw-only binding.
+///
+/// A `*args` / `**kwargs` / keyword-only parameter makes the passed
+/// fixed `arity` meaningless (the raw param count over-counts the
+/// variadic slots and the kw-only tail cannot be filled positionally),
+/// so any such signature is demoted to `HOPELESS` — the call always
+/// takes the keyword-binding slow path.
 pub fn make_builtin_function_with_arity_and_maybe_sig(
     name: &'static str,
     func: BuiltinCodeFn,
     arity: u16,
     signature: Option<Signature>,
 ) -> PyObjectRef {
+    let arity = match &signature {
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
+        _ => arity,
+    };
     let sig: *const Signature = match signature {
         Some(signature) => Box::into_raw(Box::new(signature)),
         None => std::ptr::null(),
