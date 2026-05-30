@@ -327,10 +327,11 @@ fn parse_split_sep(value: PyObjectRef) -> Result<Option<String>, crate::PyError>
 
 /// `unicodeobject.py:972 @unwrap_spec(maxsplit=int)` parity —
 /// `space.int_w(w_maxsplit)` routes through `__index__`, so any
-/// int-like object is accepted; missing maxsplit defaults to -1
-/// (unlimited).
+/// int-like object is accepted; an absent maxsplit defaults to -1
+/// (unlimited).  An explicit `None` is not int-like and has no
+/// `__index__`, so it raises `TypeError` like any other non-integer.
 fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
-    if value.is_null() || unsafe { is_none(value) } {
+    if value.is_null() {
         return Ok(-1);
     }
     crate::builtins::space_index_w(value)
