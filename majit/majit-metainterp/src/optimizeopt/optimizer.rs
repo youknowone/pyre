@@ -1883,8 +1883,12 @@ impl Optimizer {
             .max()
             .unwrap_or(0);
         let start_next_pos = ((max_pos as u32) + 1).max(num_inputs as u32);
+        // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
+        // fresh `Rc` (the #62 boundary-conversion pattern).
+        let ops_rc: Vec<majit_ir::OpRc> =
+            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         self.optimize_with_constants_and_inputs_at(
-            ops,
+            &ops_rc,
             constants,
             num_inputs,
             0,
@@ -1903,7 +1907,7 @@ impl Optimizer {
     /// OpRefs are disjoint from any parent trace's emitted ops.
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
-        ops: &[Op],
+        ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
@@ -2076,7 +2080,7 @@ impl Optimizer {
         ctx.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
         ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
 
-        sanitize_backend_constants_for_ops(ops, constants);
+        sanitize_backend_constants_for_ops(ops.iter().map(|op| &**op), constants);
         // Pre-populate known constants so passes can see them.
         //
         // history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
@@ -2266,7 +2270,7 @@ impl Optimizer {
         let mut last_op = None;
         for op in ops {
             if op.opcode == OpCode::Jump || op.opcode == OpCode::Finish {
-                last_op = Some(op.clone());
+                last_op = Some((**op).clone());
                 break;
             }
             self.propagate_one(op, &mut ctx);
@@ -3342,8 +3346,10 @@ impl Optimizer {
             .map(|p| p + 1)
             .unwrap_or(bridge_inputarg_base + num_inputs as u32)
             .max(bridge_inputarg_base + num_inputs as u32);
+        let ops_rc: Vec<majit_ir::OpRc> =
+            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
-            ops,
+            &ops_rc,
             constants,
             num_inputs,
             bridge_inputarg_base,

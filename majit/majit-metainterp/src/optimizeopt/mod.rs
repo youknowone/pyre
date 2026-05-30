@@ -1974,7 +1974,7 @@ impl OptContext {
     /// Inherited Phase 1 slots (already bound by Phase 1's end-of-pass
     /// orphan binding at `optimizer.rs:2431-2460`) skip — the
     /// `bound_op().is_some()` guard preserves their phase-1 identity.
-    pub(crate) fn bind_input_resops(&mut self, ops: &[Op]) {
+    pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         if self.box_pool.is_empty() {
             return;
         }
@@ -1989,7 +1989,10 @@ impl OptContext {
             if !b.is_resop() || b.bound_op().is_some() {
                 continue;
             }
-            let op_rc = std::rc::Rc::new(op.clone());
+            // Bind the box to the caller-threaded `OpRc` so the box,
+            // `resop_refs`, `live_synthetics`, and the iterated input op
+            // share one `Op` identity (no second private copy).
+            let op_rc = op.clone();
             b.bind_op(&op_rc);
             let idx = pos.raw() as usize;
             if idx >= self.resop_refs.len() {

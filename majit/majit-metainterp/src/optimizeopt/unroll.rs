@@ -1057,9 +1057,11 @@ impl UnrollOptimizer {
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
+        let p2_ops_in_rc: Vec<majit_ir::OpRc> =
+            p2_ops_in.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         let p2_ops = with_speculative_to_invalid_loop(|| {
             opt_p2.optimize_with_constants_and_inputs_at(
-                &p2_ops_in,
+                &p2_ops_in_rc,
                 &mut consts_p2,
                 body_num_inputs,
                 phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
