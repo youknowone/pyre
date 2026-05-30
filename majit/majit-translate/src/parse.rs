@@ -1493,6 +1493,18 @@ fn extract_match_arms(
                     mir_handler_path: None,
                 };
             }
+            // Seam: a raise-stub arm (`Err(PyError::type_error("…").into())`,
+            // the async stubs) gets a mechanically synthesized abort+ctor
+            // chain instead of a syn-AST lowering.
+            if let Some(stub) = detect_raise_stub_return(&arm.body) {
+                let graph = synthesize_raise_stub_wrapper(&name, sig, &stub);
+                return ExtractedOpcodeArm {
+                    selector,
+                    handler_calls,
+                    body_graph: Some(graph),
+                    mir_handler_path: None,
+                };
+            }
             let mut graph = crate::model::FunctionGraph::new(name.clone());
             // Pre-bind `execute_opcode_step`'s formal parameters as
             // startblock inputargs so the arm body's `Expr::Path`
@@ -1718,28 +1730,14 @@ fn synthesize_tail_call_wrapper(
     graph
 }
 
-/// Build the dispatcher-shaped wrapper graph for a constant-return arm
-/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`),
-/// reproducing exactly what
-/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
-/// body but WITHOUT the syn-AST graph builder.  Shape: one
-/// `OpKind::Input` per dispatcher parameter (in signature order, typed
-/// via `classify_fn_arg_ty`) as the startblock inputargs, then a 0-arg
-/// `SyntheticTransparentCtor` Call for the inner unit-variant, then a
-/// 1-arg `SyntheticTransparentCtor` Call for the outer wrapper, then a
-/// return of the wrapper result.  Both ctor calls carry
-/// `result_ty: Unknown`; downstream `unit_variant_fold` folds the inner
-/// to a `ConstRef` and `jtransform` elides the transparent wrapper.  The
-/// dispatcher inputargs are kept (even though unused) so the runtime
-/// seeds the full register layout at the arm entry — the same invariant
-/// `synthesize_tail_call_wrapper` upholds.
-fn synthesize_wrapped_unit_variant_wrapper(
-    name: &str,
-    sig: &syn::Signature,
-    ret: &WrappedUnitVariantReturn,
-) -> crate::model::FunctionGraph {
-    use crate::model::{CallTarget, OpKind, ValueType};
-    let mut graph = crate::model::FunctionGraph::new(name.to_string());
+/// Push one `OpKind::Input` per dispatcher parameter (in signature
+/// order, typed via `classify_fn_arg_ty`) as the startblock inputargs —
+/// the shared prologue of every synthesized opcode-arm wrapper.  The
+/// runtime seeds the dispatch entry from the full dispatcher register
+/// layout, so a wrapper must keep every dispatcher param as an inputarg
+/// even when the body reads only a subset (or none).
+fn push_dispatcher_inputargs(graph: &mut crate::model::FunctionGraph, sig: &syn::Signature) {
+    use crate::model::OpKind;
     let block = graph.startblock;
     for param in &sig.inputs {
         let (pname, pty) = match param {
@@ -1764,6 +1762,28 @@ fn synthesize_wrapped_unit_variant_wrapper(
             graph.push_inputarg_var(block, var);
         }
     }
+}
+
+/// Build the dispatcher-shaped wrapper graph for a constant-return arm
+/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`),
+/// reproducing exactly what
+/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
+/// body but WITHOUT the syn-AST graph builder.  Shape: one
+/// `OpKind::Input` per dispatcher parameter as the startblock inputargs,
+/// then a 0-arg `SyntheticTransparentCtor` Call for the inner
+/// unit-variant, then a 1-arg `SyntheticTransparentCtor` Call for the
+/// outer wrapper, then a return of the wrapper result.  Both ctor calls
+/// carry `result_ty: Unknown`; downstream `unit_variant_fold` folds the
+/// inner to a `ConstRef` and `jtransform` elides the transparent wrapper.
+fn synthesize_wrapped_unit_variant_wrapper(
+    name: &str,
+    sig: &syn::Signature,
+    ret: &WrappedUnitVariantReturn,
+) -> crate::model::FunctionGraph {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let mut graph = crate::model::FunctionGraph::new(name.to_string());
+    push_dispatcher_inputargs(&mut graph, sig);
+    let block = graph.startblock;
     let inner = graph
         .push_op_var(
             block,
@@ -1791,6 +1811,161 @@ fn synthesize_wrapped_unit_variant_wrapper(
         true,
     );
     graph.set_return(block, outer);
+    graph
+}
+
+/// A raise-stub arm body of the form `Wrapper(FnPath(<lit>).method())` —
+/// e.g. `Err(crate::PyError::type_error("async not yet implemented").into())`.
+/// The string-literal argument lowers to an untranslatable `Abort` (so
+/// the opcode always deopts to the interpreter rather than JITing),
+/// wrapped by the constructor function call, an adapter method call, and
+/// a transparent result/option ctor.
+struct RaiseStubReturn {
+    fn_segments: Vec<String>,
+    method_name: String,
+    wrapper_owner: Vec<String>,
+    wrapper_name: String,
+    literal: crate::model::UnsupportedLiteralKind,
+}
+
+/// Recognize an arm body of the form `Wrapper(FnPath(<lit>).method())`
+/// where `Wrapper` is a transparent result/option ctor (`Ok`/`Err`/`Some`)
+/// and the single argument is a no-arg method call on a one-argument
+/// function call whose argument is a string literal.  A leading
+/// single-statement block is unwrapped.  This captures the async-stub
+/// family `Err(crate::PyError::type_error("...").into())`; anything else
+/// returns `None`.
+fn detect_raise_stub_return(body: &syn::Expr) -> Option<RaiseStubReturn> {
+    use crate::front::syn_metadata::is_synthetic_result_option_wrapper_path;
+    use crate::model::UnsupportedLiteralKind;
+    let expr = match body {
+        syn::Expr::Block(block) if block.block.stmts.len() == 1 => match &block.block.stmts[0] {
+            syn::Stmt::Expr(inner, _) => inner,
+            _ => return None,
+        },
+        other => other,
+    };
+    let call = match expr {
+        syn::Expr::Call(call) => call,
+        _ => return None,
+    };
+    let wrapper_path = match &*call.func {
+        syn::Expr::Path(path) if path.qself.is_none() => &path.path,
+        _ => return None,
+    };
+    let wrapper_segments: Vec<String> = wrapper_path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    if !is_synthetic_result_option_wrapper_path(&wrapper_segments) || call.args.len() != 1 {
+        return None;
+    }
+    // The wrapped argument must be `<func>(<lit>).<method>()` — a no-arg
+    // method call on a single-argument function call.
+    let method_call = match &call.args[0] {
+        syn::Expr::MethodCall(mc) if mc.args.is_empty() => mc,
+        _ => return None,
+    };
+    let inner_call = match &*method_call.receiver {
+        syn::Expr::Call(c) => c,
+        _ => return None,
+    };
+    let fn_path = match &*inner_call.func {
+        syn::Expr::Path(path) if path.qself.is_none() => &path.path,
+        _ => return None,
+    };
+    if inner_call.args.len() != 1 {
+        return None;
+    }
+    let literal = match &inner_call.args[0] {
+        syn::Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Str(_) => UnsupportedLiteralKind::Str,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let fn_segments = fn_path
+        .segments
+        .iter()
+        .map(|seg| seg.ident.to_string())
+        .collect();
+    let (wrapper_owner, wrapper_name) = path_owner_leaf(&wrapper_segments);
+    Some(RaiseStubReturn {
+        fn_segments,
+        method_name: method_call.method.to_string(),
+        wrapper_owner,
+        wrapper_name,
+        literal,
+    })
+}
+
+/// Build the dispatcher-shaped wrapper graph for a raise-stub arm
+/// (`Wrapper(FnPath(<lit>).method())`, e.g.
+/// `Err(crate::PyError::type_error("...").into())`), reproducing exactly
+/// what `front::ast::lower_expr_into_graph_with_signature` emits for the
+/// same body but WITHOUT the syn-AST graph builder.  Shape: the
+/// dispatcher inputargs, then an `Abort` for the untranslatable literal,
+/// then a `FunctionPath` Call (the ctor fn) consuming it, then a `Method`
+/// Call (the `.into()` adapter), then the transparent result/option
+/// wrapper ctor, then a return of the wrapper result.  The `Abort` makes
+/// any trace that reaches this opcode deopt to the interpreter — correct
+/// for stub opcodes that always raise.
+fn synthesize_raise_stub_wrapper(
+    name: &str,
+    sig: &syn::Signature,
+    stub: &RaiseStubReturn,
+) -> crate::model::FunctionGraph {
+    use crate::model::{CallTarget, OpKind, UnknownKind, ValueType};
+    let mut graph = crate::model::FunctionGraph::new(name.to_string());
+    push_dispatcher_inputargs(&mut graph, sig);
+    let block = graph.startblock;
+    let literal = graph
+        .push_op_var(
+            block,
+            OpKind::Abort {
+                kind: UnknownKind::UnsupportedLiteral {
+                    variant: stub.literal.clone(),
+                },
+            },
+            true,
+        )
+        .expect("Abort has has_result=true");
+    let constructed = graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::function_path(stub.fn_segments.clone()),
+                args: vec![literal],
+                result_ty: ValueType::Unknown,
+            },
+            true,
+        )
+        .expect("FunctionPath Call has has_result=true");
+    let converted = graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::method(stub.method_name.clone(), None),
+                args: vec![constructed],
+                result_ty: ValueType::Unknown,
+            },
+            true,
+        )
+        .expect("Method Call has has_result=true");
+    let wrapped = graph.push_op_var(
+        block,
+        OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor_with_owner(
+                stub.wrapper_owner.clone(),
+                stub.wrapper_name.clone(),
+            ),
+            args: vec![converted],
+            result_ty: ValueType::Unknown,
+        },
+        true,
+    );
+    graph.set_return(block, wrapped);
     graph
 }
 
@@ -2219,6 +2394,55 @@ mod tests {
             synth_start, ast_start,
             "synthesized const-return startblock must match the AST-lowered baseline"
         );
+    }
+
+    #[test]
+    fn raise_stub_arm_detection_and_synthesis() {
+        let body: syn::Expr =
+            syn::parse_str(r#"Err(crate::PyError::type_error("async not yet implemented").into())"#)
+                .unwrap();
+        let stub = detect_raise_stub_return(&body).expect("async stub should be detected");
+        assert_eq!(
+            stub.fn_segments,
+            vec![
+                "crate".to_string(),
+                "PyError".to_string(),
+                "type_error".to_string()
+            ]
+        );
+        assert_eq!(stub.method_name, "into");
+        assert_eq!(stub.wrapper_name, "Err");
+        assert!(stub.wrapper_owner.is_empty());
+
+        let sig: syn::Signature = syn::parse_str(
+            "fn execute_opcode_step<E>(executor: &mut E, code: &CodeObject, instruction: Instruction, op_arg: OpArg, next_instr: usize) -> Result<StepResult, PyError>",
+        )
+        .unwrap();
+        let synth_graph = synthesize_raise_stub_wrapper("Async", &sig, &stub);
+        // 5 Input ops + Abort + 3 Call ops (type_error / into / Err).
+        let start = synth_graph.block(synth_graph.startblock);
+        assert_eq!(start.inputargs.len(), 5);
+        assert_eq!(start.operations.len(), 9);
+
+        // Byte-identical to the AST-lowered baseline (global Variable.id
+        // counter normalized away). check.py does not exercise async
+        // opcodes, so this equality is the authoritative behaviour check.
+        let mut ast_graph = crate::model::FunctionGraph::new("Async".to_string());
+        crate::front::ast::lower_expr_into_graph_with_signature(&mut ast_graph, &body, Some(&sig))
+            .expect("AST lowering of the async stub must succeed");
+        let synth_start =
+            strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
+        let ast_start = strip_var_ids(&format!("{:#?}", ast_graph.block(ast_graph.startblock)));
+        assert_eq!(
+            synth_start, ast_start,
+            "synthesized raise-stub startblock must match the AST-lowered baseline"
+        );
+
+        // Non-matching shapes fall through.
+        let const_body: syn::Expr = syn::parse_str("Ok(StepResult::Continue)").unwrap();
+        assert!(detect_raise_stub_return(&const_body).is_none());
+        let method_body: syn::Expr = syn::parse_str("executor.unsupported(&other)").unwrap();
+        assert!(detect_raise_stub_return(&method_body).is_none());
     }
 
     #[test]
