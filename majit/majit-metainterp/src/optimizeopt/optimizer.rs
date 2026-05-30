@@ -3120,16 +3120,26 @@ impl Optimizer {
             // positions. PyPy's `_forwarded` is an object-identity slot
             // (`resoperation.py:57-68 get_box_replacement` walks
             // `op._forwarded` via Python `is`-identity), so upstream has
-            // no analogous index-alias hazard. Pyre indexes
-            // `box_pool[opref.raw()]` directly in `get_box_replacement`
-            // (mod.rs:3158) and `get_box_replacement_box`. Without this
-            // reshuffle, `box_pool[new_pos]` after the in-place
-            // `set_position` loop above is the original Rc<Box> allocated
-            // for `new_pos`'s old occupant, not the Rc<Box> whose
-            // internal position was just remapped to `new_pos`. Phase 2
-            // callers (`unroll.rs:899/910/917/995
-            // final_ctx.get_box_replacement`) consume the post-remap
-            // context, so the alias hazard is reachable.
+            // no analogous index-alias hazard. Without this reshuffle,
+            // `box_pool[new_pos]` after the in-place `set_position` loop
+            // above is the original Rc<Box> allocated for `new_pos`'s old
+            // occupant, not the Rc<Box> whose internal position was just
+            // remapped to `new_pos`.
+            //
+            // `#[cfg(test)]`: every production reader that once indexed
+            // `box_pool[opref.raw()]` post-reshuffle now routes through
+            // `resolve_to_boxref` → `find_producer_op` (S-8.A.3/.4), which
+            // matches by full `Op.pos` over the canonical stores
+            // (`new_operations` / `phase1_emit_ops` / `resop_refs`) — the
+            // in-place `set_position` / `op.pos.set` loop above already
+            // aligned those to post-compact positions, so the alias hazard
+            // is unreachable in production. Phase 2 callers
+            // (`unroll.rs:899/910/917/995 final_ctx.get_box_replacement`)
+            // go through that resolver, not raw `box_pool[idx]`. The
+            // physical rebuild survives only to keep synthetic
+            // `ctx.box_pool = vec![..]` unit fixtures (which resolve via
+            // the `resolve_to_boxref` `box_pool` tail, also `#[cfg(test)]`)
+            // index-consistent; it disappears with `BoxPool` at S-9.
             //
             // Build a fresh `Vec<BoxRef>` keyed by current
             // `position()`. Inputarg slots `[0, num_inputs)` are not
@@ -3140,6 +3150,7 @@ impl Optimizer {
             // matching `ensure_box`'s lazy-alloc shape so any reader still
             // indexing those slots sees `Forwarded::None` instead of
             // stale forwarding fragments.
+            #[cfg(test)]
             {
                 let max_remapped = remap.values().copied().max().unwrap_or(0) as usize;
                 let new_size = std::cmp::max(max_remapped + 1, ctx.box_pool.len());
