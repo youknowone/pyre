@@ -1754,6 +1754,91 @@ pub fn execute_send<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_match_stub<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_stub()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_yield_value<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let value = executor.pop_value()?;
+    Ok(StepResult::Yield(value))
+}
+
+pub fn execute_get_len<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let obj = executor.peek_at(0)?;
+    let len = executor.get_len(obj)?;
+    executor.push_value(len)?;
+    Ok(StepResult::Continue)
+}
+
+// Template strings (PEP 750) — `t"hello {name}"`. Stack: [strings, interps].
+// PyPy has no equivalent; we consume the operands and push a 2-tuple
+// that preserves the strings+interpolations structure. Sufficient for
+// module import; real Template type semantics are not implemented.
+pub fn execute_build_template<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_build_interpolation<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::BuildInterpolation { format } = instruction else {
+        unreachable!()
+    };
+    let oparg_val = u32::from(format.get(op_arg));
+    let has_format_spec = (oparg_val & 1) != 0;
+    if has_format_spec {
+        // `let _ = expr?` rewritten as a plain expression-statement to
+        // stay inside the Rust-AST adapter's RPython-orthodox subset
+        // (Position-2 adaptation; the adapter's `lower_let` accepts
+        // `Pat::Ident` / `Pat::Type(Pat::Ident)` only — there is no
+        // upstream analogue for binding `_`).
+        executor.pop_value()?;
+    }
+    // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
+    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    Ok(StepResult::Continue)
+}
+
+// LOAD_SPECIAL: pops obj, pushes (callable, self_or_null). Used by the
+// `with` statement to load __enter__ / __exit__.
+pub fn execute_load_special<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: NamespaceOpcodeHandler,
+{
+    let Instruction::LoadSpecial { method } = instruction else {
+        unreachable!()
+    };
+    // Last arm is `_` (covers `SpecialMethod::AExit`) so the
+    // Rust-AST adapter's variant cascade has the wildcard arm
+    // it needs to close the final isinstance fork (Position-2
+    // adaptation; the adapter cannot enumerate the variant
+    // universe from `syn::ItemFn` alone).
+    let name = match method.get(op_arg) {
+        SpecialMethod::Enter => "__enter__",
+        SpecialMethod::Exit => "__exit__",
+        SpecialMethod::AEnter => "__aenter__",
+        _ => "__aexit__",
+    };
+    executor.load_method(name)?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_make_function<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -2828,10 +2913,7 @@ where
         Instruction::StoreAttr { .. } => execute_store_attr(executor, code, instruction, op_arg),
 
         // ── Generators ──
-        Instruction::YieldValue { .. } => {
-            let value = executor.pop_value()?;
-            Ok(StepResult::Yield(value))
-        }
+        Instruction::YieldValue { .. } => execute_yield_value(executor),
 
         // All other opcodes fall through to unsupported handler.
         // Remaining opcodes (closures, exceptions, imports) will be added
@@ -2862,28 +2944,9 @@ where
         Instruction::BuildSet { .. } => execute_build_set(executor, instruction, op_arg),
         Instruction::BuildSlice { .. } => execute_build_slice(executor, instruction, op_arg),
         Instruction::BuildString { .. } => execute_build_string(executor, instruction, op_arg),
-        // Template strings (PEP 750) — `t"hello {name}"`. Stack: [strings, interps].
-        // PyPy has no equivalent; we consume the operands and push a 2-tuple
-        // that preserves the strings+interpolations structure. Sufficient for
-        // module import; real Template type semantics are not implemented.
-        Instruction::BuildTemplate => {
-            OpcodeStepExecutor::build_tuple(executor, 2)?;
-            Ok(StepResult::Continue)
-        }
-        Instruction::BuildInterpolation { format } => {
-            let oparg_val = u32::from(format.get(op_arg));
-            let has_format_spec = (oparg_val & 1) != 0;
-            if has_format_spec {
-                // `let _ = expr?` rewritten as a plain expression-statement to
-                // stay inside the Rust-AST adapter's RPython-orthodox subset
-                // (Position-2 adaptation; the adapter's `lower_let` accepts
-                // `Pat::Ident` / `Pat::Type(Pat::Ident)` only — there is no
-                // upstream analogue for binding `_`).
-                executor.pop_value()?;
-            }
-            // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
-            OpcodeStepExecutor::build_tuple(executor, 2)?;
-            Ok(StepResult::Continue)
+        Instruction::BuildTemplate => execute_build_template(executor),
+        Instruction::BuildInterpolation { .. } => {
+            execute_build_interpolation(executor, instruction, op_arg)
         }
         Instruction::ListExtend { .. } => execute_list_extend(executor, instruction, op_arg),
         Instruction::SetAdd { .. } => execute_set_add(executor, instruction, op_arg),
@@ -2950,12 +3013,7 @@ where
         Instruction::ConvertValue { .. } => execute_convert_value(executor, instruction, op_arg),
 
         // ── Sequence matching ──
-        Instruction::GetLen => {
-            let obj = executor.peek_at(0)?;
-            let len = executor.get_len(obj)?;
-            executor.push_value(len)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::GetLen => execute_get_len(executor),
 
         // ── Loop / generator control ──
         Instruction::JumpBackwardNoInterrupt { .. } => {
@@ -2981,11 +3039,7 @@ where
         }
 
         // ── Pattern matching (Python 3.10+) ──
-        Instruction::MatchMapping | Instruction::MatchSequence => {
-            // Stub: push False
-            executor.match_stub()?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::MatchMapping | Instruction::MatchSequence => execute_match_stub(executor),
 
         // ── Unpack extended ──
         Instruction::UnpackEx { .. } => execute_unpack_ex(executor, instruction, op_arg),
@@ -3015,20 +3069,8 @@ where
         // Used by `with` statement to load __enter__ / __exit__.
         // RustPython: frame.rs LoadSpecial, delegates to get_special_method.
         // Pyre: delegate to load_method with the special method name.
-        Instruction::LoadSpecial { method } => {
-            // Last arm is `_` (covers `SpecialMethod::AExit`) so the
-            // Rust-AST adapter's variant cascade has the wildcard arm
-            // it needs to close the final isinstance fork (Position-2
-            // adaptation; the adapter cannot enumerate the variant
-            // universe from `syn::ItemFn` alone).
-            let name = match method.get(op_arg) {
-                SpecialMethod::Enter => "__enter__",
-                SpecialMethod::Exit => "__exit__",
-                SpecialMethod::AEnter => "__aenter__",
-                _ => "__aexit__",
-            };
-            executor.load_method(name)?;
-            Ok(StepResult::Continue)
+        Instruction::LoadSpecial { .. } => {
+            execute_load_special(executor, instruction, op_arg)
         }
         Instruction::ExitInitCheck => Ok(StepResult::Continue),
         // CPython 3.14 WITH_EXCEPT_START:
