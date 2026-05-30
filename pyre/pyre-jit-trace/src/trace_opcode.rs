@@ -7700,6 +7700,11 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
                                                      // wrong arg count (bridge fails to compile) and a backend
                                                      // regalloc panic.  Keep the whole handler region on one concrete
                                                      // (trait) leg so the bridge's framestate matches the loop entry.
+            // PushNull is a bare stack push (delta +1) with no may-force
+            // receiver and no `vsd <= nlocals` underflow guard, so it
+            // routes through the non-zero stack-effect resync alongside
+            // the other pure pushes.
+            | Instruction::PushNull
     )
 }
 
@@ -7877,7 +7882,8 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::StoreFastStoreFast { .. }
         | Instruction::PopExcept
         | Instruction::PushExcInfo
-        | Instruction::PopTop => {
+        | Instruction::PopTop
+        | Instruction::PushNull => {
             // Non-zero stack delta. The walker arm's
             // `setfield_vable_i(valuestackdepth)` emit routes through
             // `vable_setfield` (trace_ctx.rs:2608-2655) which calls
