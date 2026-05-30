@@ -686,8 +686,8 @@ pub use gateway::{
     builtin_code_name, builtin_code_new, builtin_code_new_passthrough_args1,
     builtin_code_new_with_arity, builtin_code_new_with_signature, is_builtin_code,
     make_builtin_function, make_builtin_function_passthrough_args1,
-    make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_with_arity,
+    make_builtin_function_with_arity, make_builtin_function_with_signature,
+    make_module_builtin_function, make_module_builtin_function_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use malachite_bigint::BigInt as PyBigInt;

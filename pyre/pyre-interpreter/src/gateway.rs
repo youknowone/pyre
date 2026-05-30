@@ -703,6 +703,18 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 
+/// `make_builtin_function` for a builtin with a declared argument
+/// `Signature`, so the call path binds keyword arguments into positional
+/// order before the function runs (see `call::bind_kwargs_to_signature`).
+pub fn make_builtin_function_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, None, signature);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
 pub fn make_builtin_function_with_arity(
     name: &'static str,
