@@ -5127,15 +5127,11 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else {
         String::new()
     };
-    // `newformat.py format(value, spec)`: an empty spec yields
-    // `str(value)`, a non-empty spec routes through the shared
-    // format-spec parser — the same path f-string `{v:spec}` and
+    // `PyObject_Format(value, spec)`: dispatch to a user-defined
+    // `__format__` when present, else the shared spec parser (empty spec →
+    // `str(value)`) — the same path f-string `{v:spec}` and
     // `"{:spec}".format(v)` use, so all three produce identical output.
-    let s = if spec.is_empty() {
-        unsafe { crate::py_str(value) }
-    } else {
-        crate::type_methods::format_with_spec_public(value, &spec)
-    };
+    let s = crate::type_methods::format_value_dispatch(value, &spec)?;
     Ok(w_str_new(&s))
 }
 

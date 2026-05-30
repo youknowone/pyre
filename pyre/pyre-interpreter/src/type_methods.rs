@@ -973,11 +973,7 @@ fn format_render(
             } else {
                 spec
             };
-            let formatted = if resolved_spec.is_empty() {
-                unsafe { crate::py_str(converted) }
-            } else {
-                format_with_spec(converted, &resolved_spec)
-            };
+            let formatted = format_value_dispatch(converted, &resolved_spec)?;
             result.push_str(&formatted);
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
             result.push('}');
@@ -1256,6 +1252,36 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
 /// `str.format` so both surfaces share the spec semantics.
 pub fn format_with_spec_public(val: PyObjectRef, spec: &str) -> String {
     format_with_spec(val, spec)
+}
+
+/// `PyObject_Format` — when `val` is a class instance whose type defines
+/// `__format__`, dispatch to it (the result must be a `str`); otherwise
+/// apply the shared builtin spec parser, with an empty spec collapsing to
+/// `str(value)`.  Shared by `format()`, the `FormatSimple`/`FormatWithSpec`
+/// f-string opcodes, and `str.format` field formatting.
+pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<String, crate::PyError> {
+    unsafe {
+        if is_instance(val) && crate::baseobjspace::lookup(val, "__format__").is_some() {
+            let spec_obj = pyre_object::w_str_new(spec);
+            let result = crate::baseobjspace::call_method(val, "__format__", &[spec_obj]);
+            if result.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::type_error("__format__ failed")));
+            }
+            if !pyre_object::is_str(result) {
+                return Err(crate::PyError::type_error(format!(
+                    "__format__ must return a str, not {}",
+                    (*(*result).ob_type).name
+                )));
+            }
+            return Ok(pyre_object::w_str_get_value(result).to_string());
+        }
+    }
+    if spec.is_empty() {
+        Ok(unsafe { crate::py_str(val) })
+    } else {
+        Ok(format_with_spec_public(val, spec))
+    }
 }
 
 fn format_with_spec(val: PyObjectRef, spec: &str) -> String {

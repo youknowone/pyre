@@ -2189,7 +2189,9 @@ impl OpcodeStepExecutor for PyFrame {
     // ── FormatSimple (str(TOS)) ──
     fn format_simple(&mut self) -> Result<(), PyError> {
         let val = self.pop();
-        let s = unsafe { crate::py_str(val) };
+        // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
+        // invoked with an empty spec, otherwise this is `str(value)`.
+        let s = crate::type_methods::format_value_dispatch(val, "")?;
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -2198,20 +2200,18 @@ impl OpcodeStepExecutor for PyFrame {
     fn format_with_spec(&mut self) -> Result<(), PyError> {
         let spec = self.pop();
         let val = self.pop();
-        // `pypy/objspace/std/newformat.py format(value, spec)` — empty
-        // spec falls through to `space.str_w(space.str(value))`; a
-        // non-empty spec routes through the type's `__format__`.  Pyre
-        // shares the str.format spec parser at
-        // `type_methods::format_with_spec` so f-string `{n:08.3f}` and
-        // `"{:08.3f}".format(n)` produce identical output.
-        let s = unsafe {
-            if pyre_object::is_str(spec) && !pyre_object::w_str_get_value(spec).is_empty() {
-                let spec_str = pyre_object::w_str_get_value(spec).to_string();
-                crate::type_methods::format_with_spec_public(val, &spec_str)
+        // `PyObject_Format(value, spec)` — dispatch to a user-defined
+        // `__format__` when present, else apply the shared spec parser
+        // (empty spec → `str(value)`).  `type_methods::format_value_dispatch`
+        // keeps f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical.
+        let spec_str = unsafe {
+            if pyre_object::is_str(spec) {
+                pyre_object::w_str_get_value(spec).to_string()
             } else {
-                crate::py_str(val)
+                String::new()
             }
         };
+        let s = crate::type_methods::format_value_dispatch(val, &spec_str)?;
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
