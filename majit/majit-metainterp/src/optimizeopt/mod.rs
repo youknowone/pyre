@@ -771,6 +771,21 @@ pub struct OptContext {
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<majit_ir::OpRc>,
+    /// Recorder trace ops the box pool bound at the recorder→TreeLoop
+    /// handoff (`history.rs with_box_pool` / `box.rs bind_ops`),
+    /// snapshotted once from `box_pool` at optimizer setup. These are the
+    /// real input ops (e.g. the `IntLt`/`GetfieldGcPureI` operands of a
+    /// recorded loop) whose producer `Op` is shared by `Rc` with the
+    /// bound box but is absent from `new_operations` / `phase1_emit_ops` /
+    /// `resop_refs` — previously reachable only via `box_pool`'s binding.
+    /// `find_producer_op` consults this as the lowest-priority store so a
+    /// later emission at the same position always wins; it lets the
+    /// `resolve_to_boxref` `box_pool` tail stop firing for these bound
+    /// resops (the remaining tail is unbound role2 boxes + synthetic test
+    /// fixtures). Forward-compatible with #103: once the recorder hands its
+    /// ops as `Vec<OpRc>`, this is populated from that directly instead of
+    /// from `box_pool`.
+    pub(crate) input_ops: Vec<majit_ir::OpRc>,
     /// Per-position BoxRef pool for the input ops being
     /// optimized. `box_pool[i]` mirrors the `AbstractValue` for the
     /// trace position whose `OpRef::raw() == i` (recorder issuance order:
@@ -1588,6 +1603,7 @@ impl OptContext {
             resop_refs: Vec::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),
@@ -1763,9 +1779,21 @@ impl OptContext {
         {
             return Some(op.clone());
         }
-        self.resop_refs
+        if let Some(op) = self
+            .resop_refs
             .get(opref.raw() as usize)
             .and_then(|slot| slot.clone())
+        {
+            return Some(op);
+        }
+        // Lowest-priority store: the recorder's bound input ops (snapshotted
+        // from `box_pool` at setup). Full-OpRef match (collision-safe) so a
+        // type-tagged value never aliases a different one at the same raw.
+        // Consulted last so any live emission / synthetic above wins.
+        self.input_ops
+            .iter()
+            .rfind(|op| op.pos.get() == opref)
+            .cloned()
     }
 
     /// S-8.A.1: mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
@@ -2031,6 +2059,7 @@ impl OptContext {
             resop_refs: Vec::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             box_pool: crate::r#box::BoxPool::new(),

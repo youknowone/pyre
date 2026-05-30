@@ -1965,6 +1965,16 @@ impl Optimizer {
         // RPython parity: the optimizer sees the identical AbstractValue
         // objects flowing in from the tracer.
         ctx.box_pool = box_pool;
+        // Snapshot the recorder's bound trace ops into the canonical
+        // `find_producer_op` surface so input ops bound at the
+        // recorder→TreeLoop handoff resolve without the `resolve_to_boxref`
+        // `box_pool` tail. One setup read replaces N per-resolve `box_pool`
+        // reads; full-OpRef-keyed in `find_producer_op` (collision-safe).
+        ctx.input_ops = ctx
+            .box_pool
+            .iter_indexed()
+            .filter_map(|(_, b)| b.bound_op())
+            .collect();
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
