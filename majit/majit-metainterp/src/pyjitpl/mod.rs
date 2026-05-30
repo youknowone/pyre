@@ -1309,7 +1309,7 @@ pub struct JitHooks {
 /// stores it inline on `OpRef::ConstPtr(GcRef)` so each `&mut
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
-fn walk_op_const_ptr_refs(op: &mut Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args.borrow_mut().iter_mut() {
         if let Some(slot) = arg.as_const_ptr_mut() {
             visitor(slot);
@@ -1440,7 +1440,7 @@ impl<M: Clone> MetaInterp<M> {
         let Some(trace_ctx) = self.tracing.as_mut() else {
             return;
         };
-        for op in trace_ctx.recorder.ops_mut() {
+        for op in trace_ctx.recorder.ops() {
             walk_op_const_ptr_refs(op, &mut visitor);
         }
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
@@ -5469,7 +5469,9 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
-        let bridge_ops = ctx.ops().to_vec();
+        // `ctx.ops()` yields `&[OpRc]`; the bridge compile helpers consume
+        // `&[Op]`, so materialize an owned value copy here.
+        let bridge_ops: Vec<majit_ir::Op> = ctx.ops().iter().map(|op| (**op).clone()).collect();
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputarg_types()

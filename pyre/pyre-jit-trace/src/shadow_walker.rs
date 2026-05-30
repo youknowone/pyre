@@ -327,7 +327,7 @@ pub fn shadow_validate_pre(
         .ctx()
         .ops()
         .get(pre_pos._pos..walker_post_pos._pos)
-        .map(|s| s.to_vec())
+        .map(|s| s.iter().map(|op| (**op).clone()).collect())
         .unwrap_or_default();
 
     // Roll recorder + sym fields back so the trait dispatch sees its
@@ -363,7 +363,7 @@ pub fn shadow_validate_post(miframe: &mut MIFrame, outcome: ShadowOutcome) {
         .ctx()
         .ops()
         .get(outcome.pre_pos._pos..post_pos._pos)
-        .map(|s| s.to_vec())
+        .map(|s| s.iter().map(|op| (**op).clone()).collect())
         .unwrap_or_default();
     if let Some(diff) = diff_recorded_ops(&trait_ops, &outcome.walker_ops) {
         panic!("{}", diff);

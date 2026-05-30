@@ -11,7 +11,7 @@
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type};
 
 use crate::r#box::BoxRef;
 
@@ -111,8 +111,10 @@ pub enum SnapshotTagged {
 }
 
 pub struct Trace {
-    /// Recorded operations.
-    ops: Vec<Op>,
+    /// Recorded operations. Stored as `Rc<Op>` so a single `Op` identity
+    /// flows from the recorder through the `TreeLoop` handoff to the
+    /// optimizer's `box_pool` bindings (`AbstractValue` object identity).
+    ops: Vec<OpRc>,
     /// Input arguments to the trace (live variables at the loop header).
     inputargs: Vec<InputArg>,
     /// Next OpRef index to assign.
@@ -204,9 +206,9 @@ impl Trace {
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let mut op = Op::new(opcode, args);
+        let op = Op::new(opcode, args);
         op.pos.set(opref);
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         // H-2.1 parallel BoxRef: `AbstractResOp` mirror.
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
@@ -227,9 +229,9 @@ impl Trace {
     ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let mut op = Op::with_descr(opcode, args, descr);
+        let op = Op::with_descr(opcode, args, descr);
         op.pos.set(opref);
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
@@ -254,12 +256,12 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let mut op = match descr {
+        let op = match descr {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
         };
         op.pos.set(opref);
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
@@ -281,13 +283,13 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let mut op = match descr {
+        let op = match descr {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
         };
         op.pos.set(opref);
         op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
@@ -300,7 +302,7 @@ impl Trace {
     /// Set rd_resume_position on the last recorded op.
     /// Called after record_guard* to associate a snapshot.
     pub fn set_last_op_resume_position(&mut self, snapshot_id: i32) {
-        if let Some(op) = self.ops.last_mut() {
+        if let Some(op) = self.ops.last() {
             op.rd_resume_position.set(snapshot_id);
         }
     }
@@ -318,7 +320,7 @@ impl Trace {
     pub fn set_op_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
         let op = self
             .ops
-            .iter_mut()
+            .iter()
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
@@ -330,7 +332,7 @@ impl Trace {
     /// without stamping a tracer-stage descr (codex #3 /
     /// pyjitpl.py:2548 generate_guard parity).
     pub fn set_last_op_fail_arg_types(&mut self, types: Vec<Type>) {
-        if let Some(op) = self.ops.last_mut() {
+        if let Some(op) = self.ops.last() {
             op.set_fail_arg_types(types);
         }
     }
@@ -351,12 +353,12 @@ impl Trace {
         // virtualizable arrays change depth. The optimizer (OptUnroll preamble
         // peeling) bridges the gap by creating a Label with the extended count.
         let opref = OpRef::op_typed(self.op_count, OpCode::Jump.result_type());
-        let mut op = match descr {
+        let op = match descr {
             Some(descr) => Op::with_descr(OpCode::Jump, jump_args, descr),
             None => Op::new(OpCode::Jump, jump_args),
         };
         op.pos.set(opref);
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         self.box_pool
             .push(BoxRef::new_resop(OpCode::Jump.result_type(), self.op_count));
         self.op_count += 1;
@@ -369,9 +371,9 @@ impl Trace {
     /// `finish_args` are the values returned from the trace.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
         let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
-        let mut op = Op::with_descr(OpCode::Finish, finish_args, descr);
+        let op = Op::with_descr(OpCode::Finish, finish_args, descr);
         op.pos.set(opref);
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
         self.box_pool.push(BoxRef::new_resop(
             OpCode::Finish.result_type(),
             self.op_count,
@@ -387,7 +389,7 @@ impl Trace {
     /// history.py parity: the recording phase ends and the trace is handed
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
-    pub fn into_parts(self) -> (Vec<InputArg>, Vec<Op>, crate::r#box::BoxPool) {
+    pub fn into_parts(self) -> (Vec<InputArg>, Vec<OpRc>, crate::r#box::BoxPool) {
         (self.inputargs, self.ops, self.box_pool)
     }
 
@@ -396,7 +398,9 @@ impl Trace {
     /// Snapshots are NOT included — callers that need them should use
     /// `TraceCtx::into_tree_loop` instead.
     pub fn get_trace(self) -> crate::history::TreeLoop {
-        crate::history::TreeLoop::with_box_pool(self.inputargs, self.ops, Vec::new(), self.box_pool)
+        // `self.ops` is already `Vec<OpRc>`; `from_oprc` preserves that
+        // shared identity so the box_pool binds to the recorder's ops.
+        crate::history::TreeLoop::from_oprc(self.inputargs, self.ops, Vec::new(), self.box_pool)
     }
 
     /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
@@ -453,16 +457,8 @@ impl Trace {
     }
 
     /// Access the recorded operations.
-    pub fn ops(&self) -> &[Op] {
+    pub fn ops(&self) -> &[OpRc] {
         &self.ops
-    }
-
-    /// Mutable view of the recorded operations. Used by minor-collection
-    /// root walkers (framework.py `root_walker.walk_roots`) to forward
-    /// nursery-resident `ConstPtr.value` slots stored inline in
-    /// `op.args` / `op.fail_args` per history.py:314.
-    pub fn ops_mut(&mut self) -> &mut [Op] {
-        &mut self.ops
     }
 
     /// Test-only direct append. Production callers go through
@@ -471,7 +467,7 @@ impl Trace {
     /// the op-graph storage without driving the full record path.
     #[cfg(test)]
     pub fn push_op_for_test(&mut self, op: Op) {
-        self.ops.push(op);
+        self.ops.push(OpRc::new(op));
     }
 
     /// Access the recorded input arguments.
@@ -481,7 +477,10 @@ impl Trace {
 
     /// Get an operation by its OpRef position.
     pub fn get_op_by_pos(&self, pos: OpRef) -> Option<&Op> {
-        self.ops.iter().find(|op| op.pos.get() == pos)
+        self.ops
+            .iter()
+            .find(|op| op.pos.get() == pos)
+            .map(|op| &**op)
     }
 
     /// Get an operation by its raw u32 position, ignoring the variant
@@ -489,7 +488,10 @@ impl Trace {
     /// knowing each op's RPython `box.type` upfront — the typed lookup
     /// `get_op_by_pos` requires the variant to match (variant-aware Eq).
     pub fn get_op_by_raw_pos(&self, raw: u32) -> Option<&Op> {
-        self.ops.iter().find(|op| op.pos.get().raw() == raw)
+        self.ops
+            .iter()
+            .find(|op| op.pos.get().raw() == raw)
+            .map(|op| &**op)
     }
 
     /// BoxRef for the value recorded at `position` (= `op_count` at

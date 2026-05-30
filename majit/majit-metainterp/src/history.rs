@@ -2239,7 +2239,9 @@ impl TraceCtx {
         // sees the same `Rc<Box>` allocations created during tracing —
         // RPython parity for `AbstractValue` object identity.
         let (inputargs, ops, box_pool) = self.recorder.into_parts();
-        crate::history::TreeLoop::with_box_pool(inputargs, ops, self.snapshots, box_pool)
+        // `ops` is already `Vec<OpRc>`; `from_oprc` preserves the recorder's
+        // shared `Rc<Op>` identity through the box_pool binding.
+        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots, box_pool)
     }
 
     /// Snapshot slice accessor — Pyre-level parity with
@@ -2251,7 +2253,7 @@ impl TraceCtx {
     /// Op slice accessor — returns the raw recorded operations. After
     /// Step 2e.2b this materializes via `ByteTraceIter::next` walking
     /// the byte stream.
-    pub fn ops(&self) -> &[Op] {
+    pub fn ops(&self) -> &[majit_ir::OpRc] {
         self.recorder.ops()
     }
 
