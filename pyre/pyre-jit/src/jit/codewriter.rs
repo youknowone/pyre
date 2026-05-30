@@ -9455,10 +9455,15 @@ impl CodeWriter {
         //
         // EMPIRICALLY VALIDATED (#73, 2026-05-31): this subset passes the
         // full check.py gate (dynasm 39/39, correctness + 8-benchmark
-        // performance, no regression).  The only remaining active pass still
-        // gated on a graph-driven drain (#73) is `ssa_to_ssi`, which ADDS
-        // inputargs/link-args (5/25 synthetic fail) the inline drain has no
-        // register slots for.  The other `all_passes` entries are structural
+        // performance, no regression).  The only remaining active pass is
+        // `ssa_to_ssi`, gated on the walker producing COMPLETE SSA graphs:
+        // wiring it crashes 5/25 synthetic at `backendopt_ssa.rs:316`
+        // ("no way to give a value to v"), because the walker's dual-write
+        // graph has "free" variable uses it threads via the register/slot
+        // model rather than through graph inputargs — an incomplete SSA graph
+        // that ssa_to_ssi (correctly, as RPython would) rejects.  Completing
+        // it needs the walker to thread every value through the graph (#73),
+        // not a drain bridge.  The other `all_passes` entries are structural
         // no-ops on today's empty-`operations` walker blocks (see their
         // classification in `simplify.rs`).
         super::simplify::transform_dead_op_vars(&graph);
