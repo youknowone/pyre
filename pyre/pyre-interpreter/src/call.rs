@@ -504,6 +504,25 @@ pub fn call_user_function_resolved(
     eval_fn(&mut func_frame)
 }
 
+/// Invoke a builtin's function pointer for a positional-only call,
+/// packing the `*args` tuple / `**kwargs` dict tail when the builtin's
+/// `Signature` declares one.  A variadic builtin is registered with
+/// `HOPELESS` arity (see `make_builtin_function_with_arity_and_maybe_sig`),
+/// so even a no-keyword call must materialize the (possibly empty) tail
+/// slots the `#[pyre_function]` wrapper reads.  Non-variadic builtins keep
+/// the raw `func(args)` fast path.
+fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+    let func = unsafe { builtin_code_get(code) };
+    if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
+        if sig.has_vararg() || sig.has_kwarg() {
+            let fname = unsafe { crate::builtin_code_name(code) };
+            let bound = bind_kwargs_to_signature(sig, fname, args, &[])?;
+            return func(&bound);
+        }
+    }
+    func(args)
+}
+
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
@@ -578,8 +597,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
                 return Ok(w_res);
             }
             let code = unsafe { crate::getcode(callable) };
-            let func = unsafe { builtin_code_get(code as pyre_object::PyObjectRef) };
-            func(args)
+            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         },
         |callable| call_user_function(frame, callable, args),
     )
@@ -691,8 +709,7 @@ pub fn call_callable_inline_residual(
         callable,
         |callable| {
             let code = unsafe { crate::getcode(callable) };
-            let func = unsafe { builtin_code_get(code as pyre_object::PyObjectRef) };
-            func(args)
+            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
         },
         |callable| call_user_function_plain(frame, callable, args),
     )
