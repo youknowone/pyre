@@ -3982,6 +3982,17 @@ fn try_execute_residual_call_via_executor(
     if !allboxes[0].is_constant() {
         return None;
     }
+    // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
+    // carry no value the walk needs to specialize on — the only reason to run
+    // one would be its side effect.  But the walk traces the loop body that
+    // the loop itself re-executes (interpreted tier-1 then compiled), so
+    // committing the side effect here double-applies it to the live heap
+    // (`xs[j] = xs[j] + i` lands twice → the traced iteration is counted
+    // twice).  The trait tracer records these symbolically and never touches
+    // the real heap; mirror that by leaving the side effect to the loop.
+    if call_descr.result_type() == majit_ir::Type::Void {
+        return None;
+    }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
