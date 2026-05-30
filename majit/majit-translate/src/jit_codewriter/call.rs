@@ -5782,12 +5782,13 @@ fn collect_readwrite_effects(
                     // False)` (`descr.py:359`) so headerless array-of-structs
                     // shapes hash to a different bitstring slot than
                     // length-prefixed shapes of the same item type.
-                    let len_offset =
-                        if crate::front::syn_metadata::nolength_from_array_type_id(resolved_id.as_deref()) {
-                            None
-                        } else {
-                            Some(0)
-                        };
+                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                        resolved_id.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,
@@ -5852,12 +5853,13 @@ fn collect_readwrite_effects(
                     // (`descr.py:359`) so headerless array-of-structs shapes
                     // do not alias length-prefixed ones at the EffectInfo
                     // bitset.
-                    let len_offset =
-                        if crate::front::syn_metadata::nolength_from_array_type_id(resolved_id.as_deref()) {
-                            None
-                        } else {
-                            Some(0)
-                        };
+                    let len_offset = if crate::front::syn_metadata::nolength_from_array_type_id(
+                        resolved_id.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref(None)),
                         &resolved_id,

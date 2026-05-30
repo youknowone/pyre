@@ -207,10 +207,9 @@ pub fn build_semantic_program_from_llbcs(
 /// Build a [`SemanticProgram`] by lowering every local function
 /// declaration in `llbc`.
 ///
-/// This is the MIR-driven analog of
-/// [`crate::front::ast::build_semantic_program_from_parsed_files`]
-/// and the entry point Step 4 swaps into the production pipeline at
-/// `lib.rs:134`.
+/// This is the MIR-driven analog of the retired syn-AST
+/// `build_semantic_program_from_parsed_files`, and the entry point
+/// Step 4 swaps into the production pipeline at `lib.rs:134`.
 ///
 /// **Whole-program metadata** (`known_struct_names`,
 /// `known_trait_names`, `struct_fields`) is populated from

@@ -19,10 +19,9 @@ pub struct ExtractedOpcodeArm {
     /// Set when the arm body is a single tail-call to a lifted
     /// per-opcode handler free fn (`execute_<op>(dispatcher params)`).
     /// In that case `body_graph` is the mechanically synthesized
-    /// dispatcher-shaped wrapper (not the syn-AST lowering), and this
-    /// records the handler's [`CallPath`] — the seam that lets the JIT
-    /// resolve the Charon/MIR handler graph by name instead of
-    /// re-lowering the arm body through `front::ast`.
+    /// dispatcher-shaped wrapper, and this records the handler's
+    /// [`CallPath`] — the seam that lets the JIT resolve the Charon/MIR
+    /// handler graph by name instead of re-lowering the arm body.
     pub mir_handler_path: Option<CallPath>,
 }
 
@@ -1047,7 +1046,11 @@ fn collect_trait_impls_from_items(
                     // with use-site lookups when the receiver type is referenced
                     // via a `use <path> as alias` form.
                     let self_ty_root = type_root_ident(self_ty).map(|t| {
-                        crate::front::semantic::qualify_type_name_with_imports(&t, prefix, use_imports)
+                        crate::front::semantic::qualify_type_name_with_imports(
+                            &t,
+                            prefix,
+                            use_imports,
+                        )
                     });
                     let mut methods: Vec<MethodInfo> = Vec::new();
                     for item in &impl_block.items {
@@ -1570,8 +1573,8 @@ fn detect_single_tail_call(body: &syn::Expr) -> Option<(CallPath, Vec<String>)> 
 /// e.g. `Ok(StepResult::Continue)`.  `wrapper_*` is the transparent
 /// result/option ctor (`Ok`/`Err`/`Some`); `inner_*` is the synthetic
 /// unit-variant ctor it wraps.  Carries the owner/leaf split so the
-/// synthesizer reproduces the exact two-`Call` chain `front::ast` emits
-/// for the same body, WITHOUT the syn-AST graph builder.
+/// synthesizer builds the exact two-`Call` chain directly, with no
+/// syn-AST graph builder.
 struct WrappedUnitVariantReturn {
     wrapper_owner: Vec<String>,
     wrapper_name: String,
@@ -1591,9 +1594,8 @@ fn path_owner_leaf(segments: &[String]) -> (Vec<String>, String) {
 /// and the single argument is a synthetic unit-variant path
 /// (`StepResult::Continue`, …).  A leading single-statement block
 /// (`{ Ok(StepResult::Continue) }`) is unwrapped.  Returns the
-/// owner/leaf split of both ctors so the synthesizer can reproduce the
-/// two-`Call` chain `front::ast::lower_expr_into_graph_with_signature`
-/// emits for the same body.  Anything else (other call shapes, method
+/// owner/leaf split of both ctors so the synthesizer can build the
+/// two-`Call` chain directly.  Anything else (other call shapes, method
 /// calls, non-allowlisted paths, multi-arg wrappers) returns `None`.
 fn detect_wrapped_unit_variant_return(body: &syn::Expr) -> Option<WrappedUnitVariantReturn> {
     use crate::front::syn_metadata::{
@@ -1645,9 +1647,7 @@ fn detect_wrapped_unit_variant_return(body: &syn::Expr) -> Option<WrappedUnitVar
 }
 
 /// Build the dispatcher-shaped wrapper graph for a single-tail-call arm
-/// mechanically, reproducing what
-/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
-/// body but WITHOUT the syn-AST graph builder.  Shape: one
+/// mechanically, with no syn-AST graph builder.  Shape: one
 /// `OpKind::Input` per dispatcher parameter (in signature order, typed
 /// via `classify_fn_arg_ty`) as the startblock inputargs, then one
 /// `OpKind::Call` to `handler_path` forwarding the mapped inputarg vars
@@ -1751,10 +1751,8 @@ fn push_dispatcher_inputargs(graph: &mut crate::model::FunctionGraph, sig: &syn:
 }
 
 /// Build the dispatcher-shaped wrapper graph for a constant-return arm
-/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`),
-/// reproducing exactly what
-/// `front::ast::lower_expr_into_graph_with_signature` emits for the same
-/// body but WITHOUT the syn-AST graph builder.  Shape: one
+/// (`Wrapper(Owner::Variant)`, e.g. `Ok(StepResult::Continue)`), with no
+/// syn-AST graph builder.  Shape: one
 /// `OpKind::Input` per dispatcher parameter as the startblock inputargs,
 /// then a 0-arg `SyntheticTransparentCtor` Call for the inner
 /// unit-variant, then a 1-arg `SyntheticTransparentCtor` Call for the
@@ -1888,9 +1886,8 @@ fn detect_raise_stub_return(body: &syn::Expr) -> Option<RaiseStubReturn> {
 
 /// Build the dispatcher-shaped wrapper graph for a raise-stub arm
 /// (`Wrapper(FnPath(<lit>).method())`, e.g.
-/// `Err(crate::PyError::type_error("...").into())`), reproducing exactly
-/// what `front::ast::lower_expr_into_graph_with_signature` emits for the
-/// same body but WITHOUT the syn-AST graph builder.  Shape: the
+/// `Err(crate::PyError::type_error("...").into())`), with no syn-AST
+/// graph builder.  Shape: the
 /// dispatcher inputargs, then an `Abort` for the untranslatable literal,
 /// then a `FunctionPath` Call (the ctor fn) consuming it, then a `Method`
 /// Call (the `.into()` adapter), then the transparent result/option
