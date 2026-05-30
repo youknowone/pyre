@@ -2168,6 +2168,59 @@ mod tests {
         assert!(detect_wrapped_unit_variant_return(&non_variant).is_none());
     }
 
+    /// Normalize the process-global `Variable.id` allocation counter out
+    /// of a Debug dump (`id: 13` -> `id: _`), leaving `BlockId(n)` and
+    /// per-graph vids intact, so two structurally-identical graphs built
+    /// at different points in the global allocation sequence compare equal.
+    fn strip_var_ids(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(pos) = rest.find("id: ") {
+            out.push_str(&rest[..pos + 4]);
+            rest = &rest[pos + 4..];
+            let digits_end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits_end > 0 {
+                out.push('_');
+                rest = &rest[digits_end..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn wrapped_unit_variant_synthesis_matches_ast_lowering() {
+        // The synthesized const-return startblock must be byte-identical to
+        // what `front::ast::lower_expr_into_graph_with_signature` produces
+        // for the same body, so routing the arm off the AST lowerer is
+        // behaviour-preserving.  The startblock Debug (inputargs +
+        // operations + exits, all deterministic Vecs) is compared with the
+        // global `Variable.id` counter normalized away; the graph-level
+        // `variable_to_vid` map is a HashMap with non-deterministic Debug
+        // order and global-id keys, so it is intentionally not compared.
+        let body: syn::Expr = syn::parse_str("Ok(StepResult::Continue)").unwrap();
+        let sig: syn::Signature = syn::parse_str(
+            "fn execute_opcode_step<E>(executor: &mut E, code: &CodeObject, instruction: Instruction, op_arg: OpArg, next_instr: usize) -> Result<StepResult, PyError>",
+        )
+        .unwrap();
+
+        let mut ast_graph = crate::model::FunctionGraph::new("NoOp".to_string());
+        crate::front::ast::lower_expr_into_graph_with_signature(&mut ast_graph, &body, Some(&sig))
+            .expect("AST lowering of Ok(StepResult::Continue) must succeed");
+
+        let ret = detect_wrapped_unit_variant_return(&body).unwrap();
+        let synth_graph = synthesize_wrapped_unit_variant_wrapper("NoOp", &sig, &ret);
+
+        let synth_start = strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
+        let ast_start = strip_var_ids(&format!("{:#?}", ast_graph.block(ast_graph.startblock)));
+        assert_eq!(
+            synth_start, ast_start,
+            "synthesized const-return startblock must match the AST-lowered baseline"
+        );
+    }
+
     #[test]
     fn collect_module_statics_records_const_and_static_decls_at_file_root() {
         let parsed = parse_source(
