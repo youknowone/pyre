@@ -122,6 +122,46 @@ fn format_str_repr(s: &str) -> String {
     out
 }
 
+thread_local! {
+    /// Object pointers currently mid-`py_repr` on this thread.  Guards the
+    /// recursive container branches against unbounded recursion on a
+    /// reference cycle (a list holding itself, a dict valued by itself).
+    /// Mirrors the per-thread reprlist behind `Py_ReprEnter`/`Py_ReprLeave`.
+    static REPR_ACTIVE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII cycle guard.  `enter` returns `None` when `obj` is already being
+/// repr'd on this thread — the caller emits the `...` placeholder — and
+/// otherwise records `obj`, removing it again when the guard drops.
+struct ReprGuard(usize);
+
+impl ReprGuard {
+    fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
+        let key = obj as usize;
+        REPR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&key) {
+                None
+            } else {
+                active.push(key);
+                Some(ReprGuard(key))
+            }
+        })
+    }
+}
+
+impl Drop for ReprGuard {
+    fn drop(&mut self) {
+        REPR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(pos) = active.iter().rposition(|&k| k == self.0) {
+                active.remove(pos);
+            }
+        });
+    }
+}
+
 /// Format a PyObjectRef for debug display.
 ///
 /// # Safety
@@ -151,6 +191,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                 "False".to_string()
             }
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "[...]".to_string();
+            };
             let n = pyre_object::w_list_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
@@ -193,6 +236,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
                     }
                 }
             }
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "(...)".to_string();
+            };
             let n = pyre_object::w_tuple_len(obj);
             let mut parts = Vec::with_capacity(n);
             for i in 0..n {
@@ -212,6 +258,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // `w_dict_items` already routes through `is_module_dict`,
             // so reach for the unified surface instead of casting
             // through the W_DictObject layout.
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return "{...}".to_string();
+            };
             let entries = pyre_object::w_dict_items(obj);
             let mut parts = Vec::with_capacity(entries.len());
             for (k, v) in entries {
@@ -260,9 +309,16 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // → `'%s({%s})' % (typename, items_repr_joined)` for
             // frozenset and `'{%s}' % items_repr_joined` for set.  Empty
             // set keeps the `set()` constructor form.
+            let is_frozen = pyre_object::is_frozenset(obj);
+            let Some(_guard) = ReprGuard::enter(obj) else {
+                return if is_frozen {
+                    "frozenset(...)".to_string()
+                } else {
+                    "set(...)".to_string()
+                };
+            };
             let items = pyre_object::w_set_items(obj);
             let parts: Vec<String> = items.iter().map(|&v| py_repr(v)).collect();
-            let is_frozen = pyre_object::is_frozenset(obj);
             if items.is_empty() {
                 if is_frozen {
                     "frozenset()".to_string()
