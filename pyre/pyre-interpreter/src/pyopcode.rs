@@ -1586,6 +1586,174 @@ pub fn execute_store_slice<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_jump_forward<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ControlFlowOpcodeHandler,
+{
+    let Instruction::JumpForward { delta } = instruction else {
+        unreachable!()
+    };
+    executor.jump_forward(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_jump_backward<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ControlFlowOpcodeHandler,
+{
+    let Instruction::JumpBackward { delta } = instruction else {
+        unreachable!()
+    };
+    executor.jump_backward(jump_target_backward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))
+}
+
+pub fn execute_pop_jump_if_false<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: BranchOpcodeHandler,
+{
+    let Instruction::PopJumpIfFalse { delta } = instruction else {
+        unreachable!()
+    };
+    executor.pop_jump_if_false(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_pop_jump_if_true<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: BranchOpcodeHandler,
+{
+    let Instruction::PopJumpIfTrue { delta } = instruction else {
+        unreachable!()
+    };
+    executor.pop_jump_if_true(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_for_iter<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: IterOpcodeHandler + ControlFlowOpcodeHandler,
+{
+    let Instruction::ForIter { delta } = instruction else {
+        unreachable!()
+    };
+    executor.for_iter(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_pop_jump_if_none<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::PopJumpIfNone { delta } = instruction else {
+        unreachable!()
+    };
+    executor.pop_jump_if_none(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_pop_jump_if_not_none<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::PopJumpIfNotNone { delta } = instruction else {
+        unreachable!()
+    };
+    executor.pop_jump_if_not_none(jump_target_forward(
+        &code.instructions,
+        next_instr,
+        delta.get(op_arg).as_usize(),
+    ))?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_jump_backward_no_interrupt<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: ControlFlowOpcodeHandler,
+{
+    let Instruction::JumpBackwardNoInterrupt { delta } = instruction else {
+        unreachable!()
+    };
+    let tgt = delta.get(op_arg).as_usize();
+    executor.set_next_instr(next_instr - tgt)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_send<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    code: &CodeObject,
+    op_arg: OpArg,
+    next_instr: usize,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let target = jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg));
+    executor.send_value(target)?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_make_function<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
@@ -2611,37 +2779,20 @@ where
 
         Instruction::UnaryInvert => execute_unary_invert(executor),
 
-        Instruction::JumpForward { delta } => {
-            executor.jump_forward(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::JumpForward { .. } => {
+            execute_jump_forward(executor, code, instruction, op_arg, next_instr)
         }
 
-        Instruction::JumpBackward { delta } => executor.jump_backward(jump_target_backward(
-            &code.instructions,
-            next_instr,
-            delta.get(op_arg).as_usize(),
-        )),
-
-        Instruction::PopJumpIfFalse { delta } => {
-            executor.pop_jump_if_false(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::JumpBackward { .. } => {
+            execute_jump_backward(executor, code, instruction, op_arg, next_instr)
         }
 
-        Instruction::PopJumpIfTrue { delta } => {
-            executor.pop_jump_if_true(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::PopJumpIfFalse { .. } => {
+            execute_pop_jump_if_false(executor, code, instruction, op_arg, next_instr)
+        }
+
+        Instruction::PopJumpIfTrue { .. } => {
+            execute_pop_jump_if_true(executor, code, instruction, op_arg, next_instr)
         }
 
         Instruction::MakeFunction => execute_make_function(executor),
@@ -2664,13 +2815,8 @@ where
 
         Instruction::GetIter => execute_get_iter(executor),
 
-        Instruction::ForIter { delta } => {
-            executor.for_iter(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::ForIter { .. } => {
+            execute_for_iter(executor, code, instruction, op_arg, next_instr)
         }
 
         Instruction::EndFor => execute_end_for(executor),
@@ -2754,21 +2900,11 @@ where
         Instruction::ToBool => execute_to_bool(executor),
 
         // ── None comparison jumps ──
-        Instruction::PopJumpIfNone { delta } => {
-            executor.pop_jump_if_none(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::PopJumpIfNone { .. } => {
+            execute_pop_jump_if_none(executor, code, instruction, op_arg, next_instr)
         }
-        Instruction::PopJumpIfNotNone { delta } => {
-            executor.pop_jump_if_not_none(jump_target_forward(
-                &code.instructions,
-                next_instr,
-                delta.get(op_arg).as_usize(),
-            ))?;
-            Ok(StepResult::Continue)
+        Instruction::PopJumpIfNotNone { .. } => {
+            execute_pop_jump_if_not_none(executor, code, instruction, op_arg, next_instr)
         }
 
         // ── Closure 3.11+ ──
@@ -2822,10 +2958,8 @@ where
         }
 
         // ── Loop / generator control ──
-        Instruction::JumpBackwardNoInterrupt { delta } => {
-            let tgt = delta.get(op_arg).as_usize();
-            executor.set_next_instr(next_instr - tgt)?;
-            Ok(StepResult::Continue)
+        Instruction::JumpBackwardNoInterrupt { .. } => {
+            execute_jump_backward_no_interrupt(executor, instruction, op_arg, next_instr)
         }
 
         // ── Load fast and clear (comprehension scope) ──
@@ -2872,12 +3006,7 @@ where
         // yield from: handled by PyFrame override in eval.rs
         Instruction::GetYieldFromIter => execute_get_yield_from_iter(executor),
 
-        Instruction::Send { .. } => {
-            let target =
-                jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg));
-            executor.send_value(target)?;
-            Ok(StepResult::Continue)
-        }
+        Instruction::Send { .. } => execute_send(executor, code, op_arg, next_instr),
 
         Instruction::EndSend => execute_end_send(executor),
 
