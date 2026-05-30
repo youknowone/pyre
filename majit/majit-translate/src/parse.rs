@@ -1505,31 +1505,17 @@ fn extract_match_arms(
                     mir_handler_path: None,
                 };
             }
-            let mut graph = crate::model::FunctionGraph::new(name.clone());
-            // Pre-bind `execute_opcode_step`'s formal parameters as
-            // startblock inputargs so the arm body's `Expr::Path`
-            // references (e.g. `frame`, `instruction`, `executor`)
-            // resolve to those inputargs instead of falling through
-            // to the naked body-`Input` emit that the flowspace
-            // adapter rejects as "adapter cross-block body Input"
-            // (the dominant Cat 2.1 Skip family).  PyPy/RPython parity:
-            // each per-opcode handler method receives the
-            // dispatcher's parameters in its formal signature
-            // (`pypy/interpreter/pyopcode.py:519`,
-            // `rpython/flowspace/model.py:28 startblock.inputargs`).
-            crate::front::ast::lower_expr_into_graph_with_signature(
-                &mut graph,
-                &arm.body,
-                Some(sig),
-                fn_return_types,
-            )
-            .unwrap_or_else(|e| {
-                panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")
-            });
+            // No synthesizer seam matched this arm body (tail-call /
+            // const-return / raise-stub).  With the syn-AST lowerer retired
+            // there is no body graph to build, so the arm carries no JIT entry
+            // and is dispatched by the interpreter.  Every real
+            // `execute_opcode_step` arm matches a seam, so `body_graph: None`
+            // arises only for synthetic inputs and is handled by the dispatch
+            // registrar (`lib.rs` `arm.body_graph.map(..)`).
             ExtractedOpcodeArm {
                 selector,
                 handler_calls,
-                body_graph: Some(graph),
+                body_graph: None,
                 mir_handler_path: None,
             }
         })
@@ -2343,60 +2329,6 @@ mod tests {
         assert!(detect_wrapped_unit_variant_return(&non_variant).is_none());
     }
 
-    /// Normalize the process-global `Variable.id` allocation counter out
-    /// of a Debug dump (`id: 13` -> `id: _`), leaving `BlockId(n)` and
-    /// per-graph vids intact, so two structurally-identical graphs built
-    /// at different points in the global allocation sequence compare equal.
-    fn strip_var_ids(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut rest = s;
-        while let Some(pos) = rest.find("id: ") {
-            out.push_str(&rest[..pos + 4]);
-            rest = &rest[pos + 4..];
-            let digits_end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            if digits_end > 0 {
-                out.push('_');
-                rest = &rest[digits_end..];
-            }
-        }
-        out.push_str(rest);
-        out
-    }
-
-    #[test]
-    fn wrapped_unit_variant_synthesis_matches_ast_lowering() {
-        // The synthesized const-return startblock must be byte-identical to
-        // what `front::ast::lower_expr_into_graph_with_signature` produces
-        // for the same body, so routing the arm off the AST lowerer is
-        // behaviour-preserving.  The startblock Debug (inputargs +
-        // operations + exits, all deterministic Vecs) is compared with the
-        // global `Variable.id` counter normalized away; the graph-level
-        // `variable_to_vid` map is a HashMap with non-deterministic Debug
-        // order and global-id keys, so it is intentionally not compared.
-        let body: syn::Expr = syn::parse_str("Ok(StepResult::Continue)").unwrap();
-        let sig: syn::Signature = syn::parse_str(
-            "fn execute_opcode_step<E>(executor: &mut E, code: &CodeObject, instruction: Instruction, op_arg: OpArg, next_instr: usize) -> Result<StepResult, PyError>",
-        )
-        .unwrap();
-
-        let mut ast_graph = crate::model::FunctionGraph::new("NoOp".to_string());
-        crate::front::ast::lower_expr_into_graph_with_signature(&mut ast_graph, &body, Some(&sig))
-            .expect("AST lowering of Ok(StepResult::Continue) must succeed");
-
-        let ret = detect_wrapped_unit_variant_return(&body).unwrap();
-        let synth_graph = synthesize_wrapped_unit_variant_wrapper("NoOp", &sig, &ret);
-
-        let synth_start =
-            strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
-        let ast_start = strip_var_ids(&format!("{:#?}", ast_graph.block(ast_graph.startblock)));
-        assert_eq!(
-            synth_start, ast_start,
-            "synthesized const-return startblock must match the AST-lowered baseline"
-        );
-    }
-
     #[test]
     fn raise_stub_arm_detection_and_synthesis() {
         let body: syn::Expr = syn::parse_str(
@@ -2425,20 +2357,6 @@ mod tests {
         let start = synth_graph.block(synth_graph.startblock);
         assert_eq!(start.inputargs.len(), 5);
         assert_eq!(start.operations.len(), 9);
-
-        // Byte-identical to the AST-lowered baseline (global Variable.id
-        // counter normalized away). check.py does not exercise async
-        // opcodes, so this equality is the authoritative behaviour check.
-        let mut ast_graph = crate::model::FunctionGraph::new("Async".to_string());
-        crate::front::ast::lower_expr_into_graph_with_signature(&mut ast_graph, &body, Some(&sig))
-            .expect("AST lowering of the async stub must succeed");
-        let synth_start =
-            strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
-        let ast_start = strip_var_ids(&format!("{:#?}", ast_graph.block(ast_graph.startblock)));
-        assert_eq!(
-            synth_start, ast_start,
-            "synthesized raise-stub startblock must match the AST-lowered baseline"
-        );
 
         // Non-matching shapes fall through.
         let const_body: syn::Expr = syn::parse_str("Ok(StepResult::Continue)").unwrap();

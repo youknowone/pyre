@@ -204,49 +204,19 @@
 //!   no longer falls back to AST graph builds; production 39/39
 //!   dynasm + 39/39 cranelift.
 //!
-//!   What remains in `front/ast.rs` (~7936 LOC after Slice 2 extractions):
-//!     - `lower_expr_into_graph_with_signature` and its walker
-//!       infrastructure (still used by
-//!       `parse::extract_opcode_dispatch_arms::extract_match_arms`
-//!       to lower per-arm body graphs).
-//!     - syn-metadata helpers used by `lib.rs` / `parse.rs` /
-//!       `jit_codewriter/call.rs`:
-//!       `collect_program_metadata_pub`, `collect_jit_hints_with_sig`,
-//!       `collect_struct_origins`, `qualify_type_name_with_imports`,
-//!       `qualified_full_type_string`, `synthesize_or_passthrough`,
-//!       `transparent_result_ok_type`, `nolength_from_array_type_id`,
-//!       and the `FlowingError` / `ProgramMetadata` types.
-//!   Final deletion of `front/ast.rs` is blocked on lowering the
-//!   per-arm body-graph builder away from AST (its own multi-session
-//!   project — the metadata helpers are smaller and can move to
-//!   `front/syn_metadata` per Slice 2 as a separate cleanup).
-//!
-//! ### Remaining AST-side CFG shims (Step 6.E)
-//!
-//! Three AST-side CFG-reconstruction shims remain reachable through
-//! the surviving walker (`lower_expr_into_graph_with_signature`):
-//!
-//! - `front::ast::lazy_install_local_at_current_block_var`
-//! - `front::ast::lower_if_expr`'s fallback branch
-//! - `front::ast::GraphBuildContext` per-scope binding tracking
-//!
-//! (`can_thread_variable_to_block` was retired during the Slice 5
-//! deletions — it had no remaining callers.)
-//!
-//! These compensate for the recursive walker's CFG-blindness.  Every
-//! survivor is instantiated directly by
-//! `lower_expr_into_graph_with_signature`
-//! (`front/ast.rs:1055`), which is still production-essential for
-//! `parse::extract_opcode_dispatch_arms::extract_match_arms` per-arm
-//! body lowering.  Retiring the shims therefore requires retiring
-//! that walker first — its own multi-session project (see Slice 5's
-//! "remaining" note above).  The Charon mission's acceptance
-//! criterion is honoured because the AST graph builder is unreachable
-//! in production; only the per-arm body lowerer survives, and only
-//! for the dispatch table.
+//!   front/ast.rs is now DELETED.  The per-arm body-graph walker
+//!   (`lower_expr_into_graph_with_signature`) was retired once every
+//!   `execute_opcode_step` arm routed through a seam synthesizer
+//!   (tail-call / const-return / raise-stub / wildcard tail-call in
+//!   `parse::extract_opcode_dispatch_arms`), so no arm needs syn-AST
+//!   lowering.  The metadata/type helpers it re-exported live in
+//!   `front/semantic` and `front/syn_metadata`; callers reference those
+//!   modules directly.  The three AST-side CFG-reconstruction shims
+//!   (`lazy_install_local_at_current_block_var`, `lower_if_expr`'s
+//!   fallback branch, `GraphBuildContext` per-scope binding tracking)
+//!   were retired with the walker (Step 6.E complete).
 //!
 
-pub mod ast;
 pub mod mir;
 pub mod raise;
 pub mod semantic;
