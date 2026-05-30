@@ -514,6 +514,14 @@ pub struct BuiltinCode {
     /// positional arity 0-4, this equals the arity directly. Builtins
     /// with optional/variadic args use HOPELESS (0x400).
     pub fast_natural_arity: u16,
+    /// gateway.py:743 `BuiltinCode.sig` — the argument `Signature`
+    /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
+    /// keyword arguments into positional order before the function runs.
+    /// `null` means "no declared signature" (positional-only), which is
+    /// every builtin today.  The pointee is leaked to `'static` so the
+    /// raw pointer carries no Drop obligation and is not a GC pointer,
+    /// matching the `func` function-pointer convention.
+    pub sig: *const Signature,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -599,6 +607,7 @@ fn builtin_code_new_full(
         func,
         docstring,
         fast_natural_arity,
+        sig: std::ptr::null(),
     }) as PyObjectRef
 }
 
@@ -628,6 +637,17 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
 #[inline]
 pub unsafe fn builtin_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     unsafe { (*(obj as *const BuiltinCode)).fast_natural_arity }
+}
+
+/// Read the declared argument `Signature` from a BuiltinCode, or `None`
+/// when the builtin is positional-only (`sig` is null — every builtin
+/// today).  The pointee is leaked to `'static`, so the borrow is sound.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_get_signature(obj: PyObjectRef) -> Option<&'static Signature> {
+    unsafe { (*(obj as *const BuiltinCode)).sig.as_ref() }
 }
 
 /// Get the name of a built-in function.
