@@ -1910,11 +1910,18 @@ impl OptContext {
             }
             _ => {}
         }
-        // Transitional `box_pool` tail: (1) ResOp positions whose producer is
-        // absent from every canonical store yet carry a `box_pool`-bound
-        // resop box (rare cross-phase/reshuffle case), and (2) synthetic test
-        // fixtures with no `inputarg_refs`. Retires with the resop-coverage
-        // work and `BoxPool` deletion in S-9.
+        // Transitional `box_pool` tail, test-fixture-only: synthetic
+        // `ctx.box_pool = vec![..]` fixtures populate neither `input_ops`
+        // (snapshotted from bound producers at setup) nor `inputarg_refs`,
+        // so they resolve here. Production resops now resolve through
+        // `find_producer_op` (real producers in `new_operations` /
+        // `phase1_emit_ops` / `resop_refs` / the `input_ops` snapshot of
+        // box-pool-bound recorder ops); production inputargs through the
+        // `inputarg_refs` branch above. Gated `#[cfg(test)]` so the
+        // release binary carries no `box_pool` read here — its survival
+        // until `BoxPool` deletion (S-9) is purely to keep unit fixtures
+        // resolving.
+        #[cfg(test)]
         if let Some(b) = self.box_pool.get(opref) {
             return Some(b.clone());
         }
