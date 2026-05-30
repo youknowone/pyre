@@ -350,6 +350,41 @@ fn typed_alias(
             "expected an unsigned 16-bit integer",
             idx,
         ),
+        "PyCUidT" => (
+            // space.c_uid_t_w — c_uint_w range (0..=UINT_MAX) with one
+            // exception: -1 maps to UINT_MAX (the `(uid_t)-1` sentinel);
+            // values below -1 raise OverflowError rather than ValueError.
+            quote! { u32 },
+            quote! {
+                {
+                    let __v: i64 = unsafe { ::pyre_object::w_int_get_value(args[#idx]) };
+                    if __v == -1 {
+                        u32::MAX
+                    } else if __v < 0 {
+                        return ::std::result::Result::Err(
+                            crate::PyError::overflow_error(
+                                "user/group id smaller than minimum (-1)".to_string()
+                            )
+                        );
+                    } else if __v > 4294967295 {
+                        return ::std::result::Result::Err(
+                            crate::PyError::overflow_error(
+                                "expected an unsigned 32-bit integer".to_string()
+                            )
+                        );
+                    } else {
+                        __v as u32
+                    }
+                }
+            },
+        ),
+        "PyTruncatedInt" => (
+            // space.truncatedint_w — like int_w but truncates instead of
+            // raising OverflowError.  Pyre's int payload is already an
+            // i64, so reading the value is the truncation (intmask).
+            quote! { i64 },
+            quote! { unsafe { ::pyre_object::w_int_get_value(args[#idx]) } },
+        ),
         "PyText0" => (
             // space.text0_w — text_w plus a rejection of embedded NUL.
             quote! { &'static str },
