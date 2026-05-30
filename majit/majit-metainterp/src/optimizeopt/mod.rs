@@ -749,6 +749,17 @@ pub struct OptContext {
     /// upgrades (e.g. in already-installed `Forwarded::Op` chains)
     /// stay valid.
     pub(crate) resop_refs: Vec<Option<majit_ir::resoperation::OpRc>>,
+    /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
+    /// products) that have NOT been superseded by an `emit` at their
+    /// position. The end-of-Phase-1 orphan-binding pass drains this into
+    /// `phase1_emit_ops` so retrace's `Weak<Op>` upgrades stay valid; an
+    /// `emit` that rebinds a position's box off its synthetic removes the
+    /// synthetic here (it stays strongly held by `resop_refs` for lookup,
+    /// but is no longer an orphan needing carry). Tracking liveness
+    /// incrementally by `OpRc` identity sidesteps the flat-OpRef raw/type
+    /// collision that makes the final `resop_refs` / `new_operations` state
+    /// ambiguous about which type-tagged value won a shared raw slot.
+    pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -1575,6 +1586,7 @@ impl OptContext {
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
             resop_refs: Vec::new(),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1764,6 +1776,7 @@ impl OptContext {
             self.resop_refs.resize_with(idx + 1, || None);
         }
         self.resop_refs[idx] = Some(synthetic.clone());
+        self.live_synthetics.push(synthetic.clone());
         synthetic
     }
 
@@ -1915,7 +1928,8 @@ impl OptContext {
             if idx >= self.resop_refs.len() {
                 self.resop_refs.resize_with(idx + 1, || None);
             }
-            self.resop_refs[idx] = Some(op_rc);
+            self.resop_refs[idx] = Some(op_rc.clone());
+            self.live_synthetics.push(op_rc);
         }
     }
 
@@ -1985,6 +1999,7 @@ impl OptContext {
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
             resop_refs: Vec::new(),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -2466,17 +2481,36 @@ impl OptContext {
         // `get_forwarded()` (via the stand-in's slot) and writes it
         // into `op_rc.forwarded` before re-pointing the handle, so
         // forwarded state migrates to the real producer Op.
-        if let Some(b) = self.box_pool.get(op_pos) {
+        let superseded_synthetic = if let Some(b) = self.box_pool.get(op_pos) {
             if b.is_resop() {
-                let bound_is_synthetic = b.bound_op().is_some_and(|bound| {
+                let bound = b.bound_op();
+                let bound_is_synthetic = bound.as_ref().is_some_and(|bound| {
                     self.resop_refs
                         .get(op_pos.raw() as usize)
                         .and_then(|slot| slot.as_ref())
-                        .is_some_and(|synth| std::rc::Rc::ptr_eq(&bound, synth))
+                        .is_some_and(|synth| std::rc::Rc::ptr_eq(bound, synth))
                 });
-                if b.bound_op().is_none() || bound_is_synthetic {
+                if bound.is_none() || bound_is_synthetic {
                     b.bind_op(&op_rc);
                 }
+                // The position's box is moving off its synthetic onto the
+                // real producer; the synthetic is no longer an orphan
+                // needing carry into `phase1_emit_ops` (it survives in
+                // `resop_refs` for lookup / `Weak<Op>` liveness).
+                bound_is_synthetic.then_some(bound).flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(synth) = superseded_synthetic {
+            if let Some(i) = self
+                .live_synthetics
+                .iter()
+                .position(|s| std::rc::Rc::ptr_eq(s, &synth))
+            {
+                self.live_synthetics.swap_remove(i);
             }
         }
         self.new_operations.push(op_rc);

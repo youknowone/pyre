@@ -2444,36 +2444,45 @@ impl Optimizer {
         // `phase1_emit_ops` (and from there into
         // `ExportedState.partial_trace_operations`) so retrace's
         // `Weak<Op>` upgrade succeeds.
-        for (idx, b) in ctx.box_pool.iter_indexed() {
-            if !b.is_resop() {
-                continue;
-            }
-            let synth_stand_in = ctx.resop_refs.get(idx).and_then(|slot| slot.as_ref());
-            let bound = b.bound_op();
-            let bound_is_synthetic = match (&bound, synth_stand_in) {
-                (Some(boxed), Some(synth)) => std::rc::Rc::ptr_eq(boxed, synth),
-                _ => false,
-            };
-            if let Some(bound_rc) = bound {
-                if bound_is_synthetic {
-                    self.phase1_emit_ops.push(bound_rc);
+        // `live_synthetics` is the incrementally-maintained set of synthetic
+        // stand-ins (mint_synthetic_resop / bind_input_resops) whose position
+        // was never superseded by an `emit` — exactly the box-bound-to-synthetic
+        // boxes the old `box_pool.iter_indexed()` walk pushed. The unbound
+        // branch of that walk only ever hit Void boxes (no synthesis), so this
+        // drain reproduces it without reading `box_pool`.
+        #[cfg(debug_assertions)]
+        {
+            let mut old: Vec<*const _> = Vec::new();
+            for (idx, b) in ctx.box_pool.iter_indexed() {
+                if !b.is_resop() {
+                    continue;
                 }
-                continue;
+                let synth_stand_in = ctx.resop_refs.get(idx).and_then(|slot| slot.as_ref());
+                let bound = b.bound_op();
+                let bound_is_synthetic = match (&bound, synth_stand_in) {
+                    (Some(boxed), Some(synth)) => std::rc::Rc::ptr_eq(boxed, synth),
+                    _ => false,
+                };
+                if let Some(bound_rc) = bound {
+                    if bound_is_synthetic {
+                        old.push(std::rc::Rc::as_ptr(&bound_rc));
+                    }
+                    continue;
+                }
+                debug_assert_eq!(
+                    b.type_(),
+                    majit_ir::Type::Void,
+                    "non-Void unbound orphan at idx={idx}"
+                );
             }
-            use majit_ir::resoperation::Op;
-            let opcode = match b.type_() {
-                majit_ir::Type::Int => OpCode::SameAsI,
-                majit_ir::Type::Float => OpCode::SameAsF,
-                majit_ir::Type::Ref => OpCode::SameAsR,
-                majit_ir::Type::Void => continue,
-            };
-            let stand_in = std::rc::Rc::new(Op::new(opcode, &[]));
-            stand_in
-                .pos
-                .set(majit_ir::OpRef::op_typed(idx as u32, b.type_()));
-            b.bind_op(&stand_in);
-            self.phase1_emit_ops.push(stand_in);
+            let mut new: Vec<*const _> =
+                ctx.live_synthetics.iter().map(std::rc::Rc::as_ptr).collect();
+            old.sort();
+            new.sort();
+            debug_assert_eq!(old, new, "live_synthetics diverges from box_pool walk");
         }
+        self.phase1_emit_ops
+            .extend(ctx.live_synthetics.iter().cloned());
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
