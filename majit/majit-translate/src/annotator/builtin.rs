@@ -319,6 +319,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `usize` lattice as `size_of`; called by `object_array.rs` /
     // `pyframe.rs`.
     analyzer_for(&mut reg, "std.mem.align_of", std_mem_align_of);
+    // Rust `String::new()` / `String::with_capacity(n)` construct an empty
+    // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
+    // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
+    // "no analyser registered" error (the formatting helpers in
+    // `type_methods.rs` call them).
+    analyzer_for(&mut reg, "String.new", string_constructor);
+    analyzer_for(&mut reg, "String.with_capacity", string_constructor);
     // External crate `majit_metainterp` bool flag helpers — both
     // qualnames share the same analyzer (returns `SomeBool`).
     analyzer_for(
@@ -1240,6 +1247,20 @@ pub fn std_mem_align_of(
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     std_mem_size_of(bk, args_s, kwds)
+}
+
+/// Analyzer for `String::new()` / `String::with_capacity(n)`.  Both
+/// build an empty owned UTF-8 buffer, so the annotation surface is a
+/// mutable `SomeString` (not `None`; a `String` may hold interior nul
+/// bytes, hence `no_nul = false`).  Registered against the `String.new`
+/// / `String.with_capacity` HOST_ENV stubs so those callsites resolve to
+/// a real lattice value instead of erroring with "no analyser registered".
+pub fn string_constructor(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
