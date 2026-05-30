@@ -971,6 +971,51 @@ fn phase4_resume_coverage(
     targets
 }
 
+/// #238 (P4SUB) probe: does the Variable-keyed CFG coalesce sweep ALONE
+/// reproduce the Ref coloring that the combined `walker_pin_pairs +
+/// cfg_variable_pairs` set produces?  Production seeds the canonical Ref
+/// regalloc with BOTH the walker scratch↔inputarg pins
+/// (`derive_walker_pin_coalesce_pairs`) and the CFG link.args↔inputargs
+/// pairs (`collect_cfg_coalesce_pairs`).  If the CFG sweep alone yields
+/// the same per-Variable color on every Ref Variable, the walker pins
+/// (and `walker_slot_for_variable` behind them) are subsumed and can be
+/// retired — the precondition #248 left open for the Path 4 epic.
+///
+/// Returns `(ref_vars_compared, color_match, color_mismatch,
+/// cfg_only_missing)`: `color_mismatch` counts Ref Variables whose
+/// cfg-only color differs from the combined color; `cfg_only_missing`
+/// counts Variables the combined coloring colors but the cfg-only one
+/// does not (a coverage gap, distinct from a value divergence).  A
+/// graph is pin-subsumed iff `mismatch == 0 && missing == 0`.
+fn phase4_pin_subsumption(
+    graph: &super::flow::FunctionGraph,
+    combined_ref: &super::regalloc::GraphAllocationResult,
+    cfg_variable_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> (u32, u32, u32, u32) {
+    // Re-run the canonical Ref regalloc with the CFG sweep pairs ONLY
+    // (no walker pins), mirroring the production call's enforce step so
+    // the comparison is apples-to-apples.
+    let mut cfg_only = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
+        graph,
+        cfg_variable_pairs,
+    );
+    super::regalloc::enforce_input_args(graph, &mut cfg_only);
+    let cfg_only_ref = &cfg_only[super::flatten::Kind::Ref.index()];
+    let mut compared = 0u32;
+    let mut color_match = 0u32;
+    let mut color_mismatch = 0u32;
+    let mut cfg_only_missing = 0u32;
+    for (&var_id, &combined_color) in &combined_ref.coloring {
+        compared += 1;
+        match cfg_only_ref.coloring.get(&var_id) {
+            Some(&cfg_color) if cfg_color == combined_color => color_match += 1,
+            Some(_) => color_mismatch += 1,
+            None => cfg_only_missing += 1,
+        }
+    }
+    (compared, color_match, color_mismatch, cfg_only_missing)
+}
+
 /// Diagnostic helper: tally per-opname occurrences of the given Insn
 /// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
 /// resulting `Vec<(String, i64)>` is sortable and comparable across
@@ -9799,6 +9844,31 @@ impl CodeWriter {
             &canonical_ref_coalesce_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
+        // #238 (P4SUB) measurement: is the combined `walker_pin_pairs +
+        // cfg_variable_pairs` Ref coloring reproducible from
+        // `cfg_variable_pairs` ALONE?  If so on every bench, the walker
+        // pins (and `walker_slot_for_variable`) are subsumed by the CFG
+        // sweep and can retire (the open question from #248).  Gated by
+        // its own env var (the `phase4_diff_canonical` flag is bound
+        // downstream at the canonical-build block, after the
+        // `graph_regallocs` + `cfg_variable_pairs` borrows this probe
+        // needs go out of scope) — measurement only, no behavior change.
+        if std::env::var("PYRE_P4_PIN_SUBSUMPTION").as_deref() == Ok("1") {
+            let (compared, color_match, color_mismatch, cfg_only_missing) =
+                phase4_pin_subsumption(
+                    &graph,
+                    &graph_regallocs[super::flatten::Kind::Ref.index()],
+                    &cfg_variable_pairs,
+                );
+            let subsumed = color_mismatch == 0 && cfg_only_missing == 0;
+            eprintln!(
+                "[phase4-pin-subsumption] graph={} subsumed={subsumed} \
+                 ref_vars={compared} match={color_match} mismatch={color_mismatch} \
+                 cfg_only_missing={cfg_only_missing} walker_pins={}",
+                ssarepr.name,
+                walker_pin_pairs.len(),
+            );
+        }
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
