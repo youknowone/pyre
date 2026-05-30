@@ -638,6 +638,32 @@ fn full_body_walk_trace(
                 // start_pc closes at the trace head.
                 if loop_header_pc != start_pc {
                     let target_key = crate::driver::make_green_key(w_code, loop_header_pc);
+                    // A cross-loop cut (`cut_trace_from`) will replace the
+                    // trace inputargs with the inner merge point's
+                    // `green_boxes` (the boxes registered when the walk first
+                    // reached this header).  The walker's `jit_merge_point`
+                    // handler registers those from the JitCode merge-point reds
+                    // (`[frame, ec]`, len 2 for the portal jitdriver), but
+                    // `jump_args` here was rebuilt by `close_loop_args_at` with
+                    // the full virtualizable expansion (locals + stack).  When
+                    // the loop virtualizes a heap object (fannkuch's
+                    // permutation list, nbody's body tuples), the forced
+                    // virtuals make `next_iteration_args` longer than the
+                    // reds-only cut inputargs, and the unroll peel reads an
+                    // inputarg slot past the cut list end
+                    // (`inputarg_type_at_strict` out of range).  Registering
+                    // the inner merge point with the virtualizable-expanded
+                    // boxes mid-walk is the deep fix; until then, abort the
+                    // walk on the mismatch so the portal falls back to the
+                    // trait tracer (interpreter), which traces this shape
+                    // correctly.  Loops without a heap virtual (int/float/fib)
+                    // have matching shapes and are unaffected.
+                    let cut_boxes_len = ctx
+                        .get_merge_point_at(target_key, loop_header_pc)
+                        .map(|mp| mp.green_boxes.len());
+                    if cut_boxes_len.is_some_and(|len| len != jump_args.len()) {
+                        return TraceAction::Abort;
+                    }
                     ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
                     ctx.header_pc = loop_header_pc;
                     ctx.cut_inner_green_key = Some(target_key);
