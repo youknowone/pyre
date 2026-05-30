@@ -277,10 +277,14 @@ fn adapter_accepts_execute_opcode_step_when_walker_registers_module() {
 
 #[test]
 fn adapter_rejects_execute_opcode_step_without_walker_at_cast_removal_helper() {
-    // Sister oracle: WITHOUT the walker call, the rejection state is
-    // the pre-walker `UnboundLocal { name }` at one of the
-    // cast-removal helpers (`u32_as_i64` / `u32_as_usize` /
-    // `op_arg_as_usize` / `raise_kind_as_usize`). Documented in
+    // Sister oracle: WITHOUT the walker call, the rejection state is a
+    // pre-walker `UnboundLocal { name }`. Since the dispatch arms were
+    // lifted to per-opcode `execute_<op>` tail-calls, the first symbol
+    // the adapter cannot resolve is now the first lifted handler
+    // (`execute_load_const`, the `LoadConst` arm) rather than a
+    // cast-removal helper inlined inside an arm body (`u32_as_i64` /
+    // `u32_as_usize` / `op_arg_as_usize` / `raise_kind_as_usize`, now
+    // reachable only past the unresolved handler). Documented in
     // `pyre/pyre-interpreter/src/pyopcode.rs:1302..1336`.
     //
     // Per-module scoping (Issue 1.3, 2026-05-05): `build_flow_from_rust`
@@ -299,16 +303,22 @@ fn adapter_rejects_execute_opcode_step_without_walker_at_cast_removal_helper() {
         .expect("adapter still has un-roadmapped constructs to walk past");
     match err {
         AdapterError::UnboundLocal { name } => {
-            const CAST_REMOVAL_HELPERS: &[&str] = &[
+            // The first lifted per-opcode handler (`LoadConst` arm) is
+            // the new pre-walker frontier; the cast-removal helpers stay
+            // listed because they remain the rejection point inside any
+            // arm body the walker does step into.
+            const PRE_WALKER_UNRESOLVED_SYMBOLS: &[&str] = &[
+                "execute_load_const",
                 "u32_as_i64",
                 "u32_as_usize",
                 "op_arg_as_usize",
                 "raise_kind_as_usize",
             ];
             assert!(
-                CAST_REMOVAL_HELPERS.contains(&name.as_str()),
-                "without walker: expected an unresolved cast-removal \
-                 helper from {CAST_REMOVAL_HELPERS:?}, got {name:?}",
+                PRE_WALKER_UNRESOLVED_SYMBOLS.contains(&name.as_str()),
+                "without walker: expected an unresolved lifted handler or \
+                 cast-removal helper from {PRE_WALKER_UNRESOLVED_SYMBOLS:?}, \
+                 got {name:?}",
             );
         }
         other => panic!(
