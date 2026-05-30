@@ -237,12 +237,15 @@ macro_rules! py_module {
 /// Count typed `name: ty` arguments in a `fn` parameter list.  Used by
 /// `py_module!`'s `inline_functions:` arm to derive arity from the
 /// signature.  Treats `&[PyObjectRef]` varargs as zero (caller should
-/// route those through path-ref `functions:` form instead).
+/// route those through path-ref `functions:` form instead).  Each
+/// parameter may carry leading attributes (`#[default(...)]`,
+/// `#[kwonly]`, `#[kwargs]`) — they are consumed and ignored here; the
+/// `#[pyre_function]` expansion strips them from the emitted fn.
 #[macro_export]
 macro_rules! pyre_count_typed_args {
     () => { 0usize };
-    ($a:ident : $t:ty) => { 1usize };
-    ($a:ident : $t:ty, $($rest:tt)*) => {
+    ( $(#[$m:meta])* $a:ident : $t:ty ) => { 1usize };
+    ( $(#[$m:meta])* $a:ident : $t:ty, $($rest:tt)* ) => {
         1usize + $crate::pyre_count_typed_args!($($rest)*)
     };
 }
