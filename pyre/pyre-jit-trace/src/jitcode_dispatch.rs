@@ -4672,6 +4672,30 @@ fn python_pc_for_jitcode_pc(pc_map: &[usize], jit_pc: usize) -> u32 {
     best_py
 }
 
+/// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
+/// / `NotTaken`) from `py_pc` to the next executable opcode.  Mirrors the
+/// forward trivia walk in [`crate::metainterp::semantic_fallthrough_pc`]
+/// but starts AT `py_pc` (not `py_pc + 1`) so a coordinate that already
+/// points at trivia is advanced.  A resume coordinate must be a real
+/// opcode boundary; the resume reader's own backtrack walks trivia
+/// BACKWARD, which is wrong for a `NOT_TAKEN` branch-target coordinate.
+fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: usize) -> usize {
+    use pyre_interpreter::bytecode::Instruction;
+    loop {
+        match pyre_interpreter::decode_instruction_at(code, py_pc) {
+            Some((
+                Instruction::ExtendedArg
+                | Instruction::Resume { .. }
+                | Instruction::Nop
+                | Instruction::Cache
+                | Instruction::NotTaken,
+                _,
+            )) => py_pc += 1,
+            _ => return py_pc,
+        }
+    }
+}
+
 /// Follow a synthetic register-renaming trampoline (`ref_copy*; goto L`,
 /// emitted by `emit_trampoline_for_multi_pred_link` for multi-predecessor
 /// link rewrites — `flatten.py:306-334 insert_renamings`) to the real
@@ -4772,10 +4796,23 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
         if !sym.jitcode.is_null() {
             let (py_pc, jitcode_index) = unsafe {
                 let jc = &*sym.jitcode;
-                (
-                    python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op_pc),
-                    jc.index as u32,
-                )
+                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op_pc);
+                // The inverse-`pc_map` can land on a Python trivia
+                // instruction's jitcode region (e.g. a branch target
+                // whose block lowers `NOT_TAKEN`).  A resume coordinate
+                // must be a real opcode: the trait path resumes branches
+                // at `semantic_fallthrough_pc` / `jump_target_forward`,
+                // both of which forward-skip trivia.  Advance to the same
+                // real opcode so the resume reader's BACKWARD trivia
+                // backtrack (call_jit.rs:837) is a no-op — otherwise a
+                // `NOT_TAKEN` py_pc backtracks to the preceding branch
+                // opcode, whose block-entry liveness differs from the
+                // target's and desyncs the snapshot box-count.
+                if !jc.payload.code_ptr.is_null() {
+                    let code = &*jc.payload.code_ptr;
+                    py = skip_python_trivia_forward(code, py as usize) as u32;
+                }
+                (py, jc.index as u32)
             };
             let active = collect_outer_active_boxes(
                 sym,
