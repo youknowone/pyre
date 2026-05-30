@@ -3066,6 +3066,13 @@ impl Optimizer {
             // `remap.contains_key` guard dedups a position reached through more
             // than one store.
             let mut next_const_pos = fni + ctx.new_operations.len() as u32;
+            // Const-folded producers whose `Op.pos` needs aligning to the
+            // post-compact slot. Captured here (op + assigned slot) so the
+            // production `Op.pos` update below runs without re-walking
+            // `box_pool`. The `remap.contains_key` guard makes each old
+            // position trigger exactly once, so a producer reachable from
+            // more than one canonical store is captured a single time.
+            let mut const_remaps: Vec<(majit_ir::OpRc, u32)> = Vec::new();
             let mut consider_const = |op: &majit_ir::OpRc| {
                 let old_idx = op.pos.get().raw();
                 if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
@@ -3075,6 +3082,7 @@ impl Optimizer {
                     return;
                 }
                 remap.insert(old_idx, next_const_pos);
+                const_remaps.push((op.clone(), next_const_pos));
                 next_const_pos += 1;
             };
             for op in &ctx.new_operations {
@@ -3088,27 +3096,33 @@ impl Optimizer {
                     consider_const(op);
                 }
             }
+            drop(consider_const);
+            // Align each const-folded producer's canonical `Op.pos` to its
+            // post-compact slot. The `new_operations` loop above already
+            // remapped emitted live ops; removed constant-folded ops (their
+            // box carries `Forwarded::Const`) had their `Op.pos` left at the
+            // pre-compact value. Readers off the canonical `Op.pos`
+            // (`merge_backend_constants`) need the post-compact position.
+            // Non-const synthetics never entered `remap`, so they keep their
+            // position — matching the prior `box_pool` walk's `remap.get`
+            // guard. Replaces that walk's production `Op.pos` write.
+            for (op, new_pos) in &const_remaps {
+                op.pos.set(op.pos.get().with_raw(*new_pos));
+            }
 
-            // Walk box_pool and update each ResOp's position field in
-            // place so the chain walker's `target.position()`
-            // reconstruction (in `Forwarded::Box(target)` chain advance)
-            // returns post-compact positions. The `Rc<Box>` identity is
-            // preserved — sibling chains carrying the same Rc<Box> as a
-            // forwarding target observe the new position automatically.
+            // `#[cfg(test)]`: align each box's stored `BoxKind::ResOp`
+            // position field to the post-compact slot so synthetic
+            // `ctx.box_pool = vec![..]` fixtures resolving through the
+            // `resolve_to_boxref` `box_pool` tail (also `#[cfg(test)]`)
+            // reconstruct post-compact `OpRef`s via `box_to_opref`'s
+            // `terminal.position()`. Production resolves through bound
+            // `Op.pos` (aligned by the `new_operations` loop + the
+            // `const_remaps` pass above), not the box's stored position.
+            #[cfg(test)]
             for box_ref in ctx.box_pool.iter() {
                 if let Some(old_pos) = box_ref.position() {
                     if let Some(&new_pos) = remap.get(&old_pos) {
                         box_ref.set_position(new_pos);
-                        // Keep the canonical `Op.pos` aligned with the remapped
-                        // box position. The `new_operations` loop above only
-                        // remaps emitted live ops; removed constant-folded ops
-                        // (their box carries `Forwarded::Const`) are bound — the
-                        // orphan-binding pass above pushed every resop box's
-                        // producer into `phase1_emit_ops` — but their `Op.pos`
-                        // is otherwise left at the pre-compact value. Readers
-                        // off the canonical `Op.pos` (`merge_backend_constants`)
-                        // need the post-compact position too. Idempotent for
-                        // live ops (already set to `new_pos` above).
                         if let Some(op) = box_ref.bound_op() {
                             op.pos.set(op.pos.get().with_raw(new_pos));
                         }
