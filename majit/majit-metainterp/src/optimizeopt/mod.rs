@@ -1782,7 +1782,9 @@ impl OptContext {
         if let Some(op) = self
             .resop_refs
             .get(opref.raw() as usize)
-            .and_then(|slot| slot.clone())
+            .and_then(|slot| slot.as_ref())
+            .filter(|op| op.pos.get() == opref)
+            .cloned()
         {
             return Some(op);
         }
