@@ -3415,6 +3415,13 @@ impl Optimizer {
             .max(bridge_inputarg_base + num_inputs as u32);
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        // Bridge `box_pool` is a fresh `TraceIterator`'s planted UNBOUND resop
+        // slots (`bind_input_resops` binds them later, after `input_ops` is
+        // built), so the `box_pool` snapshot would yield an empty `input_ops`
+        // anyway. State that explicitly via an empty seed so the bridge path
+        // does not read `box_pool` to build `input_ops`; producer lookup runs
+        // off `resop_refs` (populated by `bind_input_resops`).
+        self.explicit_input_ops_seed = Some(Vec::new());
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
             &ops_rc,
             constants,
@@ -3422,8 +3429,6 @@ impl Optimizer {
             bridge_inputarg_base,
             start_next_pos,
             box_pool,
-            // Bridge ops are fresh-Rc `TraceIterator` wraps, not the bound
-            // producers; `input_ops` snapshots from `box_pool`.
             false,
         );
 
