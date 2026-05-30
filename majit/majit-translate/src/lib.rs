@@ -1983,6 +1983,50 @@ mod tests {
         );
     }
 
+    /// Parity tripwire: the `Instruction::LoadFast` dispatch arm must
+    /// inline `load_fast` and the inlined body must have rewritten the
+    /// virtualizable `self.next_instr` field read and `self.locals_w[idx]`
+    /// array read to `getfield_vable` / `getarrayitem_vable`
+    /// ([`OpKind::VableFieldRead`] / [`OpKind::VableArrayRead`]).  A plain
+    /// `getfield` / `getarrayitem` (vable rewrite silently skipped) leaves
+    /// these kinds absent and must fail the test, not pass it — guarding
+    /// against the tripwire degrading to a mere "non-empty flattening"
+    /// check.
+    fn assert_load_fast_rewrites_vable_accesses(arm: &opcode_dispatch::PipelineOpcodeArm) {
+        use crate::jit_codewriter::flatten::FlatOp;
+        use crate::model::OpKind;
+
+        let flattened = arm
+            .flattened
+            .as_ref()
+            .expect("LoadFast arm should be flattened");
+        let inlined = flattened
+            .insns
+            .iter()
+            .find_map(|insn| match insn {
+                FlatOp::Op(op) => match &op.kind {
+                    OpKind::InlineCall { jitcode, .. } => jitcode.body()._ssarepr.as_ref(),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("LoadFast dispatch should inline the load_fast method body");
+        let body_has = |pred: &dyn Fn(&OpKind) -> bool| {
+            inlined
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, FlatOp::Op(op) if pred(&op.kind)))
+        };
+        assert!(
+            body_has(&|k| matches!(k, OpKind::VableFieldRead { .. })),
+            "self.next_instr should rewrite to a vable field read"
+        );
+        assert!(
+            body_has(&|k| matches!(k, OpKind::VableArrayRead { .. })),
+            "self.locals_w[idx] should rewrite to a vable array read"
+        );
+    }
+
     #[test]
     fn test_analyze_multiple_with_config_rewrites_virtualizable_graphs() {
         let source = r#"
@@ -2044,6 +2088,7 @@ mod tests {
             load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "LoadFast flattened should have ops"
         );
+        assert_load_fast_rewrites_vable_accesses(load_fast);
     }
 
     #[test]
@@ -2106,6 +2151,7 @@ mod tests {
             canonical_load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "canonical LoadFast flattened should have ops"
         );
+        assert_load_fast_rewrites_vable_accesses(canonical_load_fast);
     }
 
     #[test]

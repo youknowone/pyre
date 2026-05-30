@@ -1166,85 +1166,84 @@ pub fn translate_op(
                             )?;
                             module.module_get(&full_segments[full_segments.len() - 1])
                         };
-                    let callable_host = if let Some(entry) =
-                        call_registry.lookup_with_leaf_match(&key)
-                    {
-                        // `lookup_with_leaf_match` tries the verbatim key +
-                        // alias indirection (`Self::lookup`), then a cross-
-                        // module leaf-match against free-function entries —
-                        // the registry-build analog of the codewriter-side
-                        // `target_to_path` leaf-match (`call.rs:3043-3104`),
-                        // closing the glob-import gap (`use pyre_object::*;`
-                        // in caller `baseobjspace` referencing a bare name
-                        // with no `use_imports` entry).
-                        entry.host_object.clone()
-                    } else if segments.len() == 1
-                        && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
-                    {
-                        builtin
-                    } else if let Some(attr) = resolve_via_use_imports() {
-                        // Branch 3a — caller imported `segments[0]`;
-                        // upstream-orthodox `frame.globals[<alias>]`
-                        // resolution path.
-                        attr
-                    } else if segments.len() >= 2
-                        && let Some(module) =
-                            HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
-                        && let Some(attr) = module.module_get(&segments[segments.len() - 1])
-                    {
-                        // Branch 3b — fully-qualified inline path,
-                        // PRE-EXISTING-ADAPTATION as documented above.
-                        attr
-                    } else if segments.len() == 2
-                        && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
-                    {
-                        // Branch 4 — associated-function call
-                        // `Type::method(self, ...)` whose impl method is
-                        // registered under a module-qualified key
-                        // `[...module..., Type, method]`.  The exact
-                        // lookup at layer 1 missed because the call site
-                        // spells only `[Type, method]`; recover the
-                        // canonical entry by its `[Type, method]` tail,
-                        // mirroring the bound method-call suffix match
-                        // (`call.rs:3155 target_to_path`).  Upstream
-                        // resolves both spellings to one `FunctionDesc`.
-                        entry.host_object.clone()
-                    } else if segments.len() == 2
-                        && segments[0] == "simple_call"
-                        && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
-                    {
-                        // Branch 3c — PRE-EXISTING-ADAPTATION closure
-                        // for `front/raise.rs::lower_exc_from_raise`
-                        // (~`raise.rs:153`).  Upstream RPython
-                        // `flowcontext.py:614/623` emits
-                        // `op.simple_call(const(exc_class), *args)`
-                        // with the class as `args[0]`; pyre stashes
-                        // the class name in `path[1]` of the
-                        // `FunctionPath` because its `Vec<Variable>`
-                        // arg carrier cannot yet hold a
-                        // `Constant(HostObject(class))` alongside
-                        // `Variable`s — that conversion is the
-                        // multi-session `Vec<Variable>` →
-                        // `Vec<LinkArg>` migration (see the
-                        // module-level "PRE-EXISTING-ADAPTATION"
-                        // block in `front/raise.rs:120-126` for the
-                        // detailed rationale).  The downstream
-                        // reconstruction is documented at
-                        // `raise.rs:122-123`:
-                        // > any downstream reader can reconstruct
-                        // > `(op, const_class, args…)` from
-                        // > `(path[0], path[1], op.args)`
-                        // This branch is exactly that
-                        // reconstruction: resolve `path[1]`
-                        // (the exception class name) as a builtin
-                        // HostObject and use it as the simple_call
-                        // callable, leaving `op.args` as the
-                        // trailing message arguments.  TODO retire
-                        // when the LinkArg migration lands.
-                        exc_class
-                    } else {
-                        return Err(TyperError::message(format!(
-                            "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
+                    let callable_host =
+                        if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
+                            // `lookup_with_leaf_match` tries the verbatim key +
+                            // alias indirection (`Self::lookup`), then a cross-
+                            // module leaf-match against free-function entries —
+                            // the registry-build analog of the codewriter-side
+                            // `target_to_path` leaf-match (`call.rs:3043-3104`),
+                            // closing the glob-import gap (`use pyre_object::*;`
+                            // in caller `baseobjspace` referencing a bare name
+                            // with no `use_imports` entry).
+                            entry.host_object.clone()
+                        } else if segments.len() == 1
+                            && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
+                        {
+                            builtin
+                        } else if let Some(attr) = resolve_via_use_imports() {
+                            // Branch 3a — caller imported `segments[0]`;
+                            // upstream-orthodox `frame.globals[<alias>]`
+                            // resolution path.
+                            attr
+                        } else if segments.len() >= 2
+                            && let Some(module) =
+                                HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
+                            && let Some(attr) = module.module_get(&segments[segments.len() - 1])
+                        {
+                            // Branch 3b — fully-qualified inline path,
+                            // PRE-EXISTING-ADAPTATION as documented above.
+                            attr
+                        } else if segments.len() == 2
+                            && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
+                        {
+                            // Branch 4 — associated-function call
+                            // `Type::method(self, ...)` whose impl method is
+                            // registered under a module-qualified key
+                            // `[...module..., Type, method]`.  The exact
+                            // lookup at layer 1 missed because the call site
+                            // spells only `[Type, method]`; recover the
+                            // canonical entry by its `[Type, method]` tail,
+                            // mirroring the bound method-call suffix match
+                            // (`call.rs:3155 target_to_path`).  Upstream
+                            // resolves both spellings to one `FunctionDesc`.
+                            entry.host_object.clone()
+                        } else if segments.len() == 2
+                            && segments[0] == "simple_call"
+                            && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
+                        {
+                            // Branch 3c — PRE-EXISTING-ADAPTATION closure
+                            // for `front/raise.rs::lower_exc_from_raise`
+                            // (~`raise.rs:153`).  Upstream RPython
+                            // `flowcontext.py:614/623` emits
+                            // `op.simple_call(const(exc_class), *args)`
+                            // with the class as `args[0]`; pyre stashes
+                            // the class name in `path[1]` of the
+                            // `FunctionPath` because its `Vec<Variable>`
+                            // arg carrier cannot yet hold a
+                            // `Constant(HostObject(class))` alongside
+                            // `Variable`s — that conversion is the
+                            // multi-session `Vec<Variable>` →
+                            // `Vec<LinkArg>` migration (see the
+                            // module-level "PRE-EXISTING-ADAPTATION"
+                            // block in `front/raise.rs:120-126` for the
+                            // detailed rationale).  The downstream
+                            // reconstruction is documented at
+                            // `raise.rs:122-123`:
+                            // > any downstream reader can reconstruct
+                            // > `(op, const_class, args…)` from
+                            // > `(path[0], path[1], op.args)`
+                            // This branch is exactly that
+                            // reconstruction: resolve `path[1]`
+                            // (the exception class name) as a builtin
+                            // HostObject and use it as the simple_call
+                            // callable, leaving `op.args` as the
+                            // trailing message arguments.  TODO retire
+                            // when the LinkArg migration lands.
+                            exc_class
+                        } else {
+                            return Err(TyperError::message(format!(
+                                "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
                              not registered in PyreCallRegistry, not in HOST_ENV \
                              `__builtin__`, and not a known module-qualified host attribute — \
                              the production builder (a SemanticProgram walker, or a test \
@@ -1800,24 +1799,16 @@ fn link_extravar_to_hlvalue(
 ///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
-    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+    // Retained for call-site symmetry with the rtyper entry points; the
+    // receiver's ClassDef is resolved by annotation, not seeded here.
+    _bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
     let startblock = &legacy.blocks[legacy.startblock.0];
-    let mut input_by_result: HashMap<
-        crate::flowspace::model::Variable,
-        (&crate::model::ValueType, &str, Option<&str>),
-    > = HashMap::new();
+    let mut input_by_result: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
+        HashMap::new();
     for op in &startblock.operations {
-        if let (
-            Some(result),
-            OpKind::Input {
-                ty,
-                name,
-                class_root,
-            },
-        ) = (op.result.as_ref(), &op.kind)
-        {
-            input_by_result.insert(result.clone(), (ty, name.as_str(), class_root.as_deref()));
+        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
+            input_by_result.insert(result.clone(), ty);
         }
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
@@ -1831,8 +1822,8 @@ pub(crate) fn derive_subject_inputcells(
             continue;
         }
         // 2. Front-end Input op at the startblock.
-        if let Some(&(ty, name, class_root)) = input_by_result.get(var) {
-            let mut shell = valuetype_to_someshell(ty).ok_or_else(|| {
+        if let Some(&ty) = input_by_result.get(var) {
+            let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
                      ({var:?}) has `ValueType::{ty:?}` (from Input op) whose \
@@ -1840,52 +1831,18 @@ pub(crate) fn derive_subject_inputcells(
                      only `ValueType::Unknown` lacks a SomeValue shell)"
                 ))
             })?;
-            // RPython parity (M2.5g.2 — class_root structural carry):
-            // when the front-end populated `OpKind::Input.class_root` from
-            // `syn::Type`'s leaf ident, project the inputarg as
-            // `SomeInstance(Some(getuniqueclassdef(class_root)))` instead
-            // of the abstract `SomeInstance(None)` that
-            // `valuetype_to_someshell` yields for un-narrowed Ref.
-            // Mirrors `description.py:283-305 FunctionDesc.pycall` lifting
-            // each typed pointer through `bookkeeper.getuniqueclassdef`
-            // so the rtyper's `find_attribute` (`rclass.py:556`) can
-            // route attribute reads against the actual ClassDef.
-            //
-            // Gate: only activate the narrowing when the resulting
-            // ClassDef has non-empty `attrs` — an empty-attrs ClassDef
-            // would slow the rtyper's find_attribute walk before any
-            // Skip-classification (`fib_recursive` regression precedent
-            // — see [[z25-skip-profile-2026-05-20]]).
-            //
-            // Fallback path: when the front-end did not populate
-            // `class_root` (e.g. legacy/test fixtures pre-dating
-            // M2.5g.2.a), fall back to the impl-block self-type root
-            // carried on the legacy graph for the receiver inputarg.
-            if let Some(bk) = bookkeeper
-                && matches!(ty, crate::model::ValueType::Ref(_))
-            {
-                let resolved_root: Option<&str> = class_root.or_else(|| {
-                    if name == "self" {
-                        legacy.owner_root.as_deref()
-                    } else {
-                        None
-                    }
-                });
-                if let Some(root) = resolved_root
-                    && let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(root)
-                {
-                    let attrs_populated = !classdef.borrow().attrs.is_empty();
-                    if attrs_populated {
-                        shell = crate::annotator::model::SomeValue::Instance(
-                            crate::annotator::model::SomeInstance::new(
-                                Some(classdef),
-                                false,
-                                std::collections::BTreeMap::new(),
-                            ),
-                        );
-                    }
-                }
-            }
+            // A `Ref` inputarg projects to the abstract `SomeInstance(None)`
+            // that `valuetype_to_someshell` yields; its concrete ClassDef is
+            // resolved by call-propagation during annotation, the way RPython
+            // binds a method to the class observed at its call site
+            // (`description.py:283-305 FunctionDesc.pycall`).  An earlier
+            // pass eager-seeded the receiver here from `OpKind::Input
+            // .class_root` via `getuniqueclassdef_for_struct_root`; that
+            // minted a struct-root ClassDef whose identity differed from the
+            // call-propagated one, leaving the annotation fixpoint dependent
+            // on graph-processing (HashMap) order — non-deterministic
+            // classdef-less-`self` getattr.  Receiver narrowing is left to
+            // annotation.
             cells.push(shell);
             continue;
         }
