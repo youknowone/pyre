@@ -3331,7 +3331,10 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let obj = args[0];
     let has_dict = unsafe {
-        pyre_object::is_instance(obj) || crate::is_function(obj) || pyre_object::is_module(obj)
+        pyre_object::is_instance(obj)
+            || pyre_object::is_type(obj)
+            || crate::is_function(obj)
+            || pyre_object::is_module(obj)
     } || crate::baseobjspace::ATTR_TABLE
         .with(|table| table.borrow().contains_key(&(obj as usize)));
     if !has_dict {

@@ -1385,6 +1385,16 @@ impl IterOpcodeHandler for PyFrame {
     /// PyPy: space.iter(w_iterable) → calls __iter__ or wraps in seq_iter.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
         unsafe {
+            // mappingproxy iterates over its backing dict's keys.
+            // dictproxyobject.py:41 descr_iter → space.iter(self.w_mapping).
+            let iter = if pyre_object::is_dict_proxy(iter) {
+                let mapping = pyre_object::w_dict_proxy_get_mapping(iter);
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = mapping;
+                mapping
+            } else {
+                iter
+            };
             // Already an iterator
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
