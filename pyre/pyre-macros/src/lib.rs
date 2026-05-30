@@ -139,7 +139,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut stripped = inner_sig.clone();
     for arg in stripped.inputs.iter_mut() {
         if let FnArg::Typed(pt) = arg {
-            pt.attrs.retain(|a| !a.path().is_ident("default"));
+            pt.attrs
+                .retain(|a| !a.path().is_ident("default") && !a.path().is_ident("kwonly"));
         }
     }
     rewrite_alias_args(&mut stripped);
@@ -159,9 +160,47 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // Companion `<name>_pyre_sig()` — derives a keyword-aware `Signature`
+    // from the typed parameter names so the registration path can bind
+    // keyword / kw-only / `**kwargs`-style calls by name.  A
+    // `&[PyObjectRef]` parameter becomes the `*args` varargname; a
+    // `#[kwonly]` marker starts the keyword-only tail at that parameter.
+    let sig_fn_name = format_ident!("{}_pyre_sig", user_name);
+    let mut sig_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut kwonly_marked = false;
+    for arg in user_sig.inputs.iter() {
+        let FnArg::Typed(pt) = arg else { continue };
+        let name_lit = match &*pt.pat {
+            Pat::Ident(pi) => pi.ident.to_string(),
+            _ => continue,
+        };
+        if !kwonly_marked && pt.attrs.iter().any(|a| a.path().is_ident("kwonly")) {
+            sig_stmts.push(quote! { __b.marker_kwonly(); });
+            kwonly_marked = true;
+        }
+        let is_slice = match unwrap_type_group(&pt.ty) {
+            Type::Reference(r) => matches!(unwrap_type_group(&r.elem), Type::Slice(_)),
+            _ => false,
+        };
+        if is_slice {
+            sig_stmts.push(quote! { __b.varargname = ::std::option::Option::Some(#name_lit); });
+        } else {
+            sig_stmts.push(quote! { __b.append(#name_lit); });
+        }
+    }
+    let sig_fn = quote! {
+        #[allow(dead_code)]
+        #vis fn #sig_fn_name() -> ::std::option::Option<crate::Signature> {
+            let mut __b = crate::SignatureBuilder::default();
+            #(#sig_stmts)*
+            ::std::option::Option::Some(__b.signature())
+        }
+    };
+
     Ok(quote! {
         #inner_fn
         #wrapper
+        #sig_fn
     })
 }
 
