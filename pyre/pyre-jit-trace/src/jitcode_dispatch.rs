@@ -4672,6 +4672,42 @@ fn python_pc_for_jitcode_pc(pc_map: &[usize], jit_pc: usize) -> u32 {
     best_py
 }
 
+/// Follow a synthetic register-renaming trampoline (`ref_copy*; goto L`,
+/// emitted by `emit_trampoline_for_multi_pred_link` for multi-predecessor
+/// link rewrites — `flatten.py:306-334 insert_renamings`) to the real
+/// py-boundary target block.
+///
+/// These `epsilon_link` trampolines carry no Python pc: they sit between
+/// a `goto_if_not` and the branch's target block, shuffling jitcode
+/// registers so the target's inputarg colors line up.  A branch guard's
+/// `other_target` can land directly on such a trampoline (the codewriter
+/// makes the goto label the trampoline, not the canonical block).  The
+/// blackhole resumes at the *Python* level — it reads locals from the
+/// `PyFrame`, not from jitcode registers — so the register renaming is
+/// irrelevant to it; the correct resume coordinate is the trampoline's
+/// ultimate destination, which IS a py-boundary block (starts with a
+/// `live/` marker and has an exact `pc_map` entry).  Without this
+/// resolution the inverse-`pc_map` maps the trampoline offset (no
+/// boundary) to the wrong Python opcode (the nearest preceding entry,
+/// e.g. `RETURN_VALUE`), so the guard resumes past its real target.
+///
+/// Real py-boundary blocks begin with `live/` (or any non-`ref_copy`,
+/// non-`goto` op), so the scan terminates there.  The iteration bound is
+/// a safety valve against a malformed self-referential chain.
+fn resolve_branch_target_through_trampoline(code: &[u8], mut target: usize) -> usize {
+    for _ in 0..16 {
+        let Some(op) = decode_op_at(code, target) else {
+            return target;
+        };
+        match op.opname {
+            "ref_copy" => target = op.next_pc,
+            "goto" => target = read_label(code, &op, 0),
+            _ => return target,
+        }
+    }
+    target
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
@@ -7251,7 +7287,10 @@ fn handle(
             // blackhole must re-enter past `POP_JUMP_IF_*`.  GuardTrue
             // (trace fell through to `op.next_pc`) → resume at `target`;
             // GuardFalse (trace jumped to `target`) → resume at `op.next_pc`.
-            let other_target = if switchcase != 0 { target } else { op.next_pc };
+            let other_target = resolve_branch_target_through_trampoline(
+                code,
+                if switchcase != 0 { target } else { op.next_pc },
+            );
             if !valuebox.is_constant() {
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
                 walker_capture_snapshot_for_last_guard(ctx, other_target);
