@@ -562,7 +562,7 @@ pub fn builtin_code_new_with_arity(
         arity <= 4,
         "builtin arity {arity} for {name} exceeds fast-path max 4"
     );
-    builtin_code_new_full(name, func, None, arity)
+    builtin_code_new_full(name, func, None, arity, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with an explicit docstring.
@@ -575,7 +575,7 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    builtin_code_new_full(name, func, docstring, HOPELESS)
+    builtin_code_new_full(name, func, docstring, HOPELESS, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
@@ -588,15 +588,18 @@ pub fn builtin_code_new_with_doc(
 /// `function.rs:funccall_valuestack` peeks `args[0]` separately to mirror
 /// `function.py:194-199`, but the closure still receives `[w_obj, ...rest]`.
 pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
-    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1)
+    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1, std::ptr::null())
 }
 
-/// Full constructor for `BuiltinCode`.
+/// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
+/// (null for positional-only builtins); the pointee must outlive the
+/// object — callers leak it to `'static`.
 fn builtin_code_new_full(
     name: &'static str,
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
     fast_natural_arity: u16,
+    sig: *const Signature,
 ) -> PyObjectRef {
     pyre_object::lltype::malloc_typed(BuiltinCode {
         ob: PyObject {
@@ -607,8 +610,24 @@ fn builtin_code_new_full(
         func,
         docstring,
         fast_natural_arity,
-        sig: std::ptr::null(),
+        sig,
     }) as PyObjectRef
+}
+
+/// Allocate a `BuiltinCode` carrying an argument `Signature`.  The
+/// signature is leaked to `'static` so the raw pointer stored on the
+/// object has no Drop obligation, matching the `func`/`name` convention.
+/// `fast_natural_arity` is `HOPELESS`: a builtin with a declared
+/// signature takes the keyword-binding slow path, not the fixed-arity
+/// fast path.
+pub fn builtin_code_new_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    builtin_code_new_full(name, func, docstring, HOPELESS, sig)
 }
 
 /// Check if an object is a built-in function.
