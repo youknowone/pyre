@@ -314,12 +314,17 @@ pub struct UnrollOptimizer {
     /// TraceIterator copies those values onto the fresh per-phase boxes it
     /// mints, preserving RPython's box-carried `_res*` value shape.
     pub source_box_pool: Option<crate::r#box::BoxPool>,
-    /// Recorder `Rc<Op>` slice the source `box_pool` is bound to
-    /// (`preamble_data.base.operations()`). When non-empty, seeds Phase 2's
-    /// optimizer `input_ops` directly — same `Rc`, same Phase-1 `_forwarded`
-    /// as the `box_pool` snapshot — so Phase 2 does not read `box_pool` to
-    /// build `input_ops`. Empty on retrace / paths without a preamble base.
-    pub phase2_input_ops_seed: Vec<majit_ir::OpRc>,
+    /// Explicit `input_ops` seed for the phase optimizers, threaded from the
+    /// compile caller. `Some(ops)` on the non-cut finish path =
+    /// `preamble_data.base.operations()` — the same `Rc<Op>` the source
+    /// `box_pool` is bound to, carrying the identical Phase-1 `_forwarded` — so
+    /// the optimizer skips the `box_pool` snapshot. `Some(empty)` on the cut
+    /// path: the cut trace's ops live in a remapped namespace that the original
+    /// `source_box_pool` does not match, so the `box_pool` snapshot's
+    /// `input_ops` cannot resolve cut-op lookups anyway; an empty seed states
+    /// that without the read. `None` (retrace / fixtures) keeps the `box_pool`
+    /// fallback.
+    pub phase2_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
     /// MetaInterp-owned compile snapshot root slot list. Stored as an address
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
@@ -360,7 +365,7 @@ impl UnrollOptimizer {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cpu: crate::cpu::default_cpu(),
             source_box_pool: None,
-            phase2_input_ops_seed: Vec::new(),
+            phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
         }
     }
@@ -673,8 +678,8 @@ impl UnrollOptimizer {
                 // only the read source changes; box_pool binding / `_forwarded`
                 // writes are untouched. No forwarding yet at Phase 1 setup, so
                 // seed and box_pool snapshot are trivially equal here.
-                if !self.phase2_input_ops_seed.is_empty() {
-                    opt_p1.explicit_input_ops_seed = Some(self.phase2_input_ops_seed.clone());
+                if let Some(seed) = &self.phase2_input_ops_seed {
+                    opt_p1.explicit_input_ops_seed = Some(seed.clone());
                 }
                 let p1_ops = opt_p1.optimize_with_constants_and_inputs(
                     &p1_ops_in,
@@ -1076,9 +1081,10 @@ impl UnrollOptimizer {
             p2_ops_in.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
         // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` the source
         // `box_pool` is bound to (same `Rc`, same Phase-1 `_forwarded`) so
-        // the optimizer does not read `box_pool` to build `input_ops`.
-        if !self.phase2_input_ops_seed.is_empty() {
-            opt_p2.explicit_input_ops_seed = Some(self.phase2_input_ops_seed.clone());
+        // the optimizer does not read `box_pool` to build `input_ops`. A
+        // `Some(empty)` (cut path) still skips the `box_pool` read.
+        if let Some(seed) = &self.phase2_input_ops_seed {
+            opt_p2.explicit_input_ops_seed = Some(seed.clone());
         }
         let p2_ops = with_speculative_to_invalid_loop(|| {
             opt_p2.optimize_with_constants_and_inputs_at(

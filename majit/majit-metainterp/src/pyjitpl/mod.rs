@@ -4739,16 +4739,20 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
         unroll_opt.source_box_pool = Some(close_loop_box_pool);
-        // Seed Phase 2's `input_ops` from the canonical `Rc<Op>` the
-        // `source_box_pool` is bound to. Non-cut path only: `close_loop`
-        // appends ops, so `preamble_data.base.operations()`'s loop-body
-        // `Rc<Op>` are the SAME objects the snapshot (`close_loop_box_pool`)
-        // binds, hence carry the identical Phase-1 `_forwarded`. A
-        // `cut_trace_from` rebuilds the trace with fresh `Rc<Op>` that diverge
-        // from the snapshot, so leave the seed empty (box_pool fallback) there.
-        if cross_loop_cut.is_none() {
-            unroll_opt.phase2_input_ops_seed = preamble_data.base.operations().to_vec();
-        }
+        // Seed the phase optimizers' `input_ops` so they skip the `box_pool`
+        // snapshot. Non-cut: `close_loop` only appends, so
+        // `preamble_data.base.operations()`'s loop-body `Rc<Op>` are the SAME
+        // objects `source_box_pool` binds — identical Phase-1 `_forwarded`. Cut:
+        // `cut_trace_from` remaps ops into a fresh namespace the original
+        // `source_box_pool` does not match, so its `box_pool` `input_ops` cannot
+        // resolve cut-op lookups anyway; an explicit empty seed states that
+        // without the read (producer lookup runs off new_operations /
+        // phase1_emit_ops / resop_refs).
+        unroll_opt.phase2_input_ops_seed = Some(if cross_loop_cut.is_none() {
+            preamble_data.base.operations().to_vec()
+        } else {
+            Vec::new()
+        });
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
