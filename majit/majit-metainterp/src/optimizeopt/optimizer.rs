@@ -2547,7 +2547,14 @@ impl Optimizer {
         // boxes the old `box_pool.iter_indexed()` walk pushed. The unbound
         // branch of that walk only ever hit Void boxes (no synthesis), so this
         // drain reproduces it without reading `box_pool`.
-        #[cfg(debug_assertions)]
+        //
+        // `#[cfg(test)]` (not `debug_assertions`): production `emit` updates
+        // `live_synthetics` authoritatively without rebinding the superseded
+        // `box_pool` slot off its synthetic (the rebind is `#[cfg(test)]`), so
+        // the box-walk side of this equality intentionally diverges from
+        // `live_synthetics` in non-test builds. Only the test build maintains
+        // the `box_pool` binding this cross-checks against.
+        #[cfg(test)]
         {
             let mut old: Vec<*const _> = Vec::new();
             for (idx, b) in ctx.box_pool.iter_indexed() {

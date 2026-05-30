@@ -2552,36 +2552,62 @@ impl OptContext {
         // `get_forwarded()` (via the stand-in's slot) and writes it
         // into `op_rc.forwarded` before re-pointing the handle, so
         // forwarded state migrates to the real producer Op.
-        let superseded_synthetic = if let Some(b) = self.box_pool.get(op_pos) {
-            if b.is_resop() {
-                let bound = b.bound_op();
-                let bound_is_synthetic = bound.as_ref().is_some_and(|bound| {
-                    self.resop_refs
-                        .get(op_pos.raw() as usize)
-                        .and_then(|slot| slot.as_ref())
-                        .is_some_and(|synth| std::rc::Rc::ptr_eq(bound, synth))
-                });
-                if bound.is_none() || bound_is_synthetic {
-                    b.bind_op(&op_rc);
+        // Production (no `box_pool`): the synthetic stand-in registered for
+        // `op_pos` by `ensure_box` / `bind_input_resops` is the
+        // `live_synthetics` entry at this position — the same `OpRc` held in
+        // `resop_refs[op_pos]`, which the position's BoxRef is bound to.
+        // Migrate its `_forwarded` onto the real producer (`bind_op`'s
+        // carry-over; resoperation.py:233 `_forwarded` lives on the op) and
+        // drop it from `live_synthetics` so the superseded stand-in is not
+        // drained into `phase1_emit_ops`. Each `op_pos` has at most one live
+        // stand-in, so the position match is unambiguous.
+        #[cfg(not(test))]
+        if let Some(i) = self
+            .live_synthetics
+            .iter()
+            .position(|s| s.pos.get() == op_pos)
+        {
+            let synth = self.live_synthetics.swap_remove(i);
+            *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
+        }
+        // Test: keep the `box_pool`-routed rebind so synthetic
+        // `ctx.box_pool = vec![..]` fixtures resolving through the
+        // `resolve_to_boxref` `box_pool` tail observe the real producer
+        // (including the unbound-placeholder bind the production path skips
+        // because it has no `_forwarded` to migrate).
+        #[cfg(test)]
+        {
+            let superseded_synthetic = if let Some(b) = self.box_pool.get(op_pos) {
+                if b.is_resop() {
+                    let bound = b.bound_op();
+                    let bound_is_synthetic = bound.as_ref().is_some_and(|bound| {
+                        self.resop_refs
+                            .get(op_pos.raw() as usize)
+                            .and_then(|slot| slot.as_ref())
+                            .is_some_and(|synth| std::rc::Rc::ptr_eq(bound, synth))
+                    });
+                    if bound.is_none() || bound_is_synthetic {
+                        b.bind_op(&op_rc);
+                    }
+                    // The position's box is moving off its synthetic onto the
+                    // real producer; the synthetic is no longer an orphan
+                    // needing carry into `phase1_emit_ops` (it survives in
+                    // `resop_refs` for lookup / `Weak<Op>` liveness).
+                    bound_is_synthetic.then_some(bound).flatten()
+                } else {
+                    None
                 }
-                // The position's box is moving off its synthetic onto the
-                // real producer; the synthetic is no longer an orphan
-                // needing carry into `phase1_emit_ops` (it survives in
-                // `resop_refs` for lookup / `Weak<Op>` liveness).
-                bound_is_synthetic.then_some(bound).flatten()
             } else {
                 None
-            }
-        } else {
-            None
-        };
-        if let Some(synth) = superseded_synthetic {
-            if let Some(i) = self
-                .live_synthetics
-                .iter()
-                .position(|s| std::rc::Rc::ptr_eq(s, &synth))
-            {
-                self.live_synthetics.swap_remove(i);
+            };
+            if let Some(synth) = superseded_synthetic {
+                if let Some(i) = self
+                    .live_synthetics
+                    .iter()
+                    .position(|s| std::rc::Rc::ptr_eq(s, &synth))
+                {
+                    self.live_synthetics.swap_remove(i);
+                }
             }
         }
         self.new_operations.push(op_rc);
