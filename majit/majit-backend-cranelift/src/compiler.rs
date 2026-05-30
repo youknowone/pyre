@@ -8737,39 +8737,21 @@ impl CraneliftBackend {
                 // then check if the result fits in i64.
                 OpCode::IntAddOvf => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let r = builder.ins().iadd(a, b);
+                    let (r, of) = builder.ins().sadd_overflow(a, b);
                     builder.def_var(var(vi), r);
-                    // ovf = ((a ^ r) & (b ^ r)) >> 63
-                    let axr = builder.ins().bxor(a, r);
-                    let bxr = builder.ins().bxor(b, r);
-                    let both = builder.ins().band(axr, bxr);
-                    let ovf = builder.ins().sshr_imm(both, 63);
-                    last_ovf_flag = Some(ovf);
+                    last_ovf_flag = Some(of);
                 }
                 OpCode::IntSubOvf => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let r = builder.ins().isub(a, b);
+                    let (r, of) = builder.ins().ssub_overflow(a, b);
                     builder.def_var(var(vi), r);
-                    // ovf = ((a ^ r) & (a ^ b)) >> 63
-                    let axr = builder.ins().bxor(a, r);
-                    let axb = builder.ins().bxor(a, b);
-                    let both = builder.ins().band(axr, axb);
-                    let ovf = builder.ins().sshr_imm(both, 63);
-                    last_ovf_flag = Some(ovf);
+                    last_ovf_flag = Some(of);
                 }
                 OpCode::IntMulOvf => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let r = builder.ins().imul(a, b);
+                    let (r, of) = builder.ins().smul_overflow(a, b);
                     builder.def_var(var(vi), r);
-                    // x86 IMUL sets OF when the 128-bit signed product doesn't
-                    // fit in 64 bits (assembler.py:1864-1866). Mirror that by
-                    // comparing the high 64 bits against the sign-extension of
-                    // the low 64 bits: ovf <=> smulhi(a,b) != (r >>s 63).
-                    let hi = builder.ins().smulhi(a, b);
-                    let sign = builder.ins().sshr_imm(r, 63);
-                    let differ = builder.ins().icmp(IntCC::NotEqual, hi, sign);
-                    let ovf = builder.ins().uextend(cl_types::I64, differ);
-                    last_ovf_flag = Some(ovf);
+                    last_ovf_flag = Some(of);
                 }
                 OpCode::IntAnd => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
@@ -9274,12 +9256,9 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, ovf, zero);
-                    // If ovf == 0 (no overflow), continue; otherwise side-exit.
-                    builder
-                        .ins()
-                        .brif(is_zero, cont_block, &[], exit_block, &[]);
+                    // ovf is the i8 OF-flag from {sadd,ssub,smul}_overflow.
+                    // brif treats nonzero as true: overflow → exit, else cont.
+                    builder.ins().brif(ovf, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -9314,12 +9293,9 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, ovf, zero);
-                    // If ovf == 0 (no overflow), side-exit; otherwise continue.
-                    builder
-                        .ins()
-                        .brif(is_zero, exit_block, &[], cont_block, &[]);
+                    // ovf is the i8 OF-flag from {sadd,ssub,smul}_overflow.
+                    // brif treats nonzero as true: overflow → cont, else exit.
+                    builder.ins().brif(ovf, cont_block, &[], exit_block, &[]);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
