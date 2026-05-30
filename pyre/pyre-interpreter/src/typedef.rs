@@ -7771,11 +7771,14 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
             new_bytes_like(args[0], &data[i + sep.len()..]),
         ])),
         None => {
+            // A bytearray receiver must not alias into the result tuple
+            // (mutating it would mutate the tuple); hand back a fresh copy.
+            let whole = new_bytes_like(args[0], data);
             let empty = || empty_bytes_like(args[0]);
             if forward {
-                Ok(pyre_object::w_tuple_new(vec![args[0], empty(), empty()]))
+                Ok(pyre_object::w_tuple_new(vec![whole, empty(), empty()]))
             } else {
-                Ok(pyre_object::w_tuple_new(vec![empty(), empty(), args[0]]))
+                Ok(pyre_object::w_tuple_new(vec![empty(), empty(), whole]))
             }
         }
     }
@@ -7903,7 +7906,7 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "ljust() takes at least 1 argument");
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "ljust")?;
     let len = data.len() as i64;
     if width <= len {
@@ -7918,7 +7921,7 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "rjust() takes at least 1 argument");
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "rjust")?;
     let len = data.len() as i64;
     if width <= len {
@@ -7935,7 +7938,7 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "center() takes at least 1 argument");
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "center")?;
     let len = data.len() as i64;
     if width <= len {
@@ -7954,7 +7957,7 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "zfill() takes exactly one argument");
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let width = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let width = crate::builtins::space_index_w(args[1])?;
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -8163,10 +8166,14 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let tabsize = if args.len() > 1 {
-        unsafe { pyre_object::w_int_get_value(args[1]) }
-    } else {
-        8
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let tabsize = match pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+    {
+        Some(t) if !t.is_null() => crate::builtins::space_index_w(t)?,
+        _ => 8,
     };
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut col: i64 = 0;
@@ -9013,7 +9020,7 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// clamping out-of-range indices (negative counts from the end).
 fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 3, "insert() takes exactly 2 arguments");
-    let index = unsafe { pyre_object::w_int_get_value(args[1]) };
+    let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
@@ -9055,7 +9062,9 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             ));
         }
         let index = match args.get(1) {
-            Some(&a) if !a.is_null() && !pyre_object::is_none(a) => pyre_object::w_int_get_value(a),
+            Some(&a) if !a.is_null() && !pyre_object::is_none(a) => {
+                crate::builtins::space_index_w(a)?
+            }
             _ => -1,
         };
         let i = if index < 0 { index + len } else { index };
