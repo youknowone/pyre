@@ -13,12 +13,21 @@ use walkdir::WalkDir;
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
-    // Run on a worker thread with a large stack: on Windows the main
-    // thread's default stack is 1 MiB, which `syn`'s recursive parsing
-    // of the ~90 collected source files overflows
-    // (STATUS_STACK_OVERFLOW 0xc00000fd).
+    // Run on a worker thread with a large stack. Two recursive
+    // consumers need the headroom:
+    //   1. `syn`'s recursive parsing of the ~150 collected source files
+    //      (on Windows the main thread's default stack is 1 MiB →
+    //      STATUS_STACK_OVERFLOW 0xc00000fd).
+    //   2. the dual-gate real RPythonTyper specialization
+    //      (`specialize_legacy_graph_with_registry` → annotator
+    //      `complete_pending_blocks` / rtyper `specialize_more_blocks`),
+    //      whose recursion depth is bounded but order-dependent: the
+    //      processing order is keyed off a HashMap, so on some seeds the
+    //      deepest graph chain overran a 64 MiB worker and aborted with
+    //      a non-deterministic `stack overflow` (the flaky M2.5g.2.c
+    //      build failure). 512 MiB covers the deepest observed chain.
     std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(512 * 1024 * 1024)
         .spawn(real_main)
         .expect("spawn build-script worker")
         .join()
