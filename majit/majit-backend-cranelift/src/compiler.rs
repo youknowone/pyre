@@ -1090,6 +1090,60 @@ fn block_args(vals: &[CValue]) -> Vec<BlockArg> {
     vals.iter().copied().map(BlockArg::from).collect()
 }
 
+/// Reinterpret `val` as `want` via `bitcast`, but only when the types
+/// actually differ. Scalar float values are carried either as `F64` (kept
+/// live in an FP register across a loop back-edge) or as `I64` (boxed raw
+/// bits at frame/guard/call boundaries) depending on the variable's declared
+/// type; this reconciles the two at a boundary without emitting a redundant
+/// GPR<->FP move (`fmov`) when the value already has the wanted type.
+fn coerce_ty(
+    builder: &mut FunctionBuilder,
+    val: CValue,
+    want: cranelift_codegen::ir::Type,
+) -> CValue {
+    if builder.func.dfg.value_type(val) == want {
+        val
+    } else {
+        builder.ins().bitcast(want, MemFlags::new(), val)
+    }
+}
+
+/// Cranelift carrier type for a scalar OpRef: `F64` for float-typed boxes
+/// (kept in an FP register), `I64` for everything else. Vector OpRefs are
+/// classified separately via `vec_oprefs` and never reach here.
+fn cl_type_for_opref(opref: OpRef) -> cranelift_codegen::ir::Type {
+    match opref.ty() {
+        Some(Type::Float) => cl_types::F64,
+        _ => cl_types::I64,
+    }
+}
+
+/// Build block args for a branch into `target`, coercing each value to the
+/// corresponding block-param type. A float value delivered as boxed `I64`
+/// (e.g. an inline float constant) is reinterpreted to the param's `F64`
+/// type, and vice versa, so an `F64`-typed loop-carried param never receives
+/// a mismatched `I64` arg.
+fn block_args_to(
+    builder: &mut FunctionBuilder,
+    target: cranelift_codegen::ir::Block,
+    vals: &[CValue],
+) -> Vec<BlockArg> {
+    let want: Vec<cranelift_codegen::ir::Type> = builder
+        .func
+        .dfg
+        .block_params(target)
+        .iter()
+        .map(|&p| builder.func.dfg.value_type(p))
+        .collect();
+    vals.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let t = want.get(i).copied().unwrap_or(cl_types::I64);
+            BlockArg::from(coerce_ty(builder, v, t))
+        })
+        .collect()
+}
+
 /// Whether to use native SIMD (I64X2/F64X2) for Vec* codegen.
 /// When false, falls back to scalar emulation.
 const USE_NATIVE_SIMD: bool = true;
@@ -1225,11 +1279,9 @@ fn resolve_opref_vec_float(
         // I64X2 -> F64X2 bitcast
         return builder.ins().bitcast(cl_types::F64X2, MemFlags::new(), v);
     }
-    // Scalar variable: bitcast i64 -> f64 then splat
+    // Scalar variable: reinterpret as f64 (a float var is already F64) then splat
     let scalar = builder.use_var(var(opref.raw()));
-    let scalar_f = builder
-        .ins()
-        .bitcast(cl_types::F64, MemFlags::new(), scalar);
+    let scalar_f = coerce_ty(builder, scalar, cl_types::F64);
     builder.ins().splat(cl_types::F64X2, scalar_f)
 }
 
@@ -3951,8 +4003,8 @@ fn emit_fcmp(
     vi: u32,
 ) {
     let (a, b) = resolve_binop(builder, constants, op);
-    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+    let fa = coerce_ty(builder, a, cl_types::F64);
+    let fb = coerce_ty(builder, b, cl_types::F64);
     let cmp = builder.ins().fcmp(cc, fa, fb);
     let r = builder.ins().uextend(cl_types::I64, cmp);
     builder.def_var(var(vi), r);
@@ -4964,8 +5016,10 @@ fn emit_load_from_addr(
                     "float memory operations currently require 8-byte values",
                 ));
             }
-            let fval = builder.ins().load(cl_types::F64, heap_flags, addr, 0);
-            Ok(builder.ins().bitcast(cl_types::I64, MemFlags::new(), fval))
+            // Return the natural F64 so a Float-result variable (declared
+            // F64) receives it without a GPR round-trip; callers feeding a
+            // boxed I64 slot coerce at their own boundary.
+            Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
         }
         Type::Int | Type::Ref => {
             if value_type == Type::Ref && size != 8 {
@@ -5011,7 +5065,7 @@ fn emit_store_to_addr(
                     "float memory operations currently require 8-byte values",
                 ));
             }
-            let fval = builder.ins().bitcast(cl_types::F64, MemFlags::new(), value);
+            let fval = coerce_ty(builder, value, cl_types::F64);
             builder.ins().store(MemFlags::trusted(), fval, addr, 0);
         }
         Type::Int | Type::Ref => {
@@ -5610,7 +5664,7 @@ fn emit_indirect_call_from_parts(
     for (i, &arg_ref) in arg_refs.iter().enumerate() {
         let raw = resolve_opref(builder, constants, arg_ref);
         if i < arg_types.len() && arg_types[i] == Type::Float {
-            args.push(builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw));
+            args.push(coerce_ty(builder, raw, cl_types::F64));
         } else {
             args.push(raw);
         }
@@ -5646,15 +5700,11 @@ fn emit_indirect_call_from_parts(
     }
 
     if result_type != Type::Void {
+        // Return the call's natural result type (F64 for a float-returning
+        // call); the consuming op's result variable is declared with the
+        // matching carrier type, so `def_var` needs no GPR round-trip.
         let result = builder.inst_results(call)[0];
-        let stored = if result_type == Type::Float {
-            builder
-                .ins()
-                .bitcast(cl_types::I64, MemFlags::new(), result)
-        } else {
-            result
-        };
-        Some(stored)
+        Some(result)
     } else {
         None
     }
@@ -8279,7 +8329,10 @@ impl CraneliftBackend {
                         cl_types::I64X2
                     }
                 } else {
-                    cl_types::I64
+                    // Carry scalar floats as F64 so a loop-carried float stays
+                    // live in an FP register instead of being round-tripped
+                    // through a GPR (fmov) on every iteration.
+                    cranelift_type_for(&op.result_type())
                 };
                 if debug_declares {
                     // Independent debug toggle — not gated by MAJIT_LOG.
@@ -8312,7 +8365,7 @@ impl CraneliftBackend {
                             op.opcode
                         );
                     }
-                    var_types.insert(arg.raw(), cl_types::I64);
+                    var_types.insert(arg.raw(), cl_type_for_opref(arg));
                 }
             }
         }
@@ -8335,7 +8388,7 @@ impl CraneliftBackend {
                     // Independent debug toggle — not gated by MAJIT_LOG.
                     eprintln!("[jit][declare] label-arg var{}", arg.raw());
                 }
-                var_types.insert(arg.raw(), cl_types::I64);
+                var_types.insert(arg.raw(), cl_type_for_opref(arg));
             }
         }
 
@@ -8480,8 +8533,16 @@ impl CraneliftBackend {
         let mut label_blocks_by_descr = VecAssoc::new();
         for &label_idx in &label_indices {
             let block = builder.create_block();
-            for _ in 0..ops[label_idx].num_args() {
-                builder.append_block_param(block, cl_types::I64);
+            // Param type must match the bound variable's declared carrier type
+            // (var_types), so the LABEL-block `def_var(param)` never mismatches.
+            // Float vars are F64, keeping a loop-carried float in an FP register
+            // across the back-edge; the matching JUMP coerces incoming values.
+            for &arg in ops[label_idx].getarglist().iter() {
+                let ty = var_types
+                    .get(&arg.raw())
+                    .copied()
+                    .unwrap_or_else(|| cl_type_for_opref(arg));
+                builder.append_block_param(block, ty);
             }
             if let Some(descr_index) = ops[label_idx].getdescr().map(|descr| descr.index()) {
                 label_blocks_by_descr.insert(descr_index, block);
@@ -8539,8 +8600,16 @@ impl CraneliftBackend {
                 let entry_mode = entry_input_vals[max_entry_inputs];
                 let body_block = label_blocks.last().unwrap().1;
 
-                let body_args = block_args(&entry_input_vals[..body_direct_num_inputs]);
-                let preamble_args = block_args(&entry_input_vals[..num_inputs]);
+                let body_args = block_args_to(
+                    &mut builder,
+                    body_block,
+                    &entry_input_vals[..body_direct_num_inputs],
+                );
+                let preamble_args = block_args_to(
+                    &mut builder,
+                    entry_label_block,
+                    &entry_input_vals[..num_inputs],
+                );
                 builder.ins().brif(
                     entry_mode,
                     body_block,
@@ -8570,7 +8639,8 @@ impl CraneliftBackend {
                 first_label_entered_at_entry = true;
             } else if has_entry_label {
                 let vals: Vec<CValue> = entry_input_vals.clone();
-                builder.ins().jump(entry_label_block, &block_args(&vals));
+                let args = block_args_to(&mut builder, entry_label_block, &vals);
+                builder.ins().jump(entry_label_block, &args);
                 builder.switch_to_block(entry_label_block);
                 for (i, &arg_ref) in ops[entry_label_idx].getarglist().iter().enumerate() {
                     let param = builder.block_params(entry_label_block)[i];
@@ -8601,7 +8671,8 @@ impl CraneliftBackend {
                     }
                 })
                 .collect();
-            builder.ins().jump(loop_block, &block_args(&vals));
+            let args = block_args_to(&mut builder, loop_block, &vals);
+            builder.ins().jump(loop_block, &args);
             builder.switch_to_block(loop_block);
             for i in 0..loop_param_count {
                 let param = builder.block_params(loop_block)[i];
@@ -8645,7 +8716,8 @@ impl CraneliftBackend {
                             .iter()
                             .map(|&r| resolve_opref(&mut builder, &constants, r))
                             .collect();
-                        builder.ins().jump(*label_block, &block_args(&vals));
+                        let args = block_args_to(&mut builder, *label_block, &vals);
+                        builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
                     for (i, &arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
@@ -8905,6 +8977,11 @@ impl CraneliftBackend {
                     } else {
                         builder.ins().iconst(cl_types::I64, 0)
                     };
+                    // SameAsF forwards a float: its result var is F64 while the
+                    // source (e.g. an I64-carried inputarg or constant) may be
+                    // boxed — reconcile to the result var's carrier type.
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let a = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(vi), a);
                     if op.opcode == OpCode::SameAsR {
                         let cur_jf = builder.use_var(jf_ptr_var);
@@ -10743,7 +10820,7 @@ impl CraneliftBackend {
                     for (i, &arg_ref) in op.getarglist()[2..].iter().enumerate() {
                         let raw = resolve_opref(&mut builder, &constants, arg_ref);
                         if i < arg_types.len() && arg_types[i] == Type::Float {
-                            args.push(builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw));
+                            args.push(coerce_ty(&mut builder, raw, cl_types::F64));
                         } else {
                             args.push(raw);
                         }
@@ -10777,13 +10854,8 @@ impl CraneliftBackend {
                     );
 
                     if let Some(result) = result {
-                        let result_val = if result_type == Type::Float {
-                            builder
-                                .ins()
-                                .bitcast(cl_types::I64, MemFlags::new(), result)
-                        } else {
-                            result
-                        };
+                        let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                        let result_val = coerce_ty(&mut builder, result, want);
                         builder.def_var(var(vi), result_val);
                     }
                 }
@@ -12114,7 +12186,8 @@ impl CraneliftBackend {
                         None
                     };
                     if let Some(target_block) = target_block {
-                        builder.ins().jump(target_block, &block_args(&vals));
+                        let args = block_args_to(&mut builder, target_block, &vals);
+                        builder.ins().jump(target_block, &args);
                     } else {
                         // External JUMP (bridge → loop body) — emit as
                         // Finish exit. The dispatcher will re-enter the
@@ -12156,10 +12229,13 @@ impl CraneliftBackend {
                 OpCode::Label => {}
 
                 // ── Float arithmetic ──
+                // Float operands/results carry as F64 (FP register) when the
+                // variable is float-typed, else as boxed I64; `coerce_ty`
+                // reconciles each boundary with a `bitcast` only when needed.
                 OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
+                    let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let fr = match op.opcode {
                         OpCode::FloatAdd => builder.ins().fadd(fa, fb),
                         OpCode::FloatSub => builder.ins().fsub(fa, fb),
@@ -12167,62 +12243,72 @@ impl CraneliftBackend {
                         OpCode::FloatTrueDiv => builder.ins().fdiv(fa, fb),
                         _ => unreachable!(),
                     };
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatFloorDiv => {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
+                    let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let fdiv = builder.ins().fdiv(fa, fb);
                     let fr = builder.ins().floor(fdiv);
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatMod => {
                     // Python's float mod: a - floor(a/b) * b
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
+                    let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let fdiv = builder.ins().fdiv(fa, fb);
                     let ffloor = builder.ins().floor(fdiv);
                     let prod = builder.ins().fmul(ffloor, fb);
                     let fr = builder.ins().fsub(fa, prod);
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatNeg => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fneg(fa);
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatAbs => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fabs(fa);
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
 
                 // ── Casts ──
                 OpCode::CastFloatToInt => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let r = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::CastIntToFloat => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
                     let fr = builder.ins().fcvt_from_sint(cl_types::F64, a);
-                    let r = builder.ins().bitcast(cl_types::I64, MemFlags::new(), fr);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
                 }
                 OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                    // Both are identity in our I64 storage scheme.
+                    // Bit reinterpretation: float<->longlong shares storage, so
+                    // coerce the operand to the result variable's carrier type
+                    // (an actual `bitcast` when one side is F64 and the other I64).
                     let a = resolve_opref(&mut builder, &constants, op.arg(0));
-                    builder.def_var(var(vi), a);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let r = coerce_ty(&mut builder, a, want);
+                    builder.def_var(var(vi), r);
                 }
 
                 // ── Debug / no-op operations ──
@@ -12984,8 +13070,8 @@ impl CraneliftBackend {
                 // ── Float ↔ SingleFloat casts ──
                 OpCode::CastFloatToSinglefloat => {
                     let val = resolve_opref(&mut builder, &constants, op.arg(0));
-                    // i64-encoded f64 → f64 → f32 → zero-extend to i64
-                    let f64_val = builder.ins().bitcast(cl_types::F64, MemFlags::new(), val);
+                    // f64 → f32 → zero-extend to i64 (singlefloat is Int-typed)
+                    let f64_val = coerce_ty(&mut builder, val, cl_types::F64);
                     let f32_val = builder.ins().fdemote(cl_types::F32, f64_val);
                     let i32_val = builder
                         .ins()
@@ -13002,9 +13088,8 @@ impl CraneliftBackend {
                         .ins()
                         .bitcast(cl_types::F32, MemFlags::new(), i32_val);
                     let f64_val = builder.ins().fpromote(cl_types::F64, f32_val);
-                    let result = builder
-                        .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), f64_val);
+                    let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
+                    let result = coerce_ty(&mut builder, f64_val, want);
                     builder.def_var(var(vi), result);
                 }
 
