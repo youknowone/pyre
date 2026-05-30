@@ -4848,14 +4848,15 @@ impl<M: Clone> MetaInterp<M> {
                         // Seed the retry optimizer's `input_ops` so it skips the
                         // `retry_box_pool` snapshot. `retry_box_pool` is
                         // `trace.box_pool`, bound to `preamble_data.base.operations()`,
-                        // so those `Rc<Op>` carry the identical state the snapshot
-                        // would read. Gated on the non-cut path to mirror the
-                        // loop-finish seed: a cut remaps ops into a fresh namespace
-                        // (kept on the `box_pool` fallback).
-                        if cross_loop_cut.is_none() {
-                            simple_opt.explicit_input_ops_seed =
-                                Some(preamble_data.base.operations().to_vec());
-                        }
+                        // so those `Rc<Op>` are the same objects the snapshot would
+                        // read. Unlike the loop-finish seed (which uses the pre-cut
+                        // `source_box_pool` and so must gate on the non-cut path),
+                        // `trace.box_pool` already tracks any cut: when `trace` was
+                        // cut, `preamble_data` was built from the cut trace and
+                        // `trace.box_pool` is bound to those cut ops. So the seed is
+                        // equal to the snapshot for both cut and non-cut here.
+                        simple_opt.explicit_input_ops_seed =
+                            Some(preamble_data.base.operations().to_vec());
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
