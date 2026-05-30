@@ -268,24 +268,27 @@ impl BoxRef {
     /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
     /// if called on a non-ResOp Box.
     ///
-    /// Late-binding carry-over: at bind time the box's effective forwarded
-    /// state (`self.get_forwarded()`) becomes the source of truth for the
-    /// bound `Op`. Copy it into `op.forwarded` unconditionally — including
-    /// when it is `Forwarded::None` — so any stale forwarding the `OpRc`
-    /// happened to carry (e.g. from a clone path) is overwritten and
-    /// post-bind `get_forwarded` reads exactly what the writer set.
+    /// Late-binding carry-over: when the box is *already bound* (a rebind:
+    /// `bind → set_forwarded → rebind`, e.g. `emit()` re-pointing a
+    /// synthetic placeholder at its real producer), its effective forwarded
+    /// state (`self.get_forwarded()`) is transferred into the new `Op` host.
+    /// A freshly minted, still-unbound box has no forwarded state of its own
+    /// — S-0.C removed the Box-side mirror, so `get_forwarded()` on an
+    /// unbound box is always `Forwarded::None`. Carrying that `None` would
+    /// *clobber* an already-populated canonical host's authoritative
+    /// `_forwarded` (the bug that `box_pool` memoization used to mask by
+    /// returning the same bound box on a repeat `ensure_box`). So the
+    /// carry-over fires only when `self` is bound; binding a fresh box leaves
+    /// the host's `_forwarded` intact.
     pub fn bind_op(&self, op: &crate::resoperation::OpRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::ResOp { .. }),
             "BoxRef::bind_op only valid for ResOp boxes"
         );
-        // Read the canonical effective forwarded slot, not the in-Box
-        // mirror. `get_forwarded` consults the bound op/inputarg first,
-        // so a `bind → set_forwarded → rebind` sequence carries the
-        // freshest state across the rebind even if a writer ever bypasses
-        // `BoxRef::set_forwarded_*` and updates `op.forwarded` directly.
-        let carry = self.get_forwarded();
-        *op.forwarded.borrow_mut() = carry;
+        if self.bound_op().is_some() {
+            let carry = self.get_forwarded();
+            *op.forwarded.borrow_mut() = carry;
+        }
         *self.0.op_handle.borrow_mut() = Some(Rc::downgrade(op));
     }
 
@@ -302,19 +305,20 @@ impl BoxRef {
     /// `Weak<InputArg>` so subsequent `set_forwarded_*` / `clear_forwarded`
     /// route through `inputarg.forwarded` (`resoperation.py:700
     /// AbstractInputArg._forwarded`). Panics if called on a non-InputArg
-    /// box. Late-binding carry-over: the effective forwarded state
-    /// (`self.get_forwarded()`) is copied into `inputarg.forwarded`
-    /// unconditionally so any forwarding written before bind survives the
-    /// handoff and post-bind readers see what was set.
+    /// box. Late-binding carry-over follows the same rule as `bind_op`: it
+    /// fires only when `self` is already bound (a rebind that carries real
+    /// state), never when binding a freshly minted box — carrying an unbound
+    /// box's `Forwarded::None` would clobber the canonical host's
+    /// authoritative `_forwarded`.
     pub fn bind_inputarg(&self, ia: &crate::value::InputArgRc) {
         assert!(
             matches!(&self.0.kind, BoxKind::InputArg { .. }),
             "BoxRef::bind_inputarg only valid for InputArg boxes"
         );
-        // Same canonical-slot rule as `bind_op`: `get_forwarded` reads via
-        // the bound handle first so the rebind sees the freshest state.
-        let carry = self.get_forwarded();
-        *ia.forwarded.borrow_mut() = carry;
+        if self.bound_inputarg().is_some() {
+            let carry = self.get_forwarded();
+            *ia.forwarded.borrow_mut() = carry;
+        }
         *self.0.inputarg_handle.borrow_mut() = Some(Rc::downgrade(ia));
     }
 
