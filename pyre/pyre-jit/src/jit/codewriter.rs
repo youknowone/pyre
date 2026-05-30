@@ -971,51 +971,6 @@ fn phase4_resume_coverage(
     targets
 }
 
-/// #238 (P4SUB) probe: does the Variable-keyed CFG coalesce sweep ALONE
-/// reproduce the Ref coloring that the combined `walker_pin_pairs +
-/// cfg_variable_pairs` set produces?  Production seeds the canonical Ref
-/// regalloc with BOTH the walker scratch↔inputarg pins
-/// (`derive_walker_pin_coalesce_pairs`) and the CFG link.args↔inputargs
-/// pairs (`collect_cfg_coalesce_pairs`).  If the CFG sweep alone yields
-/// the same per-Variable color on every Ref Variable, the walker pins
-/// (and `walker_slot_for_variable` behind them) are subsumed and can be
-/// retired — the precondition #248 left open for the Path 4 epic.
-///
-/// Returns `(ref_vars_compared, color_match, color_mismatch,
-/// cfg_only_missing)`: `color_mismatch` counts Ref Variables whose
-/// cfg-only color differs from the combined color; `cfg_only_missing`
-/// counts Variables the combined coloring colors but the cfg-only one
-/// does not (a coverage gap, distinct from a value divergence).  A
-/// graph is pin-subsumed iff `mismatch == 0 && missing == 0`.
-fn phase4_pin_subsumption(
-    graph: &super::flow::FunctionGraph,
-    combined_ref: &super::regalloc::GraphAllocationResult,
-    cfg_variable_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-) -> (u32, u32, u32, u32) {
-    // Re-run the canonical Ref regalloc with the CFG sweep pairs ONLY
-    // (no walker pins), mirroring the production call's enforce step so
-    // the comparison is apples-to-apples.
-    let mut cfg_only = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
-        graph,
-        cfg_variable_pairs,
-    );
-    super::regalloc::enforce_input_args(graph, &mut cfg_only);
-    let cfg_only_ref = &cfg_only[super::flatten::Kind::Ref.index()];
-    let mut compared = 0u32;
-    let mut color_match = 0u32;
-    let mut color_mismatch = 0u32;
-    let mut cfg_only_missing = 0u32;
-    for (&var_id, &combined_color) in &combined_ref.coloring {
-        compared += 1;
-        match cfg_only_ref.coloring.get(&var_id) {
-            Some(&cfg_color) if cfg_color == combined_color => color_match += 1,
-            Some(_) => color_mismatch += 1,
-            None => cfg_only_missing += 1,
-        }
-    }
-    (compared, color_match, color_mismatch, cfg_only_missing)
-}
-
 /// Diagnostic helper: tally per-opname occurrences of the given Insn
 /// slice, using `"Label"` / `"---"` for the non-`Op` variants so the
 /// resulting `Vec<(String, i64)>` is sortable and comparable across
@@ -3096,98 +3051,6 @@ fn pair_walker_slot_if_absent(
             table[idx] = Some(walker_slot);
         }
     }
-}
-
-/// Derive scratch↔inputarg coalesce pairs from
-/// `walker_slot_for_variable`, feeding
-/// [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
-/// so the canonical graph regalloc reproduces walker's slot pinning.
-///
-/// Walker pins every Variable it writes to a Python local-`i` register
-/// to `walker_slot=i` via [`pair_walker_slot`].  Canonical graph
-/// regalloc does not see those pins — its `RegAllocator` only knows
-/// the graph's `link.args↔target.inputargs` pairs (which all locals
-/// share the same inputarg Variable in upstream RPython, but in pyre
-/// each `LOAD_FAST`/`STORE_FAST` walker emit creates a fresh scratch
-/// Variable).  The result is canonical assigns scratch Variables to
-/// arbitrary colors `>= nlocals` while walker has them at color `i`.
-///
-/// This helper returns `(scratch_id, inputarg_id)` pairs for every
-/// non-inputarg Variable walker pinned to slot `i ∈ 0..n_args`,
-/// matched against `graph.startblock.inputargs[i]`.  Feeding the pairs
-/// to [`super::regalloc::perform_register_allocation_all_kinds_with_pairs`]
-/// pre-coalesces them in the canonical union-find so chordal coloring
-/// gives the unified cluster a single color, which
-/// `enforce_input_args` then rotates onto the `0..n_args-1` slot —
-/// matching walker's slot-pinned color exactly.
-///
-/// The slot upper bound is `n_args` (function parameter count), not
-/// `nlocals`.  Walker's `walker_slot_for_variable[scratch] = Some(i)`
-/// means "scratch represents Python local i", with semantics defined
-/// by `code.varnames[i]`.  Canonical's `startblock.inputargs` only
-/// holds entries for function parameters followed by portal red args
-/// (`graph_entry_inputargs`); `inputargs[n_args..n_args+2]` are
-/// `[portal_frame, portal_ec]`, NOT Python locals `n_args..nlocals`.
-///
-/// Pinning a walker-Python-local-i scratch with `inputargs[i]` for
-/// `i >= n_args` would semantically coalesce different things
-/// (Python local i with portal frame/ec) and force canonical regalloc
-/// to assign the same register to both — visible only via the probe
-/// today, but would corrupt runtime state if canonical's SSARepr ever
-/// became production.  Body-defined Python locals `n_args..nlocals`
-/// have no canonical inputarg counterpart in pyre today; the
-/// architecturally-correct fix (PyPy parity) is to extend
-/// `graph_entry_inputargs` to seed all `nlocals` slots.
-///
-/// TODO: the upstream
-/// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` signature
-/// has no extra pre-coalesce parameter because PyPy's flowgraph never
-/// produces scratch local-`i` Variables disjoint from the
-/// `startblock.inputargs[i]` Variable — every read/write of local `i`
-/// flows through the same Variable.  Pyre's walker creates fresh
-/// scratch Variables per emit, so the canonical regalloc needs this
-/// pre-coalesce hint to converge with walker's color assignments.
-/// Retires when the walker is replaced with a graph-only emit
-/// pipeline.
-fn derive_walker_pin_coalesce_pairs(
-    graph: &super::flow::FunctionGraph,
-    walker_slot_for_variable: &[Option<u16>],
-    n_args: usize,
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    let inputargs = graph.startblock.borrow().inputargs.clone();
-    let mut pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> = Vec::new();
-    for (var_id_usize, maybe_slot) in walker_slot_for_variable.iter().enumerate() {
-        let Some(slot) = maybe_slot else { continue };
-        let slot_idx = *slot as usize;
-        if slot_idx >= n_args {
-            // Slot above function-parameter range — either a body-
-            // defined Python local (`n_args..nlocals`, no canonical
-            // inputarg counterpart) or a stack slot (`>= nlocals`,
-            // walker's chordal coloring assigns it freely).  Both
-            // cases need the orthodox PyPy parity fix (extend
-            // `graph_entry_inputargs` to nlocals) before a meaningful
-            // pin can be derived.
-            continue;
-        }
-        let Some(inputarg_value) = inputargs.get(slot_idx) else {
-            continue;
-        };
-        let Some(inputarg_var) = inputarg_value.as_variable() else {
-            continue;
-        };
-        let scratch_id = super::flow::VariableId(var_id_usize as u32);
-        if inputarg_var.id == scratch_id {
-            // The inputarg itself was paired to its own slot — no
-            // coalesce needed (it's already at the right color via
-            // `enforce_input_args`).
-            continue;
-        }
-        if inputarg_var.kind != Some(Kind::Ref) {
-            continue;
-        }
-        pairs.push((scratch_id, inputarg_var.id));
-    }
-    pairs
 }
 
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
@@ -9769,12 +9632,9 @@ impl CodeWriter {
         // emit-then-strip approach converges to the same byte stream.
         //
         // Seed `walker_slot_for_variable` with block inputarg slots
-        // BEFORE graph regalloc + `walker_post_walk_insert_renamings`
-        // read it.  The same pairing pass also runs downstream
-        // (idempotent via `pair_walker_slot_if_absent`);
-        // `derive_walker_pin_coalesce_pairs` needs the full pin map
-        // to project scratch↔inputarg pre-coalesce pairs onto the
-        // canonical graph regalloc below.
+        // BEFORE `walker_post_walk_insert_renamings` reads it.  The same
+        // pairing pass also runs downstream (idempotent via
+        // `pair_walker_slot_if_absent`).
         for spam in &all_walker_blocks {
             let Some(state) = spam.framestate() else {
                 continue;
@@ -9793,82 +9653,35 @@ impl CodeWriter {
         // separate regalloc calls would otherwise diverge bridge-
         // fallback Variables' colors).
         //
-        // TODO: thread walker pin pairs into
-        // canonical Ref regalloc via
-        // `perform_register_allocation_all_kinds_with_pairs`.  Each
-        // pair `(scratch_var, inputarg_var)` requests that the
-        // chordal coloring assign them the same color so
-        // `enforce_input_args`'s rotation lands the scratch on its
-        // semantic local-i slot — matching walker's
-        // `walker_slot_for_variable` pinning regime exactly.
-        //
-        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): CFG
-        // `link.args ↔ target.inputargs` pairs are pre-merged
-        // alongside `walker_pin_pairs`.  PyPy `regalloc.py:79-96
-        // coalesce_variables` + `:98-112 _try_coalesce` coalesces CFG
-        // pairs post-`make_dependencies` with the
-        // `v0 not in dg.neighbours[w0]` interference check; this
-        // pre-merge bypasses that check and silently merges pairs
-        // PyPy would reject.  Honouring the interference check
-        // measurably regresses cranelift (fib_recursive/raise_catch/
-        // fannkuch TIMEOUT, measured 2026-05-26).  Re-measured
-        // 2026-05-26 cycle-10 on top of LoadName/LoadConst
-        // orphan-Variable closures (commits `ba48e1ab61`, `1606e187de`):
-        // dynasm fib_recursive 2.44s vs cpython 1.62s = 1.5x FAIL.
-        // The orphan-Variable closures did not remove the bridge
-        // ref_copy cost.  Root cause is walker's color-aggressive
-        // emit diverging from canonical's interference-respecting
-        // coloring; `walker_post_walk_insert_renamings` emits
-        // unbounded ref_copy ops to bridge — gated on Path 4 (#238)
-        // retirement of `walker_slot_for_variable` so canonical
-        // colors become authoritative.
-        let walker_pin_pairs = derive_walker_pin_coalesce_pairs(
-            &graph,
-            &walker_slot_for_variable,
-            entry_arg_slots(code),
-        );
         // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
-        // `flatten.py:154 insert_renamings` mutates the graph.
-        // Collect once here so both the canonical (above) and
-        // SSARepr-side (below at `allocate_registers`) consumers
-        // share the same pre-renaming pair set.
+        // `flatten.py:154 insert_renamings` mutates the graph.  Collect
+        // once here so both the canonical pass and the SSARepr-side
+        // `allocate_registers` observe the same pre-renaming graph.  The
+        // walker scratch↔inputarg pins (#248) used to be chained in
+        // alongside these CFG pairs, but P4SUB proved them subsumed:
+        // `cfg_variable_pairs` alone reproduces the combined Ref coloring
+        // (per-Variable + num_colors) on every production graph, so they
+        // are dropped (#238).
+        //
+        // PRE-EXISTING-ADAPTATION (parity regression vs PyPy): these CFG
+        // `link.args ↔ target.inputargs` pairs are pre-merged into the
+        // union-find BEFORE `make_dependencies`.  PyPy `regalloc.py:79-96
+        // coalesce_variables` + `:98-112 _try_coalesce` coalesce post-
+        // `make_dependencies` with the `v0 not in dg.neighbours[w0]`
+        // interference check; the pre-merge bypasses that check and
+        // silently merges pairs PyPy would reject.  Honouring the check
+        // measurably regresses cranelift (fib_recursive/raise_catch/
+        // fannkuch TIMEOUT, measured 2026-05-26) — see #260.  Root cause
+        // is walker's color-aggressive emit diverging from canonical's
+        // interference-respecting coloring; `walker_post_walk_insert_
+        // renamings` emits bridge ref_copy ops, gated on the Path 4
+        // (#238) retirement of `walker_slot_for_variable`.
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
-        let canonical_ref_coalesce_pairs: Vec<(super::flow::VariableId, super::flow::VariableId)> =
-            walker_pin_pairs
-                .iter()
-                .copied()
-                .chain(cfg_variable_pairs.iter().copied())
-                .collect();
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,
-            &canonical_ref_coalesce_pairs,
+            &cfg_variable_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
-        // #238 (P4SUB) measurement: is the combined `walker_pin_pairs +
-        // cfg_variable_pairs` Ref coloring reproducible from
-        // `cfg_variable_pairs` ALONE?  If so on every bench, the walker
-        // pins (and `walker_slot_for_variable`) are subsumed by the CFG
-        // sweep and can retire (the open question from #248).  Gated by
-        // its own env var (the `phase4_diff_canonical` flag is bound
-        // downstream at the canonical-build block, after the
-        // `graph_regallocs` + `cfg_variable_pairs` borrows this probe
-        // needs go out of scope) — measurement only, no behavior change.
-        if std::env::var("PYRE_P4_PIN_SUBSUMPTION").as_deref() == Ok("1") {
-            let (compared, color_match, color_mismatch, cfg_only_missing) =
-                phase4_pin_subsumption(
-                    &graph,
-                    &graph_regallocs[super::flatten::Kind::Ref.index()],
-                    &cfg_variable_pairs,
-                );
-            let subsumed = color_mismatch == 0 && cfg_only_missing == 0;
-            eprintln!(
-                "[phase4-pin-subsumption] graph={} subsumed={subsumed} \
-                 ref_vars={compared} match={color_match} mismatch={color_mismatch} \
-                 cfg_only_missing={cfg_only_missing} walker_pins={}",
-                ssarepr.name,
-                walker_pin_pairs.len(),
-            );
-        }
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
