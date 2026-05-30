@@ -726,6 +726,18 @@ impl SpamBlockRef {
     fn per_block_ssarepr_len(&self) -> usize {
         self.0.borrow().per_block_ssarepr.len()
     }
+
+    /// Move `other`'s per-block accumulator onto the end of `self`'s and clear
+    /// `other` (issue #73 `remove_trivial_links` merge bridge).  Returns the
+    /// index in `self` where `other`'s insns now begin so callers can re-point
+    /// any `-live-` marker offsets recorded against `other`.  `self` and
+    /// `other` must be distinct blocks.
+    fn absorb_per_block_ssarepr(&self, other: &SpamBlockRef) -> usize {
+        let base = self.0.borrow().per_block_ssarepr.len();
+        let moved = std::mem::take(&mut other.0.borrow_mut().per_block_ssarepr);
+        self.0.borrow_mut().per_block_ssarepr.extend(moved);
+        base
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -1733,6 +1745,54 @@ fn rewrite_dead_forwarder_gotos(all_walker_blocks: &[SpamBlockRef]) {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Issue #73 `remove_trivial_links` merge bridge.
+///
+/// When `remove_trivial_links` merges `target` into `source`
+/// (`source.recloseblock(*target.exits)`), `target` becomes unreachable in
+/// `graph.iterblocks()`, but the walker has already emitted `target`'s Python
+/// opcodes inline into its `per_block_ssarepr`.  The drain appends unreachable
+/// blocks AFTER the DFS-ordered prefix, so without this bridge `target`'s insns
+/// would emit at the wrong position behind `source`'s now-dangling
+/// `goto TLabel(target)`.
+///
+/// Relocate each merged `target`'s accumulator to the end of its `source`'s, in
+/// the merge (absorption) order, and re-point any per-PC `-live-` markers
+/// recorded against `target` to their new `source` offset.  The surviving
+/// stream keeps `source`'s block-boundary `goto TLabel(target) + ---`
+/// immediately followed by `target`'s `Label` — a runtime-correct (redundant)
+/// fall-through branch that the assembler patches normally (`target`'s label is
+/// single-entry, so it is marked exactly once and never left unmarked).
+fn rewrite_trivial_link_merges(
+    merges: &[(super::flow::BlockRef, super::flow::BlockRef)],
+    all_walker_blocks: &[SpamBlockRef],
+    walker_pc_live_marker_pos: &mut [Vec<(SpamBlockRef, usize)>],
+) {
+    let find = |b: &super::flow::BlockRef| -> Option<SpamBlockRef> {
+        all_walker_blocks
+            .iter()
+            .find(|spam| &spam.block() == b)
+            .cloned()
+    };
+    for (source, target) in merges {
+        let (Some(src_spam), Some(tgt_spam)) = (find(source), find(target)) else {
+            continue;
+        };
+        if src_spam == tgt_spam {
+            continue;
+        }
+        let base = src_spam.absorb_per_block_ssarepr(&tgt_spam);
+        // Re-point `-live-` markers: (tgt_spam, off) -> (src_spam, base + off).
+        for pc_entries in walker_pc_live_marker_pos.iter_mut() {
+            for entry in pc_entries.iter_mut() {
+                if entry.0 == tgt_spam {
+                    entry.0 = src_spam.clone();
+                    entry.1 += base;
                 }
             }
         }
@@ -9377,11 +9437,10 @@ impl CodeWriter {
         //
         // The full orthodox pass list lives in
         // [`super::simplify::simplify_graph`] / `all_passes` (issue #112).
-        // Here we run the **walker-safe subset** — the graph-normalization
-        // passes that neither change block count (so the block-by-block
-        // drain below keeps every SpamBlock's `per_block_ssarepr`) nor add
-        // inputargs/link-args (which would desync the walker renamings),
-        // matching the upstream `all_passes` relative order:
+        // Here we run the **walker-safe subset** of the orthodox pass list,
+        // each either keeping every SpamBlock's `per_block_ssarepr` in the
+        // block-by-block drain, or reconciling the inline byte stream with a
+        // bridge, in the upstream `all_passes` relative order:
         //
         //   transform_dead_op_vars   (drops dead inputargs + matching args)
         //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge)
@@ -9390,23 +9449,31 @@ impl CodeWriter {
         //                             branch conditions before emitting an
         //                             exitswitch — but kept for all_passes
         //                             parity and to fold any that do appear)
+        //   remove_trivial_links     (merges single-entry/exit chains; the
+        //                             merge bridge below relocates each merged
+        //                             target's per_block_ssarepr into source)
         //
-        // EMPIRICALLY VALIDATED (#73, 2026-05-30): this subset passes the
+        // EMPIRICALLY VALIDATED (#73, 2026-05-31): this subset passes the
         // full check.py gate (dynasm 39/39, correctness + 8-benchmark
-        // performance).  The remaining active passes are still gated on a
-        // graph-driven drain (#73):
-        //   - `ssa_to_ssi` ADDS inputargs/link-args (5/25 synthetic fail) —
-        //     it changes the coalesce pairs and walker renamings the inline
-        //     drain depends on;
-        //   - `remove_trivial_links` MERGES blocks (16/25 fail) — the merged
-        //     target's `per_block_ssarepr` would be lost from the drain.
-        // The other `all_passes` entries are structural no-ops on today's
-        // empty-`operations` walker blocks (see their classification in
-        // `simplify.rs`).
+        // performance, no regression).  The only remaining active pass still
+        // gated on a graph-driven drain (#73) is `ssa_to_ssi`, which ADDS
+        // inputargs/link-args (5/25 synthetic fail) the inline drain has no
+        // register slots for.  The other `all_passes` entries are structural
+        // no-ops on today's empty-`operations` walker blocks (see their
+        // classification in `simplify.rs`).
         super::simplify::transform_dead_op_vars(&graph);
         eliminate_empty_blocks(&graph);
         super::simplify::remove_identical_vars_ssa(&graph);
         super::simplify::constfold_exitswitch(&graph);
+        // remove_trivial_links merges single-entry/single-exit chains; the
+        // merge bridge relocates each merged target's inline per_block_ssarepr
+        // into its surviving source so the drain keeps the opcodes (issue #73).
+        let trivial_link_merges = super::simplify::remove_trivial_links_recording(&graph);
+        rewrite_trivial_link_merges(
+            &trivial_link_merges,
+            &all_walker_blocks,
+            &mut walker_pc_live_marker_pos,
+        );
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
         // no equivalent check (its graph is simplified before flatten),

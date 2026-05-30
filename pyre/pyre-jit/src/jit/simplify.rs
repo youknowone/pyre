@@ -64,6 +64,24 @@ use super::flow::{
 /// single predecessor and is not the returnblock (`target.exits` non-empty).
 /// Such a link is removed by folding `target` into `source`.
 pub fn remove_trivial_links(graph: &FunctionGraph) {
+    let mut merges = Vec::new();
+    remove_trivial_links_recording_into(graph, &mut merges);
+}
+
+/// Like [`remove_trivial_links`] but returns each `(source, target)` merge in
+/// absorption order so the walker drain can move the merged target block's
+/// inline `per_block_ssarepr` into the surviving source (issue #73).  `source`
+/// absorbs `target`; a chain `s <- t1 <- t2` records `(s, t1), (s, t2)`.
+pub fn remove_trivial_links_recording(graph: &FunctionGraph) -> Vec<(BlockRef, BlockRef)> {
+    let mut merges = Vec::new();
+    remove_trivial_links_recording_into(graph, &mut merges);
+    merges
+}
+
+fn remove_trivial_links_recording_into(
+    graph: &FunctionGraph,
+    merges: &mut Vec<(BlockRef, BlockRef)>,
+) {
     let entrymap = mkentrymap(graph);
     let startblock = graph.startblock.clone();
     // `seen = set([block])` — faithful port of a Python set; BlockRef hashes
@@ -126,6 +144,9 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
                 source_b.exitswitch = target_exitswitch;
             }
             source.recloseblock(target_exits);
+            // Record the merge so the walker drain can relocate `target`'s
+            // inline `per_block_ssarepr` into `source` (issue #73).
+            merges.push((source.clone(), target.clone()));
             // `stack.extend(source.exits)` — keep collapsing through source.
             stack.extend(source.borrow().exits.clone());
         } else {
