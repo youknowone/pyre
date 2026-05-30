@@ -388,7 +388,7 @@ fn merge_fn_return_types_from_parsed_files(
     program: &mut front::SemanticProgram,
     parsed_files: &[parse::ParsedInterpreter],
 ) {
-    let ast_metadata = front::ast::collect_program_metadata_pub(parsed_files);
+    let ast_metadata = front::syn_metadata::collect_program_metadata(parsed_files);
     for (name, ty) in ast_metadata.fn_return_types {
         program.fn_return_types.entry(name).or_insert(ty);
     }

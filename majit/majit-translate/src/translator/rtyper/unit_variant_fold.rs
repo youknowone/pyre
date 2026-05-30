@@ -99,7 +99,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             }
             let mut segments = owner_path.clone();
             segments.push(name.clone());
-            if !crate::front::ast::is_synthetic_unit_variant_path(&segments) {
+            if !crate::front::syn_metadata::is_synthetic_unit_variant_path(&segments) {
                 continue;
             }
             let qualname = segments.join(".");

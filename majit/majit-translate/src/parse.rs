@@ -1002,7 +1002,7 @@ pub fn extract_trait_impls(
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
-) -> Result<Vec<TraitImplInfo>, crate::front::ast::FlowingError> {
+) -> Result<Vec<TraitImplInfo>, crate::front::semantic::FlowingError> {
     let mut impls = Vec::new();
     let mut known_trait_names = std::collections::HashSet::new();
     collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
@@ -1030,7 +1030,7 @@ fn collect_trait_impls_from_items(
     known_trait_names: &std::collections::HashSet<String>,
     mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
     impls: &mut Vec<TraitImplInfo>,
-) -> Result<(), crate::front::ast::FlowingError> {
+) -> Result<(), crate::front::semantic::FlowingError> {
     for item in items {
         match item {
             // Concrete trait impls (impl Trait for Type)
@@ -1047,7 +1047,7 @@ fn collect_trait_impls_from_items(
                     // with use-site lookups when the receiver type is referenced
                     // via a `use <path> as alias` form.
                     let self_ty_root = type_root_ident(self_ty).map(|t| {
-                        crate::front::ast::qualify_type_name_with_imports(&t, prefix, use_imports)
+                        crate::front::semantic::qualify_type_name_with_imports(&t, prefix, use_imports)
                     });
                     let mut methods: Vec<MethodInfo> = Vec::new();
                     for item in &impl_block.items {
@@ -1263,7 +1263,7 @@ pub fn extract_inherent_impl_methods(
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
-) -> Result<Vec<InherentMethodInfo>, crate::front::ast::FlowingError> {
+) -> Result<Vec<InherentMethodInfo>, crate::front::semantic::FlowingError> {
     let mut methods = Vec::new();
     // Feed `parsed.module_path` so the inherent-impl receiver-root
     // qualification agrees with the caller-side
@@ -1294,7 +1294,7 @@ fn collect_inherent_methods_from_items(
     known_struct_names: &std::collections::HashSet<String>,
     mir_graphs: Option<&crate::front::semantic::MirGraphLookup>,
     methods: &mut Vec<InherentMethodInfo>,
-) -> Result<(), crate::front::ast::FlowingError> {
+) -> Result<(), crate::front::semantic::FlowingError> {
     for item in items {
         match item {
             Item::Impl(impl_block) => {
@@ -1320,7 +1320,7 @@ fn collect_inherent_methods_from_items(
                 //    identity uses the same lookup at both ends.
                 let self_ty_root_bare = type_root_ident(&impl_block.self_ty);
                 let self_ty_root_qualified = self_ty_root_bare.as_ref().map(|t| {
-                    crate::front::ast::qualify_type_name_with_imports(t, prefix, use_imports)
+                    crate::front::semantic::qualify_type_name_with_imports(t, prefix, use_imports)
                 });
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
