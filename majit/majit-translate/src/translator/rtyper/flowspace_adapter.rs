@@ -636,6 +636,7 @@ pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
             | OpKind::GuardFalse { .. }
             | OpKind::GuardValue { .. }
             | OpKind::VableForce { .. }
+            | OpKind::Abort { .. }
     )
 }
 
