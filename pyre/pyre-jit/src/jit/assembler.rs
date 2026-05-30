@@ -2259,6 +2259,54 @@ mod tests {
     }
 
     #[test]
+    fn assemble_ref_return_accepts_const_ref() {
+        let mut ssarepr = SSARepr::new("ref_return_const");
+        ssarepr
+            .insns
+            .push(Insn::op("ref_return", vec![Operand::ConstRef(42)]));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 2,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("ref_return/r")
+            .expect("ref_return must be registered in wellknown insns");
+        // The constant routes into the ref constant pool; the operand byte
+        // resolves to `num_regs_r + pool_idx` (2 + 0) in the const window.
+        assert_eq!(jitcode.code, vec![opcode, 2]);
+        assert_eq!(jitcode.constants_r, vec![42]);
+    }
+
+    #[test]
+    fn assemble_raise_accepts_const_ref() {
+        let mut ssarepr = SSARepr::new("raise_const");
+        ssarepr
+            .insns
+            .push(Insn::op("raise", vec![Operand::ConstRef(7)]));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 2,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("raise/r")
+            .expect("raise must be registered in wellknown insns");
+        assert_eq!(jitcode.code, vec![opcode, 2]);
+        assert_eq!(jitcode.constants_r, vec![7]);
+    }
+
+    #[test]
     fn assemble_ptr_nonzero_uses_canonical_ref_nullity_opcode() {
         let mut ssarepr = SSARepr::new("ptr_nonzero");
         ssarepr.insns.push(Insn::op_with_result(
