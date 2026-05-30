@@ -1701,6 +1701,12 @@ impl OptContext {
     /// (`optimizer.py:394 op.set_forwarded(newop)`, unroll.py:497).
     /// Idempotent — re-running re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
+        // The recorder always populates `box_pool` for a real trace, so this
+        // emptiness guard never fires in production; it is a synthetic-fixture
+        // concern only. The `#[cfg(not(test))]` derive below self-guards (its
+        // loops no-op when `self.inputargs` is empty), so production needs no
+        // `box_pool` read here.
+        #[cfg(test)]
         if self.box_pool.is_empty() {
             return;
         }
@@ -1754,8 +1760,7 @@ impl OptContext {
                 let ia = match bound {
                     Some(a) => a,
                     None => {
-                        let fresh =
-                            std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+                        let fresh = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
                         if let Some(b) = self.box_pool.get_at_position(pos) {
                             b.bind_inputarg(&fresh);
                         }
@@ -2018,6 +2023,11 @@ impl OptContext {
     /// `ctx.box_pool = vec![..]` fixtures resolving through the
     /// `resolve_to_boxref` `box_pool` tail still observe the producer.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
+        // The recorder always populates `box_pool` for a real trace, so this
+        // emptiness guard never fires in production; the loop over the
+        // caller-threaded `ops` self-guards (no-op on an empty slice). Retain
+        // the guard `#[cfg(test)]` for synthetic fixtures.
+        #[cfg(test)]
         if self.box_pool.is_empty() {
             return;
         }
@@ -4250,7 +4260,9 @@ impl OptContext {
                 self.inputarg_refs[idx] =
                     std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
             }
-            return Some(crate::r#box::BoxRef::from_bound_inputarg(&self.inputarg_refs[idx]));
+            return Some(crate::r#box::BoxRef::from_bound_inputarg(
+                &self.inputarg_refs[idx],
+            ));
         }
         // Existing entries keep their construction-time shape (the recorder
         // / `with_inputarg_types` plant authoritative BoxRefs upstream);
