@@ -4118,7 +4118,41 @@ impl JitCodeBuilder {
 
     fn patch_labels(&mut self) {
         for &(label_idx, patch_offset) in &self.patches {
-            let target = self.labels[label_idx].expect("jitcode label was never marked") as u16;
+            let target = match self.labels.get(label_idx).copied().flatten() {
+                Some(target) => target as u16,
+                None => {
+                    // Diagnostic for issue #112 scope #3: a label was
+                    // *referenced* (a goto / switch / forwarder operand was
+                    // emitted at these code offsets) but never *marked* (its
+                    // target block's `Label` was never emitted).  The orthodox
+                    // cause is an un-simplified graph reaching flatten — a
+                    // dead/trivial forwarder or a constant-folded switch arm
+                    // whose target block produced no `Label`.  Report the
+                    // offending label index, every referencing code offset, and
+                    // the marked/total label counts so the origin can be traced
+                    // before the panic, then point at the `simplify_graph`
+                    // passes that remove the shape.
+                    let marked = self.labels.iter().filter(|l| l.is_some()).count();
+                    let total = self.labels.len();
+                    let referencing_offsets: Vec<usize> = self
+                        .patches
+                        .iter()
+                        .filter(|(idx, _)| *idx == label_idx)
+                        .map(|(_, off)| *off)
+                        .collect();
+                    panic!(
+                        "jitcode label {label_idx} was never marked \
+                         (referenced at code offsets {referencing_offsets:?}; \
+                         {marked}/{total} labels marked). Issue #112 unmarked-label \
+                         gap: a goto/switch/forwarder targets a block whose Label \
+                         was never emitted — typically an un-simplified dead/trivial \
+                         forwarder or dead switch arm reaching flatten. The orthodox \
+                         fix is graph normalization via simplify_graph \
+                         (eliminate_empty_blocks / remove_trivial_links / \
+                         constfold_exitswitch)."
+                    );
+                }
+            };
             let bytes = target.to_le_bytes();
             self.code[patch_offset] = bytes[0];
             self.code[patch_offset + 1] = bytes[1];

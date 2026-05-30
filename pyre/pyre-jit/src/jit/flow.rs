@@ -36,7 +36,7 @@
 //! Scope of THIS slice: data types only. No walker integration yet.
 //! Subsequent slices of Step 6 (see task #205) populate and consume.
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
@@ -138,6 +138,19 @@ impl Variable {
                 .nr = nr;
         }
         format!("{}{}", prefix, nr)
+    }
+
+    /// The name *prefix* (the `_name` slot upstream), without the numeric
+    /// suffix `name()` appends.  `simplify.py:537 isspecialvar` matches on
+    /// this prefix (`'last_exception_'` / `'last_exc_value_'`).
+    pub fn name_prefix(&self) -> String {
+        VARIABLE_NAMES
+            .lock()
+            .unwrap()
+            .states
+            .get(&self.id)
+            .map(|state| state.name.clone())
+            .unwrap_or_else(|| DUMMYNAME.to_owned())
     }
 
     pub fn renamed(&self) -> bool {
@@ -873,6 +886,18 @@ impl Link {
         self.target = Some(targetblock);
     }
 
+    /// `link.prevblock` as a strong [`BlockRef`].
+    ///
+    /// RPython stores `Link.prevblock` as a direct object reference; pyre
+    /// breaks the block↔link ownership cycle with a `Weak`, so passes that
+    /// need `source = link.prevblock` (e.g. `simplify.py:242
+    /// remove_trivial_links`) recover the strong reference here.  Returns
+    /// `None` only if the owning block has been dropped, which never
+    /// happens for a link still reachable from `graph.iterlinks()`.
+    pub fn prevblock_ref(&self) -> Option<BlockRef> {
+        self.prevblock.as_ref().and_then(Weak::upgrade).map(BlockRef)
+    }
+
     pub fn into_ref(self) -> LinkRef {
         LinkRef(Rc::new(RefCell::new(self)))
     }
@@ -1025,7 +1050,13 @@ pub struct FunctionGraph {
     pub exceptblock: BlockRef,
     pub tag: Option<String>,
     /// Monotonic id generator for Variables allocated in this graph.
-    next_variable_id: u32,
+    ///
+    /// Interior-mutable (`Cell`) so graph-normalization passes that take
+    /// `&FunctionGraph` (the `simplify_graph` pass shape) can still allocate
+    /// fresh Variables — `SSA_to_SSI`'s `v.copy()` (`ssa.py:622`) needs a new
+    /// identity while every other slot mutates through `RefCell` block/link
+    /// interior mutability.
+    next_variable_id: Cell<u32>,
 }
 
 impl FunctionGraph {
@@ -1040,13 +1071,13 @@ impl FunctionGraph {
             next_variable_id = next_variable_id.max(return_var.id.0 + 1);
         }
 
-        let mut graph = Self {
+        let graph = Self {
             name: name.into(),
             startblock: startblock.clone(),
             returnblock: Block::shared(Vec::new()),
             exceptblock: Block::shared(Vec::new()),
             tag: None,
-            next_variable_id,
+            next_variable_id: Cell::new(next_variable_id),
         };
 
         let return_var = return_var.unwrap_or_else(|| graph.fresh_untyped_variable());
@@ -1058,6 +1089,9 @@ impl FunctionGraph {
         let exceptblock = Block::shared(vec![except_etype.into(), except_evalue.into()]);
         exceptblock.borrow_mut().mark_final();
 
+        // `graph` is not `mut`: `returnblock`/`exceptblock` are reassigned
+        // through the owned struct binding below.
+        let mut graph = graph;
         graph.returnblock = returnblock;
         graph.exceptblock = exceptblock;
         graph
@@ -1065,21 +1099,32 @@ impl FunctionGraph {
 
     /// Allocate a fresh `Variable` of the given kind. Mirrors upstream
     /// `Variable(name=None)` which also creates a new identity.
-    pub fn fresh_variable(&mut self, kind: Kind) -> Variable {
-        let id = VariableId(self.next_variable_id);
-        self.next_variable_id += 1;
+    pub fn fresh_variable(&self, kind: Kind) -> Variable {
+        let id = VariableId(self.next_variable_id.get());
+        self.next_variable_id.set(id.0 + 1);
         Variable::new(id, kind)
     }
 
-    pub fn fresh_untyped_variable(&mut self) -> Variable {
-        let id = VariableId(self.next_variable_id);
-        self.next_variable_id += 1;
+    pub fn fresh_untyped_variable(&self) -> Variable {
+        let id = VariableId(self.next_variable_id.get());
+        self.next_variable_id.set(id.0 + 1);
         Variable::new_untyped(id)
     }
 
+    /// `model.py:341-348 Variable.copy` — a fresh identity carrying the same
+    /// kind (`concretetype`) as `v`.  Used by `SSA_to_SSI`.
+    pub fn fresh_like(&self, v: Variable) -> Variable {
+        match v.kind {
+            Some(kind) => self.fresh_variable(kind),
+            None => self.fresh_untyped_variable(),
+        }
+    }
+
     /// Allocate and own a fresh `Block`.
-    pub fn new_block(&mut self, inputargs: Vec<FlowValue>) -> BlockRef {
-        observe_values_for_next_id(&mut self.next_variable_id, &inputargs);
+    pub fn new_block(&self, inputargs: Vec<FlowValue>) -> BlockRef {
+        let mut next = self.next_variable_id.get();
+        observe_values_for_next_id(&mut next, &inputargs);
+        self.next_variable_id.set(next);
         Block::shared(inputargs)
     }
 
@@ -1292,7 +1337,7 @@ pub fn copygraph(
     let mut blockmap: HashMap<BlockRef, BlockRef> = HashMap::new();
     let mut local_varmap = varmap.clone();
     let shallowvars = shallowvars || shallow;
-    let mut next_variable_id = graph.next_variable_id;
+    let mut next_variable_id = graph.next_variable_id.get();
 
     let copy_block = |block: &BlockRef,
                       local_varmap: &mut HashMap<Variable, Variable>,
@@ -1448,7 +1493,7 @@ pub fn copygraph(
         returnblock: blockmap[&graph.returnblock].clone(),
         exceptblock: blockmap[&graph.exceptblock].clone(),
         tag: graph.tag.clone(),
-        next_variable_id,
+        next_variable_id: Cell::new(next_variable_id),
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod backendopt_ssa;
 pub mod call;
 pub mod codewriter;
 pub mod cpu;
@@ -7,6 +8,7 @@ pub mod flatten;
 pub mod flow;
 pub mod liveness;
 pub mod regalloc;
+pub mod simplify;
 mod ssa_emitter;
 pub use pyre_jit_trace::descr;
 pub mod executor;

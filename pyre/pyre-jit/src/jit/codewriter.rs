@@ -1555,7 +1555,7 @@ fn walker_post_walk_insert_renamings(
 /// producer of the empty-forwarding shape, so `dead` is the faithful
 /// pyre predicate.  The `exitswitch.is_none()` / `!exits.is_empty()`
 /// guards still mirror upstream exactly.
-fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
+pub(crate) fn eliminate_empty_blocks(graph: &super::flow::FunctionGraph) {
     for link_ref in graph.iterlinks() {
         loop {
             let Some(block1) = link_ref.borrow().target.clone() else {
@@ -9374,6 +9374,24 @@ impl CodeWriter {
         // use) reflect the collapsed `predecessor -> generalization`
         // links; `rewrite_dead_forwarder_gotos` then retargets the
         // walker's inline-emitted `TLabel`s to match.
+        //
+        // The full orthodox pass list now lives in
+        // [`super::simplify::simplify_graph`] / `all_passes` (issue #112),
+        // but only `eliminate_empty_blocks` is wired into the walker today.
+        // The other *active* passes — `remove_trivial_links` (merges
+        // blocks), `remove_identical_vars_ssa` / `ssa_to_ssi` (rename / add
+        // inputargs), `transform_dead_op_vars` (drops inputargs),
+        // `constfold_exitswitch` (drops exits) — would change graph
+        // topology / variables after the walker has already emitted SSARepr
+        // inline into `per_block_ssarepr`.  The drain below reads that
+        // SSARepr block-by-block in `graph.iterblocks()` order, and only
+        // `eliminate_empty_blocks` has a reconciliation bridge
+        // (`rewrite_dead_forwarder_gotos`).  Wiring the rest is therefore
+        // gated on making the drain graph-driven (issue #73); until then
+        // they would desync the emitted byte stream.  (The remaining
+        // `simplify_graph` passes are no-ops on today's empty-`operations`
+        // walker blocks anyway — see their classification in
+        // `simplify.rs`.)
         eliminate_empty_blocks(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
