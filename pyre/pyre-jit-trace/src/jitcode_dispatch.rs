@@ -897,6 +897,20 @@ pub enum DispatchError {
     /// driver maps it to `TraceAction::Abort` and the loop falls back to
     /// the interpreter instead of compiling a wrong trace.
     MayForceNullRefArgUnsupported { pc: usize },
+    /// A may-force residual CALL that can raise (`GUARD_NO_EXCEPTION`
+    /// emitted) sits at a jitcode position immediately followed by a
+    /// `catch_exception/L` — i.e. the call is covered by a Python
+    /// `try`/`except` handler. The full-body walk cannot yet resume the
+    /// `GUARD_NO_EXCEPTION` deopt into that handler: the exception-path
+    /// bridge reads the standing exception value, but the walker's guard
+    /// resume snapshot does not seed it (task #51c exc-routing), so the
+    /// bridge dereferences a NULL exception object (`GuardClass ldr [x0]`
+    /// with `x0 == 0`). The trait tracer resumes the handler correctly,
+    /// so the walker surfaces a typed abort and the driver maps it to
+    /// `TraceAction::Abort` → interpreter fallback. Calls NOT covered by
+    /// a handler (e.g. `math.sqrt` in nbody) never deopt into a handler
+    /// and are unaffected.
+    MayForceProtectedByExceptionHandlerUnsupported { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
     ///
@@ -3903,6 +3917,41 @@ fn walker_abort_if_mayforce_null_ref_arg(
     Ok(())
 }
 
+/// Abort the walk when a may-force residual CALL that can raise lives in
+/// a jitcode body that contains exception-handler structure (any
+/// `catch_exception/L`).  CPython 3.13 routes a call's exception through
+/// the per-frame exception table rather than an inline marker right
+/// after the call, so the handler is reachable from the call site even
+/// though it is not at `op.next_pc`.  The full-body walk cannot yet
+/// resume the `GUARD_NO_EXCEPTION` deopt into such a handler: the
+/// exception-path bridge reads the standing exception value, but the
+/// walker's guard resume snapshot never seeds it (task #51c exc-routing),
+/// so the bridge dereferences a NULL exception object (`GuardClass ldr
+/// [x0]` with `x0 == 0`).  Falling back to the trait tracer (which
+/// resumes the handler correctly) keeps the loop correct.  Bodies with
+/// no `catch_exception/L` (nbody / fannkuch / the loop benches) never
+/// deopt into a handler and compile under the walk.  See
+/// [`DispatchError::MayForceProtectedByExceptionHandlerUnsupported`].
+fn walker_abort_if_protected_may_force(
+    code: &[u8],
+    op: &DecodedOp,
+    can_raise: bool,
+) -> Result<(), DispatchError> {
+    if can_raise && jitcode_has_exception_handler(code) {
+        return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
+    }
+    Ok(())
+}
+
+/// Returns `true` when the jitcode body contains any `catch_exception/L`
+/// op — i.e. the source function has a `try`/`except` handler.  Used by
+/// [`walker_abort_if_protected_may_force`] to keep the full-body walk
+/// off functions whose `GUARD_NO_EXCEPTION` deopt could route into an
+/// exception handler the walk cannot yet resume.
+fn jitcode_has_exception_handler(code: &[u8]) -> bool {
+    crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+}
+
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py:1346/1349/1354) port
 /// for the **non-elidable** call shapes — companion to
 /// [`try_fold_pure_call_via_executor`] which handles the elidable case.
@@ -5581,6 +5630,7 @@ fn dispatch_residual_call_iRd_kind(
         // ports `capture_resumedata(after_residual_call=True)`
         // (`pyjitpl.py:2599-2603`).
         if can_raise {
+            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // `pyjitpl.py:2156-2168 handle_possible_exception` routes
@@ -6504,6 +6554,7 @@ fn dispatch_residual_call_iIRd_kind(
             walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
         if can_raise {
+            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py:2156-2168 `handle_possible_exception`
@@ -6674,6 +6725,7 @@ fn dispatch_residual_call_iIRFd_kind(
             walker_capture_snapshot_for_last_guard(ctx, op.pc);
         }
         if can_raise {
+            walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py:2156-2168 `handle_possible_exception`
