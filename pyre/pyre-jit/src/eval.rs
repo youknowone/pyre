@@ -5708,7 +5708,22 @@ pub(crate) fn decode_and_restore_guard_failure(
     }
 
     if restored {
-        Some((typed, jit_state.next_instr()))
+        // `next_instr()` is derived from the vable `last_instr` field.  The
+        // full-body walk sets the concrete frame's `last_instr` once at the
+        // loop header and does not advance it per opcode, so for a mid-body
+        // guard that field — and hence `next_instr()` — carries the loop
+        // header pc instead of the guard's resume opcode.  The per-frame
+        // section pc (`ResumedFrame.py_pc`, the same coordinate
+        // `resume_in_blackhole` resumes at) is the correct resume point.
+        // Prefer it when the two disagree; for the trait tracer they always
+        // match (the frame's `last_instr` tracks the Python pc), so this is
+        // a no-op there.
+        let ni = jit_state.next_instr();
+        let resume_pc = LAST_GUARD_FRAMES
+            .with(|c| c.borrow().as_ref().and_then(|frames| frames.last().map(|f| f.py_pc)))
+            .filter(|&section_pc| section_pc != ni)
+            .unwrap_or(ni);
+        Some((typed, resume_pc))
     } else {
         None
     }
