@@ -1374,7 +1374,6 @@ mod tests {
         result: &pipeline::ProgramPipelineResult,
         trait_impls: &[TraitImplInfo],
     ) {
-
         eprintln!("=== Multi-file Analysis ===");
         eprintln!("Opcodes: {}", result.opcode_dispatch.len());
         eprintln!("Functions: {}", result.functions.len());

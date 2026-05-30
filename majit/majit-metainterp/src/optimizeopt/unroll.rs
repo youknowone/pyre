@@ -1077,8 +1077,10 @@ impl UnrollOptimizer {
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
-        let p2_ops_in_rc: Vec<majit_ir::OpRc> =
-            p2_ops_in.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        let p2_ops_in_rc: Vec<majit_ir::OpRc> = p2_ops_in
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
         // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` the source
         // `box_pool` is bound to (same `Rc`, same Phase-1 `_forwarded`) so
         // the optimizer does not read `box_pool` to build `input_ops`. A

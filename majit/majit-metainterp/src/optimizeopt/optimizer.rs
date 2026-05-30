@@ -2579,8 +2579,11 @@ impl Optimizer {
                     "non-Void unbound orphan at idx={idx}"
                 );
             }
-            let mut new: Vec<*const _> =
-                ctx.live_synthetics.iter().map(std::rc::Rc::as_ptr).collect();
+            let mut new: Vec<*const _> = ctx
+                .live_synthetics
+                .iter()
+                .map(std::rc::Rc::as_ptr)
+                .collect();
             old.sort();
             new.sort();
             debug_assert_eq!(old, new, "live_synthetics diverges from box_pool walk");
@@ -3085,7 +3088,10 @@ impl Optimizer {
                 if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
                     return;
                 }
-                if !matches!(op.forwarded.borrow().clone(), crate::r#box::Forwarded::Const(_)) {
+                if !matches!(
+                    op.forwarded.borrow().clone(),
+                    crate::r#box::Forwarded::Const(_)
+                ) {
                     return;
                 }
                 remap.insert(old_idx, next_const_pos);

@@ -2415,6 +2415,14 @@ impl OptContext {
         // single requested slot via `BoxPool::set(idx, ...)` and leaves
         // the holes untouched.
         let opref = OpRef::op_typed(raw, tp);
+        // The recorder always populates box_pool for a real trace, so the
+        // emptiness guard is always satisfied in production; eagerly
+        // materialize unconditionally there (ensure_box mints a synthetic into
+        // resop_refs, not box_pool). Retain the guard #[cfg(test)] so empty
+        // ctx.box_pool fixtures stay empty.
+        #[cfg(not(test))]
+        self.ensure_box(opref);
+        #[cfg(test)]
         if !self.box_pool.is_empty() {
             self.ensure_box(opref);
         }
