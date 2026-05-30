@@ -9392,6 +9392,17 @@ impl CodeWriter {
         // `simplify_graph` passes are no-ops on today's empty-`operations`
         // walker blocks anyway — see their classification in
         // `simplify.rs`.)
+        //
+        // EMPIRICALLY VERIFIED (#112, 2026-05-30): replacing this call with
+        // the full `super::simplify::simplify_graph(&graph)` driver FAILS
+        // 21/25 synthetic correctness tests — the active passes
+        // (`remove_trivial_links` merges blocks, `remove_identical_vars_SSA`/
+        // `ssa_to_ssi` rename/add inputargs, `transform_dead_op_vars` drops
+        // inputargs, `constfold_exitswitch` drops exits) restructure the
+        // graph after the walker already emitted SSARepr inline, desyncing
+        // the block-by-block drain below.  Wiring the rest stays gated on a
+        // graph-driven drain (#73); only `eliminate_empty_blocks` (with its
+        // `rewrite_dead_forwarder_gotos` bridge) is safe today.
         eliminate_empty_blocks(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
         // the startblock may still target a dead forwarder.  RPython has
