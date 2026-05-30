@@ -2388,7 +2388,8 @@ mod tests {
         let ret = detect_wrapped_unit_variant_return(&body).unwrap();
         let synth_graph = synthesize_wrapped_unit_variant_wrapper("NoOp", &sig, &ret);
 
-        let synth_start = strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
+        let synth_start =
+            strip_var_ids(&format!("{:#?}", synth_graph.block(synth_graph.startblock)));
         let ast_start = strip_var_ids(&format!("{:#?}", ast_graph.block(ast_graph.startblock)));
         assert_eq!(
             synth_start, ast_start,
@@ -2398,9 +2399,10 @@ mod tests {
 
     #[test]
     fn raise_stub_arm_detection_and_synthesis() {
-        let body: syn::Expr =
-            syn::parse_str(r#"Err(crate::PyError::type_error("async not yet implemented").into())"#)
-                .unwrap();
+        let body: syn::Expr = syn::parse_str(
+            r#"Err(crate::PyError::type_error("async not yet implemented").into())"#,
+        )
+        .unwrap();
         let stub = detect_raise_stub_return(&body).expect("async stub should be detected");
         assert_eq!(
             stub.fn_segments,

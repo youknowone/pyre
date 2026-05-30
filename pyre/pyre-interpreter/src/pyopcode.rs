@@ -2782,6 +2782,13 @@ pub fn execute_load_super_attr<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_unsupported<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.unsupported(&instruction)
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -2840,7 +2847,9 @@ where
 
         Instruction::StoreName { .. } => execute_store_name(executor, code, instruction, op_arg),
 
-        Instruction::StoreGlobal { .. } => execute_store_global(executor, code, instruction, op_arg),
+        Instruction::StoreGlobal { .. } => {
+            execute_store_global(executor, code, instruction, op_arg)
+        }
 
         Instruction::LoadName { .. } => execute_load_name(executor, code, instruction, op_arg),
 
@@ -2896,7 +2905,9 @@ where
 
         Instruction::ListAppend { .. } => execute_list_append(executor, instruction, op_arg),
 
-        Instruction::UnpackSequence { .. } => execute_unpack_sequence(executor, instruction, op_arg),
+        Instruction::UnpackSequence { .. } => {
+            execute_unpack_sequence(executor, instruction, op_arg)
+        }
 
         Instruction::GetIter => execute_get_iter(executor),
 
@@ -2992,12 +3003,16 @@ where
         // ── Delete ops ──
         Instruction::DeleteFast { .. } => execute_delete_fast(executor, instruction, op_arg),
         Instruction::DeleteName { .. } => execute_delete_name(executor, code, instruction, op_arg),
-        Instruction::DeleteGlobal { .. } => execute_delete_global(executor, code, instruction, op_arg),
+        Instruction::DeleteGlobal { .. } => {
+            execute_delete_global(executor, code, instruction, op_arg)
+        }
         Instruction::DeleteAttr { .. } => execute_delete_attr(executor, code, instruction, op_arg),
 
         // ── Load super attr ──
         // CPython 3.12: stack = [global_super, class, self] → super(class, self).attr
-        Instruction::LoadSuperAttr { .. } => execute_load_super_attr(executor, code, instruction, op_arg),
+        Instruction::LoadSuperAttr { .. } => {
+            execute_load_super_attr(executor, code, instruction, op_arg)
+        }
 
         // ── Misc ──
         // SETUP_ANNOTATIONS: ensure that the current locals namespace has
@@ -3045,8 +3060,12 @@ where
         Instruction::UnpackEx { .. } => execute_unpack_ex(executor, instruction, op_arg),
 
         // ── Intrinsics ──
-        Instruction::CallIntrinsic1 { .. } => execute_call_intrinsic_1(executor, instruction, op_arg),
-        Instruction::CallIntrinsic2 { .. } => execute_call_intrinsic_2(executor, instruction, op_arg),
+        Instruction::CallIntrinsic1 { .. } => {
+            execute_call_intrinsic_1(executor, instruction, op_arg)
+        }
+        Instruction::CallIntrinsic2 { .. } => {
+            execute_call_intrinsic_2(executor, instruction, op_arg)
+        }
 
         // ── Async stubs ──
         Instruction::GetAwaitable { .. }
@@ -3069,9 +3088,7 @@ where
         // Used by `with` statement to load __enter__ / __exit__.
         // RustPython: frame.rs LoadSpecial, delegates to get_special_method.
         // Pyre: delegate to load_method with the special method name.
-        Instruction::LoadSpecial { .. } => {
-            execute_load_special(executor, instruction, op_arg)
-        }
+        Instruction::LoadSpecial { .. } => execute_load_special(executor, instruction, op_arg),
         Instruction::ExitInitCheck => Ok(StepResult::Continue),
         // CPython 3.14 WITH_EXCEPT_START:
         //   val = TOS         (the exception)
@@ -3080,7 +3097,7 @@ where
         //   push(res)
         Instruction::WithExceptStart => execute_with_except_start(executor),
 
-        other => executor.unsupported(&other),
+        _ => execute_unsupported(executor, instruction),
     }
 }
 

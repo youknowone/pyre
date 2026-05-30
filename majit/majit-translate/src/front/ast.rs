@@ -237,8 +237,6 @@ pub fn lower_expr_into_graph_with_signature(
     Ok(())
 }
 
-
-
 /// Resolution of a `(receiver_leaf, method)` suffix against the
 /// `fn_return_types` keys: either the single unique key carrying that
 /// suffix or `Ambiguous` when two distinct keys share it.

@@ -2866,10 +2866,7 @@ fn build_allboxes(
 /// `ResidualCallArgUnbound` instead lets the outer walker fall back to a
 /// trace abort — the same graceful outcome a pre-seam inline arm reached
 /// when its payload read surfaced `GotoIfNotValueNotConcrete`.
-fn ensure_residual_call_args_bound(
-    allboxes: &[OpRef],
-    pc: usize,
-) -> Result<(), DispatchError> {
+fn ensure_residual_call_args_bound(allboxes: &[OpRef], pc: usize) -> Result<(), DispatchError> {
     if let Some(arg_index) = allboxes.iter().position(|b| b.is_none()) {
         return Err(DispatchError::ResidualCallArgUnbound { pc, arg_index });
     }
