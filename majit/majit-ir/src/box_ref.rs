@@ -37,20 +37,6 @@ use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
 use crate::{GcRef, OpRef, Type, Value};
 
-/// Per-type mixin class-attribute default — `IntOp._resint = 0`
-/// (resoperation.py:566), `RefOp._resref = nullptr` (resoperation.py:613),
-/// `FloatOp._resfloat = 0.0` (resoperation.py:582).  `Type::Void` has no
-/// mixin (void ops carry no result) so we use `Value::Void` as the inert
-/// placeholder.
-fn default_value_for(type_: Type) -> Value {
-    match type_ {
-        Type::Int => Value::Int(0),
-        Type::Ref => Value::Ref(GcRef::NULL),
-        Type::Float => Value::Float(0.0),
-        Type::Void => Value::Void,
-    }
-}
-
 /// `AbstractValue` mirror — unified representation of RPython's
 /// op/inputarg/const objects.
 pub struct Box {
@@ -596,24 +582,6 @@ impl BoxRef {
         self.write_forwarded(next);
     }
 
-    /// Per-type mixin slot read — `_resint` / `_resref` / `_resfloat`
-    /// (resoperation.py:566/612/582).  Returns the cached runtime value
-    /// for `ResOp` / `InputArg` boxes; the variant default for `Const`
-    /// (which is what `Const.getvalue()` returns upstream).
-    /// For ResOp/InputArg, reads the stamped mixin slot; falls back
-    /// to the type-default when unstamped (RPython mixin class-attr
-    /// defaults: `_resint = 0`, `_resref = nullptr`, `_resfloat = 0.0`).
-    pub fn value(&self) -> Value {
-        match &self.0.kind {
-            BoxKind::Const { value, .. } => *value,
-            _ => self
-                .0
-                .value
-                .get()
-                .unwrap_or_else(|| default_value_for(self.type_())),
-        }
-    }
-
     /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
     /// per-Box intrinsic value carrier.  `None` when the mixin slot
     /// has not been stamped (Pyre allocates BoxRefs before the tracer
@@ -625,31 +593,6 @@ impl BoxRef {
             BoxKind::Const { value, .. } => Some(*value),
             _ => self.0.value.get(),
         }
-    }
-
-    /// `IntOp.setint` (resoperation.py:576) — typed mixin slot write.
-    /// Rust adaptation of RPython's class-level typing: `setint` only
-    /// exists on `IntOp` subclasses, so calling it on a non-Int box is
-    /// structurally impossible in RPython. The assert mirrors that.
-    pub fn setint(&self, v: i64) {
-        assert_eq!(self.type_(), Type::Int, "setint on non-Int box");
-        self.0.value.set(Some(Value::Int(v)));
-    }
-
-    /// `RefOp.setref_base` (resoperation.py:630) — typed mixin slot write.
-    pub fn setref_base(&self, v: GcRef) {
-        assert_eq!(self.type_(), Type::Ref, "setref_base on non-Ref box");
-        self.0.value.set(Some(Value::Ref(v)));
-    }
-
-    /// `FloatOp.setfloatstorage` (resoperation.py:601) — typed mixin slot write.
-    pub fn setfloatstorage(&self, v: f64) {
-        assert_eq!(
-            self.type_(),
-            Type::Float,
-            "setfloatstorage on non-Float box"
-        );
-        self.0.value.set(Some(Value::Float(v)));
     }
 
     /// Generic mixin slot write.  Asserts type consistency as the Rust
