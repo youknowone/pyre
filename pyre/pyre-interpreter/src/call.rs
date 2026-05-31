@@ -1715,9 +1715,11 @@ pub fn call_function_impl_result(
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
                 // Builtin function: direct Rust call. Errors propagate
                 // naturally through the Result return type — this is the
-                // PyPy/OperationError equivalent.
-                let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                return func(args);
+                // PyPy/OperationError equivalent. Route through the
+                // signature-aware positional path so variadic builtins
+                // (*args / **kwargs) get their tail packed; non-variadic
+                // builtins fall through to the raw fast path.
+                return call_builtin_code_positional(code as pyre_object::PyObjectRef, args);
             }
             // User function: create frame + eval. The bare-PyObjectRef
             // helper stashes any error in `PENDING_CALL_ERROR` and returns

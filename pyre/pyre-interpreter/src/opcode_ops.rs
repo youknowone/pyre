@@ -38,9 +38,7 @@ pub fn binary_value(
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
     if let Some(idunder) = inplace_dunder_name(op) {
-        if let Some(result) =
-            crate::objspace::descroperation::try_inplace_special(a, b, idunder)?
-        {
+        if let Some(result) = crate::objspace::descroperation::try_inplace_special(a, b, idunder)? {
             return Ok(result);
         }
     }
