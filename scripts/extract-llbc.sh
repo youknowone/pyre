@@ -25,7 +25,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-charon_bin="$repo_root/build/charon/charon"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) charon_exe="charon.exe" ;;
+    *)                    charon_exe="charon" ;;
+esac
+charon_bin="$repo_root/build/charon/$charon_exe"
 
 if [[ ! -x "$charon_bin" ]]; then
     echo "extract-llbc.sh: charon not installed at $charon_bin" >&2

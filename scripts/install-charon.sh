@@ -38,27 +38,35 @@ CHARON_VERSION="${CHARON_VERSION:-$CHARON_VERSION_DEFAULT}"
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 CHARON_DEST="${CHARON_DEST:-$repo_root/build/charon}"
 
-# Detect platform tag for the prebuilt asset.
+# Detect platform. Charon publishes prebuilt assets for Linux/macOS only;
+# on Windows there is no release asset, so we build from source at the
+# pinned tag. Set CHARON_FROM_SOURCE=1 to force a source build elsewhere.
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
+exe=""
+from_source="${CHARON_FROM_SOURCE:-0}"
 case "$uname_s-$uname_m" in
     Darwin-arm64)  asset="charon-macos-aarch64.tar.gz" ;;
     Darwin-x86_64) asset="charon-macos-x86_64.tar.gz" ;;
     Linux-aarch64) asset="charon-linux-aarch64.tar.gz" ;;
     Linux-x86_64)  asset="charon-linux-x86_64.tar.gz" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        from_source=1
+        exe=".exe"
+        ;;
     *)
         echo "install-charon.sh: unsupported platform $uname_s-$uname_m" >&2
-        echo "  charon releases publish: darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64" >&2
-        echo "  (no windows asset — extraction is unsupported on Windows)" >&2
+        echo "  prebuilt: darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64" >&2
+        echo "  set CHARON_FROM_SOURCE=1 to build from source instead" >&2
         exit 1
         ;;
 esac
 
-# Skip re-download if the installed binary already matches the pinned
+# Skip re-install if the installed binary already matches the pinned
 # version. `charon version` prints the cargo version (e.g. 0.1.196),
 # not the nightly tag, so we cache the tag in a sidecar file.
 stamp="$CHARON_DEST/.installed-version"
-if [[ -x "$CHARON_DEST/charon" && -f "$stamp" ]]; then
+if [[ -x "$CHARON_DEST/charon$exe" && -f "$stamp" ]]; then
     cur="$(cat "$stamp")"
     if [[ "$cur" == "$CHARON_VERSION" ]]; then
         echo "charon $CHARON_VERSION already installed at $CHARON_DEST"
@@ -69,21 +77,39 @@ fi
 
 mkdir -p "$CHARON_DEST"
 
-url="https://github.com/AeneasVerif/charon/releases/download/$CHARON_VERSION/$asset"
-echo "fetching $url"
+if [[ "$from_source" == 1 ]]; then
+    # Build charon from source at the pinned tag. Charon's rust-toolchain
+    # pins the nightly it needs; rustup auto-installs it on the first build.
+    charon_src="${CHARON_SRC:-$repo_root/build/charon-src}"
+    if [[ -d "$charon_src/.git" ]]; then
+        echo "updating $charon_src to $CHARON_VERSION"
+        git -C "$charon_src" fetch --depth 1 origin "refs/tags/$CHARON_VERSION:refs/tags/$CHARON_VERSION"
+        git -C "$charon_src" checkout -q "$CHARON_VERSION"
+    else
+        echo "cloning charon $CHARON_VERSION into $charon_src"
+        git clone --depth 1 --branch "$CHARON_VERSION" \
+            https://github.com/AeneasVerif/charon.git "$charon_src"
+    fi
+    echo "building charon (cargo build --release; first run installs the pinned nightly)"
+    ( cd "$charon_src/charon" && cargo build --release )
+    cp "$charon_src/charon/target/release/charon$exe" \
+       "$charon_src/charon/target/release/charon-driver$exe" "$CHARON_DEST/"
+else
+    url="https://github.com/AeneasVerif/charon/releases/download/$CHARON_VERSION/$asset"
+    echo "fetching $url"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fL --progress-bar -o "$tmp/$asset" "$url"
+    tar -C "$tmp" -xzf "$tmp/$asset"
+    # Charon archives contain `charon` + `charon-driver` at the archive root.
+    mv "$tmp/charon" "$tmp/charon-driver" "$CHARON_DEST/"
+fi
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-curl -fL --progress-bar -o "$tmp/$asset" "$url"
-
-tar -C "$tmp" -xzf "$tmp/$asset"
-# Charon archives contain `charon` + `charon-driver` at the archive root.
-mv "$tmp/charon" "$tmp/charon-driver" "$CHARON_DEST/"
 echo "$CHARON_VERSION" > "$stamp"
 
 echo
-echo "installed: $CHARON_DEST/charon"
-"$CHARON_DEST/charon" version || true
+echo "installed: $CHARON_DEST/charon$exe"
+"$CHARON_DEST/charon$exe" version || true
 echo
 echo "next: trigger the rustc nightly install (one-time, ~1 minute):"
-echo "  $CHARON_DEST/charon toolchain-path"
+echo "  $CHARON_DEST/charon$exe toolchain-path"

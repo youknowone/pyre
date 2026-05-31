@@ -1,0 +1,4 @@
+# Keep Rust sources LF on every platform: Charon embeds source text and
+# computes spans from the files it reads, so CRLF checkouts on Windows
+# would make the extracted .ullbc differ from other hosts.
+*.rs text eol=lf

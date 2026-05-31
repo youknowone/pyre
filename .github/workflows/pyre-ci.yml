@@ -48,9 +48,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest is excluded: Charon publishes no Windows binary,
-        # so the LLBC the build now requires cannot be extracted there.
-        os: [ubuntu-24.04, macos-latest]
+        # On windows-latest install-charon.sh builds Charon from source
+        # (no Windows release asset is published); see scripts/install-charon.sh.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         backend: [dynasm, cranelift]
 
     steps:
@@ -60,8 +60,10 @@ jobs:
       with:
         cache-bin: false
     - name: Install Charon
+      shell: bash
       run: scripts/install-charon.sh
     - name: Extract LLBC
+      shell: bash
       run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run cargo test for ${{ matrix.backend }}
       run: cargo test --all --no-default-features --features ${{ matrix.backend }}
@@ -72,9 +74,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest is excluded: Charon publishes no Windows binary,
-        # so the LLBC the build now requires cannot be extracted there.
-        os: [ubuntu-24.04, macos-latest]
+        # On windows-latest install-charon.sh builds Charon from source
+        # (no Windows release asset is published); see scripts/install-charon.sh.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -93,8 +95,10 @@ jobs:
       with:
         cache-bin: false
     - name: Install Charon
+      shell: bash
       run: scripts/install-charon.sh
     - name: Extract LLBC
+      shell: bash
       run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run pyre/check.py
       env:
