@@ -5203,6 +5203,7 @@ pub fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
         OpCode::IntNeg => value.wrapping_neg(),
         OpCode::IntInvert => !value,
         OpCode::IntIsTrue => i64::from(value != 0),
+        OpCode::IntIsZero => i64::from(value == 0),
         other => panic!("unsupported jitcode integer unary op {other:?}"),
     }
 }

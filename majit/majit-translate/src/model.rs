@@ -4130,6 +4130,22 @@ impl FunctionGraph {
     ///  block.closeblock(Link(false_args, if_false, False),
     ///                   Link(true_args,  if_true,  True))`
     /// (`flowspace/model.py:175-180` + `:304`).
+    ///
+    /// RPython `flowcontext.py:744-779` unconditionally evaluates
+    /// `op.bool(w_value).eval(self)` before `guessbool`, so every
+    /// `block.exitswitch` Variable is the result of a `bool` HighLevelOp.
+    /// The rtyper then specialises `bool` per repr (`rmodel.py:251-260
+    /// CanBeNull → ptr_nonzero`; `rint.py IntegerRepr → identity`;
+    /// `rstr.py → str_nonzero`; etc.).  Pyre's flatten consumer asserts
+    /// `block.exitswitch.concretetype == lltype.Bool`
+    /// (`flatten.py:248`) — without the unconditional `bool` wrap, a
+    /// composite-pattern `match` / `if let` scrutinee of `Ref` kind
+    /// reaches `FlatOp::GotoIfNot` (`assembler.rs:559-578`), the
+    /// hard-coded `goto_if_not/iL` opname forces the walker into the
+    /// wrong register bank, and every LoadAttr/StoreAttr arm aborts with
+    /// `RegisterOutOfRange` (issue #115).  Routing the cond through a
+    /// `bool` hop here re-establishes the upstream invariant in one
+    /// place; the rtyper handles the per-repr specialisation downstream.
     pub fn set_branch(
         &mut self,
         block: BlockId,
@@ -4139,6 +4155,22 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<crate::flowspace::model::Variable>,
     ) {
+        // upstream: `op.bool(w_value).eval(self)` — append `bool` hop to
+        // `block.operations` before installing it as exitswitch.  The
+        // wrap is idempotent (a `bool(bool(_))` chain folds to identity
+        // through `IntegerRepr::rtype_bool` / `BoolRepr::rtype_bool`),
+        // mirroring upstream which also wraps unconditionally.
+        let cond = self
+            .push_op_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: cond,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("UnaryOp { op: \"bool\", .. } produces a value");
         // `flowspace/model.py:114 Link.__init__` arity assert per
         // arm — same rationale as `set_goto`.
         let true_inputarg_count = self.block(if_true).inputargs.len();
@@ -4460,7 +4492,11 @@ mod tests {
         let next = graph.create_block();
         graph.set_branch(entry, cond_var, next, vec![], next, vec![]);
         assert_eq!(graph.blocks.len(), 4);
-        assert_eq!(graph.block(entry).operations.len(), 1);
+        // `set_branch` mirrors RPython `flowcontext.py:744-779`
+        // `op.bool(w_value).eval(self)` — every exitswitch is the result
+        // of an appended `bool` HighLevelOp, so a branching block carries
+        // the original Input op plus the bool wrap (2 ops total).
+        assert_eq!(graph.block(entry).operations.len(), 2);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
         assert_eq!(graph.block(graph.exceptblock).inputargs.len(), 2);
     }
