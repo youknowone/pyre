@@ -38,7 +38,16 @@ pub fn binary_value(
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
     if let Some(idunder) = inplace_dunder_name(op) {
-        if let Some(result) = crate::objspace::descroperation::try_inplace_special(a, b, idunder)? {
+        // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
+        // name so the builtin-sequence rhs-first branch can fire.
+        let (rdunder, seq_bug_compat) = match op {
+            BinaryOperator::InplaceAdd => (Some("__radd__"), true),
+            BinaryOperator::InplaceMultiply => (Some("__rmul__"), true),
+            _ => (None, false),
+        };
+        if let Some(result) = crate::objspace::descroperation::try_inplace_special(
+            a, b, idunder, rdunder, seq_bug_compat,
+        )? {
             return Ok(result);
         }
     }

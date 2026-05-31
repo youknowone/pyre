@@ -1476,7 +1476,29 @@ pub(crate) fn try_inplace_special(
     lhs: PyObjectRef,
     rhs: PyObjectRef,
     idunder: &str,
+    rdunder: Option<&str>,
+    seq_bug_compat: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    // descroperation.py:825 `inplace_impl` seq_bug_compat — for `+=` / `*=`
+    // where the lhs is a builtin sequence and the rhs is not, try the rhs
+    // reflected method before the lhs in-place method.
+    if seq_bug_compat {
+        if let Some(rd) = rdunder {
+            if let (Some(lhs_type), Some(rhs_type)) =
+                (crate::typedef::r#type(lhs), crate::typedef::r#type(rhs))
+            {
+                if crate::baseobjspace::flag_sequence_bug_compat(lhs_type)
+                    && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type)
+                {
+                    if let Some(rmethod) = unsafe { lookup_type_special(rhs, rd) } {
+                        if let Some(result) = try_call_special(rmethod, &[rhs, lhs])? {
+                            return Ok(Some(result));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         if let Some(result) = try_call_special(method, &[lhs, rhs])? {
             return Ok(Some(result));
