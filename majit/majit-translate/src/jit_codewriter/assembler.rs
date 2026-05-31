@@ -1263,6 +1263,37 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstRefNull => {
+                let const_value = crate::flowspace::model::ConstValue::LLAddress(
+                    crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                );
+                let idx = self.emit_const_r(&const_value, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::ConstRefAddr(addr) => {
+                let idx = self.emit_const_r_bits(*addr, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
 
             // Float-constant materialization mirrors `ConstInt`: the
             // bit pattern goes through `emit_const_f` (the same pool
@@ -2090,6 +2121,8 @@ impl Assembler {
                 OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstRef(_) => "ConstRef",
+                OpKind::ConstRefNull => "ConstRefNull",
+                OpKind::ConstRefAddr(_) => "ConstRefAddr",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
                 OpKind::ArrayRead { .. } => "ArrayRead",
@@ -2307,8 +2340,15 @@ impl Assembler {
     fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
         let bits = match value {
             ConstValue::HostObject(obj) => obj.identity_id() as i64,
+            ConstValue::LLAddress(
+                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+            ) => 0,
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
+        self.emit_const_r_bits(bits, state)
+    }
+
+    fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
         if let Some(index) = state
             .constants_r
             .iter()
@@ -3142,7 +3182,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `identity_id()` enters the shared `constants_r` pool via
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
-        OpKind::ConstRef(_) => "ref_copy".into(),
+        OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => "ref_copy".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {
@@ -3279,12 +3319,15 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
-        // `LoadStatic` lowers to a `same_as` SpaceOperation whose arg
-        // is the static's resolved `Hlvalue::Constant` (see model.rs
-        // `LoadStatic` doc).  The opname matches RPython's
-        // `same_as` (`flowspace/operation.py:540`) which the rtyper
-        // already handles as identity.
-        OpKind::LoadStatic { .. } => "same_as".into(),
+        // RPython's codewriter never sees a crate-static carrier:
+        // LOAD_GLOBAL is resolved to a Constant before JitCode assembly.
+        // The flowspace adapter must either fold `LoadStatic` to a
+        // constant `same_as` that rtyper/removenoops eliminates, or reject
+        // the unresolved static before this layer.  Emitting `same_as/*`
+        // here would create an opcode with no blackhole handler.
+        OpKind::LoadStatic { segments, .. } => {
+            panic!("unresolved LoadStatic reached JitCode assembly: {segments:?}")
+        }
     }
 }
 

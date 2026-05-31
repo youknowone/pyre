@@ -1227,14 +1227,14 @@ pub fn std_ptr_eq(
 /// the actual value is a compile-time `usize`; the rtyper folds the
 /// const at lowering time, but the annotator just needs the lattice
 /// position.  The value is a `usize` byte size, so it is non-negative —
-/// modeled as `SomeInteger(nonneg=True)` (the `rffi.sizeof` / `len`
+/// modeled as `SomeInteger(nonneg=True, unsigned=True)` (the `usize`
 /// lattice), strictly more precise than the default and safe under join.
 pub fn std_mem_size_of(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(SomeValue::Integer(SomeInteger::new(true, false)))
+    Ok(SomeValue::Integer(SomeInteger::new(true, true)))
 }
 
 /// Analyzer for `std::mem::align_of::<T>() -> usize`.  Identical

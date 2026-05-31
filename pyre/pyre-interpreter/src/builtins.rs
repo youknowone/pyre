@@ -910,6 +910,21 @@ pub(crate) fn kwarg_reject_unknown(
     Ok(())
 }
 
+/// Reject `f(x, name=...)` when `name` already arrived positionally.
+/// The flat builtin ABI leaves this validation to each kw-aware method.
+pub(crate) fn kwarg_reject_duplicate(
+    kwargs: Option<PyObjectRef>,
+    name: &str,
+    positional_present: bool,
+) -> Result<(), crate::PyError> {
+    if positional_present && kwarg_get(kwargs, name).is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "got multiple values for argument '{name}'"
+        )));
+    }
+    Ok(())
+}
+
 /// `space.index_w(obj)` parity — `pypy/interpreter/baseobjspace.py
 /// space.index_w` returns the int value of an object exposing
 /// `__index__`.  Pyre handles the int / long / bool fast paths

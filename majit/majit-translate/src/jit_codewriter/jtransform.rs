@@ -3969,6 +3969,8 @@ fn remap_op(
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }

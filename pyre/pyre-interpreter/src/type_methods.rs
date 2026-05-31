@@ -236,8 +236,14 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// keyword.  Builtin kwargs arrive as a trailing `__pyre_kw__` dict, so
 /// resolve each argument from its positional slot (after the receiver),
 /// falling back to the matching keyword.
-fn resolve_split_args(args: &[PyObjectRef]) -> (PyObjectRef, PyObjectRef) {
+fn resolve_split_args(
+    args: &[PyObjectRef],
+    fn_name: &str,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "maxsplit", pos.get(2).is_some())?;
     let sep = pos
         .get(1)
         .copied()
@@ -248,13 +254,13 @@ fn resolve_split_args(args: &[PyObjectRef]) -> (PyObjectRef, PyObjectRef) {
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
         .unwrap_or(pyre_object::PY_NULL);
-    (sep, maxsplit)
+    Ok((sep, maxsplit))
 }
 
 pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    let (sep_arg, maxsplit_arg) = resolve_split_args(args);
+    let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
     let sep = parse_split_sep(sep_arg)?;
     // `unicodeobject.py:972 @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
@@ -346,7 +352,7 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_value(args[0]) };
-    let (sep_arg, maxsplit_arg) = resolve_split_args(args);
+    let (sep_arg, maxsplit_arg) = resolve_split_args(args, "rsplit")?;
     let sep = parse_split_sep(sep_arg)?;
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
     let sep_view = sep.as_deref();

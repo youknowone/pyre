@@ -1846,14 +1846,23 @@ fn call_metaclass_with_kwargs(
     w_namespace_dict: PyObjectRef,
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
-    // Find the metaclass __new__ method
-    let new_fn = if unsafe { pyre_object::is_type(w_metaclass) } {
-        unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
+    if unsafe { !pyre_object::is_type(w_metaclass) } {
+        return crate::call_function(w_metaclass, &[name, bases, w_namespace_dict]);
+    }
+    let kw_items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(kwargs) } {
+        unsafe {
+            pyre_object::w_dict_items(kwargs)
+                .into_iter()
+                .filter(|(k, _)| pyre_object::is_str(*k))
+                .collect()
+        }
     } else {
-        None
+        Vec::new()
     };
+    // Find the metaclass __new__ method
+    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") };
 
-    if let Some(new_fn) = new_fn {
+    let instance = if let Some(new_fn) = new_fn {
         // Resolve only against a user-defined __new__ with a real code
         // object; the builtin type.__new__ has none, so fall through.
         let is_user_fn = unsafe { crate::is_function(new_fn) }
@@ -1867,25 +1876,79 @@ fn call_metaclass_with_kwargs(
             // the remainder into a `**kwds` parameter when present.
             let mut call_args = vec![w_metaclass, name, bases, w_namespace_dict];
             let mut names = Vec::new();
-            for (k, v) in unsafe { pyre_object::w_dict_items(kwargs) } {
-                if unsafe { pyre_object::is_str(k) } {
-                    call_args.push(v);
-                    names.push(k);
-                }
+            for (k, v) in &kw_items {
+                call_args.push(*v);
+                names.push(*k);
             }
             let kwarg_names = pyre_object::w_tuple_new(names);
-            return match resolve_kwargs(new_fn, &call_args, kwarg_names) {
+            match resolve_kwargs(new_fn, &call_args, kwarg_names) {
                 Ok(resolved) => call_user_function_resolved_frameless(new_fn, &resolved),
                 Err(e) => {
                     set_call_error(e);
                     PY_NULL
                 }
+            }
+        } else {
+            match call_function_impl_result(new_fn, &[w_metaclass, name, bases, w_namespace_dict]) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    set_call_error(e);
+                    PY_NULL
+                }
+            }
+        }
+    } else {
+        pyre_object::w_instance_new(w_metaclass)
+    };
+
+    if instance.is_null() {
+        return PY_NULL;
+    }
+
+    if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)
+        && let Some(init_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+    {
+        let is_user_fn = unsafe { crate::is_function(init_fn) }
+            && unsafe {
+                !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
             };
+        if kw_items.is_empty() {
+            if let Err(e) =
+                call_function_impl_result(init_fn, &[instance, name, bases, w_namespace_dict])
+            {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        } else if is_user_fn {
+            let mut call_args = vec![instance, name, bases, w_namespace_dict];
+            let mut names = Vec::with_capacity(kw_items.len());
+            for (k, v) in &kw_items {
+                call_args.push(*v);
+                names.push(*k);
+            }
+            let kwarg_names = pyre_object::w_tuple_new(names);
+            match resolve_kwargs(init_fn, &call_args, kwarg_names) {
+                Ok(resolved) => {
+                    let res = call_user_function_resolved_frameless(init_fn, &resolved);
+                    if res.is_null() {
+                        return PY_NULL;
+                    }
+                }
+                Err(e) => {
+                    set_call_error(e);
+                    return PY_NULL;
+                }
+            }
+        } else {
+            set_call_error(crate::PyError::type_error(
+                "__init__() got unexpected keyword arguments",
+            ));
+            return PY_NULL;
         }
     }
 
-    // Fallback: call without kwargs
-    crate::call_function(w_metaclass, &[name, bases, w_namespace_dict])
+    instance
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.

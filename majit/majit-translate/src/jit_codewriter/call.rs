@@ -6233,7 +6233,9 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
-        | OpKind::ConstRef(_) => RaiseClass::No,
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_) => RaiseClass::No,
         // JIT-specific ops that cannot raise
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }

@@ -1412,22 +1412,6 @@ mod tests {
         //   before it reaches the blackhole interp, so PyPy never wires
         //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
         //   these emissions; once it does, these entries vanish.
-        // - `same_as/>i` / `same_as/>r` — `OpKind::LoadStatic`
-        //   (`flowspace_adapter.rs:720`) emits a `same_as(UniStr(...))`
-        //   sentinel that survives to JITCode at `assembler.rs:3218`.
-        //   RPython's `same_as` is rtyper-eliminated before reaching the
-        //   blackhole.  Pyre's LoadStatic-as-sentinel design is a
-        //   reviewer-flagged deviation (Slice C target); closing
-        //   requires emitting the resolved constant value instead of a
-        //   string sentinel at the adapter, after which the regular
-        //   jtransform `same_as` alias-elimination retires the
-        //   `OpKind::LoadStatic` variant entirely.  Null-pointer statics
-        //   (`PY_NULL = std::ptr::null_mut()`) now resolve to a real
-        //   `ConstValue::LLAddress(Null)` (immediate `0`) in
-        //   `extract_static_decls`, so their `same_as` folds away; the
-        //   remaining `same_as/>r` is the `*_TYPE` runtime-address
-        //   globals whose host addresses are only known at runtime
-        //   (Slice B address-baking target).
         // - `int_eq/if>i` — an `int_eq` enumerated with one int and one
         //   float operand.  Surfaced once `format_float`'s no-type branch
         //   started formatting through `display::format_float_repr`
@@ -1441,25 +1425,15 @@ mod tests {
         //   int/float ordered-compare coercion (Slice E / reviewer 2.5),
         //   after which the mixed-operand `int_eq` is never emitted.
         //
-        // Cross-platform tolerance: the analyzer's classdef/type-alias
-        // resolution still depends on file-traversal order beyond what
-        // `build.rs collect_rs_files` sort fixes (e.g. process-wide
-        // first-writer-wins type-alias registry under PR 91 reviewer
-        // 2.2).  macOS APFS happens to produce `same_as/>i` for some
-        // Int-typed LoadStatic that ext4 / NTFS instead lowers to a
-        // Ref-Ref tuple emitting `newtuple/rr>r` — both belong to the
-        // Z2.5 in-progress set above, so this tripwire accepts either
-        // shape as long as no NEW opname appears outside the documented
-        // pending list.  Closing the underlying order-sensitivity is
-        // Task #133 / multi-session Z2.5 deep fix.
+        // `same_as/*` is deliberately not accepted here: RPython
+        // eliminates flowspace `same_as` before blackhole setup, and pyre
+        // now rejects unresolved `LoadStatic` before JitCode assembly.
         let (_builder, unwired) = build_default_bh_builder_with_unwired_report();
         let allowed: &[&str] = &[
             "newtuple/>r",
             "newtuple/ff>r",
             "newtuple/ii>r",
             "newtuple/rr>r",
-            "same_as/>i",
-            "same_as/>r",
             "int_eq/if>i",
         ];
         let unexpected: Vec<&String> = unwired

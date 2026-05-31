@@ -333,6 +333,26 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstRefNull => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::LLAddress(
+                                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                            ),
+                            LowLevelType::Address,
+                        )),
+                    );
+                }
+                OpKind::ConstRefAddr(addr) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Int(*addr),
+                            LowLevelType::Address,
+                        )),
+                    );
+                }
                 _ => {}
             }
         }
@@ -632,6 +652,8 @@ pub(crate) fn translate_op_is_skipped(kind: &OpKind) -> bool {
             | OpKind::ConstInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstRefAddr(_)
             | OpKind::GuardTrue { .. }
             | OpKind::GuardFalse { .. }
             | OpKind::GuardValue { .. }
@@ -676,7 +698,11 @@ pub fn translate_op(
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
-        OpKind::ConstInt(_) | OpKind::ConstBool(_) | OpKind::ConstFloat(_) => Ok(Vec::new()),
+        OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstFloat(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_) => Ok(Vec::new()),
         // ─── Skipped: pyre JIT trace markers without a flowspace peer ───
         // `GuardTrue` / `GuardFalse` / `GuardValue` are JIT-side
         // assertions emitted by pyre's tracer — they constrain the
@@ -773,23 +799,22 @@ pub fn translate_op(
         //
         // Slice C: when `extract_static_decls` could fold the static's
         // RHS to a `ConstValue` (`bool` / integer / float / string
-        // literals + `const { LIT }` block wrapper), the adapter
-        // emits `same_as(Constant(value))` — the concrete `Constant`
-        // shape PyPy `LOAD_GLOBAL` pushes.  For unresolved RHS
-        // (host calls, `LazyLock::new(...)`, `std::ptr::null_mut()`,
-        // struct ctors, etc.) the adapter falls back to a
-        // `UniStr(joined_path)` sentinel — the rtyper's `same_as`
-        // arm (`rtyper.rs::translate_op "same_as"`) still treats
-        // both shapes as identity, but only the resolved-value
-        // arm matches the upstream `Constant(value)` payload
-        // contract.
+        // literals + `const { LIT }` block wrapper), the adapter emits
+        // `same_as(Constant(value))` — the concrete `Constant` shape PyPy
+        // `LOAD_GLOBAL` pushes.  Unresolved RHS values are rejected here:
+        // allowing a path-string sentinel to survive would create a
+        // `same_as/*` JitCode opcode, but RPython's blackhole only has
+        // `int_same_as/i>i` for test hints.
         OpKind::LoadStatic {
             segments, value, ..
         } => {
-            let constant = match value {
-                Some(v) => Hlvalue::Constant(Constant::new(v.clone())),
-                None => Hlvalue::Constant(Constant::new(ConstValue::UniStr(segments.join("::")))),
+            let Some(v) = value else {
+                return Err(TyperError::message(format!(
+                    "translate_op: unresolved LoadStatic {segments:?} has no RPython \
+                     JitCode counterpart; fold the static to a Constant before rtyper"
+                )));
             };
+            let constant = Hlvalue::Constant(Constant::new(v.clone()));
             let result = resolve_result_hlvalue(op, value_map, graph)?;
             Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
         }
@@ -1166,94 +1191,93 @@ pub fn translate_op(
                             )?;
                             module.module_get(&full_segments[full_segments.len() - 1])
                         };
-                    let callable_host =
-                        if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
-                            // `lookup_with_leaf_match` tries the verbatim key +
-                            // alias indirection (`Self::lookup`), then a cross-
-                            // module leaf-match against free-function entries —
-                            // the registry-build analog of the codewriter-side
-                            // `target_to_path` leaf-match (`call.rs:3043-3104`),
-                            // closing the glob-import gap (`use pyre_object::*;`
-                            // in caller `baseobjspace` referencing a bare name
-                            // with no `use_imports` entry).
-                            entry.host_object.clone()
-                        } else if segments.len() == 1
-                            && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
-                        {
-                            builtin
-                        } else if let Some(attr) = resolve_via_use_imports() {
-                            // Branch 3a — caller imported `segments[0]`;
-                            // upstream-orthodox `frame.globals[<alias>]`
-                            // resolution path.
-                            attr
-                        } else if segments.len() >= 2
-                            && let Some(module) =
-                                HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
-                            && let Some(attr) = module.module_get(&segments[segments.len() - 1])
-                        {
-                            // Branch 3b — fully-qualified inline path,
-                            // PRE-EXISTING-ADAPTATION as documented above.
-                            attr
-                        } else if segments.len() == 2
-                            && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
-                        {
-                            // Branch 4 — associated-function call
-                            // `Type::method(self, ...)` whose impl method is
-                            // registered under a module-qualified key
-                            // `[...module..., Type, method]`.  The exact
-                            // lookup at layer 1 missed because the call site
-                            // spells only `[Type, method]`; recover the
-                            // canonical entry by its `[Type, method]` tail,
-                            // mirroring the bound method-call suffix match
-                            // (`call.rs:3155 target_to_path`).  Upstream
-                            // resolves both spellings to one `FunctionDesc`.
-                            entry.host_object.clone()
-                        } else if segments.len() == 2
-                            && segments[0] == "simple_call"
-                            && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
-                        {
-                            // Branch 3c — PRE-EXISTING-ADAPTATION closure
-                            // for `front/raise.rs::lower_exc_from_raise`
-                            // (~`raise.rs:153`).  Upstream RPython
-                            // `flowcontext.py:614/623` emits
-                            // `op.simple_call(const(exc_class), *args)`
-                            // with the class as `args[0]`; pyre stashes
-                            // the class name in `path[1]` of the
-                            // `FunctionPath` because its `Vec<Variable>`
-                            // arg carrier cannot yet hold a
-                            // `Constant(HostObject(class))` alongside
-                            // `Variable`s — that conversion is the
-                            // multi-session `Vec<Variable>` →
-                            // `Vec<LinkArg>` migration (see the
-                            // module-level "PRE-EXISTING-ADAPTATION"
-                            // block in `front/raise.rs:120-126` for the
-                            // detailed rationale).  The downstream
-                            // reconstruction is documented at
-                            // `raise.rs:122-123`:
-                            // > any downstream reader can reconstruct
-                            // > `(op, const_class, args…)` from
-                            // > `(path[0], path[1], op.args)`
-                            // This branch is exactly that
-                            // reconstruction: resolve `path[1]`
-                            // (the exception class name) as a builtin
-                            // HostObject and use it as the simple_call
-                            // callable, leaving `op.args` as the
-                            // trailing message arguments.  TODO retire
-                            // when the LinkArg migration lands.
-                            exc_class
-                        } else {
-                            return Err(TyperError::message(format!(
-                                "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
+                    let callable_host = if let Some(entry) = call_registry.lookup(&key) {
+                        entry.host_object.clone()
+                    } else if segments.len() == 1
+                        && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
+                    {
+                        builtin
+                    } else if let Some(attr) = resolve_via_use_imports() {
+                        // Branch 3a — caller imported `segments[0]`;
+                        // upstream-orthodox `frame.globals[<alias>]`
+                        // resolution path.
+                        attr
+                    } else if segments.len() >= 2
+                        && let Some(module) =
+                            HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
+                        && let Some(attr) = module.module_get(&segments[segments.len() - 1])
+                    {
+                        // Branch 3b — fully-qualified inline path,
+                        // PRE-EXISTING-ADAPTATION as documented above.
+                        attr
+                    } else if segments.len() == 2
+                        && let Some(entry) = call_registry.lookup_by_method_suffix(segments)
+                    {
+                        // Branch 4 — associated-function call
+                        // `Type::method(self, ...)` whose impl method is
+                        // registered under a module-qualified key
+                        // `[...module..., Type, method]`.  The exact
+                        // lookup at layer 1 missed because the call site
+                        // spells only `[Type, method]`; recover the
+                        // canonical entry by its `[Type, method]` tail,
+                        // mirroring the bound method-call suffix match
+                        // (`call.rs:3155 target_to_path`).  Upstream
+                        // resolves both spellings to one `FunctionDesc`.
+                        entry.host_object.clone()
+                    } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
+                        // Fuzzy leaf-match is the last registry fallback.
+                        // Exact registry entries, lexical imports, HOST_ENV
+                        // module paths, and associated-method suffixes must
+                        // win first so external stubs such as `BigInt::from`,
+                        // `Vec::new`, and `Box::new` cannot be captured by
+                        // an unrelated user function with the same leaf.
+                        entry.host_object.clone()
+                    } else if segments.len() == 2
+                        && segments[0] == "simple_call"
+                        && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
+                    {
+                        // Branch 3c — PRE-EXISTING-ADAPTATION closure
+                        // for `front/raise.rs::lower_exc_from_raise`
+                        // (~`raise.rs:153`).  Upstream RPython
+                        // `flowcontext.py:614/623` emits
+                        // `op.simple_call(const(exc_class), *args)`
+                        // with the class as `args[0]`; pyre stashes
+                        // the class name in `path[1]` of the
+                        // `FunctionPath` because its `Vec<Variable>`
+                        // arg carrier cannot yet hold a
+                        // `Constant(HostObject(class))` alongside
+                        // `Variable`s — that conversion is the
+                        // multi-session `Vec<Variable>` →
+                        // `Vec<LinkArg>` migration (see the
+                        // module-level "PRE-EXISTING-ADAPTATION"
+                        // block in `front/raise.rs:120-126` for the
+                        // detailed rationale).  The downstream
+                        // reconstruction is documented at
+                        // `raise.rs:122-123`:
+                        // > any downstream reader can reconstruct
+                        // > `(op, const_class, args…)` from
+                        // > `(path[0], path[1], op.args)`
+                        // This branch is exactly that
+                        // reconstruction: resolve `path[1]`
+                        // (the exception class name) as a builtin
+                        // HostObject and use it as the simple_call
+                        // callable, leaving `op.args` as the
+                        // trailing message arguments.  TODO retire
+                        // when the LinkArg migration lands.
+                        exc_class
+                    } else {
+                        return Err(TyperError::message(format!(
+                            "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
                              not registered in PyreCallRegistry, not in HOST_ENV \
                              `__builtin__`, and not a known module-qualified host attribute — \
                              the production builder (a SemanticProgram walker, or a test \
                              fixture building the registry directly) must register the path \
                              with its parameter Signature before specialize_legacy_graph \
                              consults the rtyper. Result slot = {}",
-                                segments,
-                                fmt_op_result_slot(graph, op),
-                            )));
-                        };
+                            segments,
+                            fmt_op_result_slot(graph, op),
+                        )));
+                    };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
@@ -1610,6 +1634,22 @@ fn legacy_const_define_hlvalue(
             Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::Float(*bits),
                 LowLevelType::Float,
+            )),
+        )),
+        OpKind::ConstRefNull => Some((
+            result,
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LLAddress(
+                    crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                ),
+                LowLevelType::Address,
+            )),
+        )),
+        OpKind::ConstRefAddr(addr) => Some((
+            result,
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(*addr),
+                LowLevelType::Address,
             )),
         )),
         // RPython parity: unit-variant ctors (`StepResult::Continue`,

@@ -6014,40 +6014,96 @@ fn init_int_type(ns: &mut DictStorage) {
         "to_bytes",
         make_builtin_function("to_bytes", |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            // pos[0] is the receiver int.
-            let val = if !pos.is_empty() && unsafe { pyre_object::is_int(pos[0]) } {
-                unsafe { pyre_object::w_int_get_value(pos[0]) }
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["length", "byteorder", "signed"],
+                "to_bytes",
+            )?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "length", pos.get(1).is_some())?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "byteorder", pos.get(2).is_some())?;
+            if pos.len() > 3 {
+                return Err(crate::PyError::type_error(format!(
+                    "to_bytes() takes at most 2 positional arguments ({} given)",
+                    pos.len() - 1
+                )));
+            }
+            let val = if !pos.is_empty() && unsafe { pyre_object::pyobject::is_int_or_long(pos[0]) }
+            {
+                unsafe { crate::builtins::obj_to_bigint(pos[0]) }
             } else {
-                0
+                malachite_bigint::BigInt::from(0)
             };
-            // length: the `length` keyword, else the first int positional
-            // after the receiver, else 1.
-            let length = crate::builtins::kwarg_get(kwargs, "length")
-                .or_else(|| {
-                    pos.get(1)
-                        .copied()
-                        .filter(|&a| unsafe { pyre_object::is_int(a) })
-                })
-                .map(|o| unsafe { pyre_object::w_int_get_value(o) as usize })
-                .unwrap_or(1);
-            // byteorder: the `byteorder` keyword, else the first str
-            // positional after the receiver, else "big".
-            let little_endian = crate::builtins::kwarg_get(kwargs, "byteorder")
-                .or_else(|| {
-                    pos.iter()
-                        .skip(1)
-                        .find(|&&a| unsafe { pyre_object::is_str(a) })
-                        .copied()
-                })
-                .map(|o| unsafe {
-                    pyre_object::is_str(o) && pyre_object::w_str_get_value(o) == "little"
-                })
+            let length_obj = pos
+                .get(1)
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "length"));
+            let length_i = match length_obj {
+                Some(o) => crate::builtins::space_index_w(o)?,
+                None => 1,
+            };
+            if length_i < 0 {
+                return Err(crate::PyError::value_error(
+                    "length argument must be non-negative",
+                ));
+            }
+            let length = length_i as usize;
+            let little_endian = match pos
+                .get(2)
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "byteorder"))
+            {
+                None => false,
+                Some(o) if unsafe { pyre_object::is_str(o) } => {
+                    match unsafe { pyre_object::w_str_get_value(o) } {
+                        "little" => true,
+                        "big" => false,
+                        _ => {
+                            return Err(crate::PyError::value_error(
+                                "byteorder must be either 'little' or 'big'",
+                            ));
+                        }
+                    }
+                }
+                Some(o) => {
+                    return Err(crate::PyError::type_error(format!(
+                        "expected str, got {} object",
+                        unsafe { (*(*o).ob_type).name }
+                    )));
+                }
+            };
+            let signed = crate::builtins::kwarg_get(kwargs, "signed")
+                .map(crate::baseobjspace::is_true)
                 .unwrap_or(false);
+            let bits = length * 8;
+            let zero = malachite_bigint::BigInt::from(0);
+            let limit = malachite_bigint::BigInt::from(1) << bits;
+            let encoded = if bits == 0 {
+                if val != zero {
+                    return Err(crate::PyError::overflow_error("int too big to convert"));
+                }
+                zero.clone()
+            } else if signed {
+                let half = if bits == 0 {
+                    malachite_bigint::BigInt::from(0)
+                } else {
+                    malachite_bigint::BigInt::from(1) << (bits - 1)
+                };
+                if val < -half.clone() || val >= half {
+                    return Err(crate::PyError::overflow_error("int too big to convert"));
+                }
+                if val < zero { val + &limit } else { val }
+            } else {
+                if val < zero || val >= limit {
+                    return Err(crate::PyError::overflow_error("int too big to convert"));
+                }
+                val
+            };
             let mut bytes = vec![0u8; length];
-            let uval = val as u64;
+            use num_traits::ToPrimitive;
             for i in 0..length {
                 let shift = if little_endian { i } else { length - 1 - i } * 8;
-                bytes[i] = ((uval >> shift) & 0xff) as u8;
+                let byte = (&encoded >> shift) & malachite_bigint::BigInt::from(0xff);
+                bytes[i] = byte.to_u8().unwrap_or(0);
             }
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
         }),
@@ -7729,6 +7785,10 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     // routes through `__index__` (`space_index_w`), so a non-integer
     // (including `None`) raises rather than silently defaulting.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let fn_name = if forward { "split" } else { "rsplit" };
+    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "maxsplit", pos.get(2).is_some())?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let maxsplit = match pos
         .get(2)
@@ -7824,7 +7884,12 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// element raises the CPython `sequence item N: expected a bytes-like
 /// object, <T> found` TypeError.
 fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "join() takes exactly one argument");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "join() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let iterable = args[1];
     let items: Vec<PyObjectRef> = unsafe {
@@ -7895,12 +7960,22 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
 }
 
 fn bytes_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "partition() takes exactly one argument");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "partition() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     bytes_partition(args, true)
 }
 
 fn bytes_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "rpartition() takes exactly one argument");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "rpartition() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     bytes_partition(args, false)
 }
 
@@ -8268,6 +8343,8 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "keepends", pos.get(1).is_some())?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
@@ -8343,7 +8420,7 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// the two bytes-like arguments must have equal length.  Bytes not in
 /// `frm` map to themselves.
 fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
+    if args.len() != 2 {
         return Err(crate::PyError::type_error(
             "maketrans() takes exactly two arguments",
         ));
@@ -8367,6 +8444,11 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the end raises the even-count error, any other non-hex byte raises
 /// the positional error.
 fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "fromhex() takes exactly one argument",
+        ));
+    }
     let bytes: &[u8] = match args.first() {
         Some(&a) if unsafe { pyre_object::is_str(a) } => {
             unsafe { pyre_object::w_str_get_value(a) }.as_bytes()
@@ -8499,30 +8581,33 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let signed = crate::builtins::kwarg_get(kwargs, "signed")
         .map(crate::baseobjspace::is_true)
         .unwrap_or(false);
-    let mut val: u64 = 0;
+    let mut val = malachite_bigint::BigInt::from(0);
     if little_endian {
-        for (i, &b) in bytes.iter().enumerate() {
-            val |= (b as u64) << (i * 8);
+        for &b in bytes.iter().rev() {
+            val = (val << 8) + malachite_bigint::BigInt::from(b);
         }
     } else {
         for &b in &bytes {
-            val = (val << 8) | b as u64;
+            val = (val << 8) + malachite_bigint::BigInt::from(b);
         }
     }
-    // Two's-complement reinterpretation for `signed=True` (values up to 8
-    // bytes; wider inputs keep the existing truncating path).
     let n = bytes.len();
-    let result: i64 = if signed && (1..=8).contains(&n) {
-        let sign_bit_set = (val >> (8 * n - 1)) & 1 == 1;
-        if sign_bit_set && n < 8 {
-            (val as i64) - (1i64 << (8 * n))
+    if signed && n > 0 {
+        let sign_probe = if little_endian {
+            bytes[n - 1]
         } else {
-            val as i64
+            bytes[0]
+        };
+        if sign_probe & 0x80 != 0 {
+            val -= malachite_bigint::BigInt::from(1) << (8 * n);
         }
+    }
+    use num_traits::ToPrimitive;
+    let w_result = if let Some(result) = val.to_i64() {
+        pyre_object::w_int_new(result)
     } else {
-        val as i64
+        pyre_object::w_long_new(val)
     };
-    let w_result = pyre_object::w_int_new(result);
     let base = crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
     if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
         Ok(w_result)
@@ -8569,11 +8654,19 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// inserts between pairs; `bytes_per_sep` controls the grouping.
 fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "bytes_per_sep", pos.get(2).is_some())?;
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // No sep / default grouping — produces "ffff" for [0xff, 0xff].
     // The sep + bytes_per_sep kwargs are deferred until first observed
     // need; CPython callers without args hit the hot path.
-    if args.len() <= 1 {
+    let sep_arg = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
+    if sep_arg.is_none() {
         let mut out = String::with_capacity(data.len() * 2);
         for &b in data {
             out.push_str(&format!("{:02x}", b));
@@ -8583,7 +8676,7 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
     // sep validation — must be a length-1 ASCII string or length-1
     // bytes; otherwise ValueError per PyPy.
-    let sep_obj = args[1];
+    let sep_obj = sep_arg.unwrap();
     let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
         let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
         let mut chars = s.chars();
@@ -8619,10 +8712,13 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
     // from the right (default), negative groups from the left; zero
     // disables separators entirely.
-    let raw_group: i64 = if args.len() >= 3 {
-        crate::baseobjspace::int_w(args[2])?
-    } else {
-        1
+    let raw_group: i64 = match pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "bytes_per_sep"))
+    {
+        Some(o) => crate::baseobjspace::int_w(o)?,
+        None => 1,
     };
     let group = raw_group.unsigned_abs() as usize;
     let group_from_left = raw_group < 0;

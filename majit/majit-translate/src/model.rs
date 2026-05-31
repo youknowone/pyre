@@ -474,6 +474,14 @@ pub enum OpKind {
     /// args: [] }` matching `is_synthetic_unit_variant_path`
     /// into this variant.
     ConstRef(crate::flowspace::model::HostObject),
+    /// RPython `lltype.nullptr(T)` / null GC ref constant. Pyre spells
+    /// the common sentinel as `PY_NULL`; it materialises in the ref bank
+    /// as address 0, not as an integer register.
+    ConstRefNull,
+    /// Process-wide singleton pointer that must be materialised in the
+    /// ref bank (e.g. PyPy `space.fromcache(DictStrategy)` singletons
+    /// represented by pyre's Rust `pub static *_DICT_STRATEGY` values).
+    ConstRefAddr(i64),
     FieldRead {
         base: crate::flowspace::model::Variable,
         field: FieldDescriptor,
@@ -944,12 +952,10 @@ pub enum OpKind {
     /// wrapper).  `Some(v)` reaches the flowspace adapter as the
     /// concrete `Constant(v)` operand of the synthetic `same_as` op,
     /// matching PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) pushing the
-    /// resolved object.  `None` retains the legacy `UniStr(joined)`
-    /// sentinel for non-literal RHS (host calls, struct ctors,
-    /// `LazyLock::new(...)`, `std::ptr::null_mut()`, etc.); those
-    /// still surface as the `same_as/>i` / `same_as/>r` unwired
-    /// snapshot entry in `default_bh_builder_unwired_set_matches_
-    /// task_85_snapshot` pending host-evaluator infrastructure.
+    /// resolved object.  `None` is rejected before JitCode assembly:
+    /// RPython has no blackhole `same_as/*` opcode, so unresolved
+    /// statics must be folded to constants or lowered through a real
+    /// host-evaluator path first.
     LoadStatic {
         segments: Vec<String>,
         ty: ValueType,
