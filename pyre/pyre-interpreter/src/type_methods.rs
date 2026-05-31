@@ -1306,6 +1306,24 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &str) -> Result<String, cra
     }
 }
 
+/// `int/float/str/bool.__format__(self, format_spec)` — formats `self`
+/// through the shared spec parser without re-dispatching to an instance
+/// `__format__` (which `format_value_dispatch` would do for subclasses,
+/// risking recursion).  An empty spec collapses to `str(self)`.
+pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let spec = if args.len() > 1 {
+        unsafe { crate::py_str(args[1]) }
+    } else {
+        String::new()
+    };
+    let s = if spec.is_empty() {
+        unsafe { crate::py_str(args[0]) }
+    } else {
+        format_with_spec_public(args[0], &spec)
+    };
+    Ok(pyre_object::w_str_new(&s))
+}
+
 fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
     let p = parse_spec(spec);
     unsafe {

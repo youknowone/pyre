@@ -1554,6 +1554,15 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(str_descr_new));
     dict_storage_store(
         ns,
+        "__format__",
+        make_builtin_function_with_arity(
+            "__format__",
+            crate::type_methods::builtin_value_format,
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "join",
         make_builtin_function_with_arity("join", crate::type_methods::str_method_join, 2),
     );
@@ -6053,6 +6062,15 @@ fn init_int_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__format__",
+        make_builtin_function_with_arity(
+            "__format__",
+            crate::type_methods::builtin_value_format,
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "__float__",
         make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
     );
@@ -6449,6 +6467,15 @@ fn init_float_type(ns: &mut DictStorage) {
         ns,
         "__round__",
         make_builtin_function("__round__", crate::builtins::builtin_round),
+    );
+    dict_storage_store(
+        ns,
+        "__format__",
+        make_builtin_function_with_arity(
+            "__format__",
+            crate::type_methods::builtin_value_format,
+            2,
+        ),
     );
     dict_storage_store(
         ns,
