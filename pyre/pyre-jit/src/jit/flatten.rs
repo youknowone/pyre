@@ -2901,24 +2901,27 @@ pub struct LoweringContext {
     /// HLOp record), so the lowering arm returns `None`
     /// (passthrough) on nargs > 8.
     pub call_fn_idx_by_nargs: [u16; 9],
-    /// Portal frame Ref register, threaded into `simple_call` lowering
-    /// as the leading `bh_call_fn_N(frame, …)` operand.  This is the
-    /// raw register the walker pins the frame to (`portal_frame_reg` at
-    /// the codewriter, filled by `fill_portal_registers` at portal
-    /// entry); `u16::MAX` for non-portal graphs.
+    /// Portal red `frame` Variable — the startblock inputarg appended
+    /// by `graph_entry_inputargs(code, portal_inputs=true)`
+    /// (codewriter.rs:93-101) and exposed via
+    /// `portal_graph_inputvars(code).0` (codewriter.rs:85-91).  Routed
+    /// through `get_register` in `lower_simple_call_hlop_to_insn` so
+    /// the canonical Register index always lands in
+    /// `[0, regallocs[Ref].num_colors)` — matching upstream
+    /// `flatten.py:382-391 GraphFlattener.getcolor(v)` which treats
+    /// every register reference as a colored Variable, never as a raw
+    /// pre-regalloc slot.
     ///
+    /// `None` indicates an unseeded fixture context —
+    /// `lower_simple_call_hlop_to_insn` asserts `Some(_)` was wired
+    /// before lowering production traces.  Pyre adaptation:
     /// `bh_call_fn_N(frame, callable, args...)` helpers receive the
     /// parent frame as the leading ref operand (see call_jit.rs's
     /// `bh_call_fn_impl_with_frame`); the graph-side `simple_call` HLOp
-    /// carries only `(callable, args...)` to match RPython
-    /// `jtransform.py:414 rewrite_call`, so flatten prepends the frame.
-    /// Sourcing the register directly — rather than
-    /// `getcolor(frame_var)` — matches the walker's inline CALL emit
-    /// byte-for-byte in both portal and non-portal graphs: in
-    /// non-portal graphs `frame_var`'s VariableId collides with the
-    /// synthesised `return_var` slot, so resolving it through
-    /// `get_register` would yield `return_var`'s color.
-    pub portal_frame_reg: u16,
+    /// itself carries only `(callable, args...)` to match RPython
+    /// `jtransform.py:414 rewrite_call`, so flatten supplies the
+    /// frame from this Variable.
+    pub portal_frame_var: Option<super::flow::Variable>,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -3978,21 +3981,23 @@ where
     if nargs > 8 {
         return None;
     }
+    let frame_var = ctx.portal_frame_var.expect(
+        "lower_simple_call_hlop_to_insn requires LoweringContext::portal_frame_var \
+         to be seeded from portal_graph_inputvars(code).0; simple_call must not \
+         survive canonical lowering",
+    );
     // First arg is the callable, rest are call arguments.  All Ref.
     // The lowered ListR is `[portal_frame, callable, args...]` because
     // `bh_call_fn_N(frame, callable, args...)` receives the parent
     // frame as the leading ref operand.  The graph-side `simple_call`
     // HLOp carries only `(callable, args...)` to match RPython
     // `jtransform.py:414 rewrite_call`; flatten prepends the frame
-    // here.  The frame register comes straight from
-    // `ctx.portal_frame_reg` (the same raw register the walker's inline
-    // CALL emit prepends), so portal and non-portal graphs match the
-    // walker byte-for-byte.
+    // here.  `get_register(frame_var)` routes through
+    // `regallocs[Ref].getcolor(frame_var)` per upstream
+    // `flatten.py:382-391`, so the Register index always lands in
+    // `[0, num_colors)`.
     let mut operands: Vec<Operand> = Vec::with_capacity(1 + op.args.len());
-    operands.push(Operand::Register(Register::new(
-        Kind::Ref,
-        ctx.portal_frame_reg,
-    )));
+    operands.push(Operand::Register(get_register(frame_var)));
     for arg in &op.args {
         let operand = match arg {
             super::flow::SpaceOperationArg::Value(super::flow::FlowValue::Variable(var)) => {
@@ -5262,7 +5267,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -5383,7 +5388,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -5508,7 +5513,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -5678,7 +5683,7 @@ mod tests {
             store_subscr_fn_idx: 19,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -5897,7 +5902,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -5982,7 +5987,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6011,7 +6016,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -6108,7 +6113,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6169,7 +6174,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6196,7 +6201,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6230,7 +6235,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6291,7 +6296,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6315,7 +6320,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -6353,7 +6358,7 @@ mod tests {
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6407,7 +6412,7 @@ mod tests {
             store_subscr_fn_idx: 41,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -6446,7 +6451,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -6480,7 +6485,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6510,7 +6515,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6540,7 +6545,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6575,7 +6580,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -6624,7 +6629,7 @@ mod tests {
             store_subscr_fn_idx: 53,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -7984,7 +7989,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
@@ -8240,9 +8245,10 @@ mod tests {
     #[test]
     fn lower_simple_call_hlop_prepends_portal_frame_register() {
         // `flatten.py:382-391` simple_call lowering: the residual_call's
-        // first Ref operand is the portal frame (the raw
-        // `ctx.portal_frame_reg`), not part of the original graph-side
-        // `simple_call(callable, args...)`.
+        // first Ref operand is the portal frame (via
+        // `get_register(portal_frame_var)`), not part of the original
+        // graph-side `simple_call(callable, args...)`.
+        let frame_var = Variable::new(VariableId(7), Kind::Ref);
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let mut call_fn_idx_by_nargs = [0u16; 9];
@@ -8254,7 +8260,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs,
-            portal_frame_reg: 100,
+            portal_frame_var: Some(frame_var),
         };
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -8263,6 +8269,10 @@ mod tests {
             0,
         );
         let mut get_register = |var: Variable| match var.id {
+            VariableId(7) => Register {
+                kind: Kind::Ref,
+                index: 100,
+            },
             VariableId(8) => Register {
                 kind: Kind::Ref,
                 index: 101,
@@ -8280,7 +8290,7 @@ mod tests {
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("simple_call lowering must succeed");
+        .expect("simple_call lowering must succeed when portal_frame_var is set");
         match insn {
             Insn::Op {
                 opname,
@@ -8321,11 +8331,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_simple_call_hlop_lowers_non_portal_with_max_frame_reg() {
-        // Non-portal graphs seed `portal_frame_reg = u16::MAX`; the
-        // lowering still prepends that raw register so the canonical
-        // Insn matches the walker's inline CALL emit (which also uses
-        // `portal_frame_reg`) byte-for-byte.
+    #[should_panic(expected = "portal_frame_var")]
+    fn lower_simple_call_hlop_panics_without_portal_frame_var() {
+        // PyPy's jtransform never leaves a lowered call as raw
+        // `simple_call`.  If pyre lacks the frame operand needed by its
+        // explicit-frame helper ABI, fail loudly instead of passing the
+        // HLOp through to canonical SSARepr.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let ctx = LoweringContext {
@@ -8335,7 +8346,7 @@ mod tests {
             store_subscr_fn_idx: 0,
             build_list_fn_idx: 0,
             call_fn_idx_by_nargs: [0; 9],
-            portal_frame_reg: u16::MAX,
+            portal_frame_var: None,
         };
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -8348,22 +8359,11 @@ mod tests {
             index: 0,
         };
         let mut lower_constant = |_c: &Constant| unreachable!();
-        let insn = super::lower_simple_call_hlop_to_insn(
+        let _ = super::lower_simple_call_hlop_to_insn(
             &op,
             &ctx,
             &mut get_register,
             &mut lower_constant,
-        )
-        .expect("non-portal simple_call lowers with the u16::MAX frame reg");
-        match insn {
-            Insn::Op { args, .. } => match &args[1] {
-                Operand::ListOfKind(list) => match &list.content[0] {
-                    Operand::Register(r) => assert_eq!(r.index, u16::MAX),
-                    other => panic!("frame must be the leading Ref operand, got {other:?}"),
-                },
-                other => panic!("expected ListOfKind Ref, got {other:?}"),
-            },
-            _ => panic!("expected Insn::Op, got {insn:?}"),
-        }
+        );
     }
 }

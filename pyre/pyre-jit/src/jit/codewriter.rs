@@ -4970,16 +4970,22 @@ impl CodeWriter {
                     call_fn_7_idx,
                     call_fn_8_idx,
                 ],
-                // `simple_call` lowering prepends the parent frame for
-                // `bh_call_fn_N(frame, callable, args)`.  Source the raw
-                // `portal_frame_reg` (the register the walker pins the
-                // frame to, `u16::MAX` for non-portal) so the canonical
-                // Insn matches the walker's inline CALL emit byte-for-byte.
-                // Routing through `get_register(frame_var)` instead would
-                // mis-resolve non-portal graphs: `frame_var.id` collides
-                // with the synthesised `return_var` slot there, yielding
-                // `return_var`'s color.
-                portal_frame_reg,
+                // Only portal graphs include `frame_var` in
+                // `graph_entry_inputargs(code, true)`; for non-portal
+                // graphs `frame_var.id` collides with the synthesised
+                // `return_var` slot (`new_shadow_graph_with_portal_inputs`
+                // assigns `return_var = Variable(VariableId(start_inputargs.len()))`,
+                // which equals `entry_arg_slots(code)` when
+                // `portal_inputs=false` — the same id `portal_graph_inputvars`
+                // returns for `frame_var`).  Threading a non-portal
+                // `Some(frame_var)` through `get_register` resolves the
+                // call-frame operand from `return_var`'s color, corrupting
+                // canonical `lower_simple_call_hlop_to_insn` lowering.
+                // `simple_call` lowering prepends this frame for
+                // `bh_call_fn_N(frame, callable, args)`; it is valid for
+                // non-portal graphs too since `frame_var` is the graph's
+                // leading ref input arg in both cases.
+                portal_frame_var: Some(frame_var),
             });
         }
 
