@@ -9442,10 +9442,8 @@ impl CodeWriter {
         // block-by-block drain, or reconciling the inline byte stream with a
         // bridge, in the upstream `all_passes` relative order:
         //
-        //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge)
-        //   remove_identical_vars_SSA (dedups duplicate phi inputargs — the
-        //                             removed input is renamed to its identical
-        //                             twin, so no value is lost)
+        //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge;
+        //                             dead blocks have cleared per_block_ssarepr)
         //   constfold_exitswitch     (no-op today — the walker folds constant
         //                             branch conditions before emitting an
         //                             exitswitch — but kept for all_passes
@@ -9457,21 +9455,20 @@ impl CodeWriter {
         // EMPIRICALLY VALIDATED (#73): this subset passes the full check.py
         // gate (dynasm 39/39, correctness + 8-benchmark performance).
         //
-        // Two `all_passes` entries are deliberately NOT wired here because they
-        // are unsafe or unprofitable on today's inline walker (both pay off
-        // only once codegen is driven from the graph, #73):
+        // The remaining active `all_passes` entries are deliberately NOT wired
+        // here (all pay off only once codegen is driven from the graph, #73):
         //
-        //   - `transform_dead_op_vars` PRUNES inputargs/link-args it deems
-        //     dead — but its liveness only scans `Block.operations`,
-        //     exitswitches and outgoing links, NOT each SpamBlock's
-        //     `per_block_ssarepr`, where the walker's real bytecode uses live.
-        //     A target block that consumes an incoming value only in its inline
-        //     instructions (without forwarding/returning the graph var) would
-        //     have that inputarg + the predecessor link arg pruned, and
-        //     `walker_post_walk_insert_renamings` would then have no pair to
-        //     copy the value the inline insns still read — losing a live edge
-        //     value (codex review P1, PR #127).  Stays out until the drain is
-        //     graph-driven and liveness can see every use.
+        //   - `transform_dead_op_vars` and `remove_identical_vars_SSA` both
+        //     drop a graph inputarg + its predecessor link arg (one PRUNES dead
+        //     ones, the other DEDUPS a duplicate phi and renames it to its
+        //     twin).  But the walker's real bytecode uses live in each
+        //     SpamBlock's `per_block_ssarepr` and read the dropped variable's
+        //     walker SLOT, which the graph rename does not touch.  Since
+        //     `walker_post_walk_insert_renamings` only sees the pruned graph it
+        //     emits no copy into that slot, so the inline insns can read a
+        //     stale slot — a lost / wrong edge value (codex review P1 x2,
+        //     PR #127).  They need a walker-side liveness/renaming bridge, or
+        //     the graph-driven drain, before they can be wired.
         //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
         //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
         //     overhead-only: it threads values the walker already routes
@@ -9483,7 +9480,6 @@ impl CodeWriter {
         // empty-`operations` walker blocks (see their classification in
         // `simplify.rs`).
         eliminate_empty_blocks(&graph);
-        super::simplify::remove_identical_vars_ssa(&graph);
         super::simplify::constfold_exitswitch(&graph);
         // remove_trivial_links merges single-entry/single-exit chains; the
         // merge bridge relocates each merged target's inline per_block_ssarepr
