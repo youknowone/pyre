@@ -310,10 +310,6 @@ pub struct UnrollOptimizer {
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
     /// and any future `bh_*` calls resolve to the same backend services.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
-    /// Recorder BoxRef pool carrying tracer-stamped runtime values.
-    /// TraceIterator copies those values onto the fresh per-phase boxes it
-    /// mints, preserving RPython's box-carried `_res*` value shape.
-    pub source_box_pool: Option<crate::r#box::BoxPool>,
     /// Explicit `input_ops` seed for the phase optimizers, threaded from the
     /// compile caller. `Some(ops)` on the non-cut finish path =
     /// `preamble_data.base.operations()` — the same `Rc<Op>` the source
@@ -364,7 +360,6 @@ impl UnrollOptimizer {
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cpu: crate::cpu::default_cpu(),
-            source_box_pool: None,
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
         }
@@ -636,7 +631,7 @@ impl UnrollOptimizer {
                 // allocation inside `TraceIterator.next` (opencoder.py:399-401).
                 let ops_oprc: Vec<majit_ir::OpRc> =
                     ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-                let mut p1_iter = crate::opencoder::TraceIterator::new_with_source_box_pool(
+                let mut p1_iter = crate::opencoder::TraceIterator::new(
                     &ops_oprc,
                     0,
                     ops_oprc.len(),
@@ -644,7 +639,6 @@ impl UnrollOptimizer {
                     &p1_inputarg_types,
                     0,    // start_fresh = 0 — inputargs at [0..num_inputs)
                     None, // p1_full_prefix — Phase 1 has no prior phase
-                    self.source_box_pool.as_ref(),
                 );
                 let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
                 while let Some(op) = p1_iter.next() {
@@ -995,7 +989,7 @@ impl UnrollOptimizer {
         // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
         let ops_oprc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-        let mut iter = crate::opencoder::TraceIterator::new_with_source_box_pool(
+        let mut iter = crate::opencoder::TraceIterator::new(
             &ops_oprc,
             0,
             ops_oprc.len(),
@@ -1003,7 +997,6 @@ impl UnrollOptimizer {
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
             p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
-            self.source_box_pool.as_ref(),
         );
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {

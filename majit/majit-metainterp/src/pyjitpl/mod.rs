@@ -4631,11 +4631,6 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
-        // Recorder BoxRefs carry values stamped by `set_opref_concrete`
-        // during tracing. TraceIterator copies those intrinsic values to
-        // the fresh per-iteration boxes it mints for the optimizer.
-        let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
-
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -4738,7 +4733,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.source_box_pool = Some(close_loop_box_pool);
         // Seed the phase optimizers' `input_ops` so they skip the `box_pool`
         // snapshot. Non-cut: `close_loop` only appends, so
         // `preamble_data.base.operations()`'s loop-body `Rc<Op>` are the SAME
@@ -5729,7 +5723,6 @@ impl<M: Clone> MetaInterp<M> {
             mut constants,
             trace,
             call_pure_results,
-            close_loop_box_pool,
             phase2_input_ops_seed,
         ) = {
             let green_key = ctx.green_key;
@@ -5752,7 +5745,6 @@ impl<M: Clone> MetaInterp<M> {
             let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
-            let close_loop_box_pool = ctx.recorder.box_pool_snapshot();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -5793,7 +5785,6 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 trace,
                 call_pure_results,
-                close_loop_box_pool,
                 phase2_input_ops_seed,
             )
         };
@@ -5841,7 +5832,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        unroll_opt.source_box_pool = Some(close_loop_box_pool);
         unroll_opt.phase2_input_ops_seed = phase2_input_ops_seed;
         unroll_opt.call_pure_results = call_pure_results.clone();
         let (

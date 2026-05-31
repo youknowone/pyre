@@ -545,14 +545,6 @@ impl Trace {
         self.box_pool.iter_indexed()
     }
 
-    /// Snapshot the recorder's sparse BoxRef pool so `TraceIterator`
-    /// can copy intrinsic `_res*` runtime values onto the fresh boxes it
-    /// creates for optimizer iteration, matching RPython's box-carried
-    /// value model without a parallel map.
-    pub(crate) fn box_pool_snapshot(&self) -> crate::r#box::BoxPool {
-        self.box_pool.clone()
-    }
-
     /// Full BoxRef pool snapshot — borrows the sparse slot table
     /// (`None` for skipped positions). Test-only.
     #[cfg(test)]

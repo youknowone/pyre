@@ -254,11 +254,6 @@ pub struct TraceIterator<'a> {
     /// Inputargs at `[start_fresh..start_fresh + num_inputargs)`.
     /// Op results pushed in `next()` for both void and non-void ops.
     pub(crate) box_pool: crate::r#box::BoxPool,
-    /// Optional original trace BoxPool. RPython's trace iterator returns
-    /// fresh Box objects whose `_res*` runtime values are already present
-    /// on the source boxes; pyre copies those intrinsic values when it
-    /// mints the fresh per-iteration BoxRefs.
-    source_box_pool: Option<&'a crate::r#box::BoxPool>,
 }
 
 impl<'a> TraceIterator<'a> {
@@ -279,28 +274,6 @@ impl<'a> TraceIterator<'a> {
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
         p1_full_prefix: Option<crate::r#box::BoxPool>,
-    ) -> Self {
-        Self::new_with_source_box_pool(
-            trace,
-            start,
-            end,
-            force_inputargs,
-            inputarg_types,
-            start_fresh,
-            p1_full_prefix,
-            None,
-        )
-    }
-
-    pub fn new_with_source_box_pool(
-        trace: &'a [majit_ir::OpRc],
-        start: usize,
-        end: usize,
-        force_inputargs: Option<&[OpRef]>,
-        inputarg_types: &[majit_ir::Type],
-        start_fresh: u32,
-        p1_full_prefix: Option<crate::r#box::BoxPool>,
-        source_box_pool: Option<&'a crate::r#box::BoxPool>,
     ) -> Self {
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
@@ -369,7 +342,6 @@ impl<'a> TraceIterator<'a> {
                     let r = OpRef::input_arg_typed(_fresh, tp);
                     // companion BoxRef per inputarg, fresh per iter.
                     let box_ref = BoxRef::new_inputarg(tp, _fresh);
-                    copy_runtime_value_from_source(source_box_pool, arg.raw(), &box_ref);
                     box_pool.push(box_ref);
                     _fresh += 1;
                     r
@@ -389,12 +361,10 @@ impl<'a> TraceIterator<'a> {
             //       self._cache[self.trace.inputargs[i].get_position()] = arg
             inputargs = inputarg_types
                 .iter()
-                .enumerate()
-                .map(|(source_raw, &tp)| {
+                .map(|&tp| {
                     let r = OpRef::input_arg_typed(_fresh, tp);
                     // companion BoxRef per inputarg, fresh per iter.
                     let box_ref = BoxRef::new_inputarg(tp, _fresh);
-                    copy_runtime_value_from_source(source_box_pool, source_raw as u32, &box_ref);
                     box_pool.push(box_ref);
                     _fresh += 1;
                     r
@@ -416,7 +386,6 @@ impl<'a> TraceIterator<'a> {
             end,
             _fresh,
             box_pool,
-            source_box_pool,
         }
     }
 
@@ -529,7 +498,6 @@ impl<'a> TraceIterator<'a> {
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             // companion BoxRef for the fresh op result.
             let box_ref = BoxRef::new_resop(src.opcode.result_type(), self._fresh);
-            copy_runtime_value_from_source(self.source_box_pool, src.pos.get().raw(), &box_ref);
             self.box_pool.push(box_ref);
             self._fresh += 1;
             self._cache[orig] = Some(fresh);
@@ -561,24 +529,6 @@ impl<'a> TraceIterator<'a> {
         // self._count += 1
         self._count += 1;
         Some(res)
-    }
-}
-
-fn copy_runtime_value_from_source(
-    source_box_pool: Option<&crate::r#box::BoxPool>,
-    source_raw: u32,
-    fresh_box: &BoxRef,
-) {
-    let Some(source_box) =
-        source_box_pool.and_then(|pool| pool.get_at_position(source_raw as usize))
-    else {
-        return;
-    };
-    let Some(value) = source_box.get_value() else {
-        return;
-    };
-    if value.get_type() == fresh_box.type_() && value.get_type() != Type::Void {
-        fresh_box.set_value(value);
     }
 }
 
