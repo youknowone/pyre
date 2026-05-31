@@ -2137,7 +2137,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str) -> PyResult {
                 }
             }
             if name == "__name__" {
-                return Ok(w_str_new(w_type_get_name(obj)));
+                // `type.__name__` is the bare type name; a dotted tp_name
+                // (e.g. "types.UnionType") carries its module prefix only
+                // in repr, so strip to the final component here.
+                let full = w_type_get_name(obj);
+                let bare = full.rsplit('.').next().unwrap_or(full);
+                return Ok(w_str_new(bare));
             }
             if name == "__qualname__" {
                 // Check if __qualname__ was explicitly set in class body
