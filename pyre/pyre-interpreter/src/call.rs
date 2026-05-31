@@ -1758,6 +1758,58 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     }
 }
 
+/// Invoke a user function with an already-resolved argument scope,
+/// frameless (exec ctx pulled from the thread-local set by
+/// __build_class__).  Mirrors [`call_user_function_with_args`] but skips
+/// `fill_user_function_args` because `args` is the final frame-local
+/// layout produced by [`resolve_kwargs`] — re-matching it would treat the
+/// packed `*args` / `**kwargs` slots as extra positionals.
+fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    let w_code = unsafe { crate::getcode(func) };
+    let globals = unsafe { function_get_globals(func) };
+    let w_globals_obj = unsafe { function_get_globals_obj(func) };
+    let closure = unsafe { function_get_closure(func) };
+    let func_code = unsafe {
+        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
+    };
+    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = if exec_ctx.is_null() {
+        LAST_EXEC_CTX.with(|c| c.get())
+    } else {
+        exec_ctx
+    };
+    let code_ref = unsafe { &*func_code };
+
+    let mut frame = PyFrame::new_for_call_with_closure_and_globals_obj(
+        w_code,
+        args,
+        globals,
+        w_globals_obj,
+        exec_ctx,
+        closure,
+    );
+    frame.fix_array_ptrs();
+    if code_ref
+        .flags
+        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
+    {
+        return match frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                set_call_error(e);
+                PY_NULL
+            }
+        };
+    }
+    match frame.execute_frame(None, None) {
+        Ok(v) => v,
+        Err(e) => {
+            set_call_error(e);
+            PY_NULL
+        }
+    }
+}
+
 /// Call a metaclass with extra keyword arguments.
 ///
 /// PyPy: metaclass(name, bases, namespace, **kwds).
@@ -2183,6 +2235,22 @@ fn build_class_inner(
 
     // Call __init_subclass__ on each base class
     // PyPy: typeobject.py type.__init__ → call __init_subclass__
+    //
+    // type.__new__ calls super().__init_subclass__(cls, **kwds) with the
+    // class-definition keyword arguments (`class C(Base, x=1)` → `x=1`).
+    // The kwds left after metaclass extraction live in `extra_kwargs`;
+    // forward them to a user-defined __init_subclass__ resolved against
+    // its signature so `def __init_subclass__(cls, **kw)` and
+    // `def __init_subclass__(cls, *, x=None)` both receive them.
+    let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match extra_kwargs {
+        Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
+            pyre_object::w_dict_items(kw)
+                .into_iter()
+                .filter(|(k, _)| pyre_object::is_str(*k))
+                .collect()
+        },
+        _ => Vec::new(),
+    };
     if !w_effective_bases.is_null() && unsafe { pyre_object::is_tuple(w_effective_bases) } {
         let n = unsafe { pyre_object::w_tuple_len(w_effective_bases) };
         for i in 0..n {
@@ -2192,7 +2260,36 @@ fn build_class_inner(
                     if let Some(init_sub) =
                         unsafe { crate::baseobjspace::lookup_in_type(base, "__init_subclass__") }
                     {
-                        let _ = crate::call_function(init_sub, &[w_type]);
+                        // Forward kwargs only to a user-defined
+                        // __init_subclass__ with a real Python code object;
+                        // object's builtin default has no code object, so
+                        // resolve_kwargs would deref a bogus code pointer.
+                        let is_user_fn = unsafe { crate::is_function(init_sub) }
+                            && unsafe {
+                                !crate::is_builtin_code(
+                                    crate::getcode(init_sub) as pyre_object::PyObjectRef
+                                )
+                            };
+                        if !init_subclass_kwargs.is_empty() && is_user_fn {
+                            let mut call_args = Vec::with_capacity(1 + init_subclass_kwargs.len());
+                            call_args.push(w_type);
+                            let mut names = Vec::with_capacity(init_subclass_kwargs.len());
+                            for (k, v) in &init_subclass_kwargs {
+                                call_args.push(*v);
+                                names.push(*k);
+                            }
+                            let kwarg_names = pyre_object::w_tuple_new(names);
+                            let resolved = resolve_kwargs(init_sub, &call_args, kwarg_names)?;
+                            clear_call_error();
+                            let res = call_user_function_resolved_frameless(init_sub, &resolved);
+                            if res.is_null() {
+                                if let Some(err) = take_call_error() {
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            let _ = crate::call_function(init_sub, &[w_type]);
+                        }
                     }
                 }
             }
