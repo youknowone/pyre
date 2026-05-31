@@ -427,10 +427,7 @@ fn call_user_function_with_eval(
     // Generator function: create generator object instead of executing.
     // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
     // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -478,10 +475,7 @@ pub fn call_user_function_resolved(
     let code_ref = unsafe { &*func_code };
 
     // Generator function
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             args,
@@ -638,10 +632,7 @@ pub fn call_user_function_plain_with_ctx(
     let code_ref = unsafe { &*func_code };
     let final_args = fill_user_function_args(callable, code_ref, args)?;
 
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -1731,10 +1722,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     };
 
     // Generator function: wrap frame in generator object
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let mut gen_frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             &final_args,
@@ -1814,10 +1802,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
         closure,
     );
     frame.fix_array_ptrs();
-    if code_ref
-        .flags
-        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
-    {
+    if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame.run() {
             Ok(v) => v,
             Err(e) => {

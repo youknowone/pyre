@@ -555,6 +555,21 @@ pub fn ncells(code: &CodeObject) -> usize {
     npure_cellvars(code) + code.freevars.len()
 }
 
+/// Whether calling a code object with these flags produces a suspended
+/// frame object (generator / coroutine / async generator) rather than
+/// running the body eagerly.
+/// pyframe.py get_generator: CO_GENERATOR | CO_COROUTINE |
+/// CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR.
+#[inline]
+pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
+    flags.intersects(
+        crate::CodeFlags::GENERATOR
+            | crate::CodeFlags::COROUTINE
+            | crate::CodeFlags::ITERABLE_COROUTINE
+            | crate::CodeFlags::ASYNC_GENERATOR,
+    )
+}
+
 impl PyFrame {
     /// pyframe.py:121 getdebug → self.debugdata
     #[inline]
@@ -2249,11 +2264,7 @@ impl PyFrame {
 
     #[inline]
     pub fn _is_generator_or_coroutine(&self) -> bool {
-        self.code().flags.intersects(
-            crate::CodeFlags::GENERATOR
-                | crate::CodeFlags::COROUTINE
-                | crate::CodeFlags::ITERABLE_COROUTINE,
-        )
+        code_flags_make_generator(self.code().flags)
     }
 
     /// pyframe.py:276 initialize_as_generator

@@ -1307,6 +1307,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 // For now, just leave the value on the stack unchanged.
                 Ok(())
             }
+            IntrinsicFunction1::AsyncGenWrap => {
+                // Wraps a value yielded from an async generator. pyre conflates
+                // generators / coroutines / async generators into a single
+                // suspended-frame object, so the wrapper type is not modeled —
+                // the value passes through unchanged.
+                Ok(())
+            }
             _ => Err(crate::PyError::type_error(&format!(
                 "intrinsic function {:?} not implemented",
                 func
