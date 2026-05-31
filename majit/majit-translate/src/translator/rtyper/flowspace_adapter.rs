@@ -348,7 +348,11 @@ pub fn build_value_to_hlvalue_map(
                     map.insert(
                         result,
                         Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::Int(*addr),
+                            ConstValue::LLAddress(
+                                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(
+                                    *addr,
+                                ),
+                            ),
                             LowLevelType::Address,
                         )),
                     );
@@ -1648,7 +1652,9 @@ fn legacy_const_define_hlvalue(
         OpKind::ConstRefAddr(addr) => Some((
             result,
             Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::Int(*addr),
+                ConstValue::LLAddress(
+                    crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(*addr),
+                ),
                 LowLevelType::Address,
             )),
         )),

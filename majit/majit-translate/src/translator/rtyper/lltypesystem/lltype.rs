@@ -343,6 +343,14 @@ pub enum _address {
     /// have a stable structural hash; the `Fake` arm carries a Box
     /// to keep the variant fixed-size.
     Fake(Box<_ptr>),
+    /// `cast_int_to_adr(int)` (`llmemory.py:788`) — the fakeaddress
+    /// produced by casting a raw integer pointer to an `Address`.
+    /// Upstream casts the integer to a `_NONGCREF` `_ptr` (or resolves
+    /// it through `ll2ctypes._int2obj`) and wraps that ptr; pyre carries
+    /// the integer directly because the host-evaluator hands back a raw
+    /// pointer value for a `Ref`-typed static without a live `_ptr` to
+    /// wrap.
+    IntCast(i64),
 }
 
 #[derive(Clone, Debug)]

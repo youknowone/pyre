@@ -2392,6 +2392,10 @@ impl Hash for ConstValue {
                     1u8.hash(state);
                     p._hashable_identity().hash(state);
                 }
+                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n) => {
+                    2u8.hash(state);
+                    n.hash(state);
+                }
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
