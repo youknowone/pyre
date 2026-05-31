@@ -9442,9 +9442,10 @@ impl CodeWriter {
         // block-by-block drain, or reconciling the inline byte stream with a
         // bridge, in the upstream `all_passes` relative order:
         //
-        //   transform_dead_op_vars   (drops dead inputargs + matching args)
         //   eliminate_empty_blocks   (+ rewrite_dead_forwarder_gotos bridge)
-        //   remove_identical_vars_SSA (dedups duplicate phi inputargs)
+        //   remove_identical_vars_SSA (dedups duplicate phi inputargs — the
+        //                             removed input is renamed to its identical
+        //                             twin, so no value is lost)
         //   constfold_exitswitch     (no-op today — the walker folds constant
         //                             branch conditions before emitting an
         //                             exitswitch — but kept for all_passes
@@ -9453,22 +9454,34 @@ impl CodeWriter {
         //                             merge bridge below relocates each merged
         //                             target's per_block_ssarepr into source)
         //
-        // EMPIRICALLY VALIDATED (#73, 2026-05-31): this subset passes the
-        // full check.py gate (dynasm 39/39, correctness + 8-benchmark
-        // performance, no regression).  The only remaining active pass is
-        // `ssa_to_ssi`, deliberately NOT wired.  It now runs CORRECTLY on
-        // walker graphs (the `backendopt_ssa.rs` stop-at-startblock
-        // adaptation makes it recognise values the walker defines inline at
-        // entry instead of crashing), and wiring it passes correctness
-        // 39/39 — but it is **overhead-only** on today's inline walker: it
-        // threads variables the walker already routes through its
-        // register/slot model, adding redundant coalesce pairs / `ref_copy`
-        // that measurably regress exception-heavy code (raise_catch ~4.2x ->
-        // ~10.9x).  SSI form only pays off once codegen is driven from the
-        // graph (#73), so it stays out until then.  The other `all_passes`
-        // entries are structural no-ops on today's empty-`operations` walker
-        // blocks (see their classification in `simplify.rs`).
-        super::simplify::transform_dead_op_vars(&graph);
+        // EMPIRICALLY VALIDATED (#73): this subset passes the full check.py
+        // gate (dynasm 39/39, correctness + 8-benchmark performance).
+        //
+        // Two `all_passes` entries are deliberately NOT wired here because they
+        // are unsafe or unprofitable on today's inline walker (both pay off
+        // only once codegen is driven from the graph, #73):
+        //
+        //   - `transform_dead_op_vars` PRUNES inputargs/link-args it deems
+        //     dead — but its liveness only scans `Block.operations`,
+        //     exitswitches and outgoing links, NOT each SpamBlock's
+        //     `per_block_ssarepr`, where the walker's real bytecode uses live.
+        //     A target block that consumes an incoming value only in its inline
+        //     instructions (without forwarding/returning the graph var) would
+        //     have that inputarg + the predecessor link arg pruned, and
+        //     `walker_post_walk_insert_renamings` would then have no pair to
+        //     copy the value the inline insns still read — losing a live edge
+        //     value (codex review P1, PR #127).  Stays out until the drain is
+        //     graph-driven and liveness can see every use.
+        //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
+        //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
+        //     overhead-only: it threads values the walker already routes
+        //     through its register/slot model, adding redundant coalesce pairs
+        //     / `ref_copy` that measurably regress exception-heavy code
+        //     (raise_catch ~4.2x -> ~10.9x).
+        //
+        // The other `all_passes` entries are structural no-ops on today's
+        // empty-`operations` walker blocks (see their classification in
+        // `simplify.rs`).
         eliminate_empty_blocks(&graph);
         super::simplify::remove_identical_vars_ssa(&graph);
         super::simplify::constfold_exitswitch(&graph);
