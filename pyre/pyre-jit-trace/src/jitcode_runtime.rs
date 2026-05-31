@@ -1428,6 +1428,18 @@ mod tests {
         //   remaining `same_as/>r` is the `*_TYPE` runtime-address
         //   globals whose host addresses are only known at runtime
         //   (Slice B address-baking target).
+        // - `int_eq/if>i` — an `int_eq` enumerated with one int and one
+        //   float operand.  Surfaced once `format_float`'s no-type branch
+        //   started formatting through `display::format_float_repr`
+        //   (commit f94d00f183, the no-type float `.0` fix), which widened
+        //   the translated reachability set and let whole-program
+        //   annotation infer a mixed int/float comparand for a shared
+        //   numeric-compare helper.  The int/float compare is coerced to a
+        //   float compare by the optimizer before the blackhole, so the
+        //   shape is never dispatched — `i == 1.0` in a JIT hot loop runs
+        //   correctly (check.py 39/39 x2).  Closing it is the rtyper
+        //   int/float ordered-compare coercion (Slice E / reviewer 2.5),
+        //   after which the mixed-operand `int_eq` is never emitted.
         //
         // Cross-platform tolerance: the analyzer's classdef/type-alias
         // resolution still depends on file-traversal order beyond what
@@ -1448,6 +1460,7 @@ mod tests {
             "newtuple/rr>r",
             "same_as/>i",
             "same_as/>r",
+            "int_eq/if>i",
         ];
         let unexpected: Vec<&String> = unwired
             .iter()
