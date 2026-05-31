@@ -9742,15 +9742,21 @@ mod opt_box_env_tests {
         assert_eq!(materialised.position(), Some(0));
         assert_eq!(materialised.type_(), majit_ir::Type::Int);
 
-        // Re-entering must keep the same identity (no second lazy
-        // mint): `BoxRef` `PartialEq` is `Rc::ptr_eq` matching
-        // PyPy's `_forwarded` identity.
+        // Re-entering must resolve to the same canonical `_forwarded`
+        // host (`resoperation.py:700 AbstractInputArg._forwarded`). The
+        // `BoxRef` wrapper carries no state post-S-0.C, so two
+        // `ensure_box` calls return distinct wrappers bound to the same
+        // `InputArgRc`; identity lives on that bound host, not the
+        // wrapper `Rc`.
         let second = ctx
             .ensure_box(arg)
             .expect("InputArg OpRef must continue to resolve");
-        assert_eq!(
-            materialised, second,
-            "second ensure_box must return the same Box identity",
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &materialised.bound_inputarg().expect("materialised bound to InputArg"),
+                &second.bound_inputarg().expect("second bound to InputArg"),
+            ),
+            "second ensure_box must resolve to the same InputArg host",
         );
     }
 
