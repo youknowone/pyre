@@ -1444,8 +1444,9 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
         // `newformat.py` percent type: scale by 100, format fixed, suffix `%`.
         '%' => format!("{:.*}%", prec, abs * 100.0),
         // `g`/`G` always format `general`: default precision 6, trailing
-        // zeros trimmed unless alt-form keeps them.
-        'g' | 'G' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
+        // zeros trimmed unless alt-form keeps them.  `n` matches `g` but
+        // takes its digit grouping from the locale (none in the C locale).
+        'g' | 'G' | 'n' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
         '\0' => {
             // No presentation type formats like `repr()` — the shortest
             // round-trip string, which keeps the trailing `.0` for whole
