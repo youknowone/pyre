@@ -1798,6 +1798,141 @@ mod tests {
             "Ref-typed inputarg must project to GcRef matching legacy"
         );
     }
+
+    #[test]
+    fn cachedgraph_hit_registers_callee_graph_into_translator_graphs() {
+        let _lock = anchor_lock();
+        // Keystone linkage: after a real caller -> callee specialize,
+        // the lifted callee `FunctionGraph` must live in the session
+        // `translator.graphs`.  Upstream reaches that state because
+        // `buildgraph -> buildflowgraph` appends every graph
+        // (`translator.py:61`); pyre's lazy-lift prefills
+        // `FunctionDesc.cache` via `lift_callee_to_pygraph` +
+        // `prefill_default_cache`, bypassing `buildflowgraph`, so the
+        // graph would otherwise never enter `translator.graphs`.
+        // `FunctionDesc.cachedgraph`'s hit path restores the invariant
+        // (description.rs:1058-1082).  This pins that the registration
+        // actually fires through the shared-bookkeeper session and that
+        // `funcobj.graph` (= the cached PyGraph's `graph`) is the exact
+        // `Rc` now resolvable by the flowspace effect analyzers
+        // (`canraise::RaiseAnalyzer` resolving `direct_call` through
+        // `translator.graphs`, graphanalyze.rs) instead of falling to
+        // `top_result()`.
+        let mut graph = LegacyGraph::new("call_resolved");
+        let inputargs = block_inputargs(&mut graph, &[1]);
+        let v1_var = inputargs[0].clone();
+        let (_, _, v2_var) = graph.exceptblock_arg_vars();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs,
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(v2_var.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["foo".into()],
+                    },
+                    args: vec![v1_var.clone()],
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v2_var.clone())],
+                graph.returnblock,
+            )],
+            dead: false,
+            framestate: None,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&mut graph, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            dead: false,
+            framestate: None,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let bookkeeper = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        let registry =
+            crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(bookkeeper);
+
+        // Leaf callee `fn foo(x: i64) -> i64 { x }` lifted through a
+        // child registry; the entry's `FunctionDesc` (whose
+        // `cachedgraph` is hit during the caller's specialize) is owned
+        // by the session `registry` via `register_callee`, so its
+        // `base.bookkeeper` is the bookkeeper `ensure_session` attaches
+        // the annotator to.
+        let mut callee_graph = LegacyGraph::new("foo");
+        let foo_inputargs = block_inputargs(&mut callee_graph, &[10]);
+        let foo_v10_var = foo_inputargs[0].clone();
+        let foo_start = Block {
+            id: callee_graph.startblock,
+            inputargs: foo_inputargs,
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(foo_v10_var.clone())],
+                callee_graph.returnblock,
+            )],
+            dead: false,
+            framestate: None,
+        };
+        let foo_return = Block {
+            id: callee_graph.returnblock,
+            inputargs: block_inputargs(&mut callee_graph, &[10]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            dead: false,
+            framestate: None,
+        };
+        callee_graph.blocks = vec![foo_start, foo_return];
+        let leaf_registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
+            std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
+        );
+        setbinding(&foo_v10_var, ValueType::Int);
+        let pygraph = lift_callee_to_pygraph(
+            &callee_graph,
+            crate::flowspace::argument::Signature::new(vec!["x".to_string()], None, None),
+            &leaf_registry,
+        )
+        .expect("leaf callee must lift to PyGraph");
+        // Capture the callee's flowspace graph `Rc` before the pygraph
+        // is moved into `register_callee`; this is the identity that
+        // `cachedgraph` clones into `translator.graphs` and that
+        // `funcobj.graph` points at after rtyping.
+        let callee_graph_ref = pygraph.graph.clone();
+        registry.register_callee(
+            crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(["foo"]),
+            crate::flowspace::argument::Signature::new(vec!["x".to_string()], None, None),
+            pygraph,
+        );
+
+        setbinding(&v1_var, ValueType::Int);
+        setbinding(&v2_var, ValueType::Int);
+        specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+            .expect("cache pre-fill must let the leaf Call resolve end-to-end");
+
+        // `ensure_session` ran inside the specialize and wired the
+        // annotator backlink onto the registry's shared bookkeeper
+        // (`set_annotator`), so the diagnostic accessor must now
+        // upgrade.
+        let annotator = registry
+            .bookkeeper()
+            .try_annotator()
+            .expect("specialize must have attached the session annotator");
+        let graphs = annotator.translator.graphs.borrow();
+        assert!(
+            graphs
+                .iter()
+                .any(|g| std::rc::Rc::ptr_eq(g, &callee_graph_ref)),
+            "the lifted callee graph must be registered into translator.graphs by the \
+             cachedgraph hit path, so RaiseAnalyzer can resolve funcobj.graph through \
+             translator.graphs instead of falling to top_result()"
+        );
+    }
     // `build_program_annotator_starts_empty_after_step3` retired at
     // Step 4 first slice (2026-05-07).  The function being tested
     // (`build_program_annotator`) was retired together with the
