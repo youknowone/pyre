@@ -1792,6 +1792,33 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Native iterator methods — `iter(x)` products: list/tuple/str/set/
+    // bytes/zip/map/reversed share the seq-iter type; range, the dict
+    // views and enumerate are distinct.  `next(it)` and `for` already
+    // drive these through the iternext slot; expose `__next__` and
+    // `__iter__` so explicit `it.__next__()` / `it.__iter__()` work too.
+    unsafe {
+        if is_seq_iter(obj)
+            || is_range_iter(obj)
+            || pyre_object::dictviewobject::is_dict_view_iterator(obj)
+            || pyre_object::enumerateobject::is_enumerate(obj)
+        {
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
+                "__next__" => Some((iter_next_method, "__next__")),
+                "__iter__" => Some((iter_self_method, "__iter__")),
+                _ => None,
+            };
+            if let Some((func, sname)) = entry {
+                let func_obj = crate::make_builtin_function_with_arity(sname, func, 1);
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
+            }
+        }
+    }
+
     // Property descriptor methods — PyPy: descriptor.py W_Property.setter / getter / deleter
     // Returns a bound method (W_Method) that captures the property via w_self,
     // so the static handler can extract the property from args[0].
@@ -5993,6 +6020,11 @@ fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
 fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     next(obj)
+}
+
+/// `__iter__` for an iterator — returns the iterator itself.
+fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
+    Ok(args.first().copied().unwrap_or(pyre_object::PY_NULL))
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
