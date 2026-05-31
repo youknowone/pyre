@@ -1123,24 +1123,20 @@ impl TraceCtx {
         if opref.is_constant() {
             return;
         }
-        let boxref = self
-            .recorder
-            .box_for_position(opref.raw())
-            .unwrap_or_else(|| {
-                panic!(
-                    "set_opref_concrete: no BoxPool slot for OpRef position {} \
-                 ({opref:?}) — Box must be allocated by record_op*/record_input_arg \
-                 before its value can be stamped (history.py:803 *FrontendOp \
-                 invariant)",
-                    opref.raw(),
-                )
-            });
-        boxref.set_value(concrete);
-        // Stamp the canonical `InputArg`/`Op` value slot too (the
-        // `_resint`/`_resfloat`/`_resref` host the BoxPool entry mirrors).
-        // The box and the object carry the same value during the transition
-        // off the side pool.
-        self.recorder.set_concrete_at(opref.raw(), concrete);
+        // Stamp the concrete value on the canonical `InputArg`/`Op` identity
+        // (`history.py:803 *FrontendOp(pos, value)` — the value lives on the
+        // op object, not a side pool). A missing slot means a synthetic /
+        // stale OpRef is trying to stamp a value before the op was recorded —
+        // an invariant violation; panic rather than silently swallow it.
+        if !self.recorder.set_concrete_at(opref.raw(), concrete) {
+            panic!(
+                "set_opref_concrete: no recorded op/inputarg for OpRef position \
+                 {} ({opref:?}) — the *FrontendOp must be recorded by \
+                 record_op*/record_input_arg before its value can be stamped \
+                 (history.py:803 *FrontendOp invariant)",
+                opref.raw(),
+            );
+        }
     }
 
     /// `BoxRef::get_value` reader — the concrete value stamped onto
@@ -1154,9 +1150,7 @@ impl TraceCtx {
         if opref.is_constant() {
             return opref.inline_const_to_value();
         }
-        self.recorder
-            .box_for_position(opref.raw())
-            .and_then(|b| b.get_value())
+        self.recorder.concrete_at(opref.raw())
     }
 
     /// `Box.value` read — composes the resolution chain that
