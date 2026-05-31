@@ -4111,11 +4111,10 @@ mod tests {
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
-        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
-        // exceptblock-augmented map — `flatten_graph` (without type
-        // state) leaves it empty, but the Slice C-3 lookup_coloring_var
-        // contract requires the same authoritative table that
-        // `perform_all_register_allocations` consumed.
+        // `assemble` derives every operand kind from the variable
+        // concretetype + the `regallocs` coloring (lookup_coloring_var,
+        // flatten.py:386-387); pass the same canonical-exceptblock-
+        // augmented graph and regallocs that the flatten pass consumed.
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
 
