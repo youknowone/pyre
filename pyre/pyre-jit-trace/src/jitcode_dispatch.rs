@@ -3955,37 +3955,18 @@ fn walker_abort_if_protected_may_force(
     if !can_raise {
         return Ok(());
     }
-    // Precise gate (full-body walk): abort only when THIS call's Python
-    // opcode is actually covered by an exception handler, instead of when
-    // the body contains ANY `catch_exception/L`.  The full-body walk's
-    // `FULL_BODY_SNAPSHOT_SYM` gives `sym.jitcode` → `pc_map` (JitCode pc →
-    // Python pc, the same inverse map `walker_capture_snapshot_for_last_guard`
-    // uses) and `code_ptr` → the `CodeObject.exceptiontable`.  A call whose
-    // Python pc has no covering handler range raises straight out of the
-    // frame (`GUARD_NO_EXCEPTION` deopt exits the frame, never routing into
-    // a handler the walk can't yet resume), so it is safe to walk.
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if !full_body_sym.is_null() {
-        // SAFETY: set only for the lifetime of the full-body
-        // `dispatch_via_miframe`; the `PyreSym`/jitcode/CodeObject outlive
-        // the walk.  Read-only access to immutable layout fields.
-        let sym = unsafe { &*full_body_sym };
-        if !sym.jitcode.is_null() {
-            let jc = unsafe { &*sym.jitcode };
-            if !jc.payload.code_ptr.is_null() {
-                // Full-body walk: a protected may-force call no longer aborts.
-                // Its `GUARD_NO_EXCEPTION` deopt routes into an exception
-                // handler whose bridge re-trace is seeded with the runtime
-                // standing exception at `run_perfn_walk` entry (#51c bridge
-                // handler-resume seeding), so the handler body's
-                // `last_exc_value` / `catch_exception` reads resolve instead
-                // of baking NULL.  Walk it like any other may-force call.
-                return Ok(());
-            }
-        }
-    }
-    // Fallback (non-full-body walk / no sym pointer): conservative
-    // whole-body scan — abort if the body has any handler at all.
+    // Abort whenever the walked body contains any `catch_exception/L`.  A
+    // may-force call's `GUARD_NO_EXCEPTION` deopt can route into that handler,
+    // and the walk cannot yet seed the handler's standing exception value at
+    // resume — the exception-path bridge bakes a NULL exception object, so the
+    // compiled `GuardClass ldr [x0]` dereferences `x0 == 0` (the synth
+    // `exceptions` loop: `may_fail` raises, caught in `main`'s handler reading
+    // `e.args[0]`).  Falling back to the trait tracer keeps such loops correct.
+    // A per-call precise gate (abort only when THIS call's Python pc is covered
+    // by a handler range) would need the handler-resume seeding to be reliable
+    // first; until then the conservative whole-body scan is the correct gate.
+    // Bodies with no handler (the loop benches / nbody / fannkuch) never deopt
+    // into a handler and compile under the walk.
     if jitcode_has_exception_handler(code) {
         return Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc });
     }
