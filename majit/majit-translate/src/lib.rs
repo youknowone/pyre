@@ -118,9 +118,9 @@ pub fn analyze_pipeline(source: &str) -> pipeline::ProgramPipelineResult {
 /// through [`front::mir::build_semantic_program_from_llbcs`] using
 /// LLBC artefacts discovered via, in priority order:
 ///
-/// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (colon-separated paths).
-///    Explicit override for CI / test fixtures targeting a specific
-///    LLBC set.
+/// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
+///    Windows, `:`-separated elsewhere). Explicit override for CI /
+///    test fixtures targeting a specific LLBC set.
 /// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`
 ///    (Step 6.B 2026-05-25).  `scripts/extract-llbc.sh` writes here.
 ///    If every expected file exists, MIR cutover engages
@@ -134,22 +134,22 @@ fn build_semantic_program_via_active_frontend(
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
-        // Step 4.6 multi-LLBC cutover: accept colon-separated paths
-        // (matching unix PATH convention) so production can pass
-        // both `pyre-object.ullbc` and `pyre-interpreter.ullbc`
-        // (and any future per-crate ullbc) in one env-var.  The
-        // single-path form continues to work — it parses as a
-        // length-one slice.
+        // Step 4.6 multi-LLBC cutover: accept an OS path-list so
+        // production can pass both `pyre-object.ullbc` and
+        // `pyre-interpreter.ullbc` (and any future per-crate ullbc) in
+        // one env-var.  `std::env::split_paths` uses the platform
+        // separator (`;` on Windows, `:` elsewhere) so a Windows drive
+        // letter like `Z:` is not mistaken for a separator.  The
+        // single-path form continues to work.
         //
         // Step 6.B: if the env-var is unset, auto-discover the
         // canonical workspace LLBC artefacts before falling through
         // to AST.
-        let resolved_paths: Option<Vec<String>> = std::env::var("PYRE_MIR_FRONTEND_LLBC")
-            .ok()
+        let resolved_paths: Option<Vec<String>> = std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
             .map(|v| {
-                v.split(':')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
+                std::env::split_paths(&v)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
             .or_else(|| auto_discover_workspace_llbc_paths(parsed_files));
@@ -202,7 +202,8 @@ fn build_semantic_program_via_active_frontend(
         "no LLBC source resolved.\n\
          Run `scripts/extract-llbc.sh` to produce \
          `build/llbc/{{pyre-object,pyre-interpreter}}.ullbc`, \
-         or set `PYRE_MIR_FRONTEND_LLBC=path1:path2:...` explicitly."
+         or set `PYRE_MIR_FRONTEND_LLBC` to an OS path-list \
+         (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
 }
 

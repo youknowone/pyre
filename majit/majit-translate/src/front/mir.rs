@@ -514,10 +514,10 @@ impl<'a> Lowering<'a> {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             // Register a stable name so canonical comparison can spot
-            // arg-renames.
-            graph
-                .value_names
-                .insert(graph.slot_of(&var).unwrap(), name.clone());
+            // arg-renames.  The `value_names` side-table was retired;
+            // names live on the value via `name_value_var` (mirrors the
+            // `parse.rs` arg-binding path).
+            graph.name_value_var(&var, name.clone());
             local_var[i] = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
             input_ops.push(SpaceOperation {

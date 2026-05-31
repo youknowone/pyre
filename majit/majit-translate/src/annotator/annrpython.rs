@@ -12,8 +12,8 @@
 //! comment verbatim and a `todo!()` stub so every stub surfaces at
 //! runtime rather than silently no-op'ing.
 
-use std::cell::RefCell;
 use indexmap::IndexMap;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 

@@ -171,10 +171,13 @@ fn ensure_workspace_llbc_env() -> bool {
         }
         paths.push(p.to_string_lossy().into_owned());
     }
+    // Join with the OS path-list separator (`;` on Windows, `:` else)
+    // so Windows drive letters survive; lib.rs parses it via split_paths.
+    let joined = std::env::join_paths(&paths).expect("join llbc paths");
     // SAFETY: set_var is unsafe in Rust 2024 because multi-threaded
     // env mutation races; this test binary runs single-threaded before
     // `with_all_jitcodes` spawns any worker, so the call is sound.
-    unsafe { std::env::set_var("PYRE_MIR_FRONTEND_LLBC", paths.join(":")) };
+    unsafe { std::env::set_var("PYRE_MIR_FRONTEND_LLBC", joined) };
     true
 }
 
