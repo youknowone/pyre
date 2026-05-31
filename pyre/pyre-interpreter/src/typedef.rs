@@ -2311,6 +2311,81 @@ fn init_dict_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__ror__",
+        make_builtin_function_with_arity(
+            "__ror__",
+            |args| {
+                // `dictmultiobject.py:295 descr_ror`: `other | dict` copies
+                // the right-hand-side base (other) and overlays self.
+                if args.len() < 2 {
+                    return Ok(args[0]);
+                }
+                let self_ = crate::type_methods::resolve_dict_backing(args[0]);
+                let other = crate::type_methods::resolve_dict_backing(args[1]);
+                if other.is_null() {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                let dst = pyre_object::w_dict_new();
+                for (k, v) in unsafe { pyre_object::w_dict_items(other) } {
+                    unsafe { pyre_object::w_dict_store(dst, k, v) };
+                }
+                if !self_.is_null() {
+                    for (k, v) in unsafe { pyre_object::w_dict_items(self_) } {
+                        unsafe { pyre_object::w_dict_store(dst, k, v) };
+                    }
+                }
+                Ok(dst)
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__ior__",
+        make_builtin_function_with_arity(
+            "__ior__",
+            |args| {
+                // `dictmultiobject.py:303 descr_ior`: in-place update via
+                // `update1`, returns self.
+                if args.len() < 2 {
+                    return Ok(args[0]);
+                }
+                let self_ = crate::type_methods::resolve_dict_backing(args[0]);
+                if !self_.is_null() {
+                    crate::type_methods::dict_update1(self_, args[1])?;
+                }
+                Ok(args[0])
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__reversed__",
+        make_builtin_function_with_arity(
+            "__reversed__",
+            |args| {
+                // `dictmultiobject.py:207 descr_reversed`: reverse iterator
+                // over the dict keys.
+                let d = crate::type_methods::resolve_dict_backing(args[0]);
+                let mut keys: Vec<PyObjectRef> = if d.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { pyre_object::w_dict_items(d) }
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect()
+                };
+                keys.reverse();
+                let n = keys.len();
+                let list = pyre_object::w_list_new(keys);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "copy",
         make_builtin_function_with_arity("copy", crate::type_methods::dict_method_copy, 1),
     );
