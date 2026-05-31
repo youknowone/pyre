@@ -30,4 +30,20 @@ en = enumerate("xy", 1)
 assert en.__iter__() is en
 assert en.__next__() == (1, "x")
 
+# Generators and itertools count/repeat: __iter__() returns self.
+def gen():
+    yield 1
+    yield 2
+g = gen()
+assert g.__iter__() is g
+assert g.__next__() == 1
+
+import itertools
+c = itertools.count(5)
+assert c.__iter__() is c
+assert c.__next__() == 5
+r = itertools.repeat(7, 2)
+assert r.__iter__() is r
+assert r.__next__() == 7
+
 print("iterator_dunders ok")

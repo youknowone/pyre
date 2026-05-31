@@ -1751,7 +1751,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     "throw" => ("throw", generator_throw_method, None),
                     "close" => ("close", generator_close_method, Some(1)),
                     "__next__" => ("__next__", generator_next_method, Some(1)),
-                    "__iter__" => return Ok(obj),
+                    "__iter__" => ("__iter__", iter_self_method, Some(1)),
                     _ => ("", generator_next_method, None), // sentinel — won't match
                 };
             if !sname.is_empty() {
@@ -1776,18 +1776,18 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if pyre_object::itertoolsmodule::is_count(obj)
             || pyre_object::itertoolsmodule::is_repeat(obj)
         {
-            match name {
-                "__iter__" => return Ok(obj),
-                "__next__" => {
-                    let func_obj =
-                        crate::make_builtin_function_with_arity("__next__", iter_next_method, 1);
-                    return Ok(pyre_object::w_method_new(
-                        func_obj,
-                        obj,
-                        pyre_object::PY_NULL,
-                    ));
-                }
-                _ => {}
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
+                "__next__" => Some((iter_next_method, "__next__")),
+                "__iter__" => Some((iter_self_method, "__iter__")),
+                _ => None,
+            };
+            if let Some((func, sname)) = entry {
+                let func_obj = crate::make_builtin_function_with_arity(sname, func, 1);
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
             }
         }
     }
