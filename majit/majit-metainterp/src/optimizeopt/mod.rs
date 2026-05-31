@@ -2414,15 +2414,15 @@ impl OptContext {
         self.next_pos = self
             .next_pos
             .max(self.inputarg_base + self.num_inputs + self.new_operations.len() as u32);
-        // Skip positions already claimed by a constant BoxRef forwarding
-        // (`make_constant`/`seed_constant`'s
-        // `box._forwarded = Box(constbox)` write) — those slots' BoxRef is
-        // already a constant identity and cannot be reused for a fresh op.
-        while self
-            .box_pool
-            .get_at_position(self.next_pos as usize)
-            .is_some_and(|b| matches!(b.get_forwarded(), crate::r#box::Forwarded::Const(_)))
-        {
+        // Skip positions already claimed by a constant forwarding
+        // (`make_constant`/`seed_constant`'s `set_forwarded_const` write) —
+        // those positions' canonical host is already a constant identity and
+        // cannot be reused for a fresh op. Reads the canonical `_forwarded`
+        // host for the position (`resop_refs[pos]` / `inputarg_refs[pos]`),
+        // not `box_pool`: `make_constant` now writes `Forwarded::Const` to
+        // that host (resoperation.py:233), so the box_pool slot's forwarding
+        // is no longer authoritative.
+        while self.position_is_const_forwarded(self.next_pos) {
             self.next_pos += 1;
         }
         debug_assert!(
@@ -2433,6 +2433,26 @@ impl OptContext {
         let raw = self.next_pos;
         self.next_pos += 1;
         raw
+    }
+
+    /// Whether the canonical `_forwarded` host for raw position `raw`
+    /// (`resop_refs[raw]` for a ResOp slot, `inputarg_refs[raw]` for an
+    /// InputArg slot) carries `Forwarded::Const`. The position-keyed
+    /// replacement for the retired `box_pool.get_at_position(raw)` const
+    /// probe in `allocate_next_pos_raw`.
+    fn position_is_const_forwarded(&self, raw: u32) -> bool {
+        use crate::r#box::Forwarded;
+        let idx = raw as usize;
+        let resop_const = self
+            .resop_refs
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
+        let inputarg_const = self
+            .inputarg_refs
+            .get(idx)
+            .is_some_and(|ia| matches!(*ia.forwarded.borrow(), Forwarded::Const(_)));
+        resop_const || inputarg_const
     }
 
     /// RPython `box.type` invariant (history.py:220
