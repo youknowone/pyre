@@ -2289,8 +2289,15 @@ fn build_class_inner(
                                     return Err(err);
                                 }
                             }
-                        } else {
+                        } else if init_subclass_kwargs.is_empty() {
                             let _ = crate::call_function(init_sub, &[w_type]);
+                        } else {
+                            // The default __init_subclass__ consumes no
+                            // keywords; leftover class-definition keywords
+                            // are an error rather than silently dropped.
+                            return Err(crate::PyError::type_error(
+                                "__init_subclass__() takes no keyword arguments",
+                            ));
                         }
                     }
                 }

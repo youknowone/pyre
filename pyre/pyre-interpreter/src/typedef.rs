@@ -2448,7 +2448,9 @@ fn init_dict_type(ns: &mut DictStorage) {
             } else if args.len() == 2 {
                 (args[1], pyre_object::w_none())
             } else {
-                return Ok(pyre_object::w_dict_new());
+                return Err(crate::PyError::type_error(
+                    "fromkeys expected at least 1 argument, got 0",
+                ));
             };
             let items = crate::builtins::collect_iterable(iterable)?;
             // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
@@ -8155,7 +8157,15 @@ fn bytes_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytes.removeprefix` — drop a leading bytes-like prefix if present.
 fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "removeprefix() takes exactly one argument");
+    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{}.removeprefix() takes exactly one argument ({} given)",
+            unsafe { (*(*pos[0]).ob_type).name },
+            pos.len().saturating_sub(1)
+        )));
+    }
+    let args = pos;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let prefix = require_bytes_like(args[1])?;
     let out = if data.starts_with(prefix) {
@@ -8168,7 +8178,15 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// `bytes.removesuffix` — drop a trailing bytes-like suffix if present.
 fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "removesuffix() takes exactly one argument");
+    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{}.removesuffix() takes exactly one argument ({} given)",
+            unsafe { (*(*pos[0]).ob_type).name },
+            pos.len().saturating_sub(1)
+        )));
+    }
+    let args = pos;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let suffix = require_bytes_like(args[1])?;
     let out = if !suffix.is_empty() && data.ends_with(suffix) {
@@ -8249,8 +8267,14 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// extra empty entry.
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let keepends = args.len() > 1 && crate::baseobjspace::is_true(args[1]);
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    // keepends is positional-or-keyword.
+    let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
+        .or_else(|| pos.get(1).copied())
+        .map(crate::baseobjspace::is_true)
+        .unwrap_or(false);
+    let args = pos;
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;

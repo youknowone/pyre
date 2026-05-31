@@ -2203,12 +2203,13 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// `'a\nb\n'.splitlines() == ['a', 'b']`.
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let s = unsafe { w_str_get_value(args[0]) };
-    let keepends = if args.len() > 1 {
-        crate::baseobjspace::is_true(args[1])
-    } else {
-        false
-    };
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let s = unsafe { w_str_get_value(pos[0]) };
+    // keepends is positional-or-keyword.
+    let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
+        .or_else(|| pos.get(1).copied())
+        .map(crate::baseobjspace::is_true)
+        .unwrap_or(false);
     let bytes = s.as_bytes();
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;
@@ -2241,25 +2242,37 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
 pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let prefix = unsafe { w_str_get_value(args[1]) };
+    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "str.removeprefix() takes exactly one argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    let s = unsafe { w_str_get_value(pos[0]) };
+    let prefix = unsafe { w_str_get_value(pos[1]) };
     if s.starts_with(prefix) {
         Ok(w_str_new(&s[prefix.len()..]))
     } else {
-        Ok(args[0])
+        Ok(pos[0])
     }
 }
 
 /// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
 pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
-    let s = unsafe { w_str_get_value(args[0]) };
-    let suffix = unsafe { w_str_get_value(args[1]) };
+    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "str.removesuffix() takes exactly one argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    let s = unsafe { w_str_get_value(pos[0]) };
+    let suffix = unsafe { w_str_get_value(pos[1]) };
     if s.ends_with(suffix) {
         Ok(w_str_new(&s[..s.len() - suffix.len()]))
     } else {
-        Ok(args[0])
+        Ok(pos[0])
     }
 }
 
