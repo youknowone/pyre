@@ -168,6 +168,27 @@ fn real_main(binary_name: &str) {
     }
 }
 
+/// Print a one-line JIT statistics summary to stderr when `MAJIT_STATS` is
+/// set. `internal_compile_panics > 0` means an internal JIT bug silently
+/// disabled compilation for some traces (graceful degradation in release);
+/// `check.py` asserts it stays 0. Must be called before any `process::exit`
+/// since exits skip destructors.
+fn maybe_print_jit_stats() {
+    if std::env::var_os("MAJIT_STATS").is_none() {
+        return;
+    }
+    let stats = pyre_jit::eval::driver_pair().0.get_stats();
+    eprintln!(
+        "[jit-stats] loops_compiled={} bridges_compiled={} loops_aborted={} \
+         guard_failures={} internal_compile_panics={}",
+        stats.loops_compiled,
+        stats.bridges_compiled,
+        stats.loops_aborted,
+        stats.guard_failures,
+        stats.internal_compile_panics,
+    );
+}
+
 fn run_source(source: &str, mode: Mode, filename: &str) {
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
@@ -225,10 +246,13 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
         Err(e) => {
             if e.kind == PyErrorKind::SystemExit {
                 let code: i32 = e.message.parse().unwrap_or(0);
+                maybe_print_jit_stats();
                 std::process::exit(code);
             }
+            maybe_print_jit_stats();
             pyre_interpreter::eprint_exception(&e, true);
             std::process::exit(1);
         }
     }
+    maybe_print_jit_stats();
 }

@@ -117,6 +117,18 @@ pub fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
+/// Strict JIT mode: a non-`InvalidLoop` panic during compilation is a bug and
+/// must fail loudly rather than silently degrade to the interpreter and mask
+/// the bug behind correct output. Enabled in debug builds (`cargo test`) and
+/// whenever `MAJIT_STRICT` is set (release benches / CI); off in plain release
+/// so production keeps graceful degradation. Cached like `majit_log_enabled`.
+pub fn jit_strict_mode() -> bool {
+    static STRICT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        cfg!(debug_assertions) || std::env::var_os("MAJIT_STRICT").is_some()
+    });
+    *STRICT
+}
+
 /// Result of tracing a single instruction.
 ///
 /// Returned by the interpreter's `trace_instruction()` function

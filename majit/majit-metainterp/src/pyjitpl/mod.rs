@@ -998,6 +998,12 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) exported_state: Option<crate::optimizeopt::unroll::ExportedState>,
     /// pyjitpl.py:2373: number of cancelled compilation attempts.
     pub(crate) cancel_count: u32,
+    /// issue #108: count of non-`InvalidLoop` panics caught during JIT
+    /// compilation (a JIT bug, not a legitimate trace abort). In strict
+    /// builds these re-raise; in release they are swallowed for graceful
+    /// degradation, so this counter is the telemetry that the JIT was
+    /// silently disabled for some traces. `MAJIT_STATS=1` prints it on exit.
+    pub(crate) internal_compile_panics: u32,
     /// Actual green_key the last compile_loop stored under. May differ
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
@@ -1275,6 +1281,10 @@ pub struct JitStats {
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
     pub guard_failures: usize,
+    /// issue #108: non-`InvalidLoop` panics swallowed during compilation
+    /// (graceful degradation in release). Non-zero means the JIT was
+    /// silently disabled for some traces by an internal bug.
+    pub internal_compile_panics: u32,
 }
 
 /// Callback hooks for JIT events (compilation, guard failures, etc.).
@@ -2049,6 +2059,7 @@ impl<M: Clone> MetaInterp<M> {
             retracing_from: None,
             exported_state: None,
             cancel_count: 0,
+            internal_compile_panics: 0,
             last_compiled_key: None,
             num_scalar_inputargs: 0,
             potential_retrace_position: None,
@@ -3136,6 +3147,7 @@ impl<M: Clone> MetaInterp<M> {
             loops_aborted: self.stats.loops_aborted,
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
+            internal_compile_panics: self.internal_compile_panics,
         }
     }
 
@@ -4853,7 +4865,12 @@ impl<M: Clone> MetaInterp<M> {
                                 let ni = simple_opt.final_num_inputs();
                                 (retry_ops, ni)
                             }
-                            Err(_) => {
+                            Err(payload) => {
+                                self.note_jit_panic_or_reraise(
+                                    payload,
+                                    "retry optimize (no unroll)",
+                                    green_key,
+                                );
                                 self.warm_state.abort_tracing(green_key, false);
                                 self.exported_state = None;
                                 return CompileOutcome::Aborted;
@@ -5130,16 +5147,11 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
-                let is_invalid_loop = e.downcast_ref::<crate::optimize::InvalidLoop>().is_some();
-                if crate::debug::have_debug_prints() {
-                    let kind = if is_invalid_loop {
-                        "InvalidLoop"
-                    } else {
-                        "panic"
-                    };
+                let is_invalid_loop = self.note_jit_panic_or_reraise(e, "compile_loop", green_key);
+                if is_invalid_loop && crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
-                        &format!("compile_loop {kind}, aborting trace at key={green_key}"),
+                        &format!("compile_loop InvalidLoop, aborting trace at key={green_key}"),
                     );
                 }
                 // compile.py:288 parity: preserve preamble target_tokens
@@ -5338,6 +5350,39 @@ impl<M: Clone> MetaInterp<M> {
     fn cancelled_too_many_times(&self) -> bool {
         let limit = self.warm_state.max_unroll_loops();
         self.cancel_count > limit
+    }
+
+    /// Classify a panic payload caught from a JIT compile/optimize step and
+    /// return whether it is RPython's legitimate `InvalidLoop` abort signal.
+    ///
+    /// A non-`InvalidLoop` payload is always a JIT bug — `InvalidLoop` is the
+    /// only "give up on this trace" signal raised as a panic; every other
+    /// panic (e.g. `OpRef::raw()` on a handle) indicates broken codegen. In
+    /// strict builds (`jit_strict_mode`) the panic is re-raised so it fails
+    /// loudly instead of silently falling back to the interpreter and masking
+    /// the bug behind correct output; otherwise it is logged and counted in
+    /// `internal_compile_panics`, and the caller degrades the trace gracefully.
+    fn note_jit_panic_or_reraise(
+        &mut self,
+        payload: Box<dyn std::any::Any + Send>,
+        where_: &str,
+        green_key: u64,
+    ) -> bool {
+        if payload
+            .downcast_ref::<crate::optimize::InvalidLoop>()
+            .is_some()
+        {
+            return true;
+        }
+        if crate::jit_strict_mode() {
+            std::panic::resume_unwind(payload);
+        }
+        self.internal_compile_panics += 1;
+        eprintln!(
+            "[jit] internal compile panic in {where_} at key={green_key}: JIT \
+             disabled for this trace (set MAJIT_STRICT=1 to fail hard)"
+        );
+        false
     }
 
     /// pyjitpl.py:2389 attribute access — `self.partial_trace`.
@@ -5992,13 +6037,8 @@ impl<M: Clone> MetaInterp<M> {
         };
         let compile_result = match compile_result {
             Ok(r) => r,
-            Err(_) => {
-                if crate::debug::have_debug_prints() {
-                    crate::debug::log_one(
-                        "jit-abort",
-                        &format!("compile_retrace panicked at key={green_key}"),
-                    );
-                }
+            Err(payload) => {
+                self.note_jit_panic_or_reraise(payload, "compile_retrace", green_key);
                 self.warm_state.abort_tracing(green_key, false);
                 return false;
             }
@@ -6783,16 +6823,10 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
-                if crate::majit_log_enabled() {
-                    if payload
-                        .downcast_ref::<crate::optimize::InvalidLoop>()
-                        .is_some()
-                    {
-                        eprintln!(
-                            "[jit] compile_simple_loop: InvalidLoop at key={}",
-                            green_key
-                        );
-                    }
+                let is_invalid_loop =
+                    self.note_jit_panic_or_reraise(payload, "compile_simple_loop", green_key);
+                if is_invalid_loop && crate::majit_log_enabled() {
+                    eprintln!("[jit] compile_simple_loop: InvalidLoop at key={}", green_key);
                 }
                 // compile.py:228-230: trace.cut_at(cut_at); return None
                 self.warm_state.abort_tracing(green_key, false);
@@ -8906,7 +8940,10 @@ impl<M: Clone> MetaInterp<M> {
         };
         let compile_result = match compile_result {
             Ok(r) => r,
-            Err(_) => return false,
+            Err(payload) => {
+                self.note_jit_panic_or_reraise(payload, "compile_entry_bridge backend", green_key);
+                return false;
+            }
         };
 
         match compile_result {
@@ -9505,20 +9542,21 @@ impl<M: Clone> MetaInterp<M> {
             };
             match bridge_result {
                 Ok(r) => r,
-                Err(e) => {
+                Err(payload) => {
                     if crate::majit_log_enabled() {
+                        let msg = payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
                         eprintln!(
-                            "[jit] bridge compile_bridge panicked key={} guard={}: {:?}",
-                            green_key,
-                            fail_index,
-                            e.downcast_ref::<String>()
-                                .map(|s| s.as_str())
-                                .or_else(|| e.downcast_ref::<&str>().copied())
-                                .unwrap_or("unknown panic")
+                            "[jit] bridge compile_bridge panicked key={} guard={}: {msg}",
+                            green_key, fail_index
                         );
                     }
+                    self.note_jit_panic_or_reraise(payload, "compile_bridge backend", green_key);
                     Err(majit_backend::BackendError::CompilationFailed(
-                        "Cranelift panic during bridge compilation".to_string(),
+                        "panic during bridge compilation".to_string(),
                     ))
                 }
             }
