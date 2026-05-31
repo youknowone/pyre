@@ -31,6 +31,88 @@ use super::flow::{
     FunctionGraph, LinkRef, SpaceOperation, SpaceOperationArg, Variable, mkentrymap,
 };
 
+/// `rpython/translator/simplify.py:52-69` `eliminate_empty_blocks`.
+/// Port reference: `majit-translate/src/translator/simplify.rs:44`.
+///
+/// ```py
+/// def eliminate_empty_blocks(graph):
+///     for link in list(graph.iterlinks()):
+///         while not link.target.operations:
+///             block1 = link.target
+///             if block1.exitswitch is not None:
+///                 break
+///             if not block1.exits:
+///                 break
+///             exit = block1.exits[0]
+///             assert block1 is not exit.target
+///             subst = dict(zip(block1.inputargs, link.args))
+///             link.args = [v.replace(subst) for v in exit.args]
+///             link.target = exit.target
+/// ```
+///
+/// Collapses any empty forwarding block by retargeting each predecessor link
+/// through it — the faithful operations-based predicate the orthodox
+/// `simplify_graph` driver needs.  (The walker pipeline instead calls
+/// `codewriter::eliminate_empty_blocks`, whose `block.dead` predicate is the
+/// walker-only proxy: every walker block carries empty `operations` because the
+/// SSARepr is emitted inline, so a `not operations` predicate would collapse all
+/// of them.)
+pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
+    for link in graph.iterlinks() {
+        loop {
+            let target = match link.borrow().target.clone() {
+                Some(target) => target,
+                None => break,
+            };
+            // `while not link.target.operations:` + the two guards
+            // (`exitswitch is not None` / `not exits`).
+            let exit_link = {
+                let tb = target.borrow();
+                if !tb.operations.is_empty() || tb.exitswitch.is_some() || tb.exits.is_empty() {
+                    break;
+                }
+                tb.exits[0].clone()
+            };
+            let (exit_args, exit_target) = {
+                let e = exit_link.borrow();
+                match e.target.clone() {
+                    Some(t) => (e.args.clone(), t),
+                    None => break,
+                }
+            };
+            assert!(
+                target != exit_target,
+                "eliminate_empty_blocks: the graph contains an empty infinite loop"
+            );
+            // `subst = dict(zip(block1.inputargs, link.args))`.
+            let inputargs = target.borrow().inputargs.clone();
+            let link_args = link.borrow().args.clone();
+            let mut subst: HashMap<Variable, Option<FlowValue>> = HashMap::new();
+            for (inputarg, arg) in inputargs.iter().zip(link_args.iter()) {
+                if let FlowValue::Variable(v) = inputarg {
+                    subst.insert(*v, arg.clone());
+                }
+            }
+            // `link.args = [v.replace(subst) for v in exit.args]`.
+            let new_args: Vec<Option<FlowValue>> = exit_args
+                .iter()
+                .map(|arg| match arg {
+                    Some(FlowValue::Variable(v)) => match subst.get(v) {
+                        Some(replacement) => replacement.clone(),
+                        None => arg.clone(),
+                    },
+                    _ => arg.clone(),
+                })
+                .collect();
+            // `link.target = exit.target`; the outer loop keeps collapsing
+            // through the new target if it too is an empty forwarder.
+            let mut l = link.borrow_mut();
+            l.args = new_args;
+            l.target = Some(exit_target);
+        }
+    }
+}
+
 /// `rpython/translator/simplify.py:242-268` `remove_trivial_links`.
 /// Port reference: `majit-translate/src/translator/simplify.rs:2674`.
 ///
@@ -962,13 +1044,15 @@ pub fn checkgraph(graph: &FunctionGraph) {
 
 /// `rpython/translator/simplify.py:1060-1073` `all_passes`.
 ///
-/// The order matches upstream exactly.  `eliminate_empty_blocks` lives in
-/// `codewriter.rs` (paired with its `rewrite_dead_forwarder_gotos` inline-SSARepr
-/// bridge) and is referenced here; `SSA_to_SSI` lives in `backendopt_ssa.rs`.
+/// The order matches upstream exactly.  This uses the faithful
+/// operations-based [`eliminate_empty_blocks`] above (NOT the walker-only
+/// `codewriter::eliminate_empty_blocks`, whose `block.dead` predicate suits the
+/// inline walker but would collapse every block of a normal flow graph).
+/// `SSA_to_SSI` lives in `backendopt_ssa.rs`.
 pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
     &[
         transform_dead_op_vars,
-        super::codewriter::eliminate_empty_blocks,
+        eliminate_empty_blocks,
         remove_assertion_errors,
         remove_identical_vars_ssa,
         constfold_exitswitch,
@@ -1221,5 +1305,46 @@ mod tests {
         assert_eq!(s.exits[0].borrow().target, Some(returnblock));
         assert_eq!(s.operations.len(), 1);
         assert_eq!(s.operations[0].opname, "int_zero");
+    }
+
+    /// The faithful (operations-based) eliminate_empty_blocks collapses a
+    /// NON-dead empty forwarding block that carries args — the shape
+    /// `remove_trivial_links` cannot (its incoming link has args).  Codex P2,
+    /// PR #127.
+    #[test]
+    fn eliminate_empty_blocks_collapses_empty_forwarder_with_args() {
+        // start -> empty(ve) -> next(vn);  empty has no operations and forwards
+        // its inputarg.  start's link should retarget straight to `next`,
+        // substituting the constant it passed into `empty`.
+        let ve = Variable::new(VariableId(40), Kind::Int);
+        let vn = Variable::new(VariableId(41), Kind::Int);
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone(), None);
+        let returnblock = graph.returnblock.clone();
+        let empty = graph.new_block(vec![ve.into()]);
+        let next = graph.new_block(vec![vn.into()]);
+        // `next` carries a real op so it is NOT itself an empty forwarder
+        // (otherwise the faithful pass would collapse it too).
+        push_op(&next, SpaceOperation::new("keep_alive", vec![vn.into()], None, -1));
+
+        start.closeblock(vec![
+            Link::new(vec![Constant::signed(7).into()], Some(empty.clone()), None).into_ref(),
+        ]);
+        let empty_arg = empty.borrow().inputargs[0].clone();
+        empty.closeblock(vec![Link::new(vec![empty_arg], Some(next.clone()), None).into_ref()]);
+        next.closeblock(vec![
+            Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        eliminate_empty_blocks(&graph);
+
+        // start's link now skips `empty` and targets `next`, carrying the
+        // substituted constant.
+        let s = start.borrow();
+        assert_eq!(s.exits[0].borrow().target, Some(next));
+        assert_eq!(
+            s.exits[0].borrow().args,
+            vec![Some(Constant::signed(7).into())]
+        );
     }
 }
