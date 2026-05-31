@@ -391,6 +391,12 @@ pub struct VectorizingOptimizer {
     in_loop: bool,
     /// schedule.py:669: label inputargs — populated on Label entry.
     label_args: Vec<OpRef>,
+    /// The loop LABEL op, held (not emitted) from the Label entry until the
+    /// Jump so the streaming path can build a VectorLoop and let post_schedule/
+    /// finaloplist place the prefix BEFORE the loop entry. majit-only: RPython
+    /// has a single VectorLoop entry (vector.py) and never emits the label
+    /// eagerly into a streaming op list.
+    pending_label: Option<Op>,
     /// Deferred profiler counter: OPT_VECTORIZE_TRY.
     pub(crate) opt_vectorize_try_emitted: usize,
     /// Deferred profiler counter: OPT_VECTORIZED.
@@ -411,6 +417,7 @@ impl VectorizingOptimizer {
             body_ops: Vec::new(),
             in_loop: false,
             label_args: Vec::new(),
+            pending_label: None,
             opt_vectorize_try_emitted: 0,
             opt_vectorized_emitted: 0,
         }
@@ -655,21 +662,19 @@ impl VectorizingOptimizer {
             }
         }
 
-        // schedule.py:762 VecScheduleState.post_schedule — moves
-        // invariant_oplist into loop.prefix and routes invariant_vector_vars
-        // through prefix_label/jump renaming. That post-pass is not yet
-        // ported. If anything is sitting in either list (e.g. expand()'d
-        // splat ops or accumulator seed packs), splicing it into the loop
-        // body — which is what the original concatenation below did — is a
-        // silent semantic divergence. Bail until post_schedule lands.
-        if !sched_state.invariant_oplist.is_empty() || !sched_state.invariant_vector_vars.is_empty()
-        {
-            return Err(VectorizeError::NotVectorizeable);
-        }
+        // schedule.py:762-779: VecScheduleState.post_schedule. Mirrors the call
+        // at the tail of schedule.py:103-106 schedule() (prepare → walk_and_emit →
+        // post_schedule), which runs unconditionally — moving invariant_oplist into
+        // loop.prefix and routing invariant_vector_vars through prefix_label/jump.
+        sched_state.post_schedule(loop_, &mut seen);
 
-        // vector.py:257-258: profitability check — distinct error variant
-        // so the caller (or future GuardStrengthenOpt logging) can react to
-        // cost-model rejection separately from a structural bail.
+        // vector.py:257-258: profitability check — runs AFTER post_schedule
+        // (schedule.py:103-106 runs post_schedule inside schedule(); the
+        // `if not state.profitable(): raise` check is the next statement at
+        // vector.py:257). A distinct error variant lets the caller react to
+        // cost-model rejection separately from a structural bail. On this Err
+        // the optimize_vector caller restores the pre-vectorize snapshot
+        // (vector.rs `*loop_ = version`), discarding the post_schedule mutation.
         if !sched_state.costmodel.profitable() {
             return Err(VectorizeError::NotProfitable);
         }
@@ -684,12 +689,14 @@ impl VectorizingOptimizer {
             op.clear_vecinfo();
         }
 
-        let result = sched_state.oplist;
-
-        // Update loop operations for finaloplist
-        loop_.operations = result.clone();
-
-        Ok(result)
+        // vector.py:271: return loop.finaloplist(jitcell_token, reset_label_token=False).
+        // post_schedule already set loop_.operations / prefix / prefix_label / jump,
+        // so finaloplist splices [prefix][prefix_label] operations [jump].
+        // TODO: thread jitcell_token through when optimize_vector is wired to the
+        // compiler; None here skips the descr/token wiring (faithful for the
+        // currently-disconnected compile path). `label=false` matches RPython's
+        // default (the vector.py:271 call omits the `label` argument).
+        Ok(loop_.finaloplist(None, false, false))
     }
 
     // ── vector.py:273-344: unroll_loop_iterations ──────────────────────
@@ -983,8 +990,8 @@ impl VectorizingOptimizer {
     ///
     /// This is the sub-pass equivalent of run_optimization, used when
     /// VectorizingOptimizer is embedded in an Optimizer pipeline.
-    fn try_vectorize(&mut self, ctx: &mut OptContext) -> Option<Vec<Op>> {
-        if self.body_ops.len() < 4 {
+    fn try_vectorize(&mut self, ctx: &mut OptContext, loop_: &mut VectorLoop) -> Option<Vec<Op>> {
+        if loop_.operations.len() < 4 {
             return None;
         }
 
@@ -993,26 +1000,48 @@ impl VectorizingOptimizer {
                 .and_then(|cb| cb.const_int())
         };
 
-        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
+        // Seed fresh vector OpRefs one past the highest live position, mirroring
+        // run_optimization (`max(op.pos.raw()) + 1`). A count-based start
+        // (`new_operations.len() + operations.len()`) is not guaranteed to exceed
+        // existing OpRef::raw() values — and since the LABEL is now held back (no
+        // longer in ctx.new_operations), the sum can land on a live body position,
+        // so create_vec_op would reuse an already-live OpRef and corrupt SSA.
+        // (ctx.new_operations holds Rc<Op>, loop_ fields hold Op; collapse each
+        // source to its OpRef position so the chain is uniform.)
+        let start_pos = ctx
+            .new_operations
+            .iter()
+            .map(|op| op.pos.get())
+            .chain(std::iter::once(loop_.label.pos.get()))
+            .chain(loop_.operations.iter().map(|op| op.pos.get()))
+            .chain(std::iter::once(loop_.jump.pos.get()))
+            .filter(|pos| !pos.is_none())
+            .map(|pos| pos.raw())
+            .max()
+            .unwrap_or(0)
+            + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
         // vector.py:135 loop.setup_vectorization() — stamps
         // VectorizationInfo on each op. INT_SIGNEXT reads arg1's const
         // value for bytesize (resoperation.py:181); the constant_of
         // resolver feeds that through so the inline vecinfo slot matches
         // PyPy's VectorizationInfo(op) constructor.
-        sched_state.setup_vectorization(&self.body_ops, &constant_of);
+        sched_state.setup_vectorization(&loop_.operations, &constant_of);
 
         // Phase 1: Schedule operations for ILP before packing.
-        let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
+        let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
         let schedule = schedule_operations(&dep_graph);
-        if schedule.len() == self.body_ops.len() {
-            let scheduled: Vec<Op> = schedule.iter().map(|&i| self.body_ops[i].clone()).collect();
-            self.body_ops = scheduled;
-            sched_state.setup_vectorization(&self.body_ops, &constant_of);
+        if schedule.len() == loop_.operations.len() {
+            let scheduled: Vec<Op> = schedule
+                .iter()
+                .map(|&i| loop_.operations[i].clone())
+                .collect();
+            loop_.operations = scheduled;
+            sched_state.setup_vectorization(&loop_.operations, &constant_of);
         }
 
         // Phase 2: Rebuild dependency graph and find packs.
-        let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
+        let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
         let seed_packs = dep_graph.find_packable_groups();
         if seed_packs.is_empty() {
             return None;
@@ -1039,7 +1068,7 @@ impl VectorizingOptimizer {
             if !pack.is_accumulating {
                 continue;
             }
-            let first_op = &self.body_ops[pack.members[0]];
+            let first_op = &loop_.operations[pack.members[0]];
             if first_op.opcode.is_guard() {
                 continue;
             }
@@ -1051,7 +1080,7 @@ impl VectorizingOptimizer {
             };
             let operator = pack.operator.unwrap_or('+');
             for &member_idx in &pack.members {
-                let op = &self.body_ops[member_idx];
+                let op = &loop_.operations[member_idx];
                 if op.opcode.is_guard() {
                     continue;
                 }
@@ -1069,8 +1098,8 @@ impl VectorizingOptimizer {
                 return None;
             }
             let datatype = 'i';
-            let bytesize: i32 = self
-                .body_ops
+            let bytesize: i32 = loop_
+                .operations
                 .iter()
                 .find(|op| op.pos.get() == seed)
                 .and_then(|op| op.get_vecinfo())
@@ -1144,16 +1173,16 @@ impl VectorizingOptimizer {
                 if all_ready && !pack_emitted[pack_idx] {
                     pack_emitted[pack_idx] = true;
                     for &member_idx in &pack.members {
-                        let mut member_op = self.body_ops[member_idx].clone();
+                        let mut member_op = loop_.operations[member_idx].clone();
                         pre_emit_guard_accum(&sched_state, &mut member_op);
                         sched_state.renamer.rename(&mut member_op);
                         seen.insert(member_op.pos.get());
-                        self.body_ops[member_idx] = member_op;
+                        loop_.operations[member_idx] = member_op;
                     }
-                    turn_into_vector(&mut sched_state, pack, &self.body_ops);
+                    turn_into_vector(&mut sched_state, pack, &loop_.operations);
                 }
             } else {
-                let mut scalar_op = self.body_ops[node_idx].clone();
+                let mut scalar_op = loop_.operations[node_idx].clone();
                 pre_emit_guard_accum(&sched_state, &mut scalar_op);
                 sched_state.renamer.rename(&mut scalar_op);
                 ensure_args_unpacked(&mut sched_state, &mut scalar_op, &mut seen);
@@ -1162,19 +1191,30 @@ impl VectorizingOptimizer {
             }
         }
 
-        // schedule.py:762 post_schedule not yet ported — same bail rationale
-        // as run_optimization (do not splice invariant_oplist /
-        // invariant_vector_vars into the loop body).
-        if !sched_state.invariant_oplist.is_empty() || !sched_state.invariant_vector_vars.is_empty()
-        {
-            return None;
-        }
+        // schedule.py:762-779: VecScheduleState.post_schedule. Moves
+        // invariant_oplist into loop_.prefix and routes invariant_vector_vars
+        // through prefix_label/jump renaming. Reachable in the streaming path
+        // because propagate_forward holds the LABEL (self.pending_label) until
+        // the JUMP, builds this VectorLoop, and emits the finaloplist result —
+        // so prefix ops land BEFORE the loop entry, not inside the body.
+        sched_state.post_schedule(loop_, &mut seen);
 
         if !sched_state.costmodel.profitable() {
             return None;
         }
 
-        Some(sched_state.oplist)
+        // Emit the original loop label only when post_schedule did NOT mint a
+        // prefix_label (which replaces the label as the vectorized loop entry):
+        //   - no invariants → prefix_label None → label=true  → [label] body [jump]
+        //   - invariants    → prefix_label Some → label=false → prefix [prefix_label] body [jump]
+        // jitcell_token=None: copy_and_change preserves descr, so prefix_label
+        // inherits the label's loop token and the rewritten jump inherits the
+        // jump's token — for a loop these are the same token, so the jump
+        // correctly targets prefix_label. TODO: thread a JitCellToken when the
+        // compile path is un-gated so finaloplist mints fresh prefix-label
+        // tokens (vector.rs:156-185).
+        let include_label = loop_.prefix_label.is_none();
+        Some(loop_.finaloplist(None, false, include_label))
     }
 
     // ── Static variants for extend/combine (used by try_vectorize) ─────
@@ -1388,7 +1428,15 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
 
 /// schedule.py:697-736: ensure_args_unpacked — unpack vector-boxed args
 /// for a scalar op, respecting seen/invariant/accumulation state.
-fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut VecSet<OpRef>) {
+// TODO(parity): schedule.py:697 ensure_args_unpacked is a method on
+// VecScheduleState. Kept as a free `pub(crate)` fn so both the inline
+// scheduling loops here and VecScheduleState::post_schedule (schedule.rs)
+// can call it; promote to a method when the call sites are unified.
+pub(crate) fn ensure_args_unpacked(
+    state: &mut VecScheduleState,
+    op: &mut Op,
+    seen: &mut VecSet<OpRef>,
+) {
     // schedule.py:702-706: unpack immediate-use args
     for j in 0..op.num_args() {
         let arg = op.arg(j);
@@ -1447,30 +1495,77 @@ impl Optimization for VectorizingOptimizer {
             OpCode::Label => {
                 self.in_loop = true;
                 self.label_args = op.getarglist().to_vec();
-                OptimizationResult::Emit(op.clone())
+                // Hold the LABEL instead of emitting it: post_schedule may need to
+                // place prefix ops (and a prefix_label) BEFORE the loop entry, which
+                // is impossible once the label is in the stream. The held label is
+                // re-emitted (or replaced by a prefix_label) at the JUMP via
+                // finaloplist. majit-only: RPython never streams the label.
+                self.pending_label = Some(op.clone());
+                OptimizationResult::Remove
             }
             OpCode::Jump if self.in_loop => {
                 // vector.py:139
                 self.opt_vectorize_try_emitted = self.opt_vectorize_try_emitted.saturating_add(1);
-                if let Some(vectorized) = self.try_vectorize(ctx) {
+                self.in_loop = false;
+                let body = std::mem::take(&mut self.body_ops);
+                let Some(label) = self.pending_label.take() else {
+                    // Defensive: a Jump while in_loop should always follow a held
+                    // Label. If not, emit the body verbatim and pass the jump.
+                    for body_op in &body {
+                        ctx.emit(body_op.clone());
+                    }
+                    return OptimizationResult::Emit(op.clone());
+                };
+                // Pristine copies for the non-vectorized restore path. Mirrors
+                // optimize_vector's `version = info.snapshot(loop)` + restore on
+                // bail (vector.py:134,158,163). NOT clone_loop() — that renames
+                // boxes; the snapshot must keep the original op identities so
+                // post-loop references stay valid.
+                let orig_label = label.clone();
+                let orig_body = body.clone();
+                let mut loop_ = VectorLoop::new(label, body, op.clone());
+                if let Some(vectorized) = self.try_vectorize(ctx, &mut loop_) {
                     // vector.py:146
                     self.opt_vectorized_emitted = self.opt_vectorized_emitted.saturating_add(1);
+                    // `vectorized` is the full finaloplist — it already includes
+                    // the label (or prefix_label) and the (possibly rewritten)
+                    // jump, so do NOT also emit the original label/jump.
                     for vop in vectorized {
                         ctx.emit(vop);
                     }
+                    OptimizationResult::Remove
                 } else {
-                    for body_op in &self.body_ops {
+                    // Not vectorized / unprofitable: restore the original loop —
+                    // label, body, jump — exactly as it arrived.
+                    ctx.emit(orig_label);
+                    for body_op in &orig_body {
                         ctx.emit(body_op.clone());
                     }
+                    OptimizationResult::Emit(op.clone())
                 }
-                self.in_loop = false;
-                self.body_ops.clear();
-                OptimizationResult::Emit(op.clone())
             }
             _ => {
                 if self.in_loop {
-                    self.body_ops.push(op.clone());
-                    OptimizationResult::Remove
+                    // A non-Jump final op (e.g. Finish) ends the region without a
+                    // Jump, so this Label..terminator span is not a vectorizable
+                    // loop. Flush the held LABEL + buffered body verbatim and emit
+                    // the terminator; otherwise they would sit buffered with no
+                    // Jump to flush them and get wiped on the next setup(), dropping
+                    // the trace tail. (A Jump while in_loop is handled by the arm
+                    // above, so `is_final` here means a non-Jump terminator.)
+                    if op.opcode.is_final() {
+                        self.in_loop = false;
+                        if let Some(label) = self.pending_label.take() {
+                            ctx.emit(label);
+                        }
+                        for body_op in std::mem::take(&mut self.body_ops) {
+                            ctx.emit(body_op);
+                        }
+                        OptimizationResult::Emit(op.clone())
+                    } else {
+                        self.body_ops.push(op.clone());
+                        OptimizationResult::Remove
+                    }
                 } else {
                     OptimizationResult::PassOn
                 }
@@ -1481,6 +1576,7 @@ impl Optimization for VectorizingOptimizer {
     fn setup(&mut self) {
         self.body_ops.clear();
         self.in_loop = false;
+        self.pending_label = None;
         self.packset = None;
         self.unroll_count = 0;
         self.smallest_type_bytes = 0;
@@ -1581,6 +1677,209 @@ mod tests {
 
         let without_label = vloop.finaloplist(None, true, false);
         assert_eq!(without_label.len(), 2); // IntAdd + Jump
+    }
+
+    // ── post_schedule tests (schedule.py:762-779) ──
+
+    /// schedule.py:762-779: invariant ops are routed into loop.prefix and the
+    /// invariant vector var is appended to a fresh prefix_label and jump.
+    #[test]
+    fn test_post_schedule_routes_invariants_to_prefix() {
+        use majit_ir::vec_set::VecSet;
+
+        // loop: label(i0, i1) { i_add } jump(i0, i1)
+        let label = Op::new(
+            OpCode::Label,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
+        let mut body = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        )];
+        assign_positions(&mut body, 10);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
+        let mut vloop = VectorLoop::new(label, body.clone(), jump);
+
+        let mut st = VecScheduleState::new(100);
+        // Simulate accumulate_prepare (vector.rs run_optimization / try_vectorize):
+        // three invariant ops — zero vector, xor-zero, pack seed into lane 0.
+        let vc = st.create_vec_op(OpCode::VecI, &[], 'i', 8, true, 2);
+        let vc_ref = vc.pos.get();
+        st.invariant_oplist.push(vc);
+        let xor = st.create_vec_op(OpCode::VecIntXor, &[vc_ref, vc_ref], 'i', 8, true, 2);
+        st.invariant_oplist.push(xor);
+        let pack = st.create_vec_op(
+            OpCode::VecPackI,
+            &[
+                vc_ref,
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0),
+                OpRef::const_int(1),
+            ],
+            'i',
+            8,
+            true,
+            2,
+        );
+        let seed_vec = pack.pos.get();
+        st.invariant_oplist.push(pack);
+        // expand() (schedule.py:554-555) registers the splat vector here.
+        st.invariant_vector_vars.insert(seed_vec);
+
+        // The scheduled body lives in oplist; the base post_schedule
+        // (schedule.py:116) moves it into loop_.operations.
+        st.oplist = body.clone();
+
+        let mut seen: VecSet<OpRef> = vloop.label.getarglist().iter().copied().collect();
+        st.post_schedule(&mut vloop, &mut seen);
+
+        // schedule.py:766: prefix == the three invariant ops, in insertion order.
+        assert_eq!(vloop.prefix.len(), 3);
+        assert_eq!(vloop.prefix[0].opcode, OpCode::VecI);
+        assert_eq!(vloop.prefix[1].opcode, OpCode::VecIntXor);
+        assert_eq!(vloop.prefix[2].opcode, OpCode::VecPackI);
+        assert!(st.invariant_oplist.is_empty()); // drained into prefix
+
+        // schedule.py:773: prefix_label carries label args + the invariant var.
+        let pl_args = vloop
+            .prefix_label
+            .as_ref()
+            .expect("prefix_label must be set")
+            .getarglist_copy();
+        assert_eq!(vloop.prefix_label.as_ref().unwrap().opcode, OpCode::Label);
+        assert_eq!(pl_args.len(), 3); // i0, i1, seed_vec
+        assert_eq!(pl_args[2], seed_vec);
+
+        // schedule.py:779: jump rebuilt with the extra invariant var.
+        let j_args = vloop.jump.getarglist_copy();
+        assert_eq!(vloop.jump.opcode, OpCode::Jump);
+        assert_eq!(j_args.len(), 3);
+        assert_eq!(j_args[2], seed_vec);
+
+        // base post_schedule (schedule.py:116): operations came from oplist.
+        assert_eq!(vloop.operations.len(), 1);
+        assert_eq!(vloop.operations[0].opcode, OpCode::IntAdd);
+    }
+
+    /// schedule.py:767 false branch: with no invariants, post_schedule leaves
+    /// prefix/prefix_label empty and the jump arglist unchanged.
+    #[test]
+    fn test_post_schedule_no_invariants_leaves_label_and_jump() {
+        use majit_ir::vec_set::VecSet;
+
+        let label = Op::new(
+            OpCode::Label,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
+        let body = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        )];
+        let jump = Op::new(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
+        let mut vloop = VectorLoop::new(label, body.clone(), jump);
+
+        let mut st = VecScheduleState::new(100);
+        st.oplist = body.clone();
+        let mut seen: VecSet<OpRef> = vloop.label.getarglist().iter().copied().collect();
+        st.post_schedule(&mut vloop, &mut seen);
+
+        assert!(vloop.prefix.is_empty());
+        assert!(vloop.prefix_label.is_none());
+        assert_eq!(vloop.jump.getarglist_copy().len(), 2);
+        assert_eq!(vloop.operations.len(), 1);
+    }
+
+    /// Streaming refactor: a 4-op loop runs through the VectorizingOptimizer
+    /// pass (which now holds the LABEL until the JUMP, builds a VectorLoop, and
+    /// emits finaloplist). The result must be a single coherent loop — exactly
+    /// one Label and one Jump — whether or not vectorization fires.
+    #[test]
+    fn test_vectorize_pass_four_ops_single_loop() {
+        use crate::optimizeopt::optimizer::Optimizer;
+
+        let mut ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(102), OpRef::input_arg_int(103)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(104), OpRef::input_arg_int(105)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(106), OpRef::input_arg_int(107)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::input_arg_int(100)]),
+        ];
+        assign_positions(&mut ops, 0);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(VectorizingOptimizer::new()));
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+
+        let labels = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .count();
+        let jumps = result.iter().filter(|op| op.opcode == OpCode::Jump).count();
+        assert_eq!(labels, 1, "exactly one loop entry label");
+        assert_eq!(jumps, 1, "exactly one jump");
+        // The (possibly vectorized) body sits between the label and the jump.
+        let label_pos = result.iter().position(|op| op.opcode == OpCode::Label);
+        let jump_pos = result.iter().rposition(|op| op.opcode == OpCode::Jump);
+        assert!(matches!((label_pos, jump_pos), (Some(l), Some(j)) if l < j));
+    }
+
+    /// Streaming refactor: a non-loop `Label .. Finish` trace (no trailing Jump)
+    /// must survive. The held label + buffered body are flushed verbatim on the
+    /// non-Jump terminator instead of being dropped on the next setup().
+    #[test]
+    fn test_vectorize_pass_label_finish_preserved() {
+        use crate::optimizeopt::optimizer::Optimizer;
+
+        let mut ops = vec![
+            Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+            ),
+            Op::new(OpCode::Finish, &[OpRef::int_op(1)]),
+        ];
+        assign_positions(&mut ops, 0);
+
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(VectorizingOptimizer::new()));
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::Label),
+            "held label must be flushed, not dropped"
+        );
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::IntAdd),
+            "buffered body must be flushed"
+        );
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::Finish),
+            "non-Jump terminator must be emitted"
+        );
     }
 
     #[test]

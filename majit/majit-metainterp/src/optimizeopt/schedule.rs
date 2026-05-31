@@ -1118,6 +1118,72 @@ impl VecScheduleState {
         }
     }
 
+    /// schedule.py:762-779: VecScheduleState.post_schedule.
+    ///
+    /// RPython reads `self.graph.loop`; majit's VecScheduleState holds no
+    /// graph/loop (see struct above), so the loop is a parameter. `seen` is
+    /// threaded in because majit's `ensure_args_unpacked` takes it as an
+    /// explicit param (vector.rs); RPython keeps the equivalent state on self.
+    pub fn post_schedule(
+        &mut self,
+        loop_: &mut crate::optimizeopt::vector::VectorLoop,
+        seen: &mut majit_ir::vec_set::VecSet<OpRef>,
+    ) {
+        // schedule.py:763 → base SchedulerState.post_schedule (schedule.py:108-116),
+        // inlined here. schedule.py:111-114 resolve_delayed is omitted: majit has
+        // no `delayed` list (ILP scheduling is done up front via
+        // schedule_operations), so the base reduces to rename-jump + move-oplist.
+        self.renamer.rename(&mut loop_.jump); // schedule.py:115
+
+        // schedule.py:765
+        crate::optimizeopt::vector::ensure_args_unpacked(self, &mut loop_.jump, seen);
+
+        // schedule.py:116: loop.operations = self.oplist. In PyPy line 116 runs in
+        // the base post_schedule (before 765) but ALIASES self.oplist, so any
+        // VecUnpack ops that ensure_args_unpacked (765) appends to self.oplist are
+        // visible in loop.operations. Rust's mem::take MOVES (no aliasing), so the
+        // take must run AFTER ensure_args_unpacked to capture those unpack ops —
+        // otherwise the finalized jump would reference OpRefs with no defining op.
+        loop_.operations = std::mem::take(&mut self.oplist);
+
+        // schedule.py:766
+        loop_.prefix = std::mem::take(&mut self.invariant_oplist);
+
+        // schedule.py:767: if len(invariant_vector_vars) + len(invariant_oplist) > 0.
+        // We read `loop_.prefix.len()` because invariant_oplist was just moved into
+        // it; RPython aliases the same list object so the length is unchanged.
+        if !self.invariant_vector_vars.is_empty() || !loop_.prefix.is_empty() {
+            // schedule.py:769-773: prefix_label.
+            //   args = loop.label.getarglist_copy() + self.invariant_vector_vars
+            let mut args = loop_.label.getarglist_copy();
+            // invariant_vector_vars is a VecSet (insertion-ordered re-export of
+            // vecmap_rs::VecSet), so iterating reproduces RPython's list-append
+            // order. RPython's list may hold dups but expand() only appends fresh
+            // boxes, so VecSet's de-dup is a no-op here.
+            args.extend(self.invariant_vector_vars.iter().copied());
+            // schedule.py:770-771: opnum = loop.label.getopnum();
+            //   op = loop.label.copy_and_change(opnum, args).
+            // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
+            // means "keep self.descr"; copy_and_change preserves the result `pos`.
+            let mut prefix_label =
+                loop_
+                    .label
+                    .copy_and_change(loop_.label.opcode, Some(args.as_slice()), None);
+            self.renamer.rename(&mut prefix_label); // schedule.py:772
+            loop_.prefix_label = Some(prefix_label); // schedule.py:773
+
+            // schedule.py:775-779: jump.
+            let mut args = loop_.jump.getarglist_copy();
+            args.extend(self.invariant_vector_vars.iter().copied());
+            let mut new_jump =
+                loop_
+                    .jump
+                    .copy_and_change(loop_.jump.opcode, Some(args.as_slice()), None);
+            self.renamer.rename(&mut new_jump);
+            loop_.jump = new_jump;
+        }
+    }
+
     // ── schedule.py:524-633: expand / find_expanded ──
 
     /// schedule.py:597-604: record that `args` were expanded into `vecop`.
