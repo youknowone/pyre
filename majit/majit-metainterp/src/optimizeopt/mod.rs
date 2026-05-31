@@ -4981,16 +4981,32 @@ impl OptContext {
     /// — Python object identity, NOT the value-aware `Const.same_box`.
     ///
     /// Walks both operands through `get_box_replacement` (resoperation.py:58)
-    /// then compares the resolved `OpRef`s. The `OpRef` variant tag encodes
-    /// (kind, type, position); each `make_constant_*` mints a fresh
-    /// `const_pool` slot, so two distinct ConstInt slots holding the same
-    /// value resolve to distinct `OpRef`s and are NOT `box_is` — matching
-    /// PyPy's `is` (two `ConstInt(5)` instances are distinct objects).
-    /// Resolved-`OpRef` equality is a faithful 1:1 encoding of upstream
-    /// object identity: the chain walk lands on one terminal `OpRef` per
-    /// box, so `==` holds iff the operands are the same box.
-    /// Use this where RPython writes `arg0 is arg1`; use `same_box` where
-    /// RPython writes `arg0.same_box(arg1)`.
+    /// then compares the resolved `OpRef`s.
+    ///
+    /// IDENTITY CAVEAT: `OpRef::Const*` carries the constant VALUE inline
+    /// (history.py:227), not a pool-index slot, so two independently-minted
+    /// `ConstInt(5)` resolve to the *same* `OpRef` and ARE `box_is`-equal.
+    /// For constants this therefore matches PyPy's value-based
+    /// `Const.same_box` (history.py:211), NOT PyPy's object-identity `is`
+    /// (two distinct `ConstInt(5)` objects are `is`-False). For non-constant
+    /// boxes (InputArg*/`*-Op` positions) the variant tag still encodes a
+    /// unique position, so `box_is` remains a faithful 1:1 encoding of `is`.
+    ///
+    /// USAGE / HAZARD: use this where RPython writes `arg0 is arg1`; use
+    /// `same_box` where RPython writes `arg0.same_box(arg1)`. Because
+    /// constants collapse by value here, only call `box_is` at an `is`-site
+    /// where treating two equal-valued constants as identical is correct (or
+    /// conservatively safe). The current `is`-on-constant call sites are
+    /// value-safe:
+    ///   - rewrite.rs `_optimize_oois_ooisnot` `elif arg0 is arg1`
+    ///     (rewrite.py:542): folding equal `ConstPtr`/`ConstInt` to "equal"
+    ///     is the correct result.
+    ///   - heap.rs `lookup_cached` `cached_index is indexbox` (heap.py:322):
+    ///     a hit on an equal constant index is valid (the var-index cache is
+    ///     write-invalidated, so no stale hit can survive).
+    /// A future `is`-site that must treat equal-valued *distinct* constants
+    /// as DISTINCT cannot use `box_is` as-is — that needs the inline-const
+    /// identity model resolved (issue #108).
     /// Convergence path: once OpRef indexing is retired and the trace yields
     /// a shared `BoxRef` per box, this collapses to
     /// `Rc::ptr_eq(&get_box_replacement(a), &get_box_replacement(b))`.
