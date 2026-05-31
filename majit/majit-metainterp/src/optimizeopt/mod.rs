@@ -751,7 +751,12 @@ pub struct OptContext {
     /// for the OptContext's lifetime so any lingering `Weak<Op>`
     /// upgrades (e.g. in already-installed `Forwarded::Op` chains)
     /// stay valid.
-    pub(crate) resop_refs: Vec<Option<majit_ir::resoperation::OpRc>>,
+    ///
+    /// Keyed by the full type-tagged `OpRef`, so a typed and an untyped
+    /// (or differently-typed) position sharing a raw `u32` are distinct
+    /// entries instead of evicting each other in a raw-indexed slot.
+    pub(crate) resop_refs:
+        crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
     /// position. The end-of-Phase-1 orphan-binding pass drains this into
@@ -760,8 +765,8 @@ pub struct OptContext {
     /// synthetic here (it stays strongly held by `resop_refs` for lookup,
     /// but is no longer an orphan needing carry). Tracking liveness
     /// incrementally by `OpRc` identity sidesteps the flat-OpRef raw/type
-    /// collision that makes the final `resop_refs` / `new_operations` state
-    /// ambiguous about which type-tagged value won a shared raw slot.
+    /// collision that makes the final `new_operations` state ambiguous
+    /// about which type-tagged value won a shared raw slot.
     pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
@@ -1540,7 +1545,7 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: Vec::new(),
+            resop_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
@@ -1701,13 +1706,7 @@ impl OptContext {
         {
             return Some(op.clone());
         }
-        if let Some(op) = self
-            .resop_refs
-            .get(opref.raw() as usize)
-            .and_then(|slot| slot.as_ref())
-            .filter(|op| op.pos.get() == opref)
-            .cloned()
-        {
+        if let Some(op) = self.resop_refs.get(&opref).cloned() {
             return Some(op);
         }
         // Lowest-priority store: the recorder's input ops (seeded at setup
@@ -1722,7 +1721,7 @@ impl OptContext {
 
     /// S-8.A.1: mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
     /// stand-in `OpRc` for `opref` with the correct result type and
-    /// stash it in `resop_refs[idx]` so `emit()`'s
+    /// stash it in `resop_refs[opref]` so `emit()`'s
     /// `bound_is_synthetic` rebind path later upgrades the binding to
     /// the real producer via `bind_op`'s carry-over. The synthetic
     /// stays referenced from `resop_refs` for the OptContext's
@@ -1742,11 +1741,7 @@ impl OptContext {
         };
         let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
         synthetic.pos.set(opref);
-        let idx = opref.raw() as usize;
-        if idx >= self.resop_refs.len() {
-            self.resop_refs.resize_with(idx + 1, || None);
-        }
-        self.resop_refs[idx] = Some(synthetic.clone());
+        self.resop_refs.insert(opref, synthetic.clone());
         self.live_synthetics.push(synthetic.clone());
         synthetic
     }
@@ -1829,7 +1824,7 @@ impl OptContext {
         }
         // A ResOp position with no producer in any canonical store resolves
         // to `None`: the caller's `ensure_box` mints a `SameAs*` synthetic
-        // into `resop_refs[idx]` and binds it, so the next `find_producer_op`
+        // into `resop_refs[opref]` and binds it, so the next `find_producer_op`
         // (and hence the next `resolve_to_boxref` / `make_constant` chain)
         // reaches that same `_forwarded` host. Routing a ResOp OpRef to
         // `inputarg_refs[idx]` here would re-introduce the raw-position
@@ -1866,7 +1861,7 @@ impl OptContext {
     /// `inputarg_refs`) from a list of already-bound `BoxRef`s, mirroring
     /// what the production recorder→optimizer handoff populates. Each box
     /// is distributed by its bound identity: InputArg boxes land in
-    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos.raw()]`. This
+    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos]`. This
     /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
     /// `resolve_to_boxref` / `ensure_box` / `find_producer_op` resolve each
     /// OpRef through the same canonical hosts production uses, returning a
@@ -1882,11 +1877,7 @@ impl OptContext {
                 }
                 self.inputarg_refs[idx] = ia;
             } else if let Some(op) = b.bound_op() {
-                let idx = op.pos.get().raw() as usize;
-                if idx >= self.resop_refs.len() {
-                    self.resop_refs.resize_with(idx + 1, || None);
-                }
-                self.resop_refs[idx] = Some(op);
+                self.resop_refs.insert(op.pos.get(), op);
             }
         }
     }
@@ -1908,7 +1899,7 @@ impl OptContext {
     /// only resop positions land here. Each phase's input `ops` carry that
     /// phase's own positions (Phase 2 body ops sit above the Phase 1 emit
     /// namespace, so they never collide with an inherited bound slot), and
-    /// the `resop_refs[idx]` dedup covers intra-`ops` repeats.
+    /// the `resop_refs[opref]` dedup covers intra-`ops` repeats.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         // The loop over the caller-threaded `ops` self-guards (no-op on an
         // empty slice) and records each resop producer into `resop_refs` /
@@ -1927,24 +1918,15 @@ impl OptContext {
             ) {
                 continue;
             }
-            let idx = pos.raw() as usize;
             // Dedup: a producer for this exact pos is already recorded.
-            if self
-                .resop_refs
-                .get(idx)
-                .and_then(|s| s.as_ref())
-                .is_some_and(|o| o.pos.get() == pos)
-            {
+            if self.resop_refs.contains_key(&pos) {
                 continue;
             }
             // Record the caller-threaded `OpRc` so the iterated input op,
             // `resop_refs`, and `live_synthetics` share one `Op` identity
             // (no second private copy).
             let op_rc = op.clone();
-            if idx >= self.resop_refs.len() {
-                self.resop_refs.resize_with(idx + 1, || None);
-            }
-            self.resop_refs[idx] = Some(op_rc.clone());
+            self.resop_refs.insert(pos, op_rc.clone());
             self.live_synthetics.push(op_rc);
         }
     }
@@ -2014,7 +1996,7 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: Vec::new(),
+            resop_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
@@ -2325,18 +2307,19 @@ impl OptContext {
     }
 
     /// Whether the canonical `_forwarded` host for raw position `raw`
-    /// (`resop_refs[raw]` for a ResOp slot, `inputarg_refs[raw]` for an
-    /// InputArg slot) carries `Forwarded::Const`. The position-keyed
-    /// replacement for the retired `box_pool.get_at_position(raw)` const
-    /// probe in `allocate_next_pos_raw`.
+    /// (any `resop_refs` entry whose `OpRef` shares this raw, or
+    /// `inputarg_refs[raw]` for an InputArg slot) carries `Forwarded::Const`.
+    /// The position-keyed replacement for the retired
+    /// `box_pool.get_at_position(raw)` const probe in `allocate_next_pos_raw`.
     fn position_is_const_forwarded(&self, raw: u32) -> bool {
         use crate::r#box::Forwarded;
         let idx = raw as usize;
-        let resop_const = self
-            .resop_refs
-            .get(idx)
-            .and_then(|s| s.as_ref())
-            .is_some_and(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
+        // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
+        // can host more than one entry (typed vs untyped). Any host at this
+        // raw carrying `Forwarded::Const` claims the position.
+        let resop_const = self.resop_refs.values().any(|op| {
+            op.pos.get().raw() == raw && matches!(*op.forwarded.borrow(), Forwarded::Const(_))
+        });
         let inputarg_const = self
             .inputarg_refs
             .get(idx)
@@ -4159,9 +4142,9 @@ impl OptContext {
         // A resop reaching here has no producer in any `find_producer_op`
         // store (else it returned above), so it falls through to the
         // lazy-alloc arm below, which mints a `SameAs*` synthetic into
-        // `resop_refs[idx]` and binds a BoxRef to it. A subsequent
+        // `resop_refs[opref]` and binds a BoxRef to it. A subsequent
         // `ensure_box` / `find_producer_op` for the same OpRef re-resolves to
-        // that synthetic (`resop_refs[idx].pos == opref`), so the synthetic is
+        // that synthetic (`resop_refs[opref].pos == opref`), so the synthetic is
         // the stable `_forwarded` host across calls; no memoization side-table
         // is needed.
         let idx = opref.raw() as usize;

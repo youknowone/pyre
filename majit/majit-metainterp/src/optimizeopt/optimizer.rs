@@ -322,10 +322,8 @@ pub(crate) fn merge_backend_constants_from_ctx(
     for op in &ctx.phase1_emit_ops {
         consider(op);
     }
-    for slot in &ctx.resop_refs {
-        if let Some(op) = slot {
-            consider(op);
-        }
+    for op in ctx.resop_refs.values() {
+        consider(op);
     }
 }
 
@@ -3033,10 +3031,8 @@ impl Optimizer {
             for op in &ctx.phase1_emit_ops {
                 consider_const(op);
             }
-            for slot in &ctx.resop_refs {
-                if let Some(op) = slot {
-                    consider_const(op);
-                }
+            for op in ctx.resop_refs.values() {
+                consider_const(op);
             }
             drop(consider_const);
             // Align each const-folded producer's canonical `Op.pos` to its

@@ -17664,7 +17664,10 @@ mod tests {
         });
 
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
-        assert!(matches!(ops[0].get_value(), Some(Value::Ref(GcRef(0xB000)))));
+        assert!(matches!(
+            ops[0].get_value(),
+            Some(Value::Ref(GcRef(0xB000)))
+        ));
         assert!(matches!(ops[1].get_value(), Some(Value::Int(7))));
     }
 
