@@ -4633,37 +4633,6 @@ impl CodeWriter {
         INSTANCE.with(|cw| unsafe { &*(cw as *const CodeWriter) })
     }
 
-    /// PyPy-orthodox `transform_graph_to_jitcode` skeleton —
-    /// `rpython/jit/codewriter/codewriter.py:46-53` 4-step pipeline:
-    ///
-    ///   1. Build `FunctionGraph` from Python bytecode
-    ///      (graph-only walker — pending M2).
-    ///   2. `perform_register_allocation_all_kinds(graph)` (no
-    ///      `extra_coalesce_pairs` — pure PyPy `regalloc.py:11-15`).
-    ///   3. `flatten_graph(graph, regallocs, cpu) → SSARepr`
-    ///      (pending M3 wiring).
-    ///   4. `assembler.assemble(ssarepr, jitcode)`.
-    ///
-    /// Strangler Fig migration: existing emit-first walker keeps
-    /// running by default. ENV `PYRE_PYPY_ORTHODOX=1` opts in to this
-    /// path. M1.1 returns a panic stub so callers see a fail-loud
-    /// signal once the ENV flag is set; subsequent milestones fill in
-    /// each step.
-    fn transform_graph_to_jitcode_pypy_orthodox(
-        &self,
-        _code: &CodeObject,
-        _w_code: *const (),
-        _merge_point_pc: Option<usize>,
-    ) -> Option<PyJitCode> {
-        if std::env::var("PYRE_PYPY_ORTHODOX").ok().as_deref() != Some("1") {
-            return None;
-        }
-        panic!(
-            "PYRE_PYPY_ORTHODOX path not yet implemented (M1.1 skeleton) — \
-             needs M2 graph-only walker fork + M3 GraphFlattener wiring"
-        );
-    }
-
     /// Transform a Python CodeObject into a JitCode.
     ///
     /// RPython: CodeWriter.transform_graph_to_jitcode(graph, jitcode, verbose, index)
@@ -4677,11 +4646,6 @@ impl CodeWriter {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> PyJitCode {
-        if let Some(jitcode) =
-            self.transform_graph_to_jitcode_pypy_orthodox(code, w_code, merge_point_pc)
-        {
-            return jitcode;
-        }
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
