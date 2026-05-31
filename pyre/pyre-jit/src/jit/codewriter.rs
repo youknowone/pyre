@@ -7802,11 +7802,39 @@ impl CodeWriter {
                                 ResKind::Void,
                                 py_pc as i64,
                             );
+                            // `emit_pushvalue_ref!` writes each value into its
+                            // positional stack slot (`stack_base + depth`) but
+                            // does not pin the `FlowValue` Variable to that slot,
+                            // so graph regalloc colours the pushed value
+                            // arbitrarily.  For the exception value that flows
+                            // from PUSH_EXC_INFO into the handler's CHECK_EXC_MATCH
+                            // across a block boundary, the colour/slot mismatch
+                            // makes `walker_post_walk_insert_renamings` emit a
+                            // parallel copy that clobbers the slot the exc
+                            // actually lives in (raise_catch: exc lost before
+                            // CHECK_EXC_MATCH -> NULL operand).  Pin both pushed
+                            // values to the slot the walker wrote, mirroring the
+                            // catch-landing `last_exc_value` pin, so
+                            // `get_color` agrees with the runtime register.
+                            let prev_slot = stack_base + current_depth;
                             let prev_value = fresh_ref_value(&mut graph);
                             current_state.stack.push(prev_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_prev, prev_value, py_pc);
+                            emit_pushvalue_ref!(
+                                current_depth,
+                                scratch_prev,
+                                prev_value.clone(),
+                                py_pc
+                            );
+                            pin!(prev_value.as_variable(), prev_slot);
+                            let exc_handler_slot = stack_base + current_depth;
                             current_state.stack.push(exc_value.clone());
-                            emit_pushvalue_ref!(current_depth, scratch_exc, exc_value, py_pc);
+                            emit_pushvalue_ref!(
+                                current_depth,
+                                scratch_exc,
+                                exc_value.clone(),
+                                py_pc
+                            );
+                            pin!(exc_value.as_variable(), exc_handler_slot);
                         }
 
                         Instruction::CheckExcMatch => {
@@ -8890,6 +8918,24 @@ impl CodeWriter {
                 let exc_type_slot = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                 emit_last_exception!(exc_type_slot);
                 emit_last_exc_value!(exc_slot);
+                // `flatten.py:336-347 generate_last_exc` writes
+                // `last_exc_value` straight into `getcolor(handler_inputarg)`,
+                // and `insert_renamings` (flatten.py:311) excludes the exc
+                // value from the copy list.  pyre's walker materialises the
+                // exception into the positional `exc_slot` above; that slot
+                // equals `getcolor(handler_inputarg)` (both are
+                // `stack_base + depth`).  But `exc_value` reaches graph
+                // regalloc uncoloured-to-slot and gets an arbitrary colour,
+                // so `walker_post_walk_insert_renamings` emits a spurious
+                // `ref_copy[get_color(exc_value) -> get_color(handler_inputarg)]`
+                // that reads the never-written colour and overwrites the exc
+                // at the catch-landing -> handler boundary — leaving the
+                // handler's CHECK_EXC_MATCH / PUSH_EXC_INFO with a NULL
+                // exception.  Pin `exc_value` to `exc_slot` so
+                // `get_color(exc_value)` matches the slot `emit_last_exc_value!`
+                // wrote; the renaming then collapses to a `src == dst` no-op
+                // (skipped) or a correct `exc_slot -> handler_color` copy.
+                pin!(exc_value.as_variable(), exc_slot);
                 if is_portal {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
                     // pyframe.py:378-387 `pushvalue` semantics — graph

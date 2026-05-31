@@ -30,9 +30,6 @@ struct OldObject {
 pub struct OldGen {
     /// All live old-gen objects.
     objects: Vec<OldObject>,
-    /// Sorted payload-address index for hot membership checks.
-    payload_index: Vec<usize>,
-    payload_index_dirty: bool,
     /// Total bytes allocated in old gen.
     total_bytes: usize,
 }
@@ -44,8 +41,6 @@ impl OldGen {
     pub fn new() -> Self {
         OldGen {
             objects: Vec::new(),
-            payload_index: Vec::new(),
-            payload_index_dirty: false,
             total_bytes: 0,
         }
     }
@@ -79,9 +74,6 @@ impl OldGen {
             header_addr: header_ptr as usize,
             layout,
         };
-        self.payload_index
-            .push(obj_record.header_addr + GcHeader::SIZE);
-        self.payload_index_dirty = true;
         self.objects.push(obj_record);
         self.total_bytes += alloc_size;
         header_ptr
@@ -134,7 +126,6 @@ impl OldGen {
 
         self.total_bytes -= freed_bytes;
         self.objects = surviving;
-        self.rebuild_payload_index();
     }
 
     /// Iterate all old-gen object addresses (payload address, after header).
@@ -146,36 +137,14 @@ impl OldGen {
     }
 
     /// Check whether `obj_addr` is the payload address of a tracked old-gen object.
+    ///
+    /// Linear over `objects`; the write barrier no longer needs this (it reads
+    /// the `OLDGEN_TRACKED` header flag in O(1)), so the remaining callers are
+    /// cold paths (`is_managed_heap_object`, weakref scanning).
     pub fn contains(&self, obj_addr: usize) -> bool {
         self.objects
             .iter()
             .any(|obj_record| obj_record.header_addr + GcHeader::SIZE == obj_addr)
-    }
-
-    /// Fast membership check for write-barrier hot paths.
-    ///
-    /// The authoritative shape remains `objects`, matching the simple old-gen
-    /// allocation list. This index is rebuilt lazily so allocation stays a
-    /// push, while repeated barrier checks avoid scanning every old object.
-    pub fn contains_fast(&mut self, obj_addr: usize) -> bool {
-        if self.payload_index_dirty {
-            self.payload_index.sort_unstable();
-            self.payload_index.dedup();
-            self.payload_index_dirty = false;
-        }
-        self.payload_index.binary_search(&obj_addr).is_ok()
-    }
-
-    fn rebuild_payload_index(&mut self) {
-        self.payload_index.clear();
-        self.payload_index.extend(
-            self.objects
-                .iter()
-                .map(|obj_record| obj_record.header_addr + GcHeader::SIZE),
-        );
-        self.payload_index.sort_unstable();
-        self.payload_index.dedup();
-        self.payload_index_dirty = false;
     }
 
     /// Mark an old-gen object as visited (for major collection).
@@ -261,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oldgen_contains_fast_rebuilds_after_sweep() {
+    fn test_oldgen_contains_after_sweep() {
         let mut oldgen = OldGen::new();
 
         let p1 = oldgen.alloc(GcHeader::SIZE + 16);
@@ -271,9 +240,9 @@ mod tests {
         let o2 = p2 as usize + GcHeader::SIZE;
         let o3 = p3 as usize + GcHeader::SIZE;
 
-        assert!(oldgen.contains_fast(o1));
-        assert!(oldgen.contains_fast(o2));
-        assert!(oldgen.contains_fast(o3));
+        assert!(oldgen.contains(o1));
+        assert!(oldgen.contains(o2));
+        assert!(oldgen.contains(o3));
 
         unsafe {
             *(p1 as *mut GcHeader) = GcHeader::new(0);
@@ -285,9 +254,9 @@ mod tests {
 
         oldgen.sweep();
 
-        assert!(oldgen.contains_fast(o1));
-        assert!(!oldgen.contains_fast(o2));
-        assert!(oldgen.contains_fast(o3));
+        assert!(oldgen.contains(o1));
+        assert!(!oldgen.contains(o2));
+        assert!(oldgen.contains(o3));
     }
 
     #[test]
