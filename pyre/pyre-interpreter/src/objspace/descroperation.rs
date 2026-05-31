@@ -1421,9 +1421,30 @@ pub(crate) fn try_int_long_pow_with_modulo(
             return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
         }
         if bigint_lt(exp.clone(), BigInt::from(0)) {
-            return Err(PyError::type_error(
-                "pow() 2nd argument cannot be negative when 3rd argument specified",
-            ));
+            // 3-arg pow with a negative exponent: raise the modular
+            // inverse of `base` to `-exp` (longobject.c long_pow →
+            // long_invmod).  The inverse exists only when `base` is
+            // coprime to the modulus.
+            let negative_modulus = bigint_lt(modulus.clone(), BigInt::from(0));
+            let abs_modulus = if negative_modulus {
+                bigint_neg(modulus.clone())
+            } else {
+                modulus.clone()
+            };
+            let base_residue = base.mod_floor(&abs_modulus);
+            let egcd = base_residue.extended_gcd(&abs_modulus);
+            if egcd.gcd != BigInt::from(1) {
+                return Err(PyError::value_error(
+                    "base is not invertible for the given modulus",
+                ));
+            }
+            let inverse = egcd.x.mod_floor(&abs_modulus);
+            let pos_exp = bigint_neg(exp.clone());
+            let mut result = inverse.modpow(&pos_exp, &abs_modulus);
+            if negative_modulus && bigint_gt(result.clone(), BigInt::from(0)) {
+                result = bigint_sub(result, abs_modulus);
+            }
+            return Ok(Some(box_bigint_result(result)));
         }
         if bigint_eq(exp.clone(), BigInt::from(0)) {
             return Ok(Some(box_bigint_result(bigint_mod(

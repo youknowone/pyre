@@ -5208,13 +5208,22 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_pow_three_arg_rejects_negative_exponent() {
+    fn test_builtin_pow_three_arg_negative_exponent_modular_inverse() {
         crate::typedef::init_typeobjects();
-        let err = builtin_pow(&[w_int_new(5), w_int_new(-1), w_int_new(13)]).unwrap_err();
-        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(
-            err.message,
-            "pow() 2nd argument cannot be negative when 3rd argument specified"
-        );
+        // pow(5, -1, 13) is the modular inverse of 5 mod 13: 5*8 == 40 == 1.
+        let result = builtin_pow(&[w_int_new(5), w_int_new(-1), w_int_new(13)]).unwrap();
+        assert_eq!(unsafe { w_int_get_value(result) }, 8);
+        // pow(3, -3, 7) == pow(pow(3, -1, 7), 3, 7) == 5^3 % 7 == 6.
+        let cubed = builtin_pow(&[w_int_new(3), w_int_new(-3), w_int_new(7)]).unwrap();
+        assert_eq!(unsafe { w_int_get_value(cubed) }, 6);
+    }
+
+    #[test]
+    fn test_builtin_pow_three_arg_non_invertible_base() {
+        crate::typedef::init_typeobjects();
+        // 2 and 4 share a factor, so 2 has no inverse modulo 4.
+        let err = builtin_pow(&[w_int_new(2), w_int_new(-1), w_int_new(4)]).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(err.message, "base is not invertible for the given modulus");
     }
 }
