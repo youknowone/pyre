@@ -69,15 +69,24 @@ use crate::translator::rtyper::rtyper::{
 /// `getfield` / dereferences will lower through generic `_ptr.getattr`
 /// against the resolved Struct.
 pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
-    // Pyre deviation: upstream `Array(Char, hints={'immutable': True,
-    // 'extra_item_after_alloc': 1})` carries hints that drive
-    // RPython's array layout / immutability tracking. The Rust port
-    // omits those hints today — `ArrayType::new` does not accept a
-    // hints kwarg, and the structural shape (Array of Char) is the
-    // only piece consumed by `ClassesPBCRepr.rtype_getattr('__name__')`
-    // and `OBJECT_VTABLE.name`. Adding a `with_hints` constructor is
-    // a follow-up alongside the full StringRepr port.
-    let chars = ArrayType::new(LowLevelType::Char);
+    // `Array(Char, hints={'immutable': True, 'extra_item_after_alloc': 1})`
+    // (rstr.py:1226-1228). `immutable` marks the chars array read-only;
+    // `extra_item_after_alloc=1` is the trailing NUL slot that
+    // `llmemory.sizeof(STR, n)` adds to `n` (llmemory.py:422) and that the
+    // GC rewriter's STR `basesize` token already bakes in.
+    let chars = ArrayType::with_hints(
+        LowLevelType::Char,
+        vec![
+            (
+                "immutable".into(),
+                crate::flowspace::model::ConstValue::Bool(true),
+            ),
+            (
+                "extra_item_after_alloc".into(),
+                crate::flowspace::model::ConstValue::Int(1),
+            ),
+        ],
+    );
     let body = StructType::gc_with_hints(
         "rpy_string",
         vec![
@@ -117,11 +126,15 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 /// Mirror of [`STR`] with the `chars` element type swapped from
 /// `Char` to `UniChar`. The `extra_item_after_alloc` hint that STR
 /// carries (for the trailing NUL slot) is omitted upstream for
-/// UNICODE — only `immutable` is set on the array. The Rust port
-/// elides both today (see [`STR`] docstring); structural shape is
-/// what the eventual `UnicodeRepr` port consumes.
+/// UNICODE — only `immutable` is set on the array (rstr.py:1238-1240).
 pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let chars = ArrayType::new(LowLevelType::UniChar);
+    let chars = ArrayType::with_hints(
+        LowLevelType::UniChar,
+        vec![(
+            "immutable".into(),
+            crate::flowspace::model::ConstValue::Bool(true),
+        )],
+    );
     let body = StructType::gc_with_hints(
         "rpy_unicode",
         vec![

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, _wref, GcKind, LowLevelType, cast_pointer, nullptr,
+    _ptr, _ptr_obj, _wref, ArrayType, GcKind, LowLevelType, cast_pointer, nullptr,
 };
 
 /// `class SomeAddress(SomeObject)` (llmemory.py:573-590).
@@ -389,16 +389,27 @@ fn sizeof_int(struct_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String>
     Ok(offsetof(struct_ty, &fldname)?.add(sizeof_offset(&array_ty, Some(n))?))
 }
 
+/// `llmemory.extra_item_after_alloc(ARRAY)` (llmemory.py:407-409) —
+/// `ARRAY._hints.get('extra_item_after_alloc', 0)`. STR's chars array sets it
+/// to 1 for the trailing NUL slot (rstr.py:1226-1228).
+fn extra_item_after_alloc(arr: &ArrayType) -> i64 {
+    match arr._hints.get("extra_item_after_alloc") {
+        Some(ConstValue::Int(n)) => *n,
+        _ => 0,
+    }
+}
+
 /// `llmemory.sizeof(TYPE, n=None)` (llmemory.py:411-426). `n=None` sizes a
 /// fixed (non-varsize) type; an `Array` is sized as
-/// `itemoffsetof(TYPE) + sizeof(TYPE.OF) * n`; a varsize `Struct` defers to
-/// [`sizeof_int`]. The `extra_item_after_alloc` array hint defaults to 0
-/// (pyre carries no allocation hints on the offset).
+/// `itemoffsetof(TYPE) + sizeof(TYPE.OF) * (n + extra_item_after_alloc(TYPE))`;
+/// a varsize `Struct` defers to [`sizeof_int`].
 fn sizeof_offset(ty: &LowLevelType, n: Option<i64>) -> Result<AddressOffset, String> {
     match n {
         None => sizeof_none(ty),
         Some(n) => match ty {
             LowLevelType::Array(arr) => {
+                // llmemory.py:422 `n += extra_item_after_alloc(TYPE)`.
+                let n = n + extra_item_after_alloc(arr);
                 let item = AddressOffset::ItemOffset {
                     TYPE: arr.OF.clone(),
                     repeat: n,
@@ -798,6 +809,26 @@ mod tests {
         let expected = AddressOffset::CompositeOffset(vec![
             AddressOffset::ArrayItemsOffset(array_ty.clone()),
             item(LowLevelType::Signed, 3),
+        ]);
+        assert_eq!(
+            sizeof(&array_ty, Some(3)),
+            Ok(ConstValue::AddressOffset(expected))
+        );
+    }
+
+    #[test]
+    fn sizeof_array_adds_extra_item_after_alloc() {
+        use crate::translator::rtyper::lltypesystem::lltype::ArrayType;
+        // llmemory.py:422 `n += extra_item_after_alloc(TYPE)` — an array with
+        // `extra_item_after_alloc=1` (e.g. `rstr.STR.chars`) sizes to n+1
+        // items so the trailing NUL slot is reserved (rstr.py:1226-1228).
+        let array_ty = LowLevelType::Array(Box::new(ArrayType::with_hints(
+            LowLevelType::Char,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
+        )));
+        let expected = AddressOffset::CompositeOffset(vec![
+            AddressOffset::ArrayItemsOffset(array_ty.clone()),
+            item(LowLevelType::Char, 4), // 3 requested + 1 extra
         ]);
         assert_eq!(
             sizeof(&array_ty, Some(3)),

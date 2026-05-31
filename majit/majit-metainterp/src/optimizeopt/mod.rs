@@ -3796,15 +3796,17 @@ impl OptContext {
         if op.is_constant() {
             return;
         }
+        // optimizer.py:391 op = get_box_replacement(op)
+        let op = op.get_box_replacement(false);
         // optimizer.py:387 Box.type invariant: cross-type forwards would
-        // silently retype the chain head.
-        debug_assert_eq!(
-            op.get_box_replacement(false).type_(),
+        // silently retype the chain head. Always-on (not `debug_assert_eq!`)
+        // for parity with the Const-invariant `assert!`s in `set_forwarded_*`;
+        // asserted on the already-chain-walked `op` so it costs no extra walk.
+        assert_eq!(
+            op.type_(),
             newop.type_(),
             "make_equal_to: cross-type forward (Box.type invariant)",
         );
-        // optimizer.py:391 op = get_box_replacement(op)
-        let op = op.get_box_replacement(false);
         // optimizer.py:392 if op is newop: return
         if &op == newop {
             return;
@@ -4113,12 +4115,20 @@ impl OptContext {
         // observes — without returning a position-collapsed InputArg slot
         // whose write would silently vanish in a release build where the
         // `BoxRef::write_forwarded` bound-precondition assert is off.
-        // Materialize / repair the slot's canonical `InputArgRc` by the OpRef's
-        // type tag, mirroring the lazy-alloc path below.
+        // Materialize / repair the slot's canonical `InputArgRc` by the
+        // canonical `inputargs` slot type, mirroring the lazy-alloc path below.
         #[cfg(not(test))]
         if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = opref {
             let idx = opref.raw() as usize;
-            let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
+            // Type the slot from the canonical `inputargs` slot type, falling
+            // back to the OpRef variant tag only when no canonical type is
+            // recorded — `opref.ty()` can disagree across a phase boundary (a
+            // Phase-2 OpRef referencing a Phase-1 low slot), so it is not the
+            // authoritative source (mirrors the lazy-alloc arm's `inputarg_type`
+            // sourcing below).
+            let tp = self
+                .inputarg_type(opref)
+                .unwrap_or_else(|| opref.ty().unwrap_or(majit_ir::Type::Void));
             if idx >= self.inputarg_refs.len() {
                 self.inputarg_refs
                     .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));

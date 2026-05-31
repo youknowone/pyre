@@ -33,7 +33,7 @@ use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
-use crate::{GcRef, OpRef, Type, Value};
+use crate::{OpRef, Type, Value};
 
 /// `AbstractValue` mirror — unified representation of RPython's
 /// op/inputarg/const objects.

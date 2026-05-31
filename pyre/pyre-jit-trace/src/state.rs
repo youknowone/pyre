@@ -1999,8 +1999,8 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         // fielddescr, box)` and asserts `resvalue ==
         // upd.currfieldbox.getint()`.  The cached Box's intrinsic
         // value is fetched via `box_value(cached)` — covering const
-        // pool, standard-virtualizable shadow, and BoxPool
-        // `Box::value` field (RPython `currfieldbox.getint()`
+        // pool, standard-virtualizable shadow, and the frontend
+        // object's `value` field (RPython `currfieldbox.getint()`
         // dispatch parity).
         let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
         let expected_int = match cached_value {
@@ -2097,8 +2097,8 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
         // `box_value(cached)` resolves the upstream
         // `currfieldbox.getref_base()` payload through the full chain
-        // (const pool, standard-virtualizable shadow, BoxPool
-        // `Box::value` field).
+        // (const pool, standard-virtualizable shadow, the frontend
+        // object's `value` field).
         let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
         let expected_ref = match cached_value {
             majit_ir::Value::Ref(r) => Some(r),
@@ -5398,11 +5398,11 @@ fn materialize_bridge_virtual(
             // parity: cache stores the Box identity (`value` OpRef).
             // Cache-hit readers resolve the intrinsic value via
             // `box_value(cached)` at hit time (covering const pool,
-            // standard-virtualizable shadow, and BoxPool `Box::value`
-            // field) — non-Const operands whose runtime concrete was
-            // stamped at the original record site (or threaded from
+            // standard-virtualizable shadow, and the frontend object's
+            // `value` field) — non-Const operands whose runtime concrete
+            // was stamped at the original record site (or threaded from
             // the parent guard's fail_args via `set_opref_concrete`)
-            // surface through the BoxPool entry; unstamped operands
+            // surface through that `value` field; unstamped operands
             // return `None` so the downstream sanity check skips.
             ctx.heapcache_setfield_cached(struct_op, fd_info.index, value);
         }

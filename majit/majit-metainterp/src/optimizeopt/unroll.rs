@@ -2970,6 +2970,21 @@ impl OptUnroll {
                 // box_pool fallback — fall through to a fresh `InputArg`
                 // allocation, matching the original last-resort behaviour
                 // for the type-mismatch edge case.
+                //
+                // Reaching here means the slot was either absent or
+                // type-mismatched. In production every canonical inputarg
+                // is seeded by `ensure_inputarg_bindings`, so the slot must
+                // be *present* (and we only fall through on a genuine type
+                // mismatch); an absent slot would mean a fresh allocation
+                // silently drops the Phase-1 `_forwarded` state. Trip a
+                // future binding regression into a test failure here rather
+                // than letting it lose state silently.
+                debug_assert!(
+                    ctx.inputarg_refs.get(idx).is_some(),
+                    "partial_trace_inputargs: inputarg slot {idx} unpopulated at \
+                     unroll close; ensure_inputarg_bindings must seed every canonical \
+                     inputarg so this fresh allocation is only a type-mismatch repair",
+                );
                 std::rc::Rc::new(majit_ir::InputArg::from_type(want_ty, idx as u32))
             })
             .collect();
