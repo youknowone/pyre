@@ -699,6 +699,12 @@ impl UnrollOptimizer {
                 }
                 None => {
                     *constants = consts_p1;
+                    // Take back the descriptor table grown during Phase 1's pass
+                    // (`ensure_descr_index` appends at guard-resume serialization),
+                    // mirroring the Some branch's restore above. Without this the
+                    // non-peeled path drops those descriptors and publishes a stale
+                    // `all_descrs` back over the global table.
+                    self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
                     // RPython: compile_loop uses flush=True — terminal op
                     // (Finish/Jump) goes through the pass pipeline normally.
                     // majit: flush=False stores it in terminal_op; restore it

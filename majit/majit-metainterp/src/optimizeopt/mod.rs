@@ -1702,15 +1702,20 @@ impl OptContext {
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
     /// `tp` (the `_forwarded` host that `resolve_to_boxref` / `read_forwarded`
     /// / `clear_forwarded` / `ensure_box` route the matching InputArg OpRef
-    /// through). Idempotent reassignment is harmless because no `_forwarded`
-    /// chain exists yet at setup time (`optimizer.rs` calls this before the
-    /// optimization pass).
+    /// through). Idempotent: keeps an existing same-shape host (preserving any
+    /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
+    /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
+    /// the `ensure_box` InputArg arm).
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         if pos >= self.inputarg_refs.len() {
             self.inputarg_refs
                 .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+            self.inputarg_refs[pos] =
+                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+        } else if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
+            self.inputarg_refs[pos] =
+                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
         }
-        self.inputarg_refs[pos] = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
     }
 
     /// S-8.A.1 lookup primitive: find the canonical producer `OpRc`
