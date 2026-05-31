@@ -62,12 +62,12 @@ pub struct Box {
     /// `Weak` to avoid an `Rc` cycle (`Op.forwarded` may carry a
     /// `BoxRef` holding an `Rc<Box>` whose `op_handle` could
     /// otherwise loop back through the trace). Empty for
-    /// `BoxKind::InputArg` / `Const`; filled by `BoxRef::bind_op` at
-    /// the recorder→TreeLoop handoff (`history.rs::with_box_pool`)
-    /// and during emit's `bound_is_synthetic` rebind path
-    /// (`mod.rs::emit`). `BoxRef::get_forwarded` /
-    /// `set_forwarded_*` route through this handle exclusively for
-    /// ResOp boxes — there is no `Box`-side mirror to consult.
+    /// `BoxKind::InputArg` / `Const`; filled at construction
+    /// (`BoxRef::from_bound_op`) or by `BoxRef::bind_op` during emit's
+    /// `bound_is_synthetic` rebind path (`mod.rs::emit`).
+    /// `BoxRef::get_forwarded` / `set_forwarded_*` route through this
+    /// handle exclusively for ResOp boxes — there is no `Box`-side mirror
+    /// to consult.
     pub op_handle: RefCell<Option<Weak<Op>>>,
 
     /// Canonical `_forwarded` host backref for `BoxKind::InputArg`
@@ -260,9 +260,9 @@ impl BoxRef {
     /// Bind this Box to its corresponding `Op` so subsequent
     /// `set_forwarded_*` / `clear_forwarded` calls write through to
     /// `op.forwarded` (the canonical host; there is no Box-side mirror).
-    /// Stores a `Weak<Op>` to avoid an Rc cycle. Called by
-    /// `TreeLoop::with_box_pool` at the recorder→TreeLoop handoff. Panics
-    /// if called on a non-ResOp Box.
+    /// Stores a `Weak<Op>` to avoid an Rc cycle. Called when re-binding a
+    /// box to its producer (`ensure_box`'s synthetic-mint path, test
+    /// fixtures). Panics if called on a non-ResOp Box.
     ///
     /// Late-binding carry-over: when the box is *already bound* (a rebind:
     /// `bind → set_forwarded → rebind`, e.g. `emit()` re-pointing a
@@ -423,8 +423,8 @@ impl BoxRef {
     /// because `get_box_replacement`'s chain walk reconstructs a fresh
     /// `Rc<Box>` at each step from the OpRef variant tag, so independently
     /// walked terminals never share an `Rc` even when they are the same box.
-    /// Convergence path: once Goal D retires `box_pool` / OpRef indexing and
-    /// the trace yields a single shared `BoxRef` per box (optimizer.py's
+    /// Convergence path: once OpRef indexing is retired and the trace yields
+    /// a single shared `BoxRef` per box (optimizer.py's
     /// `trace.next() -> Box`), the reconstruction disappears and this body
     /// collapses to `Rc::ptr_eq` for non-Const + `same_constant` for Const.
     pub fn same_box(&self, other: &BoxRef) -> bool {

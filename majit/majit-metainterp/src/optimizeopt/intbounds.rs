@@ -88,7 +88,7 @@ impl OptIntBounds {
         // optimizer.py:99-113 `getintbound` lazy-installs unbounded on
         // first access; `ensure_box` mirrors the materialize-always
         // invariant. `get_box_replacement_box` would silently skip an
-        // absent `box_pool[idx]`, losing the bound write.
+        // opref it can't resolve, losing the bound write.
         if let Some(op_box) = ctx.ensure_box(opref) {
             ctx.setintbound(&op_box, bound);
         }
@@ -1930,7 +1930,7 @@ impl OptIntBounds {
         // the BoxRef's authoritative `_forwarded` slot.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut array| array.getlenbound(None));
         if let Some(bound) = bound {
-            // `ensure_box` lazy-allocates a `box_pool` slot for `op.pos`
+            // `ensure_box` resolves `op.pos` to its bound `Op`/`InputArg`,
             // mirroring RPython's "Box always exists" invariant
             // (`resoperation.py:233-248`).
             if let Some(pos_box) = ctx.ensure_box(op.pos.get()) {
@@ -2473,8 +2473,8 @@ impl OptIntBounds {
         let arg0 = op.arg(0);
         // optimizer.py:99-113 `getintbound` lazy-installs unbounded; the
         // is_raw_ptr read + downstream bound write both materialize via
-        // `ensure_box` so the write path doesn't silently skip an absent
-        // `box_pool[idx]`.
+        // `ensure_box` so the write path doesn't silently skip an opref
+        // it can't resolve.
         let arg0_box = ctx.ensure_box(arg0);
         if arg0_box.as_ref().map_or(false, |b| ctx.is_raw_ptr(b)) {
             return;

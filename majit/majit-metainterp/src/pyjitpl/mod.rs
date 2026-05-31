@@ -4724,14 +4724,12 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
-        // Seed the phase optimizers' `input_ops` so they skip the `box_pool`
-        // snapshot. Non-cut: `close_loop` only appends, so
-        // `preamble_data.base.operations()`'s loop-body `Rc<Op>` are the SAME
-        // objects `source_box_pool` binds — identical Phase-1 `_forwarded`. Cut:
-        // `cut_trace_from` remaps ops into a fresh namespace the original
-        // `source_box_pool` does not match, so its `box_pool` `input_ops` cannot
-        // resolve cut-op lookups anyway; an explicit empty seed states that
-        // without the read (producer lookup runs off new_operations /
+        // Seed the phase optimizers' `input_ops`. Non-cut: `close_loop` only
+        // appends, so `preamble_data.base.operations()`'s loop-body `Rc<Op>`
+        // are the recorder objects carrying the authoritative Phase-1
+        // `_forwarded`. Cut: `cut_trace_from` remaps ops into a fresh
+        // namespace, so no seed can resolve cut-op lookups anyway; an explicit
+        // empty seed states that (producer lookup runs off new_operations /
         // phase1_emit_ops / resop_refs).
         unroll_opt.phase2_input_ops_seed = Some(if cross_loop_cut.is_none() {
             preamble_data.base.operations().to_vec()
@@ -5748,13 +5746,11 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 trace
             };
-            // Seed the retrace optimizer's `input_ops` so it skips the
-            // `box_pool` snapshot. Provably equal to that snapshot: retrace runs
+            // Seed the retrace optimizer's `input_ops` directly. Retrace runs
             // no Phase 1, so the recorder ops carry no `_forwarded`, and
-            // `trace.ops` (non-cut) are the same `Rc<Op>` `source_box_pool` is
-            // bound to. Cut remaps ops into a namespace the original
-            // `source_box_pool` does not match, so an empty seed states what the
-            // snapshot could not resolve anyway.
+            // `trace.ops` (non-cut) are the recorder `Rc<Op>` themselves. Cut
+            // remaps ops into a fresh namespace, so an empty seed states that
+            // no producer lookup can resolve cut ops anyway.
             let phase2_input_ops_seed = Some(if retrace_cut.is_none() {
                 trace.ops.clone()
             } else {

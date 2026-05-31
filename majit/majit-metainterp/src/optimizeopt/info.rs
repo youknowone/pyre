@@ -42,8 +42,8 @@ pub use majit_ir::ptr_info::{
 /// - **`Forwarded(&mut PtrInfo)`** — `arg0.get_forwarded()` returns either an
 ///   existing `AbstractVirtualPtrInfo` subclass (early-return path) or a
 ///   freshly-installed Instance/Struct/Array/Str etc. (`optimizer.py:475-498`).
-///   The mutable reference is backed by the `BoxRef`'s `_forwarded` slot at
-///   `box_pool[idx]`, so `info.setfield()` / `info.setitem()` mutate the
+///   The mutable reference is backed by the bound `Op`/`InputArg`'s
+///   `_forwarded` slot, so `info.setfield()` / `info.setitem()` mutate the
 ///   canonical PtrInfo in-place — matching PyPy's
 ///   `arg0.set_forwarded(opinfo)` followed by `opinfo.setfield(...)`.
 pub enum EnsuredPtrInfo {
@@ -55,8 +55,8 @@ pub enum EnsuredPtrInfo {
         string_length_resolver: Option<StringLengthResolver>,
     },
     /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
-    /// `as_mut()` call re-borrows the inner `RefCell`. Produced when
-    /// `OptContext::box_pool` is populated.
+    /// `as_mut()` call re-borrows the inner `RefCell`. Produced when the
+    /// opref resolves to a bound `Op`/`InputArg`.
     ForwardedBox(crate::r#box::BoxRef),
 }
 

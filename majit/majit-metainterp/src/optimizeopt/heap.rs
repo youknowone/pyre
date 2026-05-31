@@ -6211,11 +6211,11 @@ mod tests {
         op1.pos.set(pos1);
         // Pretend the result is known >= 0.
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        // `reserve_pos_typed` skips extending box_pool when the pool is
-        // empty (test baseline), so lazy-allocate here.
+        // `reserve_pos_typed` does not pre-mint a canonical host; `ensure_box`
+        // materializes the BoxRef for the reserved position here.
         let pos1_box = ctx
             .ensure_box(pos1)
-            .expect("body-namespace OpRef must have a BoxRef slot");
+            .expect("body-namespace OpRef must resolve to a BoxRef");
         ctx.setintbound(
             &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),

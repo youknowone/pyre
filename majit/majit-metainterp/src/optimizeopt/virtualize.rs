@@ -1549,7 +1549,7 @@ impl OptVirtualize {
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
         // Route through `ensure_box` so const-namespace OpRefs (whose
-        // backing `BoxRef::new_const` may not yet exist in `box_pool`)
+        // backing const `BoxRef::new_const` is constructed on demand)
         // materialize from `const_pool` and the null check still fires;
         // the `unwrap_or(false)` fallback only applies to the
         // OpRef::NONE sentinel.

@@ -249,14 +249,11 @@ pub struct UnrollOptimizer {
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     /// Explicit `input_ops` seed for the phase optimizers, threaded from the
     /// compile caller. `Some(ops)` on the non-cut finish path =
-    /// `preamble_data.base.operations()` — the same `Rc<Op>` the source
-    /// `box_pool` is bound to, carrying the identical Phase-1 `_forwarded` — so
-    /// the optimizer skips the `box_pool` snapshot. `Some(empty)` on the cut
-    /// path: the cut trace's ops live in a remapped namespace that the original
-    /// `source_box_pool` does not match, so the `box_pool` snapshot's
-    /// `input_ops` cannot resolve cut-op lookups anyway; an empty seed states
-    /// that without the read. `None` (retrace / fixtures) keeps the `box_pool`
-    /// fallback.
+    /// `preamble_data.base.operations()` — the recorder's `Rc<Op>` carrying
+    /// the authoritative Phase-1 `_forwarded`. `Some(empty)` on the cut path:
+    /// the cut trace's ops live in a remapped namespace, so no seed can
+    /// resolve cut-op lookups anyway; an empty seed states that. `None`
+    /// (retrace / fixtures) leaves `input_ops` empty.
     pub phase2_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
     /// MetaInterp-owned compile snapshot root slot list. Stored as an address
     /// because the unroll optimizer owns the inner phase optimizers while the
@@ -590,11 +587,11 @@ impl UnrollOptimizer {
             // from the recorded interpreter and never raise
             // SpeculativeError under correct construction.  A raise
             // here is a real bug and must propagate.
-            // Phase 1 binds the same `source_box_pool` (recorder ops) the
-            // seed names, so its `input_ops` can come from the seed too —
-            // only the read source changes; box_pool binding / `_forwarded`
-            // writes are untouched. No forwarding yet at Phase 1 setup, so
-            // seed and box_pool snapshot are trivially equal here.
+            // Phase 1's input ops are the same recorder ops the seed names,
+            // so its `input_ops` can come from the seed too — only the read
+            // source changes; `_forwarded` writes are untouched. No
+            // forwarding yet at Phase 1 setup, so the seed is trivially the
+            // authoritative source here.
             if let Some(seed) = &self.phase2_input_ops_seed {
                 opt_p1.explicit_input_ops_seed = Some(seed.clone());
             }
@@ -969,10 +966,9 @@ impl UnrollOptimizer {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` the source
-        // `box_pool` is bound to (same `Rc`, same Phase-1 `_forwarded`) so
-        // the optimizer does not read `box_pool` to build `input_ops`. A
-        // `Some(empty)` (cut path) still skips the `box_pool` read.
+        // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` (same `Rc`,
+        // same Phase-1 `_forwarded`) so `input_ops` is the authoritative
+        // producer store. A `Some(empty)` (cut path) leaves it empty.
         if let Some(seed) = &self.phase2_input_ops_seed {
             opt_p2.explicit_input_ops_seed = Some(seed.clone());
         }
@@ -2945,21 +2941,16 @@ impl OptUnroll {
         //
         // Walk `ctx.inputargs` (the canonical inputarg-order OpRef list)
         // and pick up the `InputArgRc` for each inputarg's raw OpRef
-        // position. The bound `InputArgRc` lives on the `box_pool` slot
-        // already, populated by either `with_inputarg_types`,
-        // `ensure_inputarg_bindings`, or retrace prefix import; reading
-        // it directly preserves any `_forwarded` state the Phase 1
-        // passes wrote on the original `InputArg` object
-        // (resoperation.py:700 `_forwarded` host). `inputarg_refs[idx]`
-        // is the strong-owner mirror — read it first, but only when
-        // it actually matches the inputarg's type and index (the
-        // `ensure_inputarg_bindings` resize fills gaps with
+        // position. `inputarg_refs[idx]` is the canonical strong-owner,
+        // populated by either `with_inputarg_types`,
+        // `ensure_inputarg_bindings`, or retrace prefix import; reading it
+        // directly preserves any `_forwarded` state the Phase 1 passes wrote
+        // on the original `InputArg` object (resoperation.py:700 `_forwarded`
+        // host). Read it only when it actually matches the inputarg's type
+        // and index (the `ensure_inputarg_bindings` resize fills gaps with
         // `new_int(0)` placeholders that would otherwise leak in here);
-        // fall back to the bound BoxRef in `box_pool` for retrace paths
-        // where the prefix slot was bound before this OptContext was
-        // built, so `inputarg_refs` has no entry. Last-resort fresh
-        // allocation only when neither carries an Rc (test fixtures
-        // with empty box_pool).
+        // last-resort fresh allocation when it carries no matching Rc (test
+        // fixtures / type-mismatch edge cases).
         state.partial_trace_inputargs = ctx
             .inputargs
             .iter()

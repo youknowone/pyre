@@ -219,11 +219,10 @@ pub struct Optimizer {
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
-    /// `find_producer_op`'s lowest-priority store instead of snapshotting
-    /// `box_pool`'s bound ops. Set on the Phase 2 optimizer to the
-    /// recorder's `Vec<OpRc>` the source `box_pool` is bound to (same
-    /// `Rc`, so the Phase-1 `_forwarded` it carries is identical to the
-    /// box_pool snapshot). Consumed (`take`) by the run.
+    /// `find_producer_op`'s lowest-priority store. Set on the Phase 2
+    /// optimizer to the recorder's `Vec<OpRc>` — the same `Rc`, so the
+    /// Phase-1 `_forwarded` it carries is the authoritative one. Consumed
+    /// (`take`) by the run.
     pub explicit_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
 }
 
@@ -1887,12 +1886,11 @@ impl Optimizer {
     }
 
     /// `OpRc`-threading entry for callers that hold the canonical
-    /// `Rc<Op>` slice the recorder's `box_pool` is bound to (e.g.
-    /// `TreeLoop.ops` at the loop-finish / simple-loop sites, where the
-    /// recorder→TreeLoop handoff binds each box to `trace.ops[i]`).
-    /// Passing those canonical ops lets `input_ops` be seeded from them
-    /// directly (`input_ops_from_ops = true`), so `find_producer_op`'s
-    /// lowest-priority store needs no `box_pool` snapshot read.
+    /// `Rc<Op>` slice the recorder produced (e.g. `TreeLoop.ops` at the
+    /// loop-finish / simple-loop sites). Passing those canonical ops lets
+    /// `input_ops` be seeded from them directly (`input_ops_from_ops =
+    /// true`), so `find_producer_op`'s lowest-priority store is populated
+    /// without any snapshot read.
     pub fn optimize_with_constants_and_inputs_oprc(
         &mut self,
         ops: &[majit_ir::OpRc],
@@ -1998,20 +1996,17 @@ impl Optimizer {
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         // Seed the canonical `find_producer_op` surface (`input_ops`) with
-        // the input ops' producers so they resolve without the
-        // `resolve_to_boxref` `box_pool` tail; `find_producer_op` matches
-        // by full OpRef (collision-safe) and consults this store last.
-        // When the caller threads the canonical `Rc<Op>` slice the
-        // `box_pool` is bound to (`input_ops_from_ops`, e.g. `TreeLoop.ops`
-        // at the loop-finish / simple-loop sites), take them directly — no
-        // `box_pool` snapshot read. Otherwise (fresh-Rc `&[Op]` boundary
-        // wraps, bridges, Phase 2, fixtures) the threaded ops are not the
-        // bound producers, so snapshot from `box_pool`'s bound ops.
+        // the input ops' producers so they resolve directly; `find_producer_op`
+        // matches by full OpRef (collision-safe) and consults this store last.
+        // When the caller threads the canonical `Rc<Op>` slice
+        // (`input_ops_from_ops`, e.g. `TreeLoop.ops` at the loop-finish /
+        // simple-loop sites), take them directly. Otherwise (fresh-Rc `&[Op]`
+        // boundary wraps, bridges, Phase 2, fixtures) the threaded ops are not
+        // the producers, so the store stays empty or uses the explicit seed.
         ctx.input_ops = if let Some(seed) = self.explicit_input_ops_seed.take() {
-            // Phase 2: the caller threaded the recorder `Rc<Op>` slice the
-            // source `box_pool` is bound to (`preamble_data.base.operations()`).
-            // Same `Rc` as the bound ops, so the Phase-1 `_forwarded` it
-            // carries is identical to the `box_pool` snapshot — no read.
+            // Phase 2: the caller threaded the recorder `Rc<Op>` slice
+            // (`preamble_data.base.operations()`) — the same `Rc` whose
+            // Phase-1 `_forwarded` the canonical resolvers observe.
             seed.into_iter()
                 .filter(|op| {
                     let p = op.pos.get();
@@ -2060,12 +2055,11 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py:34 `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
-        // Bind inputarg BoxRefs handed in via `box_pool` so
-        // `make_equal_to` routes InputArg-targeted chain steps through
-        // `Forwarded::InputArg(_)` rather than the deprecated
-        // `Forwarded::Box(_)` fallback. `TraceIterator::new` builds the
-        // per-iter pool with fresh unbound `BoxRef::new_inputarg(tp, _)`;
-        // the TreeLoop-owned strong `InputArgRc`s never reach it.
+        // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
+        // chain steps through `Forwarded::InputArg(_)` rather than the
+        // deprecated `Forwarded::Box(_)` fallback. Phase 2 enters with a
+        // fresh per-iteration inputarg set whose TreeLoop-owned strong
+        // `InputArgRc`s were dropped, so re-bind them here.
         ctx.ensure_inputarg_bindings();
         // S-1: bind every input op's resop BoxRef so chain-walker
         // terminals are guaranteed bound before any `&self` reader
@@ -3001,8 +2995,8 @@ impl Optimizer {
             // and the backend will resolve the live op as the stale constant.
             // Give every such constant-only opref a fresh slot after the last
             // live op, mirroring RPython's separate constant identity.
-            // Scan the canonical `_forwarded` hosts (not box_pool) for
-            // constant-folded ops still at their pre-compact position. At this
+            // Scan the canonical `_forwarded` hosts for constant-folded ops
+            // still at their pre-compact position. At this
             // point set_position has not run, so a folded op's `Op.pos` still
             // holds the old raw index; live emitted ops carry `Forwarded::Op`/
             // info (not Const) so the forwarded filter excludes them, and the
@@ -3011,8 +3005,8 @@ impl Optimizer {
             let mut next_const_pos = fni + ctx.new_operations.len() as u32;
             // Const-folded producers whose `Op.pos` needs aligning to the
             // post-compact slot. Captured here (op + assigned slot) so the
-            // production `Op.pos` update below runs without re-walking
-            // `box_pool`. The `remap.contains_key` guard makes each old
+            // production `Op.pos` update below runs without re-walking the
+            // stores. The `remap.contains_key` guard makes each old
             // position trigger exactly once, so a producer reachable from
             // more than one canonical store is captured a single time.
             let mut const_remaps: Vec<(majit_ir::OpRc, u32)> = Vec::new();
@@ -3086,17 +3080,16 @@ impl Optimizer {
             }
 
             // Constants no longer need remapping — every optimizeopt
-            // consumer reads constants via `box_pool[idx]._forwarded`'s
-            // `Forwarded::Box(target).const_value()` chain, and the
-            // box_pool walk at the start of this remap block already
-            // rewrote each `BoxKind::ResOp { position }` to its
-            // post-compact slot. The flat `OptContext.constants` Vec
-            // backing has been retired; const values live entirely on
-            // the BoxRef forwarding chain.
+            // consumer reads a const-folded op's value off its canonical
+            // `_forwarded` host (`Forwarded::Const`), and the const-remap
+            // loop above already aligned each such op's `Op.pos` to its
+            // post-compact slot. The flat `OptContext.constants` Vec backing
+            // has been retired; const values live entirely on the forwarding
+            // chain.
 
             // Remap exported_loop_state OpRefs so Phase 2 sees post-remap
             // positions. Without this, Phase 2's import_boxes maps to
-            // pre-remap positions that no longer exist in the box pool.
+            // pre-remap positions that no longer exist.
             if let Some(ref mut state) = self.exported_loop_state {
                 // unroll.py:463 — end_args/infos may contain Const; Const
                 // is not a body position so it must not be remapped.
