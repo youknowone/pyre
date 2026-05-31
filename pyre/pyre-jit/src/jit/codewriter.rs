@@ -795,8 +795,7 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 fn pypy_walker_graph_only() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
-        let requested =
-            std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1");
+        let requested = std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1");
         assert!(
             !requested,
             "PYRE_PYPY_WALKER_GRAPH_ONLY is not production-wired: walker emit \
@@ -916,6 +915,11 @@ fn canonical_ref_color_for_slot(
 /// opname) for uncovered PCs)`.  Quantifies which resume-target PCs the
 /// canonical canraise+branch `-live-` placement already covers, the
 /// gap the orthodox sparse-resume arc must close.
+///
+/// The caller must pass a stream with `compute_liveness` /
+/// `remove_repeated_live` already applied (and `pc_first_insn_pos`
+/// translated through the fold remap), so the adjacency measured here
+/// matches the post-liveness layout the runtime consumes.
 fn phase4_live_marker_coverage(
     ssarepr: &super::flatten::SSARepr,
 ) -> (u32, u32, Vec<(i64, String)>) {
@@ -964,7 +968,10 @@ fn phase4_live_marker_coverage(
 ///     `residual_call_*` has no trailing `-live-` and is not a resume
 ///     target.
 /// Both mirror `get_live_vars_info`'s at-or-one-before rule
-/// (`jitcode.py:82-93`) on canonical insn ordinals.  `goto_if_not_*`
+/// (`jitcode.py:82-93`) on the POST-liveness canonical insn ordinals —
+/// the caller passes a `compute_liveness` / `remove_repeated_live`-applied
+/// stream so the measured adjacency matches the runtime layout.
+/// `goto_if_not_*`
 /// (tuple-exitswitch) shares the leading-`-live-` emit path
 /// (flatten.rs:1868); `goto_if_exception_mismatch` is intentionally
 /// NOT a target (it reuses the can-raise resume, no own `-live-`).
@@ -9974,6 +9981,33 @@ impl CodeWriter {
                      canonical_len={canonical_len} diff={diff}",
                     ssarepr.name,
                 );
+                // CodeRabbit #3/#4: the runtime resume contract
+                // `get_live_vars_info` (jitcode.py:82-93) resolves against the
+                // stream AFTER `compute_liveness` + `remove_repeated_live`
+                // (adjacent `-live-` folding shifts insn positions), not the raw
+                // `flatten_graph` output.  Measure coverage on a liveness-applied
+                // CLONE — mutating `canonical_ssarepr` would corrupt the
+                // byte-equivalent / tally probes below — and translate
+                // `pc_first_insn_pos` through the same `remove_repeated_live`
+                // remap the production assembler (`filter_liveness_in_place`)
+                // uses, so covered/uncovered match the assembled jitcode.
+                let mut canonical_live_stream = canonical_ssarepr.clone();
+                let pc_positions: Vec<usize> = canonical_live_stream
+                    .pc_first_insn_pos
+                    .iter()
+                    .map(|&(_, pos)| pos)
+                    .collect();
+                let pc_remap = super::liveness::compute_liveness_with_pc_anchors(
+                    &mut canonical_live_stream,
+                    &pc_positions,
+                );
+                for (entry, &new_pos) in canonical_live_stream
+                    .pc_first_insn_pos
+                    .iter_mut()
+                    .zip(pc_remap.iter())
+                {
+                    entry.1 = new_pos;
+                }
                 // #124(b).2 — measure whether the canonical (sparse)
                 // `-live-` placement satisfies the runtime resume
                 // contract: `get_live_vars_info` (jitcode.py:82-93)
@@ -9984,7 +10018,7 @@ impl CodeWriter {
                 // can quantify which resume-target PCs canonical's
                 // canraise+branch `-live-` already covers.
                 let (live_covered, live_uncovered, live_samples) =
-                    phase4_live_marker_coverage(&canonical_ssarepr);
+                    phase4_live_marker_coverage(&canonical_live_stream);
                 eprintln!(
                     "[phase4-live-coverage] graph={} covered={live_covered} \
                      uncovered={live_uncovered}",
@@ -10007,7 +10041,7 @@ impl CodeWriter {
                 // against (trace_opcode.rs live_pc), so coverage here decides
                 // whether the canonical sparse stream can drive runtime
                 // resume directly (#286).
-                let resume_targets = phase4_resume_coverage(&canonical_ssarepr);
+                let resume_targets = phase4_resume_coverage(&canonical_live_stream);
                 let mut branch_total = 0u32;
                 let mut branch_covered = 0u32;
                 let mut canraise_targets = 0u32;
