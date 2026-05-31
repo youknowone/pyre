@@ -1898,14 +1898,7 @@ fn call_metaclass_with_kwargs(
             && unsafe {
                 !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
             };
-        if kw_items.is_empty() {
-            if let Err(e) =
-                call_function_impl_result(init_fn, &[instance, name, bases, w_namespace_dict])
-            {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        } else if is_user_fn {
+        if is_user_fn && !kw_items.is_empty() {
             let mut call_args = vec![instance, name, bases, w_namespace_dict];
             let mut names = Vec::with_capacity(kw_items.len());
             for (k, v) in &kw_items {
@@ -1926,10 +1919,19 @@ fn call_metaclass_with_kwargs(
                 }
             }
         } else {
-            set_call_error(crate::PyError::type_error(
-                "__init__() got unexpected keyword arguments",
-            ));
-            return PY_NULL;
+            // Builtin __init__ (e.g. type.__init__) ignores the
+            // class-definition keywords during 3-arg class creation, and a
+            // user __init__ with no kwargs takes only the positional triple.
+            // Either way call positionally; the class-definition kwargs flow
+            // to the __init_subclass__ forwarding path instead of being
+            // rejected here (typeobject.py descr_call passes __args__ to a
+            // builtin __init__, which tolerates them).
+            if let Err(e) =
+                call_function_impl_result(init_fn, &[instance, name, bases, w_namespace_dict])
+            {
+                set_call_error(e);
+                return PY_NULL;
+            }
         }
     }
 
