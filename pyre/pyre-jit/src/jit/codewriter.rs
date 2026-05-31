@@ -762,12 +762,13 @@ impl std::hash::Hash for SpamBlockRef {
 /// uniformly routes through this helper — no direct
 /// `ssarepr.insns.push` calls remain in production.
 ///
-/// M2 PyPy parity gate — when `PYRE_PYPY_WALKER_GRAPH_ONLY=1`, the
-/// walker becomes structurally equivalent to `flowcontext.py`: it
-/// builds the `FunctionGraph` via `record_graph_op` but suppresses
-/// the inline SSARepr emit so the orthodox post-walk
-/// `flatten_graph(graph, regallocs, cpu)` driver owns SSARepr
-/// production.  Default-off; production unchanged.
+/// The graph-only flip (suppress walker SSARepr emit so the orthodox
+/// post-walk `flatten_graph(graph, regallocs, cpu)` driver owns SSARepr
+/// production) is gated on `PYRE_PYPY_WALKER_GRAPH_ONLY` but is not yet
+/// production-wired — `pypy_walker_graph_only` rejects the env at process
+/// start (see its panic), so the suppression branch below is dormant and
+/// the walker always populates the accumulator.  The branch is kept as
+/// the future flip point for when the canonical metadata is ready.
 fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     if pypy_walker_graph_only() {
         return;
@@ -778,11 +779,35 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
 /// Cache the `PYRE_PYPY_WALKER_GRAPH_ONLY` env decision per process.
 /// `std::env::var` involves a syscall; the gate is read on every
 /// walker emit site (52 callsites × N opcodes per graph), so a
-/// once-cached `OnceLock` avoids per-call syscall overhead while
-/// still respecting the env value at process start.
+/// once-cached `OnceLock` avoids per-call syscall overhead.
+///
+/// Setting the env is rejected with a panic: suppressing the walker's
+/// per-block emit only yields a correct JitCode if the canonical
+/// `flatten_graph` stream replaces it, but that stream is built only for
+/// the Phase 4 measurement probe and is never assigned back to
+/// `ssarepr.insns`, and the direct `SpamBlockRef::push_insn` paths
+/// (jit-merge-point copy, trampoline construction) bypass this helper
+/// entirely.  Enabling the gate today would therefore assemble a partial
+/// walker/canonical mix with dropped ops rather than a graph-only stream.
+/// The flip is blocked on the canonical colour/liveness convergence
+/// (M3.A/B/C); use `PYRE_PHASE4_BUILD_CANONICAL` /
+/// `PYRE_PHASE4_DIFF_CANONICAL` for parallel measurement meanwhile.
 fn pypy_walker_graph_only() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1"))
+    *GATE.get_or_init(|| {
+        let requested =
+            std::env::var("PYRE_PYPY_WALKER_GRAPH_ONLY").ok().as_deref() == Some("1");
+        assert!(
+            !requested,
+            "PYRE_PYPY_WALKER_GRAPH_ONLY is not production-wired: walker emit \
+             suppression without the canonical flatten_graph stream assigned back to \
+             ssarepr.insns (and with direct push_insn paths bypassing the gate) would \
+             assemble a partial walker/canonical mix with dropped ops. Blocked on the \
+             canonical colour/liveness flip (M3.A/B/C); use PYRE_PHASE4_BUILD_CANONICAL \
+             / PYRE_PHASE4_DIFF_CANONICAL for measurement instead."
+        );
+        requested
+    })
 }
 
 /// `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)` emits a
