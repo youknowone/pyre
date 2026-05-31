@@ -41,7 +41,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
 ///   - integral floats in the positional band → `"<n>.0"`
 ///   - magnitude < 1e-4 or >= 1e16 → `"{:e}"` with explicit sign
 ///   - otherwise → Rust's `Display` (`{}`)
-fn format_float_repr(val: f64) -> String {
+pub(crate) fn format_float_repr(val: f64) -> String {
     if val.is_nan() {
         return "nan".to_string();
     }

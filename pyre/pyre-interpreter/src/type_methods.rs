@@ -1443,15 +1443,17 @@ fn format_float(v: f64, p: &ParsedSpec) -> String {
         'f' | 'F' => format!("{:.*}", prec, abs),
         // `newformat.py` percent type: scale by 100, format fixed, suffix `%`.
         '%' => format!("{:.*}%", prec, abs * 100.0),
-        'g' | 'G' | '\0' => {
-            // Match `format_g_like` in `baseobjspace.rs`'s % path:
-            // alt-form keeps trailing zeros + the dot; default trims.
-            // Cheapest route here is to delegate to
-            // `format_g_like` for both spec types.
+        // `g`/`G` always format `general`: default precision 6, trailing
+        // zeros trimmed unless alt-form keeps them.
+        'g' | 'G' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
+        '\0' => {
+            // No presentation type formats like `repr()` — the shortest
+            // round-trip string, which keeps the trailing `.0` for whole
+            // values.  An explicit precision (or `#`) switches to `g`.
             if p.precision.is_some() || p.alt_form {
-                crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form)
+                crate::baseobjspace::format_g_like(abs, prec, false, p.alt_form)
             } else {
-                format!("{}", abs)
+                crate::display::format_float_repr(abs)
             }
         }
         _ => format!("{}", abs),
