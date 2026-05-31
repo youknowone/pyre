@@ -1322,6 +1322,15 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
             arg.walk_const_ptr_refs(visitor);
         }
     }
+    // The recorder stamps the concrete runtime result onto `Op.value`
+    // (recorder `set_concrete_at`). A `Value::Ref` there is a live nursery
+    // pointer distinct from the inline `ConstPtr` args above, so it must be
+    // forwarded too. `Op.value` is a `Cell` reached only through a shared
+    // `Rc<Op>`: read the Copy value out, forward a temporary, write it back.
+    if let Some(Value::Ref(mut r)) = op.get_value() {
+        visitor(&mut r);
+        op.set_value(Value::Ref(r));
+    }
 }
 
 impl<M: Clone> MetaInterp<M> {
@@ -1442,6 +1451,16 @@ impl<M: Clone> MetaInterp<M> {
         };
         for op in trace_ctx.recorder.ops() {
             walk_op_const_ptr_refs(op, &mut visitor);
+        }
+        // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
+        // InputArgs (loop / bridge entry args). No other walker visits them,
+        // and an InputArg carries no args / fail_args, so `.value` is the only
+        // forwardable slot. Same `Cell` get / forward / set dance as ops above.
+        for ia in trace_ctx.recorder.inputargs() {
+            if let Some(Value::Ref(mut r)) = ia.get_value() {
+                visitor(&mut r);
+                ia.set_value(Value::Ref(r));
+            }
         }
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
@@ -17617,6 +17636,59 @@ mod tests {
 
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
         assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0xB000)));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_op_value_ref() {
+        // task #107: the recorder stamps the concrete runtime result onto
+        // `Op.value` (`set_concrete_at`). A minor collection during tracing
+        // must forward a `Value::Ref` there; a non-Ref `Value` is untouched.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        let op = mk_op(
+            OpCode::PtrEq,
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            5,
+        );
+        op.set_value(Value::Ref(GcRef(0xA000)));
+        trace_ctx.recorder.push_op_for_test(op);
+        let int_op = mk_op(OpCode::IntAdd, &[OpRef::input_arg_int(0)], 6);
+        int_op.set_value(Value::Int(7));
+        trace_ctx.recorder.push_op_for_test(int_op);
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        let ops = meta.tracing.as_ref().unwrap().recorder.ops();
+        assert!(matches!(ops[0].get_value(), Some(Value::Ref(GcRef(0xB000)))));
+        assert!(matches!(ops[1].get_value(), Some(Value::Int(7))));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_inputarg_value_ref() {
+        // task #107: `set_concrete_at` also stamps `Value::Ref` onto recorder
+        // InputArgs (loop / bridge entry args), reached only through this
+        // walker since an InputArg has no args / fail_args to forward.
+        let mut meta = MetaInterp::<()>::new(0);
+        let trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+        });
+
+        let inputargs = meta.tracing.as_ref().unwrap().recorder.inputargs();
+        assert!(matches!(
+            inputargs[0].get_value(),
+            Some(Value::Ref(GcRef(0x8000)))
+        ));
     }
 
     #[test]
