@@ -3299,16 +3299,12 @@ mod tests {
             Op::with_descr(OpCode::NewArray, &[OpRef::int_op(50)], ad.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::int_op(51),
-                    OpRef::int_op(52),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::int_op(52)],
                 ad.clone(),
             ), // pos=1
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(51)],
+                &[OpRef::ref_op(0), OpRef::int_op(51)],
                 ad.clone(),
             ), // pos=2
         ];

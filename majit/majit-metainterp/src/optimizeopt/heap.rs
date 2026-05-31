@@ -4312,7 +4312,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         let arr_box = ctx
-            .get_box_replacement_box(OpRef::int_op(100))
+            .get_box_replacement_box(OpRef::ref_op(100))
             .expect("array box");
         assert_eq!(
             ctx.peek_ptr_info(&arr_box)

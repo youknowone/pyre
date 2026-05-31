@@ -2547,47 +2547,6 @@ impl Optimizer {
         // boxes the old `box_pool.iter_indexed()` walk pushed. The unbound
         // branch of that walk only ever hit Void boxes (no synthesis), so this
         // drain reproduces it without reading `box_pool`.
-        //
-        // `#[cfg(test)]` (not `debug_assertions`): production `emit` updates
-        // `live_synthetics` authoritatively without rebinding the superseded
-        // `box_pool` slot off its synthetic (the rebind is `#[cfg(test)]`), so
-        // the box-walk side of this equality intentionally diverges from
-        // `live_synthetics` in non-test builds. Only the test build maintains
-        // the `box_pool` binding this cross-checks against.
-        #[cfg(test)]
-        {
-            let mut old: Vec<*const _> = Vec::new();
-            for (idx, b) in ctx.box_pool.iter_indexed() {
-                if !b.is_resop() {
-                    continue;
-                }
-                let synth_stand_in = ctx.resop_refs.get(idx).and_then(|slot| slot.as_ref());
-                let bound = b.bound_op();
-                let bound_is_synthetic = match (&bound, synth_stand_in) {
-                    (Some(boxed), Some(synth)) => std::rc::Rc::ptr_eq(boxed, synth),
-                    _ => false,
-                };
-                if let Some(bound_rc) = bound {
-                    if bound_is_synthetic {
-                        old.push(std::rc::Rc::as_ptr(&bound_rc));
-                    }
-                    continue;
-                }
-                debug_assert_eq!(
-                    b.type_(),
-                    majit_ir::Type::Void,
-                    "non-Void unbound orphan at idx={idx}"
-                );
-            }
-            let mut new: Vec<*const _> = ctx
-                .live_synthetics
-                .iter()
-                .map(std::rc::Rc::as_ptr)
-                .collect();
-            old.sort();
-            new.sort();
-            debug_assert_eq!(old, new, "live_synthetics diverges from box_pool walk");
-        }
         self.phase1_emit_ops
             .extend(ctx.live_synthetics.iter().cloned());
         // Transfer exported virtual state from context to optimizer
@@ -6026,7 +5985,7 @@ mod tests {
         );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
         let b10 = ctx
-            .ensure_box(OpRef::int_op(10))
+            .ensure_box(OpRef::ref_op(10))
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &b10,
