@@ -738,6 +738,47 @@ impl SpamBlockRef {
         self.0.borrow_mut().per_block_ssarepr.extend(moved);
         base
     }
+
+    /// Strip a trailing block-boundary `goto TLabel(<label>) + Unreachable`
+    /// pair from this block's `per_block_ssarepr`, if the goto targets `label`.
+    /// Returns whether a pair was removed.
+    ///
+    /// Used by the `remove_trivial_links` merge bridge: after absorbing
+    /// `target`'s bytecode, the source's OLD boundary goto would otherwise sit
+    /// in the middle of the merged stream, before the absorbed opcodes.
+    /// `emit_link_renamings_into_block`'s `SourceBeforeTerminator` splice
+    /// forward-scans for the FIRST terminator, so the absorbed link's renamings
+    /// would land before `target`'s opcodes and read stale slots (codex P1,
+    /// PR #127).  Removing the old boundary goto makes `target`'s own
+    /// terminator the first one, so renamings splice after its opcodes.
+    fn strip_trailing_boundary_goto(&self, label: &str) -> bool {
+        let mut b = self.0.borrow_mut();
+        let n = b.per_block_ssarepr.len();
+        if n < 2 {
+            return false;
+        }
+        let tail_unreachable =
+            matches!(b.per_block_ssarepr[n - 1], super::flatten::Insn::Unreachable);
+        let tail_goto = matches!(
+            &b.per_block_ssarepr[n - 2],
+            super::flatten::Insn::Op { opname, args, .. }
+                if opname == "goto"
+                    && args.len() == 1
+                    && matches!(&args[0], super::flatten::Operand::TLabel(tl) if tl.name == label)
+        );
+        if tail_unreachable && tail_goto {
+            b.per_block_ssarepr.truncate(n - 2);
+            // Keep the original-terminator anchor within bounds.
+            if let Some(end) = b.original_terminator_end {
+                if end > b.per_block_ssarepr.len() {
+                    b.original_terminator_end = Some(b.per_block_ssarepr.len());
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl PartialEq for SpamBlockRef {
@@ -1622,6 +1663,11 @@ fn rewrite_trivial_link_merges(
         if src_spam == tgt_spam {
             continue;
         }
+        // Drop source's old boundary `goto target + ---` before appending, so
+        // target's own terminator is the first terminator in the merged block
+        // and the single-exit renaming splice lands after target's opcodes
+        // (codex P1, PR #127).
+        src_spam.strip_trailing_boundary_goto(&super::flatten::block_label_name(target));
         let base = src_spam.absorb_per_block_ssarepr(&tgt_spam);
         // Re-point `-live-` markers: (tgt_spam, off) -> (src_spam, base + off).
         for pc_entries in walker_pc_live_marker_pos.iter_mut() {
