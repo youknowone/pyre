@@ -238,11 +238,34 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
     let ty = &*pt.ty;
 
     let unwrap = unwrap_expr(ty, idx)?;
+    // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
+    // slice — it has no per-slot index to bounds-check.
+    let is_whole_slice = if let Type::Reference(r) = unwrap_type_group(ty) {
+        matches!(&*r.elem, Type::Slice(_))
+    } else {
+        false
+    };
+    let argname = ident.to_string();
     let expr = match arg_default(pt)? {
+        // `bind_kwargs_to_signature` pads `args` to the parameter count
+        // with PY_NULL, so the default only applies when the slot is both
+        // present and non-null.
         Some(default) => quote! {
             if #idx < args.len() && !args[#idx].is_null() { #unwrap } else { #default }
         },
-        None => unwrap,
+        None if is_whole_slice => unwrap,
+        None => quote! {
+            {
+                if #idx >= args.len() || args[#idx].is_null() {
+                    return ::std::result::Result::Err(
+                        crate::PyError::type_error(
+                            format!("missing required argument: '{}'", #argname)
+                        )
+                    );
+                }
+                #unwrap
+            }
+        },
     };
     // Typed-receiver aliases erase to the binding type declared in
     // `typed_alias` (PyObjectRef for passthrough, String for PyPath).
@@ -365,101 +388,40 @@ fn typed_alias(
                 }
             },
         ),
-        // Integer aliases with range / sign guards.  Each reads the int
-        // payload (matching the `i64` arm) then applies the bound check
-        // `space.gateway_nonnegint_w` / `space.c_*_w` impose in
-        // baseobjspace.rs, raising the same exception type and message.
-        "PyNonNegInt" => int_guard(
+        // Integer aliases — route through the `space.gateway_nonnegint_w`
+        // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
+        // checks and their exception messages live in one place.
+        "PyNonNegInt" => (
             quote! { i64 },
-            quote! { i64 },
-            quote! { __v < 0 },
-            quote! { crate::PyError::value_error },
-            "expected a non-negative integer",
-            idx,
+            quote! { crate::baseobjspace::gateway_nonnegint_w(args[#idx])? },
         ),
-        "PyCInt" => int_guard(
+        "PyCInt" => (
             quote! { i32 },
-            quote! { i32 },
-            quote! { __v < -2147483648 || __v > 2147483647 },
-            quote! { crate::PyError::overflow_error },
-            "expected a 32-bit integer",
-            idx,
+            quote! { crate::baseobjspace::c_int_w(args[#idx])? },
         ),
-        "PyCUInt" => int_guard(
+        "PyCUInt" => (
             quote! { u32 },
-            quote! { u32 },
-            quote! { __v < 0 || __v > 4294967295 },
-            quote! { crate::PyError::overflow_error },
-            "expected an unsigned 32-bit integer",
-            idx,
+            quote! { crate::baseobjspace::c_uint_w(args[#idx])? },
         ),
-        "PyCShort" => int_guard(
+        "PyCShort" => (
             quote! { i16 },
-            quote! { i16 },
-            quote! { __v < -32768 || __v > 32767 },
-            quote! { crate::PyError::value_error },
-            "expected a 16-bit integer",
-            idx,
+            quote! { crate::baseobjspace::c_short_w(args[#idx])? },
         ),
-        "PyCUShort" => int_guard(
+        "PyCUShort" => (
             quote! { u16 },
-            quote! { u16 },
-            quote! { __v < 0 || __v > 65535 },
-            quote! { crate::PyError::value_error },
-            "expected an unsigned 16-bit integer",
-            idx,
+            quote! { crate::baseobjspace::c_ushort_w(args[#idx])? },
         ),
         "PyCUidT" => (
-            // space.c_uid_t_w — c_uint_w range (0..=UINT_MAX) with one
-            // exception: -1 maps to UINT_MAX (the `(uid_t)-1` sentinel);
-            // values below -1 raise OverflowError rather than ValueError.
             quote! { u32 },
-            quote! {
-                {
-                    let __v: i64 = unsafe { ::pyre_object::w_int_get_value(args[#idx]) };
-                    if __v == -1 {
-                        u32::MAX
-                    } else if __v < 0 {
-                        return ::std::result::Result::Err(
-                            crate::PyError::overflow_error(
-                                "user/group id smaller than minimum (-1)".to_string()
-                            )
-                        );
-                    } else if __v > 4294967295 {
-                        return ::std::result::Result::Err(
-                            crate::PyError::overflow_error(
-                                "expected an unsigned 32-bit integer".to_string()
-                            )
-                        );
-                    } else {
-                        __v as u32
-                    }
-                }
-            },
+            quote! { crate::baseobjspace::c_uid_t_w(args[#idx])? },
         ),
         "PyTruncatedInt" => (
-            // space.truncatedint_w — like int_w but truncates instead of
-            // raising OverflowError.  Pyre's int payload is already an
-            // i64, so reading the value is the truncation (intmask).
             quote! { i64 },
-            quote! { unsafe { ::pyre_object::w_int_get_value(args[#idx]) } },
+            quote! { crate::baseobjspace::truncatedint_w(args[#idx])? },
         ),
         "PyText0" => (
-            // space.text0_w — text_w plus a rejection of embedded NUL.
             quote! { &'static str },
-            quote! {
-                {
-                    let __s = unsafe { ::pyre_object::w_str_get_value(args[#idx]) };
-                    if __s.as_bytes().contains(&0) {
-                        return ::std::result::Result::Err(
-                            crate::PyError::value_error(
-                                "embedded null character".to_string()
-                            )
-                        );
-                    }
-                    __s
-                }
-            },
+            quote! { crate::baseobjspace::text0_w(args[#idx])? },
         ),
         "PyBytes0" => (
             // space.bytes0_w — bytes_w plus a rejection of embedded NUL.
@@ -498,102 +460,48 @@ fn typed_alias(
             },
         ),
         // space.realunicode_w / space.utf8_w — a str argument as unicode
-        // text.  pyre's str payload is already utf8 unicode, so both
-        // borrow the same buffer (`text_w` / `&str`); the distinct names
-        // let a port carry the original unwrap_spec keyword verbatim.
-        "PyUnicode" | "PyUtf8" => (
+        // text; both route through baseobjspace and return the borrowed
+        // utf8 buffer, differing only in the TypeError message they raise.
+        "PyUnicode" => (
             quote! { &'static str },
-            quote! { unsafe { ::pyre_object::w_str_get_value(args[#idx]) } },
+            quote! { crate::baseobjspace::realunicode_w(args[#idx])? },
+        ),
+        "PyUtf8" => (
+            quote! { &'static str },
+            quote! { crate::baseobjspace::utf8_w(args[#idx])? },
         ),
         "PyTextOrNone" => (
             // space.text_or_none_w — None passes through, otherwise text_w.
             quote! { ::std::option::Option<&'static str> },
             quote! {
-                if unsafe { ::pyre_object::is_none(args[#idx]) } {
+                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(
-                        unsafe { ::pyre_object::w_str_get_value(args[#idx]) }
-                    )
+                    ::std::option::Option::Some(crate::baseobjspace::text_w(args[#idx])?)
                 }
             },
         ),
         "PyText0OrNone" => (
-            // space.text0_or_none_w — None passes through, otherwise
-            // text0_w (text_w plus a rejection of embedded NUL).
+            // space.text0_or_none_w — None passes through, otherwise text0_w.
             quote! { ::std::option::Option<&'static str> },
             quote! {
-                if unsafe { ::pyre_object::is_none(args[#idx]) } {
+                if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    let __s = unsafe { ::pyre_object::w_str_get_value(args[#idx]) };
-                    if __s.as_bytes().contains(&0) {
-                        return ::std::result::Result::Err(
-                            crate::PyError::value_error(
-                                "embedded null character".to_string()
-                            )
-                        );
-                    }
-                    ::std::option::Option::Some(__s)
+                    ::std::option::Option::Some(crate::baseobjspace::text0_w(args[#idx])?)
                 }
             },
         ),
         "PyBufferStr" => (
-            // space.charbuf_w — a read-only character buffer as raw bytes.
             quote! { &'static [u8] },
-            quote! {
-                {
-                    if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
-                        return ::std::result::Result::Err(
-                            crate::PyError::type_error(
-                                format!("argument {} must be a buffer", #idx)
-                            )
-                        );
-                    }
-                    unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) }
-                }
-            },
+            quote! { crate::baseobjspace::charbuf_w(args[#idx])? },
         ),
-        "PyCNonNegInt" => int_guard(
-            // space.c_nonnegint_w — c_int_w (32-bit range) plus a
-            // non-negative check.
+        "PyCNonNegInt" => (
             quote! { i32 },
-            quote! { i32 },
-            quote! { __v < 0 || __v > 2147483647 },
-            quote! { crate::PyError::value_error },
-            "expected a non-negative integer",
-            idx,
+            quote! { crate::baseobjspace::c_nonnegint_w(args[#idx])? },
         ),
         _ => return None,
     })
-}
-
-/// Build the `(binding_type, unwrap_expr)` pair for an integer alias that
-/// reads the int payload, runs a bound check, and casts to the target
-/// width.  `cond` refers to the local `__v: i64`; `err_ctor` is the
-/// `PyError` constructor matching the exception type the bound violates.
-fn int_guard(
-    binding_ty: proc_macro2::TokenStream,
-    cast_ty: proc_macro2::TokenStream,
-    cond: proc_macro2::TokenStream,
-    err_ctor: proc_macro2::TokenStream,
-    msg: &str,
-    idx: usize,
-) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    (
-        binding_ty,
-        quote! {
-            {
-                let __v: i64 = unsafe { ::pyre_object::w_int_get_value(args[#idx]) };
-                if #cond {
-                    return ::std::result::Result::Err(
-                        #err_ctor(#msg.to_string())
-                    );
-                }
-                __v as #cast_ty
-            }
-        },
-    )
 }
 
 /// Helper used by `rewrite_alias_args` — looks up just the binding

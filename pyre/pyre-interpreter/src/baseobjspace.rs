@@ -1355,6 +1355,26 @@ pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
     w_bool_from(is_w(w_one, w_two))
 }
 
+/// `W_TypeObject.flag_sequence_bug_compat` — set on exactly the builtin
+/// sequence types (list/tuple/bytes/bytearray/str); subclasses do not
+/// inherit it, so this is an exact type-object identity check.  Used by
+/// the in-place `+=` / `*=` bug-to-bug compatibility branch in
+/// descroperation.
+pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
+    use pyre_object::pyobject;
+    is_w(w_type, crate::typedef::gettypeobject(&pyobject::LIST_TYPE))
+        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::TUPLE_TYPE))
+        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::STR_TYPE))
+        || is_w(
+            w_type,
+            crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+        )
+        || is_w(
+            w_type,
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+        )
+}
+
 /// Python-level `not` operation.
 pub fn not_(obj: PyObjectRef) -> PyObjectRef {
     w_bool_from(!is_true(obj))
@@ -3041,6 +3061,108 @@ pub fn gateway_int_w(obj: PyObjectRef) -> Result<i64, PyError> {
     int_w(obj)
 }
 
+/// pypy/interpreter/baseobjspace.py gateway_nonnegint_w.
+pub fn gateway_nonnegint_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("expected a non-negative integer"));
+    }
+    Ok(value)
+}
+
+/// intobject.py:577 uint_w.
+fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error(
+            "cannot convert negative integer to unsigned",
+        ));
+    }
+    Ok(value as u64)
+}
+
+/// pypy/interpreter/baseobjspace.py c_uint_w.
+pub fn c_uint_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    let value = uint_w(obj)?;
+    if value > u32::MAX as u64 {
+        return Err(PyError::overflow_error("expected an unsigned 32-bit integer"));
+    }
+    Ok(value as u32)
+}
+
+/// pypy/interpreter/baseobjspace.py c_nonnegint_w.
+pub fn c_nonnegint_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("expected a non-negative integer"));
+    }
+    if value > i32::MAX as i64 {
+        return Err(PyError::overflow_error("expected a 32-bit integer"));
+    }
+    Ok(value as i32)
+}
+
+/// pypy/interpreter/baseobjspace.py c_short_w.
+pub fn c_short_w(obj: PyObjectRef) -> Result<i16, PyError> {
+    let value = int_w(obj)?;
+    if value < i16::MIN as i64 {
+        return Err(PyError::overflow_error(
+            "signed short integer is less than minimum",
+        ));
+    }
+    if value > i16::MAX as i64 {
+        return Err(PyError::overflow_error(
+            "signed short integer is greater than maximum",
+        ));
+    }
+    Ok(value as i16)
+}
+
+/// pypy/interpreter/baseobjspace.py c_ushort_w.
+pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
+    let value = int_w(obj)?;
+    if value < 0 {
+        return Err(PyError::value_error("value must be positive"));
+    }
+    if value > u16::MAX as i64 {
+        return Err(PyError::overflow_error(
+            "Python int too large for C unsigned short",
+        ));
+    }
+    Ok(value as u16)
+}
+
+/// pypy/interpreter/baseobjspace.py c_uid_t_w.
+pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    match c_uint_w(obj) {
+        Ok(value) => Ok(value),
+        Err(e) if e.kind == PyErrorKind::ValueError => {
+            if int_w(obj)? == -1 {
+                Ok(u32::MAX)
+            } else {
+                Err(PyError::overflow_error(
+                    "user/group id smaller than minimum (-1)",
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// pypy/interpreter/baseobjspace.py truncatedint_w.
+pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    match int_w(obj) {
+        Ok(value) => Ok(value),
+        Err(e) if e.kind == PyErrorKind::OverflowError => {
+            use num_traits::ToPrimitive;
+            let big = unsafe { crate::builtins::obj_to_bigint(obj) };
+            let low = (&big & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
+            Ok(low as i64)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// pypy/interpreter/baseobjspace.py:1976-1982 `c_int_w(w_obj)`.
 ///
 /// ```python
@@ -3061,6 +3183,44 @@ pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
         return Err(PyError::overflow_error("expected a 32-bit integer"));
     }
     Ok(value as i32)
+}
+
+/// baseobjspace.py:1784 text_w.
+pub fn text_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    if unsafe { !pyre_object::is_str(obj) } {
+        return Err(PyError::type_error("expected str"));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+}
+
+/// baseobjspace.py:1791 utf8_w.
+pub fn utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    text_w(obj)
+}
+
+/// baseobjspace.py realunicode_w.
+pub fn realunicode_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    if unsafe { !pyre_object::is_str(obj) } {
+        return Err(PyError::type_error("expected unicode"));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(obj) })
+}
+
+/// baseobjspace.py text0_w — rejects an embedded null character.
+pub fn text0_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
+    let s = text_w(obj)?;
+    if s.contains('\0') {
+        return Err(PyError::value_error("embedded null character"));
+    }
+    Ok(s)
+}
+
+/// baseobjspace.py:1819 charbuf_w — a read-only character buffer as raw bytes.
+pub fn charbuf_w(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
+    if unsafe { !pyre_object::bytesobject::is_bytes_like(obj) } {
+        return Err(PyError::type_error("expected a readable buffer"));
+    }
+    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(obj) })
 }
 
 /// Look up a descriptor on an object's type.

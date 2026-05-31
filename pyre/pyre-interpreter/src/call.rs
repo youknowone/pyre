@@ -514,7 +514,7 @@ pub fn call_user_function_resolved(
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let func = unsafe { builtin_code_get(code) };
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
-        if sig.has_vararg() || sig.has_kwarg() {
+        if sig.has_vararg() || sig.has_kwarg() || sig.num_kwonlyargnames() > 0 {
             let fname = unsafe { crate::builtin_code_name(code) };
             let bound = bind_kwargs_to_signature(sig, fname, args, &[])?;
             return func(&bound);
