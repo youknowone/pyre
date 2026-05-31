@@ -7229,6 +7229,11 @@ fn init_bytes_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "isascii",
+        make_builtin_function("isascii", bytes_method_isascii),
+    );
+    dict_storage_store(
+        ns,
         "isupper",
         make_builtin_function("isupper", bytes_method_isupper),
     );
@@ -7991,6 +7996,13 @@ fn bytes_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
         BYTES_WHITESPACE.contains(&b)
     })))
+}
+
+/// `bytes.isascii` / `bytearray.isascii` — every byte is <= 0x7F.
+/// An empty buffer is ASCII (`descr_isascii` returns True on no bytes).
+fn bytes_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    Ok(pyre_object::w_bool_from(data.is_ascii()))
 }
 
 /// `bytes.isupper` — at least one cased byte and no lowercase byte.
@@ -9347,6 +9359,11 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         ns,
         "isspace",
         make_builtin_function("isspace", bytes_method_isspace),
+    );
+    dict_storage_store(
+        ns,
+        "isascii",
+        make_builtin_function("isascii", bytes_method_isascii),
     );
     dict_storage_store(
         ns,
