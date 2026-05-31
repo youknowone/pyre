@@ -12,22 +12,79 @@ use walkdir::WalkDir;
 /// Analyzes all source files from:
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
+/// Env flag that tells a re-invoked copy of this build script to run the
+/// codegen worker directly instead of spawning another child.
+const WORKER_ENV: &str = "PYRE_JIT_TRACE_BUILD_WORKER";
+
 fn main() {
-    // Run on a worker thread with a large stack. Two recursive
-    // consumers need the headroom:
-    //   1. `syn`'s recursive parsing of the ~150 collected source files
-    //      (on Windows the main thread's default stack is 1 MiB →
-    //      STATUS_STACK_OVERFLOW 0xc00000fd).
-    //   2. the dual-gate real RPythonTyper specialization
-    //      (`specialize_legacy_graph_with_registry` → annotator
-    //      `complete_pending_blocks` / rtyper `specialize_more_blocks`),
-    //      whose recursion depth is bounded but order-dependent: the
-    //      processing order is keyed off a HashMap, so on some seeds the
-    //      deepest graph chain overran a 64 MiB worker and aborted with
-    //      a non-deterministic `stack overflow` (the flaky M2.5g.2.c
-    //      build failure). 512 MiB covers the deepest observed chain.
+    // The codegen worker (`real_main`) runs the dual-gate real RPythonTyper
+    // specialization (`specialize_legacy_graph_with_registry` → annotator
+    // `complete_pending_blocks` / rtyper `specialize_more_blocks`).  Its
+    // processing order is keyed off a `HashMap`, so the per-process SipHash
+    // seed decides the order in which the deepest graph chain is visited.
+    // On a bad seed that chain recurses non-deterministically deep — the
+    // flaky M2.5g.2.c build failure — and dies one of two ways:
+    //   (a) it overruns the worker stack and the runtime ABORTS the whole
+    //       process (`fatal runtime error: stack overflow`) — a process
+    //       abort cannot be caught from another thread, so an in-process
+    //       retry never gets control; only a fresh process escapes it.
+    //   (b) it panics in the annotator (`SomeInstance.getattr(..) on
+    //       classdef-less instance` / `no binding for arg`).
+    // RPython's translator is single-shot because its worklist order is
+    // deterministic; pyre's HashMap order is not.  So run the worker in a
+    // CHILD PROCESS: both failure faces surface as a non-zero / signal exit
+    // the parent observes, and each retry is a fresh process with a fresh
+    // SipHash seed (and thus a fresh order), standing in for the missing
+    // determinism.  The worker still uses a 1 GiB thread stack (vs syn's
+    // recursive parse of ~150 files + the deep rtyper chain; on Windows the
+    // main thread's 1 MiB default would STATUS_STACK_OVERFLOW) to keep the
+    // per-attempt overflow probability low.
+    if std::env::var_os(WORKER_ENV).is_some() {
+        run_worker();
+        return;
+    }
+
+    const MAX_ATTEMPTS: u32 = 8;
+    let exe = std::env::current_exe().expect("build-script current_exe");
+    for attempt in 1..=MAX_ATTEMPTS {
+        // stdout is captured so the worker's `cargo::` directives can be
+        // replayed to cargo only from the attempt that actually succeeds;
+        // stderr is inherited so its progress log + any panic/overflow
+        // message streams live.
+        let output = std::process::Command::new(&exe)
+            .env(WORKER_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .expect("spawn build-script worker process");
+        if output.status.success() {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(&output.stdout)
+                .expect("replay worker cargo directives");
+            return;
+        }
+        if attempt == MAX_ATTEMPTS {
+            panic!(
+                "[pyre-jit-trace build.rs] codegen worker failed after \
+                 {MAX_ATTEMPTS} attempts (last: {})",
+                output.status
+            );
+        }
+        eprintln!(
+            "[pyre-jit-trace build.rs] codegen worker process failed on attempt \
+             {attempt}/{MAX_ATTEMPTS} ({}, non-deterministic M2.5g.2.c order \
+             flake); retrying with a fresh HashMap seed",
+            output.status
+        );
+    }
+}
+
+/// Run the codegen worker on a large-stack thread and propagate a panic as
+/// a non-zero process exit (so the parent's retry loop observes it).
+fn run_worker() {
     std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(real_main)
         .expect("spawn build-script worker")
         .join()
