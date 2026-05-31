@@ -800,28 +800,12 @@ fn emit_vable_getfield_ref_walker_only(
     push_walker_emit(current_block, insn);
 }
 
-
-
-
-
-
-
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
 /// `ListOfKind` element so downstream analysis can correlate the
 /// violation with the canonical emit site responsible.
 type Phase4ColorBudgetViolation = (usize, String, &'static str, &'static str, u16, u16);
-
-
-
-
-
-
-
-
-
-
 
 /// The next-block label is recognised as `Insn::Label(L)`, matching
 /// upstream's `flatten.py:116 self.emit(Label(block))` block / link /
@@ -3672,7 +3656,6 @@ fn filter_liveness_in_place(
         }
     }
 
-    let drop_lv = std::env::var_os("MAJIT_PHASE06_DROP_LV").is_some();
     for (insn_idx, py_pcs) in groups {
         // Original snapshot is the same for every PC in the group
         // (they all point at the same marker).
@@ -3741,13 +3724,6 @@ fn filter_liveness_in_place(
             // either (a) populating scratch colors during tracing
             // (graph regalloc) or (b) the encoder tolerating
             // NONE for non-frame live registers.
-            //
-            // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
-            // RPython-orthodox SSA-only `live_r` so probe-A logs in
-            // `consume_one_section` (`call_jit.rs::resume_in_blackhole`)
-            // can capture what BH writes per color when the bank
-            // widens.  Default off — bench / production keep the
-            // retain.
             let depth = depth_at_pc[py_pc] as usize;
             let live_stack_colors: std::collections::BTreeSet<u16> =
                 stack_slot_color_map.iter().copied().take(depth).collect();
@@ -3774,9 +3750,7 @@ fn filter_liveness_in_place(
                 }
                 s
             };
-            if !drop_lv {
-                pc_live_r.retain(|idx| lv_live.contains(idx));
-            }
+            pc_live_r.retain(|idx| lv_live.contains(idx));
 
             union_i.extend(pc_live_i);
             union_r.extend(pc_live_r);
@@ -4408,21 +4382,17 @@ impl CodeWriter {
                     call_fn_8_idx,
                 ],
                 // Only portal graphs include `frame_var` in
-                // `graph_entry_inputargs(code, true)`; for non-portal
+                // `graph_entry_inputargs(code, true)`. For non-portal
                 // graphs `frame_var.id` collides with the synthesised
                 // `return_var` slot (`new_shadow_graph_with_portal_inputs`
                 // assigns `return_var = Variable(VariableId(start_inputargs.len()))`,
                 // which equals `entry_arg_slots(code)` when
                 // `portal_inputs=false` — the same id `portal_graph_inputvars`
-                // returns for `frame_var`).  Threading a non-portal
-                // `Some(frame_var)` through `get_register` resolves the
-                // call-frame operand from `return_var`'s color, corrupting
-                // canonical `lower_simple_call_hlop_to_insn` lowering.
-                // `simple_call` lowering prepends this frame for
-                // `bh_call_fn_N(frame, callable, args)`; it is valid for
-                // non-portal graphs too since `frame_var` is the graph's
-                // leading ref input arg in both cases.
-                portal_frame_var: Some(frame_var),
+                // returns for `frame_var`). Threading a non-portal
+                // `Some(frame_var)` through `get_register` would resolve
+                // the call-frame operand from `return_var`'s color instead
+                // of a real graph input.
+                portal_frame_var: if is_portal { Some(frame_var) } else { None },
             });
         }
 
@@ -9310,7 +9280,6 @@ impl CodeWriter {
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
         }
 
-
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         //
@@ -9337,21 +9306,34 @@ impl CodeWriter {
         // graph remains topology-only until a pre-regalloc Variable
         // environment is introduced.
 
-        // `regalloc.py:79-96 coalesce_variables` CFG-level coalescing —
-        // every Link's `(link.args[i], link.target.inputargs[i])` pair —
-        // is applied Variable-keyed to the graph-side `graph_regallocs`
-        // below via `cfg_variable_pairs` (P4.B.2).  The SSARepr-side
-        // allocator additionally runs the intra-block `*_copy` scanner in
-        // `SSAReprRegAllocator::coalesce_variables`; pyre's walker emits a
-        // `*_copy` for every link boundary, so that scanner already unions
-        // the same pairs the slot-projected CFG list would.  Feeding the
-        // SSARepr allocator the empty slice is therefore byte-identical to
-        // the former `walker_slot_for_variable`-projected list across all
-        // 26 production graphs (full rename + num_regs, all kinds), so the
-        // projection — the last SSARepr-side reader of
-        // `walker_slot_for_variable` — is dropped (#238 role-2).
-        let alloc_result =
-            super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs, &[]);
+        // `regalloc.py:79-96 coalesce_variables` CFG-level coalescing:
+        // preserve every Link's `(link.args[i], link.target.inputargs[i])`
+        // pair for the SSARepr-side allocator too.  Graph-side regalloc
+        // uses the Variable-keyed `cfg_variable_pairs`; the walker allocator
+        // is slot-keyed, so project through `walker_slot_for_variable`.
+        // Without this, `walker_post_walk_insert_renamings` can skip a copy
+        // because graph colors already match while SSARepr regalloc later
+        // assigns different colors to the same edge.
+        let cfg_coalesce_pairs: Vec<(u16, u16)> = cfg_variable_pairs
+            .iter()
+            .filter_map(|(src, dst)| {
+                let s = walker_slot_for_variable
+                    .get(src.0 as usize)
+                    .copied()
+                    .flatten()?;
+                let d = walker_slot_for_variable
+                    .get(dst.0 as usize)
+                    .copied()
+                    .flatten()?;
+                Some((s, d))
+            })
+            .collect();
+        let alloc_result = super::regalloc::allocate_registers(
+            &ssarepr,
+            code.varnames.len(),
+            inputs,
+            &cfg_coalesce_pairs,
+        );
         // Run graph-side
         // `perform_register_allocation_all_kinds` +
         // `enforce_input_args` post-walker on every
@@ -10140,7 +10122,6 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
-
 
     /// Tail-strip pass folds a `goto + Unreachable` tail into the
     /// following block when the goto's target name matches a leading
