@@ -55,22 +55,27 @@ def bold(s):   return f"\033[1m{s}\033[0m"
 
 # ── Child-process user CPU time ──────────────────────────────────────
 
-def _run_timed_unix(args, timeout_s):
+def _run_timed_unix(args, timeout_s, env=None):
     import resource
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     try:
         proc = subprocess.run(
-            args, stdout=subprocess.PIPE,
-            timeout=timeout_s,
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout_s, env=env,
         )
     except subprocess.TimeoutExpired:
-        return "", 0.0, 124
+        return "", 0.0, 124, ""
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     utime = max(after.ru_utime - before.ru_utime, 0.0)
-    return proc.stdout.decode("utf-8", errors="replace"), utime, proc.returncode
+    return (
+        proc.stdout.decode("utf-8", errors="replace"),
+        utime,
+        proc.returncode,
+        proc.stderr.decode("utf-8", errors="replace"),
+    )
 
 
-def _run_timed_win32(args, timeout_s):
+def _run_timed_win32(args, timeout_s, env=None):
     import ctypes
     from ctypes import wintypes
 
@@ -107,19 +112,19 @@ def _run_timed_win32(args, timeout_s):
     job = kernel32.CreateJobObjectW(None, None)
 
     proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE,
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
     )
     # Assigning right after Popen catches launchers like pypy3.exe before they
     # spawn their interpreter child; descendants inherit job membership.
     assigned = bool(kernel32.AssignProcessToJobObject(job, int(proc._handle)))
 
     try:
-        stdout_bytes, _ = proc.communicate(timeout=timeout_s)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
         kernel32.CloseHandle(job)
-        return "", 0.0, 124
+        return "", 0.0, 124, ""
 
     utime = 0.0
     JobObjectBasicAndIoAccountingInformation = 8
@@ -145,22 +150,72 @@ def _run_timed_win32(args, timeout_s):
             utime = ((ut.dwHighDateTime << 32) | ut.dwLowDateTime) / 1e7
     kernel32.CloseHandle(job)
     utime += WIN_TIMER_QUANTUM_S
-    return stdout_bytes.decode("utf-8", errors="replace"), utime, proc.returncode
+    return (
+        stdout_bytes.decode("utf-8", errors="replace"),
+        utime,
+        proc.returncode,
+        (stderr_bytes or b"").decode("utf-8", errors="replace"),
+    )
 
 
-def run_timed(args, timeout_s=None):
-    """Run *args*, return (stdout_str, user_cpu_seconds, returncode).
+def run_timed(args, timeout_s=None, env=None):
+    """Run *args*, return (stdout_str, user_cpu_seconds, returncode, stderr_str).
 
-    returncode 124 = timeout (matching coreutils convention).
+    returncode 124 = timeout (matching coreutils convention). *env* (when
+    given) replaces the child environment (pass a full os.environ copy plus
+    extras).
     """
     if sys.platform == "win32":
-        out, t, rc = _run_timed_win32(args, timeout_s)
+        out, t, rc, err = _run_timed_win32(args, timeout_s, env)
     else:
-        out, t, rc = _run_timed_unix(args, timeout_s)
+        out, t, rc, err = _run_timed_unix(args, timeout_s, env)
     # PyPy/CPython on Windows emit CRLF in stdout text mode; Rust's println!
     # emits LF on all platforms. Normalize so output comparisons aren't
     # platform-sensitive (and snapshots stay portable).
-    return out.replace("\r\n", "\n"), t, rc
+    return out.replace("\r\n", "\n"), t, rc, err
+
+
+def pyre_env():
+    """Child environment for pyre runs: strict JIT plus one-line stats.
+
+    MAJIT_STRICT=1 re-raises internal compile panics instead of silently
+    falling back to the interpreter, so a JIT bug surfaces as a crash here
+    rather than as correct-but-uncompiled output. MAJIT_STATS=1 prints the
+    `[jit-stats]` line that `_jit_panic_reason` inspects.
+    """
+    env = dict(os.environ)
+    env["MAJIT_STRICT"] = "1"
+    env["MAJIT_STATS"] = "1"
+    return env
+
+
+def _jit_panic_reason(stderr):
+    """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
+    nonzero internal_compile_panics stat, else None.
+
+    A Rust panic prints 'panicked at' via the default hook (InvalidLoop is
+    suppressed by pyre's panic hook, so legitimate trace aborts never appear
+    here). A nonzero internal_compile_panics in the `[jit-stats]` line means an
+    internal compile bug fell back to the interpreter (only reachable in a
+    non-strict build; under MAJIT_STRICT the panic re-raises and shows up as
+    'panicked' plus a nonzero exit instead).
+    """
+    if not stderr:
+        return None
+    if "panicked" in stderr:
+        for line in stderr.splitlines():
+            if "panicked" in line:
+                return f"rust panic: {line.strip()[:80]}"
+        return "rust panic"
+    for line in stderr.splitlines():
+        if line.startswith("[jit-stats]") and "internal_compile_panics=" in line:
+            field = line.split("internal_compile_panics=", 1)[1].split()[0]
+            try:
+                if int(field) > 0:
+                    return f"internal_compile_panics={field}"
+            except ValueError:
+                pass
+    return None
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -405,9 +460,16 @@ class Check:
         sys.stdout.write(f"    {backend:<10s}")
         sys.stdout.flush()
 
-        output, elapsed, code = run_timed(
-            [pyre_bin, script], timeout_s=effective_timeout,
+        output, elapsed, code, stderr = run_timed(
+            [pyre_bin, script], timeout_s=effective_timeout, env=pyre_env(),
         )
+
+        panic_reason = _jit_panic_reason(stderr)
+        if panic_reason:
+            self._record(backend, False, name, panic_reason)
+            print(f"{red('JIT-PANIC')}  {panic_reason}")
+            self._append_comparison(backend, name, t_cpython, t_pypy, "FAIL")
+            return
 
         if code != 0:
             if code == 124:
@@ -504,7 +566,7 @@ class Check:
         if need_cpython:
             sys.stdout.write(f"    {'cpython':<10s}")
             sys.stdout.flush()
-            cpython_output, t_cpu, cpython_code = run_timed([PYTHON3, script])
+            cpython_output, t_cpu, cpython_code, _ = run_timed([PYTHON3, script])
             t_cpython = f"{t_cpu:.2f}"
             if cpython_code != 0:
                 print(f"{red('CRASH')} (exit {cpython_code})")
@@ -513,7 +575,7 @@ class Check:
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
-        pypy_output, pypy_cpu, pypy_code = run_timed([PYPY3, script])
+        pypy_output, pypy_cpu, pypy_code, _ = run_timed([PYPY3, script])
         t_pypy = f"{pypy_cpu:.2f}" if pypy_code == 0 else "-"
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
@@ -558,7 +620,7 @@ class Check:
 
         sys.stdout.write(f"    {'cpython':<10s}")
         sys.stdout.flush()
-        cpython_output, cpython_time, cpython_code = run_timed(
+        cpython_output, cpython_time, cpython_code, _ = run_timed(
             [PYTHON3, path], timeout_s=effective_timeout,
         )
         if cpython_code != 0:
@@ -576,7 +638,7 @@ class Check:
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
-        pypy_output, pypy_time, pypy_code = run_timed(
+        pypy_output, pypy_time, pypy_code, _ = run_timed(
             [PYPY3, path], timeout_s=effective_timeout,
         )
         if pypy_code != 0:
