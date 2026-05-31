@@ -1306,6 +1306,16 @@ pub struct Op {
     /// `Forwarded::None` until a writer sets it; `BoxRef::set_forwarded_*`
     /// on a bound box routes here, and `get_forwarded` reads it back.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+
+    /// `resoperation.py:566 IntOp._resint` / `:582 FloatOp._resfloat` /
+    /// `:612 RefOp._resref` parity (`history.py:803-807 *FrontendOp(pos,
+    /// value)`) — the concrete runtime value stamped onto this op
+    /// identity at execute-time. The canonical per-identity concrete
+    /// carrier for a bound ResOp box; `BoxRef::get_value`/`set_value`
+    /// route here. `None` until a writer stamps it (trace-time
+    /// `set_opref_concrete`); residual calls / guards keep it `None`
+    /// until blackhole runs them.
+    pub value: std::cell::Cell<Option<crate::value::Value>>,
 }
 
 impl Clone for Op {
@@ -1329,6 +1339,7 @@ impl Clone for Op {
             // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 }
@@ -1456,6 +1467,7 @@ impl Op {
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -1471,6 +1483,7 @@ impl Op {
             rd_resume_position: std::cell::Cell::new(-1),
             vecinfo: std::cell::RefCell::new(None),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -1484,6 +1497,19 @@ impl Op {
 
     pub fn result_type(&self) -> Type {
         self.type_
+    }
+
+    /// Read the concrete runtime value stamped on this op identity
+    /// (`history.py:680 *FrontendOp.getint()` for the `_resint`/
+    /// `_resfloat`/`_resref` slot). `None` until a writer stamps it.
+    pub fn get_value(&self) -> Option<crate::value::Value> {
+        self.value.get()
+    }
+
+    /// Stamp the concrete runtime value on this op identity
+    /// (`history.py:803 *FrontendOp(pos, value)`).
+    pub fn set_value(&self, v: crate::value::Value) {
+        self.value.set(Some(v));
     }
 
     /// resoperation.py:323-334 AbstractResOp.copy_and_change +
@@ -1527,6 +1553,7 @@ impl Op {
             // `self.vecinfo` as `None`, so the clone is a no-op for them.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
+            value: std::cell::Cell::new(None),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3601,6 +3628,7 @@ mod tests {
                 $($field)*
                 type_: Type::Void,
                 forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+                value: std::cell::Cell::new(None),
             };
             __op.type_ = __op.opcode.result_type();
             __op

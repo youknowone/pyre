@@ -263,6 +263,13 @@ pub struct InputArg {
     /// `Forwarded::None` until a writer sets it; `BoxRef::set_forwarded_*`
     /// on a bound box routes here.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+    /// `resoperation.py:719/727/739 InputArgInt/Float/Ref` carry the
+    /// concrete runtime value on the frontend-arg object itself (the
+    /// `_resint`/`_resfloat`/`_resref` mixin slot, `history.py:803-807`).
+    /// The canonical per-identity concrete carrier for a bound InputArg
+    /// box; `BoxRef::get_value`/`set_value` route here. `None` until a
+    /// writer stamps it (trace-time `set_opref_concrete`).
+    pub value: std::cell::Cell<Option<Value>>,
 }
 
 impl InputArg {
@@ -285,6 +292,7 @@ impl InputArg {
             tp: self.tp,
             index: self.index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 }
@@ -306,6 +314,7 @@ impl InputArg {
             tp: Type::Int,
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -314,6 +323,7 @@ impl InputArg {
             tp: Type::Ref,
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -322,6 +332,7 @@ impl InputArg {
             tp: Type::Float,
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -337,6 +348,7 @@ impl InputArg {
             tp,
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            value: std::cell::Cell::new(None),
         }
     }
 
@@ -346,6 +358,18 @@ impl InputArg {
     /// identity (no interning), so two `new_*_rc` results compare equal
     /// only when both `tp` and `index` match — identity is shared only
     /// when callers `Rc::clone` the same handle.
+    /// Read the stamped concrete runtime value (`_resint`/`_resfloat`/
+    /// `_resref`, `history.py:680 *FrontendOp.getint()`). `None` until a
+    /// writer stamps it.
+    pub fn get_value(&self) -> Option<Value> {
+        self.value.get()
+    }
+
+    /// Stamp the concrete runtime value on this frontend-arg identity.
+    pub fn set_value(&self, v: Value) {
+        self.value.set(Some(v));
+    }
+
     pub fn new_int_rc(index: u32) -> InputArgRc {
         std::rc::Rc::new(Self::new_int(index))
     }
