@@ -5891,21 +5891,36 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "to_bytes",
         make_builtin_function("to_bytes", |args| {
-            let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                unsafe { pyre_object::w_int_get_value(args[0]) }
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            // pos[0] is the receiver int.
+            let val = if !pos.is_empty() && unsafe { pyre_object::is_int(pos[0]) } {
+                unsafe { pyre_object::w_int_get_value(pos[0]) }
             } else {
                 0
             };
-            let length = if args.len() >= 2 && unsafe { pyre_object::is_int(args[1]) } {
-                unsafe { pyre_object::w_int_get_value(args[1]) as usize }
-            } else {
-                1
-            };
-            let little_endian = if args.len() >= 3 && unsafe { pyre_object::is_str(args[2]) } {
-                unsafe { pyre_object::w_str_get_value(args[2]) == "little" }
-            } else {
-                false
-            };
+            // length: the `length` keyword, else the first int positional
+            // after the receiver, else 1.
+            let length = crate::builtins::kwarg_get(kwargs, "length")
+                .or_else(|| {
+                    pos.get(1)
+                        .copied()
+                        .filter(|&a| unsafe { pyre_object::is_int(a) })
+                })
+                .map(|o| unsafe { pyre_object::w_int_get_value(o) as usize })
+                .unwrap_or(1);
+            // byteorder: the `byteorder` keyword, else the first str
+            // positional after the receiver, else "big".
+            let little_endian = crate::builtins::kwarg_get(kwargs, "byteorder")
+                .or_else(|| {
+                    pos.iter()
+                        .skip(1)
+                        .find(|&&a| unsafe { pyre_object::is_str(a) })
+                        .copied()
+                })
+                .map(|o| unsafe {
+                    pyre_object::is_str(o) && pyre_object::w_str_get_value(o) == "little"
+                })
+                .unwrap_or(false);
             let mut bytes = vec![0u8; length];
             let uval = val as u64;
             for i in 0..length {
