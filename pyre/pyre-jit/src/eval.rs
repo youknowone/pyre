@@ -3661,6 +3661,26 @@ fn handle_fail(
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
+    // Full-body-walk guard-failure resume: skip bridge compilation and
+    // resume every guard through the blackhole interpreter. The FBW sets
+    // the concrete frame's `last_instr` once at the loop header and never
+    // advances it per opcode, so a guard's per-PC resume coordinate +
+    // partial operand stack are only reconstructed precisely by the
+    // blackhole's rd_numb `consume_one_section` decode. Compiling and
+    // attaching a bridge from such a resume yields compiled code that
+    // mishandles the resumed state (a hot in-place list-swap loop drops one
+    // iteration). Forcing the blackhole path for every FBW guard is exactly
+    // the behavior proven correct under the diagnostic no-bridge mode; FBW
+    // is default-off and experimental, so trading bridge throughput for
+    // resume correctness is the right call until the walker records a
+    // per-opcode resume coordinate (Issue #73 Phase 7/8). The trait tracer
+    // (flag-off) is unaffected. Cache the env read — handle_fail is hot on
+    // recursion-heavy guard chains (fib_recursive), so a per-call
+    // `env::var_os` would add measurable overhead.
+    static FULL_BODY_WALK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FULL_BODY_WALK.get_or_init(|| std::env::var_os("PYRE_FULL_BODY_WALK").is_some()) {
+        return HandleFailOutcome::ResumeInBlackhole;
+    }
     // compile.py:702-703: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
