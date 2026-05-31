@@ -415,7 +415,10 @@ pub unsafe fn isinstance_bytes_like_w(obj: PyObjectRef) -> bool {
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
 /// tuple — that one is followed by re-entering the loop.
-fn p_abstract_issubclass_w(w_derived: PyObjectRef, w_cls: PyObjectRef) -> Result<bool, PyError> {
+pub(crate) fn p_abstract_issubclass_w(
+    w_derived: PyObjectRef,
+    w_cls: PyObjectRef,
+) -> Result<bool, PyError> {
     let mut w_derived = w_derived;
     loop {
         if is_w(w_derived, w_cls) {
@@ -3351,11 +3354,15 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     }
 }
 
-/// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`.
+/// typeobject.py `_lookup_where(self, key)` — linear search through `self.mro_w`,
+/// returning the MRO class that defines `key` together with the found descriptor.
 /// NOTE: PyPy's elidable wrapper (_pure_lookup_where_with_method_cache) takes
 /// a version_tag argument to invalidate on type mutation. Until pyre has
 /// version tags, this raw lookup must NOT be marked elidable.
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub(crate) unsafe fn lookup_where(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
@@ -3377,12 +3384,18 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
             let ns = &*ns_ptr;
             if let Some(&value) = ns.get(name) {
                 if !value.is_null() {
-                    return Some(value);
+                    return Some((*cls, value));
                 }
             }
         }
     }
     None
+}
+
+/// `lookup_in_type` / `lookup_in_type_where` descriptor-only projection of
+/// [`lookup_where`], for the callers that do not need the defining class.
+pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
 /// Determine what `self` value to bind for a super-resolved attribute.

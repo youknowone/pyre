@@ -17,7 +17,7 @@ use rustpython_wtf8::Wtf8Buf;
 
 use crate::baseobjspace::{
     getattr, getitem, is_true, issubtype_w, lookup, lookup_in_type, lookup_in_type_where,
-    unwrap_cell,
+    lookup_where, p_abstract_issubclass_w, unwrap_cell,
 };
 pub use crate::{PyError, PyErrorKind, PyResult};
 
@@ -955,68 +955,44 @@ unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult>
     None
 }
 
-/// True when `obj`'s dynamic type (`w_class`) resolves `dunder` to a
-/// user-level Python function — a genuine override rather than the inherited
-/// builtin operator slot.  A builtin-storage instance keeps `ob_type` at the
-/// canonical storage type and carries its Python class in `w_class`, so a
-/// subclass `def __add__`/`__or__` is otherwise ignored by the storage fast
-/// paths.  The discriminator is the resolved method's kind, not a storage
-/// pointer: the builtin slots are fixed-code gateway functions that re-enter
-/// `add()`/`or_()`/…, so resolving to one must not trigger early dispatch —
-/// otherwise a plain `int`/`long` operand recurses forever (a `long` carries
-/// `w_class` = the `int` type object but `ob_type` = `LONG_TYPE`, so the two
-/// cannot be told apart by a storage-type comparison).  A user `def`
-/// (including one inherited from a Python mixin) is a `FUNCTION_TYPE` object
-/// with mutable code; `is_function_with_fixed_code` excludes the gateway
-/// builtins (`function_new_with_fixed_code`) that back the operator slots.
-unsafe fn operand_overrides(obj: PyObjectRef, dunder: &str) -> bool {
-    let w_class = (*obj).w_class;
-    if w_class.is_null() || !pyre_object::is_type(w_class) {
-        return false;
-    }
-    match lookup_in_type_where(w_class, dunder) {
-        Some(found) => {
-            pyre_object::py_type_check(found, &crate::function::FUNCTION_TYPE)
-                && !crate::function::is_function_with_fixed_code(found)
-        }
+/// True when `obj`'s type defines `dunder` in a class other than the
+/// builtin type object `tp` — i.e. a subclass overrides it.  Builtin
+/// `str`/`list`/`tuple` install `__add__`/`__radd__` on their own type;
+/// an inherited (non-overridden) lookup resolves back to `tp`.
+unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> bool {
+    match crate::typedef::r#type(obj).and_then(|t| lookup_where(t, dunder)) {
+        Some((src, _)) => !std::ptr::eq(src, tp),
         None => false,
     }
 }
 
-/// Whether a binary operator should consult the dunder dispatch before its
-/// builtin storage fast path: when the left operand overrides the forward
-/// dunder or the right operand overrides the reflected one.
-unsafe fn binop_dispatch_first(
+/// descroperation.py:708 `binop_impl` shortcut — the builtin sequence
+/// fast path (`str`/`list`/`tuple` concat) bypasses `__op__`/`__rop__`
+/// dispatch unless one operand is a subclass that actually overrides the
+/// forward or reflected special method (descroperation.py:664 "unicode +
+/// string subclass").  Returns `false` when no override exists so the
+/// caller concatenates directly — this also avoids re-entering the
+/// builtin `__add__` slot, which would recurse back into `add`.
+unsafe fn needs_seq_binop_dispatch(
     a: PyObjectRef,
     b: PyObjectRef,
-    dunder: &str,
-    rdunder: &str,
+    tp: *const pyre_object::PyType,
+    fwd: &str,
+    rev: &str,
 ) -> bool {
-    operand_overrides(a, dunder) || operand_overrides(b, rdunder)
-}
-
-/// Dispatch a builtin-leaf subclass's unary operator override (`__neg__`,
-/// `__pos__`, `__invert__`) before the storage fast paths, which operate on
-/// the value and ignore the override.  `try_instance_unaryop` only fires for
-/// is_instance-shaped objects, so a builtin-storage subclass needs the
-/// w_class-driven lookup here.
-unsafe fn try_unary_override(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    if !operand_overrides(a, dunder) {
-        return None;
-    }
-    let method = lookup_type_special(a, dunder)?;
-    Some(crate::call::call_function_impl_result(method, &[a]))
+    let Some(t) = crate::typedef::gettypefor(tp) else {
+        return false;
+    };
+    dunder_overridden(a, fwd, t)
+        || dunder_overridden(a, rev, t)
+        || dunder_overridden(b, fwd, t)
+        || dunder_overridden(b, rev, t)
 }
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__add__", "__radd__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_add(a, b);
         }
@@ -1027,12 +1003,30 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return float_add(a, b);
         }
         if is_str(a) && is_str(b) {
+            // descroperation.py:664 "unicode + string subclass" — a str
+            // subclass overriding `__add__`/`__radd__` must reach the
+            // reflected dispatch; otherwise concat directly.
+            if needs_seq_binop_dispatch(a, b, &pyre_object::STR_TYPE, "__add__", "__radd__") {
+                if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                    return Ok(result);
+                }
+            }
             return str_concat(a, b);
         }
         if is_list(a) && is_list(b) {
+            if needs_seq_binop_dispatch(a, b, &pyre_object::LIST_TYPE, "__add__", "__radd__") {
+                if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                    return Ok(result);
+                }
+            }
             return list_concat(a, b);
         }
         if is_tuple(a) && is_tuple(b) {
+            if needs_seq_binop_dispatch(a, b, &pyre_object::TUPLE_TYPE, "__add__", "__radd__") {
+                if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                    return Ok(result);
+                }
+            }
             return tuple_concat(a, b);
         }
         if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
@@ -1082,11 +1076,6 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__sub__", "__rsub__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_sub(a, b);
         }
@@ -1135,11 +1124,6 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__mul__", "__rmul__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_mul(a, b);
         }
@@ -1240,13 +1224,6 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__floordiv__", "__rfloordiv__") {
-            if let Some(result) =
-                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
-            {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_floordiv(a, b);
         }
@@ -1274,11 +1251,6 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__mod__", "__rmod__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_mod(a, b);
         }
@@ -1318,12 +1290,6 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__truediv__", "__rtruediv__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
-            {
-                return Ok(result);
-            }
-        }
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
         if a_num && b_num {
@@ -1359,11 +1325,6 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__pow__", "__rpow__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_pow(a, b);
         }
@@ -1436,36 +1397,74 @@ pub(crate) fn try_call_special(
     }
 }
 
-/// descroperation.py `_make_binop_impl` — forward `__op__` then
-/// reflected `__rop__`, with the reflected-first reordering rule when
-/// `type(rhs)` subtypes `type(lhs)`.
+/// descroperation.py:648 `_call_binop_impl` — resolve the forward
+/// (`dunder`) and reflected (`rdunder`) special methods through
+/// `lookup_where`, decide whether to try the reflected operand first by
+/// comparing the two defining classes, then invoke forward-then-reverse.
 pub(crate) fn try_dispatch_binary_special(
     lhs: PyObjectRef,
     rhs: PyObjectRef,
     dunder: &str,
     rdunder: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let try_reverse_first = unsafe { should_try_reverse_first(lhs, rhs, rdunder) };
-    if try_reverse_first {
-        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
-            if let Some(result) = try_call_special(method, &[rhs, lhs])? {
+    // descroperation.py:687 `seq_bug_compat = (symbol == '+' or symbol == '*')`.
+    let seq_bug_compat = dunder == "__add__" || dunder == "__mul__";
+    unsafe {
+        let Some(w_typ1) = crate::typedef::r#type(lhs) else {
+            return Ok(None);
+        };
+        let Some(w_typ2) = crate::typedef::r#type(rhs) else {
+            return Ok(None);
+        };
+        let (w_left_src, mut w_left_impl) = match lookup_where(w_typ1, dunder) {
+            Some((src, imp)) => (Some(src), Some(imp)),
+            None => (None, None),
+        };
+        let mut w_obj1 = lhs;
+        let mut w_obj2 = rhs;
+        let mut w_right_impl: Option<PyObjectRef> = None;
+        // descroperation.py:652 — same type means the reflected method is
+        // never considered.
+        if !std::ptr::eq(w_typ1, w_typ2) {
+            let (w_right_src, wri) = match lookup_where(w_typ2, rdunder) {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
+            w_right_impl = wri;
+            // descroperation.py:662 — both `__op__` and `__rop__` are
+            // found, in different MRO classes.
+            if let (Some(rsrc), Some(lsrc)) = (w_right_src, w_left_src) {
+                if !std::ptr::eq(lsrc, rsrc) {
+                    // descroperation.py:667-670.
+                    let prefer_reverse = (seq_bug_compat
+                        && crate::baseobjspace::flag_sequence_bug_compat(w_typ1)
+                        && !crate::baseobjspace::flag_sequence_bug_compat(w_typ2))
+                        || issubtype_w(w_typ2, w_typ1);
+                    // descroperation.py:671-672.
+                    if prefer_reverse
+                        && !p_abstract_issubclass_w(lsrc, rsrc)?
+                        && !p_abstract_issubclass_w(w_typ1, rsrc)?
+                    {
+                        std::mem::swap(&mut w_obj1, &mut w_obj2);
+                        std::mem::swap(&mut w_left_impl, &mut w_right_impl);
+                    }
+                }
+            }
+        }
+        // descroperation.py:676 — _invoke_binop(w_left_impl, w_obj1, w_obj2).
+        if let Some(method) = w_left_impl {
+            if let Some(result) = try_call_special(method, &[w_obj1, w_obj2])? {
                 return Ok(Some(result));
             }
         }
-    }
-    if let Some(method) = unsafe { lookup_type_special(lhs, dunder) } {
-        if let Some(result) = try_call_special(method, &[lhs, rhs])? {
-            return Ok(Some(result));
-        }
-    }
-    if !try_reverse_first {
-        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
-            if let Some(result) = try_call_special(method, &[rhs, lhs])? {
+        // descroperation.py:679 — _invoke_binop(w_right_impl, w_obj2, w_obj1).
+        if let Some(method) = w_right_impl {
+            if let Some(result) = try_call_special(method, &[w_obj2, w_obj1])? {
                 return Ok(Some(result));
             }
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
 /// descroperation.py:825 `inplace_impl` — try the in-place special
@@ -1479,27 +1478,28 @@ pub(crate) fn try_inplace_special(
     rdunder: Option<&str>,
     seq_bug_compat: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    // descroperation.py:825 `inplace_impl` seq_bug_compat — for `+=` / `*=`
-    // where the lhs is a builtin sequence and the rhs is not, try the rhs
-    // reflected method before the lhs in-place method.
-    if seq_bug_compat {
-        if let Some(rd) = rdunder {
-            if let (Some(lhs_type), Some(rhs_type)) =
-                (crate::typedef::r#type(lhs), crate::typedef::r#type(rhs))
-            {
-                if crate::baseobjspace::flag_sequence_bug_compat(lhs_type)
-                    && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type)
+    // descroperation.py:826 — only when the lhs in-place method exists.
+    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
+        // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
+        // lhs is a builtin sequence and the rhs is not, try the rhs
+        // reflected method before the lhs in-place method.
+        if seq_bug_compat {
+            if let Some(rd) = rdunder {
+                if let (Some(lhs_type), Some(rhs_type)) =
+                    (crate::typedef::r#type(lhs), crate::typedef::r#type(rhs))
                 {
-                    if let Some(rmethod) = unsafe { lookup_type_special(rhs, rd) } {
-                        if let Some(result) = try_call_special(rmethod, &[rhs, lhs])? {
-                            return Ok(Some(result));
+                    if crate::baseobjspace::flag_sequence_bug_compat(lhs_type)
+                        && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type)
+                    {
+                        if let Some(rmethod) = unsafe { lookup_type_special(rhs, rd) } {
+                            if let Some(result) = try_call_special(rmethod, &[rhs, lhs])? {
+                                return Ok(Some(result));
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         if let Some(result) = try_call_special(method, &[lhs, rhs])? {
             return Ok(Some(result));
         }
@@ -1765,11 +1765,6 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__lshift__", "__rlshift__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_lshift(a, b);
         }
@@ -1796,11 +1791,6 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__rshift__", "__rrshift__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
-                return Ok(result);
-            }
-        }
         if is_int_like(a) && is_int_like(b) {
             return int_rshift(a, b);
         }
@@ -1827,11 +1817,6 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__and__", "__rand__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
-                return Ok(result);
-            }
-        }
         // boolobject.py:74 W_BoolObject.descr_and — both operands bool
         // → space.newbool(op(a, b)). MRO ensures this runs before the
         // W_IntObject.descr_and fallback in int_bitand.
@@ -1915,11 +1900,6 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
     };
     unsafe {
-        if binop_dispatch_first(a, b, "__or__", "__ror__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
-                return Ok(result);
-            }
-        }
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
         // → space.newbool(op(a, b)).
         if is_bool(a) && is_bool(b) {
@@ -1988,11 +1968,6 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        if binop_dispatch_first(a, b, "__xor__", "__rxor__") {
-            if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
-                return Ok(result);
-            }
-        }
         if is_bool(a) && is_bool(b) {
             return Ok(pyre_object::bool_descr_xor(a, b));
         }
@@ -2042,70 +2017,12 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-/// Rich-comparison override dispatch for builtin-leaf subclasses, run before
-/// `compare`'s storage fast paths (which compare by value and ignore a
-/// subclass override).  Follows do_richcompare ordering — reflected-first
-/// when the right operand's type properly subtypes the left's and overrides
-/// the reflected comparison — but only ever invokes a genuine user override
-/// (`operand_overrides` gates each side).  The builtin comparison slots
-/// re-enter `compare`, so dispatching one here would recurse; instead, when
-/// no user override yields a result, `None` lets the caller fall through to
-/// the storage fast paths, which compute the same value comparison the
-/// builtin reflected slot would.
-unsafe fn try_compare_override(
-    a: PyObjectRef,
-    b: PyObjectRef,
-    dunder: &str,
-    rdunder: &str,
-) -> Result<Option<PyObjectRef>, PyError> {
-    let a_over = operand_overrides(a, dunder);
-    let b_over = operand_overrides(b, rdunder);
-    if !a_over && !b_over {
-        return Ok(None);
-    }
-    let reverse_first = b_over && should_try_reverse_first(a, b, rdunder);
-    if reverse_first {
-        if let Some(method) = lookup_type_special(b, rdunder) {
-            if let Some(result) = try_call_special(method, &[b, a])? {
-                return Ok(Some(result));
-            }
-        }
-    }
-    if a_over {
-        if let Some(method) = lookup_type_special(a, dunder) {
-            if let Some(result) = try_call_special(method, &[a, b])? {
-                return Ok(Some(result));
-            }
-        }
-    }
-    if b_over && !reverse_first {
-        if let Some(method) = lookup_type_special(b, rdunder) {
-            if let Some(result) = try_call_special(method, &[b, a])? {
-                return Ok(Some(result));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
-        let cmp_dunder = match op {
-            CompareOp::Lt => "__lt__",
-            CompareOp::Le => "__le__",
-            CompareOp::Gt => "__gt__",
-            CompareOp::Ge => "__ge__",
-            CompareOp::Eq => "__eq__",
-            CompareOp::Ne => "__ne__",
-        };
-        let cmp_rdunder = reverse_dunder(cmp_dunder).unwrap_or(cmp_dunder);
-        if let Some(result) = try_compare_override(a, b, cmp_dunder, cmp_rdunder)? {
-            return Ok(result);
-        }
         if is_int_like(a) && is_int_like(b) {
             return match op {
                 CompareOp::Lt => int_lt(a, b),
@@ -2451,9 +2368,6 @@ impl CompareOp {
 pub fn pos(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
-        if let Some(result) = try_unary_override(a, "__pos__") {
-            return result;
-        }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(int_value(a)));
         }
@@ -2483,9 +2397,6 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 pub fn neg(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
-        if let Some(result) = try_unary_override(a, "__neg__") {
-            return result;
-        }
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
             return match v.checked_neg() {
@@ -2520,9 +2431,6 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 pub fn invert(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
-        if let Some(result) = try_unary_override(a, "__invert__") {
-            return result;
-        }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(!int_value(a)));
         }
