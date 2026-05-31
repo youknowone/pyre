@@ -290,6 +290,7 @@ impl Assembler {
                 // lands it must register onto the shared
                 // `BlackholeInterpBuilder.descrs` pool (`blackhole.py:
                 // 102-103 setup_descrs`), not a per-jitcode duplicate.
+                CURRENT_DISPATCH_OP.with(|cur| cur.borrow_mut().replace_range(.., opname));
                 dispatch_op(state, opname, args, result.as_ref());
             }
         }
@@ -1630,10 +1631,27 @@ fn expect_result_reg(result: Option<&Register>, kind: Kind, msg: &str) -> u16 {
     }
 }
 
+thread_local! {
+    /// Opname of the `Insn::Op` currently being lowered by `dispatch_op`,
+    /// so operand-shape panics (`expect_reg` etc.) can name the opcode
+    /// whose operand list violated the assembler's expectation instead
+    /// of forcing the reader to grep the SSARepr for the bad operand.
+    static CURRENT_DISPATCH_OP: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn current_dispatch_op() -> String {
+    CURRENT_DISPATCH_OP.with(|op| op.borrow().clone())
+}
+
 fn expect_reg(op: &Operand, expected: Kind) -> u16 {
     match op {
         Operand::Register(Register { kind, index }) if *kind == expected => *index,
-        _ => panic!("expected Register({:?}, _), got {:?}", expected, op),
+        _ => panic!(
+            "expected Register({:?}, _), got {:?} (op={})",
+            expected,
+            op,
+            current_dispatch_op()
+        ),
     }
 }
 
