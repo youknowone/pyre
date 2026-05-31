@@ -3153,7 +3153,7 @@ fn build_host_class_from_struct(item_struct: &ItemStruct, module_prefix: &str) -
                 continue;
             };
             let field_name = ident.to_string();
-            let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+            let ty = crate::front::syn_metadata::classify_fn_arg_ty(&field.ty);
             stubs.push((field_name, ty));
         }
         if !stubs.is_empty() {
@@ -3754,7 +3754,7 @@ fn pre_register_struct_fields_from_items(items: &[syn::Item], prefix: &str) {
                             continue;
                         };
                         let field_name = ident.to_string();
-                        let ty = crate::front::ast::classify_fn_arg_ty(&field.ty);
+                        let ty = crate::front::syn_metadata::classify_fn_arg_ty(&field.ty);
                         stubs.push((field_name, ty));
                     }
                     if !stubs.is_empty() {
@@ -4184,7 +4184,7 @@ pub fn extract_static_decls(
             segments.push(prefix.to_string());
         }
         segments.push(ident.to_string());
-        let value_type = crate::front::ast::classify_fn_arg_ty(ty);
+        let value_type = crate::front::syn_metadata::classify_fn_arg_ty(ty);
         let const_value = init.and_then(eval_literal_init_to_const_value);
         out.push((segments, value_type, const_value));
     };

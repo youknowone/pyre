@@ -522,7 +522,11 @@ impl<'a> Lowering<'a> {
             let ty = tyref_to_value_type(&local.ty, llbc);
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
-                kind: OpKind::Input { name, ty },
+                kind: OpKind::Input {
+                    name,
+                    ty,
+                    class_root: None,
+                },
             });
             startblock_args.push(var);
         }

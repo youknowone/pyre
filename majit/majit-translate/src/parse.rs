@@ -1682,6 +1682,7 @@ fn synthesize_tail_call_wrapper(
             OpKind::Input {
                 name: pname.clone(),
                 ty: pty,
+                class_root: None,
             },
             true,
         ) {
@@ -1741,6 +1742,7 @@ fn push_dispatcher_inputargs(graph: &mut crate::model::FunctionGraph, sig: &syn:
             OpKind::Input {
                 name: pname.clone(),
                 ty: pty,
+                class_root: None,
             },
             true,
         ) {
