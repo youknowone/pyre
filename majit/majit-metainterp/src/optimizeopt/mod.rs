@@ -8927,10 +8927,10 @@ mod constant_ptr_info_tests {
 
         let parent_box = ctx
             .get_box_replacement_box(parent)
-            .expect("set_ptr_info populated box_pool");
+            .expect("set_ptr_info bound a BoxRef");
         let slice_box = ctx
             .get_box_replacement_box(slice)
-            .expect("set_ptr_info populated box_pool");
+            .expect("set_ptr_info bound a BoxRef");
         assert!(ctx.is_raw_ptr(&parent_box));
         assert!(ctx.is_raw_ptr(&slice_box));
     }
