@@ -1820,7 +1820,22 @@ impl RPythonAnnotator {
         inputcells: &[Option<SomeValue>],
     ) {
         let blk = block.borrow();
-        let oldcells: Vec<SomeValue> = blk.inputargs.iter().map(|a| self.binding(a)).collect();
+        let oldcells: Vec<SomeValue> = blk
+            .inputargs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                self.annotation(a).unwrap_or_else(|| {
+                    panic!(
+                        "KeyError: no binding for arg [mergeinputargs slot={i}/{n} \
+                         block={block_id:?} graph_inputargs_len={ga_len}] {a:?}",
+                        n = blk.inputargs.len(),
+                        block_id = std::ptr::addr_of!(*blk),
+                        ga_len = graph.borrow().getargs().len(),
+                    )
+                })
+            })
+            .collect();
         drop(blk);
 
         // `annrpython.py:432` calls `unionof(c1, c2)` directly —
