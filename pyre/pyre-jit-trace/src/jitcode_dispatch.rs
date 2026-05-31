@@ -5035,6 +5035,29 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
+    walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, false)
+}
+
+/// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py:2599-2603`):
+/// the guards emitted right after a may-force residual call
+/// (`GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) must resume *after* the call.
+/// The call already executed in compiled code and consumed its Python stack
+/// operands; resuming at the call's own opcode would re-execute it from a
+/// coordinate whose stack no longer holds those operands, dropping/duplicating
+/// the side effect (e.g. an in-place `a[i] = a[j]` swap losing one store at a
+/// guard-failure transition).  #124/#281.
+fn walker_capture_snapshot_after_residual_call(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, true)
+}
+
+fn walker_capture_snapshot_for_last_guard_impl(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    after_residual_call: bool,
+) -> Result<(), DispatchError> {
     // A guard whose resume snapshot cannot be built must abort the trace,
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
     // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a
@@ -5122,6 +5145,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(
                 if !jc.payload.code_ptr.is_null() {
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
+                    // after_residual_call=True (`pyjitpl.py:2599-2603`): the
+                    // may-force call already executed in compiled code and
+                    // consumed its Python stack operands.  Resume at the NEXT
+                    // executable opcode so the blackhole continues past the
+                    // call instead of re-executing it from a coordinate whose
+                    // stack no longer holds those operands (which drops/dups
+                    // the side effect, e.g. an in-place list swap store).
+                    if after_residual_call {
+                        py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+                    }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
             };
@@ -5298,16 +5331,16 @@ fn direct_call_release_gil(
     // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
     // diff would run.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_after_residual_call(ctx, pc)?;
     // pyjitpl.py:2082 handle_possible_exception — emits
     // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.  Walker's
-    // `walker_capture_snapshot_for_last_guard` ports
+    // `walker_capture_snapshot_after_residual_call` ports
     // `capture_resumedata(after_residual_call=True)` so the optimizer's
     // `store_final_boxes_in_guard` finds a populated
     // `rd_resume_position`.
     if ei.check_can_raise(false) {
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+        walker_capture_snapshot_after_residual_call(ctx, pc)?;
     }
     Ok(())
 }
@@ -5853,14 +5886,16 @@ fn dispatch_residual_call_iRd_kind(
         // diff would run.
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            walker_capture_snapshot_after_residual_call(ctx, op.pc)?;
         }
         // pyjitpl.py:2082 `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
         // helper raised (pinning the class for guard recovery), else
-        // `GUARD_NO_EXCEPTION`.  `walker_capture_snapshot_for_last_guard`
+        // `GUARD_NO_EXCEPTION`.  `walker_capture_snapshot_after_residual_call`
         // ports `capture_resumedata(after_residual_call=True)`
-        // (`pyjitpl.py:2599-2603`).
+        // (`pyjitpl.py:2599-2603`) so the optimizer's
+        // `store_final_boxes_in_guard` finds a `rd_resume_position`
+        // advanced *past* the call.
         if can_raise {
             walker_abort_if_protected_may_force(code, op, can_raise)?;
             if resid_raised {
@@ -5883,7 +5918,7 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                walker_capture_snapshot_after_residual_call(ctx, op.pc)?;
             }
         }
 
