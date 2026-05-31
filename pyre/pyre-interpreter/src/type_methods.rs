@@ -1522,18 +1522,21 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
         }
     };
-    let encoding = str_arg(
-        pos.get(1)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding")),
-        "utf-8",
-    )?;
-    let errors = str_arg(
-        pos.get(2)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "errors")),
-        "strict",
-    )?;
+    // `encode(encoding=None, errors=None)` — both positional-or-keyword;
+    // the gateway rejects unknown keywords and a value given both ways.
+    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
+    let dual =
+        |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
+            let kw = crate::builtins::kwarg_get(kwargs, name);
+            if p.is_some() && kw.is_some() {
+                return Err(crate::PyError::type_error(format!(
+                    "got multiple values for argument '{name}'"
+                )));
+            }
+            Ok(p.or(kw))
+        };
+    let encoding = str_arg(dual("encoding", pos.get(1).copied())?, "utf-8")?;
+    let errors = str_arg(dual("errors", pos.get(2).copied())?, "strict")?;
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),

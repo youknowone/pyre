@@ -30,3 +30,24 @@ except TypeError as e:
     assert "at most 2 positional arguments" in str(e), str(e)
 
 print("int_from_bytes_kwargs positional-signed rejected")
+
+# Gateway signature enforcement (byteorder='text', signed=bool).
+def _raises(exc, fn):
+    try:
+        fn()
+    except exc:
+        return True
+    raise AssertionError(f"expected {exc.__name__}")
+assert _raises(TypeError, lambda: int.from_bytes(b'\x01', 'big', foo=1))      # unknown kw
+assert _raises(TypeError, lambda: int.from_bytes(b'\x01', 'big', byteorder='little'))  # dup
+assert _raises(TypeError, lambda: int.from_bytes(b'\x01', 123))               # non-str byteorder
+assert _raises(TypeError, lambda: int.from_bytes(b'\x01', byteorder=123))     # non-str kw
+assert _raises(ValueError, lambda: int.from_bytes(b'\x01', 'mid'))            # bad str stays ValueError
+
+# str.encode signature enforcement (encoding=None, errors=None).
+assert _raises(TypeError, lambda: "ab".encode(foo=1))                          # unknown kw
+assert _raises(TypeError, lambda: "ab".encode("utf-8", encoding="ascii"))      # dup
+assert _raises(TypeError, lambda: "ab".encode(123))                            # non-str
+assert "ab".encode(encoding="ascii") == b"ab"
+
+print("int_from_bytes_kwargs enforcement ok")

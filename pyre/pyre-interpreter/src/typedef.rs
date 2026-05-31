@@ -8442,6 +8442,9 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             pos.len() - 1
         )));
     }
+    // `byteorder` and `signed` are the only keywords the gateway signature
+    // accepts; anything else is an unexpected-keyword TypeError.
+    crate::builtins::kwarg_reject_unknown(kwargs, &["byteorder", "signed"], "from_bytes")?;
     let data_obj = pos.get(1).copied().ok_or_else(|| {
         crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
@@ -8462,10 +8465,18 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         v
     };
-    // byteorder: positional `pos[2]` or the `byteorder` keyword, default "big".
-    let byteorder_obj =
-        crate::builtins::kwarg_get(kwargs, "byteorder").or_else(|| pos.get(2).copied());
-    let little_endian = match byteorder_obj {
+    // byteorder is positional-or-keyword; supplying both is an error rather
+    // than the keyword silently winning.
+    let byteorder_kw = crate::builtins::kwarg_get(kwargs, "byteorder");
+    let byteorder_pos = pos.get(2).copied();
+    if byteorder_kw.is_some() && byteorder_pos.is_some() {
+        return Err(crate::PyError::type_error(
+            "got multiple values for argument 'byteorder'",
+        ));
+    }
+    // `byteorder='text'` unwraps through `space.text_w`; a non-str value is a
+    // TypeError, and only a str that is neither 'little'/'big' is a ValueError.
+    let little_endian = match byteorder_pos.or(byteorder_kw) {
         None => false,
         Some(b) if unsafe { pyre_object::is_str(b) } => {
             match unsafe { pyre_object::w_str_get_value(b) } {
@@ -8478,10 +8489,11 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         }
-        Some(_) => {
-            return Err(crate::PyError::value_error(
-                "byteorder must be either 'little' or 'big'",
-            ));
+        Some(b) => {
+            let tname = unsafe { (*(*b).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "expected str, got {tname} object"
+            )));
         }
     };
     let signed = crate::builtins::kwarg_get(kwargs, "signed")
