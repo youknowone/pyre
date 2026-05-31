@@ -595,7 +595,23 @@ impl BoxRef {
     pub fn get_value(&self) -> Option<Value> {
         match &self.0.kind {
             BoxKind::Const { value, .. } => Some(*value),
-            _ => self.0.value.get(),
+            _ => {
+                // The concrete value's canonical host is the bound
+                // `Op`/`InputArg` (`resoperation.py:566 IntOp._resint`).
+                // Prefer it; fall back to the transitional `Box.value`
+                // slot only for boxes not yet bound to their object
+                // (recorder pool entries).
+                if let Some(op) = self.bound_op() {
+                    if let Some(v) = op.get_value() {
+                        return Some(v);
+                    }
+                } else if let Some(ia) = self.bound_inputarg() {
+                    if let Some(v) = ia.get_value() {
+                        return Some(v);
+                    }
+                }
+                self.0.value.get()
+            }
         }
     }
 
@@ -618,6 +634,15 @@ impl BoxRef {
                     self.type_(),
                     v.get_type()
                 );
+                // Stamp the concrete value on the canonical host (the bound
+                // `Op`/`InputArg`, `resoperation.py:566 IntOp._resint`).
+                // Dual-write the transitional `Box.value` slot so boxes not
+                // yet bound to their object keep working.
+                if let Some(op) = self.bound_op() {
+                    op.set_value(v);
+                } else if let Some(ia) = self.bound_inputarg() {
+                    ia.set_value(v);
+                }
                 self.0.value.set(Some(v));
             }
         }
