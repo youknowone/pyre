@@ -563,7 +563,7 @@ fn compare_real_against_legacy(
 /// | `unimplemented operation`                  | Per-opname rtyper handlers.                                                  |
 /// | `variable used before definition`          | Cross-block locals threading.                                                |
 /// | `MissingRTypeAttribute`                    | Typed-Ref → SomeInstance(ClassDef).                                          |
-/// | `KeyError: no binding for arg`             | Annotator per-call coverage.                                                 |
+/// | `KeyError: no binding for arg`             | Rtyper bindingrepr gap on annotation-less Variable (e.g. `current_sp`).      |
 /// | `compute_at_fixpoint failed`               | PBC dispatch / call-family coverage (per-call).                              |
 /// | `post-rtyper jtransform variant`           | Per-variant emit-site retracing (rpbc / rclass / front-end).  Includes `OpKind::Abort` (pyre-only marker; retire every `Expr::ForLoop` / `stop_unsupported` / `continue_with_unknown` emit-site at the front-end). |
 /// | `adapter cross-block body Input`           | Final emit-site retirement.                                                  |
@@ -615,10 +615,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // `None` for it (intentionally fail-loud for "annotation gap"
         // so producers know which slot missed seeding, see
         // `seed_variable` at `flowspace_adapter.rs:96-115`).  Closing
-        // the gap means
-        // tightening the front-end / annotator producers so every
-        // slot has a non-`Unknown` annotation; the gate skips
-        // until then.
+        // the gap means tightening the front-end / annotator
+        // producers so every slot has a non-`Unknown` annotation; the
+        // gate skips until then.  The mergeinputargs-side flavour of
+        // this gap (raising subjects' `follow_raise_link` reaching an
+        // unannotated exceptblock seed) was resolved 2026-05-31 via
+        // `setbinding(Impossible)` pre-registration in
+        // `specialize_legacy_graph_with_registry_returning_value_to_var`;
+        // the remaining producer is the rtyper-side `bindingrepr`
+        // gap on synthesized `current_sp`-like graphs.
         || msg.contains("KeyError: no binding for arg")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
@@ -1373,13 +1378,46 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     // `Variable.concretetype = ExceptionData.lltype_of_exception_*`
     // without reading `Variable.annotation`, so the block needs no
     // `flowin`; it only needs to appear in `annotator.annotated`.
+    //
+    // Additionally, seed each inputarg with a `setbinding`-level
+    // annotation (`Impossible` when none is already present) so that
+    // a raising subject's `follow_raise_link` — which reaches the
+    // same exceptblock via `addpendingblock` with `seen_before=true`
+    // and routes to `mergeinputargs` — does not panic on the unbound
+    // `seed_variable(legacy_v)` inputargs from
+    // `flowspace_adapter.rs:1839`.  `setbinding` widens via the
+    // lattice's `contains` check, so an `Integer`-already-annotated
+    // slot stays `Integer`; a `None`-annotated slot becomes
+    // `Impossible`, which any later `mergeinputargs` widens to the
+    // real cell.  The `annotated[block] = Some(graph)` bare insert
+    // (the next block) keeps the pre-fix `specialize_block` walk
+    // semantic intact — the block is treated as already annotated
+    // and never enters `complete_pending_blocks`.
+    {
+        let blk = exceptblock.borrow();
+        let inputargs: Vec<crate::flowspace::model::Hlvalue> = blk.inputargs.clone();
+        drop(blk);
+        for a in &inputargs {
+            if let crate::flowspace::model::Hlvalue::Variable(v) = a {
+                let needs_seed = v.annotation.borrow().is_none();
+                if needs_seed {
+                    let mut tmp = v.clone();
+                    annotator
+                        .setbinding(&mut tmp, crate::annotator::model::SomeValue::Impossible);
+                }
+            }
+        }
+    }
     {
         let bkey = crate::flowspace::model::BlockKey::of(&exceptblock);
         annotator
             .annotated
             .borrow_mut()
             .insert(bkey.clone(), Some(graph.clone()));
-        annotator.all_blocks.borrow_mut().insert(bkey, exceptblock);
+        annotator
+            .all_blocks
+            .borrow_mut()
+            .insert(bkey, exceptblock.clone());
     }
 
     // Callee blocks are seeded naturally with no explicit pre-seed:
