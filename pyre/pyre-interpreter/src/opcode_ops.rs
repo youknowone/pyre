@@ -46,7 +46,11 @@ pub fn binary_value(
             _ => (None, false),
         };
         if let Some(result) = crate::objspace::descroperation::try_inplace_special(
-            a, b, idunder, rdunder, seq_bug_compat,
+            a,
+            b,
+            idunder,
+            rdunder,
+            seq_bug_compat,
         )? {
             return Ok(result);
         }

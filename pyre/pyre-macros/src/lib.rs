@@ -187,8 +187,14 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             sig_stmts.push(quote! { __b.kwargname = ::std::option::Option::Some(#name_lit); });
             continue;
         }
+        // Only a `&[PyObjectRef]` slice is the raw whole-args passthrough
+        // that suppresses the signature.  A `&[u8]` (or other element type)
+        // is a positioned bytes-like parameter and keeps by-name binding.
         let is_slice = match unwrap_type_group(&pt.ty) {
-            Type::Reference(r) => matches!(unwrap_type_group(&r.elem), Type::Slice(_)),
+            Type::Reference(r) => match unwrap_type_group(&r.elem) {
+                Type::Slice(s) => type_is_py_object_ref(unwrap_type_group(&s.elem)),
+                _ => false,
+            },
             _ => false,
         };
         if is_slice {
@@ -239,9 +245,15 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
 
     let unwrap = unwrap_expr(ty, idx)?;
     // A `&[PyObjectRef]` whole-slice parameter binds the entire `args`
-    // slice — it has no per-slot index to bounds-check.
+    // slice — it has no per-slot index to bounds-check.  Other slice
+    // element types (e.g. `&[u8]`) are positioned params indexing
+    // `args[idx]`, so they keep the missing-argument bounds guard.
     let is_whole_slice = if let Type::Reference(r) = unwrap_type_group(ty) {
-        matches!(&*r.elem, Type::Slice(_))
+        if let Type::Slice(s) = unwrap_type_group(&r.elem) {
+            type_is_py_object_ref(unwrap_type_group(&s.elem))
+        } else {
+            false
+        }
     } else {
         false
     };

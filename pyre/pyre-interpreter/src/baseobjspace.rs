@@ -3088,7 +3088,9 @@ fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
 pub fn c_uint_w(obj: PyObjectRef) -> Result<u32, PyError> {
     let value = uint_w(obj)?;
     if value > u32::MAX as u64 {
-        return Err(PyError::overflow_error("expected an unsigned 32-bit integer"));
+        return Err(PyError::overflow_error(
+            "expected an unsigned 32-bit integer",
+        ));
     }
     Ok(value as u32)
 }
