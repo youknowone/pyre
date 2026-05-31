@@ -5175,7 +5175,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert!(
@@ -5201,7 +5200,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert!(
@@ -5232,7 +5230,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert!(!result.is_empty());
     }
@@ -5256,7 +5253,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
@@ -5283,7 +5279,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),

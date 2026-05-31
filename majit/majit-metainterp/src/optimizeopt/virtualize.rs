@@ -2652,7 +2652,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -2665,7 +2664,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -2685,7 +2683,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -3110,7 +3107,6 @@ mod tests {
             &ops,
             &mut constants,
             3,
-            crate::r#box::BoxPool::new(),
         );
         let jump = result
             .iter()
@@ -3478,7 +3474,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // Forced reconstruction: NEW_ARRAY_CLEAR, 2× SETINTERIORFIELD_GC, CALL_N.
@@ -3561,7 +3556,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
@@ -4024,7 +4018,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert_eq!(
             result.len(),
@@ -4619,7 +4612,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
@@ -4732,7 +4724,6 @@ mod tests {
             &ops,
             &mut constants,
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         let new_positions: Vec<_> = result

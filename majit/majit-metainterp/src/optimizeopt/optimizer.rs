@@ -1841,11 +1841,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(
-            ops,
-            &mut majit_ir::VecAssoc::new(),
-            crate::r#box::BoxPool::new(),
-        )
+        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1862,9 +1858,8 @@ impl Optimizer {
         &mut self,
         ops: &[Op],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
-        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
-        self.optimize_with_constants_and_inputs(ops, constants, 0, box_pool)
+        self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
 
     /// Like `optimize_with_constants`, but also takes `num_inputs` so that
@@ -1880,15 +1875,15 @@ impl Optimizer {
         ops: &[Op],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
         // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
         // fresh `Rc` (the #62 boundary-conversion pattern). The fresh wraps
-        // are not the producers `box_pool` binds to, so `input_ops` is
-        // snapshotted from `box_pool` (`input_ops_from_ops = false`).
+        // are not the canonical producers, so `input_ops` is seeded as empty
+        // here (`input_ops_from_ops = false`); the canonical stores
+        // (`bind_input_resops` / emit) carry identity instead.
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-        self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, box_pool, false)
+        self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, false)
     }
 
     /// `OpRc`-threading entry for callers that hold the canonical
@@ -1903,9 +1898,8 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-        box_pool: crate::r#box::BoxPool,
     ) -> Vec<Op> {
-        self.run_optimize_from_inputs(ops, constants, num_inputs, box_pool, true)
+        self.run_optimize_from_inputs(ops, constants, num_inputs, true)
     }
 
     fn run_optimize_from_inputs(
@@ -1913,7 +1907,6 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-        box_pool: crate::r#box::BoxPool,
         input_ops_from_ops: bool,
     ) -> Vec<Op> {
         // Ensure new ops get positions beyond all original trace positions.
@@ -1933,7 +1926,6 @@ impl Optimizer {
             num_inputs,
             0,
             start_next_pos,
-            box_pool,
             input_ops_from_ops,
         )
     }
@@ -1953,7 +1945,6 @@ impl Optimizer {
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
-        box_pool: crate::r#box::BoxPool,
         input_ops_from_ops: bool,
     ) -> Vec<Op> {
         use majit_ir::OpRef;
@@ -2006,11 +1997,6 @@ impl Optimizer {
         );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
-        // Hand the recorder's BoxRef pool to the OptContext so writes
-        // reach the same `Rc<Box>` allocations the recorder produced.
-        // RPython parity: the optimizer sees the identical AbstractValue
-        // objects flowing in from the tracer.
-        ctx.box_pool = box_pool;
         // Seed the canonical `find_producer_op` surface (`input_ops`) with
         // the input ops' producers so they resolve without the
         // `resolve_to_boxref` `box_pool` tail; `find_producer_op` matches
@@ -3276,7 +3262,6 @@ impl Optimizer {
         // base into `optimize_with_constants_and_inputs_at` so step 3
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
-        box_pool: crate::r#box::BoxPool,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
@@ -3317,12 +3302,10 @@ impl Optimizer {
             .max(bridge_inputarg_base + num_inputs as u32);
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
-        // Bridge `box_pool` is a fresh `TraceIterator`'s planted UNBOUND resop
-        // slots (`bind_input_resops` binds them later, after `input_ops` is
-        // built), so the `box_pool` snapshot would yield an empty `input_ops`
-        // anyway. State that explicitly via an empty seed so the bridge path
-        // does not read `box_pool` to build `input_ops`; producer lookup runs
-        // off `resop_refs` (populated by `bind_input_resops`).
+        // Bridge ops are a fresh `TraceIterator`'s planted UNBOUND resop slots
+        // (`bind_input_resops` binds them later, after `input_ops` is built),
+        // so the input-ops seed is empty; producer lookup runs off `resop_refs`
+        // (populated by `bind_input_resops`).
         self.explicit_input_ops_seed = Some(Vec::new());
         let optimized_ops = self.optimize_with_constants_and_inputs_at(
             &ops_rc,
@@ -3330,7 +3313,6 @@ impl Optimizer {
             num_inputs,
             bridge_inputarg_base,
             start_next_pos,
-            box_pool,
             false,
         );
 
@@ -4854,7 +4836,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -4878,7 +4859,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(
@@ -4931,7 +4911,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         let call_count = result
@@ -5069,7 +5048,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
@@ -5120,7 +5098,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
@@ -5150,7 +5127,6 @@ mod tests {
             &ops,
             &mut constants,
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
@@ -5192,7 +5168,6 @@ mod tests {
             &ops,
             &mut constants,
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result[0].pos.get(), OpRef::int_op(5));
@@ -5223,7 +5198,6 @@ mod tests {
             &ops,
             &mut constants,
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -5248,7 +5222,6 @@ mod tests {
             &ops,
             &mut constants,
             3,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -5274,7 +5247,6 @@ mod tests {
             &ops,
             &mut constants,
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -5316,7 +5288,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
@@ -5339,7 +5310,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             0,
-            crate::r#box::BoxPool::new(),
         );
 
         assert!(
@@ -5389,7 +5359,6 @@ mod tests {
             &ops,
             &mut constants,
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -5460,7 +5429,6 @@ mod tests {
             &ops,
             &mut constants,
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -5513,7 +5481,6 @@ mod tests {
             &ops,
             &mut constants,
             2,
-            crate::r#box::BoxPool::new(),
         );
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
@@ -5583,7 +5550,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         let guard = result
             .iter()
@@ -5657,7 +5623,6 @@ mod tests {
             3,
             0,
             0,
-            crate::r#box::BoxPool::new(),
             false,
         );
 
@@ -5984,7 +5949,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         let guard = result

@@ -1110,7 +1110,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -1455,7 +1454,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         let guard_count = result
             .iter()
@@ -1525,7 +1523,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // GUARD_VALUE should be replaced with GUARD_TRUE

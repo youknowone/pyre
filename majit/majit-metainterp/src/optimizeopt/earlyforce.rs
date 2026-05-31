@@ -131,7 +131,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -152,7 +151,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -173,7 +171,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -196,7 +193,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -221,7 +217,6 @@ mod tests {
                 &ops,
                 &mut majit_ir::VecAssoc::new(),
                 1024,
-                crate::r#box::BoxPool::new(),
             );
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
         }
@@ -242,7 +237,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);

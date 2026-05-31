@@ -3978,7 +3978,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -6086,7 +6085,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         let len_count = result
             .iter()

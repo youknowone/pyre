@@ -523,12 +523,6 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
-    /// Per-iter `BoxRef` pool from the bridge `TraceIterator`, mirroring
-    /// `opencoder.py:259-262`'s fresh `inputarg_from_tp` / `cls()` allocation
-    /// for the bridge's disjoint Box identity set. The optimizer consumes it
-    /// via the `box_pool` parameter on `optimize_bridge` so BoxRef-routing
-    /// readers see the bridge's own boxes, not the parent loop's.
-    box_pool: crate::r#box::BoxPool,
 }
 
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
@@ -614,7 +608,6 @@ fn prepare_bridge_trace_for_optimizer(
         .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.raw()))
         .collect();
     let cache = iter._cache;
-    let box_pool = iter.box_pool;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
     let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
@@ -635,7 +628,6 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_vref_boxes,
         snapshot_frame_pcs,
         pending_bridge_rd,
-        box_pool,
     }
 }
 
@@ -4838,17 +4830,10 @@ impl<M: Clone> MetaInterp<M> {
                         // Forward the recorder's BoxRef pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
                         // the original trace.
-                        let retry_box_pool = trace.box_pool.clone();
-                        // Seed the retry optimizer's `input_ops` so it skips the
-                        // `retry_box_pool` snapshot. `retry_box_pool` is
-                        // `trace.box_pool`, bound to `preamble_data.base.operations()`,
-                        // so those `Rc<Op>` are the same objects the snapshot would
-                        // read. Unlike the loop-finish seed (which uses the pre-cut
-                        // `source_box_pool` and so must gate on the non-cut path),
-                        // `trace.box_pool` already tracks any cut: when `trace` was
-                        // cut, `preamble_data` was built from the cut trace and
-                        // `trace.box_pool` is bound to those cut ops. So the seed is
-                        // equal to the snapshot for both cut and non-cut here.
+                        //
+                        // Seed the retry optimizer's `input_ops` from
+                        // `preamble_data.base.operations()` (the canonical
+                        // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
                         let retry_result =
@@ -4857,7 +4842,6 @@ impl<M: Clone> MetaInterp<M> {
                                     &trace_ops_snapshot,
                                     &mut retry_constants,
                                     num_trace_inputargs,
-                                    retry_box_pool,
                                 )
                             }));
                         match retry_result {
@@ -6377,24 +6361,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // Hand the recorder's BoxRef pool to the optimizer so writes reach
-        // the same `Rc<Box>` allocations. RPython parity: PyPy's
-        // `AbstractValue` objects from tracing flow unchanged into
-        // optimization.
-        let trace_box_pool = trace.box_pool.clone();
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             optimizer.optimize_with_constants_and_inputs_oprc(
-                // `trace.ops` are the canonical `Rc<Op>` the recorder's
-                // `box_pool` binds to (`from_oprc`/`with_box_pool` →
-                // `bind_ops`), so `input_ops` seeds from them without a
-                // `box_pool` snapshot read.
+                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+                // seeds identity directly from them.
                 &trace.ops,
                 &mut constants,
                 trace.inputargs.len(),
-                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -6800,18 +6776,13 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        // Simple-loop path — same recorder BoxRef pool plumb as the
-        // unrolled loop entry above.
-        let trace_box_pool = trace.box_pool.clone();
 
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             optimizer.optimize_with_constants_and_inputs_oprc(
-                // Canonical `Rc<Op>` the recorder's `box_pool` binds to;
-                // `input_ops` seeds from them, no `box_pool` snapshot read.
+                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
                 &trace.ops,
                 &mut constants,
                 num_trace_inputargs,
-                trace_box_pool,
             )
         }));
         let optimized_ops = match optimize_result {
@@ -8746,12 +8717,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        // Per-iter bridge `BoxRef` pool from `prepare_bridge_trace_for_optimizer`'s
-        // `TraceIterator::new` (`opencoder.py:259-262` parity). The bridge
-        // optimizer reads through `BoxRef::_forwarded` for `getptrinfo` /
-        // `getintbound` callsites; the pool must be plumbed through for
-        // those readers to hit non-empty BoxRefs.
-        let bridge_box_pool = prepared.box_pool;
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -8800,10 +8765,9 @@ impl<M: Clone> MetaInterp<M> {
             );
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
                 let value = heap_value_for(ia.tp, raw);
-                let box_ref = bridge_box_pool
-                    .get(ia.opref())
-                    .expect("fresh bridge inputarg BoxRef must exist");
-                box_ref.set_value(value);
+                // Stamp the concrete value on the canonical bridge `InputArg`
+                // identity (`history.py:803 *FrontendOp(pos, value)`).
+                ia.set_value(value);
             }
         }
 
@@ -8826,7 +8790,6 @@ impl<M: Clone> MetaInterp<M> {
                     None,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
-                    bridge_box_pool,
                 )
             }))
         };
@@ -9313,13 +9276,9 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        // Per-iter bridge `BoxRef` pool — see the sibling compile_bridge entry
-        // earlier for the rationale. Both bridge entries (descriptor=None and
-        // descriptor=Some) need the plumb so BoxRef readers stay primary.
-        let bridge_box_pool = prepared.box_pool;
         if let Some(prd) = pending_bridge_rd.as_ref() {
             // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
-            // The concrete values belong on the fresh bridge InputArg boxes
+            // The concrete values belong on the fresh bridge InputArg objects
             // themselves, mirroring `FrontendOp(pos, value)` rather than a
             // side table keyed by OpRef.
             assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
@@ -9330,10 +9289,9 @@ impl<M: Clone> MetaInterp<M> {
                 if tp == Type::Void {
                     continue;
                 }
-                let box_ref = bridge_box_pool
-                    .get(livebox)
-                    .expect("fresh descriptor bridge livebox BoxRef must exist");
-                box_ref.set_value(heap_value_for(tp, raw));
+                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
+                    ia.set_value(heap_value_for(tp, raw));
+                }
             }
         }
         // history.py:220 box.type parity: promote the legacy `i64` pool
@@ -9395,7 +9353,6 @@ impl<M: Clone> MetaInterp<M> {
                     pending_bridge_rd,
                     Some(loop_num_inputs),
                     bridge_inputarg_base,
-                    bridge_box_pool,
                 )
             }))
         };

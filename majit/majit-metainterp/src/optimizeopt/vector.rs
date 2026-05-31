@@ -1827,7 +1827,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert!(!result.is_empty());
     }
@@ -1859,7 +1858,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));
         assert!(result.iter().any(|op| op.opcode == OpCode::Jump));

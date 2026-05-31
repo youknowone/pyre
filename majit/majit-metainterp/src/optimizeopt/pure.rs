@@ -1376,7 +1376,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // Only the first IntAdd should remain.
@@ -1400,7 +1399,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1422,7 +1420,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1444,7 +1441,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1466,7 +1462,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1491,7 +1486,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1512,7 +1506,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1537,7 +1530,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1560,7 +1552,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1583,7 +1574,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1605,7 +1595,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1645,7 +1634,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // All 17 unique ops should be emitted, plus the re-inserted one
@@ -1709,7 +1697,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1729,7 +1716,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1751,7 +1737,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 1);
@@ -1776,7 +1761,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1802,7 +1786,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1834,7 +1817,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // Only the first call should remain, demoted to CallI.
@@ -1864,7 +1846,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1890,7 +1871,6 @@ mod tests {
                 &ops,
                 &mut majit_ir::VecAssoc::new(),
                 1024,
-                crate::r#box::BoxPool::new(),
             );
 
             assert_eq!(result.len(), 1);
@@ -1929,7 +1909,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
@@ -1962,7 +1941,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         assert_eq!(result.len(), 2);
@@ -1990,7 +1968,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
         let result =
-            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
+            opt.optimize_with_constants(&ops, &mut constants);
 
         // IntAdd should be folded away (only Finish remains)
         assert_eq!(result.len(), 1, "IntAdd(3,4) should be constant-folded");
@@ -2016,7 +1994,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
         let result =
-            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
+            opt.optimize_with_constants(&ops, &mut constants);
 
         assert_eq!(result.len(), 1, "IntLt(3,5) should be constant-folded");
     }
@@ -2042,7 +2020,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // First pair stays, second pair CSE'd → 3 ops total
@@ -2073,7 +2050,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure::new()));
         let result =
-            opt.optimize_with_constants(&ops, &mut constants, crate::r#box::BoxPool::new());
+            opt.optimize_with_constants(&ops, &mut constants);
 
         // Both OVF and guard should be folded away
         let ovf_count = result
@@ -2226,7 +2203,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
@@ -2698,7 +2674,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // First COND_CALL_VALUE emitted, second removed by CSE
@@ -2727,7 +2702,6 @@ mod tests {
             &ops,
             &mut constants,
             1,
-            crate::r#box::BoxPool::new(),
         );
 
         assert!(result.is_empty());

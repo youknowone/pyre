@@ -4552,7 +4552,6 @@ mod tests {
             &ops,
             &mut constants,
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();

@@ -786,19 +786,6 @@ pub struct OptContext {
     /// ops as `Vec<OpRc>`, this is populated from that directly instead of
     /// from `box_pool`.
     pub(crate) input_ops: Vec<majit_ir::OpRc>,
-    /// Per-position BoxRef pool for the input ops being
-    /// optimized. `box_pool[i]` mirrors the `AbstractValue` for the
-    /// trace position whose `OpRef::raw() == i` (recorder issuance order:
-    /// inputargs first, then ops). Empty when the optimizer is invoked
-    /// without an upstream recorder pool (tests, retrace helpers).
-    ///
-    /// RPython parity: PyPy's `_forwarded` slot lives on the `Box`
-    /// object itself, so the optimizer just calls
-    /// `box.set_forwarded(target)` directly. The Rust pool gives the
-    /// optimizer the same per-position object access that RPython gets
-    /// for free from object identity. PtrInfo / IntBound / forwarding
-    /// state is carried by the BoxRef `_forwarded` slot.
-    pub(crate) box_pool: crate::r#box::BoxPool,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -1606,7 +1593,6 @@ impl OptContext {
             input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: crate::r#box::BoxPool::new(),
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
@@ -1646,35 +1632,23 @@ impl OptContext {
         let num_inputs = inputarg_types.len();
         let mut ctx =
             Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32);
-        let mut seed = crate::r#box::BoxPool::with_capacity(inputarg_types.len());
-        let mut refs: Vec<majit_ir::InputArgRc> = Vec::with_capacity(inputarg_types.len());
-        for (i, &tp) in inputarg_types.iter().enumerate() {
-            let b = crate::r#box::BoxRef::new_inputarg(tp, i as u32);
-            // Bind each seeded BoxRef to a fresh `InputArgRc` so the
-            // optimizer's `make_equal_to` routes a chain step that
-            // targets one of these BoxRefs through
-            // `Forwarded::InputArg(_)`, matching the production
-            // recorder→TreeLoop handoff invariant
-            // (`BoxPool::bind_inputargs`). The strong `InputArgRc`s
-            // are stashed in `ctx.inputarg_refs` so the bound
-            // `Weak<InputArg>` stays upgradable for the OptContext's
-            // lifetime.
-            let ia = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32));
-            b.bind_inputarg(&ia);
-            seed.push(b);
-            refs.push(ia);
-        }
-        ctx.box_pool = seed;
-        ctx.inputarg_refs = refs;
-        // Mirror the production wiring at `setup_optimizations`
-        // (optimizer.rs `ctx.inputargs = self.trace_inputargs.clone()`):
-        // seed `ctx.inputargs` in lockstep with the `box_pool` so the
-        // typed-Box parity contract holds — strict accessors like
-        // `inputarg_type_at_strict` (and `inputarg_type_at`) return
-        // `Some(tp)` matching `box.type` for slot i. Test fixtures that
-        // call `with_inputarg_types` no longer need to set `inputargs`
-        // separately. Each entry is `OpRef::input_arg_typed(i, tp)` so
-        // the variant tag IS the type (resoperation.py:719/727/739).
+        // Seed a fresh canonical `InputArgRc` per slot so the optimizer's
+        // `make_equal_to` routes an InputArg-targeted chain step through
+        // `Forwarded::InputArg(_)` (`optimizer.py:394 op.set_forwarded(newop)`).
+        // The strong `InputArgRc`s are stashed in `ctx.inputarg_refs` so the
+        // `Weak<InputArg>` each bound box later carries stays upgradable for
+        // the OptContext's lifetime. Production traces own these via
+        // `TreeLoop.inputargs`; this test-and-fallback helper has no upstream
+        // `TreeLoop`.
+        ctx.inputarg_refs = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)))
+            .collect();
+        // Seed `ctx.inputargs` so strict accessors like
+        // `inputarg_type_at_strict` return `Some(tp)` matching slot i. Each
+        // entry is `OpRef::input_arg_typed(i, tp)` so the variant tag IS the
+        // type (resoperation.py:719/727/739).
         ctx.inputargs = majit_ir::OpRef::inputarg_refs(inputarg_types);
         ctx
     }
@@ -2115,7 +2089,6 @@ impl OptContext {
             input_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: crate::r#box::BoxPool::new(),
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,

@@ -477,8 +477,7 @@ impl UnrollOptimizer {
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
-        let result =
-            optimizer.optimize_with_constants(ops, constants, crate::r#box::BoxPool::new());
+        let result = optimizer.optimize_with_constants(ops, constants);
         let sp = crate::optimizeopt::shortpreamble::extract_short_preamble(&result);
         if !sp.is_empty() {
             self.short_preamble = Some(sp);
@@ -675,12 +674,8 @@ impl UnrollOptimizer {
                 if let Some(seed) = &self.phase2_input_ops_seed {
                     opt_p1.explicit_input_ops_seed = Some(seed.clone());
                 }
-                let p1_ops = opt_p1.optimize_with_constants_and_inputs(
-                    &p1_ops_in,
-                    &mut consts_p1,
-                    num_inputs,
-                    p1_iter.box_pool.clone(),
-                );
+                let p1_ops =
+                    opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
                 // RPython parity: Phase 1 optimizer may discover new constants
                 // via make_constant (e.g., constant-folded heap reads, guard
                 // class pointers). These live on the BoxRef forwarded chain
@@ -779,29 +774,12 @@ impl UnrollOptimizer {
                         };
                         final_exported_state.root_all_gcrefs();
                         self.final_exported_state = Some(final_exported_state);
-                        // Codex plan step 3: snapshot Phase 1 emit-op slice as
-                        // Rc::clone vector. Phase 2's TraceIterator embeds these
-                        // BoxRefs at its placeholder prefix `[num_inputs..end)`
-                        // so chain walks via `Forwarded::Box(rc)` observe Phase 1's
-                        // accumulated `_forwarded` info naturally — `unroll.py`
-                        // Phase 2 reading Phase 1 box._forwarded through shared
-                        // Python identity parity. After Phase 1 finishes Phase 2
-                        // is the sole writer of these Rcs (audit memo Risk 1).
-                        //
-                        // Slice end is `box_pool.len()` to cover the full Phase 1
-                        // allocation high water — Phase 2's `next_global_opref` is
-                        // `max(next_pos, p1_iter_fresh_hw)` which can exceed
-                        // `next_pos` when Phase 1 dropped/folded ops (the iterator
-                        // advanced `_fresh` past those positions while
-                        // `OptContext::next_pos` only counts `new_operations`).
-                        // `p1_iter.box_pool` was threaded into
-                        // `optimize_with_constants_and_inputs` so `final_ctx.box_pool` carries
-                        // the iterator's full allocation range; transferring up to
-                        // `box_pool.len()` ensures Phase 2 chain walks observe the
-                        // real Phase 1 BoxRefs at every reachable position rather
-                        // than Type::Void placeholders.
-                        let p1_full_prefix: Option<crate::r#box::BoxPool> =
-                            opt_p1.final_ctx.as_ref().map(|c| c.box_pool.clone());
+                        // Phase 2's TraceIterator no longer needs a Phase 1
+                        // BoxRef prefix: the iterator's box_pool is a dead
+                        // structural carrier (its slots are never read — the
+                        // optimizer resolves identity via `resop_refs` /
+                        // `inputarg_refs` and forwarding via `Op`/`InputArg`).
+                        let p1_full_prefix: Option<crate::r#box::BoxPool> = None;
                         (state, consts_p1, p1_ops, p1_full_prefix)
                     }
                     None => {
@@ -1088,10 +1066,9 @@ impl UnrollOptimizer {
                 body_num_inputs,
                 phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
                 p2_high_water,
-                iter.box_pool.clone(),
-                // Phase 2 ops are fresh-Rc `TraceIterator` wraps; when no
-                // explicit seed was threaded, `input_ops` snapshots from the
-                // Phase-1-prefix-bound `box_pool`.
+                // Phase 2 ops are fresh-Rc `TraceIterator` wraps; with no
+                // explicit seed threaded, `input_ops` stays empty and identity
+                // comes from `bind_input_resops` / emit.
                 false,
             )
         });
@@ -5423,7 +5400,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         )
     }
 
@@ -5974,7 +5950,6 @@ mod tests {
             &ops,
             &mut majit_ir::VecAssoc::new(),
             1024,
-            crate::r#box::BoxPool::new(),
         );
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
