@@ -1325,13 +1325,18 @@ mod tests {
         let next = graph.new_block(vec![vn.into()]);
         // `next` carries a real op so it is NOT itself an empty forwarder
         // (otherwise the faithful pass would collapse it too).
-        push_op(&next, SpaceOperation::new("keep_alive", vec![vn.into()], None, -1));
+        push_op(
+            &next,
+            SpaceOperation::new("keep_alive", vec![vn.into()], None, -1),
+        );
 
         start.closeblock(vec![
             Link::new(vec![Constant::signed(7).into()], Some(empty.clone()), None).into_ref(),
         ]);
         let empty_arg = empty.borrow().inputargs[0].clone();
-        empty.closeblock(vec![Link::new(vec![empty_arg], Some(next.clone()), None).into_ref()]);
+        empty.closeblock(vec![
+            Link::new(vec![empty_arg], Some(next.clone()), None).into_ref(),
+        ]);
         next.closeblock(vec![
             Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),
         ]);

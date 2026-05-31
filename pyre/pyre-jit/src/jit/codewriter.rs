@@ -757,8 +757,10 @@ impl SpamBlockRef {
         if n < 2 {
             return false;
         }
-        let tail_unreachable =
-            matches!(b.per_block_ssarepr[n - 1], super::flatten::Insn::Unreachable);
+        let tail_unreachable = matches!(
+            b.per_block_ssarepr[n - 1],
+            super::flatten::Insn::Unreachable
+        );
         let tail_goto = matches!(
             &b.per_block_ssarepr[n - 2],
             super::flatten::Insn::Op { opname, args, .. }
