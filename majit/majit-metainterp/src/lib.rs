@@ -72,7 +72,10 @@ pub use jitcode::{
     BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, insns,
     live_slots_for_state_field_jit,
 };
-pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
+pub use jitdriver::{
+    trace_continuation_suspended, DeclarativeJitDriver, JitDriver, JitDriverStaticData,
+    TraceContinuationSuspendGuard,
+};
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted

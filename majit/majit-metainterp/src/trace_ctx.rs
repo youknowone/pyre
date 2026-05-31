@@ -1236,6 +1236,22 @@ impl TraceCtx {
         }
     }
 
+    /// Like [`Self::set_opref_concrete`] but returns `false` instead of
+    /// panicking when no frontend op/inputarg is recorded at `opref`'s
+    /// position.  The full-body walker's speculative residual-call
+    /// execution (`try_execute_residual_call_via_walker`) can compute a
+    /// concrete for an OpRef recorded in a context whose op was not
+    /// allocated in the active recorder (a deeper inlined / recursive
+    /// frame's result).  Leaving that result symbolic makes the downstream
+    /// branch abort the trace into the trait fallback rather than crash
+    /// the tracer.
+    pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
+        if opref.is_constant() {
+            return true;
+        }
+        self.recorder.set_concrete_at(opref.raw(), concrete)
+    }
+
     /// `BoxRef::get_value` reader — the concrete value stamped onto
     /// this OpRef's frontend value slot (`history.py:803 *FrontendOp(pos,
     /// value)` analog).  `None` if never stamped — RPython equivalent:
@@ -1870,6 +1886,18 @@ impl TraceCtx {
     /// for vref.  Empty vectors when neither a virtualizable nor any
     /// virtualref is live (matches RPython's `_list_of_boxes_virtualizable`
     /// / `_list_of_boxes` returning a 0-length array).
+    /// Walker precondition for [`Self::build_snapshot_vable_vref_boxes`]:
+    /// every virtualizable box (including the identity at `[-1]`) must carry
+    /// `OpRef::ty()` — the invariant [`crate::pyjitpl::build_vable_snapshot_boxes`]
+    /// enforces by panicking.  A deeper inlined / recursive frame can leave
+    /// the identity box untyped, so the full-body walker calls this before
+    /// recording a guard snapshot and aborts the trace into the trait
+    /// fallback instead of tripping the panic.
+    pub fn vable_snapshot_buildable(&self) -> bool {
+        let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        vable_slice.iter().all(|op| op.ty().is_some())
+    }
+
     pub fn build_snapshot_vable_vref_boxes(
         &self,
     ) -> (

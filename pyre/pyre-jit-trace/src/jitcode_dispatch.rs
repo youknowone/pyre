@@ -911,6 +911,15 @@ pub enum DispatchError {
     /// a handler (e.g. `math.sqrt` in nbody) never deopt into a handler
     /// and are unaffected.
     MayForceProtectedByExceptionHandlerUnsupported { pc: usize },
+    /// A walker-emitted guard needs a resume snapshot, but the live
+    /// virtualizable box list carries an untyped entry (typically the
+    /// identity box `[-1]` of a deeper inlined / recursive frame). Building
+    /// the snapshot would trip the `build_vable_snapshot_boxes`
+    /// `OpRef::ty()` invariant. The full-body walk surfaces a typed abort so
+    /// the driver maps it to `TraceAction::Abort` → trait fallback instead
+    /// of panicking the tracer. Resuming such a guard needs the multi-frame
+    /// vable snapshot machinery (task #124).
+    GuardSnapshotVableUntyped { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
     ///
@@ -1721,7 +1730,7 @@ fn dispatch_switch_id(
             let expected = ctx.trace_ctx.const_int(search_value);
             ctx.trace_ctx
                 .record_guard(OpCode::GuardValue, &[valuebox, expected], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             ctx.trace_ctx.replace_box(valuebox, expected);
             for slot in ctx.registers_i.iter_mut() {
                 if *slot == valuebox {
@@ -1751,7 +1760,7 @@ fn dispatch_switch_id(
                     .set_opref_concrete(eqbox, majit_ir::Value::Int((v == key) as i64));
             }
             ctx.trace_ctx.record_guard(OpCode::GuardFalse, &[eqbox], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -3201,7 +3210,7 @@ fn ref_guard_value_record(
     let expected = ctx.trace_ctx.const_ref(ptr as usize as i64);
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     ctx.trace_ctx.replace_box(value, expected);
     for slot in ctx.registers_r.iter_mut() {
         if *slot == value {
@@ -3874,7 +3883,13 @@ fn try_fold_pure_call_via_executor(
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return,
     };
-    ctx.trace_ctx.set_opref_concrete(recorded, result_value);
+    // Stamp only when the recorded result has a live BoxPool slot.  A deeper
+    // inlined / recursive frame's residual result may be recorded in a
+    // context whose Box is not allocated in the active recorder; stamping it
+    // would violate the `*FrontendOp(pos, value)` invariant.  Skipping leaves
+    // the result symbolic so the downstream branch aborts the trace into the
+    // trait fallback instead of crashing.
+    ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
 }
 
 /// Abort the walk when a result-bearing may-force CALL is recorded with a
@@ -3958,18 +3973,14 @@ fn walker_abort_if_protected_may_force(
         if !sym.jitcode.is_null() {
             let jc = unsafe { &*sym.jitcode };
             if !jc.payload.code_ptr.is_null() {
-                let py_pc = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op.pc);
-                let pycode = unsafe { &*jc.payload.code_ptr };
-                let protected = pyre_interpreter::exception_table::lookup_exceptiontable(
-                    &pycode.exceptiontable,
-                    py_pc * 2,
-                )
-                .is_some();
-                return if protected {
-                    Err(DispatchError::MayForceProtectedByExceptionHandlerUnsupported { pc: op.pc })
-                } else {
-                    Ok(())
-                };
+                // Full-body walk: a protected may-force call no longer aborts.
+                // Its `GUARD_NO_EXCEPTION` deopt routes into an exception
+                // handler whose bridge re-trace is seeded with the runtime
+                // standing exception at `run_perfn_walk` entry (#51c bridge
+                // handler-resume seeding), so the handler body's
+                // `last_exc_value` / `catch_exception` reads resolve instead
+                // of baking NULL.  Walk it like any other may-force call.
+                return Ok(());
             }
         }
     }
@@ -3988,6 +3999,113 @@ fn walker_abort_if_protected_may_force(
 /// exception handler the walk cannot yet resume.
 fn jitcode_has_exception_handler(code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+}
+
+/// Deferred void-residual-store accounting for the authoritative full-body
+/// walk (#63 / #124 loop-close boundary).
+///
+/// A void may-force call (`STORE_SUBSCR` / `list.__setitem__` etc.) is not
+/// executed eagerly during the walk: the compiled loop re-runs the traced
+/// iteration's body, so eager execution double-applies the side effect to the
+/// live heap (#61).  But that re-run only covers stores that live in the body
+/// of the loop that actually *closes*.  When a store lives in an *enclosing*
+/// scope relative to the closing loop — e.g. the outer `result[i] = s` of a
+/// nested loop whose inner loop is the hot one — the compiled (inner) loop
+/// starts at the next outer iteration and never re-runs that store, so leaving
+/// it to the loop drops it exactly once at the trace-compilation transition.
+///
+/// To commit such a store exactly once (not 0×, not 2×) the walk records an
+/// ordered event log: each skipped void store, and each `jit_merge_point` that
+/// *registers* a loop (does not close) with its loop-header Python pc.  At the
+/// primary loop close (header pc `H`) the log is drained back-to-front: a store
+/// is committed iff a later-in-time merge registered an *enclosing* loop
+/// (`header_py_pc < H`, i.e. textually-earlier / outer), which proves the
+/// closing loop's body does not contain the store.  Stores with no intervening
+/// enclosing register are dropped (the compiled loop re-runs them, #61).
+enum VoidDeferEvent {
+    Store { func_ptr: i64, args: Vec<i64> },
+    Register { loop_header_py_pc: usize },
+}
+
+thread_local! {
+    static VOID_DEFER_LOG: std::cell::RefCell<Vec<VoidDeferEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Maps a freshly-boxed `W_Bool` opref (the `jit_bool_value_from_truth(t)`
+/// result a compare specialization writes to the value-stack slot) back to its
+/// raw truth Int opref `t` (#62).  The `COMPARE_OP` specialization boxes the
+/// `int_lt`/… result because the generic `compare` helper returns a Ref, but
+/// the immediately-following `POP_JUMP_IF_*` lowers to an `is_true` residual
+/// (`residual_call_r_i`) that unboxes it straight back to an Int for the
+/// branch.  That box→stack→unbox round-trip is pure overhead the trait path
+/// never emits (it branches on the raw compare result).  When the `is_true`
+/// residual's Ref arg is a mapped boxed bool we fold its result to the raw
+/// truth Int (bool→int is value-preserving), eliding the may-force unbox; the
+/// now-dead box + stack store are then DCE'd by the optimizer.
+thread_local! {
+    static BOOL_BOX_TRUTH: std::cell::RefCell<Vec<(OpRef, OpRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn bool_box_truth_record(boxed: OpRef, truth: OpRef) {
+    BOOL_BOX_TRUTH.with(|m| m.borrow_mut().push((boxed, truth)));
+}
+
+/// If `boxed` is a recorded freshly-boxed bool, return its raw truth Int opref.
+fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
+    BOOL_BOX_TRUTH.with(|m| {
+        m.borrow()
+            .iter()
+            .rev()
+            .find(|(b, _)| *b == boxed)
+            .map(|(_, t)| *t)
+    })
+}
+
+/// Clear the deferred-void-store log at the start of an authoritative walk so a
+/// prior aborted walk's events never leak into the next one.
+pub fn void_defer_reset() {
+    VOID_DEFER_LOG.with(|log| log.borrow_mut().clear());
+    BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
+}
+
+fn void_defer_push_store(func_ptr: i64, args: Vec<i64>) {
+    VOID_DEFER_LOG.with(|log| {
+        log.borrow_mut()
+            .push(VoidDeferEvent::Store { func_ptr, args })
+    });
+}
+
+fn void_defer_push_register(loop_header_py_pc: usize) {
+    VOID_DEFER_LOG.with(|log| {
+        log.borrow_mut()
+            .push(VoidDeferEvent::Register { loop_header_py_pc })
+    });
+}
+
+/// Drain the log at the primary loop close with closing-loop header pc
+/// `closing_header_py_pc`, committing exactly the stores whose iteration the
+/// compiled loop will not re-run (see [`VoidDeferEvent`]).  Clears the log.
+pub fn void_defer_commit_at_close(closing_header_py_pc: usize) {
+    VOID_DEFER_LOG.with(|log| {
+        let events = std::mem::take(&mut *log.borrow_mut());
+        let mut enclosing_register_seen = false;
+        for event in events.into_iter().rev() {
+            match event {
+                VoidDeferEvent::Register { loop_header_py_pc } => {
+                    if loop_header_py_pc < closing_header_py_pc {
+                        enclosing_register_seen = true;
+                    }
+                }
+                VoidDeferEvent::Store { func_ptr, args } => {
+                    if enclosing_register_seen {
+                        majit_metainterp::call_void_function(func_ptr as *const (), &args);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py:1346/1349/1354) port
@@ -4060,14 +4178,18 @@ fn jitcode_has_exception_handler(code: &[u8]) -> bool {
 /// * `None` — fold declined (preconditions not met: not the
 ///   authoritative executor, opcode out of set, funcbox non-const, arity
 ///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
-///   `box_value`, or any Ref arg is NULL).
+///   `box_value`, or any Ref arg is NULL), or the call's result is void
+///   and was routed into the deferred-store log ([`VoidDeferEvent`]).
 ///   The trace still has the recorded call op for the optimizer to
 ///   consume later; walker falls through as if this function did not
 ///   exist.
 ///
-/// Invoked from all three residual-call dispatch entry points alongside
-/// [`try_fold_pure_call_via_executor`].  Raised exceptions are propagated
-/// through `WalkContext.last_exc_value`.
+/// **Wire status** (Task #390 sub-slice 2.3): invoked from all three
+/// dispatch entry points (`dispatch_residual_call_iRd_kind`,
+/// `dispatch_residual_call_iIRd_kind`, `dispatch_residual_call_iIRFd_kind`)
+/// alongside [`try_fold_pure_call_via_executor`].  The may-force /
+/// can-raise path wires the `Err` exception through
+/// `WalkContext.last_exc_value`.
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -4120,17 +4242,6 @@ fn try_execute_residual_call_via_executor(
     // implicitly requires constness too (residual_call descrs always
     // carry a fixed funcptr at translation time).
     if !allboxes[0].is_constant() {
-        return None;
-    }
-    // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
-    // carry no value the walk needs to specialize on — the only reason to run
-    // one would be its side effect.  But the walk traces the loop body that
-    // the loop itself re-executes (interpreted tier-1 then compiled), so
-    // committing the side effect here double-applies it to the live heap
-    // (`xs[j] = xs[j] + i` lands twice → the traced iteration is counted
-    // twice).  The trait tracer records these symbolically and never touches
-    // the real heap; mirror that by leaving the side effect to the loop.
-    if call_descr.result_type() == majit_ir::Type::Void {
         return None;
     }
     // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
@@ -4200,8 +4311,31 @@ fn try_execute_residual_call_via_executor(
             return None;
         }
     }
-    let exec_result =
-        majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
+    // Void-result calls (STORE_SUBSCR / list.append / dict.__setitem__ etc.)
+    // carry no value the walk specializes on — only their side effect.  Do not
+    // execute eagerly: the compiled loop re-runs the traced iteration's body,
+    // so eager execution double-applies the heap mutation (#61, `xs[j] = …`
+    // landing twice).  Instead record the store in the deferred log; at the
+    // primary loop close it is committed exactly once if-and-only-if the
+    // closing loop's body does not contain it (an enclosing scope, e.g. the
+    // outer `result[i] = s` of a nested loop), and dropped otherwise (the
+    // compiled loop re-runs it).  See [`VoidDeferEvent`] / #63.
+    if call_descr.result_type() == majit_ir::Type::Void {
+        void_defer_push_store(func_ptr, args);
+        return None;
+    }
+    // A Python-level callee (e.g. a recursive `fib`) re-enters the
+    // interpreter (`eval_loop_jit` → `jit_merge_point`) while this walk still
+    // holds the driver in the tracing state.  Suspend re-entrant trace
+    // continuation for the duration of the concrete call so the callee runs as
+    // plain interpretation instead of starting a nested trace that would share
+    // and corrupt this walk's `TraceCtx` (flaky `libsystem_malloc` freelist
+    // abort during deep recursion).  Plain C-helper callees never re-enter, so
+    // the guard is a no-op for them.
+    let exec_result = {
+        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
+        majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
+    };
     match exec_result {
         Ok(result_i64) => {
             // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
@@ -4221,8 +4355,8 @@ fn try_execute_residual_call_via_executor(
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
-            // value.  Void callees do not stamp (no result to record); the
-            // heap mutation has already happened via `call_void_function`.
+            // value.  Void results were deferred above (`void_defer_push_store`)
+            // and never reach this arm; the case is kept for exhaustiveness.
             match call_descr.result_type() {
                 majit_ir::Type::Int => {
                     ctx.trace_ctx
@@ -4897,7 +5031,19 @@ fn resolve_branch_target_through_trampoline(code: &[u8], mut target: usize) -> u
     target
 }
 
-pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '_>, op_pc: usize) {
+pub(crate) fn walker_capture_snapshot_for_last_guard(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    // A guard whose resume snapshot cannot be built must abort the trace,
+    // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
+    // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a
+    // deeper inlined / recursive frame can leave the identity untyped.
+    // Surface a typed abort → trait fallback rather than tripping the
+    // invariant panic (the multi-frame vable snapshot is task #124).
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
+    }
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py:2582-2603 generate_guard` + `capture_resumedata`):
     //
@@ -4959,7 +5105,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode.is_null() {
-            let (py_pc, jitcode_index) = unsafe {
+            let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, op_pc);
                 // The inverse-`pc_map` can land on a Python trivia
@@ -4977,7 +5123,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
                 }
-                (py, jc.index as u32)
+                (py, jc.index as u32, jc.payload.metadata.pc_map.len())
+            };
+            // #67/#124: synthetic loop-close guard pc overshoots past the last
+            // Python opcode → resume at the trace's entry py (loop header).
+            let py_pc = if py_pc as usize >= num_instrs {
+                ctx.entry_py_pc
+            } else {
+                py_pc
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -4996,7 +5149,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
                     &vable_boxes,
                     &vref_boxes,
                 );
-            return;
+            return Ok(());
         }
     }
 
@@ -5011,6 +5164,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(ctx: &mut WalkContext<'_, '
             &vable_boxes,
             &vref_boxes,
         );
+    Ok(())
 }
 
 /// Walker-side port of `pyjitpl.py:2156-2168 handle_possible_exception`'s
@@ -5144,7 +5298,7 @@ fn direct_call_release_gil(
     // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
     // diff would run.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
     // pyjitpl.py:2082 handle_possible_exception — emits
     // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.  Walker's
     // `walker_capture_snapshot_for_last_guard` ports
@@ -5153,7 +5307,7 @@ fn direct_call_release_gil(
     // `rd_resume_position`.
     if ei.check_can_raise(false) {
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, pc);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     Ok(())
 }
@@ -5543,6 +5697,32 @@ fn dispatch_residual_call_iRd_kind(
     // recording `CALL_MAY_FORCE_*`.
     do_jit_force_virtual_guard(ei, op.pc)?;
 
+    // #62: `is_true(box_bool(t))` -> `t` fold.  A `POP_JUMP_IF_*` lowers to an
+    // `is_true` residual (`residual_call_r_i`, Int result) whose sole Ref arg
+    // is the boxed bool a preceding COMPARE specialization produced.  Folding
+    // it to the raw truth Int elides the may-force unbox (and lets the dead box
+    // + value-stack store DCE), matching the trait path's branch-on-raw-compare
+    // behaviour.  bool->int is value-preserving so the fold is sound.  Consume
+    // the map entry so a later genuine use of the same box is not mis-folded.
+    if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
+        if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+
+    // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
+    // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
+    // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
+    // iteration.  Falls through to the generic residual otherwise (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'v'
+        && ei.oopspecindex == majit_ir::OopSpecIndex::StoreSubscr
+        && try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
     // pair, route through `direct_call_release_gil` which records
@@ -5673,7 +5853,7 @@ fn dispatch_residual_call_iRd_kind(
         // diff would run.
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         // pyjitpl.py:2082 `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
@@ -5703,7 +5883,7 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             }
         }
 
@@ -5923,23 +6103,23 @@ fn walker_unbox_int(
     op_pc: usize,
     obj: OpRef,
     int_type_addr: i64,
-) -> OpRef {
+) -> Result<OpRef, DispatchError> {
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(int_type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(obj, int_type_addr);
     }
-    crate::generated::trace_unbox_int(
+    Ok(crate::generated::trace_unbox_int(
         ctx.trace_ctx,
         obj,
         int_type_addr,
         crate::descr::ob_type_descr(),
         crate::descr::int_intval_descr(),
-    )
+    ))
 }
 
 /// Walker-native unbox of a boxed `W_FloatObject` operand: the float
@@ -5952,23 +6132,23 @@ fn walker_unbox_float(
     op_pc: usize,
     obj: OpRef,
     float_type_addr: i64,
-) -> OpRef {
+) -> Result<OpRef, DispatchError> {
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(float_type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(obj, float_type_addr);
     }
-    crate::generated::trace_unbox_float(
+    Ok(crate::generated::trace_unbox_float(
         ctx.trace_ctx,
         obj,
         float_type_addr,
         crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
-    )
+    ))
 }
 
 /// Coerce a boxed operand to a raw `f64` OpRef for a float op: float →
@@ -5982,18 +6162,18 @@ fn walker_coerce_operand_to_float(
     obj: OpRef,
     is_int: bool,
     val: f64,
-) -> OpRef {
+) -> Result<OpRef, DispatchError> {
     let raw = if is_int {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        let raw_int = walker_unbox_int(ctx, op_pc, obj, int_type_addr);
+        let raw_int = walker_unbox_int(ctx, op_pc, obj, int_type_addr)?;
         ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
     } else {
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-        walker_unbox_float(ctx, op_pc, obj, float_type_addr)
+        walker_unbox_float(ctx, op_pc, obj, float_type_addr)?
     };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(val));
-    raw
+    Ok(raw)
 }
 
 /// Emit a walker-native guard (`record_guard` + the walker snapshot for
@@ -6004,9 +6184,9 @@ fn walker_emit_guard_with_snapshot(
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
-) {
+) -> Result<(), DispatchError> {
     ctx.trace_ctx.record_guard(opcode, args, 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
 /// Record `int_eq(raw, const k)` and stamp its already-known concrete
@@ -6138,8 +6318,8 @@ fn try_walker_specialize_binary_op_int(
     }
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr);
-    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr);
+    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
     let (raw_result, concrete_value) = match op_code {
         OpCode::IntFloorDiv | OpCode::IntMod => {
             // rint.py:429/520 _ovf_zer guards: int_eq(rhs,0)→guard_false +
@@ -6147,7 +6327,7 @@ fn try_walker_specialize_binary_op_int(
             // helper call (so a re-used trace bails before the helper's
             // wrapping_div / wrapping_rem returns a wrap value).
             let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, (rb == 0) as i64);
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero]);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
             let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
             let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
             let ovf_both = ctx.trace_ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
@@ -6155,7 +6335,7 @@ fn try_walker_specialize_binary_op_int(
                 ovf_both,
                 majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
             );
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both]);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])?;
             // jtransform.py:576-577 OS_INT_PY_DIV / OS_INT_PY_MOD elidable
             // residual call (call_typed_with_effect_pure → CallI patched via
             // record_result_of_call_pure).
@@ -6196,7 +6376,7 @@ fn try_walker_specialize_binary_op_int(
     ctx.trace_ctx
         .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
     if has_overflow {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[]);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
     }
     let boxed = crate::state::wrapint(ctx.trace_ctx, raw_result);
     ctx.trace_ctx.set_opref_concrete(
@@ -6250,8 +6430,8 @@ fn try_walker_specialize_compare_op_int(
 
     // --- emit the specialized IR (walker-native) ---
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr);
-    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr);
+    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
@@ -6264,6 +6444,9 @@ fn try_walker_specialize_compare_op_int(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
+    // #62: remember boxed→truth so an immediately-following `is_true` residual
+    // (POP_JUMP_IF_*) folds back to the raw Int instead of may-force-unboxing.
+    bool_box_truth_record(boxed, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
@@ -6315,8 +6498,8 @@ fn try_walker_specialize_binary_op_float(
     };
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64);
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64);
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64)?;
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64)?;
     let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
     let bits =
         majit_metainterp::eval_binop_f(op_code, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
@@ -6330,6 +6513,283 @@ fn try_walker_specialize_binary_op_float(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #62: walker-native speculative specialization for the `BINARY_SUBSCR`
+/// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
+/// `generated_binary_subscr_value` → `generated_list_getitem_by_strategy`
+/// for the int- and float-storage list strategies with a non-negative
+/// concrete index: `guard_class LIST` + `guard_value(strategy)` + unbox
+/// index + `IntLt` bounds guard + raw-array getitem, then `wrapint` /
+/// `wrapfloat` to rebox for the Ref dst.  The authentic boxed result is
+/// taken from the same `execute_may_force_call` path the generic leg uses.
+///
+/// Object-storage lists, tuples, negative indices, and non-`list[int]`
+/// operands fall through to the generic `CallMayForce` record (`Ok(None)`),
+/// preserving Python `__getitem__` semantics.
+fn try_walker_specialize_subscr(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let list_op = r_args[0];
+    let key_op = r_args[1];
+    let (Some(list_obj), Some(key_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+    ) else {
+        return Ok(None);
+    };
+
+    // Gate: list[int], non-negative index in bounds, int- or float-storage.
+    let (sid, index, concrete_len) = unsafe {
+        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+            return Ok(None);
+        }
+        let index = pyre_object::w_int_get_value(key_obj);
+        if index < 0 {
+            return Ok(None);
+        }
+        let concrete_len = pyre_object::w_list_len(list_obj);
+        if index as usize >= concrete_len {
+            return Ok(None);
+        }
+        let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
+            1i64
+        } else if pyre_object::w_list_uses_float_storage(list_obj) {
+            2i64
+        } else {
+            return Ok(None);
+        };
+        (sid, index, concrete_len)
+    };
+
+    // Authentic boxed result from the same may-force path the generic leg uses.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // guard_class LIST (skip when class already known / operand is constant).
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardNonnullClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, list_type_addr);
+
+    // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    // Unbox the index operand (guard_class INT + getfield intval).
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw_index = walker_unbox_int(ctx, op_pc, key_op, int_type_addr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+
+    // Bounds guard (non-negative index path): IntLt(raw_index, len).
+    let (len_descr, items_ptr_descr) = if sid == 1 {
+        (
+            crate::descr::list_int_items_len_descr(),
+            crate::descr::list_int_items_ptr_descr(),
+        )
+    } else {
+        (
+            crate::descr::list_float_items_len_descr(),
+            crate::descr::list_float_items_ptr_descr(),
+        )
+    };
+    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // Raw-array getitem + rebox for the Ref dst.  Stamp the raw element with
+    // the true value read from the authentic may-force result (the in-array
+    // sanity load is skipped when `items_ptr` is not trace-time concrete), so
+    // the `wrapint` / `wrapfloat` box's cached field matches a later unbox.
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, items_ptr_descr);
+    let result_obj = boxed_result_i64 as pyre_object::PyObjectRef;
+    let boxed = if sid == 1 {
+        let raw =
+            crate::state::trace_raw_int_array_getitem_value(ctx.trace_ctx, items_ptr, raw_index);
+        let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(elem));
+        crate::state::wrapint(ctx.trace_ctx, raw)
+    } else {
+        let raw =
+            crate::state::trace_raw_float_array_getitem_value(ctx.trace_ctx, items_ptr, raw_index);
+        let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        crate::state::wrapfloat(ctx.trace_ctx, raw)
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #62: walker-native speculative specialization for the `STORE_SUBSCR`
+/// helper residual_call (oopspec `StoreSubscr`, void result).  Ports
+/// `generated_store_subscr_value` → `generated_list_setitem_by_strategy`
+/// for the int- and float-storage list strategies with a non-negative
+/// concrete index and a type-matching value: `guard_class LIST` +
+/// `guard_value(strategy)` + unbox index + `IntLt` bounds guard + unbox
+/// value + `setarrayitem_raw`.
+///
+/// No concrete execution: the recorded `setarrayitem_raw` performs the
+/// mutation at runtime (the void residual was likewise not walk-executed —
+/// `try_execute_residual_call_via_walker` skips Void results), so the walk's
+/// concrete state is unchanged relative to the generic leg.  Object-storage
+/// lists, long values, strategy mismatches, negative indices, and
+/// non-`list[int]` operands fall through to the generic `CALL_MAY_FORCE`
+/// record (`Ok(None)`), preserving Python `__setitem__` semantics.
+fn try_walker_specialize_store_subscr(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 3 {
+        return Ok(None);
+    }
+    let list_op = r_args[0];
+    let key_op = r_args[1];
+    let value_op = r_args[2];
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        return Ok(None);
+    };
+
+    // Gate: list[int] = value, non-negative index in bounds, storage matching
+    // the value type (int storage ← W_IntObject, float storage ← W_FloatObject).
+    let (sid, index, concrete_len) = unsafe {
+        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+            return Ok(None);
+        }
+        let index = pyre_object::w_int_get_value(key_obj);
+        if index < 0 {
+            return Ok(None);
+        }
+        let concrete_len = pyre_object::w_list_len(list_obj);
+        if index as usize >= concrete_len {
+            return Ok(None);
+        }
+        let sid = if pyre_object::w_list_uses_int_storage(list_obj)
+            && pyre_object::is_int(value_obj)
+        {
+            1i64
+        } else if pyre_object::w_list_uses_float_storage(list_obj)
+            && pyre_object::is_float(value_obj)
+        {
+            2i64
+        } else {
+            return Ok(None);
+        };
+        (sid, index, concrete_len)
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // guard_class LIST (skip when class already known / operand is constant).
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardNonnullClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, list_type_addr);
+
+    // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    // Unbox the index operand.
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw_index = walker_unbox_int(ctx, op_pc, key_op, int_type_addr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+
+    // Bounds guard (non-negative index path): IntLt(raw_index, len).
+    let (len_descr, items_ptr_descr) = if sid == 1 {
+        (
+            crate::descr::list_int_items_len_descr(),
+            crate::descr::list_int_items_ptr_descr(),
+        )
+    } else {
+        (
+            crate::descr::list_float_items_len_descr(),
+            crate::descr::list_float_items_ptr_descr(),
+        )
+    };
+    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // Unbox the value + setarrayitem_raw.
+    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, items_ptr_descr);
+    if sid == 1 {
+        let raw = walker_unbox_int(ctx, op_pc, value_op, int_type_addr)?;
+        let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(elem));
+        crate::state::trace_raw_int_array_setitem_value(ctx.trace_ctx, items_ptr, raw_index, raw);
+    } else {
+        let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+        let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
+        let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        crate::state::trace_raw_float_array_setitem_value(ctx.trace_ctx, items_ptr, raw_index, raw);
+    }
     Ok(Some(()))
 }
 
@@ -6376,8 +6836,8 @@ fn try_walker_specialize_compare_op_float(
     };
 
     // --- emit the specialized IR (walker-native) ---
-    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64);
-    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64);
+    let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_is_int, lhs_f64)?;
+    let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_is_int, rhs_f64)?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded =
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
@@ -6390,6 +6850,9 @@ fn try_walker_specialize_compare_op_float(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
+    // #62: remember boxed→truth so an immediately-following `is_true` residual
+    // (POP_JUMP_IF_*) folds back to the raw Int instead of may-force-unboxing.
+    bool_box_truth_record(boxed, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
@@ -6478,6 +6941,30 @@ fn dispatch_residual_call_iIRd_kind(
         }
     }
 
+    // BoxInt fold (#62): `box_int_fn(raw)` allocates a fresh `PyLong`.  The
+    // opaque CanRaise residual the generic leg would record blocks the
+    // optimizer (no DCE of an unused/round-tripped box).  Emit the
+    // virtualizable `new_with_vtable` + `setfield_gc` form (`wrapint`,
+    // identical to the BINARY_OP result box) so a following unbox
+    // (`getfield_gc_pure`) forwards through the setfield and the box DCEs
+    // when it never escapes.  The concrete shadow carries the authentic
+    // boxed pointer so downstream specializations still see a concrete int.
+    if ei.oopspecindex == majit_ir::OopSpecIndex::BoxInt && dst_bank == 'r' {
+        if let Some(&raw_arg) = i_args.first() {
+            if let Some(boxed_ptr) =
+                walker_execute_may_force_boxed(ctx, &allboxes, call_descr)
+            {
+                let boxed = crate::state::wrapint(ctx.trace_ctx, raw_arg);
+                ctx.trace_ctx.set_opref_concrete(
+                    boxed,
+                    majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
+                );
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
+    }
+
     // #57: speculative int specialization for the BINARY_OP / COMPARE_OP
     // helper (oopspec `BinaryOp` / `CompareOp`, set codewriter-side at
     // flatten.rs `build_residual_call_ir_r_insn_from_operands`).  When both
@@ -6493,15 +6980,27 @@ fn dispatch_residual_call_iIRd_kind(
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
                 let specialized = if ei.oopspecindex == majit_ir::OopSpecIndex::BinaryOp {
-                    // int specialization first; float (incl. mixed int/float)
-                    // as a fallback so two-int operands keep int arithmetic.
-                    match try_walker_specialize_binary_op_int(
-                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                    )? {
-                        Some(()) => Some(()),
-                        None => try_walker_specialize_binary_op_float(
+                    let is_subscr = matches!(
+                        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+                        Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+                    );
+                    if is_subscr {
+                        // BINARY_SUBSCR list[int] getitem (int/float storage);
+                        // falls through to the generic may-force leg otherwise.
+                        try_walker_specialize_subscr(
+                            ctx, op.pc, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        )?
+                    } else {
+                        // int specialization first; float (incl. mixed int/float)
+                        // as a fallback so two-int operands keep int arithmetic.
+                        match try_walker_specialize_binary_op_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                        )?,
+                        )? {
+                            Some(()) => Some(()),
+                            None => try_walker_specialize_binary_op_float(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                            )?,
+                        }
                     }
                 } else {
                     // int compare first; float (incl. mixed int/float) as a
@@ -6603,7 +7102,7 @@ fn dispatch_residual_call_iIRd_kind(
         }
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise {
             walker_abort_if_protected_may_force(code, op, can_raise)?;
@@ -6620,7 +7119,7 @@ fn dispatch_residual_call_iIRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             }
         }
 
@@ -6774,7 +7273,7 @@ fn dispatch_residual_call_iIRFd_kind(
         }
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         if can_raise {
             walker_abort_if_protected_may_force(code, op, can_raise)?;
@@ -6791,7 +7290,7 @@ fn dispatch_residual_call_iIRFd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             }
         }
 
@@ -7401,6 +7900,19 @@ fn dispatch_inline_call_dirf_kind(
     }
 }
 
+/// #67 shape fix: append virtualizable data boxes so the walker merge-point
+/// `live_arg_boxes` matches the JUMP `close_loop_args_at` records.
+fn append_virtualizable_boxes(ctx: &TraceCtx, mut reds: Vec<OpRef>) -> Vec<OpRef> {
+    if let Some(total) = ctx.virtualizable_boxes_len() {
+        for i in 0..total.saturating_sub(1) {
+            if let Some(b) = ctx.virtualizable_box_at(i) {
+                reds.push(b);
+            }
+        }
+    }
+    reds
+}
+
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
 /// branching handlers (`goto/L`) override the linear `op.next_pc`
 /// advance; non-branching handlers return `op.next_pc` unchanged.
@@ -7481,6 +7993,14 @@ fn handle(
             let switchcase = match ctx.trace_ctx.concrete_of_opref(valuebox) {
                 Some(Value::Int(v)) => v,
                 _ => {
+                    if std::env::var("PYRE_DIAG_GIN").is_ok() {
+                        let tb = read_int_reg_concrete(code, op, 0, ctx);
+                        let reg = code[op.pc + 1] as usize;
+                        eprintln!(
+                            "[diag-gin] pc={} valuebox={:?} reg={} concrete_of_opref=NON-INT typed_bank={:?}",
+                            op.pc, valuebox, reg, tb
+                        );
+                    }
                     return Err(DispatchError::GotoIfNotValueNotConcrete {
                         pc: op.pc,
                         value: valuebox,
@@ -7534,7 +8054,7 @@ fn handle(
             );
             if !valuebox.is_constant() {
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
-                walker_capture_snapshot_for_last_guard(ctx, other_target);
+                walker_capture_snapshot_for_last_guard(ctx, other_target)?;
                 ctx.trace_ctx.replace_box(valuebox, promoted);
                 for slot in ctx.registers_i.iter_mut() {
                     if *slot == valuebox {
@@ -8156,7 +8676,7 @@ fn handle(
                         let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
                         ctx.trace_ctx
                             .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
-                        walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
                         ctx.trace_ctx
                             .heap_cache_mut()
                             .class_now_known(exc, exc_class_ptr as usize as i64);
@@ -8368,9 +8888,23 @@ fn handle(
             // `patch_new_loop_to_load_virtualizable_fields`
             // (`trace_opcode.rs:2959-2967`).
             let mut live_args: Vec<OpRef> = Vec::with_capacity(ri.len() + rr.len() + rf.len());
-            live_args.extend(ri);
-            live_args.extend(rr);
-            live_args.extend(rf);
+            live_args.extend(ri.iter().copied());
+            live_args.extend(rr.iter().copied());
+            live_args.extend(rf.iter().copied());
+            live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
+
+            if std::env::var("PYRE_DIAG_51C").is_ok() {
+                eprintln!(
+                    "[51c-redclose] pc={} ri_regs={:?} rr_regs={:?} rf_regs={:?}",
+                    op.pc, ri, rr, rf
+                );
+                for (idx, &arg) in live_args.iter().enumerate() {
+                    eprintln!(
+                        "[51c-redclose]   live_arg[{idx}] {arg:?} concrete={:?}",
+                        ctx.trace_ctx.concrete_of_opref(arg)
+                    );
+                }
+            }
 
             // pyjitpl.py:2994-3036: a matching merge point (same green key
             // + red-bank shape) closes the loop; first visit registers and
@@ -8395,6 +8929,13 @@ fn handle(
                     op.next_pc,
                 ))
             } else {
+                // This merge point registers (does not close) — the walk
+                // crossed a loop-boundary that did not match the primary
+                // loop's green key, i.e. an enclosing or sibling loop whose
+                // header is `next_instr`.  Record it so the deferred void-store
+                // drain can tell whether a buffered store sits in an enclosing
+                // scope relative to the loop that ultimately closes (#63).
+                void_defer_push_register(next_instr);
                 let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
                     .iter()
                     .map(|opref| {

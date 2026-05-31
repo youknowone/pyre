@@ -499,6 +499,21 @@ pub enum OopSpecIndex {
     // ref at trace time (the indexed co_consts entry is loop-invariant)
     // instead of recording an opaque CanRaise residual the optimizer keeps.
     LoadConst = 202,
+    // pyre-specific: `box_int_fn` allocates a fresh `PyLong` wrapper from a
+    // raw Int operand (LoadSmallInt / UnaryNegative-zero / exception-lasti).
+    // Tagging the calldescr lets the full-body walker emit the virtualizable
+    // `new_with_vtable` + `setfield_gc` boxing form instead of an opaque
+    // CanRaise residual, so the optimizer can forward a following unbox
+    // (`getfield_gc_pure`) and DCE the box when it never escapes.
+    BoxInt = 203,
+    // pyre-specific: `store_subscr_fn` performs `obj[key] = value` as a
+    // MayForce residual.  Tagging the calldescr lets the full-body walker
+    // emit the specialized list-setitem form (`guard_class` + strategy guard
+    // + bounds guard + `setarrayitem_raw`) for an in-bounds, type-matching
+    // `list[int] = value` instead of an opaque CALL_MAY_FORCE that forces the
+    // virtualizable each iteration; other receivers fall through to the
+    // residual.
+    StoreSubscr = 204,
 }
 
 impl EffectInfo {

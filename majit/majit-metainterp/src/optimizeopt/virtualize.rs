@@ -292,23 +292,22 @@ impl VirtualizableTracker {
     }
 
     /// Read counterpart to [`mirror_setarrayitem`]: returns the tracked
-    /// value box for `array_ref[index]` on the standard virtualizable
+    /// value box for `array_box[index]` on the standard virtualizable
     /// array state (seeded from the inputarg layout, updated by
-    /// `mirror_setarrayitem`), or `None` when `array_ref` is not the
+    /// `mirror_setarrayitem`), or `None` when `array_box` is not the
     /// standard virtualizable array field or the slot is untracked.
     fn tracked_array_element(
         &self,
-        array_ref: OpRef,
+        array_box: &crate::r#box::BoxRef,
         index: i64,
         ctx: &mut OptContext,
     ) -> Option<OpRef> {
         if index < 0 {
             return None;
         }
-        let (frame_ref, array_idx) = self.resolve_array_source(array_ref, ctx)?;
+        let (frame_box, array_idx) = self.resolve_array_source(array_box, ctx)?;
         let elem_idx = index as usize;
-        let b = ctx.ensure_box(frame_ref)?;
-        match ctx.peek_ptr_info(&b)? {
+        match ctx.peek_ptr_info(&frame_box)? {
             PtrInfo::Virtualizable(vstate) => {
                 get_array_element(&vstate.arrays, array_idx, elem_idx)
             }
@@ -943,19 +942,17 @@ impl OptVirtualize {
             .get_box_replacement_box(index_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            if let Some(item_ref) = self
-                .vable
-                .as_ref()
-                .and_then(|vt| vt.tracked_array_element(array_ref, index, ctx))
-            {
-                let b_old = ctx
-                    .ensure_box(op.pos.get())
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                let b_item = ctx
-                    .ensure_box(item_ref)
-                    .expect("body-namespace OpRef must have a BoxRef slot");
-                ctx.make_equal_to(&b_old, &b_item);
-                return OptimizationResult::Remove;
+            if let Some(array_box) = array_box.as_ref() {
+                if let Some(item_ref) = self
+                    .vable
+                    .as_ref()
+                    .and_then(|vt| vt.tracked_array_element(array_box, index, ctx))
+                {
+                    let b_old = ctx.materialize_box_at(op.pos.get());
+                    let b_item = ctx.materialize_box_at(item_ref);
+                    ctx.make_equal_to(&b_old, &b_item);
+                    return OptimizationResult::Remove;
+                }
             }
         }
         // virtualize.py:287: self.make_nonnull(op.getarg(0))

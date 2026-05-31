@@ -3766,7 +3766,11 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
     int_operand: Operand,
     dst_reg: Register,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    // `box_int_fn` boxes a raw Int into a fresh `PyLong`; tag it so the
+    // full-body walker emits the virtualizable `new_with_vtable` +
+    // `setfield_gc` form instead of an opaque CanRaise residual.
+    effect_info.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Int],
@@ -4141,6 +4145,7 @@ where
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::StoreSubscr,
     ))
 }
 
@@ -4395,6 +4400,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
             Operand::Register(Register::new(Kind::Ref, value_reg)),
         ],
         CallFlavor::MayForce,
+        majit_ir::OopSpecIndex::StoreSubscr,
     )
 }
 
@@ -4420,6 +4426,7 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
         set_current_exception_fn_idx,
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
         CallFlavor::PlainCannotRaiseNoHeap,
+        majit_ir::OopSpecIndex::None,
     )
 }
 
@@ -4436,9 +4443,11 @@ fn build_residual_call_r_v_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
+    oopspec: majit_ir::OopSpecIndex,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
-    let effect_info = effect_info_for_call_flavor(flavor);
+    let mut effect_info = effect_info_for_call_flavor(flavor);
+    effect_info.oopspecindex = oopspec;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -7242,10 +7251,9 @@ mod tests {
                     Operand::Descr(rc) => match &**rc {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::Plain),
-                            );
+                            let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                            assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7309,10 +7317,9 @@ mod tests {
                     Operand::Descr(rc) => match &**rc {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::Plain),
-                            );
+                            let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                            assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7342,7 +7349,11 @@ mod tests {
         let pycode_var = Variable::new(VariableId(4), Kind::Ref);
         let dst_var = Variable::new(VariableId(5), Kind::Ref);
         let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::Plain),
+            {
+                let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                ei.oopspecindex = majit_ir::OopSpecIndex::LoadConst;
+                ei
+            },
             vec![Kind::Ref, Kind::Int],
             Some(Kind::Ref),
         );
@@ -7942,10 +7953,9 @@ mod tests {
                     Operand::Descr(rc) => match &**rc {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Int]);
-                            assert_eq!(
-                                stub.effect_info,
-                                effect_info_for_call_flavor(CallFlavor::Plain),
-                            );
+                            let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                            expected_ei.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
+                            assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },
@@ -7993,7 +8003,11 @@ mod tests {
         // would have produced before the refactor.
         let dst = Variable::new(VariableId(7), Kind::Ref);
         let descr = intern_call_descr_stub(
-            effect_info_for_call_flavor(CallFlavor::Plain),
+            {
+                let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
+                ei.oopspecindex = majit_ir::OopSpecIndex::BoxInt;
+                ei
+            },
             vec![Kind::Int],
             Some(Kind::Ref),
         );

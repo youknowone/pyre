@@ -399,9 +399,21 @@ fn run_perfn_walk(
                     seed(r, ec_box);
                 }
             }
-            // Straight-line resume (no governing loop header): fall back to
-            // the per-opcode-arm convention of r0 = frame.
-            None => seed(0, frame_box),
+            // Straight-line entry, no governing loop header (e.g. a
+            // non-looping recursive function like `fib`): the portal entry
+            // register layout follows `MIFrame.setup_call`'s positional
+            // per-bank fill of the jitdriver args `[pycode, frame, ec]`.
+            // All three are Ref, so the per-bank positional colors are
+            // pycode=r0, frame=r1, ec=r2 — the body reads its vable from r1,
+            // NOT r0.  The earlier r0=frame arm-convention fallback left r1
+            // `OpRef::NONE`, so every `getarrayitem_vable_r` of a local took
+            // the nonstandard `Value::Void` leg and the entry `goto_if_not`
+            // aborted with `GotoIfNotValueNotConcrete`.
+            None => {
+                seed(0, pycode_box);
+                seed(1, frame_box);
+                seed(2, ec_box);
+            }
         }
         v
     };
@@ -614,6 +626,9 @@ fn full_body_walk_trace(
     // it the compiled loop's entry args don't match what the portal
     // supplies, so the portal cannot enter the compiled loop and re-traces
     // every iteration (the observed spin).
+    // Clear any deferred void-store events left by a prior aborted walk so
+    // they cannot leak into this one (#63).
+    crate::jitcode_dispatch::void_defer_reset();
     {
         let start_key = crate::driver::make_green_key(w_code, start_pc);
         let input_types = ctx.inputarg_types();
@@ -646,6 +661,12 @@ fn full_body_walk_trace(
                     ctx.set_green_key(key, (w_code as usize, start_pc));
                     ctx.header_pc = start_pc;
                 }
+                // Commit deferred void-residual stores whose iteration the
+                // compiled loop will not re-run (those in an enclosing scope
+                // relative to the closing loop `loop_header_pc`); stores inside
+                // the closing loop's body are dropped here and re-run by the
+                // compiled loop (#61 / #63).
+                crate::jitcode_dispatch::void_defer_commit_at_close(loop_header_pc);
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),
@@ -653,7 +674,30 @@ fn full_body_walk_trace(
             }
             _ => TraceAction::Abort,
         },
-        _ => TraceAction::Abort,
+        Some((_entry, _code_len, Err(e))) => {
+            // Structural walker limitations recur identically on every
+            // retrace of this location (the same jitcode walked from the same
+            // entry produces the same error), so blacklist it permanently
+            // (`AbortPermanent` → `DONT_TRACE_HERE`) instead of thrashing
+            // `MAX_TRACE_ABORT_COUNT` futile deep re-traces — each of which
+            // executes the body's residual calls concretely before failing at
+            // the unsupported resume / exception / closure shape.  The
+            // location stays correct via the trait-interpreted fallback; the
+            // permanent mark only stops the wasted walk attempts.  These four
+            // are the multi-session-blocked shapes (resume snapshot #124,
+            // exception-handler resume #51c, closure NULL-self #60, unported
+            // raise marker); other errors retain the soft `Abort` so a
+            // capability that lands mid-run can still pick the location up.
+            use crate::jitcode_dispatch::DispatchError as DE;
+            match e {
+                DE::AbortPermanentMarkerReached { .. }
+                | DE::GuardSnapshotVableUntyped { .. }
+                | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
+                | DE::MayForceNullRefArgUnsupported { .. } => TraceAction::AbortPermanent,
+                _ => TraceAction::Abort,
+            }
+        }
+        None => TraceAction::Abort,
     }
 }
 
