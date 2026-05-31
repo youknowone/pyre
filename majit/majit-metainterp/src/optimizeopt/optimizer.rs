@@ -2041,26 +2041,15 @@ impl Optimizer {
                 .cloned()
                 .collect()
         } else {
-            // No explicit seed and no threaded canonical ops. Every production
-            // entry now seeds `input_ops` explicitly: the loop-finish, retrace,
-            // and retry paths thread their producers (or an empty seed on the
-            // cut path), and the bridge seeds empty. The remaining callers that
-            // reach here (`propagate_all_forward`, `optimize_with_constants`)
-            // always pass an empty `box_pool` (`BoxPool::new()`), so the
-            // snapshot is empty. Production therefore builds an empty store.
-            // Only the `ctx.box_pool = vec![..]` unit-test fixtures still rely
-            // on the snapshot to seed producer lookup.
-            #[cfg(test)]
-            {
-                ctx.box_pool
-                    .iter_indexed()
-                    .filter_map(|(_, b)| b.bound_op())
-                    .collect()
-            }
-            #[cfg(not(test))]
-            {
-                Vec::new()
-            }
+            // No explicit seed and no threaded canonical ops. Every entry now
+            // seeds `input_ops` explicitly: the loop-finish, retrace, and retry
+            // paths thread their producers (or an empty seed on the cut path),
+            // and the bridge seeds empty. The remaining callers that reach here
+            // (`propagate_all_forward`, `optimize_with_constants`, unit
+            // fixtures) pass an empty `box_pool` (`BoxPool::new()`) and rely on
+            // the canonical stores (`seed_boxes_canonical` / `bind_input_resops`
+            // / emit), so the store is empty here.
+            Vec::new()
         };
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
