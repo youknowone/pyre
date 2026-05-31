@@ -3154,10 +3154,10 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], fd.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3249,10 +3249,10 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3388,7 +3388,7 @@ mod tests {
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    OpRef::input_arg_ref(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(51),
                     OpRef::float_op(60),
                 ],
@@ -3397,7 +3397,7 @@ mod tests {
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    OpRef::input_arg_ref(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(51),
                     OpRef::float_op(61),
                 ],
@@ -3405,7 +3405,7 @@ mod tests {
             ),
             Op::with_descr(
                 OpCode::GetinteriorfieldGcF,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(51)],
+                &[OpRef::ref_op(0), OpRef::int_op(51)],
                 real.clone(),
             ),
         ];
@@ -3443,7 +3443,7 @@ mod tests {
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    OpRef::input_arg_ref(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(51),
                     OpRef::float_op(60),
                 ],
@@ -3452,13 +3452,13 @@ mod tests {
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    OpRef::input_arg_ref(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(51),
                     OpRef::float_op(61),
                 ],
                 imag.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3517,7 +3517,7 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewArray, &[OpRef::int_op(50)], ad.clone()),
-            Op::with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], ad.clone()),
+            Op::with_descr(OpCode::ArraylenGc, &[OpRef::ref_op(0)], ad.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3551,7 +3551,7 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::new(
                 OpCode::GuardClass,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[OpRef::ref_op(0), OpRef::int_op(200)],
             ),
         ];
         assign_positions(&mut ops);
@@ -3584,7 +3584,7 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::GuardNonnull, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3617,7 +3617,7 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()), // pos=1
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::ref_op(1)],
+                &[OpRef::ref_op(0), OpRef::ref_op(1)],
                 fd_ref.clone(),
             ), // pos=2
             Op::with_descr(
@@ -3625,7 +3625,7 @@ mod tests {
                 &[OpRef::ref_op(1), OpRef::int_op(100)],
                 fd_int.clone(),
             ), // pos=3
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),      // pos=4
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),      // pos=4
         ];
         assign_positions(&mut ops);
 
@@ -3671,10 +3671,10 @@ mod tests {
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd.clone(),
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], fd.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3698,10 +3698,10 @@ mod tests {
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3930,22 +3930,22 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[OpRef::ref_op(0), OpRef::int_op(200)],
                 fd_b.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[OpRef::input_arg_ref(0)],
+                &[OpRef::ref_op(0)],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[OpRef::input_arg_ref(0)],
+                &[OpRef::ref_op(0)],
                 fd_b.clone(),
             ),
         ];
@@ -3972,15 +3972,15 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+                &[OpRef::ref_op(0), OpRef::int_op(200)],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -4114,7 +4114,7 @@ mod tests {
                 OpCode::VirtualRefR,
                 &[OpRef::int_op(100), OpRef::int_op(101)],
             ), // pos=0
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]), // pos=1
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -4266,7 +4266,7 @@ mod tests {
             ), // pos=0
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[OpRef::input_arg_ref(0)],
+                &[OpRef::ref_op(0)],
                 forced_descr,
             ), // pos=1
         ];
@@ -4560,11 +4560,11 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::ref_op(100)],
+                &[OpRef::ref_op(0), OpRef::ref_op(100)],
                 fd.clone(),
             ),
-            Op::new(OpCode::CallN, &[OpRef::input_arg_ref(0)]),
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::input_arg_ref(0)], fd.clone()),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::ref_op(0)], fd.clone()),
             Op::new(OpCode::CallN, &[OpRef::ref_op(3)]),
             Op::new(OpCode::Jump, &[OpRef::ref_op(100)]),
         ];
@@ -4800,12 +4800,12 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::ref_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(10)],
+                &[OpRef::ref_op(0), OpRef::int_op(10)],
                 fd.clone(),
             ), // pos=1
             guard,                                                  // pos=2
@@ -4875,7 +4875,7 @@ mod tests {
         guard.setfailargs(
             vec![
                 OpRef::int_op(30),
-                OpRef::input_arg_ref(0),
+                OpRef::ref_op(0),
                 OpRef::int_op(40),
             ]
             .into(),
@@ -4885,7 +4885,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(10)],
+                &[OpRef::ref_op(0), OpRef::int_op(10)],
                 fd.clone(),
             ), // pos=1
             guard,                                        // pos=2
@@ -4968,12 +4968,12 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::ref_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(10)],
+                &[OpRef::ref_op(0), OpRef::int_op(10)],
                 fd.clone(),
             ),
             guard,
@@ -5023,17 +5023,17 @@ mod tests {
         let fd_b = field_descr(20);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::ref_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(10)],
+                &[OpRef::ref_op(0), OpRef::int_op(10)],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(20)],
+                &[OpRef::ref_op(0), OpRef::int_op(20)],
                 fd_b.clone(),
             ),
             guard,
@@ -5090,7 +5090,7 @@ mod tests {
         let inner_fd = field_descr(20);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::ref_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
@@ -5101,7 +5101,7 @@ mod tests {
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::input_arg_ref(0), OpRef::ref_op(1)],
+                &[OpRef::ref_op(0), OpRef::ref_op(1)],
                 outer_fd,
             ),
             guard,
@@ -5156,13 +5156,13 @@ mod tests {
         // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
+        guard.setfailargs(vec![OpRef::ref_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewArray, &[OpRef::int_op(10)], ad.clone()),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    OpRef::input_arg_ref(0),
+                    OpRef::ref_op(0),
                     OpRef::int_op(11),
                     OpRef::int_op(12),
                 ],
