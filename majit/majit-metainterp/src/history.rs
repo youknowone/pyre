@@ -7,8 +7,6 @@
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
-use crate::r#box::BoxRef;
-
 /// RPython `History` parity name.
 ///
 /// The current Rust port still fuses RPython's `History` recording role into
@@ -88,19 +86,6 @@ pub struct TreeLoop {
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.
     pub snapshots: Vec<crate::recorder::Snapshot>,
-    /// H-3.0a: per-position BoxRef pool inherited from the
-    /// `recorder::Trace` that produced this loop. `box_pool[i]` is the
-    /// `AbstractValue` mirror of the operation at `op_count == i`
-    /// (inputargs followed by ops, in record order). Empty for tests
-    /// that synthesize a `TreeLoop` directly without going through the
-    /// recorder.
-    ///
-    /// RPython parity: PyPy's `AbstractResOp` / `AbstractInputArg`
-    /// objects created during tracing flow unchanged into the optimizer
-    /// (same Python objects, same `_forwarded` slot). The Rust pool
-    /// preserves that identity by carrying the same `Rc<Box>` allocations
-    /// from the recorder through to the optimizer.
-    pub(crate) box_pool: crate::r#box::BoxPool,
 }
 
 impl TreeLoop {
@@ -126,7 +111,6 @@ impl TreeLoop {
             inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots: Vec::new(),
-            box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
@@ -140,54 +124,23 @@ impl TreeLoop {
             inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops: ops.into_iter().map(std::rc::Rc::new).collect(),
             snapshots,
-            box_pool: crate::r#box::BoxPool::new(),
-        }
-    }
-
-    /// H-3.0a: build with explicit BoxRef pool inherited from a recorder.
-    /// Production path: `recorder::Trace::get_trace` uses this so the
-    /// optimizer receives the same `Rc<Box>` allocations that were
-    /// created during tracing.
-    pub fn with_box_pool(
-        inputargs: Vec<InputArg>,
-        ops: Vec<Op>,
-        snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: crate::r#box::BoxPool,
-    ) -> Self {
-        let inputargs: Vec<majit_ir::InputArgRc> =
-            inputargs.into_iter().map(std::rc::Rc::new).collect();
-        let ops: Vec<OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        box_pool.bind_inputargs(&inputargs);
-        box_pool.bind_ops(inputargs.len(), &ops);
-        TreeLoop {
-            inputargs,
-            ops,
-            snapshots,
-            box_pool,
         }
     }
 
     /// Construct from `Vec<OpRc>` directly, preserving shared identity for
     /// callers that already track Op via `Rc`. This is the canonical
     /// constructor used internally once consumers traffic in `OpRc`; the
-    /// `new` / `with_snapshots` / `with_box_pool` overloads above wrap a
-    /// `Vec<Op>` into `Vec<OpRc>` for legacy test sites still building
-    /// ops by value.
+    /// `new` / `with_snapshots` overloads above wrap a `Vec<Op>` into
+    /// `Vec<OpRc>` for legacy test sites still building ops by value.
     pub fn from_oprc(
         inputargs: Vec<InputArg>,
         ops: Vec<OpRc>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: crate::r#box::BoxPool,
     ) -> Self {
-        let inputargs: Vec<majit_ir::InputArgRc> =
-            inputargs.into_iter().map(std::rc::Rc::new).collect();
-        box_pool.bind_inputargs(&inputargs);
-        box_pool.bind_ops(inputargs.len(), &ops);
         TreeLoop {
-            inputargs,
+            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
             ops,
             snapshots,
-            box_pool,
         }
     }
 
@@ -525,30 +478,6 @@ impl TreeLoop {
             .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
             .collect();
 
-        // Build a fresh `box_pool` mirroring the new namespace. Inputargs
-        // go first (fresh `BoxRef::new_inputarg` with type/position),
-        // followed by prefix re-emitted ops and post-cut ops (fresh
-        // `BoxRef::new_resop` with result type). The optimizer reads
-        // PtrInfo / IntBound / Const exclusively through these BoxRefs,
-        // so retrace baselines must arrive with the pool seeded. Total
-        // length: `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
-        let mut box_pool = crate::r#box::BoxPool::with_capacity(
-            new_ia_boxes.len() + op_escaped.len() + cut_ops.len(),
-        );
-        for (i, &tp) in new_ia_types.iter().enumerate() {
-            box_pool.push(BoxRef::new_inputarg(tp, i as u32));
-        }
-        for &r in op_escaped.iter() {
-            let op_idx = (r.raw() - num_original_inputargs) as usize;
-            let result_tp = self.ops[op_idx].opcode.result_type();
-            let position = box_pool.len() as u32;
-            box_pool.push(BoxRef::new_resop(result_tp, position));
-        }
-        for op in cut_ops.iter() {
-            let position = box_pool.len() as u32;
-            box_pool.push(BoxRef::new_resop(op.opcode.result_type(), position));
-        }
-
         // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.
         // Result type comes from the original op's opcode so the new OpRef
         // variant matches RPython's IntOp/FloatOp/RefOp dispatch.
@@ -678,7 +607,7 @@ impl TreeLoop {
                 }
             })
             .collect();
-        TreeLoop::with_box_pool(new_inputargs, new_ops, remapped_snapshots, box_pool)
+        TreeLoop::with_snapshots(new_inputargs, new_ops, remapped_snapshots)
     }
 }
 
@@ -2227,13 +2156,10 @@ impl TraceCtx {
     /// come from the TraceCtx-owned side table (moved them off
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(self) -> crate::history::TreeLoop {
-        // H-3.0a: forward the recorder's BoxRef pool so the optimizer
-        // sees the same `Rc<Box>` allocations created during tracing —
-        // RPython parity for `AbstractValue` object identity.
-        let (inputargs, ops, box_pool) = self.recorder.into_parts();
         // `ops` is already `Vec<OpRc>`; `from_oprc` preserves the recorder's
-        // shared `Rc<Op>` identity through the box_pool binding.
-        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots, box_pool)
+        // shared `Rc<Op>` identity.
+        let (inputargs, ops) = self.recorder.into_parts();
+        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots)
     }
 
     /// Snapshot slice accessor — Pyre-level parity with

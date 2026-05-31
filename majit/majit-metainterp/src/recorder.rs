@@ -13,8 +13,6 @@
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
-use crate::r#box::BoxRef;
-
 /// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
 /// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
 ///
@@ -112,8 +110,8 @@ pub enum SnapshotTagged {
 
 pub struct Trace {
     /// Recorded operations. Stored as `Rc<Op>` so a single `Op` identity
-    /// flows from the recorder through the `TreeLoop` handoff to the
-    /// optimizer's `box_pool` bindings (`AbstractValue` object identity).
+    /// flows from the recorder through the `TreeLoop` handoff into the
+    /// optimizer (`AbstractValue` object identity).
     ops: Vec<OpRc>,
     /// Input arguments to the trace (live variables at the loop header).
     inputargs: Vec<InputArg>,
@@ -122,18 +120,6 @@ pub struct Trace {
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
-    /// parallel BoxRef allocation.
-    ///
-    /// Mirrors RPython `AbstractValue` object identity per recorded
-    /// position. `box_pool[i]` holds the `BoxRef` allocated when
-    /// `op_count == i` (so its index matches `OpRef::raw()` for the
-    /// non-encoded position). Inputargs occupy `box_pool[0..num_inputargs]`,
-    /// recorded ops occupy `box_pool[num_inputargs..]`.
-    ///
-    /// H-2.1 functional no-op: pool is populated but no reader consumes
-    /// it yet. H-3 will start routing `_forwarded` / info reads through
-    /// `BoxRef.forwarded`. Const Box allocation is deferred to H-2.2.
-    box_pool: crate::r#box::BoxPool,
 }
 
 impl Trace {
@@ -148,7 +134,6 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            box_pool: crate::r#box::BoxPool::with_capacity(256),
         }
     }
 
@@ -190,8 +175,6 @@ impl Trace {
             Type::Ref => OpRef::input_arg_ref(self.op_count),
             Type::Void => panic!("input args cannot be Void"),
         };
-        // H-2.1 parallel BoxRef: `AbstractInputArg` mirror with position.
-        self.box_pool.push(BoxRef::new_inputarg(tp, self.op_count));
         self.op_count += 1;
         self.box_count += 1;
         opref
@@ -209,9 +192,6 @@ impl Trace {
         let op = Op::new(opcode, args);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
-        // H-2.1 parallel BoxRef: `AbstractResOp` mirror.
-        self.box_pool
-            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -232,8 +212,6 @@ impl Trace {
         let op = Op::with_descr(opcode, args, descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
-        self.box_pool
-            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -262,8 +240,6 @@ impl Trace {
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
-        self.box_pool
-            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -290,8 +266,6 @@ impl Trace {
         op.pos.set(opref);
         op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(OpRc::new(op));
-        self.box_pool
-            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -359,8 +333,6 @@ impl Trace {
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
-        self.box_pool
-            .push(BoxRef::new_resop(OpCode::Jump.result_type(), self.op_count));
         self.op_count += 1;
         if OpCode::Jump.result_type() != Type::Void {
             self.box_count += 1;
@@ -374,23 +346,19 @@ impl Trace {
         let op = Op::with_descr(OpCode::Finish, finish_args, descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
-        self.box_pool.push(BoxRef::new_resop(
-            OpCode::Finish.result_type(),
-            self.op_count,
-        ));
         self.op_count += 1;
         if OpCode::Finish.result_type() != Type::Void {
             self.box_count += 1;
         }
     }
 
-    /// Consume the recorder and return its parts: (inputargs, ops, box_pool).
+    /// Consume the recorder and return its parts: (inputargs, ops).
     ///
     /// history.py parity: the recording phase ends and the trace is handed
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
-    pub fn into_parts(self) -> (Vec<InputArg>, Vec<OpRc>, crate::r#box::BoxPool) {
-        (self.inputargs, self.ops, self.box_pool)
+    pub fn into_parts(self) -> (Vec<InputArg>, Vec<OpRc>) {
+        (self.inputargs, self.ops)
     }
 
     /// Convenience: consume the recorder and produce a `TreeLoop`.
@@ -399,8 +367,8 @@ impl Trace {
     /// `TraceCtx::into_tree_loop` instead.
     pub fn get_trace(self) -> crate::history::TreeLoop {
         // `self.ops` is already `Vec<OpRc>`; `from_oprc` preserves that
-        // shared identity so the box_pool binds to the recorder's ops.
-        crate::history::TreeLoop::from_oprc(self.inputargs, self.ops, Vec::new(), self.box_pool)
+        // shared identity.
+        crate::history::TreeLoop::from_oprc(self.inputargs, self.ops, Vec::new())
     }
 
     /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
@@ -428,10 +396,6 @@ impl Trace {
         self.ops.truncate(pos._pos);
         self.op_count = pos._count;
         self.box_count = pos._index;
-        // H-2.1 parallel pool: 1:1 with op_count (one BoxRef per recorded
-        // position, including void ops). Saved counts above match the
-        // box_pool length at the same point.
-        self.box_pool.truncate(pos._count as usize);
     }
 
     /// history.py:725 `length`: number of non-inputarg ops recorded so far.
@@ -462,9 +426,9 @@ impl Trace {
     }
 
     /// Test-only direct append. Production callers go through
-    /// `record_op` so `op_count` / `box_count` / `box_pool` stay
-    /// in sync; this helper is for GC walker unit tests that exercise
-    /// the op-graph storage without driving the full record path.
+    /// `record_op` so `op_count` / `box_count` stay in sync; this helper
+    /// is for GC walker unit tests that exercise the op-graph storage
+    /// without driving the full record path.
     #[cfg(test)]
     pub fn push_op_for_test(&mut self, op: Op) {
         self.ops.push(OpRc::new(op));
@@ -492,16 +456,6 @@ impl Trace {
             .iter()
             .find(|op| op.pos.get().raw() == raw)
             .map(|op| &**op)
-    }
-
-    /// BoxRef for the value recorded at `position` (= `op_count` at
-    /// the time of recording).  Production callers: `TraceCtx`
-    /// `set_opref_concrete` / `lookup_opref_concrete` — the BoxPool
-    /// carries the `Box::value: Cell<Option<Value>>` intrinsic that
-    /// replaces the retired `opref_concrete` side-table (RPython
-    /// `history.py:803-807 *FrontendOp(pos, value)` parity).
-    pub(crate) fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
-        self.box_pool.get_at_position(position as usize)
     }
 
     /// Stamp the concrete runtime value on the canonical frontend object
@@ -537,20 +491,6 @@ impl Trace {
         }
     }
 
-    /// Iterate `(slot_index, &BoxRef)` over every materialised pool
-    /// entry, skipping `None` holes.
-    pub fn box_pool_iter_indexed(
-        &self,
-    ) -> impl Iterator<Item = (usize, &majit_ir::box_ref::BoxRef)> {
-        self.box_pool.iter_indexed()
-    }
-
-    /// Full BoxRef pool snapshot — borrows the sparse slot table
-    /// (`None` for skipped positions). Test-only.
-    #[cfg(test)]
-    pub fn box_pool(&self) -> &crate::r#box::BoxPool {
-        &self.box_pool
-    }
 }
 
 impl Default for Trace {
@@ -613,95 +553,18 @@ mod tests {
         Arc::new(TestFailDescr { index })
     }
 
-    /// H-2.1 invariant: `box_pool.len() == op_count` after every recorded
-    /// position (inputarg + every record_op family + close_loop / finish).
-    /// Each entry's kind/type matches the issuance shape.
+    /// `cut(pos)` truncates the recorded ops back to the saved position.
     #[test]
-    fn h2_1_box_pool_invariants() {
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let r1 = rec.record_input_arg(Type::Ref);
-        let f2 = rec.record_input_arg(Type::Float);
-        // 3 inputargs -> 3 entries
-        assert_eq!(rec.box_pool().len(), 3);
-        for (raw, expect_tp) in [(0u32, Type::Int), (1, Type::Ref), (2, Type::Float)] {
-            let b = rec.box_for_position(raw).expect("inputarg slot");
-            assert!(b.is_inputarg());
-            assert_eq!(b.type_(), expect_tp);
-            assert_eq!(b.position(), Some(raw));
-        }
-
-        // record_op typed (Int result)
-        let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        assert_eq!(rec.box_pool().len(), 4);
-        let b = rec.box_for_position(3).expect("op slot");
-        assert!(b.is_resop());
-        assert_eq!(b.type_(), Type::Int);
-
-        // record_guard (Void result, kind=ResOp)
-        let _g = rec.record_guard(OpCode::GuardTrue, &[i0], None);
-        assert_eq!(rec.box_pool().len(), 5);
-        let g = rec.box_for_position(4).expect("guard slot");
-        assert!(g.is_resop());
-        assert_eq!(g.type_(), Type::Void);
-
-        // close_loop adds JUMP (Void)
-        rec.close_loop(&[i0, r1, f2]);
-        assert_eq!(rec.box_pool().len(), 6);
-        let jump = rec.box_for_position(5).expect("jump slot");
-        assert!(jump.is_resop());
-        assert_eq!(jump.type_(), Type::Void);
-    }
-
-    /// H-2.1 invariant: `cut(pos)` truncates the pool to match restored counts.
-    #[test]
-    fn h2_1_cut_truncates_box_pool() {
+    fn cut_truncates_recorded_ops() {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let saved = rec.get_position();
         let _add1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         let _add2 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        assert_eq!(rec.box_pool().len(), 3);
+        assert_eq!(rec.num_ops(), 2);
         rec.cut(saved);
-        assert_eq!(rec.box_pool().len(), 1);
-        assert!(rec.box_for_position(0).unwrap().is_inputarg());
-        assert!(rec.box_for_position(1).is_none());
-    }
-
-    /// H-3.0a invariant: `get_trace()` plumbs `box_pool` to `TreeLoop`
-    /// preserving Rc identity. Cloning the BoxRef on either side points
-    /// to the same allocation.
-    #[test]
-    fn h3_0a_get_trace_preserves_box_pool_identity() {
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        // Snapshot the box identity before consuming the recorder.  BoxRef's
-        // `PartialEq` is `Rc::ptr_eq`, so equality below is pointer identity
-        // — matching the H-2.1 invariant the test was already asserting.
-        let pre_box_at_1 = rec.box_for_position(1).unwrap().clone();
-        let trace = rec.get_trace();
-        assert_eq!(trace.box_pool.len(), 2);
-        assert_eq!(trace.box_pool.get_at_position(1).unwrap(), &pre_box_at_1);
-        assert!(trace.box_pool.get_at_position(0).unwrap().is_inputarg());
-        assert!(trace.box_pool.get_at_position(1).unwrap().is_resop());
-    }
-
-    /// H-2.1 invariant: BoxRef identity is per-allocation. Two record calls
-    /// with the same kind/type produce distinct boxes (unlike OpRef numbers
-    /// which are positional, BoxRef equality is pointer identity).
-    #[test]
-    fn h2_1_box_pool_distinct_identities() {
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let _x = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        let _y = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        let b0 = rec.box_for_position(0).unwrap().clone();
-        let b1 = rec.box_for_position(1).unwrap().clone();
-        let b2 = rec.box_for_position(2).unwrap().clone();
-        assert_ne!(b0, b1);
-        assert_ne!(b1, b2);
-        assert_ne!(b0, b2);
+        assert_eq!(rec.num_ops(), 0);
+        assert_eq!(rec.num_inputargs(), 1);
     }
 
     #[test]
