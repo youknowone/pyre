@@ -53,9 +53,10 @@ impl DataFlowFamilyBuilder {
                 let mut put_in_const = false;
                 for link in links {
                     // `var = link.args[n]`.
-                    let var = link.borrow().args.get(n).cloned().flatten().expect(
-                        "DataFlowFamilyBuilder: link.args position missing for inputarg",
-                    );
+                    let var =
+                        link.borrow().args.get(n).cloned().flatten().expect(
+                            "DataFlowFamilyBuilder: link.args position missing for inputarg",
+                        );
                     // `if not isinstance(var, Variable): put_in = opportunities_with_const`.
                     if matches!(var, FlowValue::Constant(_)) {
                         put_in_const = true;
@@ -145,7 +146,8 @@ impl DataFlowFamilyBuilder {
         while progress {
             progress = false;
             // `block_phi_nodes = {}`.
-            let mut block_phi_nodes: HashMap<(BlockRef, Vec<FlowValue>), FlowValue> = HashMap::new();
+            let mut block_phi_nodes: HashMap<(BlockRef, Vec<FlowValue>), FlowValue> =
+                HashMap::new();
             // `for vars in self.opportunities + self.opportunities_with_const`.
             for opp in self
                 .opportunities
@@ -312,12 +314,21 @@ pub fn ssa_to_ssi(graph: &FunctionGraph) {
             block.borrow_mut().renamevariables(&renaming);
         } else {
             // Add `v` to every incoming link and the block's inputargs.
-            let links = entrymap.get(&block).cloned().unwrap_or_else(|| {
-                panic!(
-                    "SSA_to_SSI failed: no way to give a value to {} in block",
-                    v.name()
-                )
-            });
+            //
+            // pyre walker adaptation (#73): a block with no graph predecessors
+            // (the startblock) is reached when `v` is defined by the walker's
+            // INLINE emission in that entry block — `block.operations` is empty
+            // because the walker records ops into `per_block_ssarepr`, not the
+            // graph, so `variables_created_in` cannot see the definition.  The
+            // value really exists (in the walker's register/slot model), so the
+            // link.args/inputargs threaded so far flow correctly from it; stop
+            // threading instead of panicking.  RPython panics here because its
+            // flow graphs are complete; pyre's walker dual-write is not (until
+            // the walker threads every value through the graph — the rest of
+            // #73).
+            let Some(links) = entrymap.get(&block).cloned() else {
+                continue;
+            };
             // `w = v.copy()` — fresh identity, same kind.
             let w = graph.fresh_like(v);
             variable_families.union(FlowValue::Variable(v), FlowValue::Variable(w));

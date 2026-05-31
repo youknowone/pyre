@@ -195,12 +195,18 @@ fn isspecialvar(v: &FlowValue) -> bool {
 /// Variable and any Constant is returned unchanged.
 fn rename_value(v: &FlowValue, mapping: &HashMap<Variable, FlowValue>) -> FlowValue {
     match v {
-        FlowValue::Variable(var) => mapping.get(var).cloned().unwrap_or(FlowValue::Variable(*var)),
+        FlowValue::Variable(var) => mapping
+            .get(var)
+            .cloned()
+            .unwrap_or(FlowValue::Variable(*var)),
         FlowValue::Constant(_) => v.clone(),
     }
 }
 
-fn rename_arg(arg: &SpaceOperationArg, mapping: &HashMap<Variable, FlowValue>) -> SpaceOperationArg {
+fn rename_arg(
+    arg: &SpaceOperationArg,
+    mapping: &HashMap<Variable, FlowValue>,
+) -> SpaceOperationArg {
     match arg {
         SpaceOperationArg::Value(value) => SpaceOperationArg::Value(rename_value(value, mapping)),
         SpaceOperationArg::ListOfKind(list) => SpaceOperationArg::ListOfKind(FlowListOfKind {
@@ -227,9 +233,7 @@ fn rename_exitswitch(sw: &ExitSwitch, mapping: &HashMap<Variable, FlowValue>) ->
                     ExitSwitchElement::Value(value) => {
                         ExitSwitchElement::Value(rename_value(value, mapping))
                     }
-                    ExitSwitchElement::Marker(marker) => {
-                        ExitSwitchElement::Marker(marker.clone())
-                    }
+                    ExitSwitchElement::Marker(marker) => ExitSwitchElement::Marker(marker.clone()),
                 })
                 .collect(),
         ),
@@ -263,7 +267,10 @@ fn renamevariables_value(block: &BlockRef, mapping: &HashMap<Variable, FlowValue
                 offset: op.offset,
             })
             .collect();
-        let switch = b.exitswitch.as_ref().map(|sw| rename_exitswitch(sw, mapping));
+        let switch = b
+            .exitswitch
+            .as_ref()
+            .map(|sw| rename_exitswitch(sw, mapping));
         (ops, switch)
     };
     {
@@ -325,9 +332,10 @@ pub fn remove_identical_vars_ssa(graph: &FunctionGraph) {
             };
             let mut phi_args: Vec<FlowValue> = Vec::with_capacity(links.len());
             for link in links {
-                let arg = link.borrow().args.get(i).cloned().flatten().expect(
-                    "remove_identical_vars_SSA: link.args position missing for inputarg",
-                );
+                let arg =
+                    link.borrow().args.get(i).cloned().flatten().expect(
+                        "remove_identical_vars_SSA: link.args position missing for inputarg",
+                    );
                 phi_args.push(arg);
             }
             phis.push((*input_v, phi_args));
@@ -371,7 +379,8 @@ pub fn remove_identical_vars_ssa(graph: &FunctionGraph) {
             .get(block)
             .cloned()
             .expect("entrymap lookup consistent with inputs");
-        let new_inputs: Vec<FlowValue> = phis.iter().map(|(v, _)| FlowValue::Variable(*v)).collect();
+        let new_inputs: Vec<FlowValue> =
+            phis.iter().map(|(v, _)| FlowValue::Variable(*v)).collect();
         // `per_link_args[link_idx][phi_idx] = phis[phi_idx].1[link_idx]`.
         let per_link_args: Vec<Vec<Option<FlowValue>>> = (0..links.len())
             .map(|li| phis.iter().map(|(_, pa)| Some(pa[li].clone())).collect())
@@ -455,7 +464,11 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     };
 
     let exits_snapshot: Vec<LinkRef> = block.borrow().exits.clone();
-    let mut newexits: Vec<LinkRef> = exits_snapshot.iter().filter(|l| cases_eq(l)).cloned().collect();
+    let mut newexits: Vec<LinkRef> = exits_snapshot
+        .iter()
+        .filter(|l| cases_eq(l))
+        .cloned()
+        .collect();
     if newexits.is_empty() {
         newexits = exits_snapshot
             .iter()
@@ -592,11 +605,56 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
 /// equivalent: pyre-jit's flow ops are CPython-bytecode-derived, not RPython LL
 /// ops, so only the literal opname list ports.
 const CAN_REMOVE: &[&str] = &[
-    "newtuple", "newlist", "newdict", "bool", "is_", "id", "type", "issubtype", "isinstance",
-    "repr", "str", "len", "hash", "getattr", "getitem", "pos", "neg", "abs", "hex", "oct", "ord",
-    "invert", "add", "sub", "mul", "truediv", "floordiv", "div", "mod", "divmod", "pow", "lshift",
-    "rshift", "and_", "or_", "xor", "int", "float", "long", "lt", "le", "eq", "ne", "gt", "ge",
-    "cmp", "coerce", "contains", "iter", "get",
+    "newtuple",
+    "newlist",
+    "newdict",
+    "bool",
+    "is_",
+    "id",
+    "type",
+    "issubtype",
+    "isinstance",
+    "repr",
+    "str",
+    "len",
+    "hash",
+    "getattr",
+    "getitem",
+    "pos",
+    "neg",
+    "abs",
+    "hex",
+    "oct",
+    "ord",
+    "invert",
+    "add",
+    "sub",
+    "mul",
+    "truediv",
+    "floordiv",
+    "div",
+    "mod",
+    "divmod",
+    "pow",
+    "lshift",
+    "rshift",
+    "and_",
+    "or_",
+    "xor",
+    "int",
+    "float",
+    "long",
+    "lt",
+    "le",
+    "eq",
+    "ne",
+    "gt",
+    "ge",
+    "cmp",
+    "coerce",
+    "contains",
+    "iter",
+    "get",
 ];
 
 fn can_remove_opname(op: &str) -> bool {
@@ -1067,7 +1125,12 @@ mod tests {
 
         // `yes`/`no` both fall through to the returnblock (1 inputarg).
         yes.closeblock(vec![
-            Link::new(vec![Constant::signed(0).into()], Some(returnblock.clone()), None).into_ref(),
+            Link::new(
+                vec![Constant::signed(0).into()],
+                Some(returnblock.clone()),
+                None,
+            )
+            .into_ref(),
         ]);
         no.closeblock(vec![
             Link::new(vec![Constant::signed(0).into()], Some(returnblock), None).into_ref(),

@@ -895,7 +895,10 @@ impl Link {
     /// `None` only if the owning block has been dropped, which never
     /// happens for a link still reachable from `graph.iterlinks()`.
     pub fn prevblock_ref(&self) -> Option<BlockRef> {
-        self.prevblock.as_ref().and_then(Weak::upgrade).map(BlockRef)
+        self.prevblock
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(BlockRef)
     }
 
     pub fn into_ref(self) -> LinkRef {

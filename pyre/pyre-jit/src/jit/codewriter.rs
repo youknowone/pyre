@@ -9456,16 +9456,18 @@ impl CodeWriter {
         // EMPIRICALLY VALIDATED (#73, 2026-05-31): this subset passes the
         // full check.py gate (dynasm 39/39, correctness + 8-benchmark
         // performance, no regression).  The only remaining active pass is
-        // `ssa_to_ssi`, gated on the walker producing COMPLETE SSA graphs:
-        // wiring it crashes 5/25 synthetic at `backendopt_ssa.rs:316`
-        // ("no way to give a value to v"), because the walker's dual-write
-        // graph has "free" variable uses it threads via the register/slot
-        // model rather than through graph inputargs — an incomplete SSA graph
-        // that ssa_to_ssi (correctly, as RPython would) rejects.  Completing
-        // it needs the walker to thread every value through the graph (#73),
-        // not a drain bridge.  The other `all_passes` entries are structural
-        // no-ops on today's empty-`operations` walker blocks (see their
-        // classification in `simplify.rs`).
+        // `ssa_to_ssi`, deliberately NOT wired.  It now runs CORRECTLY on
+        // walker graphs (the `backendopt_ssa.rs` stop-at-startblock
+        // adaptation makes it recognise values the walker defines inline at
+        // entry instead of crashing), and wiring it passes correctness
+        // 39/39 — but it is **overhead-only** on today's inline walker: it
+        // threads variables the walker already routes through its
+        // register/slot model, adding redundant coalesce pairs / `ref_copy`
+        // that measurably regress exception-heavy code (raise_catch ~4.2x ->
+        // ~10.9x).  SSI form only pays off once codegen is driven from the
+        // graph (#73), so it stays out until then.  The other `all_passes`
+        // entries are structural no-ops on today's empty-`operations` walker
+        // blocks (see their classification in `simplify.rs`).
         super::simplify::transform_dead_op_vars(&graph);
         eliminate_empty_blocks(&graph);
         super::simplify::remove_identical_vars_ssa(&graph);
