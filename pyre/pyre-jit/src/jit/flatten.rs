@@ -1347,7 +1347,33 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         let insn = self.flatten_space_operation(op);
+        // `jtransform.py:467-482` appends a `-live-` AFTER a call op so the
+        // metainterp can snapshot the post-call resume state for
+        // `guard_no_exception` (residual) / inline-call boundaries:
+        //   handle_residual_call: `op1 = [op1, ('-live-', [], None)]`
+        //     emitted iff `may_call_jitcodes or calldescr_canraise(...)`.
+        //   handle_regular_call:  `[op0, ('-live-', [], None)]` — always.
+        // The walker covers this point incidentally via its per-PC `-live-`;
+        // the canonical driver must emit it explicitly so the encoder's
+        // FALLTHROUGH_pc read (`handle_possible_exception` ->
+        // `guard_no_exception`, trace_opcode.rs:7032) and the resume reader
+        // find a marker at the post-call position.  Gated on `lowering_ctx`
+        // so the production walker stream is untouched.
+        //
+        // Conservative superset: every `residual_call_*` gets the trailing
+        // `-live-`, not only the `calldescr_canraise` subset.  The retired
+        // HLOp families lowered here (add/lt/bool/setitem/...) all carry
+        // `EF_CAN_RAISE`, so the superset matches `calldescr_canraise` for
+        // the common case; an extra `-live-` after a non-raising call is a
+        // no-op marker (the encoder never reads a PC with no guard).
+        // Tightening to `EffectInfo::check_can_raise` waits until the
+        // pc_map -> `-live-` wiring (A2) makes the distinction observable.
+        let trailing_live =
+            self.lowering_ctx.is_some() && insn_needs_trailing_live(&insn);
         self.emitline(insn);
+        if trailing_live {
+            self.emitline(Insn::live(Vec::new()));
+        }
     }
 
     fn emitline(&mut self, insn: Insn) {
@@ -2344,6 +2370,22 @@ fn regalloc_color(
         )
     });
     Register::new(kind, color)
+}
+
+/// `true` iff a trailing `-live-` must follow this Insn in the canonical
+/// stream — the call ops that `jtransform.py:467-482` pairs with a
+/// post-op `-live-`.  `residual_call_*` (`handle_residual_call`) and
+/// `inline_call_*` (`handle_regular_call`) are the families; both produce
+/// a `guard_no_exception` / inline-boundary resume point that the encoder
+/// reads at the FALLTHROUGH position.  See `serialize_op` for the
+/// canraise-superset rationale.
+fn insn_needs_trailing_live(insn: &Insn) -> bool {
+    match insn {
+        Insn::Op { opname, .. } => {
+            opname.starts_with("residual_call") || opname.starts_with("inline_call")
+        }
+        _ => false,
+    }
 }
 
 fn is_bool_or_tuple_exitswitch(
@@ -5358,6 +5400,62 @@ mod tests {
                 ssarepr.insns
             );
         }
+    }
+
+    #[test]
+    fn lowering_emits_trailing_live_after_residual_call() {
+        // `jtransform.py:467-471 handle_residual_call` pairs a
+        // `residual_call_*` with a trailing `('-live-', [], None)` so the
+        // metainterp can snapshot the post-call `guard_no_exception`
+        // resume state.  The canonical driver (`serialize_op` under
+        // `lowering_ctx`) must emit that marker immediately AFTER the
+        // lowered call; the production walker covers the same point via
+        // its per-PC `-live-`.  A single `add` HLOp lowers to one
+        // `residual_call_ir_r` that must be followed by a `-live-`.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let add_res = Variable::new(VariableId(2), Kind::Ref);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("trailing_live", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(add_res.into()), 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![add_res.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+            build_list_fn_idx: 0,
+            call_fn_idx_by_nargs: [0; 9],
+            portal_frame_var: None,
+        };
+
+        let mut ssarepr = SSARepr::new("trailing_live");
+        flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
+
+        let call_pos = ssarepr
+            .insns
+            .iter()
+            .position(|insn| {
+                matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r")
+            })
+            .unwrap_or_else(|| panic!("expected residual_call_ir_r: {:?}", ssarepr.insns));
+        assert!(
+            ssarepr.insns[call_pos + 1].is_live(),
+            "residual_call must be followed by a `-live-` marker, got {:?}",
+            &ssarepr.insns[call_pos..]
+        );
     }
 
     #[test]
