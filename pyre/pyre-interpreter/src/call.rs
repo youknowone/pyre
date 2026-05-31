@@ -1829,31 +1829,33 @@ fn call_metaclass_with_kwargs(
     };
 
     if let Some(new_fn) = new_fn {
-        if unsafe { crate::is_function(new_fn) } {
-            // User function: resolve kwargs to kwonly params
-            let code_ptr = unsafe { crate::get_pycode(new_fn) };
-            let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
-            let nparams = code.arg_count as usize; // positional params
-            let nkwonly = code.kwonlyarg_count as usize;
-
-            // Build positional args: [mcs, name, bases, ns_dict]
-            let mut args = vec![w_metaclass, name, bases, w_namespace_dict];
-
-            // Fill kwonly params from kwargs dict
-            for ki in 0..nkwonly {
-                let param_idx = nparams + ki;
-                if param_idx < code.varnames.len() {
-                    let param_name = &code.varnames[param_idx];
-                    let key = pyre_object::w_str_new(param_name);
-                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwargs, key) } {
-                        args.push(val);
-                    } else {
-                        args.push(pyre_object::PY_NULL); // will be filled by defaults
-                    }
+        // Resolve only against a user-defined __new__ with a real code
+        // object; the builtin type.__new__ has none, so fall through.
+        let is_user_fn = unsafe { crate::is_function(new_fn) }
+            && unsafe {
+                !crate::is_builtin_code(crate::getcode(new_fn) as pyre_object::PyObjectRef)
+            };
+        if is_user_fn {
+            // [mcs, name, bases, ns] positional + the class-definition
+            // kwargs as keywords; resolve_kwargs matches them against the
+            // __new__ signature, filling keyword-only params and packing
+            // the remainder into a `**kwds` parameter when present.
+            let mut call_args = vec![w_metaclass, name, bases, w_namespace_dict];
+            let mut names = Vec::new();
+            for (k, v) in unsafe { pyre_object::w_dict_items(kwargs) } {
+                if unsafe { pyre_object::is_str(k) } {
+                    call_args.push(v);
+                    names.push(k);
                 }
             }
-
-            return call_user_function_with_args(new_fn, &args);
+            let kwarg_names = pyre_object::w_tuple_new(names);
+            return match resolve_kwargs(new_fn, &call_args, kwarg_names) {
+                Ok(resolved) => call_user_function_resolved_frameless(new_fn, &resolved),
+                Err(e) => {
+                    set_call_error(e);
+                    PY_NULL
+                }
+            };
         }
     }
 
