@@ -3515,7 +3515,12 @@ fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
 /// sliceobject.py:148 `W_SliceObject.descr_indices`.
 fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "indices() takes exactly one argument");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "indices() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let length = crate::builtins::getindex_w(args[1])?;
     if length < 0 {
         return Err(crate::PyError::new(
@@ -7296,7 +7301,10 @@ fn init_bytes_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromhex",
-        make_builtin_function("fromhex", bytes_fromhex),
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "fromhex",
+            bytes_fromhex,
+        )),
     );
     for (name, func) in [
         ("__eq__", bytes_dunder_eq as DunderFn),
@@ -8443,14 +8451,32 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     Ok(out)
 }
 
+// classmethod: args[0] is the bound cls, args[1] the hex string.
+// `bytesobject.py:587 descr_fromhex` / `bytearrayobject.py:207
+// descr_fromhex` — build the base type's value, then route through
+// `cls(value)` when called on a subclass.
 fn bytes_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let out = parse_hex_string(args)?;
-    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out))
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let out = parse_hex_string(&args[1..])?;
+    let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&out);
+    let base = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
+    if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
+        Ok(w_bytes)
+    } else {
+        crate::call::call_function_impl_result(cls, &[w_bytes])
+    }
 }
 
 fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let out = parse_hex_string(args)?;
-    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&out))
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let out = parse_hex_string(&args[1..])?;
+    let w_bytearray = pyre_object::bytearrayobject::w_bytearray_from_bytes(&out);
+    let base = crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+    if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
+        Ok(w_bytearray)
+    } else {
+        crate::call::call_function_impl_result(cls, &[w_bytearray])
+    }
 }
 
 /// `pypy/objspace/std/bytesobject.py W_BytesObject.descr_hex` —
@@ -8511,19 +8537,19 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Err(crate::PyError::type_error("sep must be str or bytes"));
     };
     let sep_str = sep_char.to_string();
-    // `bytearrayobject.py:660-674` — positive `bytes_per_sep` groups
+    // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
     // from the right (default), negative groups from the left; zero
-    // falls back to 1.
+    // disables separators entirely.
     let raw_group: i64 = if args.len() >= 3 {
         crate::baseobjspace::int_w(args[2])?
     } else {
         1
     };
-    let group = (raw_group.unsigned_abs() as usize).max(1);
+    let group = raw_group.unsigned_abs() as usize;
     let group_from_left = raw_group < 0;
     let mut out = String::with_capacity(data.len() * 2 + data.len());
     for (i, b) in data.iter().enumerate() {
-        if i > 0 {
+        if i > 0 && group != 0 {
             let boundary = if group_from_left {
                 i % group == 0
             } else {
@@ -9502,7 +9528,10 @@ fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromhex",
-        make_builtin_function("fromhex", bytearray_fromhex),
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "fromhex",
+            bytearray_fromhex,
+        )),
     );
     // In-place mutators specific to the mutable bytearray.
     dict_storage_store(
