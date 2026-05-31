@@ -6050,76 +6050,14 @@ fn init_int_type(ns: &mut DictStorage) {
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
         }),
     );
-    // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod in CPython
+    // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod.
     dict_storage_store(
         ns,
         "from_bytes",
-        make_builtin_function("from_bytes", |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            // The data argument is the first bytes-like / str positional;
-            // this skips a bound `cls`/instance receiver when present.
-            let data_idx = pos.iter().position(|&a| unsafe {
-                pyre_object::bytesobject::is_bytes_like(a) || pyre_object::is_str(a)
-            });
-            let bytes: Vec<u8> = match data_idx {
-                Some(i) => unsafe {
-                    let a = pos[i];
-                    if pyre_object::bytesobject::is_bytes_like(a) {
-                        pyre_object::bytesobject::bytes_like_data(a).to_vec()
-                    } else {
-                        pyre_object::w_str_get_value(a).as_bytes().to_vec()
-                    }
-                },
-                None => vec![],
-            };
-            // byteorder: the `byteorder` keyword, else the first str after
-            // the data argument (positional-or-keyword), else "big".
-            let byteorder = crate::builtins::kwarg_get(kwargs, "byteorder").or_else(|| {
-                let start = data_idx.map_or(0, |i| i + 1);
-                pos.iter()
-                    .skip(start)
-                    .find(|&&a| unsafe { pyre_object::is_str(a) })
-                    .copied()
-            });
-            let little_endian = byteorder
-                .map(|b| unsafe {
-                    pyre_object::is_str(b) && pyre_object::w_str_get_value(b) == "little"
-                })
-                .unwrap_or(false);
-            // signed: the `signed` keyword, else a positional bool, else False.
-            let signed = crate::builtins::kwarg_get(kwargs, "signed")
-                .or_else(|| {
-                    pos.iter()
-                        .find(|&&a| unsafe { pyre_object::is_bool(a) })
-                        .copied()
-                })
-                .map(crate::baseobjspace::is_true)
-                .unwrap_or(false);
-            let mut val: u64 = 0;
-            if little_endian {
-                for (i, &b) in bytes.iter().enumerate() {
-                    val |= (b as u64) << (i * 8);
-                }
-            } else {
-                for &b in &bytes {
-                    val = (val << 8) | b as u64;
-                }
-            }
-            // Two's-complement reinterpretation for `signed=True` (values up
-            // to 8 bytes; wider inputs keep the existing truncating path).
-            let n = bytes.len();
-            let result: i64 = if signed && (1..=8).contains(&n) {
-                let sign_bit_set = (val >> (8 * n - 1)) & 1 == 1;
-                if sign_bit_set && n < 8 {
-                    (val as i64) - (1i64 << (8 * n))
-                } else {
-                    val as i64
-                }
-            } else {
-                val as i64
-            };
-            Ok(pyre_object::w_int_new(result))
-        }),
+        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+            "from_bytes",
+            int_from_bytes,
+        )),
     );
     // int.__index__ / __int__ / __trunc__ — identity
     for method in ["__index__", "__int__", "__trunc__"] {
@@ -8464,6 +8402,99 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
 }
 
 // classmethod: args[0] is the bound cls, args[1] the hex string.
+// `intobject.py:62 descr_from_bytes` — classmethod
+// `(bytes, byteorder='big', *, signed=False)`.  `byteorder` is
+// positional-or-keyword; `signed` is keyword-only.  Bound `cls` arrives
+// at `args[0]`; the base type returns a plain int, a subclass routes
+// through `cls(value)`.
+fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = pos.first().copied().unwrap_or(pyre_object::PY_NULL);
+    // `bytes` and `byteorder` are the only positional parameters; `signed`
+    // is keyword-only, so a third positional is an error.
+    if pos.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "from_bytes() takes at most 2 positional arguments ({} given)",
+            pos.len() - 1
+        )));
+    }
+    let data_obj = pos.get(1).copied().ok_or_else(|| {
+        crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
+    })?;
+    // `makebytesdata_w` — the buffer protocol, else an iterable of ints.
+    let bytes: Vec<u8> = if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
+        unsafe { pyre_object::bytesobject::bytes_like_data(data_obj).to_vec() }
+    } else {
+        let items = crate::builtins::collect_iterable(data_obj)?;
+        let mut v = Vec::with_capacity(items.len());
+        for it in items {
+            let n = crate::baseobjspace::int_w(it)?;
+            if !(0..=255).contains(&n) {
+                return Err(crate::PyError::value_error(
+                    "bytes must be in range(0, 256)",
+                ));
+            }
+            v.push(n as u8);
+        }
+        v
+    };
+    // byteorder: positional `pos[2]` or the `byteorder` keyword, default "big".
+    let byteorder_obj =
+        crate::builtins::kwarg_get(kwargs, "byteorder").or_else(|| pos.get(2).copied());
+    let little_endian = match byteorder_obj {
+        None => false,
+        Some(b) if unsafe { pyre_object::is_str(b) } => {
+            match unsafe { pyre_object::w_str_get_value(b) } {
+                "little" => true,
+                "big" => false,
+                _ => {
+                    return Err(crate::PyError::value_error(
+                        "byteorder must be either 'little' or 'big'",
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(crate::PyError::value_error(
+                "byteorder must be either 'little' or 'big'",
+            ));
+        }
+    };
+    let signed = crate::builtins::kwarg_get(kwargs, "signed")
+        .map(crate::baseobjspace::is_true)
+        .unwrap_or(false);
+    let mut val: u64 = 0;
+    if little_endian {
+        for (i, &b) in bytes.iter().enumerate() {
+            val |= (b as u64) << (i * 8);
+        }
+    } else {
+        for &b in &bytes {
+            val = (val << 8) | b as u64;
+        }
+    }
+    // Two's-complement reinterpretation for `signed=True` (values up to 8
+    // bytes; wider inputs keep the existing truncating path).
+    let n = bytes.len();
+    let result: i64 = if signed && (1..=8).contains(&n) {
+        let sign_bit_set = (val >> (8 * n - 1)) & 1 == 1;
+        if sign_bit_set && n < 8 {
+            (val as i64) - (1i64 << (8 * n))
+        } else {
+            val as i64
+        }
+    } else {
+        val as i64
+    };
+    let w_result = pyre_object::w_int_new(result);
+    let base = crate::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
+    if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
+        Ok(w_result)
+    } else {
+        crate::call::call_function_impl_result(cls, &[w_result])
+    }
+}
+
 // `bytesobject.py:587 descr_fromhex` / `bytearrayobject.py:207
 // descr_fromhex` — build the base type's value, then route through
 // `cls(value)` when called on a subclass.
