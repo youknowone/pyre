@@ -4821,11 +4821,26 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 // Phase 2 panicked — unroll_opt dropped. Phase 1 results
                 // survive in phase1_out (written before Phase 2 started).
-                if let Some(inv) = payload.downcast_ref::<crate::optimize::InvalidLoop>() {
+                //
+                // unroll.py:119-123 `except SpeculativeError: raise
+                // InvalidLoop`: a SpeculativeError escaping the optimize
+                // pass (constant_fold of an ill-typed speculative heap
+                // access) is equivalent to an InvalidLoop — abandon the
+                // optimized trace and fall back, rather than re-raising and
+                // crashing the interpreter.
+                let invalid_reason = payload
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
+                    .map(|inv| inv.0)
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<crate::optimize::SpeculativeError>()
+                            .map(|err| err.0)
+                    });
+                if let Some(reason) = invalid_reason {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] abort trace at key={} (InvalidLoop: {})",
-                            green_key, inv.0,
+                            green_key, reason,
                         );
                     }
                     self.cancel_count += 1;
