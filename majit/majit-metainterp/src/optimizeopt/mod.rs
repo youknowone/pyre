@@ -2386,23 +2386,14 @@ impl OptContext {
         // model is the literal upstream shape. `ensure_box` writes the
         // single requested slot via `BoxPool::set(idx, ...)` and leaves
         // the holes untouched.
-        let opref = OpRef::op_typed(raw, tp);
-        // Eagerly materialize the position's canonical host (a `SameAs*`
-        // synthetic in `resop_refs[raw]`, not `box_pool`) so a later
-        // `find_producer_op` for this position resolves. Gated on a non-empty
-        // `box_pool` in test builds: an empty `ctx.box_pool` marks a synthetic
-        // fixture / empty trace that reserves label / jump positions it never
-        // emits, where an eager synthetic would leak into `phase1_emit_ops`
-        // (the production trace always emits the reserved op, superseding the
-        // synthetic). The `is_empty()` check is the last surviving `box_pool`
-        // read in this method.
-        #[cfg(not(test))]
-        self.ensure_box(opref);
-        #[cfg(test)]
-        if !self.box_pool.is_empty() {
-            self.ensure_box(opref);
-        }
-        opref
+        // The position's canonical host is materialized lazily on first
+        // access (`ensure_box` / `resolve_to_boxref` mint a `SameAs*`
+        // synthetic into `resop_refs[raw]` keyed by the full OpRef). No eager
+        // pre-mint here: an eager synthetic for a position that is reserved
+        // but never emitted (label / jump positions on an empty trace) would
+        // leak into `phase1_emit_ops` via `live_synthetics`; the emitted op,
+        // when it arrives, supersedes the lazily-minted synthetic the same way.
+        OpRef::op_typed(raw, tp)
     }
 
     /// opencoder.py:271 `_index` parity: floor at the iteration's inputarg
