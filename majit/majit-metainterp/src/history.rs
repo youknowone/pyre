@@ -81,7 +81,7 @@ pub struct TreeLoop {
     /// forwarding state, short preamble export, resume metadata, and
     /// backend input lists. Pyre uses `Rc<Op>` so every consumer that
     /// holds an `OpRc` reads and writes `forwarded`/`descr`/... through
-    /// the shared identity (BoxPool removal plan slice 1).
+    /// the shared identity.
     pub ops: Vec<OpRc>,
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.

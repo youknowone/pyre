@@ -353,14 +353,14 @@ pub struct TraceCtx {
     /// which deref's the pointer to invoke `executor::do_getfield_gc_*`.
     /// The fat pointer is `*const dyn Backend` (16 bytes on 64-bit).
     pub(crate) cpu: Option<*const dyn majit_backend::Backend>,
-    // `opref_concrete: HashMap<u32, Value>` retired — the Box.value
-    // carrier now lives intrinsically on each `BoxRef` in the
-    // recorder's BoxPool (`box.rs Box::value: Cell<Option<Value>>`),
-    // matching RPython `history.py:803-807` *FrontendOp(pos, value)
-    // where the per-position concrete is a Box field, not an external
-    // side table.  `set_opref_concrete` / `lookup_opref_concrete` now
-    // route through `recorder.box_for_position(opref.raw())` and call
-    // `BoxRef::set_value` / `BoxRef::get_value` directly.
+    // `opref_concrete: HashMap<u32, Value>` retired — the concrete
+    // value now lives intrinsically on each frontend object's
+    // `value: Cell<Option<Value>>` field (`Op` / `InputArg`), matching
+    // RPython `history.py:803-807` *FrontendOp(pos, value) where the
+    // per-position concrete is an object field, not an external side
+    // table.  `set_opref_concrete` / `lookup_opref_concrete` now route
+    // through `recorder.set_concrete_at` / `recorder.concrete_at`, which
+    // resolve `opref.raw()` to the canonical `InputArg` / `Op`.
     /// `pyjitpl.py:3389-3390` `raise SwitchToBlackhole(ABORT_ESCAPE,
     /// raising_exception=True)` — RPython surfaces the abort reason and
     /// the `raising_exception` flag as a real Python exception that
@@ -732,8 +732,8 @@ impl TraceCtx {
     /// Box object carrying both identity and value; pyre returns the
     /// Box identity as an `OpRef` and sanity-check callers retrieve
     /// the intrinsic value via `box_value(cached)` (which composes
-    /// the const pool, standard-virtualizable shadow, and BoxPool's
-    /// `Box::value: Cell<Option<Value>>` field — PyPy `history.py:680
+    /// the const pool, standard-virtualizable shadow, and the frontend
+    /// object's `value: Cell<Option<Value>>` field — PyPy `history.py:680
     /// AbstractValue.getXXX()` / `history.py:803-807 *FrontendOp(pos,
     /// value)` parity).
     pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
@@ -747,7 +747,7 @@ impl TraceCtx {
     /// when `obj` is not known-unescaped.
     ///
     /// `value` is the cached Box identity (OpRef); its intrinsic
-    /// runtime value travels with the BoxPool entry so subsequent
+    /// runtime value travels with the frontend value slot so subsequent
     /// cache-hit sanity checks read it via `box_value(value)` —
     /// covering the const pool, standard-virtualizable shadow, and
     /// `Box::value: Cell<Option<Value>>` field in one call.
@@ -759,7 +759,7 @@ impl TraceCtx {
     }
 
     /// heapcache.py:534-536 `getfield_now_known` parity (no aliasing).
-    /// `value` is the loaded Box identity (OpRef); the BoxPool entry
+    /// `value` is the loaded Box identity (OpRef); the frontend value slot
     /// carries the intrinsic `executor.execute(...)`-produced value
     /// the cache-hit sanity check resolves later via
     /// `lookup_opref_concrete`.
@@ -1099,26 +1099,24 @@ impl TraceCtx {
     }
 
     /// `IntFrontendOp(pos, intval)` / `FloatFrontendOp(pos, floatval)`
-    /// / `RefFrontendOp(pos, gcref)` parity — stamp the BoxPool entry
+    /// / `RefFrontendOp(pos, gcref)` parity — stamp the frontend object
     /// for this OpRef position with its runtime concrete value.  Routes
-    /// the write through the BoxPool's intrinsic `Box.value` field
-    /// (`box.rs` — `BoxRef::set_value`) instead of a flat-OpRef side
-    /// table; matches RPython where the value lives on the operation-
-    /// result Box object itself.  Const variants are immutable
-    /// (their value is in `BoxKind::Const { value, .. }`) so the call
-    /// is a no-op for them.
+    /// the write to the canonical `InputArg` / `Op` `value` field
+    /// (`recorder.set_concrete_at`) instead of a flat-OpRef side table;
+    /// matches RPython where the value lives on the operation-result
+    /// object itself.  Const OpRefs carry their value inline, so the
+    /// call is a no-op for them.
     ///
     /// **Invariant** (`history.py:803 *FrontendOp(pos, value)` parity):
-    /// the BoxPool slot for `opref.raw()` must already exist — Pyre
-    /// allocates the slot at every `record_op*` / `record_input_arg`
-    /// site, mirroring RPython where instantiating `IntFrontendOp(pos,
-    /// value)` *is* the Box and there is no "stamp before allocation"
-    /// state.  A missing slot here means a synthetic / stale OpRef
-    /// (test fixture or bridge auxiliary path) is trying to stamp a
-    /// Box that was never constructed — an invariant violation that
-    /// would silently swallow the value under the previous
-    /// `if let Some` shape and hide cache-hit sanity-check
-    /// mismatches.  Panic instead.
+    /// the recorded position for `opref.raw()` must already exist — Pyre
+    /// allocates it at every `record_op*` / `record_input_arg` site,
+    /// mirroring RPython where instantiating `IntFrontendOp(pos, value)`
+    /// *is* the object and there is no "stamp before allocation" state.
+    /// A missing position here means a synthetic / stale OpRef (test
+    /// fixture or bridge auxiliary path) is trying to stamp an object
+    /// that was never constructed — an invariant violation that would
+    /// silently swallow the value under the previous `if let Some`
+    /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
         if opref.is_constant() {
             return;
@@ -1140,7 +1138,7 @@ impl TraceCtx {
     }
 
     /// `BoxRef::get_value` reader — the concrete value stamped onto
-    /// this OpRef's BoxPool entry (`history.py:803 *FrontendOp(pos,
+    /// this OpRef's frontend value slot (`history.py:803 *FrontendOp(pos,
     /// value)` analog).  `None` if never stamped — RPython equivalent:
     /// the operation result has not been computed at trace time
     /// (residual calls + guards keep their result `None` until
@@ -1155,7 +1153,7 @@ impl TraceCtx {
 
     /// `Box.value` read — composes the resolution chain that
     /// `concrete_of_opref` uses (Const pool + standard-virtualizable
-    /// shadow + BoxPool `Box::value` field) but returns
+    /// shadow + the frontend object's `value` field) but returns
     /// `Option<Value>` instead of the `Ref(usize::MAX)` sentinel.
     /// history.py:680 `AbstractValue.getint()/getref_base()/
     /// getfloat_storage()` analog: `Const.getint()` for constants,
@@ -2467,7 +2465,7 @@ impl TraceCtx {
                 // `cached` (an OpRef); its intrinsic runtime value is
                 // surfaced via `box_value(cached)` — covering the
                 // const pool, standard-virtualizable shadow, and
-                // BoxPool `Box::value` field (RPython
+                // the frontend object's `value` field (RPython
                 // `currfieldbox.getXXX()` dispatch parity).
                 let cached_value = self.box_value(cached).unwrap_or(Value::Void);
                 let expected_int = match cached_value {
@@ -2501,7 +2499,7 @@ impl TraceCtx {
                 self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr.clone());
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
-            // pyre stamps the BoxPool entry for `op` with the live
+            // pyre stamps the frontend value slot for `op` with the live
             // load so subsequent `box_value(op)` sees the
             // executor-returned payload (RPython `IntFrontendOp(pos,
             // intval)` construction-time field assignment).
@@ -2684,7 +2682,7 @@ impl TraceCtx {
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
             // pyjitpl.py:980 upd.setfield(valuebox).  Cache stores the
             // Box identity (`value` OpRef); the intrinsic concrete
-            // travels with the BoxPool entry — `value`'s slot was
+            // travels with the frontend value slot — `value`'s slot was
             // stamped at the calling record-site with `concrete` via
             // `set_opref_concrete`, so cache-hit sanity readers retrieve
             // it through `box_value(cached)`.
@@ -2740,7 +2738,7 @@ impl TraceCtx {
                 // `box_value(cached)` resolves the upstream
                 // `currfieldbox.getref_base()` payload through the
                 // full chain (const pool, standard-virtualizable
-                // shadow, BoxPool `Box::value` field).
+                // shadow, the frontend object's `value` field).
                 let cached_value = self.box_value(cached).unwrap_or(Value::Void);
                 let expected_ref = match cached_value {
                     Value::Ref(r) => Some(r),
@@ -3194,7 +3192,7 @@ impl TraceCtx {
                 // `box_value(cached)` resolves the upstream
                 // `currfieldbox.getref_base()` payload through the
                 // full chain (const pool, standard-virtualizable
-                // shadow, BoxPool `Box::value` field).
+                // shadow, the frontend object's `value` field).
                 let cached_value = self.box_value(cached).unwrap_or(Value::Void);
                 let expected_ref = match cached_value {
                     Value::Ref(r) => Some(r),

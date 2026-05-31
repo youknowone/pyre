@@ -10,8 +10,6 @@
 //! `_forwarded` slot lives on `Op` / `InputArg` themselves
 //! (`resoperation.py:233` / `:700`); `BoxRef` is a thin wrapper that
 //! routes `get_forwarded` / `set_forwarded_*` through the bound handle.
-//! The `BoxPool` side-table that addresses these objects by `OpRef`
-//! index stays in metainterp.
 //!
 //! # Design decisions
 //!
@@ -202,12 +200,10 @@ impl BoxRef {
 
     /// Transient `AbstractResOp` Box wrapping an already-bound
     /// `OpRc`. Used by the chain walker to materialize a `BoxRef`
-    /// terminal from a `Forwarded::Op(Weak<Op>)` payload without
-    /// going through the pool; the new box does not live in
-    /// `BoxPool`, but its `bound_op` immediately answers with the
-    /// same `Rc<Op>` and its `_forwarded` slot reads via the bound op
-    /// per `get_forwarded`. Type and position are mirrored from
-    /// `op.pos.get()`.
+    /// terminal from a `Forwarded::Op(Weak<Op>)` payload; the new box's
+    /// `bound_op` immediately answers with the same `Rc<Op>` and its
+    /// `_forwarded` slot reads via the bound op per `get_forwarded`.
+    /// Type and position are mirrored from `op.pos.get()`.
     pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
         let opref = op.pos.get();
         let type_ = opref.ty().unwrap_or(Type::Void);
@@ -669,9 +665,7 @@ impl BoxRef {
     /// unbound or dropped-target write would silently lose data
     /// since there is no `Box`-side mirror to catch it. Production
     /// pre-binds every chain-walker-reachable slot via
-    /// `OptContext::ensure_inputarg_bindings` and
-    /// `bind_input_resops`; recorder→TreeLoop handoff binds via
-    /// `BoxPool::bind_inputargs` / `bind_ops`.
+    /// `OptContext::ensure_inputarg_bindings` and `bind_input_resops`.
     fn write_forwarded(&self, value: Forwarded) {
         if let Some(op) = self.bound_op() {
             *op.forwarded.borrow_mut() = value;

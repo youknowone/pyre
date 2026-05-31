@@ -89,12 +89,12 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 /// fieldbox as a bare [`OpRef`] — the Box identity itself.  RPython
 /// `heapcache.py:60-95 cache_anything[box] = valuebox` stores a Box
 /// object (carrying both identity and value); pyre carries the same
-/// fact through `OpRef` + the recorder's per-position BoxPool
-/// (`box.rs Box::value: Cell<Option<Value>>`).  Cache-hit sanity
+/// fact through `OpRef` + the frontend object's `value`
+/// (`Op` / `InputArg` `value: Cell<Option<Value>>`).  Cache-hit sanity
 /// checks (`pyjitpl.py:937 assert resvalue == upd.currfieldbox.
 /// getint()`) read the cached OpRef's value via
 /// `TraceCtx::box_value` — composing the const pool, standard-
-/// virtualizable shadow, and BoxPool `Box::value` field in one
+/// virtualizable shadow, and the frontend object's `value` field in one
 /// call.  No separate side table.
 #[derive(Debug, Default)]
 pub(crate) struct CacheEntry {
@@ -291,8 +291,8 @@ impl FieldUpdater {
     /// upd.currfieldbox` direct attribute access.  Pyre carries the
     /// Box identity as an `OpRef`; downstream sanity readers look up
     /// the intrinsic value via `TraceCtx::box_value` (composing const
-    /// pool, standard-virtualizable shadow, BoxPool `Box::value`
-    /// field).
+    /// pool, standard-virtualizable shadow, the frontend object's
+    /// `value` field).
     pub fn currfieldbox(&self) -> Option<OpRef> {
         self.currfieldbox
     }
@@ -1557,7 +1557,7 @@ impl HeapCache {
                 // — follow the FO_REPLACED_WITH_CONST forwarding so callers
                 // see the canonical const replacement, not the stale Box.
                 // The Box identity is the OpRef; its intrinsic `value`
-                // travels with the BoxPool entry, so the copy needs no
+                // travels with the frontend value slot, so the copy needs no
                 // explicit payload handling.
                 let value = raw_value.map(|opref| self.maybe_replace_with_const(opref));
                 // heapcache.py:423-429: ...and write it to the dest cell.

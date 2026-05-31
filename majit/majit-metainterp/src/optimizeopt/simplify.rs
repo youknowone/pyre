@@ -95,11 +95,7 @@ mod tests {
         opt.add_pass(Box::new(OptSimplify::new()));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        )
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     #[test]

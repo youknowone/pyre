@@ -7,9 +7,8 @@
 //!
 //! `Op.descr` is now `RefCell<Option<DescrRef>>` so the optimizer can
 //! stamp a `ResumeGuardDescr` onto a shared `Op` (reached through
-//! `Rc<Op>` in the BoxPool trace storage migration) the same
-//! way RPython's `op.setdescr(d)` writes on a shared Python object.
-//! `setdescr` / `cleardescr` therefore take `&self`.
+//! `Rc<Op>`) the same way RPython's `op.setdescr(d)` writes on a shared
+//! Python object. `setdescr` / `cleardescr` therefore take `&self`.
 
 use std::rc::Rc;
 use std::sync::Arc;

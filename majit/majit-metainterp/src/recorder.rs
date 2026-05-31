@@ -490,7 +490,6 @@ impl Trace {
             self.ops.get(pos - n).and_then(|op| op.get_value())
         }
     }
-
 }
 
 impl Default for Trace {

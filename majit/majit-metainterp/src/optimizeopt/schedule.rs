@@ -817,8 +817,9 @@ impl VecScheduleState {
     }
 
     /// vector.py:54-60 setup/teardown_vectorization. Seed only the local
-    /// scheduling BoxPool; RPython clears this `_forwarded` state after the
-    /// vector pass, so it must not leak into the main optimizer BoxPool.
+    /// scheduling vecinfo state; RPython clears this `_forwarded` state
+    /// after the vector pass, so it must not leak into the main
+    /// optimizer's forwarded state.
     ///
     /// `constant_of` resolves the optimizer's const-pool so the
     /// `resoperation.py:181-186 INT_SIGNEXT` branch can read `arg1.value`

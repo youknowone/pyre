@@ -724,10 +724,9 @@ pub struct OptContext {
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
-    /// Strong `InputArgRc` ownership for the BoxRefs seeded by
+    /// Strong `InputArgRc` ownership for the inputargs seeded by
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
-    /// via `TreeLoop.inputargs` and re-bind the optimizer's `box_pool`
-    /// via `BoxPool::bind_inputargs`; the test-and-fallback helper
+    /// via `TreeLoop.inputargs`; the test-and-fallback helper
     /// `with_inputarg_types` has no upstream `TreeLoop`, so it stashes
     /// fresh `InputArgRc`s here to keep the `Weak<InputArg>` stored
     /// inside each `BoxRef.inputarg_handle` upgradable. `make_equal_to`
@@ -1840,14 +1839,9 @@ impl OptContext {
     /// `None` for sentinel `OpRef::none()` and for ResOp positions
     /// without a producer in any canonical store.
     ///
-    /// Transitional fallback: synthetic test fixtures (`ctx.box_pool =
-    /// vec![...]`) bypass the production canonical-store population
-    /// path. While `BoxPool` survives (until S-9), consult it after
-    /// the canonical stores so those fixtures continue resolving to
-    /// the same bound `BoxRef`. Production paths populate `inputarg_refs`
-    /// via S-1's `bind_input_resops` plus emit-time `bind_op`, so the
-    /// fallback is dead outside synthetic fixtures and disappears with
-    /// `BoxPool` in S-9.
+    /// Production paths populate `inputarg_refs` via S-1's
+    /// `bind_input_resops` plus emit-time `bind_op`, so every
+    /// chain-walker-reachable position resolves to its bound `BoxRef`.
     pub(crate) fn resolve_to_boxref(&self, opref: OpRef) -> Option<crate::r#box::BoxRef> {
         if opref.is_none() {
             return None;
@@ -1932,9 +1926,8 @@ impl OptContext {
             if let Some(ia) = b.bound_inputarg() {
                 let idx = ia.index as usize;
                 if idx >= self.inputarg_refs.len() {
-                    self.inputarg_refs.resize_with(idx + 1, || {
-                        std::rc::Rc::new(majit_ir::InputArg::new_int(0))
-                    });
+                    self.inputarg_refs
+                        .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
                 }
                 self.inputarg_refs[idx] = ia;
             } else if let Some(op) = b.bound_op() {
@@ -2340,25 +2333,6 @@ impl OptContext {
     /// so typed positions never grow `value_types`.
     pub(crate) fn reserve_pos_typed(&mut self, tp: majit_ir::Type) -> OpRef {
         let raw = self.allocate_next_pos_raw();
-        // H-3.4 prerequisite (round-6 audit TODO B): eagerly materialize a
-        // typed BoxRef at `box_pool[idx]` so fresh OpRefs from `emit` /
-        // `alloc_op_position_typed` / `reserve_pos_typed` carry a Box.
-        // Without this, `get_box_replacement_box` returns None for these
-        // positions and `make_equal_to` mirror skips when the target is fresh
-        // (mod.rs:2927), leaving the BoxRef forwarded chain incomplete.
-        //
-        // Empty `box_pool` (test / retrace baselines) stays empty — only
-        // extend when the pool is plumbed by the recorder (production
-        // paths post H-2.1/H-3.0b).
-        //
-        // Gaps between `box_pool.len()` and `idx` (raw positions skipped by
-        // `allocate_next_pos_raw` advancing past slots claimed by the
-        // `constants` table) stay as `None` tombstones — PyPy/RPython has
-        // no Box for positions that no `ResOperation()` / `InputArg()` call
-        // produced (`resoperation.py:233-248`), so the sparse `BoxPool`
-        // model is the literal upstream shape. `ensure_box` writes the
-        // single requested slot via `BoxPool::set(idx, ...)` and leaves
-        // the holes untouched.
         // The position's canonical host is materialized lazily on first
         // access (`ensure_box` / `resolve_to_boxref` mint a `SameAs*`
         // synthetic into `resop_refs[raw]` keyed by the full OpRef). No eager
@@ -2366,6 +2340,8 @@ impl OptContext {
         // but never emitted (label / jump positions on an empty trace) would
         // leak into `phase1_emit_ops` via `live_synthetics`; the emitted op,
         // when it arrives, supersedes the lazily-minted synthetic the same way.
+        // PyPy/RPython has no Box for positions that no `ResOperation()` /
+        // `InputArg()` call produced (`resoperation.py:233-248`).
         OpRef::op_typed(raw, tp)
     }
 
@@ -6383,10 +6359,9 @@ impl OptContext {
     /// ```
     /// The Int arm delegates to `getrawptrinfo` per `info.py:881-882`.
     /// The Float arm short-circuits to `None`. The Void arm panics —
-    /// `info.py:885 assert op.type == 'r'` rejects Void boxes
-    /// outright, and the sparse `BoxPool` (`Vec<Option<BoxRef>>`) no
-    /// longer produces synthetic Void filler boxes that would smuggle
-    /// a typed-erased pointer through this helper.
+    /// `info.py:885 assert op.type == 'r'` rejects Void boxes outright;
+    /// no synthetic Void filler box exists that would smuggle a
+    /// type-erased pointer through this helper.
     pub fn getptrinfo(&self, op: &crate::r#box::BoxRef) -> Option<PtrInfo> {
         self.getptrinfo_handle(op).map(|h| h.snapshot())
     }
@@ -9615,7 +9590,9 @@ mod opt_box_env_tests {
             .expect("InputArg OpRef must continue to resolve");
         assert!(
             std::rc::Rc::ptr_eq(
-                &materialised.bound_inputarg().expect("materialised bound to InputArg"),
+                &materialised
+                    .bound_inputarg()
+                    .expect("materialised bound to InputArg"),
                 &second.bound_inputarg().expect("second bound to InputArg"),
             ),
             "second ensure_box must resolve to the same InputArg host",

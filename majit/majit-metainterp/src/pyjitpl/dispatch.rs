@@ -1832,7 +1832,7 @@ where
                     // the upstream `tobox.getint()` payload — fetched
                     // through `box_value(cached)` which composes the
                     // const pool, standard-virtualizable shadow, and
-                    // BoxPool `Box::value` field (RPython
+                    // the frontend object's `value` field (RPython
                     // `currfieldbox.getint()` dispatch parity).
                     // `None` payload (entry seeded without a live
                     // concrete) skips the check.
@@ -1890,7 +1890,7 @@ where
                     // payload — mirrors RPython's `resbox` Box carrying
                     // both identity and value from `executor.execute`.
                     // `Box.value` parity: stamp the result OpRef's
-                    // BoxPool entry so `lookup_opref_concrete(opref)`
+                    // frontend value slot so `lookup_opref_concrete(opref)`
                     // returns the runtime concrete (RPython
                     // `IntFrontendOp(pos, intval)` construction-time
                     // field assignment).

@@ -148,13 +148,13 @@ impl Value {
 }
 
 // `HeapBox { opref, value }` retired — the (identity, value) pair is
-// now carried by `BoxRef` itself: identity by the `OpRef` position,
-// value by the recorder's BoxPool `Box::value: Cell<Option<Value>>`
+// now carried by the frontend object itself: identity by the `OpRef`
+// position, value by the `Op` / `InputArg` `value: Cell<Option<Value>>`
 // field (PyPy `history.py:803-807 IntFrontendOp(pos, intval) /
 // FloatFrontendOp(pos, floatval) / RefFrontendOp(pos, gcref)` parity).
 // Cache writes store the bare `OpRef`; sanity readers resolve the
 // intrinsic value via `TraceCtx::box_value` (composing const pool,
-// standard-virtualizable shadow, BoxPool `Box::value` field).  No
+// standard-virtualizable shadow, the frontend object's `value` field).  No
 // external pair carrier needed.
 
 /// A constant value known at trace time.

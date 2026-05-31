@@ -556,7 +556,7 @@ fn getfield_gc_i_pureornot(
         // pointer through `concrete_of_opref(obj)`; the cached Box's
         // intrinsic value is fetched via `box_value(cached)` —
         // covering const pool, standard-virtualizable shadow, and
-        // BoxPool `Box::value` field (RPython
+        // the frontend object's `value` field (RPython
         // `currfieldbox.getint()` dispatch parity).
         let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
         let expected_int = match cached_value {
@@ -789,7 +789,7 @@ fn getfield_gc_f_pureornot(
         // to_bits — bit-identical, NaN==NaN, 0.0!=-0.0.  The cached
         // Box's intrinsic value is fetched via `box_value(cached)` —
         // covering const pool, standard-virtualizable shadow, and
-        // BoxPool `Box::value` field (RPython
+        // the frontend object's `value` field (RPython
         // `currfieldbox.getfloat_storage()` dispatch parity).
         let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
         let expected_float = match cached_value {

@@ -2648,11 +2648,7 @@ mod tests {
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        )
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
@@ -2660,11 +2656,7 @@ mod tests {
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        )
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
@@ -2679,11 +2671,7 @@ mod tests {
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            1024,
-        )
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
@@ -3103,11 +3091,7 @@ mod tests {
 
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            3,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
         let jump = result
             .iter()
             .find(|op| op.opcode == OpCode::Jump)
@@ -3379,20 +3363,12 @@ mod tests {
             Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::int_op(51),
-                    OpRef::float_op(60),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(60)],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::int_op(51),
-                    OpRef::float_op(61),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(61)],
                 imag.clone(),
             ),
             Op::with_descr(
@@ -3434,20 +3410,12 @@ mod tests {
             Op::with_descr(OpCode::NewArrayClear, &[OpRef::int_op(50)], arr.clone()),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::int_op(51),
-                    OpRef::float_op(60),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(60)],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::int_op(51),
-                    OpRef::float_op(61),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(51), OpRef::float_op(61)],
                 imag.clone(),
             ),
             Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
@@ -3470,11 +3438,7 @@ mod tests {
         let mut constants = majit_ir::VecAssoc::new();
         constants.insert(50u32, Value::Int(1));
         constants.insert(51u32, Value::Int(0));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // Forced reconstruction: NEW_ARRAY_CLEAR, 2× SETINTERIORFIELD_GC, CALL_N.
         assert_eq!(
@@ -3540,10 +3504,7 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(
-                OpCode::GuardClass,
-                &[OpRef::ref_op(0), OpRef::int_op(200)],
-            ),
+            Op::new(OpCode::GuardClass, &[OpRef::ref_op(0), OpRef::int_op(200)]),
         ];
         assign_positions(&mut ops);
 
@@ -3552,11 +3513,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -3615,7 +3572,7 @@ mod tests {
                 &[OpRef::ref_op(1), OpRef::int_op(100)],
                 fd_int.clone(),
             ), // pos=3
-            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),      // pos=4
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),             // pos=4
         ];
         assign_positions(&mut ops);
 
@@ -3928,16 +3885,8 @@ mod tests {
                 &[OpRef::ref_op(0), OpRef::int_op(200)],
                 fd_b.clone(),
             ),
-            Op::with_descr(
-                OpCode::GetfieldGcI,
-                &[OpRef::ref_op(0)],
-                fd_a.clone(),
-            ),
-            Op::with_descr(
-                OpCode::GetfieldGcI,
-                &[OpRef::ref_op(0)],
-                fd_b.clone(),
-            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd_a.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::ref_op(0)], fd_b.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -4014,11 +3963,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
         assert_eq!(
             result.len(),
             1,
@@ -4253,11 +4198,7 @@ mod tests {
                 OpCode::VirtualRefR,
                 &[OpRef::int_op(100), OpRef::int_op(101)],
             ), // pos=0
-            Op::with_descr(
-                OpCode::GetfieldGcR,
-                &[OpRef::ref_op(0)],
-                forced_descr,
-            ), // pos=1
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::ref_op(0)], forced_descr), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -4608,11 +4549,7 @@ mod tests {
         ops[2].pos.set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            1024,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // force_all_lazy_setfields emits the lazy SetfieldGc at JUMP,
         // which forces the virtual New to be materialized.
@@ -4720,11 +4657,7 @@ mod tests {
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         constants.insert(100u32, majit_ir::Value::Int(7));
         constants.insert(101u32, majit_ir::Value::Int(11));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut constants,
-            2,
-        );
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: Vec<_> = result
             .iter()
@@ -4859,14 +4792,7 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.setfailargs(
-            vec![
-                OpRef::int_op(30),
-                OpRef::ref_op(0),
-                OpRef::int_op(40),
-            ]
-            .into(),
-        );
+        guard.setfailargs(vec![OpRef::int_op(30), OpRef::ref_op(0), OpRef::int_op(40)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
@@ -5148,11 +5074,7 @@ mod tests {
             Op::with_descr(OpCode::NewArray, &[OpRef::int_op(10)], ad.clone()),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[
-                    OpRef::ref_op(0),
-                    OpRef::int_op(11),
-                    OpRef::int_op(12),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(11), OpRef::int_op(12)],
                 ad,
             ),
             guard,
