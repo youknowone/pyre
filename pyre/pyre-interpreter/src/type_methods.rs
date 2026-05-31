@@ -1503,12 +1503,23 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // `encoding` and `errors` arrive positionally or by keyword; builtin
     // kwargs are packed in a trailing `__pyre_kw__` dict.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let str_arg = |obj: Option<PyObjectRef>, default: &str| -> String {
+    // `get_encoding_and_errors` unwraps both arguments through
+    // `space.text_w`; a present non-string value raises
+    // `TypeError("expected str, got X object")` (baseobjspace.py
+    // `_typed_unwrap_error`).  An absent argument keeps the default.
+    let str_arg = |obj: Option<PyObjectRef>, default: &str| -> Result<String, crate::PyError> {
         match obj {
-            Some(o) if !o.is_null() && unsafe { pyre_object::is_str(o) } => {
-                unsafe { w_str_get_value(o) }.to_string()
+            None => Ok(default.to_string()),
+            Some(o) if o.is_null() => Ok(default.to_string()),
+            Some(o) if unsafe { pyre_object::is_str(o) } => {
+                Ok(unsafe { w_str_get_value(o) }.to_string())
             }
-            _ => default.to_string(),
+            Some(o) => {
+                let tname = unsafe { (*(*o).ob_type).name };
+                Err(crate::PyError::type_error(format!(
+                    "expected str, got {tname} object"
+                )))
+            }
         }
     };
     let encoding = str_arg(
@@ -1516,13 +1527,13 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             .copied()
             .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding")),
         "utf-8",
-    );
+    )?;
     let errors = str_arg(
         pos.get(2)
             .copied()
             .or_else(|| crate::builtins::kwarg_get(kwargs, "errors")),
         "strict",
-    );
+    )?;
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => Ok(pyre_object::w_bytes_from_bytes(s.as_bytes())),

@@ -262,7 +262,7 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     // Python floor division: rounds toward negative infinity.
     // i64::MIN / -1 overflows → fall back to BigInt.
@@ -280,7 +280,7 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     // Python modulo: result has the same sign as the divisor.
     let r = va % vb;
@@ -305,7 +305,7 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     Ok(bigint_result(as_bigint(a).div_floor(&vb)))
 }
@@ -313,7 +313,7 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
     if bigint_eq(vb.clone(), BigInt::from(0)) {
-        return Err(PyError::zero_division("division by zero"));
+        return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
 }
@@ -391,7 +391,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
     if y == 0.0 {
         // floatobject.py:761
-        return Err(PyError::zero_division("float floor division by zero"));
+        return Err(PyError::zero_division("float modulo"));
     }
     let mut m = x % y; // fmod
     // floatobject.py:767: div = (x - mod) / y
@@ -1220,8 +1220,9 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// True division (`/` operator) — always produces a float result.
 ///
-/// All zero-division paths raise "division by zero" (the unified
-/// ZeroDivisionError message) regardless of int/float/long operands.
+/// intobject.py:332-345 `_truediv` raises "division by zero" for int/int;
+/// floatobject.py:519 `_floatdiv` raises "float division by zero" once
+/// any operand is a float.
 /// longobject.py:62-70 `_truediv` catches OverflowError from
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
@@ -1584,7 +1585,9 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     }
     // floatobject.py:844-847
     if x == 0.0 && y < 0.0 {
-        return Err(PyError::zero_division("zero to a negative power"));
+        return Err(PyError::zero_division(
+            "0.0 cannot be raised to a negative power",
+        ));
     }
     // floatobject.py:849-862
     let mut negate_result = false;

@@ -4015,16 +4015,12 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     if val < 0 || val > 0x10ffff {
         // `pypy/module/__builtin__/operation.py:31-32 chr` — out-of-range
-        // raises ValueError.
-        return Err(crate::PyError::value_error(
-            "chr() arg not in range(0x110000)",
-        ));
+        // raises ValueError, message "chr() arg out of range".
+        return Err(crate::PyError::value_error("chr() arg out of range"));
     }
     match char::from_u32(val as u32) {
         Some(c) => Ok(w_str_new(&c.to_string())),
-        None => Err(crate::PyError::value_error(
-            "chr() arg not in range(0x110000)",
-        )),
+        None => Err(crate::PyError::value_error("chr() arg out of range")),
     }
 }
 

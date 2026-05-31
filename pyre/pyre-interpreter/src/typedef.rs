@@ -2343,6 +2343,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         pyre_object::propertyobject::w_classmethod_new(make_builtin_function("fromkeys", |args| {
             // classmethod: args[0] is the bound cls; the user arguments are
             // fromkeys(iterable, value=None).
+            let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let (iterable, value) = if args.len() >= 3 {
                 (args[1], args[2])
             } else if args.len() == 2 {
@@ -2350,12 +2351,25 @@ fn init_dict_type(ns: &mut DictStorage) {
             } else {
                 return Ok(pyre_object::w_dict_new());
             };
-            let d = pyre_object::w_dict_new();
             let items = crate::builtins::collect_iterable(iterable)?;
-            for key in items {
-                unsafe { pyre_object::w_dict_store(d, key, value) };
+            // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
+            // fill a fresh dict directly; for a dict subclass, construct an
+            // instance via `cls()` and route through `space.setitem` so the
+            // result is an instance of the subclass.
+            let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+            if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
+                let d = pyre_object::w_dict_new();
+                for key in items {
+                    unsafe { pyre_object::w_dict_store(d, key, value) };
+                }
+                Ok(d)
+            } else {
+                let d = crate::call::call_function_impl_result(cls, &[])?;
+                for key in items {
+                    crate::baseobjspace::setitem(d, key, value)?;
+                }
+                Ok(d)
             }
-            Ok(d)
         })),
     );
 }
@@ -3453,10 +3467,12 @@ fn slice_getter(
     field: unsafe fn(PyObjectRef) -> PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    // sliceobject.py:191 `slicewprop.fget` — applied to a non-slice
+    // receiver raises TypeError("descriptor is for 'slice'").
     if unsafe { pyre_object::sliceobject::is_slice(self_) } {
         Ok(unsafe { field(self_) })
     } else {
-        Ok(pyre_object::PY_NULL)
+        Err(crate::PyError::type_error("descriptor is for 'slice'"))
     }
 }
 
