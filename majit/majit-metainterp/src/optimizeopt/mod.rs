@@ -1701,77 +1701,39 @@ impl OptContext {
     /// (`optimizer.py:394 op.set_forwarded(newop)`, unroll.py:497).
     /// Idempotent — re-running re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
-        // The recorder always populates `box_pool` for a real trace, so this
-        // emptiness guard never fires in production; it is a synthetic-fixture
-        // concern only. The `#[cfg(not(test))]` derive below self-guards (its
-        // loops no-op when `self.inputargs` is empty), so production needs no
-        // `box_pool` read here.
-        #[cfg(test)]
-        if self.box_pool.is_empty() {
-            return;
-        }
-        // Production derives the materialized InputArg positions from `ctx`
-        // state without scanning `box_pool`. `box_pool`'s InputArg slots are
-        // exactly the canonical/inherited set (`self.inputargs` =
-        // `optimizer.py:34 self.inputargs`, positions `[0, num_inputs)` carried
-        // across Phase 1 → Phase 2 by `opt_p2.trace_inputargs =
-        // self.trace_inputargs`) UNION the fresh per-iteration label set at
-        // `[inputarg_base, inputarg_base + num_inputs)` (`TraceIterator`
-        // allocates these; their types match `self.inputargs` because Phase 2
-        // walks the body half with the same per-arg types). Pre-populating
-        // `inputarg_refs` for both subsets makes every InputArg OpRef resolve
-        // through `inputarg_refs` (read path: `resolve_to_boxref` /
-        // `read_forwarded`; write path: `ensure_box`'s InputArg branch), with
-        // no surviving production reader of `box_pool`'s InputArg binding (the
-        // `resolve_to_boxref` `box_pool` tail is `#[cfg(test)]`). `ensure_box`
-        // type-repairs any position this derive misses.
-        #[cfg(not(test))]
-        {
-            for op in self.inputargs.clone() {
-                if let Some(tp) = op.ty() {
+        // Derive the materialized InputArg positions from `ctx` state without
+        // scanning `box_pool`. The InputArg positions are exactly the
+        // canonical/inherited set (`self.inputargs` = `optimizer.py:34
+        // self.inputargs`, positions `[0, num_inputs)` carried across Phase 1 →
+        // Phase 2 by `opt_p2.trace_inputargs = self.trace_inputargs`) UNION the
+        // fresh per-iteration label set at `[inputarg_base, inputarg_base +
+        // num_inputs)` (`TraceIterator` allocates these; their types match
+        // `self.inputargs` because Phase 2 walks the body half with the same
+        // per-arg types). Pre-populating `inputarg_refs` for both subsets makes
+        // every InputArg OpRef resolve through `inputarg_refs` (read path:
+        // `resolve_to_boxref` / `read_forwarded`; write path: `ensure_box`'s
+        // InputArg branch). `ensure_box` type-repairs any position this derive
+        // misses. Both loops no-op when `self.inputargs` is empty
+        // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
+        // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
+        // encoding (resoperation.py:719/727/739), so a Void sentinel in
+        // `inputargs` is not a real input-arg host (mirrors the retired
+        // box_pool scan's `!b.is_inputarg()` skip).
+        for op in self.inputargs.clone() {
+            match op.ty() {
+                Some(tp) if tp != majit_ir::Type::Void => {
                     self.bind_canonical_inputarg(op.raw() as usize, tp);
                 }
-            }
-            let base = self.inputarg_base as usize;
-            for i in 0..self.num_inputs as usize {
-                if let Some(tp) = self.inputargs.get(i).and_then(|op| op.ty()) {
-                    self.bind_canonical_inputarg(base + i, tp);
-                }
+                _ => {}
             }
         }
-        // Synthetic `ctx.box_pool = vec![..]` fixtures populate `box_pool`
-        // directly and may leave `self.inputargs` empty, so the test build
-        // discovers InputArg slots by scanning `box_pool` and binds the box to
-        // the canonical `InputArgRc` so the `resolve_to_boxref` `box_pool` tail
-        // (also `#[cfg(test)]`) observes the same host.
-        #[cfg(test)]
-        {
-            let slots: Vec<(usize, Option<majit_ir::InputArgRc>, majit_ir::Type)> = self
-                .box_pool
-                .iter_indexed()
-                .filter_map(|(pos, b)| {
-                    if !b.is_inputarg() {
-                        return None;
-                    }
-                    Some((pos, b.bound_inputarg(), b.type_()))
-                })
-                .collect();
-            for (pos, bound, tp) in slots {
-                let ia = match bound {
-                    Some(a) => a,
-                    None => {
-                        let fresh = std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
-                        if let Some(b) = self.box_pool.get_at_position(pos) {
-                            b.bind_inputarg(&fresh);
-                        }
-                        fresh
-                    }
-                };
-                if pos >= self.inputarg_refs.len() {
-                    self.inputarg_refs
-                        .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+        let base = self.inputarg_base as usize;
+        for i in 0..self.num_inputs as usize {
+            match self.inputargs.get(i).and_then(|op| op.ty()) {
+                Some(tp) if tp != majit_ir::Type::Void => {
+                    self.bind_canonical_inputarg(base + i, tp);
                 }
-                self.inputarg_refs[pos] = ia;
+                _ => {}
             }
         }
     }
@@ -1782,7 +1744,6 @@ impl OptContext {
     /// through). Idempotent reassignment is harmless because no `_forwarded`
     /// chain exists yet at setup time (`optimizer.rs` calls this before the
     /// optimization pass).
-    #[cfg(not(test))]
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         if pos >= self.inputarg_refs.len() {
             self.inputarg_refs
@@ -2043,14 +2004,11 @@ impl OptContext {
     /// `ctx.box_pool = vec![..]` fixtures resolving through the
     /// `resolve_to_boxref` `box_pool` tail still observe the producer.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
-        // The recorder always populates `box_pool` for a real trace, so this
-        // emptiness guard never fires in production; the loop over the
-        // caller-threaded `ops` self-guards (no-op on an empty slice). Retain
-        // the guard `#[cfg(test)]` for synthetic fixtures.
-        #[cfg(test)]
-        if self.box_pool.is_empty() {
-            return;
-        }
+        // The loop over the caller-threaded `ops` self-guards (no-op on an
+        // empty slice) and records each resop producer into `resop_refs` /
+        // `live_synthetics` — the collision-safe stores `find_producer_op`
+        // consults. No `box_pool` read: no reader resolves through a
+        // `box_pool` box binding any more.
         for op in ops {
             let pos = op.pos.get();
             if pos.is_none() || pos.is_constant() {
@@ -2074,16 +2032,10 @@ impl OptContext {
             {
                 continue;
             }
-            // Bind the box to the caller-threaded `OpRc` so the box,
-            // `resop_refs`, `live_synthetics`, and the iterated input op
-            // share one `Op` identity (no second private copy).
+            // Record the caller-threaded `OpRc` so the iterated input op,
+            // `resop_refs`, and `live_synthetics` share one `Op` identity
+            // (no second private copy).
             let op_rc = op.clone();
-            #[cfg(test)]
-            if let Some(b) = self.box_pool.get(pos) {
-                if b.is_resop() && b.bound_op().is_none() {
-                    b.bind_op(&op_rc);
-                }
-            }
             if idx >= self.resop_refs.len() {
                 self.resop_refs.resize_with(idx + 1, || None);
             }
@@ -2435,11 +2387,15 @@ impl OptContext {
         // single requested slot via `BoxPool::set(idx, ...)` and leaves
         // the holes untouched.
         let opref = OpRef::op_typed(raw, tp);
-        // The recorder always populates box_pool for a real trace, so the
-        // emptiness guard is always satisfied in production; eagerly
-        // materialize unconditionally there (ensure_box mints a synthetic into
-        // resop_refs, not box_pool). Retain the guard #[cfg(test)] so empty
-        // ctx.box_pool fixtures stay empty.
+        // Eagerly materialize the position's canonical host (a `SameAs*`
+        // synthetic in `resop_refs[raw]`, not `box_pool`) so a later
+        // `find_producer_op` for this position resolves. Gated on a non-empty
+        // `box_pool` in test builds: an empty `ctx.box_pool` marks a synthetic
+        // fixture / empty trace that reserves label / jump positions it never
+        // emits, where an eager synthetic would leak into `phase1_emit_ops`
+        // (the production trace always emits the reserved op, superseding the
+        // synthetic). The `is_empty()` check is the last surviving `box_pool`
+        // read in this method.
         #[cfg(not(test))]
         self.ensure_box(opref);
         #[cfg(test)]
