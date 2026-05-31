@@ -1406,34 +1406,24 @@ mod tests {
         // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // Documented kind-flow gaps emitted by generated helper
-        // jitcodes.  Kept as an explicit snapshot rather than wired
-        // through bhhandler aliases — each entry indicates the
-        // codewriter / typer mis-typed an operand, and RPython only
-        // wires the matching all-int shape.  Adding aliases here would
-        // hide the upstream bug behind a silent runtime mis-dispatch.
+        // Lock-in: the generated insns table is now fully covered by
+        // `wire_bhimpl_handlers` — every opname has a `bhimpl_*` handler,
+        // so the unwired set is empty.
         //
-        // Refreshed after the inline-constants-into-OpRef / remove-
-        // ConstantPool lowering change: it retyped two prior gaps into
-        // their canonical wired shapes (`getfield_gc_i_pure/id>i` and
-        // `int_lt/ri>i` no longer appear) and surfaced two new ones
-        // (`int_lt/rr>i`, `residual_call_r_i/iRd`).  The remaining set is
-        // the same class of pending raw-ptr-vs-index kind-flow gaps.
+        // The prior snapshot documented three pending raw-ptr-vs-index
+        // kind-flow gaps (`int_lt/ir>i`, `int_lt/rr>i`,
+        // `residual_call_r_i/iRd`): `Lt` operands sitting in the Ref bank
+        // instead of Int, and a residual call returning Int with a Ref
+        // argument.  The `OpKind::Input` class-root retyping in the MIR
+        // frontend collapses those Ref operands to their canonical all-int
+        // shapes at emission, so the codewriter no longer produces the
+        // un-wired keys.  This is the closed-at-upstream-emission end-state
+        // the snapshot was waiting for.
         //
-        // - `int_lt/ir>i` / `int_lt/rr>i` — `Lt` whose operands sit in
-        //   the Ref bank (raw-ptr address) instead of Int (index): one
-        //   side (`ir`) or both (`rr`).  RPython would have demanded a
-        //   `cast_ptr_to_int` upstream so the comparison sees `ii>i`;
-        //   pyre's lowering currently lets the Ref operand(s) through.
-        // - `residual_call_r_i/iRd` — a residual call returning Int with
-        //   a Ref argument that the all-int bh handler does not cover;
-        //   the generated helper jitcode emits the Ref-arg shape the
-        //   upstream rerepr has not yet collapsed to the wired form.
-        let expected: Vec<String> = vec![
-            "int_lt/ir>i".to_string(),
-            "int_lt/rr>i".to_string(),
-            "residual_call_r_i/iRd".to_string(),
-        ];
+        // A non-empty set here means the codewriter / typer regressed and
+        // re-emitted a kind shape that no RPython blackhole handler has —
+        // fix at upstream emission, do NOT add a `*_r>i` / `*_ir>i` alias.
+        let expected: Vec<String> = vec![];
         assert_eq!(
             unwired, expected,
             "Unwired-opname snapshot drifted. If a new entry \
