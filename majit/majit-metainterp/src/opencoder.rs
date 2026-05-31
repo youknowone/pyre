@@ -3,8 +3,6 @@
 //! the meta-interpreter.
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
-use crate::r#box::BoxRef;
-
 fn u16_to_opcode(v: u16) -> OpCode {
     assert!(
         (v as usize) < OPCODE_COUNT,
@@ -233,27 +231,6 @@ pub struct TraceIterator<'a> {
     /// the same trace produce disjoint OpRef ranges by passing different
     /// `start_fresh` values.
     pub _fresh: u32,
-    /// Per-iter `BoxRef` pool mirroring `trace.get_iter()`'s per-call
-    /// `inputarg_from_tp(...)` and `cls()` allocations. Each `TraceIterator`
-    /// instance owns its own fresh `Rc<Box>` set so Phase 1 / Phase 2
-    /// sub-Optimizers do not share `Box._forwarded` cells.
-    ///
-    /// Layout: sparse `Vec<Option<BoxRef>>` (`BoxPool`) indexed by raw
-    /// OpRef value. `[0..p1_full_prefix.len())` are `Rc::clone`s of
-    /// Phase 1's `final_ctx.box_pool` slots (inputarg + emit BoxRefs)
-    /// when `p1_full_prefix` is `Some` — Phase 2 chain walks observe
-    /// Phase 1's accumulated `_forwarded` info naturally (`unroll.py`
-    /// Phase 2 reads Phase 1 `box._forwarded` through shared Python
-    /// identity parity). `import_state(targetargs, ...)` writes
-    /// `Forwarded::Box(target)` on each Phase 2 inputarg whose
-    /// `target.raw() < num_inputs` — chain walks land directly on
-    /// Phase 1's inputarg BoxRef cell.
-    /// Any gap between the Phase 1 prefix end and `start_fresh` stays
-    /// as `None` (resoperation.py:233-248 has no Box for positions not
-    /// produced by `ResOperation()` / `InputArg()`).
-    /// Inputargs at `[start_fresh..start_fresh + num_inputargs)`.
-    /// Op results pushed in `next()` for both void and non-void ops.
-    pub(crate) box_pool: crate::r#box::BoxPool,
 }
 
 impl<'a> TraceIterator<'a> {
@@ -273,7 +250,6 @@ impl<'a> TraceIterator<'a> {
         force_inputargs: Option<&[OpRef]>,
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
-        p1_full_prefix: Option<crate::r#box::BoxPool>,
     ) -> Self {
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
@@ -295,31 +271,6 @@ impl<'a> TraceIterator<'a> {
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
-        // Per-iter BoxRef pool. When `p1_full_prefix` is `Some` (Phase 2
-        // path), `[0..p1_full_prefix.len())` carries Phase 1's
-        // `final_ctx.box_pool` slots — `Some(BoxRef)` for inputarg + emit
-        // positions Phase 1 wrote, `None` for slots Phase 1 left empty
-        // (constant-namespace gap, skipped raw indices). Chain walks via
-        // `Forwarded::Box(rc)` observe Phase 1's accumulated `_forwarded`
-        // info naturally (`unroll.py` Phase 2 reads Phase 1 box._forwarded
-        // through shared Python identity); `import_state` setting
-        // `Forwarded::Box(target)` on Phase 2 inputargs lands the chain on
-        // the same Phase 1 inputarg cell. Remaining
-        // `[p1_full_prefix.len()..start_fresh)` stays `None` per
-        // resoperation.py:233-248 (no Box exists for positions no
-        // `ResOperation()` / `InputArg()` call produced); Phase 2
-        // materialises slots on demand as it pushes its own inputargs
-        // and op results. Phase 2 owns the Rc::cloned BoxRefs as its
-        // single-writer post-Phase-1-completion (audit memo Risk 1).
-        // Sparse pool: Phase 1's snapshot already carries `None` for
-        // positions never assigned a Box (constant-namespace gap,
-        // skipped raw slots); positions past the snapshot stay `None`
-        // (no Box exists yet) until a producer materializes via
-        // `ensure_box`.
-        let mut box_pool: crate::r#box::BoxPool = p1_full_prefix.unwrap_or_default();
-        let p1_end = box_pool.len().min(start_fresh as usize);
-        box_pool.truncate(p1_end);
-        box_pool.pad_none_to(start_fresh as usize);
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =
@@ -340,9 +291,6 @@ impl<'a> TraceIterator<'a> {
                         )
                     });
                     let r = OpRef::input_arg_typed(_fresh, tp);
-                    // companion BoxRef per inputarg, fresh per iter.
-                    let box_ref = BoxRef::new_inputarg(tp, _fresh);
-                    box_pool.push(box_ref);
                     _fresh += 1;
                     r
                 })
@@ -363,9 +311,6 @@ impl<'a> TraceIterator<'a> {
                 .iter()
                 .map(|&tp| {
                     let r = OpRef::input_arg_typed(_fresh, tp);
-                    // companion BoxRef per inputarg, fresh per iter.
-                    let box_ref = BoxRef::new_inputarg(tp, _fresh);
-                    box_pool.push(box_ref);
                     _fresh += 1;
                     r
                 })
@@ -385,7 +330,6 @@ impl<'a> TraceIterator<'a> {
             start_index: start as u32,
             end,
             _fresh,
-            box_pool,
         }
     }
 
@@ -496,9 +440,6 @@ impl<'a> TraceIterator<'a> {
             // mixin (resoperation.py:564-638); pyre uses
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
-            // companion BoxRef for the fresh op result.
-            let box_ref = BoxRef::new_resop(src.opcode.result_type(), self._fresh);
-            self.box_pool.push(box_ref);
             self._fresh += 1;
             self._cache[orig] = Some(fresh);
             res.pos.set(fresh);
@@ -517,10 +458,6 @@ impl<'a> TraceIterator<'a> {
             // never reference it. `AbstractResOp.type = 'v'`
             // (resoperation.py:260) → VoidOp variant.
             let f = OpRef::void_op(self._fresh);
-            // companion Void-typed BoxRef placeholder so
-            // `box_pool[idx]` indexing stays dense.
-            self.box_pool
-                .push(BoxRef::new_resop(Type::Void, self._fresh));
             self._fresh += 1;
             res.pos.set(f);
         } else {
@@ -2908,7 +2845,7 @@ mod tests {
         // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
         // as InputArgInt(0..2), op results follow as BoxInt(2..).
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         assert_eq!(iter.inputargs, vec![iarg(0), iarg(1)]);
         assert_eq!(iter._cache[0], Some(iarg(0)));
         assert_eq!(iter._cache[1], Some(iarg(1)));
@@ -2951,7 +2888,7 @@ mod tests {
         // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
+        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
             p1_ops.push(op);
@@ -2964,15 +2901,7 @@ mod tests {
         assert_eq!(p1._index, 4);
 
         // Phase 2: start_fresh = phase1 high water → disjoint namespace.
-        let mut p2 = TraceIterator::new(
-            &ops,
-            0,
-            ops.len(),
-            None,
-            &inputarg_types,
-            p1_high_water,
-            None,
-        );
+        let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, p1_high_water);
         let mut p2_ops = Vec::new();
         while let Some(op) = p2.next() {
             p2_ops.push(op);
@@ -3009,7 +2938,7 @@ mod tests {
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), const_ref])];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(1));
         assert_eq!(r.arg(0), iarg(0));
@@ -3035,7 +2964,7 @@ mod tests {
         // surfaces as an out-of-bounds panic or stale cache slot.
         let inputarg_types = vec![majit_ir::Type::Int; 1];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
         assert_eq!(iter._index, 2);
@@ -3067,7 +2996,7 @@ mod tests {
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10, None);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos.get(), iop(11));
         assert_eq!(r1.arg(0), iarg(10));
@@ -3095,7 +3024,7 @@ mod tests {
             majit_ir::Type::Int,
         ];
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
 
         assert_eq!(
             iter.inputargs,

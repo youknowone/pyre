@@ -596,7 +596,6 @@ fn prepare_bridge_trace_for_optimizer(
         None,
         &bridge_inputarg_types,
         bridge_inputarg_base,
-        None, // p1_full_prefix — bridge has no prior unroll phase
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
     while let Some(op) = iter.next() {

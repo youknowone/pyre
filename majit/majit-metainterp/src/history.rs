@@ -264,15 +264,7 @@ impl TreeLoop {
     /// directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
         let inputarg_types = self.inputarg_types();
-        crate::opencoder::TraceIterator::new(
-            &self.ops,
-            0,
-            self.ops.len(),
-            None,
-            &inputarg_types,
-            0,
-            None,
-        )
+        crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, &inputarg_types, 0)
     }
 
     /// history.py:552-608 check_consistency — full structural validation.

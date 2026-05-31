@@ -156,69 +156,6 @@ fn refresh_forwarded_const_ref(
     }
 }
 
-/// Reconstruct the preamble's `box_pool` prefix directly from the
-/// `partial_trace.inputargs` / `partial_trace.operations` snapshots
-/// (compile.py:362, where `optimize_peeled_loop` receives the partial
-/// trace from a prior `optimize_preamble`). PyPy parity: those lists
-/// hold the AbstractValue instances `optimize_preamble` mutated
-/// `_forwarded` on; chain walks via the bound handles read
-/// `inputarg.forwarded` / `op.forwarded` directly
-/// (resoperation.py:233-242 `_forwarded` host, `:700
-/// AbstractInputArg._forwarded`).
-///
-/// Each slot uses `BoxRef::from_bound_{op,inputarg}` so the box handle is
-/// installed *without* the carry-over that `bind_*` performs — the
-/// preamble's state already lives on the bound `Op` / `InputArg`, and
-/// `Box.get_forwarded()` reads through to it instead of overwriting it
-/// from the fresh box's empty mirror.
-///
-/// `optimize_with_constants_and_inputs_at` seals orphan unbound ResOp
-/// pool slots with synthesized `SameAs` stand-ins at preamble export,
-/// so every preamble BoxRef position is reachable through one of the
-/// two snapshot lists here.
-fn build_partial_trace_box_prefix(
-    inputargs: &[majit_ir::InputArgRc],
-    emit_ops: &[majit_ir::OpRc],
-) -> Option<crate::r#box::BoxPool> {
-    if inputargs.is_empty() && emit_ops.is_empty() {
-        return None;
-    }
-    let max_inputarg_pos = inputargs
-        .iter()
-        .map(|ia| ia.index as usize + 1)
-        .max()
-        .unwrap_or(0);
-    let max_op_pos = emit_ops
-        .iter()
-        .filter_map(|op| {
-            let pos = op.pos.get();
-            if pos.is_none() || pos.is_constant() {
-                None
-            } else {
-                Some(pos.raw() as usize + 1)
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    let size = max_inputarg_pos.max(max_op_pos);
-    let mut slots: Vec<Option<crate::r#box::BoxRef>> = vec![None; size];
-    for ia in inputargs {
-        let idx = ia.index as usize;
-        slots[idx] = Some(crate::r#box::BoxRef::from_bound_inputarg(ia));
-    }
-    for op in emit_ops {
-        let pos = op.pos.get();
-        if pos.is_none() || pos.is_constant() {
-            continue;
-        }
-        let raw = pos.raw() as usize;
-        if raw < slots.len() {
-            slots[raw] = Some(crate::r#box::BoxRef::from_bound_op(op));
-        }
-    }
-    Some(crate::r#box::BoxPool::from_slots(slots))
-}
-
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -534,7 +471,7 @@ impl UnrollOptimizer {
     ) -> (Vec<Op>, usize) {
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
-        let (mut exported_state, consts_p1, p1_ops, p1_full_prefix) =
+        let (mut exported_state, consts_p1, p1_ops) =
             if let Some(pre_imported) = self.imported_state.take() {
                 // RPython uses object identity for Boxes, so a TraceIterator over a
                 // retrace can never numerically collide with the already optimized
@@ -551,20 +488,7 @@ impl UnrollOptimizer {
                 if self.phase1_patchguardop.is_none() {
                     self.phase1_patchguardop = pre_imported.patchguardop.clone();
                 }
-                // `optimize_peeled_loop` from `compile_retrace` (compile.py:362)
-                // skips the preamble pass, so reconstruct the box prefix
-                // from `partial_trace.inputargs` / `partial_trace.operations`
-                // — those AbstractValue instances carry the preamble's
-                // `_forwarded` mutations (resoperation.py:233-242 / :700).
-                // `import_state` (unroll.py:483) writes a chain step from
-                // each peeled-loop inputarg onto the matching partial-trace
-                // box; routing through `BoxRef::from_bound_*` lands the
-                // chain on the same handle.
-                let prefix = build_partial_trace_box_prefix(
-                    &pre_imported.partial_trace_inputargs,
-                    &pre_imported.partial_trace_operations,
-                );
-                (pre_imported, constants.clone(), Vec::new(), prefix)
+                (pre_imported, constants.clone(), Vec::new())
             } else {
                 // ── Phase 1: PreambleCompileData.optimize() ──
                 // ── Phase 1: optimize_preamble (compile.py:275-276) ──
@@ -636,8 +560,7 @@ impl UnrollOptimizer {
                     ops_oprc.len(),
                     None,
                     &p1_inputarg_types,
-                    0,    // start_fresh = 0 — inputargs at [0..num_inputs)
-                    None, // p1_full_prefix — Phase 1 has no prior phase
+                    0, // start_fresh = 0 — inputargs at [0..num_inputs)
                 );
                 let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
                 while let Some(op) = p1_iter.next() {
@@ -774,13 +697,7 @@ impl UnrollOptimizer {
                         };
                         final_exported_state.root_all_gcrefs();
                         self.final_exported_state = Some(final_exported_state);
-                        // Phase 2's TraceIterator no longer needs a Phase 1
-                        // BoxRef prefix: the iterator's box_pool is a dead
-                        // structural carrier (its slots are never read — the
-                        // optimizer resolves identity via `resop_refs` /
-                        // `inputarg_refs` and forwarding via `Op`/`InputArg`).
-                        let p1_full_prefix: Option<crate::r#box::BoxPool> = None;
-                        (state, consts_p1, p1_ops, p1_full_prefix)
+                        (state, consts_p1, p1_ops)
                     }
                     None => {
                         *constants = consts_p1;
@@ -974,7 +891,6 @@ impl UnrollOptimizer {
             None,
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
-            p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
         );
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
@@ -5328,35 +5244,6 @@ mod tests {
             op.pos
                 .set(OpRef::op_typed(base + i as u32, op.opcode.result_type()));
         }
-    }
-
-    #[test]
-    fn test_build_partial_trace_box_prefix_carries_forwarded_state_via_bound_handles() {
-        // Phase 1 InputArg / Op carry `_forwarded` mutations on the
-        // AbstractValue object itself (resoperation.py:233-242 / :700);
-        // a retrace's Phase 2 must read that state through the same
-        // identity. The builder installs `BoxRef::from_bound_*` so
-        // `Box.get_forwarded()` routes through the bound handle.
-        let ia0 = std::rc::Rc::new(majit_ir::InputArg::from_type(Type::Int, 0));
-        let ia1 = std::rc::Rc::new(majit_ir::InputArg::from_type(Type::Ref, 1));
-        *ia1.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Int(42));
-        let op2 = std::rc::Rc::new(majit_ir::Op::new(
-            OpCode::IntAdd,
-            &[OpRef::int_op(0), OpRef::int_op(1)],
-        ));
-        op2.pos.set(OpRef::int_op(2));
-
-        let prefix = build_partial_trace_box_prefix(&[ia0.clone(), ia1.clone()], &[op2.clone()])
-            .expect("non-empty inputs build a prefix");
-        assert_eq!(prefix.len(), 3);
-
-        let slot1 = prefix.get_at_position(1).expect("ia1 slot present");
-        match slot1.get_forwarded() {
-            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Int(42)) => {}
-            other => panic!("expected Const(42), got {other:?}"),
-        }
-        let slot2 = prefix.get_at_position(2).expect("op2 slot present");
-        assert!(slot2.bound_op().is_some(), "op2 slot binds the OpRc");
     }
 
     #[test]
