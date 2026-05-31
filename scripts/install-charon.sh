@@ -45,19 +45,14 @@ case "$uname_s-$uname_m" in
     Darwin-arm64)  asset="charon-macos-aarch64.tar.gz" ;;
     Darwin-x86_64) asset="charon-macos-x86_64.tar.gz" ;;
     Linux-aarch64) asset="charon-linux-aarch64.tar.gz" ;;
-    Linux-x86_64)  asset="charon-linux-aarch64.tar.gz" ;;  # only aarch64 published; fail clearly
+    Linux-x86_64)  asset="charon-linux-x86_64.tar.gz" ;;
     *)
         echo "install-charon.sh: unsupported platform $uname_s-$uname_m" >&2
-        echo "  charon releases publish: darwin-aarch64, darwin-x86_64, linux-aarch64" >&2
+        echo "  charon releases publish: darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64" >&2
+        echo "  (no windows asset — extraction is unsupported on Windows)" >&2
         exit 1
         ;;
 esac
-
-if [[ "$uname_s-$uname_m" == "Linux-x86_64" ]]; then
-    echo "install-charon.sh: WARNING — charon does not publish a linux-x86_64 binary" >&2
-    echo "  Build from source: https://github.com/AeneasVerif/charon#installation" >&2
-    exit 2
-fi
 
 # Skip re-download if the installed binary already matches the pinned
 # version. `charon version` prints the cargo version (e.g. 0.1.196),

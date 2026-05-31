@@ -8,6 +8,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
+      - "scripts/install-charon.sh"
+      - "scripts/extract-llbc.sh"
       - ".github/workflows/pyre-ci.yml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
@@ -16,6 +18,8 @@ on:
       - "Cargo.lock"
       - "majit/**/*"
       - "pyre/**/*"
+      - "scripts/install-charon.sh"
+      - "scripts/extract-llbc.sh"
       - ".github/workflows/pyre-ci.yml"
   workflow_dispatch:
 
@@ -44,7 +48,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        # windows-latest is excluded: Charon publishes no Windows binary,
+        # so the LLBC the build now requires cannot be extracted there.
+        os: [ubuntu-24.04, macos-latest]
         backend: [dynasm, cranelift]
 
     steps:
@@ -53,6 +59,10 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
+    - name: Install Charon
+      run: scripts/install-charon.sh
+    - name: Extract LLBC
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run cargo test for ${{ matrix.backend }}
       run: cargo test --all --no-default-features --features ${{ matrix.backend }}
 
@@ -62,7 +72,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        # windows-latest is excluded: Charon publishes no Windows binary,
+        # so the LLBC the build now requires cannot be extracted there.
+        os: [ubuntu-24.04, macos-latest]
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -80,6 +92,10 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
+    - name: Install Charon
+      run: scripts/install-charon.sh
+    - name: Extract LLBC
+      run: scripts/extract-llbc.sh pyre-object pyre-interpreter
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
