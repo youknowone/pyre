@@ -4262,6 +4262,27 @@ fn eval_literal_init_to_const_value(
             }) => f.base10_parse::<f64>().ok().map(|v| ConstValue::float(-v)),
             _ => None,
         },
+        // `std::ptr::null()` / `std::ptr::null_mut()` — a NULL raw
+        // pointer constant (e.g. `pub const PY_NULL: PyObjectRef =
+        // std::ptr::null_mut();`). RPython models the same value as
+        // `llmemory.NULL = fakeaddress(None)`; project the call to the
+        // `_address::Null` carrier so the `LoadStatic` lowers to a
+        // proper null-ref `Constant` instead of the `UniStr(path)`
+        // sentinel. The argument-less call with a callee path whose
+        // final segment is `null` / `null_mut` is the only shape that
+        // resolves; anything with arguments stays unrecognised.
+        syn::Expr::Call(syn::ExprCall { func, args, .. }) if args.is_empty() => {
+            if let syn::Expr::Path(syn::ExprPath { path, .. }) = func.as_ref() {
+                match path.segments.last().map(|s| s.ident.to_string()).as_deref() {
+                    Some("null") | Some("null_mut") => Some(ConstValue::LLAddress(
+                        crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
         // `thread_local! { static X: T = const { LIT }; }` — the
         // initializer wraps a literal in a `syn::Expr::Const` block.
         // Plain `syn::Expr::Block` is also accepted for static
@@ -9400,6 +9421,26 @@ pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
         assert_eq!(decls[2].2, Some(ConstValue::Bool(false)));
         assert_eq!(decls[3].2, Some(ConstValue::float(1.5)));
         assert_eq!(decls[4].2, Some(ConstValue::UniStr("hi".to_string())));
+    }
+
+    #[test]
+    fn extract_static_decls_null_pointer_rhs_resolves_to_null_address() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        // `std::ptr::null_mut()` / `null()` resolve to the `_address::Null`
+        // carrier so the `LoadStatic` lowers to a null-ref `Constant`
+        // instead of the `UniStr(path)` sentinel.
+        let file = parse_file(
+            "pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
+             pub const CONST_NULL: *const u8 = std::ptr::null();
+             pub const BARE_NULL: *mut u8 = null_mut();",
+        );
+        let decls = extract_static_decls(&file, "");
+        assert_eq!(decls.len(), 3);
+        let null = Some(ConstValue::LLAddress(_address::Null));
+        assert_eq!(decls[0].2, null);
+        assert_eq!(decls[1].2, null);
+        assert_eq!(decls[2].2, null);
     }
 
     #[test]

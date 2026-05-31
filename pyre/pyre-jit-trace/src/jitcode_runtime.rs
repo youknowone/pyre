@@ -1421,7 +1421,13 @@ mod tests {
         //   requires emitting the resolved constant value instead of a
         //   string sentinel at the adapter, after which the regular
         //   jtransform `same_as` alias-elimination retires the
-        //   `OpKind::LoadStatic` variant entirely.
+        //   `OpKind::LoadStatic` variant entirely.  Null-pointer statics
+        //   (`PY_NULL = std::ptr::null_mut()`) now resolve to a real
+        //   `ConstValue::LLAddress(Null)` (immediate `0`) in
+        //   `extract_static_decls`, so their `same_as` folds away; the
+        //   remaining `same_as/>r` is the `*_TYPE` runtime-address
+        //   globals whose host addresses are only known at runtime
+        //   (Slice B address-baking target).
         //
         // Cross-platform tolerance: the analyzer's classdef/type-alias
         // resolution still depends on file-traversal order beyond what
