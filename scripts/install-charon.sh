@@ -37,6 +37,7 @@ CHARON_VERSION="${CHARON_VERSION:-$CHARON_VERSION_DEFAULT}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 CHARON_DEST="${CHARON_DEST:-$repo_root/build/charon}"
+source "$repo_root/scripts/charon-msvc-env.sh"
 
 # Detect platform. Charon publishes prebuilt assets for Linux/macOS only;
 # on Windows there is no release asset, so we build from source at the
@@ -91,6 +92,7 @@ if [[ "$from_source" == 1 ]]; then
             https://github.com/AeneasVerif/charon.git "$charon_src"
     fi
     echo "building charon (cargo build --release; first run installs the pinned nightly)"
+    charon_prepend_msvc_link
     ( cd "$charon_src/charon" && cargo build --release )
     cp "$charon_src/charon/target/release/charon$exe" \
        "$charon_src/charon/target/release/charon-driver$exe" "$CHARON_DEST/"

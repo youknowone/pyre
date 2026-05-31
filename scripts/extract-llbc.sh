@@ -25,6 +25,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$repo_root/scripts/charon-msvc-env.sh"
+charon_prepend_msvc_link
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) charon_exe="charon.exe" ;;
     *)                    charon_exe="charon" ;;
