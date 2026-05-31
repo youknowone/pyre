@@ -11,7 +11,7 @@
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type};
+use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 
@@ -502,6 +502,39 @@ impl Trace {
     /// `history.py:803-807 *FrontendOp(pos, value)` parity).
     pub(crate) fn box_for_position(&self, position: u32) -> Option<&BoxRef> {
         self.box_pool.get_at_position(position as usize)
+    }
+
+    /// Stamp the concrete runtime value on the canonical frontend object
+    /// for `position` (`history.py:803 *FrontendOp(pos, value)` — the
+    /// value lives on the `InputArg`/`Op` identity, not on a side pool).
+    /// `position` indexes the dense recording order: `[0, inputargs.len())`
+    /// are inputargs, `[inputargs.len(), ..)` are recorded ops. Returns
+    /// `false` if `position` is past the recorded range.
+    pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
+        let pos = position as usize;
+        let n = self.inputargs.len();
+        if pos < n {
+            self.inputargs[pos].set_value(value);
+            true
+        } else if let Some(op) = self.ops.get(pos - n) {
+            op.set_value(value);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read the concrete runtime value stamped on the canonical frontend
+    /// object for `position` (`history.py:680 *FrontendOp.getint()`).
+    /// `None` when never stamped or out of range.
+    pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
+        let pos = position as usize;
+        let n = self.inputargs.len();
+        if pos < n {
+            self.inputargs[pos].get_value()
+        } else {
+            self.ops.get(pos - n).and_then(|op| op.get_value())
+        }
     }
 
     /// Iterate `(slot_index, &BoxRef)` over every materialised pool

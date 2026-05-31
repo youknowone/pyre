@@ -1136,6 +1136,11 @@ impl TraceCtx {
                 )
             });
         boxref.set_value(concrete);
+        // Stamp the canonical `InputArg`/`Op` value slot too (the
+        // `_resint`/`_resfloat`/`_resref` host the BoxPool entry mirrors).
+        // The box and the object carry the same value during the transition
+        // off the side pool.
+        self.recorder.set_concrete_at(opref.raw(), concrete);
     }
 
     /// `BoxRef::get_value` reader — the concrete value stamped onto
