@@ -1479,6 +1479,30 @@ fn init_list_type(ns: &mut DictStorage) {
         "__iter__",
         make_builtin_function_with_arity("__iter__", |args| crate::baseobjspace::iter(args[0]), 1),
     );
+    dict_storage_store(
+        ns,
+        "__reversed__",
+        make_builtin_function_with_arity(
+            "__reversed__",
+            |args| {
+                // `listobject.py:737 descr_reversed` — reverse iterator over
+                // the list (same representation as `reversed(list)`).
+                let obj = args[0];
+                let n = unsafe { pyre_object::w_list_len(obj) };
+                let mut items = Vec::with_capacity(n);
+                for i in (0..n as i64).rev() {
+                    if let Some(v) = unsafe { pyre_object::w_list_getitem(obj, i) } {
+                        items.push(v);
+                    }
+                }
+                Ok(pyre_object::w_seq_iter_new(
+                    pyre_object::w_list_new(items),
+                    n,
+                ))
+            },
+            1,
+        ),
+    );
     // Arithmetic slots.  `listobject.c:list_concat` rejects a non-list
     // operand with TypeError (it does not return NotImplemented);
     // `list_repeat` requires an integer count.
