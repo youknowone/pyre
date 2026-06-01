@@ -121,6 +121,73 @@ pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(floatobject::w_float_new(monotonic_seconds()))
 }
 
+/// Monotonic clock as integer nanoseconds.
+fn monotonic_nanos() -> i128 {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+            return d.as_nanos() as i128;
+        }
+    }
+    monotonic_baseline().elapsed().as_nanos() as i128
+}
+
+/// time.monotonic_ns() → int
+pub fn monotonic_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(monotonic_nanos() as i64))
+}
+
+/// time.perf_counter_ns() → int
+///
+/// Shares the monotonic nanosecond source with `time.perf_counter`.
+pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(monotonic_nanos() as i64))
+}
+
+/// Process CPU time (kernel + user) as nanoseconds.
+///
+/// Prefers `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; falls back to
+/// `getrusage(RUSAGE_SELF)` summing `ru_utime` and `ru_stime`.
+#[cfg(all(unix, feature = "host_env"))]
+fn process_time_nanos() -> i128 {
+    if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID) {
+        return d.as_nanos() as i128;
+    }
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+        let tv_ns = |tv: &libc::timeval| -> i128 {
+            tv.tv_sec as i128 * 1_000_000_000 + tv.tv_usec as i128 * 1_000
+        };
+        return tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime);
+    }
+    0
+}
+
+#[cfg(not(all(unix, feature = "host_env")))]
+fn process_time_nanos() -> i128 {
+    // No host clock available; fall back to the monotonic baseline so
+    // the value is still non-decreasing.
+    monotonic_baseline().elapsed().as_nanos() as i128
+}
+
+/// time.process_time() → float
+///
+/// Process time for profiling: sum of the kernel and user-space CPU time.
+pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(floatobject::w_float_new(
+        process_time_nanos() as f64 * 1e-9,
+    ))
+}
+
+/// time.process_time_ns() → int
+pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(process_time_nanos() as i64))
+}
+
 /// time.clock_gettime(clk_id) → float seconds
 #[cfg(all(unix, feature = "host_env"))]
 pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
