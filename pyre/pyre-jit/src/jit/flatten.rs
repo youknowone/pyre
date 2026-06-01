@@ -1368,8 +1368,7 @@ impl<'a> GraphFlattener<'a> {
         // no-op marker (the encoder never reads a PC with no guard).
         // Tightening to `EffectInfo::check_can_raise` waits until the
         // pc_map -> `-live-` wiring (A2) makes the distinction observable.
-        let trailing_live =
-            self.lowering_ctx.is_some() && insn_needs_trailing_live(&insn);
+        let trailing_live = self.lowering_ctx.is_some() && insn_needs_trailing_live(&insn);
         self.emitline(insn);
         if trailing_live {
             self.emitline(Insn::live(Vec::new()));
@@ -5447,9 +5446,9 @@ mod tests {
         let call_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| {
-                matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r")
-            })
+            .position(
+                |insn| matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r"),
+            )
             .unwrap_or_else(|| panic!("expected residual_call_ir_r: {:?}", ssarepr.insns));
         assert!(
             ssarepr.insns[call_pos + 1].is_live(),
