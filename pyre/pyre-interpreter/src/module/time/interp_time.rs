@@ -11,6 +11,14 @@ use std::time::Instant;
 #[cfg(not(feature = "host_env"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Number of fields in `time.struct_time` as seen by C extensions.
+/// `interp_time.py:290` uses 9, raised to 11 when `struct tm` carries
+/// `tm_zone`/`tm_gmtoff` — true on every Unix target pyre builds for.
+#[cfg(unix)]
+pub const STRUCT_TM_ITEMS: i64 = 11;
+#[cfg(not(unix))]
+pub const STRUCT_TM_ITEMS: i64 = 9;
+
 /// Process-start `Instant` used as the monotonic-clock origin whenever
 /// `clock_gettime(CLOCK_MONOTONIC)` is unavailable.  Keeping a single
 /// baseline preserves `time.monotonic()`'s non-decreasing guarantee.
