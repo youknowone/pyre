@@ -9128,11 +9128,29 @@ impl CodeWriter {
         // `#[cfg(test)]` reached it.  Gate unset => the block is skipped,
         // so production is byte-identical; gate set proves the canonical
         // driver runs without panicking on every production graph shape.
-        if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
-            let mut measure_regallocs = graph_regallocs.clone();
-            let _canonical =
-                super::flatten::flatten_graph(&graph, &mut measure_regallocs, true, Some(self.cpu()));
-        }
+        // Default-off measurement: run the post-walk canonical driver on
+        // the production graph (`flatten.py:63-70`) and record its insn
+        // count for the post-drain length-parity log below.  Survey, not
+        // abort: graph shapes the canonical driver can't yet flatten
+        // panic inside `flatten_graph` (the Phase-1 SCAFFOLD panics —
+        // uncolored exception-edge vars, non-portal `simple_call` frame),
+        // so catch the unwind and record `None`, letting one
+        // `PYRE_FLATTEN_MEASURE=1` pass survey every production graph
+        // instead of aborting on the first bad one.  `flatten_graph` only
+        // reads `graph`/`cpu` (no `.borrow_mut`, `next_variable_id`
+        // untouched), so discarding the result leaves the post-measurement
+        // production path byte-identical; gate unset => skipped entirely.
+        let measure_canonical_len: Option<usize> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut measure_regallocs = graph_regallocs.clone();
+                super::flatten::flatten_graph(&graph, &mut measure_regallocs, true, Some(self.cpu()))
+                    .insns
+                    .len()
+            }))
+            .ok()
+        } else {
+            None
+        };
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -9290,6 +9308,23 @@ impl CodeWriter {
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
+            // #230.M1 length-parity survey: under PYRE_FLATTEN_MEASURE,
+            // compare the canonical driver's insn count (captured pre-drain
+            // above) against the walker's drained `ssarepr.insns`.  `Some`
+            // when the canonical driver completed, `None` when it panicked
+            // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
+            if let Some(canon_len) = measure_canonical_len {
+                let walker_len = ssarepr.insns.len();
+                eprintln!(
+                    "[flatten-measure] {} canonical={} walker={} {}",
+                    ssarepr.name,
+                    canon_len,
+                    walker_len,
+                    if canon_len == walker_len { "MATCH" } else { "DIFF" },
+                );
+            } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
+                eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
+            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
