@@ -9121,6 +9121,18 @@ impl CodeWriter {
             &cfg_variable_pairs,
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
+        // Default-off measurement: run the post-walk canonical driver on
+        // the production graph and discard its output.  This is the first
+        // production-reachable caller of `flatten_graph`
+        // (`flatten.py:63-70`); until now only `*_for_test` and
+        // `#[cfg(test)]` reached it.  Gate unset => the block is skipped,
+        // so production is byte-identical; gate set proves the canonical
+        // driver runs without panicking on every production graph shape.
+        if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
+            let mut measure_regallocs = graph_regallocs.clone();
+            let _canonical =
+                super::flatten::flatten_graph(&graph, &mut measure_regallocs, true, Some(self.cpu()));
+        }
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
