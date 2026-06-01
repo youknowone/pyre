@@ -800,6 +800,34 @@ fn emit_vable_getfield_ref_walker_only(
     push_walker_emit(current_block, insn);
 }
 
+/// #230.M2 measurement helper: bucket an SSARepr insn stream into
+/// `(genuine, live, copy, structural)` so the `PYRE_FLATTEN_MEASURE`
+/// survey can attribute the canonical-vs-walker length gap to a
+/// specific category.  `live` = `-live-` markers (per-PC, retired by
+/// #287), `copy` = `*_copy` renamings (walker emits inline where
+/// upstream defers them to `insert_renamings`, #289/#290),
+/// `structural` = `Label`/`---`, `genuine` = everything else.  Used on
+/// both the canonical and walker streams so the comparison is
+/// category-to-category.  Measurement-only; no production caller when
+/// the gate is unset.
+fn bucket_measure_insns(insns: &[super::flatten::Insn]) -> (usize, usize, usize, usize) {
+    let (mut genuine, mut live, mut copy, mut structural) = (0usize, 0usize, 0usize, 0usize);
+    for insn in insns {
+        if insn.is_live() {
+            live += 1;
+        } else {
+            match insn {
+                super::flatten::Insn::Label(_) | super::flatten::Insn::Unreachable => {
+                    structural += 1
+                }
+                super::flatten::Insn::Op { opname, .. } if opname.ends_with("_copy") => copy += 1,
+                super::flatten::Insn::Op { .. } => genuine += 1,
+            }
+        }
+    }
+    (genuine, live, copy, structural)
+}
+
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
@@ -9122,15 +9150,10 @@ impl CodeWriter {
         );
         super::regalloc::enforce_input_args(&graph, &mut graph_regallocs);
         // Default-off measurement: run the post-walk canonical driver on
-        // the production graph and discard its output.  This is the first
-        // production-reachable caller of `flatten_graph`
-        // (`flatten.py:63-70`); until now only `*_for_test` and
-        // `#[cfg(test)]` reached it.  Gate unset => the block is skipped,
-        // so production is byte-identical; gate set proves the canonical
-        // driver runs without panicking on every production graph shape.
-        // Default-off measurement: run the post-walk canonical driver on
         // the production graph (`flatten.py:63-70`) and record its insn
-        // count for the post-drain length-parity log below.  Survey, not
+        // category buckets for the post-drain DIFF survey below.  This is
+        // the first production-reachable caller of `flatten_graph`; until
+        // now only `*_for_test` and `#[cfg(test)]` reached it.  Survey, not
         // abort: graph shapes the canonical driver can't yet flatten
         // panic inside `flatten_graph` (the Phase-1 SCAFFOLD panics —
         // uncolored exception-edge vars, non-portal `simple_call` frame),
@@ -9140,17 +9163,24 @@ impl CodeWriter {
         // reads `graph`/`cpu` (no `.borrow_mut`, `next_variable_id`
         // untouched), so discarding the result leaves the post-measurement
         // production path byte-identical; gate unset => skipped entirely.
-        let measure_canonical_len: Option<usize> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut measure_regallocs = graph_regallocs.clone();
-                super::flatten::flatten_graph(&graph, &mut measure_regallocs, true, Some(self.cpu()))
-                    .insns
-                    .len()
-            }))
-            .ok()
-        } else {
-            None
-        };
+        // `(genuine, live, copy, structural)` buckets of the canonical
+        // driver's insn stream, or `None` when it panicked.
+        let measure_canonical_buckets: Option<(usize, usize, usize, usize)> =
+            if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut measure_regallocs = graph_regallocs.clone();
+                    let canonical = super::flatten::flatten_graph(
+                        &graph,
+                        &mut measure_regallocs,
+                        true,
+                        Some(self.cpu()),
+                    );
+                    bucket_measure_insns(&canonical.insns)
+                }))
+                .ok()
+            } else {
+                None
+            };
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -9308,19 +9338,40 @@ impl CodeWriter {
             // (`filter_liveness_in_place`, `pc_map`) translate them
             // through the `remove_repeated_live` remap.
             walker_tracked_pc_live_indices_out = walker_tracked_pc_indices;
-            // #230.M1 length-parity survey: under PYRE_FLATTEN_MEASURE,
-            // compare the canonical driver's insn count (captured pre-drain
-            // above) against the walker's drained `ssarepr.insns`.  `Some`
-            // when the canonical driver completed, `None` when it panicked
+            // #230.M2 DIFF bucketing survey: under PYRE_FLATTEN_MEASURE,
+            // bucket both the canonical driver's insn stream (captured
+            // pre-drain above) and the walker's drained `ssarepr.insns`
+            // into `(genuine, live, copy, struct)` and log them
+            // category-to-category, so the ~40% excess (M1: canonical is
+            // consistently ~60-65% of walker length) is attributed to a
+            // specific retirement.  `live` = per-PC `-live-` markers
+            // (retired by #287), `copy` = `*_copy` renamings the walker
+            // emits inline where upstream defers them to
+            // `insert_renamings` (#289/#290), `struct` = `Label`/`---`,
+            // `genuine` = everything else.  When walker `genuine` equals
+            // canonical `genuine` the entire gap is `live`+`copy` (both
+            // already-tracked retirements) and the flip is purely a
+            // filtering problem; a residual walker `genuine` excess is a
+            // NEW-DEVIATION needing its own retirement.  `Some` when the
+            // canonical driver completed, `None` when it panicked
             // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
-            if let Some(canon_len) = measure_canonical_len {
-                let walker_len = ssarepr.insns.len();
+            if let Some((cg, cl, cc, cs)) = measure_canonical_buckets {
+                let (wg, wl, wc, ws) = bucket_measure_insns(&ssarepr.insns);
                 eprintln!(
-                    "[flatten-measure] {} canonical={} walker={} {}",
+                    "[flatten-measure] {} canon[g={} l={} c={} s={} tot={}] walker[g={} l={} c={} s={} tot={}] {} {}",
                     ssarepr.name,
-                    canon_len,
-                    walker_len,
-                    if canon_len == walker_len { "MATCH" } else { "DIFF" },
+                    cg,
+                    cl,
+                    cc,
+                    cs,
+                    cg + cl + cc + cs,
+                    wg,
+                    wl,
+                    wc,
+                    ws,
+                    wg + wl + wc + ws,
+                    if wg == cg { "GENUINE_MATCH" } else { "GENUINE_DIFF" },
+                    if cg + cl + cc + cs == wg + wl + wc + ws { "MATCH" } else { "DIFF" },
                 );
             } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
                 eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
