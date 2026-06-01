@@ -5800,6 +5800,18 @@ fn try_walker_inline_user_call(
     if nparams > body.num_regs_r {
         return Ok(None);
     }
+    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+        let mut pc = 0usize;
+        let mut shown = 0;
+        while pc < body.code.len() && shown < 8 {
+            let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
+                break;
+            };
+            eprintln!("[inline-body] pc={} {}", d.pc, d.key);
+            pc = d.next_pc;
+            shown += 1;
+        }
+    }
 
     let (
         mut callee_regs_r,
