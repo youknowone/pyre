@@ -10,31 +10,10 @@ use crate::optimizeopt::dependency::DependencyGraph;
 
 // ── vector.py:670-678: isomorphic ─────────────────────────────────────
 
-/// vector.py:670-678 helper — returns the bytesize from the op's vecinfo
-/// slot if present, otherwise the default for the op's result type.
-/// INT_WORD = 8, FLOAT_WORD = 8 on 64-bit; void → 0.
-fn get_op_bytesize(op: &Op) -> i32 {
-    if let Some(vi) = op.get_vecinfo() {
-        return vi.getbytesize() as i32;
-    }
-    match op.opcode.result_type() {
-        majit_ir::Type::Float => 8,
-        majit_ir::Type::Void => 0,
-        _ => 8, // INT_WORD on 64-bit
-    }
-}
-
-/// vector.py:670-678: isomorphic — two ops can be packed if they have
-/// the same opcode AND the same vecinfo bytesize.
-pub fn isomorphic(l_op: &Op, r_op: &Op) -> bool {
-    if l_op.opcode != r_op.opcode {
-        return false;
-    }
-    get_op_bytesize(l_op) == get_op_bytesize(r_op)
-}
-
-/// vector.py:670-678 production path. Uses `forwarded_vecinfo`, which stores
-/// `VectorizationInfo` in the same `_forwarded` slot that RPython uses.
+/// vector.py:670-678: isomorphic — two ops can be packed if they have the
+/// same opcode AND the same vecinfo bytesize. PyPy reads each side through
+/// `forwarded_vecinfo`, so the comparison runs against the same `_forwarded`
+/// (here `vecinfo_cache`) store that `VectorizationInfo(op)` populated.
 pub fn isomorphic_with_state(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
     if l_op.opcode != r_op.opcode {
         return false;
@@ -793,13 +772,15 @@ pub struct VecScheduleState {
     pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache. PyPy reads
-    /// `op._forwarded` as the `VectorizationInfo` carrier; pyre splits
-    /// the slot — `Op.vecinfo` is the per-op canonical (cleared by
-    /// `vector.py:58-60 teardown_vectorization`) and this cache holds
-    /// the schedule-local stamps for InputArg/transient OpRefs that
-    /// don't own an Op. Keyed by full `OpRef` so InputArg/op namespaces
-    /// don't collide.
+    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache — pyre's stand-in
+    /// for PyPy's `op._forwarded` `VectorizationInfo` carrier. It is the
+    /// canonical store for the vector pass: `setup_vectorization` stamps
+    /// every loop op here through `VectorizationInfo(op)`, and
+    /// `forwarded_vecinfo` / `isomorphic_with_state` read it back. Living
+    /// on the state (not on the op) means it is dropped when the state
+    /// is, matching `vector.py:58-60 teardown_vectorization`'s
+    /// `set_forwarded(None)`. Keyed by full `OpRef` so InputArg/op
+    /// namespaces don't collide.
     vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::VectorizationInfo>,
 }
 
@@ -844,26 +825,26 @@ impl VecScheduleState {
 
     /// `resoperation.py:181-186 VectorizationInfo.__init__` INT_SIGNEXT
     /// branch.  PyPy reads `op.getarg(1).value` off the `ConstInt` object
-    /// directly; pyre's flat-OpRef encoding stores the const as a pool
-    /// index, so the caller-supplied resolver materialises the value at
-    /// stamp time.  Falls back to the generic branch when arg1 isn't a
-    /// resolvable constant (mirrors PyPy's `assert isinstance(arg1, ConstInt)`
-    /// degrading to the typecast-fallthrough path in non-translated runs).
+    /// directly, after `assert isinstance(arg1, history.ConstInt)`; pyre's
+    /// flat-OpRef encoding stores the const as a pool index, so the
+    /// caller-supplied resolver materialises `arg1.value`.  An unresolvable
+    /// `arg1` is a malformed INT_SIGNEXT, so this fails fast (mirroring the
+    /// `assert`) rather than silently degrading to a generic vecinfo.
     fn int_signext_vecinfo(
         &self,
         op: &Op,
         constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> majit_ir::VectorizationInfo {
-        if op.num_args() >= 2 {
-            if let Some(bytesize) = constant_of(op.arg(1).to_opref()) {
-                if (i8::MIN as i64..=i8::MAX as i64).contains(&bytesize) {
-                    let mut info = majit_ir::VectorizationInfo::new();
-                    info.setinfo('i', bytesize as i8, true);
-                    return info;
-                }
-            }
-        }
-        self.vectorization_info_for_op(op)
+        // resoperation.py:185 `assert isinstance(arg1, history.ConstInt)`.
+        let bytesize = constant_of(op.arg(1).to_opref())
+            .expect("INT_SIGNEXT arg1 must resolve to a ConstInt (resoperation.py:185)");
+        assert!(
+            (i8::MIN as i64..=i8::MAX as i64).contains(&bytesize),
+            "INT_SIGNEXT byte size {bytesize} out of VectorizationInfo range"
+        );
+        let mut info = majit_ir::VectorizationInfo::new();
+        info.setinfo('i', bytesize as i8, true);
+        info
     }
 
     fn get_forwarded_vecinfo(&self, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
@@ -893,7 +874,7 @@ impl VecScheduleState {
         info
     }
 
-    fn forwarded_vecinfo_for_ref(
+    pub fn forwarded_vecinfo_for_ref(
         &mut self,
         opref: OpRef,
         ops: &[Op],
@@ -925,13 +906,14 @@ impl VecScheduleState {
     /// Mirrors PyPy `resoperation.py:163-212 VectorizationInfo.__init__`.
     /// The `INT_SIGNEXT` branch (`:181-186`) is handled in
     /// `int_signext_vecinfo` at setup time because it needs the
-    /// caller-supplied const-pool resolver; once the inline vecinfo slot
-    /// is stamped, every later lookup hits the cache and never re-enters
-    /// this method for INT_SIGNEXT.  A bare miss-path call on
+    /// caller-supplied const-pool resolver; once the forwarded vecinfo
+    /// cache is stamped, every later lookup hits the cache and never
+    /// re-enters this method for INT_SIGNEXT.  A bare miss-path call on
     /// INT_SIGNEXT (e.g. a synthesised op that bypassed setup) falls
-    /// through to the typecast branch which returns `None` for it, and
-    /// then to the source-operand pass-through — same degradation as
-    /// PyPy's non-translated `assert` failure path.
+    /// through to the typecast branch, which returns `None` for it, and
+    /// then to the source-operand pass-through; `setup_vectorization`
+    /// stamps every loop INT_SIGNEXT up front, so this residual path is
+    /// not reached for real loop bodies.
     fn vectorization_info_for_op(&self, op: &Op) -> majit_ir::VectorizationInfo {
         // resoperation.py:170-180 primitive_array_access branch.
         if op.opcode.is_primitive_array_access_opcode() {
@@ -957,7 +939,7 @@ impl VecScheduleState {
         // resoperation.py:187-190 is_typecast branch (INT_SIGNEXT static
         // gating returns None per `cast_to_bytesize_static`; the dynamic
         // INT_SIGNEXT bytesize is stamped in `int_signext_vecinfo` at
-        // setup time and read back through the inline vecinfo slot).
+        // setup time and read back through the forwarded vecinfo cache).
         if op.opcode.is_typecast() {
             if let Some(bytesize) = op.opcode.cast_to_bytesize_static() {
                 let (_ft, tt) = op.opcode.cast_types();

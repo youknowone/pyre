@@ -32,7 +32,7 @@ pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
     AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
     NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, VectorizeError,
-    are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector,
+    are_adjacent_memory_refs, isomorphic_with_state, turn_into_vector, unpack_from_vector,
 };
 
 // ── vector.py:35-40: copy_resop ────────────────────────────────────────
@@ -103,33 +103,6 @@ impl VectorLoop {
             ops[label_pos + 1..jump_pos].to_vec(),
             ops[jump_pos].clone(),
         ))
-    }
-
-    /// vector.py:54-56: setup_vectorization — attach VectorizationInfo to
-    /// each operation in the loop body.
-    pub fn setup_vectorization(&mut self) {
-        for op in &mut self.operations {
-            if !op.has_vecinfo() {
-                let mut vi = majit_ir::VectorizationInfo::new();
-                let tp = op.opcode.result_type();
-                let dt = match tp {
-                    majit_ir::Type::Float => 'f',
-                    majit_ir::Type::Void => '\0',
-                    _ => 'i',
-                };
-                if dt != '\0' {
-                    vi.setinfo(dt, -1, true);
-                }
-                op.set_vecinfo(vi);
-            }
-        }
-    }
-
-    /// vector.py:58-60: teardown_vectorization — remove VectorizationInfo.
-    pub fn teardown_vectorization(&mut self) {
-        for op in &mut self.operations {
-            op.clear_vecinfo();
-        }
     }
 
     /// vector.py:62-92: finaloplist — assemble the complete operation list
@@ -282,17 +255,14 @@ pub fn optimize_vector(
     // error path; on success we hand back the vectorized ops directly.
     let version = loop_.clone_loop();
 
-    // vector.py:135: loop.setup_vectorization()
-    loop_.setup_vectorization();
-
     let result = (|| -> Result<Vec<Op>, VectorizeError> {
-        // vector.py:142-143
+        // vector.py:142-143. `run_optimization` performs vector.py:135
+        // `loop.setup_vectorization()` itself, stamping each op's
+        // VectorizationInfo into the scheduler's forwarded cache (the
+        // `_forwarded` equivalent that `forwarded_vecinfo` reads).
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_)
     })();
-
-    // vector.py:172: finally: loop.teardown_vectorization()
-    loop_.teardown_vectorization();
 
     if result.is_err() {
         // vector.py:155 / :160: `return loop_info, version.loop.finaloplist()`.
@@ -581,13 +551,12 @@ impl VectorizingOptimizer {
                 return Err(VectorizeError::NotVectorizeable);
             }
             let datatype = 'i';
-            let bytesize: i32 = loop_
-                .operations
-                .iter()
-                .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.get_vecinfo())
-                .map(|vi| vi.getbytesize() as i32)
-                .unwrap_or(8);
+            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // seed's forwarded VectorizationInfo from the same cache that
+            // VectorizationInfo(op) populated, not a separate inline slot.
+            let bytesize: i32 = sched_state
+                .forwarded_vecinfo_for_ref(seed, &loop_.operations)
+                .getbytesize() as i32;
             let vec_reg_size: i32 = self.vec_size as i32;
             let count = (vec_reg_size / bytesize) as usize;
             let signed = true;
@@ -865,7 +834,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_dep].op;
                 let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_dep < r_dep {
+                if isomorphic_with_state(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -909,7 +878,7 @@ impl VectorizingOptimizer {
                 let l_op = &graph.nodes[l_user].op;
                 let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
-                if isomorphic(l_op, r_op) && l_user < r_user {
+                if isomorphic_with_state(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
                         Err(_) => return,
@@ -1117,13 +1086,12 @@ impl VectorizingOptimizer {
                 return None;
             }
             let datatype = 'i';
-            let bytesize: i32 = loop_
-                .operations
-                .iter()
-                .find(|op| op.pos.get() == seed)
-                .and_then(|op| op.get_vecinfo())
-                .map(|vi| vi.getbytesize() as i32)
-                .unwrap_or(8);
+            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // seed's forwarded VectorizationInfo from the same cache that
+            // VectorizationInfo(op) populated, not a separate inline slot.
+            let bytesize: i32 = sched_state
+                .forwarded_vecinfo_for_ref(seed, &loop_.operations)
+                .getbytesize() as i32;
             let vec_reg_size: i32 = self.vec_size as i32;
             let count = (vec_reg_size / bytesize) as usize;
             let signed = true;
@@ -2540,6 +2508,7 @@ mod tests {
 
     #[test]
     fn test_isomorphic_same_opcode() {
+        let mut state = VecScheduleState::new(0);
         let a = Op::new(
             OpCode::IntAdd,
             &[
@@ -2554,11 +2523,12 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(isomorphic(&a, &b));
+        assert!(isomorphic_with_state(&mut state, &a, &b));
     }
 
     #[test]
     fn test_isomorphic_different_opcode() {
+        let mut state = VecScheduleState::new(0);
         let a = Op::new(
             OpCode::IntAdd,
             &[
@@ -2573,7 +2543,7 @@ mod tests {
                 BoxRef::from_opref(OpRef::input_arg_int(103)),
             ],
         );
-        assert!(!isomorphic(&a, &b));
+        assert!(!isomorphic_with_state(&mut state, &a, &b));
     }
 
     #[test]
