@@ -954,6 +954,23 @@ pub enum DispatchError {
     /// inside an inline sub-walk is therefore a codewriter/flatten shape
     /// mismatch.
     SubWalkClosedLoop { pc: usize },
+    /// A `goto_if_not` branch guard resumes at a target that still carries
+    /// a live operand-stack temp (resume-target stack depth > 0). This is
+    /// the short-circuit shape — `x and y`, `x or y`, the conditional
+    /// expression `a if c else b`, and chained comparison `a < b < c` —
+    /// where CPython keeps the tested value on the value stack across the
+    /// branch (`COPY` / `TO_BOOL` / `POP_JUMP_IF_*`). The full-body walk's
+    /// single-frame guard snapshot rebuilds locals + the post-opcode
+    /// operand stack from the live register banks, but the kept temp at a
+    /// branch *target* (a control-flow merge the trace did not take) is
+    /// not represented in the not-taken arm's liveness, so the deopt
+    /// re-entry restores a wrong value into a loop-carried slot (task
+    /// #124/#281 per-PC resume-value precision). Plain `while` / `if`
+    /// branches resume at depth 0 and are unaffected. The walker surfaces
+    /// a typed abort so the driver maps it to `TraceAction::Abort` →
+    /// interpreter fallback (correct, untraced) instead of compiling a
+    /// trace whose guard-failure path corrupts the frame.
+    BranchGuardKeptStackUnsupported { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -5012,6 +5029,51 @@ fn resolve_branch_target_through_trampoline(code: &[u8], mut target: usize) -> u
     target
 }
 
+/// Full-body-walk operand-stack depth at a branch guard's resume target.
+///
+/// `target` is a jitcode pc — the `goto_if_not` `other_target` (the
+/// not-taken arm a guard failure deopts into).  Maps it back to the
+/// Python opcode boundary the blackhole resumes at (same coordinate
+/// resolution as `walker_capture_snapshot_for_last_guard_impl`: inverse
+/// `pc_map` + forward trivia skip) and reads the forward stack-depth
+/// analysis.  A depth `> 0` means the resume target carries a live
+/// operand-stack temp — the short-circuit / conditional-expression /
+/// chained-comparison shape the single-frame snapshot cannot rebuild on
+/// the not-taken arm (#124/#281).
+///
+/// Returns `None` outside a full-body walk (per-opcode / trait path,
+/// where the snapshot uses the static entry coordinate and this guard
+/// shape does not arise) or when the coordinate resolves past the last
+/// Python opcode (a synthetic loop-close overshoot, which carries no
+/// kept temp).  Callers treat `None` as "no kept temp".
+fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return None;
+    }
+    // SAFETY: identical contract to
+    // `walker_capture_snapshot_for_last_guard_impl` — the pointer is set
+    // only for the lifetime of the full-body `dispatch_via_miframe`, and
+    // only immutable layout fields (jitcode / pc_map / code_ptr) are read.
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return None;
+        }
+        let code = &*jc.payload.code_ptr;
+        let py = python_pc_for_jitcode_pc(&jc.payload.metadata.pc_map, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        crate::liveness::liveness_for(jc.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(py)
+            .copied()
+    }
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -8095,6 +8157,19 @@ fn handle(
                 if switchcase != 0 { target } else { op.next_pc },
             );
             if !valuebox.is_constant() {
+                // #124/#281: a branch guard whose resume target still holds
+                // a live operand-stack temp (short-circuit `and`/`or`, the
+                // conditional expression, chained comparison) cannot be
+                // resumed precisely by the single-frame snapshot — the kept
+                // value lives on the not-taken arm the snapshot does not
+                // model, so a guard-failure deopt restores a wrong value
+                // into a loop-carried slot.  Abort the walk → interpreter
+                // fallback (correct, untraced) rather than compile a trace
+                // that corrupts the frame on every odd-path iteration.
+                // Plain `while` / `if` branches resume at depth 0 and pass.
+                if branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0) {
+                    return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
+                }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
                 walker_capture_snapshot_for_last_guard(ctx, other_target)?;
                 ctx.trace_ctx.replace_box(valuebox, promoted);

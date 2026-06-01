@@ -693,7 +693,8 @@ fn full_body_walk_trace(
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceProtectedByExceptionHandlerUnsupported { .. }
-                | DE::MayForceNullRefArgUnsupported { .. } => TraceAction::AbortPermanent,
+                | DE::MayForceNullRefArgUnsupported { .. }
+                | DE::BranchGuardKeptStackUnsupported { .. } => TraceAction::AbortPermanent,
                 _ => TraceAction::Abort,
             }
         }
