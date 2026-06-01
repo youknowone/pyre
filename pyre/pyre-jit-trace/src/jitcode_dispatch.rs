@@ -5670,6 +5670,51 @@ pub(crate) fn bh_store_subscr_fn_addr_cached() -> Option<usize> {
 }
 
 #[allow(non_snake_case)]
+/// #62 call-inlining recognition probe (env-gated `PYRE_DIAG_INLINE_RECOG`,
+/// ZERO behavior change — emits only diagnostics).  A user-function `CALL`
+/// lowers to a `call_fn` residual whose `funcptr` is the generic call helper,
+/// not the callee; the actual callable is a runtime Ref arg.  This scans the
+/// Ref args' concrete values for a user Python function (`FUNCTION_TYPE`,
+/// non-builtin) and reports whether its per-`CodeObject` JitCode is installed
+/// (`jitcode_lookup`).  It confirms the runtime callable -> `CodeObject` ->
+/// JitCode recognition seam fires (the walker analog of the trait path's
+/// `_opimpl_recursive_call`) before any inline sub-walk wiring lands.
+fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
+    let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+    for (i, cv) in arg_concretes.iter().enumerate() {
+        let ConcreteValue::Ref(obj) = *cv else {
+            continue;
+        };
+        if obj.is_null() {
+            continue;
+        }
+        unsafe {
+            if !pyre_interpreter::is_function(obj) {
+                continue;
+            }
+            // Only the pure-Python `function` type is a sub-walk candidate;
+            // builtins share `is_function` but have no per-fn JitCode.
+            if (*obj).ob_type as *const () as usize != function_type_addr {
+                continue;
+            }
+            let code = pyre_interpreter::function_get_code(obj);
+            // Passive probe (no global mutation): jitcode_lookup is the
+            // setup-time store; both miss because pyre builds per-fn JitCode
+            // lazily.  The on-demand build path `jitcode_for` (state.rs:593)
+            // was measured to succeed for these callees — that is the obtain
+            // step the eventual sub-walk uses.
+            let jitcode = crate::state::jitcode_lookup(code);
+            let pyjc = crate::state::pyjitcode_for_code(code);
+            eprintln!(
+                "[inline-recog] pc={op_pc} arg#{i} user-fn code={code:?} \
+                 setup-store={} codewriter-store={} (on-demand build available)",
+                if jitcode.is_null() { "MISS" } else { "HIT" },
+                if pyjc.is_none() { "MISS" } else { "HIT" }
+            );
+        }
+    }
+}
+
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
     op: &DecodedOp,
@@ -5678,6 +5723,14 @@ fn dispatch_residual_call_iRd_kind(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
+    // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
+    // set; full-body-walk authoritative path only).  First slice of the
+    // call-inlining feature — confirms callable->JitCode recognition before
+    // sub-walk wiring.
+    if ctx.is_authoritative_executor && std::env::var("PYRE_DIAG_INLINE_RECOG").is_ok() {
+        let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+        diagnose_inline_recognition(&arg_concretes, op.pc);
+    }
     let descr_offset = 1 + arg_width;
     let descr_index = decode_descr_index(code, op, descr_offset);
     let descr = read_descr(code, op, descr_offset, ctx)?;
