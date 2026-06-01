@@ -795,6 +795,44 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
     })
 }
 
+/// Build a `SubJitCodeBody` view over the callee per-fn JitCode for a
+/// W_CodeObject, building+installing it on demand (`jitcode_for`) when the
+/// lazy per-fn build has not run yet.  Used by full-body-walk call inlining
+/// to obtain a sub-walk body for a runtime callable's code.
+///
+/// The `Arc<PyJitCode>` is held for the program lifetime in the append-only
+/// `MetaInterpStaticData.jitcodes` store (warmspot.py:282) and its bytecode /
+/// constant pools are immutable after build, so extending those slices to
+/// `'static` is sound — the same justification as the per-fn arm-entry borrow
+/// extension at `trace.rs:363` / `trace_opcode.rs:6735`.  Returns `None` when
+/// the code is null or the on-demand build did not install a payload.
+pub(crate) fn sub_jitcode_body_for_code(
+    code: *const (),
+) -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
+    if code.is_null() {
+        return None;
+    }
+    if jitcode_for(code).is_null() {
+        return None;
+    }
+    let pjc = pyjitcode_for_code(code)?;
+    let jc = &pjc.jitcode;
+    // SAFETY: the payload lives for the program in the append-only jitcodes
+    // store (a second Arc keeps the allocation alive after this local clone
+    // drops); the pools are immutable post-build.
+    Some(unsafe {
+        crate::jitcode_dispatch::SubJitCodeBody {
+            code: &*(jc.code.as_slice() as *const [u8]),
+            num_regs_r: jc.num_regs_r() as usize,
+            num_regs_i: jc.num_regs_i() as usize,
+            num_regs_f: jc.num_regs_f() as usize,
+            constants_i: &*(jc.constants_i.as_slice() as *const [i64]),
+            constants_r: &*(jc.constants_r.as_slice() as *const [i64]),
+            constants_f: &*(jc.constants_f.as_slice() as *const [i64]),
+        }
+    })
+}
+
 /// `resume.py:1049` `consume_one_section` → `enumerate_vars` parity:
 /// return the number of tagged values encoded for a frame at
 /// (jitcode_index, pc).

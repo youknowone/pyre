@@ -5710,20 +5710,25 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
                 continue;
             }
             let code = pyre_interpreter::function_get_code(obj);
-            // Passive probe (no global mutation): jitcode_lookup is the
-            // setup-time store; both miss because pyre builds per-fn JitCode
-            // lazily.  The on-demand build path `jitcode_for` (state.rs:593)
-            // was measured to succeed for these callees — that is the obtain
-            // step the eventual sub-walk uses.
-            let jitcode = crate::state::jitcode_lookup(code);
-            let pyjc = crate::state::pyjitcode_for_code(code);
-            eprintln!(
-                "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} code={code:?} \
-                 setup-store={} codewriter-store={} (on-demand build available)",
-                arg_concretes.len(),
-                if jitcode.is_null() { "MISS" } else { "HIT" },
-                if pyjc.is_none() { "MISS" } else { "HIT" }
-            );
+            // Exercise the slice-(3) obtain step: build (if needed) + view the
+            // callee per-fn JitCode as a SubJitCodeBody.  Reports the callee
+            // register-bank shape the sub-walk will allocate.
+            match crate::state::sub_jitcode_body_for_code(code) {
+                Some(body) => eprintln!(
+                    "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} \
+                     code={code:?} body-OK regs_r={} regs_i={} regs_f={} code_len={}",
+                    arg_concretes.len(),
+                    body.num_regs_r,
+                    body.num_regs_i,
+                    body.num_regs_f,
+                    body.code.len()
+                ),
+                None => eprintln!(
+                    "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} \
+                     code={code:?} body-NONE",
+                    arg_concretes.len()
+                ),
+            }
         }
     }
 }
