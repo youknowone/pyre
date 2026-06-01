@@ -1686,10 +1686,16 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // built-in subclasses (W_ExceptionObject, etc.) resolve their
             // class through the same path that powers `type(obj)` —
             // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
-            let w_obj_type = if is_instance(bound_obj) {
-                w_instance_get_type(bound_obj)
-            } else if is_type(bound_obj) {
+            // superobject.py:103-110 _supercheck: `su_obj` is itself a
+            // subtype of `su_type` only in the classmethod / class-level
+            // case (return `su_obj`).  A class whose metaclass is
+            // `su_type` is an *instance* of `su_type`, not a subtype, so
+            // it must resolve through `type(su_obj)` — otherwise its MRO
+            // never reaches `su_type` and the lookup fails.
+            let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
                 bound_obj
+            } else if is_instance(bound_obj) {
+                w_instance_get_type(bound_obj)
             } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
                 cls
             } else {
@@ -1719,13 +1725,18 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                         if let Some(attr) = found {
                             // superobject.py super_getattro:
                             // Invoke descriptor __get__ protocol.
-                            // function.__get__(obj, type) → bound method
-                            // __new__ is implicitly static — never bind.
-                            if name != "__new__"
-                                && crate::is_function(attr)
-                                && !pyre_object::is_staticmethod(attr)
-                                && !pyre_object::is_classmethod(attr)
-                            {
+                            // classmethod.__get__(obj, type) binds the class
+                            // (`w_obj_type`); staticmethod.__get__ unwraps to
+                            // the plain function; a plain function binds `obj`.
+                            // `__new__` is implicitly static — never bind.
+                            if pyre_object::is_classmethod(attr) {
+                                let func = pyre_object::w_classmethod_get_func(attr);
+                                return Ok(pyre_object::w_method_new(func, w_obj_type, w_obj_type));
+                            }
+                            if pyre_object::is_staticmethod(attr) {
+                                return Ok(pyre_object::w_staticmethod_get_func(attr));
+                            }
+                            if name != "__new__" && crate::is_function(attr) {
                                 return Ok(pyre_object::w_method_new(attr, bound_obj, w_obj_type));
                             }
                             return Ok(attr);
