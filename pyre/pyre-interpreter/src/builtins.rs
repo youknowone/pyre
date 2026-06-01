@@ -756,7 +756,8 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 
 /// `range(stop)` or `range(start, stop)` or `range(start, stop, step)`.
 ///
-/// Returns a range iterator directly (simplified: no separate range object).
+/// Returns a `W_Range` sequence object; `iter()` produces a fresh
+/// `W_RangeIterator` cursor.
 fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     match args.len() {
         0 => Err(crate::PyError::type_error(
@@ -764,12 +765,12 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )),
         1 => {
             let stop = unsafe { range_arg_to_i64(args[0]) }?;
-            Ok(w_range_iter_new(0, stop, 1))
+            Ok(pyre_object::w_range_new(0, stop, 1))
         }
         2 => {
             let start = unsafe { range_arg_to_i64(args[0]) }?;
             let stop = unsafe { range_arg_to_i64(args[1]) }?;
-            Ok(w_range_iter_new(start, stop, 1))
+            Ok(pyre_object::w_range_new(start, stop, 1))
         }
         3 => {
             let start = unsafe { range_arg_to_i64(args[0]) }?;
@@ -780,7 +781,7 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     "step argument must not be zero",
                 ));
             }
-            Ok(w_range_iter_new(start, stop, step))
+            Ok(pyre_object::w_range_new(start, stop, step))
         }
         _ => Err(crate::PyError::type_error(format!(
             "range expected at most 3 arguments, got {}",
@@ -4300,8 +4301,19 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let t = pyre_object::w_tuple_new(items);
             return Ok(pyre_object::w_seq_iter_new(t, n));
         }
-        // range_iterator: `range()` returns the iterator directly, so
-        // `reversed(range(n))` lands here. rangeobject.py
+        // range: rangeobject.py W_RangeObject.descr_reversed — reflect
+        // the span and hand back a fresh reverse-walking iterator.
+        if pyre_object::is_w_range(obj) {
+            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let len = pyre_object::w_range_len(obj);
+            if len == 0 {
+                return Ok(pyre_object::w_range_iter_new(0, 0, 1));
+            }
+            let last = start + (len - 1) * step;
+            return Ok(pyre_object::w_range_iter_new(last, start - step, -step));
+        }
+        // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
+        // can also be reversed. rangeobject.py
         // `W_AbstractRangeObject.descr_reversed` walks the span in
         // reverse; mirror it by reflecting `(current, stop, step)` —
         // start from the last element, negate the step, and stop one

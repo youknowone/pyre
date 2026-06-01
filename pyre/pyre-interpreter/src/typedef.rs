@@ -574,6 +574,10 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
         );
         reg.insert(
+            &pyre_object::rangeobject::RANGE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("range", |_| {}, object_type) as usize,
+        );
+        reg.insert(
             &pyre_object::rangeobject::SEQ_ITER_TYPE as *const PyType as usize,
             new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
         );

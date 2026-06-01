@@ -1412,6 +1412,9 @@ mod tests {
         //   before it reaches the blackhole interp, so PyPy never wires
         //   `bhimpl_newtuple_*`.  Pyre's optimizer doesn't yet virtualize
         //   these emissions; once it does, these entries vanish.
+        //   `newtuple/iii>r` is the 3-int shape from the `W_Range`
+        //   `(start, stop, step)` field accessor (`w_range_fields`),
+        //   the same pending category as the 2-int / 2-float variants.
         // - `int_eq/if>i` — an `int_eq` enumerated with one int and one
         //   float operand.  Surfaced once `format_float`'s no-type branch
         //   started formatting through `display::format_float_repr`
@@ -1433,6 +1436,7 @@ mod tests {
             "newtuple/>r",
             "newtuple/ff>r",
             "newtuple/ii>r",
+            "newtuple/iii>r",
             "newtuple/rr>r",
             "int_eq/if>i",
         ];

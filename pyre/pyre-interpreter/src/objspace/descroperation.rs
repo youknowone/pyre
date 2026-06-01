@@ -2133,26 +2133,16 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // (equal length, and for non-empty ranges equal start and —
         // for length > 1 — equal step).  Only `==` / `!=` are defined;
         // ordering falls through to the dunder dispatch (TypeError).
-        if pyre_object::rangeobject::is_range_iter(a)
-            && pyre_object::rangeobject::is_range_iter(b)
+        if pyre_object::is_w_range(a)
+            && pyre_object::is_w_range(b)
             && matches!(op, CompareOp::Eq | CompareOp::Ne)
         {
-            let range_len = |obj: PyObjectRef| -> i64 {
-                let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
-                if r.step > 0 {
-                    ((r.stop - r.current + r.step - 1) / r.step).max(0)
-                } else if r.step < 0 {
-                    ((r.current - r.stop - r.step - 1) / (-r.step)).max(0)
-                } else {
-                    0
-                }
-            };
-            let ra = &*(a as *const pyre_object::rangeobject::W_RangeIterator);
-            let rb = &*(b as *const pyre_object::rangeobject::W_RangeIterator);
-            let la = range_len(a);
-            let lb = range_len(b);
+            let (astart, _astop, astep) = pyre_object::w_range_fields(a);
+            let (bstart, _bstop, bstep) = pyre_object::w_range_fields(b);
+            let la = pyre_object::w_range_len(a);
+            let lb = pyre_object::w_range_len(b);
             let equal = la == lb
-                && (la == 0 || (ra.current == rb.current && (la == 1 || ra.step == rb.step)));
+                && (la == 0 || (astart == bstart && (la == 1 || astep == bstep)));
             return Ok(w_bool_from(match op {
                 CompareOp::Eq => equal,
                 CompareOp::Ne => !equal,

@@ -186,6 +186,153 @@ mod tests {
     }
 }
 
+// ── Range sequence object ──
+//
+// `objspace/std/rangeobject.py W_AbstractRangeObject` / `W_RangeObject`:
+// an immutable arithmetic sequence carrying `(start, stop, step)`.
+// Distinct from `W_RangeIterator` (the cursor produced by `iter()`), so a
+// range is reusable, sized, indexable and comparable.
+
+/// `range(start, stop, step)` sequence object.
+#[pyre_class("range", type_id = 7, static_name = "RANGE")]
+pub struct W_Range {
+    pub start: i64,
+    pub stop: i64,
+    pub step: i64,
+}
+
+/// Allocate a `W_Range`.  `step` must already be non-zero (the caller
+/// raises `ValueError` for a zero step before reaching here).
+pub fn w_range_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
+    W_Range::allocate(W_Range {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        start,
+        stop,
+        step,
+    })
+}
+
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_w_range(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &RANGE_TYPE) }
+}
+
+/// Read the `(start, stop, step)` triple of a range object.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+#[inline]
+pub unsafe fn w_range_fields(obj: PyObjectRef) -> (i64, i64, i64) {
+    let r = obj as *const W_Range;
+    unsafe { ((*r).start, (*r).stop, (*r).step) }
+}
+
+/// Number of elements in a `(start, stop, step)` range —
+/// `rangeobject.py compute_range_length`.
+pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
+    if step > 0 {
+        if start < stop {
+            (stop - start - 1) / step + 1
+        } else {
+            0
+        }
+    } else if start > stop {
+        (start - stop - 1) / (-step) + 1
+    } else {
+        0
+    }
+}
+
+/// Length of a `W_Range`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_len(obj: PyObjectRef) -> i64 {
+    let (start, stop, step) = unsafe { w_range_fields(obj) };
+    range_length(start, stop, step)
+}
+
+/// `start + index * step` for an already-normalised, in-bounds `index`
+/// (`0 <= index < len`).  Returns `None` when out of range so the caller
+/// can raise `IndexError`; negative indices are folded by adding `len`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_getitem(obj: PyObjectRef, index: i64) -> Option<i64> {
+    let (start, _stop, step) = unsafe { w_range_fields(obj) };
+    let len = unsafe { w_range_len(obj) };
+    let i = if index < 0 { index + len } else { index };
+    if i < 0 || i >= len {
+        None
+    } else {
+        Some(start + i * step)
+    }
+}
+
+/// Whether integer `value` is a member of the range —
+/// `rangeobject.py W_RangeObject.descr_contains` integer fast path.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+pub unsafe fn w_range_contains_int(obj: PyObjectRef, value: i64) -> bool {
+    let (start, stop, step) = unsafe { w_range_fields(obj) };
+    if step > 0 {
+        if value < start || value >= stop {
+            return false;
+        }
+    } else if value > start || value <= stop {
+        return false;
+    }
+    (value - start) % step == 0
+}
+
+#[cfg(test)]
+mod range_obj_tests {
+    use super::*;
+
+    #[test]
+    fn w_range_gc_type_id_matches_descr() {
+        assert_eq!(W_RANGE_GC_TYPE_ID, 7);
+        assert_eq!(
+            <W_Range as crate::lltype::GcType>::type_id(),
+            W_RANGE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_Range as crate::lltype::GcType>::SIZE,
+            W_RANGE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn range_length_matches_cpython() {
+        assert_eq!(range_length(0, 5, 1), 5);
+        assert_eq!(range_length(0, 0, 1), 0);
+        assert_eq!(range_length(5, 0, 1), 0);
+        assert_eq!(range_length(0, 10, 3), 4);
+        assert_eq!(range_length(10, 0, -1), 10);
+        assert_eq!(range_length(10, 0, -3), 4);
+    }
+
+    #[test]
+    fn w_range_getitem_and_contains() {
+        let r = w_range_new(0, 10, 2);
+        unsafe {
+            assert_eq!(w_range_len(r), 5);
+            assert_eq!(w_range_getitem(r, 0), Some(0));
+            assert_eq!(w_range_getitem(r, 4), Some(8));
+            assert_eq!(w_range_getitem(r, -1), Some(8));
+            assert_eq!(w_range_getitem(r, 5), None);
+            assert!(w_range_contains_int(r, 4));
+            assert!(!w_range_contains_int(r, 5));
+        }
+    }
+}
+
 // ── Sequence iterator (list/tuple) ──
 
 #[pyre_class("list_iterator", type_id = 23, static_name = "SEQ_ITER")]

@@ -1412,6 +1412,19 @@ impl IterOpcodeHandler for PyFrame {
             } else {
                 iter
             };
+            // `range` sequence → fresh `W_RangeIterator` cursor; replace
+            // the stack operand so FOR_ITER advances the iterator, not the
+            // reusable range object.  (Mirrors the dict-proxy rewrite
+            // above.)  This runs in the loop preheader, outside the traced
+            // loop body, so the JIT's `for i in range(N)` fast path is
+            // unaffected.
+            if pyre_object::is_w_range(iter) {
+                let (start, stop, step) = pyre_object::w_range_fields(iter);
+                let it = pyre_object::w_range_iter_new(start, stop, step);
+                let tos = self.valuestackdepth - 1;
+                self.locals_w_mut()[tos] = it;
+                return Ok(());
+            }
             // Already an iterator
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)

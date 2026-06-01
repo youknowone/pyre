@@ -465,6 +465,16 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let snapshot = crate::type_methods::dict_view_snapshot(obj);
             let parts: Vec<String> = snapshot.iter().map(|&item| py_repr(item)).collect();
             format!("{label}([{}])", parts.join(", "))
+        } else if pyre_object::is_w_range(obj) {
+            // `rangeobject.py W_AbstractRangeObject.descr_repr` —
+            // `range(start, stop)`, with the step appended only when
+            // it is not 1.
+            let (start, stop, step) = pyre_object::w_range_fields(obj);
+            if step == 1 {
+                format!("range({start}, {stop})")
+            } else {
+                format!("range({start}, {stop}, {step})")
+            }
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(s) = try_call_dunder(obj, "__repr__") {
