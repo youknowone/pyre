@@ -6528,6 +6528,26 @@ fn try_walker_specialize_compare_op_int(
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    // #62: elide the dead `box_bool` when a forward JitCode lookahead
+    // PROVES the compare's boxed Ref dst is consumed solely by the
+    // immediately-following `is_true` (POP_JUMP_IF_*), which folds to the
+    // raw truth.  In that shape the W_Bool is never read as a Ref, so the
+    // box is dead the moment it is recorded — yet it is a non-pure `CallR`
+    // the optimizer cannot DCE (pure.py:222 demotes CALL_PURE→CALL and
+    // emits it; RPython never *creates* the box because its trait path
+    // fuses COMPARE_OP+POP_JUMP at the bytecode level).  Mirroring that
+    // fusion walker-side: write the raw truth into the Ref dst as a marker
+    // and record `bool_box_truth(truth, truth)` so the `is_true` fold
+    // (dispatch_residual_call_iRd_kind:5137) resolves it to `truth`; emit
+    // no box.  Gated on the lookahead proof so the marker provably never
+    // escapes (no Ref consumer, not live at the branch resume) — any other
+    // shape (escape to a local, arithmetic, multi-use, branch keeping the
+    // value) falls back to emitting the real box.
+    if dst_bank == 'r' && compare_box_provably_dead(ctx, op_pc, dst as u8) {
+        bool_box_truth_record(truth, truth);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
+        return Ok(Some(()));
+    }
     // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
     // residual_call lands a boxed bool in the dst Ref register; the
     // separate goto_if_not op reads it).
@@ -6541,6 +6561,154 @@ fn try_walker_specialize_compare_op_int(
     bool_box_truth_record(boxed, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// #62 dead-`box_bool` proof for [`try_walker_specialize_compare_op_int`] /
+/// `_float`.  Returns `true` only when a forward JitCode lookahead proves
+/// the compare's boxed Ref dst register (`dst_reg`) is consumed *solely*
+/// by the immediately-following `is_true` residual (the `POP_JUMP_IF_*`
+/// truth read), so eliding the box is sound.
+///
+/// The proof requires, scanning forward from the compare until the first
+/// `goto_if_not` / `goto`:
+///   1. exactly one op reads `dst_reg` as a Ref operand, and it is an
+///      `is_true`-shaped residual (`residual_call_r_i`, single Ref arg →
+///      Int result);
+///   2. no op overwrites `dst_reg` (`>r`) before that read;
+///   3. the scan terminates at a `goto_if_not` (the branch the `is_true`
+///      result feeds);
+///   4. `dst_reg`'s color is NOT live at the `goto_if_not` resume target,
+///      so the guard snapshot (`collect_outer_active_boxes`) cannot pick
+///      up the Int marker that replaces the box.
+///
+/// Any deviation (escape to a local store, arithmetic use, second reader,
+/// register reuse, kept-on-stack short-circuit, missing branch) returns
+/// `false` → the caller emits the real box (current behaviour).  FBW-only
+/// (returns `false` when `FULL_BODY_SNAPSHOT_SYM` is null).
+fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_reg: u8) -> bool {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return false;
+    }
+    // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
+    // pointer live for the full-body walk, immutable layout fields only.
+    let (code, pc_map, jitcode_index, code_ptr): (&[u8], &[usize], i32, *const _) = unsafe {
+        let sym = &*full_body_sym;
+        if sym.jitcode.is_null() {
+            return false;
+        }
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return false;
+        }
+        (
+            jc.payload.jitcode.code.as_slice(),
+            jc.payload.metadata.pc_map.as_slice(),
+            jc.index as i32,
+            jc.payload.code_ptr,
+        )
+    };
+    let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
+        return false;
+    };
+    let mut pc = start.next_pc;
+    let mut readers = 0u32;
+    let mut reader_is_is_true = false;
+    let mut goto_if_not_pc: Option<usize> = None;
+    for _ in 0..64 {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        // Decode this op's operands, tracking reads/writes of dst_reg.
+        let mut cursor = op.pc + 1;
+        let mut chars = op.argcodes.chars();
+        let mut reads = false;
+        let mut writes = false;
+        while let Some(c) = chars.next() {
+            match c {
+                'i' | 'c' | 'f' => cursor += 1,
+                'r' => {
+                    if *code.get(cursor).unwrap_or(&0) == dst_reg {
+                        reads = true;
+                    }
+                    cursor += 1;
+                }
+                'L' | 'd' | 'j' => cursor += 2,
+                'I' | 'F' => {
+                    let n = *code.get(cursor).unwrap_or(&0) as usize;
+                    cursor += 1 + n;
+                }
+                'R' => {
+                    let n = *code.get(cursor).unwrap_or(&0) as usize;
+                    for k in 0..n {
+                        if *code.get(cursor + 1 + k).unwrap_or(&0) == dst_reg {
+                            reads = true;
+                        }
+                    }
+                    cursor += 1 + n;
+                }
+                '>' => {
+                    let rt = chars.next();
+                    if rt == Some('r') && *code.get(cursor).unwrap_or(&0) == dst_reg {
+                        writes = true;
+                    }
+                    cursor += 1;
+                }
+                _ => return false,
+            }
+        }
+        if writes {
+            // dst overwritten before/at a read — give up (the value we'd
+            // elide is not the one this op produces; stay conservative).
+            return false;
+        }
+        if reads {
+            readers += 1;
+            // is_true shape: single Ref arg, Int result (`iRd>i`).
+            reader_is_is_true = op.key == "residual_call_r_i/iRd>i";
+        }
+        if op.opname == "goto_if_not" {
+            goto_if_not_pc = Some(op.pc);
+            break;
+        }
+        if op.opname == "goto" || op.opname == "raise" || op.opname == "ref_return" {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    // Conditions 1–3.
+    if readers != 1 || !reader_is_is_true {
+        return false;
+    }
+    let Some(gin_pc) = goto_if_not_pc else {
+        return false;
+    };
+    let Some(gin_op) = crate::jitcode_runtime::decode_op_at(code, gin_pc) else {
+        return false;
+    };
+    // Condition 4: `dst_reg`'s color must be dead at BOTH branch arms (the
+    // POP_JUMP pops the tested bool regardless of direction, so the
+    // guard's resume — whichever arm is not-taken — must not carry it).
+    // Checking both arms also defends against register-color reuse: even
+    // though the transient bool shares `dst_reg` with a later local, that
+    // local is not yet live at the post-pop arm.  A `dst_reg` that IS live
+    // at an arm means the snapshot would capture the Int marker → bail.
+    // (`goto_if_not/iL`: operand 0 = `i` truth reg byte, operand 1 = `L`
+    // 2-byte target label.)
+    let fallthrough_jc = gin_op.next_pc;
+    let target_jc = read_label(code, &gin_op, 1);
+    // SAFETY: code_ptr captured non-null above, live for the walk.
+    let code_obj = unsafe { &*code_ptr };
+    let arm_dst_live = |jc_pc: usize| -> bool {
+        let py = skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(pc_map, jc_pc) as usize);
+        let banks =
+            crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+        banks.ref_.iter().any(|&c| c as u8 == dst_reg)
+    };
+    if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
+        return false;
+    }
+    true
 }
 
 /// #57 SLICE 3c: walker-native speculative float specialization for the
@@ -6947,6 +7115,14 @@ fn try_walker_specialize_compare_op_float(
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    // #62: elide the dead box when the compare's boxed dst is consumed
+    // solely by the immediately-following `is_true` (see
+    // [`compare_box_provably_dead`] / the int-compare twin for rationale).
+    if dst_bank == 'r' && compare_box_provably_dead(ctx, op_pc, dst as u8) {
+        bool_box_truth_record(truth, truth);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
+        return Ok(Some(()));
+    }
     // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
     // residual_call lands a boxed bool; the separate goto_if_not reads it).
     let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
