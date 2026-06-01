@@ -1228,14 +1228,6 @@ pub fn translate_op(
                         // (`call.rs:3155 target_to_path`).  Upstream
                         // resolves both spellings to one `FunctionDesc`.
                         entry.host_object.clone()
-                    } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
-                        // Fuzzy leaf-match is the last registry fallback.
-                        // Exact registry entries, lexical imports, HOST_ENV
-                        // module paths, and associated-method suffixes must
-                        // win first so external stubs such as `BigInt::from`,
-                        // `Vec::new`, and `Box::new` cannot be captured by
-                        // an unrelated user function with the same leaf.
-                        entry.host_object.clone()
                     } else if segments.len() == 2
                         && segments[0] == "simple_call"
                         && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
@@ -1269,6 +1261,16 @@ pub fn translate_op(
                         // trailing message arguments.  TODO retire
                         // when the LinkArg migration lands.
                         exc_class
+                    } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
+                        // Fuzzy leaf-match is the last registry fallback.
+                        // Exact registry entries, lexical imports, HOST_ENV
+                        // module paths, associated-method suffixes, and the
+                        // `simple_call(<exc class>)` raise reconstruction must
+                        // win first so external stubs such as `BigInt::from`,
+                        // `Vec::new`, and `Box::new` — and exception classes
+                        // sharing a leaf — cannot be captured by an unrelated
+                        // user function with the same leaf.
+                        entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
                             "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \

@@ -1082,7 +1082,7 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
             ));
         }
         for i in 0..len {
-            if eq_w(w_int_new(start + i * step), needle) {
+            if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
                 return Ok(w_int_new(i));
             }
         }
@@ -5956,7 +5956,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             let result = crate::call::call_function_impl_result(callable, &[])?;
             let sentinel = ci::w_callable_iterator_get_sentinel(obj);
-            if eq_w(sentinel, result) {
+            if is_true(compare(result, sentinel, CompareOp::Eq)?) {
                 ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
                 return Err(PyError::stop_iteration());
             }
@@ -6735,7 +6735,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             let (start, _stop, step) = pyre_object::w_range_fields(haystack);
             let len = pyre_object::w_range_len(haystack);
             for i in 0..len {
-                if eq_w(w_int_new(start + i * step), needle) {
+                if is_true(compare(w_int_new(start + i * step), needle, CompareOp::Eq)?) {
                     return Ok(true);
                 }
             }

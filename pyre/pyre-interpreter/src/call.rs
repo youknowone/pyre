@@ -1673,6 +1673,10 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
             init_args.push(instance);
             init_args.extend_from_slice(args);
             let res = call_function_impl(init_fn, &init_args);
+            if res.is_null() {
+                // `__init__` raised — error already stashed; propagate it.
+                return PY_NULL;
+            }
             if let Err(e) = check_init_returned_none(res) {
                 set_call_error(e);
                 return PY_NULL;
@@ -1685,8 +1689,13 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 
 /// `typeobject.py descr_call` — `__init__` must return None.  A non-null,
 /// non-None result raises `TypeError: __init__() should return None, not
-/// 'X'`.  A null result means `__init__` already raised, so propagate
-/// that error instead of overwriting it.
+/// 'X'`.
+///
+/// A null `result` means `__init__` already raised.  Callers are
+/// responsible for detecting that (via `result.is_null()` or a
+/// `?`-propagating call) and forwarding the stashed error themselves;
+/// this function returns `Ok(())` for null purely as a defensive guard so
+/// it never overwrites the original error with a spurious `TypeError`.
 fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
     if result.is_null() || unsafe { pyre_object::is_none(result) } {
         return Ok(());
@@ -2436,7 +2445,13 @@ pub(crate) fn call_init_subclass_on_bases(
                 }
             }
         } else if init_subclass_kwargs.is_empty() {
-            let _ = crate::call_function(init_sub, &[w_type]);
+            clear_call_error();
+            let res = crate::call_function(init_sub, &[w_type]);
+            if res.is_null() {
+                if let Some(err) = take_call_error() {
+                    return Err(err);
+                }
+            }
         } else {
             // The default __init_subclass__ consumes no keywords; leftover
             // keywords are an error rather than silently dropped.

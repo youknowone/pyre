@@ -6885,6 +6885,11 @@ fn init_object_type(ns: &mut DictStorage) {
                     args[1],
                     crate::baseobjspace::CompareOp::Eq,
                 )?;
+                // A `NotImplemented` from `__eq__` must pass through so the
+                // caller can try the reflected comparison.
+                if unsafe { pyre_object::is_not_implemented(eq) } {
+                    return Ok(eq);
+                }
                 Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)))
             },
             2,
