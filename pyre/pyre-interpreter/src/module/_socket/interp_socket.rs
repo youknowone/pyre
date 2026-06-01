@@ -2177,12 +2177,23 @@ fn init_socket_type(ns: &mut DictStorage) {
                     }
                     fd
                 } else {
+                    // `interp_socket.py:253-259` — a float fileno is a
+                    // TypeError; a negative fd is a ValueError.
+                    if unsafe { pyre_object::is_float(after_cls[3]) } {
+                        return Err(crate::PyError::type_error(
+                            "integer argument expected, got float",
+                        ));
+                    }
                     if !unsafe { pyre_object::is_int(after_cls[3]) } {
                         return Err(crate::PyError::type_error(
                             "socket: fileno must be an integer or None",
                         ));
                     }
-                    unsafe { pyre_object::w_int_get_value(after_cls[3]) as libc::c_int }
+                    let fd = unsafe { pyre_object::w_int_get_value(after_cls[3]) };
+                    if fd < 0 {
+                        return Err(crate::PyError::value_error("negative file descriptor"));
+                    }
+                    fd as libc::c_int
                 };
             Ok(socket_from_fd(fileno, family, ty, proto))
         }),

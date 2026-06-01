@@ -157,11 +157,7 @@ impl W_Kqueue {
         }
 
         let mut eventlist: Vec<libc::kevent> = Vec::with_capacity(max_events as usize);
-        let ptimeout: *const libc::timespec = if have_timeout {
-            &ts
-        } else {
-            std::ptr::null()
-        };
+        let ptimeout: *const libc::timespec = if have_timeout { &ts } else { std::ptr::null() };
         let pchangelist: *const libc::kevent = if changelist.is_empty() {
             std::ptr::null()
         } else {
@@ -211,13 +207,16 @@ fn sequence_items(seq: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     unsafe {
         if pyre_object::is_list(seq) {
             let n = pyre_object::w_list_len(seq);
-            (0..n).map(|i| pyre_object::w_list_getitem(seq, i as i64)).collect()
+            (0..n)
+                .map(|i| pyre_object::w_list_getitem(seq, i as i64))
+                .collect()
         } else if pyre_object::is_tuple(seq) {
             let n = pyre_object::w_tuple_len(seq);
-            (0..n).map(|i| pyre_object::w_tuple_getitem(seq, i as i64)).collect()
+            (0..n)
+                .map(|i| pyre_object::w_tuple_getitem(seq, i as i64))
+                .collect()
         } else {
             None
         }
     }
 }
-

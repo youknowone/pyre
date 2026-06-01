@@ -185,9 +185,7 @@ fn process_time_nanos() -> i128 {
 /// Process time for profiling: sum of the kernel and user-space CPU time.
 pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(floatobject::w_float_new(
-        process_time_nanos() as f64 * 1e-9,
-    ))
+    Ok(floatobject::w_float_new(process_time_nanos() as f64 * 1e-9))
 }
 
 /// time.process_time_ns() → int

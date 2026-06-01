@@ -48,7 +48,9 @@ impl W_Kevent {
 }
 
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-#[crate::pyre_methods(doc = "kevent(ident, filter=KQ_FILTER_READ, flags=KQ_EV_ADD, fflags=0, data=0, udata=0)")]
+#[crate::pyre_methods(
+    doc = "kevent(ident, filter=KQ_FILTER_READ, flags=KQ_EV_ADD, fflags=0, data=0, udata=0)"
+)]
 impl W_Kevent {
     /// `interp_kqueue.py:275 descr__init__`.  `ident` is an int fd or an
     /// object with `fileno()`; the rest are integer bitmasks.
@@ -138,4 +140,3 @@ fn kevent_compare(
         None => pyre_object::w_not_implemented(),
     }
 }
-
