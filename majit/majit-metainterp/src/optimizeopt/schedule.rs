@@ -773,15 +773,28 @@ pub struct VecScheduleState {
     pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache — pyre's stand-in
-    /// for PyPy's `op._forwarded` `VectorizationInfo` carrier. It is the
-    /// canonical store for the vector pass: `VectorLoop::setup_vectorization`
-    /// stamps every loop op here through `VectorizationInfo(op)`, and
-    /// `forwarded_vecinfo` / `isomorphic` read it back. Living on the state
-    /// (not on the op) means it is dropped when the state is, and
-    /// `VectorLoop::teardown_vectorization` clears it per op
-    /// (`vector.py:58-60 set_forwarded(None)`). Keyed by full `OpRef` so
-    /// InputArg/op namespaces don't collide.
+    /// `schedule.py:20-28 forwarded_vecinfo(op)` cache, keyed by full
+    /// `OpRef` (InputArg and op namespaces never collide).
+    ///
+    /// PyPy carries this scheduling scratch in `op._forwarded`. pyre cannot
+    /// store it there: `Op::clone` resets `forwarded` to `None`
+    /// (resoperation.rs:1352) while preserving `pos` (resoperation.rs:1344),
+    /// and the scheduler reads vecinfo off CLONED ops — the dependency graph
+    /// clones every op into its nodes (dependency.rs:221) and the
+    /// unroll/schedule paths clone `loop_.operations`. A clone-reset
+    /// `forwarded` would drop the stamp, and recompute-on-miss is NOT safe
+    /// for `INT_SIGNEXT`: its bytesize is the dynamic value of `arg1`
+    /// (`cast_to_bytesize_static` returns `None`, resoperation.rs:2310),
+    /// recoverable only through `int_signext_vecinfo`'s setup-time
+    /// box-replacement/const-pool resolver, which needs the optimizer
+    /// context that `vectorization_info_for_op(&Op)` does not hold. So a
+    /// `pos`-keyed cache — clone-stable because `OpRef`/`pos` survives a
+    /// clone — is required for correctness; it is not a stylistic split.
+    ///
+    /// `Op.vecinfo` is the SEPARATE permanent carrier: the
+    /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count
+    /// that survives `copy_and_change`, cleared for non-vector ops by
+    /// `vector.py:58-60 teardown_vectorization`.
     vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::VectorizationInfo>,
 }
 
