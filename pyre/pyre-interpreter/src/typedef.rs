@@ -6023,8 +6023,13 @@ fn init_int_type(ns: &mut DictStorage) {
                 &["length", "byteorder", "signed"],
                 "to_bytes",
             )?;
-            crate::builtins::kwarg_reject_duplicate(kwargs, "length", pos.get(1).is_some())?;
-            crate::builtins::kwarg_reject_duplicate(kwargs, "byteorder", pos.get(2).is_some())?;
+            crate::builtins::kwarg_reject_duplicate(kwargs, "to_bytes", "length", pos.get(1).is_some())?;
+            crate::builtins::kwarg_reject_duplicate(
+                kwargs,
+                "to_bytes",
+                "byteorder",
+                pos.get(2).is_some(),
+            )?;
             if pos.len() > 3 {
                 return Err(crate::PyError::type_error(format!(
                     "to_bytes() takes at most 2 positional arguments ({} given)",
@@ -6097,7 +6102,12 @@ fn init_int_type(ns: &mut DictStorage) {
                 }
                 if val < zero { val + &limit } else { val }
             } else {
-                if val < zero || val >= limit {
+                if val < zero {
+                    return Err(crate::PyError::overflow_error(
+                        "can't convert negative int to unsigned",
+                    ));
+                }
+                if val >= limit {
                     return Err(crate::PyError::overflow_error("int too big to convert"));
                 }
                 val
@@ -7791,8 +7801,8 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let fn_name = if forward { "split" } else { "rsplit" };
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "maxsplit", pos.get(2).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let maxsplit = match pos
         .get(2)
@@ -8348,7 +8358,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "keepends", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "splitlines", "keepends", pos.get(1).is_some())?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
@@ -8660,8 +8670,8 @@ fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "bytes_per_sep", pos.get(2).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "bytes_per_sep", pos.get(2).is_some())?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // No sep / default grouping — produces "ffff" for [0xff, 0xff].
     // The sep + bytes_per_sep kwargs are deferred until first observed

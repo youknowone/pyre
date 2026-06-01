@@ -915,12 +915,13 @@ pub(crate) fn kwarg_reject_unknown(
 /// The flat builtin ABI leaves this validation to each kw-aware method.
 pub(crate) fn kwarg_reject_duplicate(
     kwargs: Option<PyObjectRef>,
+    fn_name: &str,
     name: &str,
     positional_present: bool,
 ) -> Result<(), crate::PyError> {
     if positional_present && kwarg_get(kwargs, name).is_some() {
         return Err(crate::PyError::type_error(format!(
-            "got multiple values for argument '{name}'"
+            "{fn_name}() got multiple values for argument '{name}'"
         )));
     }
     Ok(())

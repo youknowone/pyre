@@ -1414,11 +1414,12 @@ pub fn call_with_kwargs(
                 let mut init_args = Vec::with_capacity(1 + pos_args.len());
                 init_args.push(instance);
                 init_args.extend_from_slice(pos_args);
-                if unsafe { crate::is_function(init_fn) } && !kwargs.is_empty() {
-                    call_with_kwargs(frame, init_fn, &init_args, kwargs)?;
+                let init_result = if unsafe { crate::is_function(init_fn) } && !kwargs.is_empty() {
+                    call_with_kwargs(frame, init_fn, &init_args, kwargs)?
                 } else {
-                    call_callable(frame, init_fn, &init_args)?;
-                }
+                    call_callable(frame, init_fn, &init_args)?
+                };
+                check_init_returned_none(init_result)?;
             }
         }
         return Ok(instance);
@@ -1671,11 +1672,31 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            let _ = call_function_impl(init_fn, &init_args);
+            let res = call_function_impl(init_fn, &init_args);
+            if let Err(e) = check_init_returned_none(res) {
+                set_call_error(e);
+                return PY_NULL;
+            }
         }
     }
 
     instance
+}
+
+/// `typeobject.py descr_call` — `__init__` must return None.  A non-null,
+/// non-None result raises `TypeError: __init__() should return None, not
+/// 'X'`.  A null result means `__init__` already raised, so propagate
+/// that error instead of overwriting it.
+fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
+    if result.is_null() || unsafe { pyre_object::is_none(result) } {
+        return Ok(());
+    }
+    let tname = crate::typedef::r#type(result)
+        .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+        .unwrap_or("object");
+    Err(PyError::type_error(format!(
+        "__init__() should return None, not '{tname}'"
+    )))
 }
 
 fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
@@ -1918,6 +1939,10 @@ fn call_metaclass_with_kwargs(
                 Ok(resolved) => {
                     let res = call_user_function_resolved_frameless(init_fn, &resolved);
                     if res.is_null() {
+                        return PY_NULL;
+                    }
+                    if let Err(e) = check_init_returned_none(res) {
+                        set_call_error(e);
                         return PY_NULL;
                     }
                 }
@@ -2463,7 +2488,8 @@ fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            let _ = call_callable(frame, init_fn, &init_args)?;
+            let init_result = call_callable(frame, init_fn, &init_args)?;
+            check_init_returned_none(init_result)?;
         }
     }
 

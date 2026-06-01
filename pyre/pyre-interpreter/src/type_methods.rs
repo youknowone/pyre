@@ -242,8 +242,8 @@ fn resolve_split_args(
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "maxsplit", pos.get(2).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
     let sep = pos
         .get(1)
         .copied()
