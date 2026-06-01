@@ -308,6 +308,13 @@ impl<'a> RawDescrPool<'a> {
             Self::PerFn(descrs) => descrs.get(idx).and_then(|d| d.as_bh_descr()),
         }
     }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Global => crate::jitcode_runtime::all_descrs().len(),
+            Self::PerFn(descrs) => descrs.len(),
+        }
+    }
 }
 
 /// `WalkContext` carries two lifetimes:
@@ -2905,6 +2912,16 @@ fn vable_array_descrs_from_jitcode(
             Some(majit_translate::jitcode::BhDescr::Array { .. }),
         ) => *index,
         _ => {
+            if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+                eprintln!(
+                    "[vable-arr-malformed] pc={} pool_len={:?} field_idx={field_idx} \
+                     field={:?} array_idx={array_pool_idx} array={:?}",
+                    op.pc,
+                    ctx.raw_descrs.len(),
+                    ctx.raw_descrs.bh_descr_at(field_idx),
+                    ctx.raw_descrs.bh_descr_at(array_pool_idx),
+                );
+            }
             return Err(DispatchError::VableArrayDescrMalformed {
                 pc: op.pc,
                 field_idx,
