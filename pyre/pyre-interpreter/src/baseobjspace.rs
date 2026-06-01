@@ -842,6 +842,22 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// `pypy/interpreter/baseobjspace.py:1574 getindex_w` — the `TypeError`
+/// raised when a sequence subscript is neither an integer nor a slice:
+/// `"<descr> indices must be integers or slices, not <type>"`.
+fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
+    let tp = unsafe {
+        if index.is_null() {
+            "NULL"
+        } else {
+            (*(*index).ob_type).name
+        }
+    };
+    PyError::type_error(format!(
+        "{descr} indices must be integers or slices, not {tp}"
+    ))
+}
+
 #[inline(never)]
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
@@ -858,9 +874,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return Ok(w_list_new(items));
     }
     if !is_int(index) {
-        return Err(PyError::type_error(
-            "list indices must be integers or slices",
-        ));
+        return Err(index_type_error("list", index));
     }
     let idx = w_int_get_value(index);
     match w_list_getitem(obj, idx) {
@@ -889,7 +903,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return Ok(w_tuple_new(items));
     }
     if !is_int(index) {
-        return Err(PyError::type_error("tuple indices must be integers"));
+        return Err(index_type_error("tuple", index));
     }
     let idx = w_int_get_value(index);
     match w_tuple_getitem(obj, idx) {
@@ -938,7 +952,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             "string index out of range",
         ));
     }
-    Err(PyError::type_error("string indices must be integers"))
+    Err(index_type_error("string", index))
 }
 
 #[inline(never)]
@@ -985,10 +999,8 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
         });
     }
-    let name = if is_bytes { "bytes" } else { "bytearray" };
-    Err(PyError::type_error(format!(
-        "{name} indices must be integers"
-    )))
+    let descr = if is_bytes { "byte" } else { "bytearray" };
+    Err(index_type_error(descr, index))
 }
 
 #[inline(never)]
@@ -1043,9 +1055,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let new_step = rstep * sstep;
         return Ok(pyre_object::w_range_new(new_start, new_stop, new_step));
     }
-    Err(PyError::type_error(
-        "range indices must be integers or slices",
-    ))
+    Err(index_type_error("range", index))
 }
 
 /// `range.count(value)` — `rangeobject.py W_RangeObject.descr_count`.
@@ -1132,9 +1142,7 @@ unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         return Ok(w_list_new(items));
     }
-    Err(PyError::type_error(
-        "range indices must be integers or slices",
-    ))
+    Err(index_type_error("range", index))
 }
 
 /// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
@@ -1195,14 +1203,7 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
         return setitem_list_slice(obj, index, value);
     }
     if !is_int(index) {
-        let tp = if index.is_null() {
-            "NULL"
-        } else {
-            (*(*index).ob_type).name
-        };
-        return Err(PyError::type_error(format!(
-            "list indices must be integers, not {tp}"
-        )));
+        return Err(index_type_error("list", index));
     }
     let idx = w_int_get_value(index);
     if w_list_setitem(obj, idx, value) {
