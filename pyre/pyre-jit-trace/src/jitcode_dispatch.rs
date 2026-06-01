@@ -2945,14 +2945,12 @@ fn vable_array_descrs_from_jitcode(
             pc: op.pc,
             index: array_field_index,
         })?;
-    let adescr =
-        info.array_descrs
-            .get(array_field_index)
-            .cloned()
-            .ok_or(DispatchError::VableArrayIndexOutOfRange {
-                pc: op.pc,
-                index: array_field_index,
-            })?;
+    let adescr = info.array_descrs.get(array_field_index).cloned().ok_or(
+        DispatchError::VableArrayIndexOutOfRange {
+            pc: op.pc,
+            index: array_field_index,
+        },
+    )?;
     Ok((fdescr, adescr))
 }
 
@@ -2985,15 +2983,30 @@ fn getarrayitem_vable_via_metainterp(
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
     let (result, shadow_value) = match dst_bank {
-        'i' => ctx
-            .trace_ctx
-            .vable_getarrayitem_int_indexed(op.pc, vable, index, index_value, fdescr, adescr),
-        'r' => ctx
-            .trace_ctx
-            .vable_getarrayitem_ref_indexed(op.pc, vable, index, index_value, fdescr, adescr),
-        'f' => ctx
-            .trace_ctx
-            .vable_getarrayitem_float_indexed(op.pc, vable, index, index_value, fdescr, adescr),
+        'i' => ctx.trace_ctx.vable_getarrayitem_int_indexed(
+            op.pc,
+            vable,
+            index,
+            index_value,
+            fdescr,
+            adescr,
+        ),
+        'r' => ctx.trace_ctx.vable_getarrayitem_ref_indexed(
+            op.pc,
+            vable,
+            index,
+            index_value,
+            fdescr,
+            adescr,
+        ),
+        'f' => ctx.trace_ctx.vable_getarrayitem_float_indexed(
+            op.pc,
+            vable,
+            index,
+            index_value,
+            fdescr,
+            adescr,
+        ),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
@@ -3010,15 +3023,15 @@ fn getarrayitem_vable_via_metainterp(
         'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
         'f' => {
             let len = ctx.registers_f.len();
-            let slot =
-                ctx.registers_f
-                    .get_mut(dst)
-                    .ok_or(DispatchError::RegisterOutOfRange {
-                        pc: op.pc,
-                        reg: dst,
-                        len,
-                        bank: "f",
-                    })?;
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
             *slot = result;
         }
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
@@ -3058,7 +3071,14 @@ fn setarrayitem_vable_via_metainterp(
     let concrete = ctx.trace_ctx.concrete_of_opref(value).unwrap_or(Value::Void);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
-        op.pc, vable, index, index_value, fdescr, adescr, value, concrete,
+        op.pc,
+        vable,
+        index,
+        index_value,
+        fdescr,
+        adescr,
+        value,
+        concrete,
     );
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -5199,13 +5219,14 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // leaves this path inlines (the non-standard identity guard is itself
     // deterministic and never fails at runtime).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    ctx.trace_ctx.capture_snapshot_for_last_guard_op_with_vable_vref(
-        &ctx.outer_active_boxes,
-        ctx.outer_jitcode_index,
-        ctx.entry_py_pc,
-        &vable_boxes,
-        &vref_boxes,
-    );
+    ctx.trace_ctx
+        .capture_snapshot_for_last_guard_op_with_vable_vref(
+            &ctx.outer_active_boxes,
+            ctx.outer_jitcode_index,
+            ctx.entry_py_pc,
+            &vable_boxes,
+            &vref_boxes,
+        );
     Ok(())
 }
 
@@ -5935,82 +5956,35 @@ fn try_walker_inline_user_call(
             let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
                 break;
             };
-            eprintln!("[inline-body] pc={} {}", d.pc, d.key);
+            let ops: Vec<u8> = body.code[d.pc + 1..d.next_pc.min(body.code.len())].to_vec();
+            eprintln!("[inline-body] pc={} {} operands={:?}", d.pc, d.key, ops);
             pc = d.next_pc;
             shown += 1;
         }
     }
 
-    // The callee per-fn JitCode is portal-shaped: it reads its params via
-    // `getfield_vable_r(r0=frame, localsplus[i])` (decode-confirmed).  For an
-    // inlined callee whose frame is NOT the active virtualizable, that read
-    // takes the `_nonstandard_virtualizable` -> GETFIELD_GC fallback against
-    // the frame's real heap `localsplus`.  So the callee needs a genuine
-    // heap frame at `r0` (mirror of the top-level portal seed at
-    // `regs_r[0] = frame_opref` above), NOT register-bound args.  Build that
-    // frame the same way `trace_opcode::build_pending_inline_frame` does.
-    //
-    // Eligibility needing a frame helper: exactly 1 or 2 positional params
-    // (the only `one_arg_callee_frame_helper` / `callee_frame_helper(n)`
-    // shapes wired so far) and a Ref-bank `r0` slot.
-    // Straight-line entry (pc=0) seeds the jitdriver args [pycode, frame, ec]
-    // into r0/r1/r2 (trace.rs:341-345 setup_call positional fill), so the
-    // body needs at least those three Ref slots and reads its vable from r1.
-    if nparams == 0 || body.num_regs_r < 3 {
+    // The inlined callee body is entered at pc=0 with the fast-path
+    // register convention `registers_r[0..nparams] = positional args` —
+    // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
+    // inline calls and the trait path's `can_skip_traced_callee_frame`
+    // branch applies (`build_pending_inline_frame`:
+    // `sym.registers_r = args.to_vec()`).  Decode-confirmed for
+    // add/mul/square/compute: the body reads its params straight from
+    // `r0`/`r1` (ref_copy + residual_call args), NOT via `getfield_vable`
+    // against a heap frame.  A callee that DOES materialize a frame
+    // (extra locals → `getfield_vable_r` / `getarrayitem_vable_r` on an
+    // unseeded register) aborts cleanly with `VableBoxNotSeeded` → trait
+    // fallback, never a miscompile.
+    if nparams == 0 {
         return Ok(None);
     }
-    // Concrete caller frame (for the execution context) + concrete args must
-    // all be live; otherwise the concrete frame build below cannot run.  Bail
-    // cleanly (no IR emitted yet) so the residual-call fallback stays valid.
-    let ConcreteValue::Ref(caller_frame_ptr) = ctx.concrete_registers_r[0] else {
-        return Ok(None);
-    };
-    let mut concrete_args: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(nparams);
-    for i in 0..nparams {
-        match arg_concretes[2 + i] {
-            ConcreteValue::Ref(p) if !p.is_null() => concrete_args.push(p),
-            _ => return Ok(None),
-        }
-    }
-    let exec_ctx =
-        unsafe { (*(caller_frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).execution_context };
-    let callee_frame_ptr;
-    let mut callee_frame = unsafe {
-        use pyre_interpreter::pyframe::PyFrame;
-        let globals = pyre_interpreter::function_get_globals(callable);
-        let globals_obj = pyre_interpreter::function_get_globals_obj(callable);
-        let closure = pyre_interpreter::function_get_closure(callable);
-        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
-            &concrete_args,
-            globals,
-            globals_obj,
-            exec_ctx,
-            closure,
-        ) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
-        }
-    };
-    callee_frame.fix_array_ptrs();
-    callee_frame_ptr = &callee_frame as *const _ as pyre_object::PyObjectRef;
 
-    // Pre-check the frame helper is wired BEFORE emitting any IR, so the
-    // unsupported-arity path bails cleanly (no orphan guard/call).
-    let frame_helper = if nparams == 1 {
-        None // one_arg_callee_frame_helper, resolved below
-    } else {
-        match (crate::callbacks::get().callee_frame_helper)(nparams) {
-            Some(h) => Some(h),
-            None => return Ok(None),
-        }
-    };
-
-    // Specialize the inlined body on this exact callable: pyjitpl
-    // `recursive_call` emits `guard_value(callable)` before building the
-    // callee frame (build_pending_inline_frame:5986).  The guard resumes at
-    // the call boundary (single outer Python frame — sound: re-execute the
-    // whole call on deopt).
+    // Specialize the inlined body on this exact callable: a later
+    // iteration calling a different function at this site must deopt
+    // rather than run the wrong body.  The guard resumes at the caller's
+    // CALL boundary (single outer Python frame — re-execute the whole
+    // call on deopt), captured via `INLINE_SUBWALK_CAPTURE_BOUNDARY` for
+    // the sub-walk guards below.
     let callable_opref = r_args[1];
     let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
     if !callable_opref.is_constant() {
@@ -6019,35 +5993,6 @@ fn try_walker_inline_user_call(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
-    // Emit the symbolic callee-frame OpRef.  Args cross the call boundary
-    // boxed, so they are Ref-typed here.
-    let callee_frame_opref = if nparams == 1 {
-        let (helper, helper_arg_types) =
-            crate::state::one_arg_callee_frame_helper(Type::Ref, false);
-        ctx.trace_ctx.call_ref_typed_with_effect(
-            helper,
-            &[ctx.registers_r[0], callable_opref, r_args[2]],
-            &helper_arg_types,
-            default_effect_info(),
-        )
-    } else {
-        let frame_helper = frame_helper.expect("checked Some above for nparams >= 2");
-        let mut helper_args = vec![ctx.registers_r[0], callable_opref];
-        helper_args.extend_from_slice(&r_args[2..2 + nparams]);
-        let helper_arg_types = crate::state::frame_callable_arg_types(nparams);
-        ctx.trace_ctx.call_ref_typed_with_effect(
-            frame_helper,
-            &helper_args,
-            &helper_arg_types,
-            default_effect_info(),
-        )
-    };
-    // pyjitpl recursive_call emits GUARD_NO_EXCEPTION right after the
-    // callee-frame build helper (build_pending_inline_frame:6153).
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-
     let (
         mut callee_regs_r,
         mut callee_regs_i,
@@ -6055,19 +6000,12 @@ fn try_walker_inline_user_call(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
-    // Straight-line callee entry: the setup_call positional per-bank fill
-    // places the jitdriver args [pycode, frame, ec] at r0/r1/r2
-    // (trace.rs:341-345).  The body reads its vable from r1, so seed all
-    // three; locals live in the frame's heap localsplus, read by the body's
-    // getfield_vable_r against the r1 frame.
-    let pycode_opref = ctx.trace_ctx.const_ref(w_code as i64);
-    let ec_opref = ctx.trace_ctx.const_ref(exec_ctx as i64);
-    callee_regs_r[0] = pycode_opref;
-    callee_concrete_r[0] = ConcreteValue::Ref(w_code as pyre_object::PyObjectRef);
-    callee_regs_r[1] = callee_frame_opref;
-    callee_concrete_r[1] = ConcreteValue::Ref(callee_frame_ptr);
-    callee_regs_r[2] = ec_opref;
-    callee_concrete_r[2] = ConcreteValue::Ref(exec_ctx as pyre_object::PyObjectRef);
+    // Fast-path arg seeding: positional args land in `r0..nparams` with
+    // their concrete shadow (mirror of `dispatch_inline_call_dr_kind`).
+    for i in 0..nparams {
+        callee_regs_r[i] = r_args[2 + i];
+        callee_concrete_r[i] = arg_concretes[2 + i];
+    }
 
     let callee_outcome = {
         let mut sub_wc = WalkContext {
@@ -6138,7 +6076,10 @@ fn try_walker_inline_user_call(
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
-                Ok(Some((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc)))
+                Ok(Some((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                )))
             }
         }
         other => Ok(Some((other, op.next_pc))),
@@ -6583,11 +6524,7 @@ fn walker_concrete_ref_object(
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
             let obj = r.as_usize() as pyre_object::PyObjectRef;
-            if obj.is_null() {
-                None
-            } else {
-                Some(obj)
-            }
+            if obj.is_null() { None } else { Some(obj) }
         }
         _ => None,
     }
@@ -6670,7 +6607,15 @@ fn walker_float_specialization_operands(
         return None;
     }
     let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
-    Some((lhs, rhs, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64, boxed_result_i64))
+    Some((
+        lhs,
+        rhs,
+        lhs_is_int,
+        rhs_is_int,
+        lhs_f64,
+        rhs_f64,
+        boxed_result_i64,
+    ))
 }
 
 /// Walker-native unbox of a boxed `W_IntObject` operand: `GUARD_CLASS`
@@ -6913,7 +6858,9 @@ fn try_walker_specialize_binary_op_int(
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
             let lhs_is_min = walker_int_eq_const(ctx, lhs_raw, i64::MIN, (la == i64::MIN) as i64);
             let rhs_is_neg_one = walker_int_eq_const(ctx, rhs_raw, -1, (rb == -1) as i64);
-            let ovf_both = ctx.trace_ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+            let ovf_both = ctx
+                .trace_ctx
+                .record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
             ctx.trace_ctx.set_opref_concrete(
                 ovf_both,
                 majit_ir::Value::Int(((la == i64::MIN) as i64) & ((rb == -1) as i64)),
@@ -7191,9 +7138,9 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
     let arm_dst_live = |jc_pc: usize| -> bool {
-        let py = skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(pc_map, jc_pc) as usize);
-        let banks =
-            crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+        let py =
+            skip_python_trivia_forward(code_obj, python_pc_for_jitcode_pc(pc_map, jc_pc) as usize);
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
     if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
@@ -7700,9 +7647,9 @@ fn dispatch_residual_call_iIRd_kind(
                 // Materialize the constant identically to the runtime
                 // `bh_load_const_fn` helper (call_jit.rs).
                 let w_const = unsafe {
-                    let code = &*(pyre_interpreter::w_code_get_ptr(
-                        w_code_ptr as pyre_object::PyObjectRef,
-                    ) as *const pyre_interpreter::CodeObject);
+                    let code =
+                        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+                            as *const pyre_interpreter::CodeObject);
                     pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
                 };
                 let const_box = ctx.trace_ctx.const_ref(w_const as i64);
@@ -7722,9 +7669,7 @@ fn dispatch_residual_call_iIRd_kind(
     // boxed pointer so downstream specializations still see a concrete int.
     if ei.oopspecindex == majit_ir::OopSpecIndex::BoxInt && dst_bank == 'r' {
         if let Some(&raw_arg) = i_args.first() {
-            if let Some(boxed_ptr) =
-                walker_execute_may_force_boxed(ctx, &allboxes, call_descr)
-            {
+            if let Some(boxed_ptr) = walker_execute_may_force_boxed(ctx, &allboxes, call_descr) {
                 let boxed = crate::state::wrapint(ctx.trace_ctx, raw_arg);
                 ctx.trace_ctx.set_opref_concrete(
                     boxed,
@@ -14134,9 +14079,7 @@ mod tests {
         a.wrapping_add(b)
     }
 
-    fn may_force_call_i_fixture(
-        tc: &mut TraceCtx,
-    ) -> ([OpRef; 3], DescrRef, OpRef) {
+    fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) {
         let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
         let arg0 = tc.const_int(40);
         let arg1 = tc.const_int(2);

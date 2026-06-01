@@ -884,8 +884,10 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
         .collect();
     let descr_refs: &'static [DescrRef] = Box::leak(descr_refs.into_boxed_slice());
     let lookup: Box<crate::jitcode_dispatch::SubJitCodeLookup> = Box::new(move |idx: usize| {
-        perfn_descrs.get(idx).and_then(|d| d.as_jitcode()).map(|jc| {
-            crate::jitcode_dispatch::SubJitCodeBody {
+        perfn_descrs
+            .get(idx)
+            .and_then(|d| d.as_jitcode())
+            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
                 code: jc.code.as_slice(),
                 num_regs_r: jc.num_regs_r() as usize,
                 num_regs_i: jc.num_regs_i() as usize,
@@ -893,8 +895,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
                 constants_i: jc.constants_i.as_slice(),
                 constants_r: jc.constants_r.as_slice(),
                 constants_f: jc.constants_f.as_slice(),
-            }
-        })
+            })
     });
     let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);
     let entry = (descr_refs, perfn_descrs, lookup);

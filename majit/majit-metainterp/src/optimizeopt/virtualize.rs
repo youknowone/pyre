@@ -3231,11 +3231,18 @@ mod tests {
         ctx.make_constant(OpRef::int_op(50), Value::Int(0));
         ctx.make_constant(OpRef::int_op(51), Value::Int(42));
 
-        let get_array_ptr =
-            Op::with_descr(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], field_descr);
+        let get_array_ptr = Op::with_descr(
+            OpCode::GetfieldRawI,
+            &[OpRef::input_arg_ref(0)],
+            field_descr,
+        );
         let set_item = Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(50), OpRef::int_op(51)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::int_op(50),
+                OpRef::int_op(51),
+            ],
             arr_descr.clone(),
         );
         let get_item = Op::with_descr(
@@ -3263,8 +3270,7 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replaced)
-                | OptimizationResult::Restart(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {}

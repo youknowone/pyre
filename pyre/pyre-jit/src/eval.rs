@@ -5740,7 +5740,11 @@ pub(crate) fn decode_and_restore_guard_failure(
         // a no-op there.
         let ni = jit_state.next_instr();
         let resume_pc = LAST_GUARD_FRAMES
-            .with(|c| c.borrow().as_ref().and_then(|frames| frames.last().map(|f| f.py_pc)))
+            .with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .and_then(|frames| frames.last().map(|f| f.py_pc))
+            })
             .filter(|&section_pc| section_pc != ni)
             .unwrap_or(ni);
         Some((typed, resume_pc))

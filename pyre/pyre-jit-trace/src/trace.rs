@@ -282,8 +282,10 @@ fn loop_header_merge_point_regs(code: &[u8], entry: usize) -> Option<(Vec<u8>, V
     Some((gr, rr))
 }
 
-type PerfnWalkResult =
-    Result<(crate::jitcode_dispatch::DispatchOutcome, usize), crate::jitcode_dispatch::DispatchError>;
+type PerfnWalkResult = Result<
+    (crate::jitcode_dispatch::DispatchOutcome, usize),
+    crate::jitcode_dispatch::DispatchError,
+>;
 
 /// Shared per-CodeObject full-body walk used by both the read-only
 /// diagnostic probe ([`probe_walk_perfn_jitcode`], `authoritative=false`,
@@ -543,8 +545,13 @@ fn run_perfn_walk(
     // the virtualizable shadow to the concrete frame heap, which the
     // read-only probe (trace discarded) must not do.
     if authoritative {
-        if let Ok((crate::jitcode_dispatch::DispatchOutcome::CloseLoop { jump_args, loop_header_pc }, _end_pc)) =
-            &mut walk_result
+        if let Ok((
+            crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
+                jump_args,
+                loop_header_pc,
+            },
+            _end_pc,
+        )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
             // `close_loop_args_at` reads `self.orgpc` for the
@@ -731,7 +738,8 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     );
     let mut count = 0usize;
     let mut last_next = 0usize;
-    let mut histogram: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut histogram: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     for op in crate::jitcode_runtime::decoded_ops(code) {
         if count < 80 {
             eprintln!(
