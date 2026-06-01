@@ -828,6 +828,33 @@ fn bucket_measure_insns(insns: &[super::flatten::Insn]) -> (usize, usize, usize,
     (genuine, live, copy, structural)
 }
 
+/// #230.M3 measurement helper: tally the `genuine`-category opnames of an
+/// SSARepr insn stream — the same classification `bucket_measure_insns`
+/// counts as `genuine` (non-`-live-`, non-`*_copy` `Insn::Op`; `Label`/
+/// `Unreachable` are not `Op` so they fall out of the `if let`).  Run on
+/// both the canonical and walker streams so the per-graph `genuine` count
+/// residual #230.M2 left unattributed (int +7, fannkuch +5) is named
+/// opname-by-opname.  `BTreeMap` keeps the keys ordered so the logged diff
+/// is deterministic.  Measurement-only; no production caller when the gate
+/// is unset.
+fn genuine_opname_tally(
+    insns: &[super::flatten::Insn],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut tally = std::collections::BTreeMap::new();
+    for insn in insns {
+        if insn.is_live() {
+            continue;
+        }
+        if let super::flatten::Insn::Op { opname, .. } = insn {
+            if opname.ends_with("_copy") {
+                continue;
+            }
+            *tally.entry(opname.clone()).or_insert(0) += 1;
+        }
+    }
+    tally
+}
+
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
@@ -9163,24 +9190,32 @@ impl CodeWriter {
         // reads `graph`/`cpu` (no `.borrow_mut`, `next_variable_id`
         // untouched), so discarding the result leaves the post-measurement
         // production path byte-identical; gate unset => skipped entirely.
-        // `(genuine, live, copy, structural)` buckets of the canonical
-        // driver's insn stream, or `None` when it panicked.
-        let measure_canonical_buckets: Option<(usize, usize, usize, usize)> =
-            if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut measure_regallocs = graph_regallocs.clone();
-                    let canonical = super::flatten::flatten_graph(
-                        &graph,
-                        &mut measure_regallocs,
-                        true,
-                        Some(self.cpu()),
-                    );
-                    bucket_measure_insns(&canonical.insns)
-                }))
-                .ok()
-            } else {
-                None
-            };
+        // `(genuine, live, copy, structural)` buckets paired with the
+        // canonical driver's genuine-category opname tally (#230.M3), or
+        // `None` when it panicked.  Both derive from the single canonical
+        // `flatten_graph` stream so the per-graph genuine residual can be
+        // named opname-by-opname at the log site below.
+        let measure_canonical: Option<(
+            (usize, usize, usize, usize),
+            std::collections::BTreeMap<String, usize>,
+        )> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut measure_regallocs = graph_regallocs.clone();
+                let canonical = super::flatten::flatten_graph(
+                    &graph,
+                    &mut measure_regallocs,
+                    true,
+                    Some(self.cpu()),
+                );
+                (
+                    bucket_measure_insns(&canonical.insns),
+                    genuine_opname_tally(&canonical.insns),
+                )
+            }))
+            .ok()
+        } else {
+            None
+        };
         // Walker-tracked per-PC `-live-` marker positions exposed to
         // the post-drain `pc_map` computation.  Populated inside the
         // drain block below; consumed by `filter_liveness_in_place`
@@ -9355,7 +9390,7 @@ impl CodeWriter {
             // NEW-DEVIATION needing its own retirement.  `Some` when the
             // canonical driver completed, `None` when it panicked
             // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
-            if let Some((cg, cl, cc, cs)) = measure_canonical_buckets {
+            if let Some(((cg, cl, cc, cs), canonical_genuine)) = measure_canonical {
                 let (wg, wl, wc, ws) = bucket_measure_insns(&ssarepr.insns);
                 eprintln!(
                     "[flatten-measure] {} canon[g={} l={} c={} s={} tot={}] walker[g={} l={} c={} s={} tot={}] {} {}",
@@ -9373,6 +9408,39 @@ impl CodeWriter {
                     if wg == cg { "GENUINE_MATCH" } else { "GENUINE_DIFF" },
                     if cg + cl + cc + cs == wg + wl + wc + ws { "MATCH" } else { "DIFF" },
                 );
+                // #230.M3: name the residual `genuine` deviation
+                // opname-by-opname.  M2 collapses `genuine` to a single
+                // count (e.g. int +7, fannkuch +5) but does not say which
+                // opnames the walker over- or under-emits.  Diff the two
+                // per-opname tallies and log each opname whose walker count
+                // differs from canonical, so the residual NEW-DEVIATION has
+                // a name before #287/#281 close the `-live-`/`copy` bulk.
+                let walker_genuine = genuine_opname_tally(&ssarepr.insns);
+                let mut opnames: Vec<&String> = canonical_genuine
+                    .keys()
+                    .chain(walker_genuine.keys())
+                    .collect();
+                opnames.sort();
+                opnames.dedup();
+                let diffs: Vec<String> = opnames
+                    .into_iter()
+                    .filter_map(|opname| {
+                        let c = canonical_genuine.get(opname).copied().unwrap_or(0);
+                        let w = walker_genuine.get(opname).copied().unwrap_or(0);
+                        (c != w).then(|| {
+                            format!("{}:w{}/c{}({:+})", opname, w, c, w as isize - c as isize)
+                        })
+                    })
+                    .collect();
+                if diffs.is_empty() {
+                    eprintln!("[flatten-measure-genuine] {} MATCH", ssarepr.name);
+                } else {
+                    eprintln!(
+                        "[flatten-measure-genuine] {} DIFF {}",
+                        ssarepr.name,
+                        diffs.join(" "),
+                    );
+                }
             } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
                 eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
             }
