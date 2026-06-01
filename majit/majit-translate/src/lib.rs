@@ -140,7 +140,15 @@ pub fn analyze_multiple_pipeline_with_config(
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None, &[], &[])
+    analyze_pipeline_from_parsed(
+        &parsed_files,
+        config,
+        None,
+        &|_, _| None,
+        &[],
+        &[],
+        HostStaticAddrs::default(),
+    )
 }
 
 /// Multi-file analysis with explicit layout provider.
@@ -161,6 +169,7 @@ pub fn analyze_multiple_pipeline_with_layout(
         &|_, _| None,
         &[],
         &[],
+        HostStaticAddrs::default(),
     )
 }
 
@@ -193,6 +202,29 @@ pub type FnAddrBindings<'a> = [(&'a str, i64)];
 /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
 pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 
+/// Host-supplied addresses of prebuilt object-space singletons that pyre
+/// source carries through the flowgraph as opaque `LOAD_GLOBAL`
+/// constants (the static `PyType` pointers and dict-strategy refs).
+///
+/// `majit-translate` is the `rpython/` translation layer and must not
+/// import the `pyre-object` object space; the driver
+/// (`pyre-jit-trace/build.rs`, via `pyre_interpreter::jit_static_*_addrs()`)
+/// supplies these prebuilt-instance addresses across the translation
+/// boundary, exactly as `rpython/jit` receives `Constant(GCREF)` from the
+/// host instead of importing `pypy/objspace`.  Resolved in the same
+/// build-script process that runs the translator, so the addresses match
+/// a direct `&pyre_object::X` read at the codewriter call site.
+///
+/// `pytypes` are recorded as `ValueType::Int`, `refs` as
+/// `ValueType::Ref(None)`, matching the front-end `KnownStaticsCatalogue`
+/// classification.  Empty (the `Default`) for test / legacy entry points
+/// that lower fixtures not referencing these singletons.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostStaticAddrs<'a> {
+    pub pytypes: &'a [(&'a str, i64)],
+    pub refs: &'a [(&'a str, i64)],
+}
+
 /// Multi-file analysis with explicit layout provider AND a
 /// `VirtualizableInfo` factory wired into
 /// `CallControl::make_virtualizable_infos` (warmspot.py:516).  The
@@ -212,6 +244,7 @@ pub fn analyze_multiple_pipeline_with_vinfo_factory(
         vinfo_factory,
         &[],
         &[],
+        HostStaticAddrs::default(),
     )
 }
 
@@ -263,6 +296,7 @@ pub fn analyze_multiple_pipeline_with_modules(
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
     fnaddr_bindings: &FnAddrBindings<'_>,
+    static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
     assert_eq!(
         sources.len(),
@@ -281,6 +315,7 @@ pub fn analyze_multiple_pipeline_with_modules(
         vinfo_factory,
         fnaddr_bindings,
         &[],
+        static_addrs,
     )
 }
 
@@ -306,6 +341,7 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
         vinfo_factory,
         fnaddr_bindings,
         impl_fnaddr_bindings,
+        HostStaticAddrs::default(),
     )
 }
 
@@ -427,6 +463,7 @@ fn analyze_pipeline_from_parsed(
     vinfo_factory: &VirtualizableInfoFactory<'_>,
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
+    static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let profile = std::env::var_os("PYRE_PROFILE_PIPELINE").is_some();
     let phase_start = std::time::Instant::now();
@@ -533,8 +570,9 @@ fn analyze_pipeline_from_parsed(
     // surfaces the unsupported expression rather than silently dropping
     // a graph.
     mark_phase!("known_statics + struct_origins + struct_field_attrs populated");
-    let program = front::build_semantic_program_from_parsed_files(parsed_files)
-        .expect("pyre-interpreter source must lower without FlowingError");
+    let program =
+        front::build_semantic_program_from_parsed_files_with_statics(parsed_files, static_addrs)
+            .expect("pyre-interpreter source must lower without FlowingError");
     mark_phase!("build_semantic_program_from_parsed_files");
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
@@ -1663,7 +1701,15 @@ mod tests {
         let config = crate::test_support::pyre_analyze_config();
         // Single whole-program lowering shared by every block below.
         let result =
-            analyze_pipeline_from_parsed(&parsed_files, &config, None, &|_, _| None, &[], &[]);
+            analyze_pipeline_from_parsed(
+                &parsed_files,
+                &config,
+                None,
+                &|_, _| None,
+                &[],
+                &[],
+                HostStaticAddrs::default(),
+            );
         // Walker-populated metadata mirrors the production
         // `analyze_pipeline_from_parsed` path: `extract_trait_impls`
         // lowers method bodies against this registry so the

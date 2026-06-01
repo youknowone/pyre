@@ -24,7 +24,6 @@ serde_json = { workspace = true }
 # `HashMap` does not.
 indexmap = { workspace = true }
 majit-ir = { workspace = true }
-pyre-object = { workspace = true }
 libc = { workspace = true }
 # PRE-EXISTING-ADAPTATION, parity rule #1.
 #

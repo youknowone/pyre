@@ -141,6 +141,19 @@ fn real_main() {
     // `CallControl::make_virtualizable_infos`.
     let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
+    // Prebuilt object-space singleton addresses (static `PyType` pointers
+    // and dict-strategy refs).  `majit-translate` is the translation
+    // layer and must not import `pyre-object`; the driver supplies these
+    // across the translation boundary.  Resolved here in the same
+    // build-script process the translator runs in, so the captured
+    // addresses match a direct `&pyre_object::X` read at the codewriter
+    // call site.
+    let static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
+    let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
+    let static_addrs = majit_translate::HostStaticAddrs {
+        pytypes: &static_pytype_addrs,
+        refs: &static_ref_addrs,
+    };
     // Per-source crate-stripped module paths — feeds
     // `parse::parse_source_with_module` so analyzer-side metadata
     // records `struct_origins[bare_name] = module_path`.  Aligns with
@@ -161,6 +174,7 @@ fn real_main() {
         None,
         vinfo_factory,
         &fnaddr_bindings,
+        static_addrs,
     );
 
     // Generate tracing code from the canonical graph-first analysis result.

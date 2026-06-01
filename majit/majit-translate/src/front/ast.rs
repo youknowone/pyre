@@ -310,13 +310,37 @@ pub struct SemanticProgram {
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_with_options(parsed, &AstGraphOptions::default())
+    build_semantic_program_with_options(
+        parsed,
+        &AstGraphOptions::default(),
+        crate::HostStaticAddrs::default(),
+    )
 }
 
 pub fn build_semantic_program_from_parsed_files(
     parsed_files: &[ParsedInterpreter],
 ) -> Result<SemanticProgram, FlowingError> {
-    build_semantic_program_from_parsed_files_with_options(parsed_files, &AstGraphOptions::default())
+    build_semantic_program_from_parsed_files_with_options(
+        parsed_files,
+        &AstGraphOptions::default(),
+        crate::HostStaticAddrs::default(),
+    )
+}
+
+/// Like [`build_semantic_program_from_parsed_files`] but with
+/// host-supplied object-space singleton addresses threaded through to
+/// the `KnownStaticsCatalogue` (`HostStaticAddrs`).  The production
+/// driver (`pyre-jit-trace/build.rs`) uses this; test / legacy callers
+/// keep the no-statics wrapper above.
+pub fn build_semantic_program_from_parsed_files_with_statics(
+    parsed_files: &[ParsedInterpreter],
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<SemanticProgram, FlowingError> {
+    build_semantic_program_from_parsed_files_with_options(
+        parsed_files,
+        &AstGraphOptions::default(),
+        static_addrs,
+    )
 }
 
 /// Pre-walk metadata produced by `collect_program_metadata_pub` —
@@ -1507,6 +1531,7 @@ fn build_graphs_from_items(
 pub fn build_semantic_program_with_options(
     parsed: &ParsedInterpreter,
     options: &AstGraphOptions,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<SemanticProgram, FlowingError> {
     let mut functions = Vec::new();
     let mut known_struct_names = std::collections::HashSet::new();
@@ -1556,7 +1581,8 @@ pub fn build_semantic_program_with_options(
         let module = qualify_module_path(&parsed.module_path, nested);
         module_statics.insert((module, name.clone()), decl.clone());
     }
-    let known_statics = KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed));
+    let known_statics =
+        KnownStaticsCatalogue::from_parsed_files(std::slice::from_ref(parsed), static_addrs);
     let start_len = functions.len();
     let method_suffix_index = MethodSuffixIndex::from_fn_return_types(&fn_return_types);
     build_graphs_from_items(
@@ -1604,6 +1630,7 @@ pub fn build_semantic_program_with_options(
 pub fn build_semantic_program_from_parsed_files_with_options(
     parsed_files: &[ParsedInterpreter],
     options: &AstGraphOptions,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<SemanticProgram, FlowingError> {
     // RPython: annotator/rtyper provides whole-program type info before
     // the codewriter runs. We emulate this with a 2-pass approach:
@@ -1656,7 +1683,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             module_statics.insert((module, name.clone()), decl.clone());
         }
     }
-    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files);
+    let known_statics = KnownStaticsCatalogue::from_parsed_files(parsed_files, static_addrs);
     // Glob expansion: each parsed file's `use <path>::*` resolves to
     // explicit (alias → full_path) entries in `use_imports` here,
     // mirroring Python's import-resolution step which binds glob-
@@ -3998,7 +4025,10 @@ impl KnownStaticsCatalogue {
     /// macro statics via `extract_static_decls`, then registers the
     /// hand-coded stdlib enum variants pyre source carries through
     /// the flowgraph as opaque constants.
-    pub fn from_parsed_files(parsed_files: &[crate::parse::ParsedInterpreter]) -> Self {
+    pub fn from_parsed_files(
+        parsed_files: &[crate::parse::ParsedInterpreter],
+        static_addrs: crate::HostStaticAddrs<'_>,
+    ) -> Self {
         let mut entries = indexmap::IndexMap::new();
         for parsed in parsed_files {
             for (segments, ty, value) in
@@ -4013,7 +4043,7 @@ impl KnownStaticsCatalogue {
                 entries.insert(segments.join("::"), (ty, value));
             }
         }
-        register_stdlib_known_statics(&mut entries);
+        register_stdlib_known_statics(&mut entries, static_addrs);
         Self { entries }
     }
 
@@ -4068,230 +4098,22 @@ impl KnownStaticsCatalogue {
 /// directly.
 fn register_stdlib_known_statics(
     m: &mut indexmap::IndexMap<String, (ValueType, Option<crate::flowspace::model::ConstValue>)>,
+    static_addrs: crate::HostStaticAddrs<'_>,
 ) {
     use crate::flowspace::model::ConstValue;
-    let mut insert_pytype = |path: &str, ptr: &'static pyre_object::pyobject::PyType| {
+    // Prebuilt static `PyType` pointers, host-supplied across the
+    // translation boundary (`HostStaticAddrs`).  Recorded as
+    // `ValueType::Int` so the `lower_expr` `Expr::Path` arm emits a
+    // `ConstInt` directly.  Empty for fixtures that do not reference
+    // these singletons.
+    for (path, addr) in static_addrs.pytypes {
         m.insert(
-            path.to_string(),
-            (
-                ValueType::Int,
-                Some(ConstValue::Int(ptr as *const _ as i64)),
-            ),
+            (*path).to_string(),
+            (ValueType::Int, Some(ConstValue::Int(*addr))),
         );
-    };
-
-    insert_pytype(
-        "bytearrayobject::BYTEARRAY_TYPE",
-        &pyre_object::bytearrayobject::BYTEARRAY_TYPE,
-    );
-    insert_pytype(
-        "bytesobject::BYTES_TYPE",
-        &pyre_object::bytesobject::BYTES_TYPE,
-    );
-    insert_pytype(
-        "celldict::OBJECT_MUTABLE_CELL_TYPE",
-        &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE,
-    );
-    insert_pytype(
-        "celldict::INT_MUTABLE_CELL_TYPE",
-        &pyre_object::celldict::INT_MUTABLE_CELL_TYPE,
-    );
-    insert_pytype(
-        "dictmultiobject::MODULE_DICT_TYPE",
-        &pyre_object::dictmultiobject::MODULE_DICT_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_KEYS_TYPE",
-        &pyre_object::dictviewobject::DICT_KEYS_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_VALUES_TYPE",
-        &pyre_object::dictviewobject::DICT_VALUES_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_ITEMS_TYPE",
-        &pyre_object::dictviewobject::DICT_ITEMS_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_KEYITERATOR_TYPE",
-        &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_VALUEITERATOR_TYPE",
-        &pyre_object::dictviewobject::DICT_VALUEITERATOR_TYPE,
-    );
-    insert_pytype(
-        "dictviewobject::DICT_ITEMITERATOR_TYPE",
-        &pyre_object::dictviewobject::DICT_ITEMITERATOR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXCEPTION_TYPE",
-        &pyre_object::excobject::EXCEPTION_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_EXCEPTION_TYPE",
-        &pyre_object::excobject::EXC_EXCEPTION_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_ARITHMETIC_ERROR_TYPE",
-        &pyre_object::excobject::EXC_ARITHMETIC_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_OVERFLOW_ERROR_TYPE",
-        &pyre_object::excobject::EXC_OVERFLOW_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_ZERO_DIVISION_ERROR_TYPE",
-        &pyre_object::excobject::EXC_ZERO_DIVISION_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_TYPE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_TYPE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_VALUE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_VALUE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_NAME_ERROR_TYPE",
-        &pyre_object::excobject::EXC_NAME_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_INDEX_ERROR_TYPE",
-        &pyre_object::excobject::EXC_INDEX_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_KEY_ERROR_TYPE",
-        &pyre_object::excobject::EXC_KEY_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_ATTRIBUTE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_ATTRIBUTE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_RUNTIME_ERROR_TYPE",
-        &pyre_object::excobject::EXC_RUNTIME_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_STOP_ITERATION_TYPE",
-        &pyre_object::excobject::EXC_STOP_ITERATION_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_IMPORT_ERROR_TYPE",
-        &pyre_object::excobject::EXC_IMPORT_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE",
-        &pyre_object::excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_ASSERTION_ERROR_TYPE",
-        &pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_REFERENCE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_REFERENCE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_GENERATOR_EXIT_TYPE",
-        &pyre_object::excobject::EXC_GENERATOR_EXIT_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_RECURSION_ERROR_TYPE",
-        &pyre_object::excobject::EXC_RECURSION_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_OS_ERROR_TYPE",
-        &pyre_object::excobject::EXC_OS_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE",
-        &pyre_object::excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_UNICODE_DECODE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_UNICODE_DECODE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_UNICODE_ENCODE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_UNICODE_ENCODE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_SYSTEM_EXIT_TYPE",
-        &pyre_object::excobject::EXC_SYSTEM_EXIT_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_MEMORY_ERROR_TYPE",
-        &pyre_object::excobject::EXC_MEMORY_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_SYSTEM_ERROR_TYPE",
-        &pyre_object::excobject::EXC_SYSTEM_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_LOOKUP_ERROR_TYPE",
-        &pyre_object::excobject::EXC_LOOKUP_ERROR_TYPE,
-    );
-    insert_pytype(
-        "excobject::EXC_UNICODE_ERROR_TYPE",
-        &pyre_object::excobject::EXC_UNICODE_ERROR_TYPE,
-    );
-    insert_pytype(
-        "generatorobject::GENERATOR_TYPE",
-        &pyre_object::generatorobject::GENERATOR_TYPE,
-    );
-    insert_pytype("pyobject::INT_TYPE", &pyre_object::pyobject::INT_TYPE);
-    insert_pytype("pyobject::BOOL_TYPE", &pyre_object::pyobject::BOOL_TYPE);
-    insert_pytype("pyobject::FLOAT_TYPE", &pyre_object::pyobject::FLOAT_TYPE);
-    insert_pytype("pyobject::STR_TYPE", &pyre_object::pyobject::STR_TYPE);
-    insert_pytype("pyobject::LIST_TYPE", &pyre_object::pyobject::LIST_TYPE);
-    insert_pytype("pyobject::TUPLE_TYPE", &pyre_object::pyobject::TUPLE_TYPE);
-    insert_pytype("pyobject::DICT_TYPE", &pyre_object::pyobject::DICT_TYPE);
-    insert_pytype("pyobject::LONG_TYPE", &pyre_object::pyobject::LONG_TYPE);
-    insert_pytype("pyobject::NONE_TYPE", &pyre_object::pyobject::NONE_TYPE);
-    insert_pytype(
-        "pyobject::NOTIMPLEMENTED_TYPE",
-        &pyre_object::pyobject::NOTIMPLEMENTED_TYPE,
-    );
-    insert_pytype(
-        "pyobject::ELLIPSIS_TYPE",
-        &pyre_object::pyobject::ELLIPSIS_TYPE,
-    );
-    insert_pytype("pyobject::MODULE_TYPE", &pyre_object::pyobject::MODULE_TYPE);
-    insert_pytype(
-        "pyobject::MAPPING_PROXY_TYPE",
-        &pyre_object::pyobject::MAPPING_PROXY_TYPE,
-    );
-    insert_pytype("pyobject::TYPE_TYPE", &pyre_object::pyobject::TYPE_TYPE);
-    insert_pytype(
-        "pyobject::INSTANCE_TYPE",
-        &pyre_object::pyobject::INSTANCE_TYPE,
-    );
-    insert_pytype("setobject::SET_TYPE", &pyre_object::setobject::SET_TYPE);
-    insert_pytype(
-        "setobject::FROZENSET_TYPE",
-        &pyre_object::setobject::FROZENSET_TYPE,
-    );
-    insert_pytype(
-        "specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE",
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
-    );
-    insert_pytype(
-        "specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE",
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE,
-    );
-    insert_pytype(
-        "specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE",
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
-    );
-    insert_pytype(
-        "weakref::GC_WEAKREF_TYPE",
-        &pyre_object::weakref::GC_WEAKREF_TYPE,
-    );
+    }
+    // `PY_NULL` is a null sentinel, not an object-space address, so it
+    // stays native here instead of arriving through `static_addrs`.
     m.insert(
         "pyobject::PY_NULL".to_string(),
         (
@@ -4301,44 +4123,13 @@ fn register_stdlib_known_statics(
             )),
         ),
     );
-    let mut insert_ref_addr = |path: &str, ptr: *const ()| {
+    // Prebuilt dict-strategy singletons, host-supplied refs.
+    for (path, addr) in static_addrs.refs {
         m.insert(
-            path.to_string(),
-            (ValueType::Ref(None), Some(ConstValue::Int(ptr as i64))),
+            (*path).to_string(),
+            (ValueType::Ref(None), Some(ConstValue::Int(*addr))),
         );
-    };
-    insert_ref_addr(
-        "dictstrategy::OBJECT_DICT_STRATEGY",
-        &pyre_object::dictstrategy::OBJECT_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "dictstrategy::EMPTY_DICT_STRATEGY",
-        &pyre_object::dictstrategy::EMPTY_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "dictstrategy::EMPTY_KWARGS_DICT_STRATEGY",
-        &pyre_object::dictstrategy::EMPTY_KWARGS_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "dictstrategy::BYTES_DICT_STRATEGY",
-        &pyre_object::dictstrategy::BYTES_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "dictstrategy::UNICODE_DICT_STRATEGY",
-        &pyre_object::dictstrategy::UNICODE_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "dictstrategy::INT_DICT_STRATEGY",
-        &pyre_object::dictstrategy::INT_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "identitydict::IDENTITY_DICT_STRATEGY",
-        &pyre_object::identitydict::IDENTITY_DICT_STRATEGY as *const _ as *const (),
-    );
-    insert_ref_addr(
-        "kwargsdict::KWARGS_DICT_STRATEGY",
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY as *const _ as *const (),
-    );
+    }
 
     let ordering_variants: &[(&str, i64)] = &[
         ("Ordering::Relaxed", 0),

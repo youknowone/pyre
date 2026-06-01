@@ -30,4 +30,5 @@ pub mod raise;
 pub use ast::{
     AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry,
     build_semantic_program, build_semantic_program_from_parsed_files,
+    build_semantic_program_from_parsed_files_with_statics,
 };

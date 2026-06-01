@@ -255,6 +255,7 @@ fn build() -> AllJitCodes {
         None,
         &|_, _| None,
         &[],
+        crate::HostStaticAddrs::default(),
     );
     AllJitCodes {
         by_path: result.jitcodes_by_path,
