@@ -908,6 +908,95 @@ fn derive_pc_live_indices_from_sparse(
         .collect()
 }
 
+/// #281 verify: of the runtime's structural resume targets in a canonical
+/// SSARepr — branch guards (`goto_if_not` / `goto_if_not_*` / `switch`,
+/// each with a LEADING `-live-`, flatten.rs:1868-69 / 1971-72) and
+/// can-raise calls (`residual_call_*` with a TRAILING `-live-`,
+/// flatten.py:206-217) per #285 — measure how
+/// `derive_pc_live_indices_from_sparse` covers them.  Returns
+/// `(branch, branch_keyed, branch_fed, canraise, canraise_fed)`:
+/// - `branch_keyed`: the resolver entry for the guard's OWN owner PC (the
+///   py_pc whose `pc_first_insn_pos` range contains the guard op) equals
+///   the guard's leading marker.  This is the strict invariant the runtime
+///   branch resume needs — it queries `pc_map[orgpc]` = the guard's own pc
+///   (#285: `resume_pc = orgpc` for a non-call guard), so when
+///   `branch_keyed < branch` the pc_first_insn_pos keying picks the wrong
+///   (earlier) marker for those guards and #281 must re-key the resolver to
+///   the guard-op position.
+/// - `branch_fed` / `canraise_fed`: the guard/raise marker appears in the
+///   fed set (the resolver hands it to SOME pc).  Necessary (the marker
+///   reaches the runtime table) but, for branches, weaker than `keyed` (it
+///   may be keyed to the fallthrough pc instead of the guard pc).
+/// - `(branch - branch_fed) + (canraise - canraise_fed)` = stranded resume
+///   markers in NO resolver entry — the (b) safety number.  A stranded
+///   marker is a structural resume point the sparse feed cannot surface
+///   (e.g. a can-raise whose fallthrough pc is stack-only / `nopc`), so a
+///   nonzero count names exactly the resume targets #281 must re-key or
+///   #286 must resolve in the runtime.  Can-raise resume keys on
+///   `fallthrough_pc` not the call's own pc (#285), so only `fed` is
+///   reported for it here; the precise fallthrough-pc keying is #286
+///   runtime work.  Measurement-only; no production caller when the gate is
+///   unset.
+fn resume_target_resolver_coverage(
+    ssarepr: &super::flatten::SSARepr,
+    live_indices: &[Option<usize>],
+) -> (usize, usize, usize, usize, usize) {
+    // Owner-pc lookup keyed on stream position: `pc_first_insn_pos` is built
+    // first-wins as the stream grows, so its positions are already ascending;
+    // re-key by position and sort defensively.  `owner_pc(q)` = the py_pc
+    // whose first-insn position is the greatest at-or-before `q`.
+    let mut pc_pos: Vec<(usize, usize)> = ssarepr
+        .pc_first_insn_pos
+        .iter()
+        .filter(|&&(pc, _)| pc >= 0)
+        .map(|&(pc, pos)| (pos, pc as usize))
+        .collect();
+    pc_pos.sort_unstable();
+    let owner_pc = |q: usize| -> Option<usize> {
+        pc_pos
+            .partition_point(|&(pos, _)| pos <= q)
+            .checked_sub(1)
+            .map(|k| pc_pos[k].1)
+    };
+    // Fed marker set: every marker index the resolver hands to some pc.
+    let fed: std::collections::HashSet<usize> = live_indices.iter().filter_map(|&x| x).collect();
+
+    let n_pcs = live_indices.len();
+    let (mut branch, mut branch_keyed, mut branch_fed) = (0usize, 0usize, 0usize);
+    let (mut canraise, mut canraise_fed) = (0usize, 0usize);
+    for (q, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Op { opname, .. } = insn else {
+            continue;
+        };
+        if opname == "goto_if_not" || opname.starts_with("goto_if_not_") || opname == "switch" {
+            // Leading `-live-` immediately precedes the guard.
+            let Some(leading) = q.checked_sub(1).filter(|&i| ssarepr.insns[i].is_live()) else {
+                continue;
+            };
+            branch += 1;
+            if fed.contains(&leading) {
+                branch_fed += 1;
+            }
+            if let Some(p) = owner_pc(q) {
+                if p < n_pcs && live_indices[p] == Some(leading) {
+                    branch_keyed += 1;
+                }
+            }
+        } else if opname.starts_with("residual_call") {
+            // Can-raise iff a trailing `-live-` immediately follows (the
+            // `Insn::Op` carries its result inline, so the marker is q+1);
+            // non-raising residual_calls have none.
+            if ssarepr.insns.get(q + 1).is_some_and(|n| n.is_live()) {
+                canraise += 1;
+                if fed.contains(&(q + 1)) {
+                    canraise_fed += 1;
+                }
+            }
+        }
+    }
+    (branch, branch_keyed, branch_fed, canraise, canraise_fed)
+}
+
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
@@ -9254,6 +9343,7 @@ impl CodeWriter {
             (usize, usize, usize, usize),
             std::collections::BTreeMap<String, usize>,
             (usize, usize, usize, usize),
+            (usize, usize, usize, usize, usize),
         )> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut measure_regallocs = graph_regallocs.clone();
@@ -9292,10 +9382,16 @@ impl CodeWriter {
                         uncovered += 1;
                     }
                 }
+                // #281 verify: restrict the sparse-resolver coverage check
+                // to the runtime's structural resume targets (branch guards
+                // + can-raise calls, #285) and report how the resolver feeds
+                // / keys each.
+                let resume = resume_target_resolver_coverage(&canonical, &live_indices);
                 (
                     bucket_measure_insns(&canonical.insns),
                     genuine_opname_tally(&canonical.insns),
                     (reachable, resolved, absent, uncovered),
+                    resume,
                 )
             }))
             .ok()
@@ -9476,8 +9572,12 @@ impl CodeWriter {
             // NEW-DEVIATION needing its own retirement.  `Some` when the
             // canonical driver completed, `None` when it panicked
             // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
-            if let Some(((cg, cl, cc, cs), canonical_genuine, (lreach, lres, labs, lunc))) =
-                measure_canonical
+            if let Some((
+                (cg, cl, cc, cs),
+                canonical_genuine,
+                (lreach, lres, labs, lunc),
+                (rb, rbk, rbf, rc, rcf),
+            )) = measure_canonical
             {
                 let (wg, wl, wc, ws) = bucket_measure_insns(&ssarepr.insns);
                 eprintln!(
@@ -9493,8 +9593,16 @@ impl CodeWriter {
                     wc,
                     ws,
                     wg + wl + wc + ws,
-                    if wg == cg { "GENUINE_MATCH" } else { "GENUINE_DIFF" },
-                    if cg + cl + cc + cs == wg + wl + wc + ws { "MATCH" } else { "DIFF" },
+                    if wg == cg {
+                        "GENUINE_MATCH"
+                    } else {
+                        "GENUINE_DIFF"
+                    },
+                    if cg + cl + cc + cs == wg + wl + wc + ws {
+                        "MATCH"
+                    } else {
+                        "DIFF"
+                    },
                 );
                 // #230.M3: name the residual `genuine` deviation
                 // opname-by-opname.  M2 collapses `genuine` to a single
@@ -9545,6 +9653,19 @@ impl CodeWriter {
                 eprintln!(
                     "[flatten-measure-liveness] {} reachable={} resolved={} nopc={} unmarked={}",
                     ssarepr.name, lreach, lres, labs, lunc,
+                );
+                // #281 verify: resume-target-restricted resolver coverage.
+                // `branch`/`canraise` = structural resume targets (#285);
+                // `keyed` = branch guards whose OWN owner-pc resolver entry
+                // is the guard's leading marker (the strict runtime
+                // `pc_map[orgpc]` invariant); `fed` = markers the resolver
+                // hands to some pc; `stranded` = resume markers in NO entry
+                // (the (b) nopc-fallthrough safety number).  Survey-only,
+                // verdict-less like the other `[flatten-measure]` lines.
+                let stranded = (rb - rbf) + (rc - rcf);
+                eprintln!(
+                    "[flatten-measure-resume] {} branch={} keyed={} branch_fed={} canraise={} canraise_fed={} stranded={}",
+                    ssarepr.name, rb, rbk, rbf, rc, rcf, stranded,
                 );
             } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
                 eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
