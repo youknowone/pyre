@@ -70,6 +70,79 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), crate::Py
 }
 
 #[cfg(unix)]
+fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::PyObjectRef {
+    let d = crate::baseobjspace::getdict(obj);
+    if d.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::w_dict_getitem_str(d, key) }.unwrap_or(pyre_object::PY_NULL)
+}
+
+// `interp_mmap.py:243 descr_iter` / `:256 descr_reversed` return a
+// generator yielding the 1-byte slices `m[i:i+1]`.  pyre models that
+// generator as a dedicated iterator object holding the source mmap, a
+// cursor, and a step (`+1` forwards, `-1` for `reversed`).
+#[cfg(unix)]
+thread_local! {
+    static MMAP_ITER_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
+#[cfg(unix)]
+fn mmap_iterator_type() -> pyre_object::PyObjectRef {
+    MMAP_ITER_TYPE_OBJ.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("mmap_iterator", init_mmap_iterator_type);
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
+}
+
+#[cfg(unix)]
+fn make_mmap_iterator(m: pyre_object::PyObjectRef, start: i64, step: i64) -> pyre_object::PyObjectRef {
+    let it = pyre_object::w_instance_new(mmap_iterator_type());
+    mmap_set_attr(it, "_m", m);
+    mmap_set_attr(it, "_i", pyre_object::w_int_new(start));
+    mmap_set_attr(it, "_step", pyre_object::w_int_new(step));
+    it
+}
+
+#[cfg(unix)]
+fn init_mmap_iterator_type(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "__iter__",
+        crate::make_builtin_function_with_arity(
+            "__iter__",
+            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
+            1,
+        ),
+    );
+    crate::dict_storage_store(
+        ns,
+        "__next__",
+        crate::make_builtin_function_with_arity(
+            "__next__",
+            |args| {
+                let it = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let m = mmap_get_attr_obj(it, "_m");
+                let i = mmap_get_attr_i64(it, "_i");
+                let step = mmap_get_attr_i64(it, "_step");
+                let (p, len) = mmap_ptr(m)?;
+                if i < 0 || i >= len as i64 {
+                    return Err(crate::PyError::stop_iteration());
+                }
+                let b = unsafe { *p.add(i as usize) };
+                mmap_set_attr(it, "_i", pyre_object::w_int_new(i + step));
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[b]))
+            },
+            1,
+        ),
+    );
+}
+
+#[cfg(unix)]
 fn init_mmap_type(ns: &mut DictStorage) {
     // `interp_mmap.py:341 __new__ = interp2app(mmap)` — the class call
     // `mmap.mmap(fileno, length, ...)` lands here.  args[0] is the
@@ -730,6 +803,37 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 Ok(pyre_object::w_none())
             },
             3,
+        ),
+    );
+
+    // `interp_mmap.py:243 descr_iter` — iterate the 1-byte slices
+    // `m[i:i+1]` forwards.
+    crate::dict_storage_store(
+        ns,
+        "__iter__",
+        crate::make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(make_mmap_iterator(obj, 0, 1))
+            },
+            1,
+        ),
+    );
+
+    // `interp_mmap.py:256 descr_reversed` — iterate the 1-byte slices
+    // `m[i:i+1]` from `len(m) - 1` down to `0`.
+    crate::dict_storage_store(
+        ns,
+        "__reversed__",
+        crate::make_builtin_function_with_arity(
+            "__reversed__",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let len = mmap_get_attr_i64(obj, "_len");
+                Ok(make_mmap_iterator(obj, len - 1, -1))
+            },
+            1,
         ),
     );
 
