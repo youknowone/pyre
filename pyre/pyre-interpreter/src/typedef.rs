@@ -6870,12 +6870,22 @@ fn init_object_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__ne__",
+        // `typeobject.py object_richcompare` — the default `__ne__`
+        // negates the (virtually dispatched) `__eq__` result, so a
+        // subclass that overrides only `__eq__` still gets a consistent
+        // `!=`.  `__eq__` itself falls back to identity here.
         make_builtin_function_with_arity(
             "__ne__",
             |args| {
-                Ok(pyre_object::w_bool_from(
-                    args.len() >= 2 && !std::ptr::eq(args[0], args[1]),
-                ))
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_bool_from(true));
+                }
+                let eq = crate::baseobjspace::compare(
+                    args[0],
+                    args[1],
+                    crate::baseobjspace::CompareOp::Eq,
+                )?;
+                Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)))
             },
             2,
         ),
