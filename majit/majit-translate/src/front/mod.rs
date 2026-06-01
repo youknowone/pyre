@@ -217,6 +217,7 @@
 //!   were retired with the walker (Step 6.E complete).
 //!
 
+pub mod llbc_hints;
 pub mod mir;
 pub mod raise;
 pub mod semantic;

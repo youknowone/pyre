@@ -200,6 +200,17 @@ impl Llbc {
             .filter_map(Option::as_ref)
     }
 
+    /// Iterate over every present `GlobalDecl` (skipping opaque `null`
+    /// entries).  Used by the hint harvester to read the macro-emitted
+    /// `_elidable_function_<NAME>` / `_jit_*_<NAME>` marker consts.
+    pub fn iter_global_decls(&self) -> impl Iterator<Item = &GlobalDecl> {
+        self.file
+            .translated
+            .global_decls
+            .iter()
+            .filter_map(Option::as_ref)
+    }
+
     /// Crate name (the `crate_name` field from `.llbc.translated`).
     pub fn crate_name(&self) -> &str {
         &self.file.translated.crate_name

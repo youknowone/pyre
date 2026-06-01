@@ -120,53 +120,73 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// analyzer-derived from `virtualizable_analyzer.analyze()`, not from
 /// a wrapper attribute).
 ///
-/// Also returns `None` when the function has a `self`-receiver: at
-/// proc-macro time we cannot tell whether the surrounding `impl` is
-/// inherent (which would accept the const as an associated item) or
-/// a trait impl (which forbids it because only trait-declared
-/// associated items are allowed inside `impl Trait for ...`).
-/// Skipping the const emission for receiver methods keeps the macro
-/// usable in both contexts; the function-level inline marker still
-/// records the attribute presence for free-function discovery
-/// downstream.  RPython itself only attaches these attributes at
-/// function/method scope (`func._elidable_function_ = True`); methods
-/// in Python carry the attribute via the underlying function object
-/// regardless of how the method is bound, so callers that need the
-/// per-method const can attach the attribute at the free-function
-/// definition site instead.
+/// `elidable_cannot_raise` / `elidable_or_memerror` additionally emit a
+/// `_jit_elidable_cannot_raise_` / `_jit_elidable_or_memerror_` marker
+/// alongside `_elidable_function_`, so the ullbc hint harvester
+/// (`front::llbc_hints`) can recover the strengthened-effect sub-flag
+/// the policy byte collapses to `UNSUPPORTED` for ref/float-return
+/// helpers.
+///
+/// Receiver methods get the `elidable` / `elidable_cannot_raise` /
+/// `elidable_or_memerror` / `dont_look_inside` markers as associated
+/// consts: those attributes already emit a `__majit_call_policy_`
+/// associated fn next to the method, so the surrounding `impl` is
+/// necessarily inherent (a trait impl would reject the foreign
+/// associated fn at compile time).  `jit_elidable` (a pure pass-through),
+/// `look_inside`, and `jit_loop_invariant` emit no policy fn and so stay
+/// free-fn-only, to avoid placing a foreign associated const inside a
+/// trait impl.
 fn rpython_attribute_const_for(
     attr_name: &str,
     sig: &syn::Signature,
     vis: &syn::Visibility,
 ) -> Option<proc_macro2::TokenStream> {
-    if sig.receiver().is_some() {
-        return None;
-    }
+    let is_method = sig.receiver().is_some();
     let fn_ident = &sig.ident;
-    let (const_name, value) = match attr_name {
-        "elidable" | "elidable_cannot_raise" | "elidable_or_memerror" | "jit_elidable" => (
-            format_ident!("_elidable_function_{}", fn_ident),
-            quote! { true },
-        ),
-        "dont_look_inside" | "dont_look_inside_cannot_raise" => (
-            format_ident!("_jit_look_inside_{}", fn_ident),
-            quote! { false },
-        ),
-        "look_inside" => (
-            format_ident!("_jit_look_inside_{}", fn_ident),
-            quote! { true },
-        ),
-        "jit_loop_invariant" => (
-            format_ident!("_jit_loop_invariant_{}", fn_ident),
-            quote! { true },
-        ),
+    // `(marker-prefix, value, method_ok)`.  `method_ok` records whether the
+    // attribute also emits a `__majit_call_policy_` associated fn next to
+    // the method (proving the impl is inherent), so a same-impl const is
+    // legal; attributes that emit no policy fn stay free-fn-only.
+    let markers: &[(&str, bool, bool)] = match attr_name {
+        // `elidable` emits a `__majit_call_policy_` fn (inherent-impl /
+        // free-fn only), so the method const inherits that constraint and
+        // is safe.  `jit_elidable` is a pure pass-through with no policy
+        // fn — it is the attribute used on trait-impl methods, where a
+        // foreign associated const would be rejected — so it stays
+        // free-fn-only.
+        "elidable" => &[("_elidable_function_", true, true)],
+        "jit_elidable" => &[("_elidable_function_", true, false)],
+        "elidable_cannot_raise" => &[
+            ("_elidable_function_", true, true),
+            ("_jit_elidable_cannot_raise_", true, true),
+        ],
+        "elidable_or_memerror" => &[
+            ("_elidable_function_", true, true),
+            ("_jit_elidable_or_memerror_", true, true),
+        ],
+        "dont_look_inside" | "dont_look_inside_cannot_raise" => {
+            &[("_jit_look_inside_", false, true)]
+        }
+        "look_inside" => &[("_jit_look_inside_", true, false)],
+        "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
         _ => return None,
     };
-    Some(quote! {
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        #vis const #const_name: bool = #value;
-    })
+    let consts: Vec<proc_macro2::TokenStream> = markers
+        .iter()
+        .filter(|(_, _, method_ok)| !is_method || *method_ok)
+        .map(|(prefix, value, _)| {
+            let const_name = format_ident!("{}{}", prefix, fn_ident);
+            quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals)]
+                #vis const #const_name: bool = #value;
+            }
+        })
+        .collect();
+    if consts.is_empty() {
+        return None;
+    }
+    Some(quote! { #(#consts)* })
 }
 
 fn primitive_type_ident(ty: &Type) -> Option<&Ident> {

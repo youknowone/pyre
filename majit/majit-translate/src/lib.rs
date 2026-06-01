@@ -163,15 +163,18 @@ fn build_semantic_program_via_active_frontend(
                 .collect();
             let mut program = front::mir::build_semantic_program_from_llbcs(&llbcs)
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
-            // Step 4.5.b: hybrid hint pass. Charon does not yet
-            // serialize pyre's proc-macro attributes
-            // (`#[majit_macros::elidable*]` / `oopspec` / `portal`),
-            // but those attributes survive in the parsed_files syn::File
-            // trees the AST front-end already had to parse for
-            // compatibility. Walk the same source, build a
-            // {fn_path → hints} table, and merge into the
-            // MIR-driven SemanticProgram by name.
-            merge_hints_from_parsed_files(&mut program, parsed_files);
+            // JIT-hint pass.  pyre's proc-macro attributes
+            // (`#[majit_macros::elidable*]` / `dont_look_inside` /
+            // `loop_invariant` / `unroll_safe`) are consumed by the
+            // proc-macro at expansion time and do not survive in
+            // Charon's `attr_info`, so the macros leave `#[doc(hidden)]`
+            // marker consts (`_elidable_function_<NAME>`, …) next to each
+            // annotated fn.  Charon extracts those into `global_decls`;
+            // `front::llbc_hints` reads them back and the hints merge into
+            // the MIR-driven SemanticProgram by leaf name — the analog of
+            // RPython's translator reading `func._elidable_function_` off
+            // the function object.
+            merge_hints_from_llbcs(&mut program, &llbcs);
             // Step 4.5.c: hybrid metadata pass. The MIR builder
             // cannot populate `fn_return_types` until
             // `Step 4.3.c.ext` (Charon dedup-table widening) resolves
@@ -413,70 +416,30 @@ fn merge_fn_return_types_from_parsed_files(
     }
 }
 
-/// Step 4.5.b helper — merge syn-AST proc-macro hints into a
-/// MIR-driven SemanticProgram.
+/// Merge JIT-hint markers harvested from the ullbc surrogate consts
+/// into a MIR-driven SemanticProgram.
 ///
-/// Walks `parsed_files` for every top-level / impl-method `ItemFn`
-/// and records its `#[majit_macros::*]` attribute hints under both
-/// the bare leaf name and the module-qualified path. Then matches
-/// each `SemanticFunction` in `program` by the trailing segment of
-/// its `name` (Charon's `name_path` form, e.g.
-/// `pyre_interpreter::frame::Frame::pop`) and copies the hints in.
+/// `front::llbc_hints::harvest_hints_from_llbcs` reads the
+/// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
+/// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
+/// `_jit_look_inside_<NAME>`, …) out of Charon's `global_decls`,
+/// keyed by the fn leaf name.  Each `SemanticFunction` is matched by
+/// the trailing segment of its `name` (Charon's `name_path` form,
+/// e.g. `pyre_interpreter::frame::Frame::pop`) and the hints copied in.
 ///
-/// Matches by leaf because Charon paths use the crate name as the
-/// first segment (e.g. `pyre_interpreter::…`) while the AST parser
-/// is module-rooted; a full-path match would always miss.
+/// Matches by leaf because the marker const and its user fn share the
+/// same leaf but sit in sibling module / impl paths that a full-path
+/// match would never align.
 #[cfg(feature = "mir-frontend")]
-fn merge_hints_from_parsed_files(
+fn merge_hints_from_llbcs(
     program: &mut front::SemanticProgram,
-    parsed_files: &[parse::ParsedInterpreter],
+    llbcs: &[majit_charon_reader::Llbc],
 ) {
-    use std::collections::HashMap;
-    let mut hints_by_leaf: HashMap<String, Vec<String>> = HashMap::new();
-    for parsed in parsed_files {
-        collect_hints_walk(&parsed.file.items, &mut hints_by_leaf);
-    }
+    let hints_by_leaf = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
     for f in &mut program.functions {
         let leaf = f.name.rsplit("::").next().unwrap_or(&f.name);
         if let Some(h) = hints_by_leaf.get(leaf) {
             f.hints.clone_from(h);
-        }
-    }
-}
-
-#[cfg(feature = "mir-frontend")]
-fn collect_hints_walk(
-    items: &[syn::Item],
-    out: &mut std::collections::HashMap<String, Vec<String>>,
-) {
-    for item in items {
-        match item {
-            syn::Item::Fn(item_fn) => {
-                let hints =
-                    front::syn_metadata::collect_jit_hints_with_sig(&item_fn.attrs, &item_fn.sig);
-                if !hints.is_empty() {
-                    out.insert(item_fn.sig.ident.to_string(), hints);
-                }
-            }
-            syn::Item::Impl(item_impl) => {
-                for sub in &item_impl.items {
-                    if let syn::ImplItem::Fn(impl_fn) = sub {
-                        let hints = front::syn_metadata::collect_jit_hints_with_sig(
-                            &impl_fn.attrs,
-                            &impl_fn.sig,
-                        );
-                        if !hints.is_empty() {
-                            out.insert(impl_fn.sig.ident.to_string(), hints);
-                        }
-                    }
-                }
-            }
-            syn::Item::Mod(item_mod) => {
-                if let Some((_, sub_items)) = &item_mod.content {
-                    collect_hints_walk(sub_items, out);
-                }
-            }
-            _ => {}
         }
     }
 }
