@@ -1911,6 +1911,55 @@ fn socket_from_fd(
     obj
 }
 
+/// `rsocket.py:1694 get_socket_family` — the family of an existing fd,
+/// read from `getsockname`'s returned `sa_family`.
+#[cfg(unix)]
+fn socket_detect_family(fd: libc::c_int) -> Result<libc::c_int, crate::PyError> {
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let res =
+        unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
+    if res < 0 {
+        return Err(socket_io_err(std::io::Error::last_os_error()));
+    }
+    Ok(addr.ss_family as libc::c_int)
+}
+
+/// `rsocket.py:1678 getsockopt_int` — a single int socket option.
+#[cfg(unix)]
+fn socket_getsockopt_int(
+    fd: libc::c_int,
+    level: libc::c_int,
+    option: libc::c_int,
+) -> Result<libc::c_int, crate::PyError> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let res = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            option,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if res < 0 {
+        return Err(socket_io_err(std::io::Error::last_os_error()));
+    }
+    Ok(val)
+}
+
+/// `interp_socket.py:93 get_so_protocol` — the protocol of an existing
+/// fd via `SO_PROTOCOL`, or `-1` on platforms without it (`HAS_SO_PROTOCOL`).
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn socket_get_so_protocol(fd: libc::c_int) -> Result<libc::c_int, crate::PyError> {
+    socket_getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn socket_get_so_protocol(_fd: libc::c_int) -> Result<libc::c_int, crate::PyError> {
+    Ok(-1)
+}
+
 // ── address pack/unpack helpers ──
 //
 // Python passes IPv4 addresses as (host, port) tuples and IPv6 as
@@ -2136,66 +2185,111 @@ fn init_socket_type(ns: &mut DictStorage) {
         "__new__",
         crate::make_builtin_function("__new__", |args| {
             // args = (cls, family, type, proto, fileno).  The cls slot is
-            // present when the type is invoked as `socket(family=...)`.
+            // present when the type is invoked as `socket(...)`; keyword
+            // arguments arrive as a trailing `__pyre_kw__` dict.
             let after_cls = if !args.is_empty() && !unsafe { pyre_object::is_int(args[0]) } {
                 &args[1..]
             } else {
                 args
             };
-            for (idx, label) in [(0, "family"), (1, "type"), (2, "proto")] {
-                if after_cls.len() > idx && !unsafe { pyre_object::is_int(after_cls[idx]) } {
-                    return Err(crate::PyError::type_error(format!(
-                        "socket: {label} must be an integer"
-                    )));
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(after_cls);
+            // `interp_socket.py:216 descr_init(family=-1, type=-1, proto=-1,
+            // w_fileno=None)` — each parameter comes from its positional
+            // slot, then its keyword; family/type/proto keep the sentinel
+            // -1 (resolved below from the module defaults or the fd).
+            let family_obj = pos
+                .first()
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "family"));
+            let type_obj = pos
+                .get(1)
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "type"));
+            let proto_obj = pos
+                .get(2)
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "proto"));
+            let fileno_obj = pos
+                .get(3)
+                .copied()
+                .or_else(|| crate::builtins::kwarg_get(kwargs, "fileno"));
+            for (obj, label) in [(family_obj, "family"), (type_obj, "type"), (proto_obj, "proto")] {
+                if let Some(o) = obj {
+                    if !unsafe { pyre_object::is_int(o) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "socket: {label} must be an integer"
+                        )));
+                    }
                 }
             }
-            let family = if after_cls.is_empty() {
-                libc::AF_INET
-            } else {
-                unsafe { pyre_object::w_int_get_value(after_cls[0]) as libc::c_int }
+            let mut family = match family_obj {
+                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
+                None => -1,
             };
-            let ty = if after_cls.len() < 2 {
-                libc::SOCK_STREAM
-            } else {
-                unsafe { pyre_object::w_int_get_value(after_cls[1]) as libc::c_int }
+            let mut ty = match type_obj {
+                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
+                None => -1,
             };
-            let proto = if after_cls.len() < 3 {
-                0
-            } else {
-                unsafe { pyre_object::w_int_get_value(after_cls[2]) as libc::c_int }
+            let mut proto = match proto_obj {
+                Some(o) => unsafe { pyre_object::w_int_get_value(o) as libc::c_int },
+                None => -1,
             };
-            let fileno: libc::c_int =
-                if after_cls.len() < 4 || unsafe { pyre_object::is_none(after_cls[3]) } {
-                    let fd = unsafe { libc::socket(family, ty, proto) };
-                    if fd < 0 {
-                        return Err(socket_io_err(std::io::Error::last_os_error()));
-                    }
-                    // `rsocket.py:RSocket.__init__` sets FD_CLOEXEC on
-                    // every newly created socket (PEP 446).
-                    unsafe {
-                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
-                    fd
-                } else {
-                    // `interp_socket.py:253-259` — a float fileno is a
-                    // TypeError; a negative fd is a ValueError.
-                    if unsafe { pyre_object::is_float(after_cls[3]) } {
-                        return Err(crate::PyError::type_error(
-                            "integer argument expected, got float",
-                        ));
-                    }
-                    if !unsafe { pyre_object::is_int(after_cls[3]) } {
-                        return Err(crate::PyError::type_error(
-                            "socket: fileno must be an integer or None",
-                        ));
-                    }
-                    let fd = unsafe { pyre_object::w_int_get_value(after_cls[3]) };
-                    if fd < 0 {
-                        return Err(crate::PyError::value_error("negative file descriptor"));
-                    }
-                    fd as libc::c_int
-                };
-            Ok(socket_from_fd(fileno, family, ty, proto))
+            let has_fileno = match fileno_obj {
+                Some(o) => !unsafe { pyre_object::is_none(o) },
+                None => false,
+            };
+            if !has_fileno {
+                // `interp_socket.py:219-225` — without a fileno the
+                // sentinels resolve to AF_INET / SOCK_STREAM / 0.
+                if family == -1 {
+                    family = libc::AF_INET;
+                }
+                if ty == -1 {
+                    ty = libc::SOCK_STREAM;
+                }
+                if proto == -1 {
+                    proto = 0;
+                }
+                let fd = unsafe { libc::socket(family, ty, proto) };
+                if fd < 0 {
+                    return Err(socket_io_err(std::io::Error::last_os_error()));
+                }
+                // `rsocket.py:RSocket.__init__` sets FD_CLOEXEC on every
+                // newly created socket (PEP 446).
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                return Ok(socket_from_fd(fd, family, ty, proto));
+            }
+            // `interp_socket.py:253-265` — wrap an existing fd.  A float
+            // fileno is a TypeError, a negative fd a ValueError, and any
+            // -1 family/type/proto is derived from the descriptor itself.
+            let fileno_obj = fileno_obj.unwrap();
+            if unsafe { pyre_object::is_float(fileno_obj) } {
+                return Err(crate::PyError::type_error(
+                    "integer argument expected, got float",
+                ));
+            }
+            if !unsafe { pyre_object::is_int(fileno_obj) } {
+                return Err(crate::PyError::type_error(
+                    "socket: fileno must be an integer or None",
+                ));
+            }
+            let fd = unsafe { pyre_object::w_int_get_value(fileno_obj) };
+            if fd < 0 {
+                return Err(crate::PyError::value_error("negative file descriptor"));
+            }
+            let fd = fd as libc::c_int;
+            if family == -1 {
+                family = socket_detect_family(fd)?;
+            }
+            if ty == -1 {
+                ty = socket_getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
+            }
+            if proto == -1 {
+                proto = socket_get_so_protocol(fd)?;
+            }
+            Ok(socket_from_fd(fd, family, ty, proto))
         }),
     );
 
