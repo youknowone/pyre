@@ -1470,6 +1470,14 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Number of guard operations recorded so far.  The walker compares
+    /// this across a `vable_getfield_*` / `vable_setfield` call to detect
+    /// the `_nonstandard_virtualizable` PTR_EQ promote guard those helpers
+    /// emit internally, so it can attach a resume snapshot to it.
+    pub fn num_guards(&self) -> usize {
+        self.recorder.num_guards()
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()

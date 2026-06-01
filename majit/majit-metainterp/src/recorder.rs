@@ -350,6 +350,22 @@ impl Trace {
         }
     }
 
+    /// Set rd_resume_position on the most-recently recorded *guard* op,
+    /// skipping any non-guard ops recorded after it.
+    ///
+    /// `set_last_op_resume_position` assumes the guard is the last op,
+    /// which holds when a guard is captured immediately after recording.
+    /// A guard emitted *inside* a helper (e.g. the
+    /// `_nonstandard_virtualizable` PTR_EQ promote, after which
+    /// `emit_force_virtualizable` records GETFIELD_GC / PTR_NE /
+    /// COND_CALL) is not the last op when the caller captures, so the
+    /// resume position must target the guard by its guard-ness.
+    pub fn set_last_guard_op_resume_position(&mut self, snapshot_id: i32) {
+        if let Some(op) = self.ops.iter().rev().find(|op| op.opcode.is_guard()) {
+            op.rd_resume_position.set(snapshot_id);
+        }
+    }
+
     /// Set fail_args on a recorded op identified by `opref`.
     ///
     /// Mirrors RPython's `Op.setfailargs([...])` (`resoperation.py`)

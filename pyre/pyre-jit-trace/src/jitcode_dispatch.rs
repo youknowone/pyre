@@ -2754,6 +2754,7 @@ fn getfield_vable_via_metainterp(
         ConcreteValue::Null => 0,
         ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => 0,
     };
+    let guards_before = ctx.trace_ctx.num_guards();
     let (result, shadow_value) = match dst_bank {
         'i' => ctx
             .trace_ctx
@@ -2766,6 +2767,7 @@ fn getfield_vable_via_metainterp(
             .vable_getfield_float(pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py:1186`) — a Box whose
     // `_resint`/`_resref`/`_resfloat` is filled at construction time.
@@ -2865,8 +2867,10 @@ fn setfield_vable_via_metainterp(
     // valuebox, fielddescr, pc)` threads orgpc through
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
     // JitCode PC, pass through.
+    let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -2979,6 +2983,7 @@ fn getarrayitem_vable_via_metainterp(
         _ => return Err(DispatchError::VableArrayIndexNotConcrete { pc: op.pc, value: index }),
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
+    let guards_before = ctx.trace_ctx.num_guards();
     let (result, shadow_value) = match dst_bank {
         'i' => ctx
             .trace_ctx
@@ -2991,6 +2996,7 @@ fn getarrayitem_vable_via_metainterp(
             .vable_getarrayitem_float_indexed(op.pc, vable, index, index_value, fdescr, adescr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value
     // contract for downstream consumers; `Value::Void` = no live concrete.
@@ -3050,9 +3056,11 @@ fn setarrayitem_vable_via_metainterp(
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     let concrete = ctx.trace_ctx.concrete_of_opref(value).unwrap_or(Value::Void);
+    let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc, vable, index, index_value, fdescr, adescr, value, concrete,
     );
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -3076,9 +3084,11 @@ fn arraylen_vable_via_metainterp(
         ConcreteValue::Null | ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
+    let guards_before = ctx.trace_ctx.num_guards();
     let result = ctx
         .trace_ctx
         .vable_arraylen_vable(op.pc, vable, vable_struct_ptr, fdescr, adescr);
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
@@ -4945,6 +4955,39 @@ thread_local! {
     /// instead of the static entry coordinate the per-opcode path uses.
     static FULL_BODY_SNAPSHOT_SYM: std::cell::Cell<*const crate::state::PyreSym> =
         const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// Set (`true`) only while a `try_walker_inline_user_call` sub-walk is
+    /// running.  In that scope every guard captured by
+    /// [`walker_capture_snapshot_for_last_guard`] — both the walker's own
+    /// guards and the `_nonstandard_virtualizable` PTR_EQ promote that
+    /// `TraceCtx::vable_getfield_*` emits internally for the inlined
+    /// callee's non-standard heap frame — must resume at the *caller's*
+    /// CALL boundary (`ctx.entry_py_pc` / `ctx.outer_active_boxes`), not
+    /// at the callee `op_pc` mapped through the outer (`FULL_BODY_SNAPSHOT_SYM`)
+    /// jitcode's `pc_map`.  The callee `op_pc` is meaningless in the outer
+    /// pc_map, and pyre's blackhole can only re-enter the caller's Python
+    /// opcode; resuming at the CALL boundary re-executes the whole call,
+    /// which is sound for the side-effect-free leaves this path inlines.
+    static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard: mark the current scope as an inline sub-walk (see
+/// [`INLINE_SUBWALK_CAPTURE_BOUNDARY`]) and restore the prior value on
+/// drop so nested inlines unwind to their parent's setting.
+struct InlineSubwalkCaptureGuard(bool);
+
+impl InlineSubwalkCaptureGuard {
+    fn enter() -> Self {
+        let prev = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.replace(true));
+        InlineSubwalkCaptureGuard(prev)
+    }
+}
+
+impl Drop for InlineSubwalkCaptureGuard {
+    fn drop(&mut self) {
+        INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.set(self.0));
+    }
 }
 
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
@@ -5113,6 +5156,59 @@ fn walker_capture_snapshot_after_residual_call(
     walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, true)
 }
 
+/// Attach a resume snapshot to a `_nonstandard_virtualizable` PTR_EQ
+/// promote guard if a `TraceCtx::vable_*` call emitted one.
+///
+/// `TraceCtx::vable_getfield_*` / `vable_setfield` /
+/// `vable_get|setarrayitem_*` run the `_nonstandard_virtualizable`
+/// check (`trace_ctx.rs _nonstandard_virtualizable`); for a frame that
+/// is not the standard virtualizable it records a `PTR_EQ` + a
+/// `promote_int` `GuardValue` *internally*, without a resume snapshot.
+/// The walker never sees that guard at its own emit sites, so it would
+/// reach `store_final_boxes_in_guard` with `rd_resume_position == -1`
+/// and panic.  Only an inlined callee's heap frame is non-standard
+/// (the production main frame IS the standard virtualizable, so the
+/// check short-circuits at Step 1 and emits nothing) — gate on the
+/// inline sub-walk so this is a no-op (one cheap `num_guards` read)
+/// outside the inline path.  The non-standard fact is cached per box
+/// after the first access, so at most one such guard is emitted per
+/// inlined frame and `walker_capture_snapshot_for_last_guard`'s
+/// "last guard" target is unambiguous.
+fn walker_capture_inline_nonstandard_vable_guard(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    guards_before: usize,
+) -> Result<(), DispatchError> {
+    if !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+        return Ok(());
+    }
+    if ctx.trace_ctx.num_guards() <= guards_before {
+        return Ok(());
+    }
+    // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
+    // every virtualizable box must carry `OpRef::ty()` or the snapshot
+    // encoder panics — abort to the trait path instead.
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
+    }
+    // The guard is not the last recorded op: `emit_force_virtualizable`
+    // records GETFIELD_GC / PTR_NE / COND_CALL after the promote, so stamp
+    // the last *guard* op (`..._for_last_guard_op_...`).  Resume at the
+    // caller's CALL boundary (`outer_active_boxes` / `entry_py_pc`),
+    // re-executing the whole call on deopt — sound for the side-effect-free
+    // leaves this path inlines (the non-standard identity guard is itself
+    // deterministic and never fails at runtime).
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    ctx.trace_ctx.capture_snapshot_for_last_guard_op_with_vable_vref(
+        &ctx.outer_active_boxes,
+        ctx.outer_jitcode_index,
+        ctx.entry_py_pc,
+        &vable_boxes,
+        &vref_boxes,
+    );
+    Ok(())
+}
+
 fn walker_capture_snapshot_for_last_guard_impl(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -5179,7 +5275,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // from the live walk register banks at that pc, instead of the
     // static entry-time coordinate the per-opcode arm path uses.
     let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if !full_body_sym.is_null() {
+    // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
+    // does not exist in the outer (`full_body_sym`) jitcode's `pc_map`.
+    // Skip the full-body mapping and fall through to the caller-boundary
+    // capture below, which resumes at the CALL site (re-execute the
+    // call on deopt — see `INLINE_SUBWALK_CAPTURE_BOUNDARY`).
+    let inline_subwalk = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
+    if !inline_subwalk && !full_body_sym.is_null() {
         // SAFETY: the pointer is set only for the lifetime of the
         // full-body `dispatch_via_miframe` (the guard restores it on
         // exit); the `PyreSym` outlives the walk.  Read-only access to
@@ -5991,6 +6093,13 @@ fn try_walker_inline_user_call(
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
+        // Guards emitted inside the callee body — both the walker's own
+        // and the `_nonstandard_virtualizable` PTR_EQ promote that
+        // `vable_getfield_*` records internally — resume at this CALL
+        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, inherited
+        // from the caller), not at a callee `op_pc` that has no meaning in
+        // the outer jitcode's pc_map.  See `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
+        let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
             Ok(v) => v,
             Err(e) => {
