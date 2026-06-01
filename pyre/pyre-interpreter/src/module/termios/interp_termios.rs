@@ -297,6 +297,136 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
+    crate::dict_storage_store(
+        ns,
+        "tcgetwinsize",
+        crate::make_builtin_function_with_arity(
+            "tcgetwinsize",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "tcgetwinsize() requires 1 argument",
+                    ));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "tcgetwinsize: fd must be an integer",
+                    ));
+                }
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+                if ret != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("tcgetwinsize: {e}"),
+                    ));
+                }
+                // `interp_termios.py:99-101` returns `(ws_row, ws_col)`.
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(ws.ws_row as i64),
+                    pyre_object::w_int_new(ws.ws_col as i64),
+                ]))
+            },
+            1,
+        ),
+    );
+
+    crate::dict_storage_store(
+        ns,
+        "tcsetwinsize",
+        crate::make_builtin_function_with_arity(
+            "tcsetwinsize",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "tcsetwinsize() requires 2 arguments",
+                    ));
+                }
+                if !unsafe { pyre_object::is_int(args[0]) } {
+                    return Err(crate::PyError::type_error(
+                        "tcsetwinsize: fd must be an integer",
+                    ));
+                }
+                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // `interp_termios.py:110-114` — argument 2 must be a 2-sequence.
+                let seq = args[1];
+                let two = if unsafe { pyre_object::is_list(seq) } {
+                    if unsafe { pyre_object::w_list_len(seq) } == 2 {
+                        unsafe {
+                            (
+                                pyre_object::w_list_getitem(seq, 0),
+                                pyre_object::w_list_getitem(seq, 1),
+                            )
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else if unsafe { pyre_object::is_tuple(seq) } {
+                    if unsafe { pyre_object::w_tuple_len(seq) } == 2 {
+                        unsafe {
+                            (
+                                pyre_object::w_tuple_getitem(seq, 0),
+                                pyre_object::w_tuple_getitem(seq, 1),
+                            )
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+                let (w_row, w_col) = match two {
+                    (Some(r), Some(c)) => (r, c),
+                    _ => {
+                        return Err(crate::PyError::type_error(
+                            "tcsetwinsize: argument 2 must be a 2-sequence",
+                        ));
+                    }
+                };
+                if !unsafe { pyre_object::is_int(w_row) }
+                    || !unsafe { pyre_object::is_int(w_col) }
+                {
+                    return Err(crate::PyError::type_error(
+                        "tcsetwinsize: winsize elements must be integers",
+                    ));
+                }
+                let rows = unsafe { pyre_object::w_int_get_value(w_row) };
+                let cols = unsafe { pyre_object::w_int_get_value(w_col) };
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                // `interp_termios.py:120` reads the current winsize first so
+                // `ws_xpixel` / `ws_ypixel` are preserved across the set.
+                let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+                if ret != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("tcsetwinsize: {e}"),
+                    ));
+                }
+                ws.ws_row = rows as libc::c_ushort;
+                ws.ws_col = cols as libc::c_ushort;
+                // `interp_termios.py:126-128` overflow guard.
+                if ws.ws_row as i64 != rows || ws.ws_col as i64 != cols {
+                    return Err(crate::PyError::overflow_error(
+                        "winsize value(s) out of range",
+                    ));
+                }
+                let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut ws) };
+                if ret != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("tcsetwinsize: {e}"),
+                    ));
+                }
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
     // ── Constants ──
     crate::dict_storage_store(ns, "B0", pyre_object::w_int_new(host_termios::B0 as i64));
     crate::dict_storage_store(ns, "B50", pyre_object::w_int_new(host_termios::B50 as i64));
