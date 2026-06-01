@@ -251,7 +251,7 @@ fn fill_user_function_args(
 
     // argument.py:235-236 — too_many_args when no *vararg to absorb.
     if nargs > nparams && !has_varargs {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         let ndefaults = if !defaults.is_null() {
             let defaults = crate::baseobjspace::unwrap_cell(defaults);
             if unsafe { pyre_object::is_tuple(defaults) } {
@@ -342,9 +342,9 @@ fn fill_user_function_args(
         }
     }
     if !missing_positional.is_empty() {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_positional,
             true,
         )));
@@ -358,9 +358,9 @@ fn fill_user_function_args(
         }
     }
     if !missing_kwonly.is_empty() {
-        let fname = unsafe { crate::function_get_name(callable) };
+        let fname = unsafe { crate::function_get_qualname(callable) };
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_kwonly,
             false,
         )));
@@ -792,7 +792,7 @@ pub(crate) fn resolve_kwargs(
     let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
     let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
     let posonlyarg_count = code.posonlyarg_count as usize;
-    let fname = unsafe { crate::function_get_name(target_func) };
+    let fname = unsafe { crate::function_get_qualname(target_func) };
 
     // `argument.py:235-236` — too-many positional args with no *vararg.
     // The kwargs path counts only positional args (`n_pos`); kwargs are
@@ -998,7 +998,7 @@ pub(crate) fn resolve_kwargs(
     }
     if !missing_positional.is_empty() {
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_positional,
             true,
         )));
@@ -1013,7 +1013,7 @@ pub(crate) fn resolve_kwargs(
     }
     if !missing_kwonly.is_empty() {
         return Err(crate::PyError::type_error(format_missing_err(
-            fname,
+            &fname,
             &missing_kwonly,
             false,
         )));
@@ -1161,7 +1161,7 @@ pub fn call_with_kwargs(
             let n_pos_params = code.arg_count as usize;
             let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
             let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
-            let fname = unsafe { crate::function_get_name(callable) };
+            let fname = unsafe { crate::function_get_qualname(callable) };
 
             // `argument.py:235-236` — too-many positional args with no *vararg.
             if pos_args.len() > n_pos_params && !has_varargs {
@@ -1302,7 +1302,7 @@ pub fn call_with_kwargs(
             }
             if !missing_positional.is_empty() {
                 return Err(crate::PyError::type_error(format_missing_err(
-                    fname,
+                    &fname,
                     &missing_positional,
                     true,
                 )));
@@ -1316,7 +1316,7 @@ pub fn call_with_kwargs(
             }
             if !missing_kwonly.is_empty() {
                 return Err(crate::PyError::type_error(format_missing_err(
-                    fname,
+                    &fname,
                     &missing_kwonly,
                     false,
                 )));

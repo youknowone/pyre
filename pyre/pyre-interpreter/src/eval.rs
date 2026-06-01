@@ -396,7 +396,7 @@ fn callable_prefix(w_callable: PyObjectRef) -> String {
     }
     unsafe {
         if crate::is_function(w_callable) {
-            let name = crate::function_get_name(w_callable);
+            let name = crate::function_get_qualname(w_callable);
             return format!("{name}() ");
         }
         if pyre_object::is_type(w_callable) {

@@ -36,24 +36,16 @@ pub fn make_function_from_code_obj_with_globals_obj(
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
-    // `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the
-    // function's `qualname` from `codeobj.co_qualname` at construction
-    // time; `function.py:54 __init__` then writes
-    // `self.qualname = qualname or self.name`, so subsequent
-    // `__code__ = new_code` assignments do NOT change `__qualname__`.
-    //
-    // Pyre's `Function.name` historically captured `code.qualname`
-    // (longstanding bug — `function.py:51 self.name = forcename or
-    // code.co_name` says `obj_name` is the right field), but the
-    // user-visible `__name__` getter has already grown a quirk to
-    // strip the dotted prefix and many callers expect the
-    // `Class.method` form to leak through; until that path is
-    // straightened out, we keep `name = code.qualname` and only
-    // freeze the qualified name into the dedicated `w_qualname` slot
-    // here so `__code__` replacement no longer alters `__qualname__`.
+    // `function.py:51-53 __init__`:
+    //   self.name = forcename or code.co_name
+    //   self.qualname = qualname or self.name
+    // so `name` is the bare `co_name` and `qualname` is the dotted
+    // `co_qualname`.  `pyopcode.py:1457 MAKE_FUNCTION` then stamps the
+    // qualified name from `codeobj.co_qualname`, which is why a later
+    // `__code__ = new_code` assignment does NOT change `__qualname__`.
     let func = crate::function::function_new_with_globals_obj(
         code_obj as *const (),
-        code.qualname.to_string(),
+        code.obj_name.to_string(),
         globals,
         w_globals_obj,
         pyre_object::PY_NULL,

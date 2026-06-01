@@ -7,6 +7,7 @@ use pyre_object::pyobject::{
 
 use crate::{
     BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name,
+    function_get_qualname,
 };
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
@@ -350,9 +351,9 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             let name = function_get_name(obj);
             format!("<built-in function {name}>")
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            // function.py:268-269 Function.descr_function_repr —
-            // FunctionWithFixedCode inherits this and reports as <function>.
-            let name = function_get_name(obj);
+            // function.py:283 Function.descr_function_repr — `'function %s'
+            // % self.qualname` (FunctionWithFixedCode inherits this).
+            let name = function_get_qualname(obj);
             format!("<function {name}>")
         } else if unsafe { pyre_object::is_exception(obj) } {
             // `pypy/module/exceptions/interp_exceptions.py:135-147
