@@ -422,4 +422,124 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
+    // takewhile(predicate, iterable) — W_TakeWhile.  Yields elements
+    // while `predicate(item)` is true, then stops.  Pulled lazily so an
+    // infinite source (`takewhile(p, count())`) terminates.
+    crate::dict_storage_store(
+        ns,
+        "takewhile",
+        crate::make_builtin_function_with_arity(
+            "takewhile",
+            |args| {
+                let predicate = args[0];
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                let mut out = Vec::new();
+                loop {
+                    match crate::baseobjspace::next(iterator) {
+                        Ok(v) => {
+                            let r = crate::call::call_function_impl_result(predicate, &[v])?;
+                            if !crate::baseobjspace::is_true(r) {
+                                break;
+                            }
+                            out.push(v);
+                        }
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                let n = out.len();
+                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+            },
+            2,
+        ),
+    );
+    // dropwhile(predicate, iterable) — W_DropWhile.  Drops elements
+    // while `predicate(item)` is true, then yields that element and
+    // every element after it.
+    crate::dict_storage_store(
+        ns,
+        "dropwhile",
+        crate::make_builtin_function_with_arity(
+            "dropwhile",
+            |args| {
+                let predicate = args[0];
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                let mut out = Vec::new();
+                let mut dropping = true;
+                loop {
+                    match crate::baseobjspace::next(iterator) {
+                        Ok(v) => {
+                            if dropping {
+                                let r = crate::call::call_function_impl_result(predicate, &[v])?;
+                                if crate::baseobjspace::is_true(r) {
+                                    continue;
+                                }
+                                dropping = false;
+                            }
+                            out.push(v);
+                        }
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                let n = out.len();
+                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+            },
+            2,
+        ),
+    );
+    // filterfalse(predicate, iterable) — W_FilterFalse.  Keeps elements
+    // where `predicate(item)` is false; a None predicate keeps the
+    // falsy elements.
+    crate::dict_storage_store(
+        ns,
+        "filterfalse",
+        crate::make_builtin_function_with_arity(
+            "filterfalse",
+            |args| {
+                let predicate = args[0];
+                let predicate_is_none = unsafe { pyre_object::is_none(predicate) };
+                let iterator = crate::baseobjspace::iter(args[1])?;
+                let mut out = Vec::new();
+                loop {
+                    match crate::baseobjspace::next(iterator) {
+                        Ok(v) => {
+                            let truth = if predicate_is_none {
+                                crate::baseobjspace::is_true(v)
+                            } else {
+                                let r = crate::call::call_function_impl_result(predicate, &[v])?;
+                                crate::baseobjspace::is_true(r)
+                            };
+                            if !truth {
+                                out.push(v);
+                            }
+                        }
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                let n = out.len();
+                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+            },
+            2,
+        ),
+    );
+    // pairwise(iterable) — W_Pairwise.  s -> (s0,s1),(s1,s2),(s2,s3),...
+    crate::dict_storage_store(
+        ns,
+        "pairwise",
+        crate::make_builtin_function_with_arity(
+            "pairwise",
+            |args| {
+                let items = crate::builtins::collect_iterable(args[0])?;
+                let mut out = Vec::new();
+                for pair in items.windows(2) {
+                    out.push(pyre_object::w_tuple_new(vec![pair[0], pair[1]]));
+                }
+                let n = out.len();
+                Ok(pyre_object::w_seq_iter_new(pyre_object::w_list_new(out), n))
+            },
+            1,
+        ),
+    );
 }
