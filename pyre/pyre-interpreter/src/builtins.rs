@@ -9,6 +9,190 @@ use crate::{
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
+/// Read a memoryview stub's `(data copy, itemsize, backing buffer)`.
+unsafe fn memoryview_data(
+    mv: PyObjectRef,
+) -> Result<(Vec<u8>, usize, PyObjectRef), crate::PyError> {
+    let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+    let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+    let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
+    let data = if pyre_object::bytesobject::is_bytes_like(buf) {
+        pyre_object::bytesobject::bytes_like_data(buf).to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok((data, itemsize, buf))
+}
+
+/// Little-endian unpack of one `itemsize`-wide element at element index `i`.
+fn memoryview_unpack(data: &[u8], itemsize: usize, i: usize) -> i64 {
+    let base = i * itemsize;
+    let mut val: i64 = 0;
+    for j in 0..itemsize {
+        val |= (data[base + j] as i64) << (8 * j);
+    }
+    val
+}
+
+/// `memoryview.__getitem__` — integer index returns the unpacked element;
+/// a slice returns a fresh memoryview over the copied sub-buffer.
+fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let index = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let count = (data.len() / itemsize) as i64;
+        if pyre_object::is_int(index) {
+            let mut i = pyre_object::w_int_get_value(index);
+            if i < 0 {
+                i += count;
+            }
+            if i < 0 || i >= count {
+                return Err(crate::PyError::index_error("index out of bounds"));
+            }
+            return Ok(w_int_new(memoryview_unpack(&data, itemsize, i as usize)));
+        }
+        if pyre_object::is_slice(index) {
+            let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            let mut out: Vec<u8> = Vec::new();
+            let mut k = start;
+            while (step > 0 && k < stop) || (step < 0 && k > stop) {
+                let base = k as usize * itemsize;
+                out.extend_from_slice(&data[base..base + itemsize]);
+                k += step;
+            }
+            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
+            let inst = pyre_object::w_instance_new(cls);
+            let fmt = crate::baseobjspace::getattr(mv, "__pyre_fmt__")?;
+            crate::baseobjspace::setattr(
+                inst,
+                "__pyre_buf__",
+                pyre_object::bytesobject::w_bytes_from_bytes(&out),
+            )?;
+            crate::baseobjspace::setattr(inst, "__pyre_fmt__", fmt)?;
+            crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(itemsize as i64))?;
+            return Ok(inst);
+        }
+        Err(crate::PyError::type_error(
+            "memoryview: invalid slice key, must be int or slice",
+        ))
+    }
+}
+
+/// `memoryview.__setitem__` — integer assignment into a mutable, byte-wide
+/// view; read-only or wider-format views raise as in CPython.
+fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let index = args.get(1).copied().unwrap_or(w_none());
+    let value = args.get(2).copied().unwrap_or(w_none());
+    unsafe {
+        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+        let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
+        let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
+        if !pyre_object::bytearrayobject::is_bytearray(buf) {
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        }
+        if itemsize != 1 {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid type for format 'B'",
+            ));
+        }
+        if !pyre_object::is_int(index) {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid slice key, must be int",
+            ));
+        }
+        let count = pyre_object::bytesobject::bytes_like_len(buf) as i64;
+        let mut i = pyre_object::w_int_get_value(index);
+        if i < 0 {
+            i += count;
+        }
+        if i < 0 || i >= count {
+            return Err(crate::PyError::index_error("index out of bounds"));
+        }
+        if !pyre_object::is_int(value) {
+            return Err(crate::PyError::type_error(
+                "memoryview: invalid type for format 'B'",
+            ));
+        }
+        let v = pyre_object::w_int_get_value(value);
+        if !(0..=255).contains(&v) {
+            return Err(crate::PyError::value_error(
+                "memoryview: invalid value for format 'B'",
+            ));
+        }
+        pyre_object::bytearrayobject::w_bytearray_setitem(buf, i as usize, v as u8);
+        Ok(w_none())
+    }
+}
+
+/// `memoryview.tobytes` — copy the backing buffer to a `bytes`.
+fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, _, _) = memoryview_data(mv)?;
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+    }
+}
+
+/// `memoryview.__iter__` — yield the unpacked elements in order.
+fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let n = data.len() / itemsize;
+        let items: Vec<PyObjectRef> = (0..n)
+            .map(|i| w_int_new(memoryview_unpack(&data, itemsize, i)))
+            .collect();
+        crate::baseobjspace::iter(w_list_new(items))
+    }
+}
+
+/// `memoryview.__contains__` — membership over the unpacked elements.
+fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let needle = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        if !pyre_object::is_int(needle) {
+            return Ok(w_bool_from(false));
+        }
+        let target = pyre_object::w_int_get_value(needle);
+        let (data, itemsize, _) = memoryview_data(mv)?;
+        let n = data.len() / itemsize;
+        let found = (0..n).any(|i| memoryview_unpack(&data, itemsize, i) == target);
+        Ok(w_bool_from(found))
+    }
+}
+
+/// `memoryview.readonly` — false only for a mutable (bytearray) backing.
+fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
+        Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(buf)))
+    }
+}
+
+/// `memoryview.nbytes` — total byte length of the backing buffer.
+fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (data, _, _) = memoryview_data(mv)?;
+        Ok(w_int_new(data.len() as i64))
+    }
+}
+
+/// `memoryview.format` — the stored struct format string.
+fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    crate::baseobjspace::getattr(mv, "__pyre_fmt__")
+}
+
+/// `memoryview.ndim` — the stub models only 1-D views.
+fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_int_new(1))
+}
+
 pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("print", || {
         make_module_builtin_function("print", builtin_print)
@@ -266,6 +450,49 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     pyre_object::PY_NULL,
                 ),
             );
+            // Buffer-protocol accessors over the stored backing buffer.
+            crate::dict_storage_store(
+                ns,
+                "__getitem__",
+                make_builtin_function_with_arity("__getitem__", memoryview_getitem, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__setitem__",
+                make_builtin_function_with_arity("__setitem__", memoryview_setitem, 3),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__iter__",
+                make_builtin_function_with_arity("__iter__", memoryview_iter, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__contains__",
+                make_builtin_function_with_arity("__contains__", memoryview_contains, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "tobytes",
+                make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
+            );
+            type MvGetter = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
+            for (attr, getter) in [
+                ("readonly", memoryview_readonly as MvGetter),
+                ("nbytes", memoryview_nbytes),
+                ("format", memoryview_format),
+                ("ndim", memoryview_ndim),
+            ] {
+                crate::dict_storage_store(
+                    ns,
+                    attr,
+                    pyre_object::w_property_new(
+                        make_builtin_function_with_arity(attr, getter, 1),
+                        pyre_object::PY_NULL,
+                        pyre_object::PY_NULL,
+                    ),
+                );
+            }
         });
         // Store per-instance __pyre_buf__/__pyre_fmt__/__pyre_itemsize__ slots.
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
