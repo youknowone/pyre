@@ -5893,9 +5893,32 @@ fn try_walker_inline_user_call(
     callee_frame.fix_array_ptrs();
     callee_frame_ptr = &callee_frame as *const _ as pyre_object::PyObjectRef;
 
-    // Emit the symbolic callee-frame OpRef (commits to inlining: IR follows).
-    // Args cross the call boundary boxed, so they are Ref-typed here.
+    // Pre-check the frame helper is wired BEFORE emitting any IR, so the
+    // unsupported-arity path bails cleanly (no orphan guard/call).
+    let frame_helper = if nparams == 1 {
+        None // one_arg_callee_frame_helper, resolved below
+    } else {
+        match (crate::callbacks::get().callee_frame_helper)(nparams) {
+            Some(h) => Some(h),
+            None => return Ok(None),
+        }
+    };
+
+    // Specialize the inlined body on this exact callable: pyjitpl
+    // `recursive_call` emits `guard_value(callable)` before building the
+    // callee frame (build_pending_inline_frame:5986).  The guard resumes at
+    // the call boundary (single outer Python frame — sound: re-execute the
+    // whole call on deopt).
     let callable_opref = r_args[1];
+    let callable_expected = ctx.trace_ctx.const_ref(callable as usize as i64);
+    if !callable_opref.is_constant() {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_opref, callable_expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+
+    // Emit the symbolic callee-frame OpRef.  Args cross the call boundary
+    // boxed, so they are Ref-typed here.
     let callee_frame_opref = if nparams == 1 {
         let (helper, helper_arg_types) =
             crate::state::one_arg_callee_frame_helper(Type::Ref, false);
@@ -5905,7 +5928,8 @@ fn try_walker_inline_user_call(
             &helper_arg_types,
             default_effect_info(),
         )
-    } else if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nparams) {
+    } else {
+        let frame_helper = frame_helper.expect("checked Some above for nparams >= 2");
         let mut helper_args = vec![ctx.registers_r[0], callable_opref];
         helper_args.extend_from_slice(&r_args[2..2 + nparams]);
         let helper_arg_types = crate::state::frame_callable_arg_types(nparams);
@@ -5915,9 +5939,12 @@ fn try_walker_inline_user_call(
             &helper_arg_types,
             default_effect_info(),
         )
-    } else {
-        return Ok(None);
     };
+    // pyjitpl recursive_call emits GUARD_NO_EXCEPTION right after the
+    // callee-frame build helper (build_pending_inline_frame:6153).
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
     let (
         mut callee_regs_r,
