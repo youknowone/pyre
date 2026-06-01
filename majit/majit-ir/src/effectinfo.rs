@@ -514,6 +514,16 @@ pub enum OopSpecIndex {
     // virtualizable each iteration; other receivers fall through to the
     // residual.
     StoreSubscr = 204,
+    // pyre-specific: `load_global_fn` performs the `LOAD_GLOBAL` module-dict
+    // lookup as a CanRaise residual.  Tagging the calldescr lets the full-body
+    // walker emit the cell-cache fast path (`quasiimmut_field` + elidable cell
+    // lookup) so a module-global read folds to a loop-invariant cell pointer
+    // instead of repeating the opaque call each iteration; other receivers
+    // fall through to the residual.  The fold is dev-gated
+    // (`PYRE_FBW_LOADGLOBAL_FOLD`) and incomplete pending FBW call-inlining —
+    // it mis-resolves a folded function callee through the in-progress inline
+    // path, so it stays default-off.
+    LoadGlobal = 205,
 }
 
 impl EffectInfo {

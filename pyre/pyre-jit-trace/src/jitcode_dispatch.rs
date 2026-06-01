@@ -7575,6 +7575,104 @@ fn try_walker_specialize_compare_op_float(
     Ok(Some(()))
 }
 
+/// #62 LoadGlobal cell-cache fold — walker mirror of the trait LOAD_GLOBAL
+/// fast path (`opcode_handler_impls_post.template.rs` `load_global_value`).
+///
+/// When `ns` is a `W_ModuleDictObject` still in `ModuleDictStrategy` mode
+/// whose slot for `name` holds a raw value or an `ObjectMutableCell`, emit
+/// `QUASIIMMUT_FIELD(ns, slot)` + `RECORD_KNOWN_RESULT` + an elidable cell
+/// lookup that the optimizer folds to the constant cell pointer.  The
+/// strategy's `version?` watcher invalidates the loop (GUARD_NOT_INVALIDATED)
+/// on any rebind, so the fold is sound while `load_global_fn` itself stays
+/// `CallFlavor::Plain`.  Returns `Ok(true)` when the fold was emitted;
+/// `Ok(false)` when the receiver is not a foldable cell (the caller then
+/// falls through to the generic residual, which stays correct).
+///
+/// DEV-GATED + INCOMPLETE: callers gate this on `PYRE_FBW_LOADGLOBAL_FOLD`
+/// (default off).  When the loaded global is a function that is then CALLed,
+/// folding it to a loop-invariant constant callee routes the call through the
+/// in-progress FBW call-inlining path (#68), which mis-resolves the callee and
+/// produces wrong output.  Keep default-off until #68 lands.
+fn try_walker_load_global_cell_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    ns_ptr: usize,
+    w_code_ptr: usize,
+    namei: i64,
+) -> Result<bool, DispatchError> {
+    let w_globals = ns_ptr as pyre_object::PyObjectRef;
+    let name = unsafe {
+        let code = &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject);
+        match pyre_interpreter::pyframe::load_name_from_code(code, namei as usize) {
+            Some(n) => n.to_string(),
+            None => return Ok(false),
+        }
+    };
+    // Cell fast path applies only to a module dict still in strategy mode
+    // whose slot holds a raw value or an `ObjectMutableCell`; null/absent
+    // keys and `IntMutableCell` slots fall through to the residual.
+    let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, &name) else {
+        return Ok(false);
+    };
+    let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) else {
+        return Ok(false);
+    };
+    if stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+        return Ok(false);
+    }
+    let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
+    let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
+
+    let ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
+    let slot_const = ctx.trace_ctx.const_int(slot as i64);
+    ctx.trace_ctx
+        .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+    let lookup_fn = crate::helpers::jit_namespace_cell_lookup as *const ();
+    let lookup_args = [ns_const, slot_const];
+    let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];
+    ctx.trace_ctx.record_known_result_typed(
+        stored as i64,
+        lookup_fn,
+        &lookup_args,
+        &lookup_arg_types,
+        majit_ir::Type::Ref,
+        majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
+    );
+    let concrete_args = crate::helpers::namespace_slot_lookup_values(lookup_fn, w_globals, slot);
+    let concrete_cell = crate::helpers::namespace_slot_lookup_result(stored);
+    let cell_opref = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
+        ctx.trace_ctx,
+        lookup_fn,
+        &lookup_args,
+        &lookup_arg_types,
+        &concrete_args,
+        concrete_cell,
+    );
+    // An `ObjectMutableCell` needs `cell.w_value` read LIVE so a same-key
+    // reassign (in-place `write_cell`, no version bump) is observed each
+    // iteration; a raw stored value is its own result.
+    let result_opref = if is_obj_cell {
+        crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            cell_opref,
+            crate::descr::object_mutable_cell_value_descr(),
+        )
+    } else {
+        cell_opref
+    };
+    // Seed the dst's concrete with the unwrapped LOAD result so chained
+    // walker handlers see the resolved value instead of `Null`.
+    ctx.trace_ctx.set_opref_concrete(
+        result_opref,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
+    Ok(true)
+}
+
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iIRd_kind(
     code: &[u8],
@@ -7655,6 +7753,49 @@ fn dispatch_residual_call_iIRd_kind(
                 let const_box = ctx.trace_ctx.const_ref(w_const as i64);
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, const_box)?;
                 return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
+    }
+
+    // LoadGlobal fold (#62): mirror the trait LOAD_GLOBAL cell fast-path so
+    // the optimizer hoists the module-global lookup out of the loop instead of
+    // keeping the opaque CanRaise residual every iteration.  Requires namei
+    // (i_args[0]), namespace (r_args[0]), and promoted pycode (r_args[1])
+    // concrete; only the cell-strategy module-dict fast path is foldable.
+    //
+    // Skip handler-bearing bodies: `load_global_fn` is `CallFlavor::Plain`
+    // (can raise), so the generic residual path normally trips
+    // `walker_abort_if_protected_may_force` and falls the whole loop back to
+    // the trait tracer when a `catch_exception/L` is present.  Folding here
+    // would suppress that abort and let the walk compile a try/except body it
+    // cannot yet resume.
+    //
+    // DEV-GATED `PYRE_FBW_LOADGLOBAL_FOLD` (default off): the fold is incomplete
+    // pending FBW call-inlining (#68) — a folded function callee mis-resolves
+    // through the in-progress inline path and produces wrong output for
+    // global-function-call loops.  See `try_walker_load_global_cell_fold`.
+    if ctx.is_authoritative_executor
+        && ei.oopspecindex == majit_ir::OopSpecIndex::LoadGlobal
+        && !jitcode_has_exception_handler(code)
+        && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").is_ok()
+    {
+        if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
+            (i_args.first(), r_args.first(), r_args.get(1))
+        {
+            if let (
+                Some(majit_ir::Value::Int(namei)),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(ns_ptr))),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(namei_opref),
+                ctx.trace_ctx.box_value(ns_opref),
+                ctx.trace_ctx.box_value(code_opref),
+            ) {
+                if try_walker_load_global_cell_fold(
+                    ctx, op.pc, dst, dst_bank, ns_ptr, w_code_ptr, namei,
+                )? {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
             }
         }
     }

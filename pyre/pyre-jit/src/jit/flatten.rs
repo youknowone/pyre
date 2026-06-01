@@ -3487,7 +3487,12 @@ fn build_load_global_fn_insn_from_operands(
     frame_operand: Operand,
     dst_reg: u16,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    // Tag the calldescr so the full-body walker can recognize this as the
+    // `LOAD_GLOBAL` module-dict read and emit the cell-cache fold; the
+    // recognition reader is dev-gated and default-off (see OopSpecIndex::
+    // LoadGlobal).
+    effect_info.oopspecindex = majit_ir::OopSpecIndex::LoadGlobal;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],

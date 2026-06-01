@@ -2471,6 +2471,13 @@ pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
     pyobject_from_constant(&constants[idx])
 }
 
+/// `co_names[idx]` — the global/attribute name at `idx`, used by the JIT
+/// full-body walker to resolve a `LOAD_GLOBAL` namei to the name string for
+/// the module-dict cell-cache lookup.  `None` when `idx` is out of range.
+pub fn load_name_from_code(code: &CodeObject, idx: usize) -> Option<&str> {
+    code.names.get(idx).map(|s| s.as_str())
+}
+
 fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {
     unsafe {
         std::slice::from_raw_parts(

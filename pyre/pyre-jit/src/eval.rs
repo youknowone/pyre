@@ -3678,7 +3678,10 @@ fn handle_fail(
     // recursion-heavy guard chains (fib_recursive), so a per-call
     // `env::var_os` would add measurable overhead.
     static FULL_BODY_WALK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FULL_BODY_WALK.get_or_init(|| std::env::var_os("PYRE_FULL_BODY_WALK").is_some()) {
+    if *FULL_BODY_WALK.get_or_init(|| {
+        std::env::var_os("PYRE_FULL_BODY_WALK").is_some()
+            && std::env::var_os("PYRE_FBW_BRIDGE").is_none()
+    }) {
         return HandleFailOutcome::ResumeInBlackhole;
     }
     // compile.py:702-703: must_compile() AND not stack_almost_full()

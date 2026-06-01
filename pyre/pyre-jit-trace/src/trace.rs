@@ -88,7 +88,7 @@ pub fn trace_bytecode(
     // jitcode_pc` and lets `pc_map` retire.  Default-off → the trait path is
     // unchanged (check.py 39/39).  The harness for validating
     // guard-snapshot/resume correctness over a compiled full-body trace.
-    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() {
+    if std::env::var_os("PYRE_FULL_BODY_WALK").is_some() && !ctx.is_bridge_trace {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
     }
