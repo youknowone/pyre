@@ -2188,43 +2188,65 @@ fn init_socket_type(ns: &mut DictStorage) {
         }),
     );
 
-    // Attribute getters baked as methods so plain Python access also
-    // works.  Unrolled because `make_builtin_function_with_arity` takes a
-    // fn pointer that can't carry a captured key.
+    // `interp_socket.py:1157-1160` — `family`/`type`/`proto`/`timeout`
+    // are GetSetProperty data descriptors (plain attribute access, not
+    // callables).  The getter receives `(descriptor, instance)`, so the
+    // socket object is `args[1]`.
     crate::dict_storage_store(
         ns,
         "family",
-        crate::make_builtin_function_with_arity(
+        crate::typedef::make_getset_descriptor_named(
+            crate::make_builtin_function_with_arity(
+                "family",
+                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_family"))),
+                2,
+            ),
             "family",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_int_new(socket_get_attr_i64(obj, "_family")))
-            },
-            1,
         ),
     );
     crate::dict_storage_store(
         ns,
         "type",
-        crate::make_builtin_function_with_arity(
+        crate::typedef::make_getset_descriptor_named(
+            crate::make_builtin_function_with_arity(
+                "type",
+                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_type"))),
+                2,
+            ),
             "type",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_int_new(socket_get_attr_i64(obj, "_type")))
-            },
-            1,
         ),
     );
     crate::dict_storage_store(
         ns,
         "proto",
-        crate::make_builtin_function_with_arity(
+        crate::typedef::make_getset_descriptor_named(
+            crate::make_builtin_function_with_arity(
+                "proto",
+                |args| Ok(pyre_object::w_int_new(socket_get_attr_i64(args[1], "_proto"))),
+                2,
+            ),
             "proto",
-            |args| {
-                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                Ok(pyre_object::w_int_new(socket_get_attr_i64(obj, "_proto")))
-            },
-            1,
+        ),
+    );
+    // `interp_socket.py:454 gettimeout_w` — `timeout` is the stored
+    // `_timeout` object (float, or `None` when disabled).
+    crate::dict_storage_store(
+        ns,
+        "timeout",
+        crate::typedef::make_getset_descriptor_named(
+            crate::make_builtin_function_with_arity(
+                "timeout",
+                |args| {
+                    let d = crate::baseobjspace::getdict(args[1]);
+                    if d.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    Ok(unsafe { pyre_object::w_dict_getitem_str(d, "_timeout") }
+                        .unwrap_or(pyre_object::w_none()))
+                },
+                2,
+            ),
+            "timeout",
         ),
     );
 
