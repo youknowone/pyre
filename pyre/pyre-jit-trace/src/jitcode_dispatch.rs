@@ -6054,7 +6054,17 @@ fn walker_int_specialization_operands(
     let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let (lhs_val, rhs_val) = unsafe {
-        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
+        // Exclude `bool`: though a subtype of int, `W_BoolObject` has its own
+        // `&BOOL_TYPE` vtable and a 1-byte `boolval` field, not `W_IntObject`'s
+        // 8-byte `intval` at offset 16.  Int-path unbox (`GuardClass INT_TYPE` +
+        // `getfield intval`) would guard the wrong class and read 7 bytes past
+        // `boolval`.  Route bool operands through the generic residual call,
+        // which forces the correct value.
+        if !pyre_object::is_int(lhs_obj)
+            || !pyre_object::is_int(rhs_obj)
+            || pyre_object::is_bool(lhs_obj)
+            || pyre_object::is_bool(rhs_obj)
+        {
             return None;
         }
         (
@@ -6088,7 +6098,11 @@ fn walker_float_specialization_operands(
     let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
     let coerce = |obj: pyre_object::PyObjectRef| -> Option<(bool, f64)> {
         unsafe {
-            if pyre_object::is_int(obj) {
+            // Exclude `bool` from the int arm for the same reason as the int
+            // specialization: its layout/vtable differ from `W_IntObject`, so
+            // unboxing it as an int reads the wrong field.  `None` here routes
+            // the operation through the generic residual call.
+            if pyre_object::is_int(obj) && !pyre_object::is_bool(obj) {
                 Some((true, pyre_object::w_int_get_value(obj) as f64))
             } else if pyre_object::is_float(obj) {
                 Some((false, pyre_object::w_float_get_value(obj)))
