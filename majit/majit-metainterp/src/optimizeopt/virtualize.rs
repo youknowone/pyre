@@ -942,17 +942,16 @@ impl OptVirtualize {
             .get_box_replacement_box(index_ref)
             .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            if let Some(array_box) = array_box.as_ref() {
-                if let Some(item_ref) = self
-                    .vable
-                    .as_ref()
-                    .and_then(|vt| vt.tracked_array_element(array_box, index, ctx))
-                {
-                    let b_old = ctx.materialize_box_at(op.pos.get());
-                    let b_item = ctx.materialize_box_at(item_ref);
-                    ctx.make_equal_to(&b_old, &b_item);
-                    return OptimizationResult::Remove;
-                }
+            if let Some(item_ref) = self
+                .vable
+                .as_ref()
+                .zip(array_box.as_ref())
+                .and_then(|(vt, ab)| vt.tracked_array_element(ab, index, ctx))
+            {
+                let b_old = ctx.materialize_box_at(op.pos.get());
+                let b_item = ctx.materialize_box_at(item_ref);
+                ctx.make_equal_to(&b_old, &b_item);
+                return OptimizationResult::Remove;
             }
         }
         // virtualize.py:287: self.make_nonnull(op.getarg(0))
