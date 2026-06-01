@@ -5851,7 +5851,10 @@ fn try_walker_inline_user_call(
     // Eligibility needing a frame helper: exactly 1 or 2 positional params
     // (the only `one_arg_callee_frame_helper` / `callee_frame_helper(n)`
     // shapes wired so far) and a Ref-bank `r0` slot.
-    if nparams == 0 || body.num_regs_r == 0 {
+    // Straight-line entry (pc=0) seeds the jitdriver args [pycode, frame, ec]
+    // into r0/r1/r2 (trace.rs:341-345 setup_call positional fill), so the
+    // body needs at least those three Ref slots and reads its vable from r1.
+    if nparams == 0 || body.num_regs_r < 3 {
         return Ok(None);
     }
     // Concrete caller frame (for the execution context) + concrete args must
@@ -5867,10 +5870,11 @@ fn try_walker_inline_user_call(
             _ => return Ok(None),
         }
     }
+    let exec_ctx =
+        unsafe { (*(caller_frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).execution_context };
     let callee_frame_ptr;
     let mut callee_frame = unsafe {
         use pyre_interpreter::pyframe::PyFrame;
-        let exec_ctx = (*(caller_frame_ptr as *const PyFrame)).execution_context;
         let globals = pyre_interpreter::function_get_globals(callable);
         let globals_obj = pyre_interpreter::function_get_globals_obj(callable);
         let closure = pyre_interpreter::function_get_closure(callable);
@@ -5922,10 +5926,19 @@ fn try_walker_inline_user_call(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
-    // r0 = the callee frame (portal-runner contract); locals live in the
-    // frame's heap localsplus, read by the body's getfield_vable_r.
-    callee_regs_r[0] = callee_frame_opref;
-    callee_concrete_r[0] = ConcreteValue::Ref(callee_frame_ptr);
+    // Straight-line callee entry: the setup_call positional per-bank fill
+    // places the jitdriver args [pycode, frame, ec] at r0/r1/r2
+    // (trace.rs:341-345).  The body reads its vable from r1, so seed all
+    // three; locals live in the frame's heap localsplus, read by the body's
+    // getfield_vable_r against the r1 frame.
+    let pycode_opref = ctx.trace_ctx.const_ref(w_code as i64);
+    let ec_opref = ctx.trace_ctx.const_ref(exec_ctx as i64);
+    callee_regs_r[0] = pycode_opref;
+    callee_concrete_r[0] = ConcreteValue::Ref(w_code as pyre_object::PyObjectRef);
+    callee_regs_r[1] = callee_frame_opref;
+    callee_concrete_r[1] = ConcreteValue::Ref(callee_frame_ptr);
+    callee_regs_r[2] = ec_opref;
+    callee_concrete_r[2] = ConcreteValue::Ref(exec_ctx as pyre_object::PyObjectRef);
 
     let callee_outcome = {
         let mut sub_wc = WalkContext {
