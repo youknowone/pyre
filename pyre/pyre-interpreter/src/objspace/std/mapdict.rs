@@ -520,6 +520,11 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &str, attrkind: u16) -> Opt
 // W_Root into the untyped storage list) are the identity here.
 
 pub trait MapdictObject {
+    /// The object's own `W_Root` reference. `DevolvedDictTerminator` reaches the
+    /// instance dict through `obj.getdict(space)` (mapdict.py:386,393); pyre
+    /// threads the same identity so `_obj_getdict` can key the dict by object
+    /// address.
+    fn _mapdict_self_ref(&self) -> PyObjectRef;
     /// mapdict.py:905-906 `_get_mapdict_map` (`jit.promote(self.map)`).
     fn _get_mapdict_map(&self) -> MapRef;
     /// mapdict.py:907-908 `_set_mapdict_map`.
@@ -709,20 +714,18 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
 /// `term` must point to a live Terminator map node.
 unsafe fn terminator_read<O: MapdictObject>(
     term: MapRef,
-    _obj: &O,
-    _name: &str,
+    obj: &O,
+    name: &str,
     attrkind: u16,
 ) -> Option<PyObjectRef> {
     let t = unsafe { (*term).as_terminator() };
     match t.kind {
         TerminatorKind::Devolved if attrkind == DICT => {
-            // DevolvedDictTerminator reads from the instance dict
-            // (`space.finditem_str(obj.getdict(space), name)`). `getdict` and
-            // MapDictStrategy are not yet ported; a DevolvedDictTerminator only
-            // arises after the 80-attribute devolve (Slice 8), unreachable here.
-            unimplemented!(
-                "DevolvedDictTerminator._read_terminator (mapdict.py:387-391): needs getdict"
-            )
+            // DevolvedDictTerminator._read_terminator (mapdict.py:383-387):
+            // `w_dict = obj.getdict(space); return space.finditem_str(w_dict, name)`.
+            // `finditem_str` yields NULL (here `None`) when the key is absent.
+            let w_dict = _obj_getdict(obj._mapdict_self_ref());
+            unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }
         }
         // Terminator / DictTerminator / NoDictTerminator read nothing.
         _ => None,
@@ -1043,13 +1046,12 @@ unsafe fn write_terminator<O: MapdictObject>(
     match kind {
         // NoDictTerminator: object without __dict__ rejects DICT writes.
         TerminatorKind::NoDict if attrkind == DICT => return false,
-        TerminatorKind::Devolved => {
-            // DevolvedDictTerminator writes to the instance dict
-            // (`space.setitem_str`). Needs getdict; only arises after the
-            // 80-attribute devolve (Slice 8). Unreachable here.
-            unimplemented!(
-                "DevolvedDictTerminator._write_terminator (mapdict.py:393-399): needs getdict"
-            )
+        TerminatorKind::Devolved if attrkind == DICT => {
+            // DevolvedDictTerminator._write_terminator (mapdict.py:390-395):
+            // `w_dict = obj.getdict(space); space.setitem_str(w_dict, name, w_value); return True`.
+            let w_dict = _obj_getdict(obj._mapdict_self_ref());
+            unsafe { pyre_object::w_dict_setitem_str(w_dict, name, w_value) };
+            return true;
         }
         _ => {}
     }
@@ -1058,9 +1060,16 @@ unsafe fn write_terminator<O: MapdictObject>(
     if attrkind == DICT
         && unsafe { (*obj._get_mapdict_map()).num_attributes() } >= LIMIT_MAP_ATTRIBUTES
     {
-        // Past LIMIT_MAP_ATTRIBUTES, switch the instance dict to a real dict
-        // strategy (`MapDictStrategy.switch_to_text_strategy`, mapdict.py:317-320).
-        // MapDictStrategy is deferred to Slice 8.
+        // mapdict.py:317-320 switches the instance __dict__ from the lazy
+        // MapDictStrategy view to an eager UnicodeDictStrategy and devolves the
+        // map to DevolvedDictTerminator via materialize_str_dict
+        // (`switch_to_text_strategy`, mapdict.py:1148-1155). pyre cannot port
+        // this yet: there is no MapDictStrategy (StrategyKind has no Map variant)
+        // and no materialize_str_dict / _make_devolved / _set_mapdict_storage_and_map,
+        // so `_obj_getdict` returns a separate eager dict rather than a view of
+        // the mapdict storage. Switching a strategy here would strand these
+        // attributes in mapdict storage with no devolve. Deferred to Slice 8
+        // together with the DevolvedDictTerminator devolve transition.
     }
     true
 }
@@ -1376,6 +1385,9 @@ mod tests {
     }
 
     impl MapdictObject for MockObj {
+        fn _mapdict_self_ref(&self) -> PyObjectRef {
+            self as *const Self as PyObjectRef
+        }
         fn _get_mapdict_map(&self) -> MapRef {
             self.map
         }
