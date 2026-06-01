@@ -193,6 +193,50 @@ fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(1))
 }
 
+/// Unpack a memoryview-or-bytes-like operand to its element value list,
+/// or `None` when it is neither (so `__eq__` can return NotImplemented).
+unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
+    if let Some(t) = crate::typedef::r#type(obj) {
+        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
+            let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
+            let n = data.len() / itemsize;
+            return Some((0..n).map(|i| memoryview_unpack(&data, itemsize, i)).collect());
+        }
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
+        return Some(data.iter().map(|&b| b as i64).collect());
+    }
+    None
+}
+
+/// `memoryview.__eq__` — equal element values against another memoryview
+/// or bytes-like; NotImplemented for any other operand.
+fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let other = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let a = memoryview_operand_values(mv).unwrap_or_default();
+        match memoryview_operand_values(other) {
+            Some(b) => Ok(w_bool_from(a == b)),
+            None => Ok(pyre_object::w_not_implemented()),
+        }
+    }
+}
+
+/// `memoryview.__ne__` — negation of `__eq__` over comparable operands.
+fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let other = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        let a = memoryview_operand_values(mv).unwrap_or_default();
+        match memoryview_operand_values(other) {
+            Some(b) => Ok(w_bool_from(a != b)),
+            None => Ok(pyre_object::w_not_implemented()),
+        }
+    }
+}
+
 pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("print", || {
         make_module_builtin_function("print", builtin_print)
@@ -475,6 +519,16 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                 ns,
                 "tobytes",
                 make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__eq__",
+                make_builtin_function_with_arity("__eq__", memoryview_eq, 2),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__ne__",
+                make_builtin_function_with_arity("__ne__", memoryview_ne, 2),
             );
             type MvGetter = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
             for (attr, getter) in [
