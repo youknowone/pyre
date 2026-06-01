@@ -5681,6 +5681,18 @@ pub(crate) fn bh_store_subscr_fn_addr_cached() -> Option<usize> {
 /// `_opimpl_recursive_call`) before any inline sub-walk wiring lands.
 fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
     let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+    // Single-letter kind tag per arg, so the call_fn arg layout (which slot
+    // holds the callable vs the positional args) can be read off empirically
+    // without touching CodeObject internals.
+    let shape: String = arg_concretes
+        .iter()
+        .map(|cv| match cv {
+            ConcreteValue::Int(_) => 'i',
+            ConcreteValue::Float(_) => 'f',
+            ConcreteValue::Ref(_) => 'r',
+            ConcreteValue::Null => '_',
+        })
+        .collect();
     for (i, cv) in arg_concretes.iter().enumerate() {
         let ConcreteValue::Ref(obj) = *cv else {
             continue;
@@ -5706,8 +5718,9 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
             let jitcode = crate::state::jitcode_lookup(code);
             let pyjc = crate::state::pyjitcode_for_code(code);
             eprintln!(
-                "[inline-recog] pc={op_pc} arg#{i} user-fn code={code:?} \
+                "[inline-recog] pc={op_pc} nargs={} shape=[{shape}] callable@{i} code={code:?} \
                  setup-store={} codewriter-store={} (on-demand build available)",
+                arg_concretes.len(),
                 if jitcode.is_null() { "MISS" } else { "HIT" },
                 if pyjc.is_none() { "MISS" } else { "HIT" }
             );
