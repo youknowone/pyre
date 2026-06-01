@@ -644,22 +644,19 @@ impl VectorizingOptimizer {
             }
         }
 
-        // schedule.py:762-779: VecScheduleState.post_schedule. Mirrors the call
-        // at the tail of schedule.py:103-106 schedule() (prepare → walk_and_emit →
-        // post_schedule), which runs unconditionally — moving invariant_oplist into
-        // loop.prefix and routing invariant_vector_vars through prefix_label/jump.
-        sched_state.post_schedule(loop_, &mut seen);
-
-        // vector.py:257-258: profitability check — runs AFTER post_schedule
-        // (schedule.py:103-106 runs post_schedule inside schedule(); the
-        // `if not state.profitable(): raise` check is the next statement at
-        // vector.py:257). A distinct error variant lets the caller react to
-        // cost-model rejection separately from a structural bail. On this Err
-        // the optimize_vector caller restores the pre-vectorize snapshot
-        // (vector.rs `*loop_ = version`), discarding the post_schedule mutation.
+        // vector.py:515-520 schedule(): `walk_and_emit` then, only when the
+        // cost model is profitable, `post_schedule()`. An unprofitable loop
+        // returns *before* post_schedule, so loop_ is never mutated by it.
+        // vector.py:256-258 then raises NotAProfitableLoop on the same check;
+        // run_optimization collapses both into this single early Err.
         if !sched_state.costmodel.profitable() {
             return Err(VectorizeError::NotProfitable);
         }
+
+        // schedule.py:762-779: VecScheduleState.post_schedule — moves
+        // invariant_oplist into loop.prefix and routes invariant_vector_vars
+        // through prefix_label/jump.
+        sched_state.post_schedule(loop_, &mut seen);
 
         // vector.py:267-269: extra_before_label = loop.align_operations;
         // for op in loop.align_operations: op.set_forwarded(None).
