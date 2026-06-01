@@ -596,7 +596,7 @@ pub fn format_simple_call(
 /// ```
 pub fn format_blocked_annotation_error(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    blocked_blocks: &std::collections::HashMap<
+    blocked_blocks: &indexmap::IndexMap<
         crate::flowspace::model::BlockKey,
         (BlockRef, GraphRef, Option<usize>),
     >,

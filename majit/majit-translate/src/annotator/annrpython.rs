@@ -13,6 +13,7 @@
 //! runtime rather than silently no-op'ing.
 
 use std::cell::RefCell;
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -55,7 +56,7 @@ pub struct RPythonAnnotator {
     /// inner map pairs identity-keyed blocks with the owning graph
     /// reference so `processblock(graph, block)` can recover the graph
     /// later in `complete_pending_blocks()`.
-    pub genpendingblocks: RefCell<Vec<HashMap<BlockKey, (BlockRef, GraphRef)>>>,
+    pub genpendingblocks: RefCell<Vec<IndexMap<BlockKey, (BlockRef, GraphRef)>>>,
     /// RPython `self.annotated = {}` (annrpython.py:37).
     ///
     /// Upstream stores `dict[Block, bool | FunctionGraph]`:
@@ -65,7 +66,7 @@ pub struct RPythonAnnotator {
     ///   * `self.annotated[block] == graph`: done.
     /// Rust port models the two non-absent states as
     /// `Option<GraphRef>`: `None = False`, `Some = graph`.
-    pub annotated: RefCell<HashMap<BlockKey, Option<GraphRef>>>,
+    pub annotated: RefCell<IndexMap<BlockKey, Option<GraphRef>>>,
     /// Rust-side identity→BlockRef index. Upstream's `self.annotated`
     /// dict keys ARE the Python `Block` objects, so iterating the dict
     /// yields block references directly. The Rust `BlockKey` identity
@@ -73,30 +74,30 @@ pub struct RPythonAnnotator {
     /// populated in lockstep with every `annotated.insert` and
     /// `blocked_blocks.insert` — to let `call_sites()` walk "all seen
     /// blocks" without hunting through auxiliary tables.
-    pub all_blocks: RefCell<HashMap<BlockKey, BlockRef>>,
+    pub all_blocks: RefCell<IndexMap<BlockKey, BlockRef>>,
     /// RPython `self.added_blocks = None` (annrpython.py:38).
     ///
     /// Upstream sentinel: `None = track nothing`, `{} = start
     /// tracking`, filled by `processblock`. Rust port stores
     /// identity-keyed blocks; the value side is `()` (we only use it
     /// as a set).
-    pub added_blocks: RefCell<Option<HashMap<BlockKey, BlockRef>>>,
+    pub added_blocks: RefCell<Option<IndexMap<BlockKey, BlockRef>>>,
     /// RPython `self.links_followed = {}` (annrpython.py:39).
     pub links_followed: RefCell<HashSet<LinkKey>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
-    pub notify: RefCell<HashMap<BlockKey, HashSet<PositionKey>>>,
+    pub notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
     /// RPython `self.fixed_graphs = {}` (annrpython.py:41). Graphs
     /// that have already been rtyped — `addpendingblock` rejects new
     /// pending entries against these.
-    pub fixed_graphs: RefCell<HashMap<GraphKey, GraphRef>>,
+    pub fixed_graphs: RefCell<IndexMap<GraphKey, GraphRef>>,
     /// RPython `self.blocked_blocks = {}` (annrpython.py:42).
     /// `{blocked_block: (graph, opindex)}`. `opindex == None` upstream
     /// → `None` here (block is blocked at entry, not mid-flow).
-    pub blocked_blocks: RefCell<HashMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>>,
+    pub blocked_blocks: RefCell<IndexMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>>,
     /// RPython `self.blocked_graphs = {}` (annrpython.py:44). Records
     /// graphs that have at least one blocked block; the `bool` value
     /// tracks the `blocked_graphs[graph] = True` flip in `complete()`.
-    pub blocked_graphs: RefCell<HashMap<GraphKey, (GraphRef, bool)>>,
+    pub blocked_graphs: RefCell<IndexMap<GraphKey, (GraphRef, bool)>>,
     /// RPython `self.frozen = False` (annrpython.py:46).
     pub frozen: RefCell<bool>,
     /// RPython `self.policy` (annrpython.py:47-51).
@@ -106,7 +107,7 @@ pub struct RPythonAnnotator {
     /// RPython `self.keepgoing` (annrpython.py:55).
     pub keepgoing: bool,
     /// RPython `self.failed_blocks = set()` (annrpython.py:56).
-    pub failed_blocks: RefCell<HashMap<BlockKey, BlockRef>>,
+    pub failed_blocks: RefCell<IndexMap<BlockKey, BlockRef>>,
     /// RPython `self.errors = []` (annrpython.py:57).
     pub errors: RefCell<Vec<String>>,
 }
@@ -293,7 +294,7 @@ impl<'a> Drop for PolicyGuard<'a> {
 /// self.added_blocks = saved` in `complete_helpers()`.
 struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
-    saved: Option<Option<HashMap<BlockKey, BlockRef>>>,
+    saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
 }
 
 impl<'a> Drop for AddedBlocksGuard<'a> {
@@ -357,20 +358,20 @@ impl RPythonAnnotator {
             bookkeeper.set_annotator(weak.clone());
             RPythonAnnotator {
                 translator: Rc::clone(&translator),
-                genpendingblocks: RefCell::new(vec![HashMap::new()]),
-                annotated: RefCell::new(HashMap::new()),
-                all_blocks: RefCell::new(HashMap::new()),
+                genpendingblocks: RefCell::new(vec![IndexMap::new()]),
+                annotated: RefCell::new(IndexMap::new()),
+                all_blocks: RefCell::new(IndexMap::new()),
                 added_blocks: RefCell::new(None),
                 links_followed: RefCell::new(HashSet::new()),
-                notify: RefCell::new(HashMap::new()),
-                fixed_graphs: RefCell::new(HashMap::new()),
-                blocked_blocks: RefCell::new(HashMap::new()),
-                blocked_graphs: RefCell::new(HashMap::new()),
+                notify: RefCell::new(IndexMap::new()),
+                fixed_graphs: RefCell::new(IndexMap::new()),
+                blocked_blocks: RefCell::new(IndexMap::new()),
+                blocked_graphs: RefCell::new(IndexMap::new()),
                 frozen: RefCell::new(false),
                 policy: RefCell::new(annotator_policy),
                 bookkeeper: Rc::clone(&bookkeeper),
                 keepgoing,
-                failed_blocks: RefCell::new(HashMap::new()),
+                failed_blocks: RefCell::new(IndexMap::new()),
                 errors: RefCell::new(Vec::new()),
             }
         });
@@ -716,7 +717,7 @@ impl RPythonAnnotator {
     ///         self.added_blocks = saved
     /// ```
     pub fn complete_helpers(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
-        let saved = self.added_blocks.borrow_mut().replace(HashMap::new());
+        let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
         let _guard = AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
@@ -1343,7 +1344,7 @@ impl RPythonAnnotator {
         let generation = block.borrow().generation.unwrap_or(0) as usize;
         let mut pending = self.genpendingblocks.borrow_mut();
         while pending.len() <= generation {
-            pending.push(HashMap::new());
+            pending.push(IndexMap::new());
         }
         pending[generation].insert(BlockKey::of(block), (Rc::clone(block), Rc::clone(graph)));
     }
@@ -1375,7 +1376,7 @@ impl RPythonAnnotator {
             {
                 let mut pending = self.genpendingblocks.borrow_mut();
                 if pending.len() == generation + 1 {
-                    pending.push(HashMap::new());
+                    pending.push(IndexMap::new());
                 }
             }
 
@@ -1384,7 +1385,7 @@ impl RPythonAnnotator {
                 let entry = {
                     let mut pending = self.genpendingblocks.borrow_mut();
                     match pending[generation].keys().next().cloned() {
-                        Some(k) => pending[generation].remove(&k),
+                        Some(k) => pending[generation].shift_remove(&k),
                         None => None,
                     }
                 };
@@ -2404,7 +2405,7 @@ impl RPythonAnnotator {
             return Ok(());
         }
         // upstream: `if block in self.blocked_blocks: del ...`.
-        self.blocked_blocks.borrow_mut().remove(&bkey);
+        self.blocked_blocks.borrow_mut().shift_remove(&bkey);
 
         // upstream annrpython.py:397-406:
         //     try:
@@ -2586,7 +2587,7 @@ mod tests {
         let block = graph.borrow().startblock.clone();
         ann.added_blocks
             .borrow_mut()
-            .replace(HashMap::from([(BlockKey::of(&block), block.clone())]));
+            .replace(IndexMap::from([(BlockKey::of(&block), block.clone())]));
 
         ann.complete_helpers().unwrap();
 
@@ -2603,7 +2604,7 @@ mod tests {
         let block = graph.borrow().startblock.clone();
         ann.added_blocks
             .borrow_mut()
-            .replace(HashMap::from([(BlockKey::of(&block), block.clone())]));
+            .replace(IndexMap::from([(BlockKey::of(&block), block.clone())]));
         ann.bookkeeper
             .pending_specializations
             .borrow_mut()
@@ -2879,7 +2880,7 @@ mod tests {
 
         ann.added_blocks
             .borrow_mut()
-            .replace(HashMap::from([(BlockKey::of(&block), block)]));
+            .replace(IndexMap::from([(BlockKey::of(&block), block)]));
 
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ann.complete()))
             .expect_err("missing annotated entry should still panic");
