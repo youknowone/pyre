@@ -5837,7 +5837,15 @@ fn try_walker_inline_user_call(
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
         };
-        let (outcome, _end_pc) = walk(body.code, 0, &mut sub_wc)?;
+        let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
+            Ok(v) => v,
+            Err(e) => {
+                if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+                    eprintln!("[inline-abort] callee sub-walk err: {e:?}");
+                }
+                return Err(e);
+            }
+        };
         outcome
     };
 
