@@ -28,7 +28,7 @@ fn default_poll_events() -> i16 {
 /// Resolve a Python fd argument (int or object with `fileno()`) to a
 /// raw descriptor — `space.c_filedescriptor_w`.
 #[cfg(all(unix, feature = "host_env"))]
-fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
+pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
     unsafe {
         let fd_val = if pyre_object::is_int(w_fd) {
             pyre_object::w_int_get_value(w_fd)
@@ -381,6 +381,35 @@ pub fn register_module(ns: &mut DictStorage) {
         ev!("POLLRDBAND", libc::POLLRDBAND);
         ev!("POLLWRNORM", libc::POLLWRNORM);
         ev!("POLLWRBAND", libc::POLLWRBAND);
+    }
+
+    // `interp_kqueue.py` — kqueue() / kevent objects plus the KQ_* event
+    // filter and flag constants (BSD/macOS only).
+    #[cfg(all(target_os = "macos", feature = "host_env"))]
+    {
+        crate::dict_storage_store(ns, "kqueue", super::interp_kqueue::type_object());
+        crate::dict_storage_store(ns, "kevent", super::interp_kevent::type_object());
+        macro_rules! kq {
+            ($name:literal, $val:expr) => {
+                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        // `interp_kqueue.py:62 symbol_map` — KQ_FILTER_* / KQ_EV_*.
+        kq!("KQ_FILTER_READ", libc::EVFILT_READ);
+        kq!("KQ_FILTER_WRITE", libc::EVFILT_WRITE);
+        kq!("KQ_FILTER_AIO", libc::EVFILT_AIO);
+        kq!("KQ_FILTER_VNODE", libc::EVFILT_VNODE);
+        kq!("KQ_FILTER_PROC", libc::EVFILT_PROC);
+        kq!("KQ_FILTER_SIGNAL", libc::EVFILT_SIGNAL);
+        kq!("KQ_FILTER_TIMER", libc::EVFILT_TIMER);
+        kq!("KQ_EV_ADD", libc::EV_ADD);
+        kq!("KQ_EV_DELETE", libc::EV_DELETE);
+        kq!("KQ_EV_ENABLE", libc::EV_ENABLE);
+        kq!("KQ_EV_DISABLE", libc::EV_DISABLE);
+        kq!("KQ_EV_ONESHOT", libc::EV_ONESHOT);
+        kq!("KQ_EV_CLEAR", libc::EV_CLEAR);
+        kq!("KQ_EV_EOF", libc::EV_EOF);
+        kq!("KQ_EV_ERROR", libc::EV_ERROR);
     }
 
     // `interp_select.py:35 W_Error = OSError` — expose the real type so
