@@ -3896,6 +3896,57 @@ impl<'a> AssemblerARM64<'a> {
     // assembler.py:965-987 patch_jump_for_descr
     // ----------------------------------------------------------------
 
+    /// Overwrite the code at `at` with a branch to `target`.
+    ///
+    /// `link` selects the branch form to match the upstream method this
+    /// stands in for: assembler.py patch_trace overwrites a guard stub with
+    /// `BL` (branch-with-link → bridge), while redirect_call_assembler
+    /// overwrites a loop entry with a plain `B`. A direct `B`/`BL imm26`
+    /// reaches ±128 MB; once the code arena spans more than that, a bridge /
+    /// retraced loop can land farther from the originating guard stub / loop
+    /// entry, so the scaled 26-bit displacement would silently truncate and
+    /// the branch would land on garbage. When the displacement does not fit,
+    /// fall back to materializing the absolute target in ip0 and branching
+    /// through it (`BR`/`BLR x16`) — the indirect form codebuilder.py emits
+    /// for an out-of-range `B`/`BL`. ip0/x16 is call-clobbered scratch at
+    /// every redirect site (the bridge prologue's `_check_frame_depth`
+    /// reloads it before use).
+    ///
+    /// # Safety
+    /// `at` must point to at least 20 writable bytes of now-dead code:
+    /// both callers overwrite the head of a recovery stub / loop prologue
+    /// that is longer than the emitted sequence.
+    unsafe fn write_redirect_branch(at: usize, target: usize, link: bool) {
+        let offset = target as isize - at as isize;
+        // B/BL imm26: signed 26-bit, scaled by 4 → ±128 MB reach.
+        const B_REACH: isize = 1 << 27;
+        if (-B_REACH..B_REACH).contains(&offset) {
+            let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
+            // 0x14000000 = B imm26, 0x94000000 = BL imm26.
+            let opc = if link { 0x9400_0000 } else { 0x1400_0000 };
+            let insn = opc | imm26;
+            codebuf::with_writable(at as *mut u8, 4, || {
+                unsafe { (at as *mut u32).write(insn) };
+            });
+            flush_icache(at as *const u8, 4);
+        } else {
+            // MOVZ/MOVK x16, target; BR/BLR x16 — 5 words. The four MOV words
+            // come from the shared encoder so the veneer stays byte-identical
+            // to emit_mov_imm64 (pinned by frame_depth_patch_words_match_emit_mov_imm64).
+            let mov = Self::encode_mov_imm64_words(16, target as i64);
+            // 0xD61F0000 = BR Xn, 0xD63F0000 = BLR Xn (Rn in bits 9:5).
+            let br = if link { 0xD63F_0000 } else { 0xD61F_0000 };
+            let words: [u32; 5] = [mov[0], mov[1], mov[2], mov[3], br | (16 << 5)];
+            codebuf::with_writable(at as *mut u8, words.len() * 4, || {
+                let p = at as *mut u32;
+                for (i, w) in words.iter().enumerate() {
+                    unsafe { p.add(i).write(*w) };
+                }
+            });
+            flush_icache(at as *const u8, words.len() * 4);
+        }
+    }
+
     /// assembler.py:965 patch_jump_for_descr: redirect a guard to a
     /// bridge by overwriting the recovery stub with a JMP to bridge.
     ///
@@ -3908,17 +3959,8 @@ impl<'a> AssemblerARM64<'a> {
         let stub_addr = descr.adr_jump_offset();
         assert!(stub_addr != 0, "guard already patched");
 
-        codebuf::with_writable(stub_addr as *mut u8, 16, || {
-            // assembler.py:975 — unconditional B (not BL) to avoid
-            // clobbering lr. RPython uses br ip0 (indirect), we use
-            // B imm26 (direct) since the offset fits ±128 MB.
-            let offset = adr_new_target as isize - stub_addr as isize;
-            let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
-            let insn = 0x1400_0000 | imm26; // B imm26
-            unsafe { (stub_addr as *mut u32).write(insn) };
-        });
-
-        flush_icache(stub_addr as *const u8, 16);
+        // patch_trace uses BL (branch-with-link) into the bridge.
+        unsafe { Self::write_redirect_branch(stub_addr, adr_new_target, true) };
 
         // Verify patch was applied correctly
         if crate::majit_log_enabled() {
@@ -3936,14 +3978,8 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:1138 redirect_call_assembler: patch old loop entry
     /// to JMP to new loop after retrace.
     pub fn redirect_call_assembler(old_addr: *const u8, new_addr: *const u8) {
-        codebuf::with_writable(old_addr as *mut u8, 16, || {
-            let offset = new_addr as isize - old_addr as isize;
-            let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
-            let insn = 0x1400_0000 | imm26;
-            unsafe { (old_addr as *mut u32).write(insn) };
-        });
-
-        flush_icache(old_addr, 4);
+        // redirect_call_assembler uses a plain B (no link) to the new loop.
+        unsafe { Self::write_redirect_branch(old_addr as usize, new_addr as usize, false) };
     }
 
     // ----------------------------------------------------------------

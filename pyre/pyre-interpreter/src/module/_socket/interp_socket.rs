@@ -1725,8 +1725,8 @@ fn init_socket_getaddrinfo(ns: &mut DictStorage) {
                         "sockaddr resolved to multiple addresses",
                     ));
                 }
-                let mut host_buf = [0i8; libc::NI_MAXHOST as usize];
-                let mut serv_buf = [0i8; 32];
+                let mut host_buf = [0 as libc::c_char; libc::NI_MAXHOST as usize];
+                let mut serv_buf = [0 as libc::c_char; 32];
                 let nrc = unsafe {
                     libc::getnameinfo(
                         ai.ai_addr,

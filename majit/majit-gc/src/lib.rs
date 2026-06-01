@@ -47,14 +47,23 @@ pub mod flags {
     pub const VISITED_RMY: u64 = 1 << 8;
     /// GCFLAG_PINNED (bit 9)
     pub const PINNED: u64 = 1 << 9;
-    /// OLDGEN_TRACKED (bit 10) — pyre extension, not an incminimark GCFLAG.
-    /// Set on every object allocated in (or promoted to) the old gen, and
-    /// only on those. The write barrier uses it to tell a real old-gen
-    /// object apart from a Box-allocated PyFrame (which carries a GcHeader
-    /// and TRACK_YOUNG_PTRS but must not enter the remembered set), so the
-    /// barrier's membership test is an O(1) flag read instead of a lookup
+    /// GCFLAG_IGNORE_FINALIZER (bit 10)
+    pub const IGNORE_FINALIZER: u64 = 1 << 10;
+    /// GCFLAG_SHADOW_INITIALIZED (bit 11)
+    pub const SHADOW_INITIALIZED: u64 = 1 << 11;
+    /// GCFLAG_DUMMY (bit 12)
+    pub const DUMMY: u64 = 1 << 12;
+    // _GCFLAG_FIRST_UNUSED = first_gcflag << 13: the first bit incminimark
+    // leaves free. pyre-only flags must start here, above the whole upstream
+    // GCFLAG range, so they never alias an incminimark flag.
+    /// OLDGEN_TRACKED (bit 13, _GCFLAG_FIRST_UNUSED) — pyre extension, not an
+    /// incminimark GCFLAG. Set on every object allocated in (or promoted to)
+    /// the old gen, and only on those. The write barrier uses it to tell a
+    /// real old-gen object apart from a Box-allocated PyFrame (which carries a
+    /// GcHeader and TRACK_YOUNG_PTRS but must not enter the remembered set), so
+    /// the barrier's membership test is an O(1) flag read instead of a lookup
     /// in a side table that scaled with old-gen size.
-    pub const OLDGEN_TRACKED: u64 = 1 << 10;
+    pub const OLDGEN_TRACKED: u64 = 1 << 13;
 }
 
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
