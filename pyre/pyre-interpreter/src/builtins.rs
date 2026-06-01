@@ -1031,7 +1031,13 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     }
     if is_long(obj) {
         let val = w_long_get_value(obj);
-        return Ok(val.to_i64().unwrap_or(i64::MAX));
+        // `W_Range` carries `i64` bounds, so a value that overflows is
+        // clamped toward the matching extreme — a negative bound must not
+        // flip to a huge positive one (`range(-10**30)` stays empty).
+        return Ok(val.to_i64().unwrap_or_else(|| match val.sign() {
+            malachite_bigint::Sign::Minus => i64::MIN,
+            _ => i64::MAX,
+        }));
     }
     let type_name = (*(*obj).ob_type).name;
     Err(crate::PyError::type_error(format!(

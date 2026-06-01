@@ -3025,6 +3025,68 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_call_function_path_simple_call_exc_class_beats_leaf_match() {
+        // Branch 3c (`simple_call(<exc class>)` raise reconstruction)
+        // must win over the leaf-match registry fallback so an exception
+        // class sharing a leaf with a registered user function still
+        // resolves to the builtin class HostObject, not the user fn.
+        // Without the ordering, `["simple_call", "ValueError"]` would be
+        // captured by a registered `[mymod, ValueError]` free fn through
+        // `lookup_with_leaf_match`.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        let mut value_map: HashMap<usize, Hlvalue> = HashMap::new();
+        value_map.insert(1, Hlvalue::Variable(Variable::new()));
+        value_map.insert(2, Hlvalue::Variable(Variable::new()));
+        let registry = empty_call_registry();
+        // Free-fn-shaped (snake_case module) candidate whose leaf
+        // `ValueError` collides with the exception class name.
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["mymod", "ValueError"]),
+            Signature::new(vec!["msg".into()], None, None),
+        );
+        // Sanity: leaf-match alone would resolve the colliding user fn.
+        let leaf_hit = registry
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["simple_call", "ValueError"]))
+            .expect("leaf-match must find the colliding user fn");
+        assert!(
+            leaf_hit.host_object.is_user_function(),
+            "leaf-match fallback resolves the registered user fn"
+        );
+        let graph = translate_op_test_graph(10);
+        let op = SpaceOperation {
+            result: Some(graph.must_variable_at(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["simple_call".into(), "ValueError".into()],
+                },
+                args: vec![graph.must_variable_at(1)],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &registry, &graph)
+            .expect("simple_call(<exc class>) must lower");
+        assert_eq!(translated.len(), 1);
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert!(
+            !host.is_user_function(),
+            "exc_class branch must resolve the builtin class, not the leaf-match user fn"
+        );
+        let expected = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("bootstrap_builtin_exceptions must register ValueError");
+        assert_eq!(
+            host, &expected,
+            "callable must be the builtin ValueError class HostObject"
+        );
+    }
+
+    #[test]
     fn translate_op_call_function_path_falls_back_to_host_env_builtin() {
         // Single-segment FunctionPath unregistered in PyreCallRegistry
         // falls back to HOST_ENV.lookup_builtin(name), letting frontend
