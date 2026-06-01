@@ -855,6 +855,59 @@ fn genuine_opname_tally(
     tally
 }
 
+/// #288 build-side liveness resolver: derive, from an SSARepr's OWN
+/// `-live-` markers + `pc_first_insn_pos`, the per-Python-PC PRE-MERGE
+/// `-live-` marker index that `compute_liveness_with_pc_anchors` consumes
+/// — the role today filled by the walker's dense per-PC
+/// `walker_tracked_pc_live_indices`.  Resolution is nearest-`-live-`-at-
+/// or-before keyed by each PC's first insn position, so a stream with
+/// SPARSE markers (canonical: one `-live-` per canraise / before
+/// `goto_if_not`+`switch`, not one per PC — see #282/#116) reconstructs
+/// the same dense feed.  This is the prerequisite resolver for #287 to
+/// stop emitting a per-PC `-live-` while the runtime keeps its dense
+/// `pc_map`; #287 will wire it as the `None` branch of
+/// `filter_liveness_in_place`.
+///
+/// Returns one entry per Python PC `0..n_pcs`: `Some(idx)` = the resolved
+/// pre-merge marker insn index; `None` = either the PC carries no insn of
+/// its own (absent from `pc_first_insn_pos`) or no `-live-` marker
+/// precedes its position.  Absent PCs are deliberately NOT forward-filled
+/// from the preceding PC: a `jit_merge_point` loop-header PC is not
+/// structurally enumerable from the stream (the #286 gap), and masking it
+/// behind a neighbour's marker would hide exactly the resume target #286
+/// must still resolve separately.
+fn derive_pc_live_indices_from_sparse(
+    ssarepr: &super::flatten::SSARepr,
+    n_pcs: usize,
+) -> Vec<Option<usize>> {
+    // py_pc -> its own first insn position (sparse; `None` when the PC
+    // emitted no op carrying its offset).
+    let mut pos_for_pc: Vec<Option<usize>> = vec![None; n_pcs];
+    for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
+        if (0..n_pcs as i64).contains(&py_pc) {
+            pos_for_pc[py_pc as usize] = Some(pos);
+        }
+    }
+    // `-live-` marker positions in stream order (ascending by construction).
+    let live_positions: Vec<usize> = ssarepr
+        .insns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, insn)| insn.is_live().then_some(idx))
+        .collect();
+    pos_for_pc
+        .into_iter()
+        .map(|pos| {
+            let pos = pos?;
+            // Index of the last `-live-` marker at-or-before `pos`.
+            live_positions
+                .partition_point(|&lp| lp <= pos)
+                .checked_sub(1)
+                .map(|i| live_positions[i])
+        })
+        .collect()
+}
+
 /// color-budget Step A probe helper: per-Register color-budget violation
 /// record `(insn_idx, opname, role, kind_str, color, num_colors)`.
 /// Role distinguishes argument operand vs result register vs nested
@@ -9191,13 +9244,16 @@ impl CodeWriter {
         // untouched), so discarding the result leaves the post-measurement
         // production path byte-identical; gate unset => skipped entirely.
         // `(genuine, live, copy, structural)` buckets paired with the
-        // canonical driver's genuine-category opname tally (#230.M3), or
-        // `None` when it panicked.  Both derive from the single canonical
+        // canonical driver's genuine-category opname tally (#230.M3) and
+        // the #288 sparse-liveness coverage report
+        // `(reachable, resolved, absent, uncovered)`, or `None` when the
+        // driver panicked.  All three derive from the single canonical
         // `flatten_graph` stream so the per-graph genuine residual can be
-        // named opname-by-opname at the log site below.
+        // named and the sparse `-live-` resolver verified at the log site.
         let measure_canonical: Option<(
             (usize, usize, usize, usize),
             std::collections::BTreeMap<String, usize>,
+            (usize, usize, usize, usize),
         )> = if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut measure_regallocs = graph_regallocs.clone();
@@ -9207,9 +9263,39 @@ impl CodeWriter {
                     true,
                     Some(self.cpu()),
                 );
+                // #288: resolve each reachable Python PC to its
+                // nearest-at-or-before `-live-` marker from the canonical
+                // stream's OWN sparse markers + `pc_first_insn_pos`, then
+                // bucket the reachable PCs into resolved / absent (the PC
+                // emits no graph op — a stack-only instruction — so it has
+                // no `pc_first_insn_pos` entry) / uncovered (the PC emits a
+                // graph op but no `-live-` marker precedes it).
+                let live_indices = derive_pc_live_indices_from_sparse(&canonical, num_instrs);
+                let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
+                let mut present = vec![false; num_instrs];
+                for &(pc, _) in &canonical.pc_first_insn_pos {
+                    if (0..num_instrs as i64).contains(&pc) {
+                        present[pc as usize] = true;
+                    }
+                }
+                let (mut reachable, mut resolved, mut absent, mut uncovered) = (0, 0, 0, 0);
+                for pc in 0..num_instrs {
+                    if !live_vars.is_reachable(pc) {
+                        continue;
+                    }
+                    reachable += 1;
+                    if live_indices[pc].is_some() {
+                        resolved += 1;
+                    } else if !present[pc] {
+                        absent += 1;
+                    } else {
+                        uncovered += 1;
+                    }
+                }
                 (
                     bucket_measure_insns(&canonical.insns),
                     genuine_opname_tally(&canonical.insns),
+                    (reachable, resolved, absent, uncovered),
                 )
             }))
             .ok()
@@ -9390,7 +9476,9 @@ impl CodeWriter {
             // NEW-DEVIATION needing its own retirement.  `Some` when the
             // canonical driver completed, `None` when it panicked
             // (Phase-1 SCAFFOLD shape).  Log-only — never affects codegen.
-            if let Some(((cg, cl, cc, cs), canonical_genuine)) = measure_canonical {
+            if let Some(((cg, cl, cc, cs), canonical_genuine, (lreach, lres, labs, lunc))) =
+                measure_canonical
+            {
                 let (wg, wl, wc, ws) = bucket_measure_insns(&ssarepr.insns);
                 eprintln!(
                     "[flatten-measure] {} canon[g={} l={} c={} s={} tot={}] walker[g={} l={} c={} s={} tot={}] {} {}",
@@ -9441,6 +9529,23 @@ impl CodeWriter {
                         diffs.join(" "),
                     );
                 }
+                // #288: survey the canonical sparse `-live-` resolver's
+                // coverage over reachable instruction PCs.  `resolved` =
+                // PC emits a graph op (has a `pc_first_insn_pos` entry)
+                // AND a `-live-` marker precedes it.  `nopc` = PC emits no
+                // graph op (stack-only instruction: LOAD_FAST/POP_TOP/…),
+                // so it has no `pc_first_insn_pos` entry — only a resume
+                // target if the runtime deopts into a stack-only PC, which
+                // #281 must confirm it never does.  `unmarked` = PC emits
+                // a graph op but no `-live-` precedes it (≈ the entry PC
+                // before the first marker).  Survey-only, like the other
+                // `[flatten-measure]` lines; no PASS/GAP verdict because
+                // the meaningful gate (resume-target coverage, not
+                // all-PC) is #281's, which restricts to deopt targets.
+                eprintln!(
+                    "[flatten-measure-liveness] {} reachable={} resolved={} nopc={} unmarked={}",
+                    ssarepr.name, lreach, lres, labs, lunc,
+                );
             } else if std::env::var("PYRE_FLATTEN_MEASURE").is_ok() {
                 eprintln!("[flatten-measure] {} canonical=PANIC", ssarepr.name);
             }
