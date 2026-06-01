@@ -20,13 +20,25 @@ pub fn register_module(ns: &mut DictStorage) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // starmap stub
+    // starmap(function, iterable) — PyPy: W_StarMap.  Calls
+    // `function(*args)` for each `args` tuple produced by the iterable.
     crate::dict_storage_store(
         ns,
         "starmap",
         crate::make_builtin_function_with_arity(
             "starmap",
-            |_| Ok(pyre_object::w_list_new(vec![])),
+            |args| {
+                let func = args[0];
+                let items = crate::builtins::collect_iterable(args[1])?;
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let call_args = crate::builtins::collect_iterable(item)?;
+                    out.push(crate::call::call_function_impl_result(func, &call_args)?);
+                }
+                let n = out.len();
+                let list = pyre_object::w_list_new(out);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
             2,
         ),
     );
@@ -71,11 +83,100 @@ pub fn register_module(ns: &mut DictStorage) {
             Ok(pyre_object::itertoolsmodule::w_repeat_new(w_obj, w_times))
         }),
     );
-    // islice
+    // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
+    // PyPy: W_ISlice.__init__.  Pulled lazily from the source iterator so
+    // an unbounded input (`count`, `cycle`) is bounded by `stop`.
     crate::dict_storage_store(
         ns,
         "islice",
-        crate::make_builtin_function("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
+        crate::make_builtin_function("islice", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "islice expected at least 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            // `W_ISlice.arg_int_w` — `space.index` then a `>= minimum`
+            // gate; a non-integer or out-of-range value is a ValueError
+            // carrying the same message.
+            fn arg_int(
+                w: pyre_object::PyObjectRef,
+                minimum: i64,
+                msg: &str,
+            ) -> Result<i64, crate::PyError> {
+                let v = unsafe {
+                    if pyre_object::is_int(w) {
+                        pyre_object::w_int_get_value(w)
+                    } else if pyre_object::is_bool(w) {
+                        pyre_object::w_bool_get_value(w) as i64
+                    } else {
+                        return Err(crate::PyError::value_error(msg.to_string()));
+                    }
+                };
+                if v < minimum {
+                    return Err(crate::PyError::value_error(msg.to_string()));
+                }
+                Ok(v)
+            }
+            let is_none = |w| unsafe { pyre_object::is_none(w) };
+            let (start, w_stop, w_step) = if args.len() == 2 {
+                (0i64, args[1], None)
+            } else if args.len() <= 4 {
+                let start = if is_none(args[1]) {
+                    0
+                } else {
+                    arg_int(
+                        args[1],
+                        0,
+                        "Indicies for islice() must be None or non-negative integers",
+                    )?
+                };
+                (start, args[2], args.get(3).copied())
+            } else {
+                return Err(crate::PyError::type_error(format!(
+                    "islice() takes at most 4 arguments ({} given)",
+                    args.len() - 2
+                )));
+            };
+            let stop: Option<i64> = if is_none(w_stop) {
+                None
+            } else {
+                Some(
+                    arg_int(w_stop, 0, "Stop argument must be a non-negative integer or None.")?
+                        .max(start),
+                )
+            };
+            let step = match w_step {
+                None => 1,
+                Some(w) if is_none(w) => 1,
+                Some(w) => arg_int(w, 1, "Step for islice() must be a positive integer or None")?,
+            };
+            let iterator = crate::baseobjspace::iter(args[0])?;
+            let mut out = Vec::new();
+            let mut idx: i64 = 0;
+            let mut next_target = start;
+            loop {
+                if let Some(s) = stop {
+                    if idx >= s {
+                        break;
+                    }
+                }
+                match crate::baseobjspace::next(iterator) {
+                    Ok(v) => {
+                        if idx == next_target {
+                            out.push(v);
+                            next_target += step;
+                        }
+                        idx += 1;
+                    }
+                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            let n = out.len();
+            let list = pyre_object::w_list_new(out);
+            Ok(pyre_object::w_seq_iter_new(list, n))
+        }),
     );
     // groupby
     crate::dict_storage_store(

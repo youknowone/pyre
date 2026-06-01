@@ -6023,7 +6023,12 @@ fn init_int_type(ns: &mut DictStorage) {
                 &["length", "byteorder", "signed"],
                 "to_bytes",
             )?;
-            crate::builtins::kwarg_reject_duplicate(kwargs, "to_bytes", "length", pos.get(1).is_some())?;
+            crate::builtins::kwarg_reject_duplicate(
+                kwargs,
+                "to_bytes",
+                "length",
+                pos.get(1).is_some(),
+            )?;
             crate::builtins::kwarg_reject_duplicate(
                 kwargs,
                 "to_bytes",
@@ -8373,7 +8378,12 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "splitlines", "keepends", pos.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(
+        kwargs,
+        "splitlines",
+        "keepends",
+        pos.get(1).is_some(),
+    )?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")

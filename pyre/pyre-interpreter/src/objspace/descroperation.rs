@@ -2141,8 +2141,7 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             let (bstart, _bstop, bstep) = pyre_object::w_range_fields(b);
             let la = pyre_object::w_range_len(a);
             let lb = pyre_object::w_range_len(b);
-            let equal = la == lb
-                && (la == 0 || (astart == bstart && (la == 1 || astep == bstep)));
+            let equal = la == lb && (la == 0 || (astart == bstart && (la == 1 || astep == bstep)));
             return Ok(w_bool_from(match op {
                 CompareOp::Eq => equal,
                 CompareOp::Ne => !equal,

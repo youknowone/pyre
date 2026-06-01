@@ -1700,16 +1700,15 @@ mod tests {
             .collect();
         let config = crate::test_support::pyre_analyze_config();
         // Single whole-program lowering shared by every block below.
-        let result =
-            analyze_pipeline_from_parsed(
-                &parsed_files,
-                &config,
-                None,
-                &|_, _| None,
-                &[],
-                &[],
-                HostStaticAddrs::default(),
-            );
+        let result = analyze_pipeline_from_parsed(
+            &parsed_files,
+            &config,
+            None,
+            &|_, _| None,
+            &[],
+            &[],
+            HostStaticAddrs::default(),
+        );
         // Walker-populated metadata mirrors the production
         // `analyze_pipeline_from_parsed` path: `extract_trait_impls`
         // lowers method bodies against this registry so the

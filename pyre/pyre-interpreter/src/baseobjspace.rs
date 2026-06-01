@@ -1908,7 +1908,11 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             };
             if let Some((func, sname, arity)) = entry {
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::w_method_new(func_obj, obj, pyre_object::PY_NULL));
+                return Ok(pyre_object::w_method_new(
+                    func_obj,
+                    obj,
+                    pyre_object::PY_NULL,
+                ));
             }
         }
     }

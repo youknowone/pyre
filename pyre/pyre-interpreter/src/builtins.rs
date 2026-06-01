@@ -169,7 +169,9 @@ fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
-        Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(buf)))
+        Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(
+            buf,
+        )))
     }
 }
 
@@ -200,7 +202,11 @@ unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
             let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
             let n = data.len() / itemsize;
-            return Some((0..n).map(|i| memoryview_unpack(&data, itemsize, i)).collect());
+            return Some(
+                (0..n)
+                    .map(|i| memoryview_unpack(&data, itemsize, i))
+                    .collect(),
+            );
         }
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
@@ -2900,9 +2906,7 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !crate::baseobjspace::callable_w(args[0]) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
-            Ok(pyre_object::callableiteratorobject::w_callable_iterator_new(
-                args[0], args[1],
-            ))
+            Ok(pyre_object::callableiteratorobject::w_callable_iterator_new(args[0], args[1]))
         }
         n => Err(crate::PyError::type_error(format!(
             "iter expected at most 2 arguments, got {n}"
