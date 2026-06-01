@@ -6580,8 +6580,13 @@ fn try_walker_specialize_subscr(
     };
 
     // Gate: list[int], non-negative index in bounds, int- or float-storage.
+    // A bool index (`is_int` accepts `W_BoolObject`) must NOT be unboxed via
+    // the int path: it has a 1-byte `boolval`, not W_IntObject's `intval@16`.
     let (sid, index, concrete_len) = unsafe {
-        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+        if !pyre_object::pyobject::is_list(list_obj)
+            || !pyre_object::is_int(key_obj)
+            || pyre_object::is_bool(key_obj)
+        {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -6726,7 +6731,13 @@ fn try_walker_specialize_store_subscr(
     // Gate: list[int] = value, non-negative index in bounds, storage matching
     // the value type (int storage ← W_IntObject, float storage ← W_FloatObject).
     let (sid, index, concrete_len) = unsafe {
-        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+        // Bool index / bool int-storage value must route through the generic
+        // path: `is_int` accepts `W_BoolObject`, whose 1-byte `boolval` is not
+        // W_IntObject's `intval@16`, so int-path unbox would read garbage.
+        if !pyre_object::pyobject::is_list(list_obj)
+            || !pyre_object::is_int(key_obj)
+            || pyre_object::is_bool(key_obj)
+        {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -6739,6 +6750,7 @@ fn try_walker_specialize_store_subscr(
         }
         let sid = if pyre_object::w_list_uses_int_storage(list_obj)
             && pyre_object::is_int(value_obj)
+            && !pyre_object::is_bool(value_obj)
         {
             1i64
         } else if pyre_object::w_list_uses_float_storage(list_obj)
