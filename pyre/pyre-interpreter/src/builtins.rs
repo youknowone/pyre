@@ -1091,36 +1091,44 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     //   [metatype, obj] — 2 args (type(obj))
     // Find the (name, bases, dict) triple by scanning for the first str arg.
     // Also extract the metatype (first type arg before the name str).
+    // The class-definition keywords arrive as a trailing `__pyre_kw__`
+    // dict (the builtin kwargs ABI); strip it before the arity scan and
+    // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
+    let (pos, kwargs) = split_builtin_kwargs(args);
     let mut w_metaclass = pyre_object::PY_NULL;
-    for i in 0..args.len() {
-        if unsafe { pyre_object::is_str(args[i]) } && i + 2 < args.len() {
+    for i in 0..pos.len() {
+        if unsafe { pyre_object::is_str(pos[i]) } && i + 2 < pos.len() {
             // Extract metatype from preceding args
             for j in 0..i {
-                if unsafe { pyre_object::is_type(args[j]) } {
-                    w_metaclass = args[j];
+                if unsafe { pyre_object::is_type(pos[j]) } {
+                    w_metaclass = pos[j];
                 }
             }
-            return type_descr_new_with_metaclass(&args[i..], w_metaclass);
+            return type_descr_new_with_metaclass(&pos[i..], w_metaclass, kwargs);
         }
     }
-    if args.len() == 1 && unsafe { pyre_object::is_type(args[0]) } {
+    if pos.len() == 1 && unsafe { pyre_object::is_type(pos[0]) } {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
     }
-    if args.len() == 1 {
-        return type_descr_new_without_metaclass(args);
+    if pos.len() == 1 {
+        return type_descr_new_without_metaclass(pos, kwargs);
     }
-    if args.len() == 2 {
-        return type_descr_new_without_metaclass(&args[1..]);
+    if pos.len() == 2 {
+        return type_descr_new_without_metaclass(&pos[1..], kwargs);
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
-fn type_descr_new_without_metaclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    type_descr_new_with_metaclass(args, pyre_object::PY_NULL)
+fn type_descr_new_without_metaclass(
+    args: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    type_descr_new_with_metaclass(args, pyre_object::PY_NULL, kwargs)
 }
 
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
+    kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 && args.len() != 3 {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
@@ -1251,6 +1259,24 @@ fn type_descr_new_with_metaclass(
                 }
             }
         }
+
+        // type_new_init_subclass — fire __init_subclass__ with the
+        // keywords that reached type.__new__ (the stripped `__pyre_kw__`
+        // dict).  This is the single site for the metaclass path; the
+        // default-metaclass `__build_class__` shortcut fires it itself
+        // because it bypasses type.__new__.
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match kwargs {
+            Some(kw) => unsafe {
+                pyre_object::w_dict_items(kw)
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        is_str(*k) && pyre_object::w_str_get_value(*k) != "__pyre_kw__"
+                    })
+                    .collect()
+            },
+            None => Vec::new(),
+        };
+        crate::call::call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
 
         return Ok(w_type);
     }
